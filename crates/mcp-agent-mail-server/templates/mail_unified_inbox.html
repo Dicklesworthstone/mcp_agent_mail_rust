@@ -190,7 +190,7 @@
       <!-- Importance Filter -->
       <div>
         <label class="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">Importance</label>
-        <select x-model="filters.importance" @change="filterMessages()"
+        <select x-model="filters.importance" @change="handleImportanceFilterChange()"
                 class="w-full px-3 py-2 text-sm bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg text-slate-900 dark:text-white focus:ring-2 focus:ring-primary-500 focus:border-transparent">
           <option value="">All</option>
           <option value="urgent">Urgent</option>
@@ -316,7 +316,7 @@
                    :class="{
                      'bg-primary-50 dark:bg-primary-900/20 border-l-4 border-l-primary-500': selectedMessage && selectedMessage.id === msg.id,
                      'border-l-4 border-l-transparent hover:bg-slate-50 dark:hover:bg-slate-900': !selectedMessage || selectedMessage.id !== msg.id,
-                     'font-semibold': !msg.read
+                     'font-semibold': !isMessageRead(msg)
                    }"
                    class="px-4 py-3 border-b border-slate-100 dark:border-slate-700 cursor-pointer transition-all duration-200 group focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-inset"
                    :style="`animation-delay: ${Math.min(index * 0.02, 0.5)}s;`"
@@ -515,7 +515,7 @@
                   Open in Project
                 </a>
                 <template x-if="selectedMessage.thread_id">
-                  <a :href="`/mail/${selectedMessage.project_slug}/thread/${selectedMessage.thread_id}`"
+                  <a :href="`/mail/${selectedMessage.project_slug}/thread/${encodeURIComponent(selectedMessage.thread_id)}`"
                      class="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors flex items-center gap-2 text-sm font-medium">
                     <i data-lucide="git-branch" class="w-4 h-4"></i>
                     View Thread
@@ -663,6 +663,7 @@
 <script>
 function unifiedInboxManager() {
   const staticExport = {{ static_export|tojson }};
+  const initialImportanceFilter = {{ filter_importance|tojson }};
   return {
     // Data
     allMessages: {{ messages | tojson if messages else '[]' }},
@@ -686,7 +687,7 @@ function unifiedInboxManager() {
       project: '',
       sender: '',
       recipient: '',
-      importance: '',
+      importance: initialImportanceFilter || '',
       hasThread: ''
     },
 
@@ -710,14 +711,18 @@ function unifiedInboxManager() {
     get uniqueRecipients() {
       const recipients = new Set();
       this.allMessages.forEach(m => {
-        if (m.recipients) {  // Only process non-empty recipients
-          m.recipients.split(',').forEach(r => {
-            const trimmed = r.trim();
-            if (trimmed) {  // Only add non-empty strings
-              recipients.add(trimmed);
-            }
-          });
-        }
+        const recipientNames = Array.isArray(m?.recipient_names)
+          ? m.recipient_names
+          : String(m?.recipients || '')
+              .split(',')
+              .map((recipient) => recipient.trim())
+              .filter(Boolean);
+        recipientNames.forEach((recipient) => {
+          const trimmed = String(recipient).trim();
+          if (trimmed) {
+            recipients.add(trimmed);
+          }
+        });
       });
       return [...recipients].sort((a, b) => a.localeCompare(b));
     },
@@ -840,6 +845,41 @@ function unifiedInboxManager() {
     },
 
     // Filtering
+    filteredRecipientTarget() {
+      return typeof this.filters.recipient === 'string' ? this.filters.recipient.trim() : '';
+    },
+
+    getActionRecipients(msg) {
+      const recipients = Array.isArray(msg?.recipient_names) ? msg.recipient_names : [];
+      const filteredRecipient = this.filteredRecipientTarget();
+      if (!filteredRecipient) {
+        return recipients;
+      }
+      return recipients.filter((recipient) => recipient === filteredRecipient);
+    },
+
+    isMessageRead(msg) {
+      if (!msg) return true;
+      const filteredRecipient = this.filteredRecipientTarget();
+      if (filteredRecipient) {
+        const recipientRead = msg.recipient_read && typeof msg.recipient_read === 'object'
+          ? msg.recipient_read
+          : {};
+        if (Object.prototype.hasOwnProperty.call(recipientRead, filteredRecipient)) {
+          return Boolean(recipientRead[filteredRecipient]);
+        }
+      }
+      return Boolean(msg.read);
+    },
+
+    recomputeAggregateRead(msg, recipientRead) {
+      const recipients = Array.isArray(msg?.recipient_names) ? msg.recipient_names : [];
+      if (recipients.length === 0) {
+        return Boolean(msg?.read);
+      }
+      return recipients.every((recipient) => Boolean(recipientRead[recipient]));
+    },
+
     filterMessages() {
       let filtered = [...this.allMessages];
 
@@ -877,12 +917,12 @@ function unifiedInboxManager() {
       // Recipient filter
       if (this.filters.recipient) {
         filtered = filtered.filter(msg => {
-          if (!msg.recipients) return false;
-          // Split and trim to match how we build uniqueRecipients
-          const recipientList = String(msg.recipients)
-            .split(',')
-            .map(r => r.trim())
-            .filter(Boolean);
+          const recipientList = Array.isArray(msg?.recipient_names)
+            ? msg.recipient_names.map((recipient) => String(recipient).trim()).filter(Boolean)
+            : String(msg?.recipients || '')
+                .split(',')
+                .map((recipient) => recipient.trim())
+                .filter(Boolean);
           return recipientList.includes(this.filters.recipient);
         });
       }
@@ -946,9 +986,20 @@ function unifiedInboxManager() {
 
       this.filteredMessages = filtered;
 
+      const visibleIds = new Set(filtered.map((msg) => msg.id));
+      if (this.selectedMessages.length > 0) {
+        const nextSelected = this.selectedMessages.filter((id) => visibleIds.has(id));
+        if (nextSelected.length !== this.selectedMessages.length) {
+          this.selectedMessages = nextSelected;
+        }
+      }
+
       // Clear selected message if it's no longer in filtered results
       if (this.selectedMessage && !filtered.find(m => m.id === this.selectedMessage.id)) {
         this.selectedMessage = null;
+      }
+      if (this.viewMode === 'split' && !this.selectedMessage && filtered.length > 0) {
+        this.selectMessage(filtered[0]);
       }
 
       // Re-render icons
@@ -990,6 +1041,14 @@ function unifiedInboxManager() {
       }
     },
 
+    async handleImportanceFilterChange() {
+      this.filterMessages();
+      if (staticExport) {
+        return;
+      }
+      await this.fetchLatestMessages({ silent: true });
+    },
+
     async fetchLatestMessages(options = {}) {
       const { silent = false } = options;
       if (staticExport) {
@@ -1008,7 +1067,14 @@ function unifiedInboxManager() {
       const previouslySelectedSet = new Set(this.selectedMessages || []);
 
       try {
-        const response = await fetch(`/mail/api/unified-inbox?limit=500&include_projects=false`, {
+        const params = new URLSearchParams({
+          limit: '1000',
+          include_projects: 'false'
+        });
+        if (this.filters.importance) {
+          params.set('filter_importance', this.filters.importance);
+        }
+        const response = await fetch(`/mail/api/unified-inbox?${params.toString()}`, {
           headers: { Accept: 'application/json' },
           cache: 'no-store'
         });
@@ -1025,6 +1091,8 @@ function unifiedInboxManager() {
           const nextSelection = this.filteredMessages.find((m) => m.id === previouslySelectedId);
           if (nextSelection) {
             this.selectMessage(nextSelection);
+          } else if (this.viewMode === 'split' && this.filteredMessages.length > 0) {
+            this.selectMessage(this.filteredMessages[0]);
           } else {
             this.selectedMessage = null;
           }
@@ -1060,6 +1128,7 @@ function unifiedInboxManager() {
     },
 
     clearFilters() {
+      const previousImportance = this.filters.importance;
       this.filters = {
         project: '',
         sender: '',
@@ -1068,6 +1137,9 @@ function unifiedInboxManager() {
         hasThread: ''
       };
       this.filterMessages();
+      if (previousImportance && !staticExport) {
+        void this.fetchLatestMessages({ silent: true });
+      }
     },
 
     // View Mode
@@ -1239,12 +1311,178 @@ function unifiedInboxManager() {
       }
     },
 
-    markSelectedAsRead() {
+    async markSelectedAsRead() {
       if (this.selectedMessages.length === 0) return;
-      if (typeof window.showToast === 'function') {
-        window.showToast(`Marked ${this.selectedMessages.length} message(s) as read`, 'success');
+      if (staticExport) {
+        if (typeof window.showToast === 'function') {
+          window.showToast('Static export snapshots cannot mark messages as read', 'info');
+        }
+        return;
       }
-      this.selectedMessages = [];
+
+      const selectedSet = new Set(this.selectedMessages);
+      const attemptedRecipientsByMessage = new Map();
+      const groups = new Map();
+      for (const msg of this.filteredMessages) {
+        if (!selectedSet.has(msg.id)) continue;
+        const recipients = this.getActionRecipients(msg);
+        for (const recipient of recipients) {
+          const key = `${msg.project_slug}:${recipient}`;
+          if (!groups.has(key)) {
+            groups.set(key, {
+              projectSlug: msg.project_slug,
+              agentName: recipient,
+              messageIds: []
+            });
+          }
+          groups.get(key).messageIds.push(msg.id);
+          if (!attemptedRecipientsByMessage.has(msg.id)) {
+            attemptedRecipientsByMessage.set(msg.id, new Set());
+          }
+          attemptedRecipientsByMessage.get(msg.id).add(recipient);
+        }
+      }
+
+      if (groups.size === 0) {
+        if (typeof window.showToast === 'function') {
+          window.showToast('No recipient inboxes were available to update', 'warning');
+        }
+        return;
+      }
+
+      const requests = [];
+      for (const group of groups.values()) {
+        for (let index = 0; index < group.messageIds.length; index += 500) {
+          requests.push({
+            projectSlug: group.projectSlug,
+            agentName: group.agentName,
+            messageIds: group.messageIds.slice(index, index + 500)
+          });
+        }
+      }
+
+      try {
+        const settledRequests = await Promise.allSettled(requests.map(async (request) => {
+          const response = await fetch(
+            `/mail/${request.projectSlug}/inbox/${encodeURIComponent(request.agentName)}/mark-read`,
+            {
+              method: 'POST',
+              headers: {
+                Accept: 'application/json',
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ message_ids: request.messageIds })
+            }
+          );
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status} for ${request.projectSlug}/${request.agentName}`);
+          }
+          const payload = await response.json();
+          return { request, payload };
+        }));
+
+        const successfulRecipientsByMessage = new Map();
+        let markedCount = 0;
+        let failedRequestCount = 0;
+        for (const outcome of settledRequests) {
+          if (outcome.status !== 'fulfilled') {
+            failedRequestCount += 1;
+            continue;
+          }
+          const { request, payload } = outcome.value;
+          const marked = Number(payload?.marked_count ?? 0);
+          if (Number.isFinite(marked)) {
+            markedCount += marked;
+          }
+          for (const messageId of request.messageIds) {
+            if (!successfulRecipientsByMessage.has(messageId)) {
+              successfulRecipientsByMessage.set(messageId, new Set());
+            }
+            successfulRecipientsByMessage.get(messageId).add(request.agentName);
+          }
+        }
+
+        if (successfulRecipientsByMessage.size === 0) {
+          throw new Error('All mark-read requests failed');
+        }
+
+        this.allMessages = this.allMessages.map((msg) => {
+          if (!selectedSet.has(msg.id)) {
+            return msg;
+          }
+          const markedRecipients = successfulRecipientsByMessage.get(msg.id);
+          if (!markedRecipients || markedRecipients.size === 0) {
+            return msg;
+          }
+          const nextRecipientRead = {
+            ...(msg.recipient_read && typeof msg.recipient_read === 'object' ? msg.recipient_read : {})
+          };
+          for (const recipient of markedRecipients) {
+            nextRecipientRead[recipient] = true;
+          }
+          return {
+            ...msg,
+            recipient_read: nextRecipientRead,
+            read: this.recomputeAggregateRead(msg, nextRecipientRead)
+          };
+        });
+        this.filterMessages();
+        if (this.selectedMessage && selectedSet.has(this.selectedMessage.id)) {
+          const refreshedSelection = this.filteredMessages.find((msg) => msg.id === this.selectedMessage.id);
+          if (refreshedSelection) {
+            this.selectedMessage = refreshedSelection;
+          } else {
+            const nextRecipientRead = {
+              ...(this.selectedMessage.recipient_read && typeof this.selectedMessage.recipient_read === 'object'
+              ? this.selectedMessage.recipient_read
+                : {})
+            };
+            const markedRecipients = successfulRecipientsByMessage.get(this.selectedMessage.id) || new Set();
+            for (const recipient of markedRecipients) {
+              nextRecipientRead[recipient] = true;
+            }
+            this.selectedMessage = {
+              ...this.selectedMessage,
+              recipient_read: nextRecipientRead,
+              read: this.recomputeAggregateRead(this.selectedMessage, nextRecipientRead)
+            };
+          }
+        }
+
+        const fullyMarkedMessageIds = this.selectedMessages.filter((messageId) => {
+          const attemptedRecipients = attemptedRecipientsByMessage.get(messageId);
+          if (!attemptedRecipients || attemptedRecipients.size === 0) {
+            return false;
+          }
+          const successfulRecipients = successfulRecipientsByMessage.get(messageId);
+          if (!successfulRecipients || successfulRecipients.size === 0) {
+            return false;
+          }
+          return Array.from(attemptedRecipients).every((recipient) => successfulRecipients.has(recipient));
+        });
+        if (fullyMarkedMessageIds.length === this.selectedMessages.length) {
+          this.selectedMessages = [];
+        } else if (fullyMarkedMessageIds.length > 0) {
+          const fullyMarkedSet = new Set(fullyMarkedMessageIds);
+          this.selectedMessages = this.selectedMessages.filter((messageId) => !fullyMarkedSet.has(messageId));
+        }
+
+        if (typeof window.showToast === 'function') {
+          if (failedRequestCount === 0) {
+            window.showToast(`Marked ${markedCount} recipient message(s) as read`, 'success');
+          } else {
+            window.showToast(
+              `Marked ${markedCount} recipient message(s) as read; ${failedRequestCount} request group(s) failed`,
+              'warning'
+            );
+          }
+        }
+      } catch (error) {
+        console.error('Unified inbox mark-read failed:', error);
+        if (typeof window.showToast === 'function') {
+          window.showToast('Failed to mark selected messages as read', 'error');
+        }
+      }
     },
 
     // Helpers

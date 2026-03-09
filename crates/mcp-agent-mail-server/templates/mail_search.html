@@ -358,7 +358,7 @@
                     <span>{{ r.created_relative }}</span>
                   </div>
                   {% if r.thread_id %}
-                    <a href="/mail/{{ project.slug }}/thread/{{ r.thread_id }}" class="flex items-center gap-1.5 hover:text-primary-600 dark:hover:text-primary-400 transition-colors" onclick="event.stopPropagation()">
+                    <a href="{{ r.thread_url }}" class="flex items-center gap-1.5 hover:text-primary-600 dark:hover:text-primary-400 transition-colors" onclick="event.stopPropagation()">
                       <i data-lucide="message-circle" class="w-3.5 h-3.5"></i>
                       <span class="font-mono text-xs">{{ r.thread_id }}</span>
                     </a>

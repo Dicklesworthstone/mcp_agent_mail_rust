@@ -43,7 +43,7 @@ pub fn dispatch(
     match sub {
         // Python parity: GET /mail and /mail/unified-inbox → unified inbox.
         "" | "/" | "/unified-inbox" => {
-            let limit = extract_query_int(query, "limit", 10000);
+            let limit = extract_query_int(query, "limit", 1000).clamp(1, 1000);
             let filter_importance = extract_query_str(query, "filter_importance");
             render_unified_inbox(
                 &cx,
@@ -119,11 +119,23 @@ mod route_regressions {
             project_name: "Demo".to_string(),
             sender: "GreenCastle".to_string(),
             recipients: BTreeSet::from(["BlueLake".to_string(), "AmberPeak".to_string()]),
+            recipient_read: BTreeMap::from([
+                ("AmberPeak".to_string(), true),
+                ("BlueLake".to_string(), true),
+            ]),
             all_read: true,
         };
 
         let view = aggregate.into_view();
         assert_eq!(view.recipients, "AmberPeak, BlueLake");
+        assert_eq!(view.recipient_names, vec!["AmberPeak", "BlueLake"]);
+        assert_eq!(
+            view.recipient_read,
+            BTreeMap::from([
+                ("AmberPeak".to_string(), true),
+                ("BlueLake".to_string(), true),
+            ])
+        );
         assert!(view.read);
         assert!(view.excerpt.contains("Hello"));
         assert!(!view.created_full.is_empty());
@@ -143,12 +155,18 @@ mod route_regressions {
             project_name: "Demo".to_string(),
             sender: "GreenCastle".to_string(),
             recipients: BTreeSet::from(["BlueLake".to_string()]),
+            recipient_read: BTreeMap::from([("BlueLake".to_string(), false)]),
             all_read: false,
         }
         .into_view();
 
         let payload = unified_api_message_value(&message);
         assert_eq!(payload["recipients"], "BlueLake");
+        assert_eq!(payload["recipient_names"], serde_json::json!(["BlueLake"]));
+        assert_eq!(
+            payload["recipient_read"],
+            serde_json::json!({ "BlueLake": false })
+        );
         assert_eq!(payload["read"], false);
         assert!(
             payload["excerpt"]
@@ -416,6 +434,27 @@ mod route_regressions {
             .expect("unified inbox should return html");
         assert!(html.contains("Static export snapshot"));
     }
+
+    #[test]
+    fn render_unified_inbox_serializes_normalized_importance_filter() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool("unified-importance-filter-template");
+        let html = render_unified_inbox(&cx, &pool, 10, Some(" HIGH "), false)
+            .expect("unified inbox render should succeed")
+            .expect("unified inbox should return html");
+        assert!(html.contains(r#"const initialImportanceFilter = "high";"#));
+    }
+
+    #[test]
+    fn render_unified_inbox_wires_importance_filter_refresh_handler() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool("unified-importance-filter-handler");
+        let html = render_unified_inbox(&cx, &pool, 10, None, false)
+            .expect("unified inbox render should succeed")
+            .expect("unified inbox should return html");
+        assert!(html.contains(r#"@change="handleImportanceFilterChange()""#));
+        assert!(html.contains("async handleImportanceFilterChange()"));
+    }
 }
 
 fn get_pool() -> Result<DbPool, (u16, String)> {
@@ -518,12 +557,20 @@ fn archive_browser_file_project_slug(sub: &str) -> Option<&str> {
 /// - preserves invalid/truncated `%` escapes verbatim
 /// - decodes bytes and then interprets them as UTF-8 (lossy), so non-ASCII works
 fn percent_decode_component(input: &str) -> String {
+    percent_decode_impl(input, true)
+}
+
+fn percent_decode_path_segment(input: &str) -> String {
+    percent_decode_impl(input, false)
+}
+
+fn percent_decode_impl(input: &str, plus_as_space: bool) -> String {
     let bytes = input.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
     while i < bytes.len() {
         match bytes[i] {
-            b'+' => {
+            b'+' if plus_as_space => {
                 out.push(b' ');
                 i += 1;
             }
@@ -550,9 +597,32 @@ fn percent_decode_component(input: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
+fn percent_encode_path_segment(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(*byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+fn mail_thread_href(project_slug: &str, thread_id: &str) -> String {
+    format!(
+        "/mail/{project_slug}/thread/{}",
+        percent_encode_path_segment(thread_id)
+    )
+}
+
 #[cfg(test)]
 mod query_decode_tests {
-    use super::percent_decode_component;
+    use super::{
+        mail_thread_href, percent_decode_component, percent_decode_path_segment,
+        percent_encode_path_segment,
+    };
 
     #[test]
     fn percent_decode_basic() {
@@ -573,6 +643,27 @@ mod query_decode_tests {
     fn percent_decode_utf8_multibyte() {
         // "€" U+20AC is UTF-8 bytes E2 82 AC.
         assert_eq!(percent_decode_component("%E2%82%AC"), "€");
+    }
+
+    #[test]
+    fn percent_decode_path_segment_keeps_plus_literal() {
+        assert_eq!(percent_decode_path_segment("topic+a%2Fb"), "topic+a/b");
+    }
+
+    #[test]
+    fn percent_encode_path_segment_escapes_reserved_bytes() {
+        assert_eq!(
+            percent_encode_path_segment("topic/a b+"),
+            "topic%2Fa%20b%2B"
+        );
+    }
+
+    #[test]
+    fn mail_thread_href_encodes_thread_path_segment() {
+        assert_eq!(
+            mail_thread_href("demo", "topic/a b+"),
+            "/mail/demo/thread/topic%2Fa%20b%2B"
+        );
     }
 }
 
@@ -1048,6 +1139,49 @@ mod auth_route_hardening_regression_suite {
         }
     }
 
+    #[test]
+    fn regression_thread_route_decodes_percent_encoded_thread_id() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool();
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-encoded-thread-{}", unique_nonce()),
+        )));
+        let project_id = project.id.unwrap_or(0);
+
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
+        )));
+        let sender_id = sender.id.unwrap_or(0);
+        let thread_id = "topic/with space+plus";
+
+        outcome_ok(block_on(queries::create_message(
+            &cx,
+            &pool,
+            project_id,
+            sender_id,
+            "Encoded thread subject",
+            "Encoded thread body",
+            Some(thread_id),
+            "normal",
+            false,
+            "[]",
+        )));
+
+        let route = format!(
+            "/{}/thread/{}",
+            project.slug,
+            percent_encode_path_segment(thread_id)
+        );
+        let html = dispatch_project_route(&route, "GET", "", &cx, &pool, "")
+            .expect("thread route should succeed")
+            .expect("thread route should render html");
+
+        assert!(html.contains("Encoded thread subject"));
+        assert!(html.contains("topic/with space+plus"));
+    }
+
     // -- Method enforcement on known routes --
 
     #[test]
@@ -1253,6 +1387,8 @@ struct UnifiedMessage {
     project_name: String,
     sender: String,
     recipients: String,
+    recipient_names: Vec<String>,
+    recipient_read: BTreeMap<String, bool>,
     read: bool,
     excerpt: String,
 }
@@ -1269,6 +1405,7 @@ struct UnifiedMessageAggregate {
     project_name: String,
     sender: String,
     recipients: std::collections::BTreeSet<String>,
+    recipient_read: BTreeMap<String, bool>,
     all_read: bool,
 }
 
@@ -1282,6 +1419,8 @@ impl UnifiedMessageAggregate {
         let message = &row.message;
         let mut recipients = std::collections::BTreeSet::new();
         recipients.insert(recipient_name.to_string());
+        let mut recipient_read = BTreeMap::new();
+        recipient_read.insert(recipient_name.to_string(), row.read_ts.is_some());
         Self {
             id: message.id.unwrap_or(0),
             subject: message.subject.clone(),
@@ -1297,17 +1436,21 @@ impl UnifiedMessageAggregate {
             project_name: project.human_key.clone(),
             sender: row.sender_name.clone(),
             recipients,
+            recipient_read,
             all_read: row.read_ts.is_some(),
         }
     }
 
     fn absorb(&mut self, recipient_name: &str, row: &queries::InboxRow) {
         self.recipients.insert(recipient_name.to_string());
+        self.recipient_read
+            .insert(recipient_name.to_string(), row.read_ts.is_some());
         self.all_read &= row.read_ts.is_some();
     }
 
     fn into_view(self) -> UnifiedMessage {
-        let recipients = self.recipients.into_iter().collect::<Vec<_>>().join(", ");
+        let recipient_names = self.recipients.into_iter().collect::<Vec<_>>();
+        let recipients = recipient_names.join(", ");
         let created = ts_display(self.created_ts);
         UnifiedMessage {
             id: self.id,
@@ -1324,6 +1467,8 @@ impl UnifiedMessageAggregate {
             project_name: self.project_name,
             sender: self.sender,
             recipients,
+            recipient_names,
+            recipient_read: self.recipient_read,
             read: self.all_read,
         }
     }
@@ -1371,6 +1516,15 @@ fn collect_unified_message_aggregates(
     limit: usize,
     filter_importance: Option<&str>,
 ) -> Result<Vec<UnifiedMessageAggregate>, (u16, String)> {
+    // Applying the importance filter after a tight per-agent inbox window can
+    // hide matching messages behind newer non-matching rows. Over-fetch when a
+    // server-side importance filter is active so the filtered unified view stays
+    // complete and then truncate after aggregation.
+    let per_agent_limit = if filter_importance.is_some() {
+        limit.max(10_000)
+    } else {
+        limit.max(1)
+    };
     let mut messages = BTreeMap::new();
 
     for project in projects_rows {
@@ -1382,7 +1536,7 @@ fn collect_unified_message_aggregates(
             let aid = agent.id.unwrap_or(0);
             let inbox = block_on_outcome(
                 cx,
-                queries::fetch_inbox(cx, pool, pid, aid, false, None, limit),
+                queries::fetch_inbox(cx, pool, pid, aid, false, None, per_agent_limit),
             )?;
             for row in inbox {
                 let message = &row.message;
@@ -1514,6 +1668,8 @@ fn unified_api_message_value(message: &UnifiedMessage) -> serde_json::Value {
         "thread_id": message.thread_id,
         "sender": message.sender,
         "recipients": message.recipients,
+        "recipient_names": message.recipient_names,
+        "recipient_read": message.recipient_read,
         "project_slug": message.project_slug,
         "project_name": message.project_name,
         "read": message.read,
@@ -1721,6 +1877,7 @@ struct MessageView {
     body_html: String,
     importance: String,
     thread_id: String,
+    thread_url: String,
     created: String,
     ack_required: bool,
     sender: String,
@@ -1798,6 +1955,7 @@ fn render_message(
                 body_md: m.body_md.clone(),
                 body_html: markdown::render_markdown_to_safe_html(&m.body_md),
                 importance: m.importance.clone(),
+                thread_url: mail_thread_href(&p.slug, &thread_ref),
                 thread_id: thread_ref,
                 created: ts_display(m.created_ts),
                 ack_required: m.ack_required_bool(),
@@ -2013,6 +2171,7 @@ struct WebSearchResult {
     created_relative: String,
     importance: String,
     thread_id: String,
+    thread_url: String,
     ack_required: bool,
     score: String,
 }
@@ -2277,6 +2436,12 @@ fn render_search(
                 created: r.created_ts.map_or_else(String::new, ts_display),
                 created_relative: r.created_ts.map_or_else(String::new, ts_display_relative),
                 importance: r.importance.clone().unwrap_or_default(),
+                thread_url: r
+                    .thread_id
+                    .as_deref()
+                    .map_or_else(String::new, |thread_id| {
+                        mail_thread_href(project_slug, thread_id)
+                    }),
                 thread_id: r.thread_id.clone().unwrap_or_default(),
                 ack_required: r.ack_required.unwrap_or(false),
                 score: r.score.map_or_else(String::new, |s| format!("{s:.2}")),
@@ -2688,11 +2853,12 @@ fn dispatch_project_route(
             render_message(cx, pool, project_slug, mid)
         }
         _ if rest.starts_with("thread/") => {
-            let thread_id = rest.strip_prefix("thread/").unwrap_or("");
+            let encoded_thread_id = rest.strip_prefix("thread/").unwrap_or("");
+            let thread_id = percent_decode_path_segment(encoded_thread_id);
             if thread_id.is_empty() {
                 return Err((400, "Missing thread ID".to_string()));
             }
-            render_thread(cx, pool, project_slug, thread_id)
+            render_thread(cx, pool, project_slug, &thread_id)
         }
         _ => Ok(None),
     }
@@ -2743,17 +2909,27 @@ fn render_api_unified_inbox(
     pool: &DbPool,
     query: &str,
 ) -> Result<Option<String>, (u16, String)> {
-    // Python parity: limit (default 50000, clamped to 1000), include_projects.
-    let raw_limit = extract_query_int(query, "limit", 50_000);
-    let limit = raw_limit.clamp(1, 1000);
+    // Keep API and HTML route limits aligned so live refreshes never shrink
+    // the already-rendered unified inbox dataset.
+    let limit = extract_query_int(query, "limit", 1000).clamp(1, 1000);
     let include_projects =
         extract_query_str(query, "include_projects").is_some_and(|v| v == "true" || v == "1");
+    let filter_importance = extract_query_str(query, "filter_importance");
+    let normalized_filter = filter_importance
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
 
     let projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
-    let messages = collect_unified_message_aggregates(cx, pool, &projects, limit, None)?
-        .into_iter()
-        .map(|message| unified_api_message_value(&message.into_view()))
-        .collect::<Vec<_>>();
+    let messages = collect_unified_message_aggregates(
+        cx,
+        pool,
+        &projects,
+        limit,
+        normalized_filter.as_deref(),
+    )?
+    .into_iter()
+    .map(|message| unified_api_message_value(&message.into_view()))
+    .collect::<Vec<_>>();
 
     let mut result = serde_json::json!({ "messages": messages });
     if include_projects {
@@ -3282,11 +3458,28 @@ fn handle_mark_read(
     let a = block_on_outcome(cx, queries::get_agent(cx, pool, pid, agent_name))?;
     let aid = a.id.unwrap_or(0);
 
+    let requested_count = message_ids.len();
+    let mut seen_message_ids = HashSet::with_capacity(message_ids.len());
+    let mut unique_message_ids = Vec::with_capacity(message_ids.len());
+    for &message_id in &message_ids {
+        if seen_message_ids.insert(message_id) {
+            unique_message_ids.push(message_id);
+        }
+    }
+
     let mut marked_count = 0i64;
-    for mid in &message_ids {
+    let mut already_read_count = 0i64;
+    for mid in &unique_message_ids {
+        let request_started = now_micros();
         match block_on_outcome(cx, queries::mark_message_read(cx, pool, aid, *mid)) {
-            Ok(_) => marked_count += 1,
-            Err((404, _)) => {} // Not found — already read or not a recipient; skip.
+            Ok(read_ts) => {
+                if read_ts >= request_started {
+                    marked_count += 1;
+                } else {
+                    already_read_count += 1;
+                }
+            }
+            Err((404, _)) => {} // Not a recipient in this inbox; skip.
             Err(e) => return Err(e),
         }
     }
@@ -3294,7 +3487,9 @@ fn handle_mark_read(
     json_ok(&serde_json::json!({
         "success": true,
         "marked_count": marked_count,
-        "requested_count": message_ids.len(),
+        "already_read_count": already_read_count,
+        "requested_count": requested_count,
+        "unique_requested_count": seen_message_ids.len(),
         "agent": agent_name,
         "project": p.slug,
     }))
@@ -3633,6 +3828,13 @@ mod fresh_eyes_regression_tests {
                 .collect::<Vec<String>>(),
             vec!["BlueLake".to_string(), "GreenField".to_string()]
         );
+        assert_eq!(
+            aggregates[0].recipient_read,
+            BTreeMap::from([
+                ("BlueLake".to_string(), true),
+                ("GreenField".to_string(), false),
+            ])
+        );
         assert!(
             !aggregates[0].all_read,
             "message should stay unread while any recipient remains unread"
@@ -3698,6 +3900,193 @@ mod fresh_eyes_regression_tests {
     }
 
     #[test]
+    fn unified_message_aggregation_importance_filter_overfetches_past_newer_non_matching_rows() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool("mail-ui-unified-filter-overfetch");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            "/tmp/mail-ui-unified-filter-overfetch",
+        )));
+        let project_id = project.id.expect("project id");
+
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "RedFox", "test", "test", None, None,
+        )));
+        let recipient = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
+        )));
+
+        let high = outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            sender.id.expect("sender id"),
+            "High priority",
+            "Important body",
+            None,
+            "high",
+            false,
+            "[]",
+            &[(recipient.id.expect("recipient id"), "to")],
+        )));
+        let high_id = high.id.expect("high id");
+
+        outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            sender.id.expect("sender id"),
+            "Normal priority",
+            "Routine body",
+            None,
+            "normal",
+            false,
+            "[]",
+            &[(recipient.id.expect("recipient id"), "to")],
+        )));
+
+        let projects = outcome_ok(block_on(queries::list_projects(&cx, &pool)));
+        let aggregates = collect_unified_message_aggregates(&cx, &pool, &projects, 1, Some("high"))
+            .expect("filtered aggregation should succeed");
+
+        assert_eq!(
+            aggregates.len(),
+            1,
+            "high-priority message should remain visible"
+        );
+        assert_eq!(aggregates[0].id, high_id);
+        assert_eq!(aggregates[0].importance, "high");
+    }
+
+    #[test]
+    fn render_api_unified_inbox_root_seed_includes_thread_reference() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool("mail-ui-unified-api-root-thread");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            "/tmp/mail-ui-unified-api-root-thread",
+        )));
+        let project_id = project.id.expect("project id");
+
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "RedFox", "test", "test", None, None,
+        )));
+        let recipient = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
+        )));
+
+        let root = outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            sender.id.expect("sender id"),
+            "Unified API root",
+            "Shared body",
+            None,
+            "normal",
+            false,
+            "[]",
+            &[(recipient.id.expect("recipient id"), "to")],
+        )));
+        let root_id = root.id.expect("root id");
+        let root_thread_ref = root_id.to_string();
+
+        outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            recipient.id.expect("recipient id"),
+            "Unified API reply",
+            "Reply body",
+            Some(&root_thread_ref),
+            "normal",
+            false,
+            "[]",
+            &[(sender.id.expect("sender id"), "to")],
+        )));
+
+        let payload = render_api_unified_inbox(&cx, &pool, "limit=10")
+            .expect("API render should succeed")
+            .expect("API route should return json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("API payload should be valid json");
+        let messages = parsed["messages"]
+            .as_array()
+            .expect("messages payload should be an array");
+        let root_message = messages
+            .iter()
+            .find(|message| message["id"].as_i64() == Some(root_id))
+            .expect("root message should be present");
+        assert_eq!(root_message["thread_id"], root_thread_ref);
+    }
+
+    #[test]
+    fn render_api_unified_inbox_preserves_importance_filter() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool("mail-ui-unified-api-filter");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            "/tmp/mail-ui-unified-api-filter",
+        )));
+        let project_id = project.id.expect("project id");
+
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "RedFox", "test", "test", None, None,
+        )));
+        let recipient = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
+        )));
+
+        outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            sender.id.expect("sender id"),
+            "High priority",
+            "Important body",
+            None,
+            "high",
+            false,
+            "[]",
+            &[(recipient.id.expect("recipient id"), "to")],
+        )));
+
+        outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            sender.id.expect("sender id"),
+            "Normal priority",
+            "Routine body",
+            None,
+            "normal",
+            false,
+            "[]",
+            &[(recipient.id.expect("recipient id"), "to")],
+        )));
+
+        let payload = render_api_unified_inbox(&cx, &pool, "limit=10&filter_importance=HIGH")
+            .expect("API render should succeed")
+            .expect("API route should return json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("API payload should be valid json");
+        let messages = parsed["messages"]
+            .as_array()
+            .expect("messages payload should be an array");
+
+        assert_eq!(
+            messages.len(),
+            1,
+            "non-matching priorities should not reappear on API refresh"
+        );
+        assert_eq!(messages[0]["importance"], "high");
+        assert_eq!(messages[0]["subject"], "High priority");
+    }
+
+    #[test]
     fn archive_time_travel_snapshot_requires_registered_project() {
         let cx = Cx::for_testing();
         let pool = make_test_pool("mail-ui-time-travel");
@@ -3720,6 +4109,72 @@ mod fresh_eyes_regression_tests {
 
         assert_eq!(status, 404);
         assert!(detail.contains("Project"), "unexpected detail: {detail}");
+    }
+
+    #[test]
+    fn handle_mark_read_deduplicates_ids_and_excludes_already_read_rows_from_count() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool("mail-ui-mark-read-counts");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            "/tmp/mail-ui-mark-read-counts",
+        )));
+        let project_id = project.id.expect("project id");
+
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "RedFox", "test", "test", None, None,
+        )));
+        let recipient = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
+        )));
+
+        let message = outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            sender.id.expect("sender id"),
+            "Mark read counters",
+            "Body",
+            None,
+            "normal",
+            false,
+            "[]",
+            &[(recipient.id.expect("recipient id"), "to")],
+        )));
+        let message_id = message.id.expect("message id");
+
+        let first_payload = handle_mark_read(
+            &cx,
+            &pool,
+            &project.slug,
+            "BlueLake",
+            &format!(r#"{{"message_ids":[{message_id},{message_id}]}}"#),
+        )
+        .expect("first mark-read should succeed")
+        .expect("route should return json");
+        let first_json: serde_json::Value =
+            serde_json::from_str(&first_payload).expect("first payload should parse");
+        assert_eq!(first_json["marked_count"], 1);
+        assert_eq!(first_json["already_read_count"], 0);
+        assert_eq!(first_json["requested_count"], 2);
+        assert_eq!(first_json["unique_requested_count"], 1);
+
+        let second_payload = handle_mark_read(
+            &cx,
+            &pool,
+            &project.slug,
+            "BlueLake",
+            &format!(r#"{{"message_ids":[{message_id}]}}"#),
+        )
+        .expect("second mark-read should succeed")
+        .expect("route should return json");
+        let second_json: serde_json::Value =
+            serde_json::from_str(&second_payload).expect("second payload should parse");
+        assert_eq!(second_json["marked_count"], 0);
+        assert_eq!(second_json["already_read_count"], 1);
+        assert_eq!(second_json["requested_count"], 1);
+        assert_eq!(second_json["unique_requested_count"], 1);
     }
 
     #[test]

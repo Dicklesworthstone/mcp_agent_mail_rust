@@ -208,7 +208,7 @@
                       <span x-text="item.created"></span>
                     </div>
                     <template x-if="item.thread_id">
-                      <a :href="`/mail/{{ project.slug }}/thread/${item.thread_id}`"
+                      <a :href="`/mail/{{ project.slug }}/thread/${encodeURIComponent(item.thread_id)}`"
                          @click.stop
                          class="flex items-center gap-1.5 px-2 py-1 bg-primary-100 dark:bg-primary-900/30 hover:bg-primary-200 dark:hover:bg-primary-800/40 text-primary-700 dark:text-primary-300 rounded-md transition-colors">
                         <i data-lucide="messages-square" class="w-3.5 h-3.5"></i>
