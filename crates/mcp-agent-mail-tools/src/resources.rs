@@ -686,7 +686,7 @@ fn build_tool_directory() -> ToolDirectory {
                 ToolDirectoryEntry {
                     name: "send_message".to_string(),
                     summary: "Deliver a new message with attachments, WebP conversion, and policy enforcement.".to_string(),
-                    use_when: "Starting new threads or broadcasting plans across projects.".to_string(),
+                    use_when: "Starting new threads or distributing plans to specific agents across projects.".to_string(),
                     related: vec!["reply_message".to_string(), "request_contact".to_string()],
                     expected_frequency: "Frequent—core write operation.".to_string(),
                     required_capabilities: vec!["messaging".to_string(), "write".to_string()],

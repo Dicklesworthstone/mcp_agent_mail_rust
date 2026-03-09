@@ -529,6 +529,69 @@ fn run_single_probe_check(
     }
 }
 
+fn has_error_failure(checks: &[VerifyLiveCheck]) -> bool {
+    checks
+        .iter()
+        .any(|check| !check.passed && check.severity == CheckSeverity::Error)
+}
+
+fn url_has_scheme(url: &str, expected_scheme: &str) -> bool {
+    url.split_once("://")
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case(expected_scheme))
+}
+
+fn build_tls_check(
+    url: &str,
+    root_probe: &Result<crate::probe::ProbeResponse, crate::probe::ProbeError>,
+) -> VerifyLiveCheck {
+    let is_https = url_has_scheme(url, "https");
+    if !is_https {
+        return VerifyLiveCheck {
+            id: "remote.tls".to_string(),
+            description: "HTTPS connection succeeded".to_string(),
+            severity: CheckSeverity::Skipped,
+            passed: false,
+            message: "skipped (URL is not HTTPS)".to_string(),
+            elapsed_ms: 0,
+            http_status: None,
+            headers_captured: None,
+        };
+    }
+
+    match root_probe {
+        Ok(resp) if url_has_scheme(&resp.final_url, "https") => VerifyLiveCheck {
+            id: "remote.tls".to_string(),
+            description: "HTTPS connection succeeded".to_string(),
+            severity: CheckSeverity::Error,
+            passed: true,
+            message: format!("HTTPS connection succeeded (HTTP {})", resp.status),
+            elapsed_ms: 0,
+            http_status: Some(resp.status),
+            headers_captured: None,
+        },
+        Ok(resp) => VerifyLiveCheck {
+            id: "remote.tls".to_string(),
+            description: "HTTPS connection succeeded".to_string(),
+            severity: CheckSeverity::Error,
+            passed: false,
+            message: format!("HTTPS downgraded via redirect to {}", resp.final_url),
+            elapsed_ms: 0,
+            http_status: Some(resp.status),
+            headers_captured: None,
+        },
+        Err(err) => VerifyLiveCheck {
+            id: "remote.tls".to_string(),
+            description: "HTTPS connection succeeded".to_string(),
+            severity: CheckSeverity::Error,
+            passed: false,
+            message: format!("HTTPS connection failed: {err}"),
+            elapsed_ms: 0,
+            http_status: None,
+            headers_captured: None,
+        },
+    }
+}
+
 /// Run the full verify-live pipeline (Stage 1 + Stage 2 + optional Stage 3).
 ///
 /// Returns a complete `VerifyLiveReport` conforming to the JSON schema
@@ -747,70 +810,45 @@ pub fn run_verify_live(opts: &VerifyLiveOptions) -> VerifyLiveReport {
     remote_live_checks.push(content_match_check);
 
     // remote.tls: HTTPS connection check (synthesized from root probe)
-    let is_https = opts.url.starts_with("https://") || opts.url.starts_with("HTTPS://");
-    let tls_check = if is_https {
-        match (&root_probe, root_result) {
-            (Ok(resp), Some(r)) if r.passed && resp.final_url.starts_with("https://") => {
-                VerifyLiveCheck {
-                    id: "remote.tls".to_string(),
-                    description: "HTTPS connection succeeded".to_string(),
-                    severity: CheckSeverity::Error,
-                    passed: true,
-                    message: "HTTPS connection succeeded".to_string(),
-                    elapsed_ms: 0,
-                    http_status: Some(resp.status),
-                    headers_captured: None,
-                }
-            }
-            (Ok(resp), Some(_)) if !resp.final_url.starts_with("https://") => VerifyLiveCheck {
-                id: "remote.tls".to_string(),
-                description: "HTTPS connection succeeded".to_string(),
-                severity: CheckSeverity::Error,
-                passed: false,
-                message: format!("HTTPS downgraded via redirect to {}", resp.final_url),
-                elapsed_ms: 0,
-                http_status: Some(resp.status),
-                headers_captured: None,
-            },
-            (_, Some(r)) => VerifyLiveCheck {
-                id: "remote.tls".to_string(),
-                description: "HTTPS connection succeeded".to_string(),
-                severity: CheckSeverity::Error,
-                passed: false,
-                message: format!("HTTPS connection failed: {}", r.message),
-                elapsed_ms: 0,
-                http_status: r.http_status,
-                headers_captured: None,
-            },
-            _ => VerifyLiveCheck {
-                id: "remote.tls".to_string(),
-                description: "HTTPS connection succeeded".to_string(),
-                severity: CheckSeverity::Error,
-                passed: false,
-                message: "root probe did not run".to_string(),
-                elapsed_ms: 0,
-                http_status: None,
-                headers_captured: None,
-            },
-        }
-    } else {
-        VerifyLiveCheck {
-            id: "remote.tls".to_string(),
-            description: "HTTPS connection succeeded".to_string(),
-            severity: CheckSeverity::Skipped,
-            passed: false,
-            message: "skipped (URL is not HTTPS)".to_string(),
-            elapsed_ms: 0,
-            http_status: None,
-            headers_captured: None,
-        }
-    };
+    let tls_check = build_tls_check(&opts.url, &root_probe);
     remote_live_checks.push(tls_check);
 
     let remote_stage = VerifyStage {
         ran: true,
         checks: remote_live_checks,
     };
+
+    if opts.fail_fast && has_error_failure(&remote_stage.checks) {
+        let stages = VerifyStages {
+            local: local_stage,
+            remote: remote_stage,
+            security: VerifyStage {
+                ran: false,
+                checks: vec![],
+            },
+        };
+        let verdict = VerifyLiveReport::compute_verdict(&stages);
+        #[allow(clippy::cast_possible_truncation)]
+        let total_elapsed = start.elapsed().as_millis() as u64;
+        let summary = VerifyLiveReport::compute_summary(&stages, total_elapsed);
+        return VerifyLiveReport {
+            schema_version: "1.0.0".to_string(),
+            generated_at: Utc::now().to_rfc3339(),
+            url: opts.url.clone(),
+            bundle_path: opts.bundle_path.as_ref().map(|p| p.display().to_string()),
+            verdict,
+            stages,
+            summary,
+            config: VerifyConfig {
+                strict: opts.strict,
+                fail_fast: opts.fail_fast,
+                #[allow(clippy::cast_possible_truncation)]
+                timeout_ms: opts.probe_config.timeout.as_millis() as u64,
+                retries: opts.probe_config.retries,
+                security_audit: opts.security_audit,
+            },
+        };
+    }
 
     // ── Stage 3: Security header audit ──────────────────────────────
     let security_stage = if opts.security_audit {
@@ -3641,18 +3679,57 @@ mod tests {
     }
 
     #[test]
+    fn tls_check_passes_when_https_transport_succeeds_even_if_root_status_fails() {
+        let check = build_tls_check(
+            "https://example.com",
+            &Ok(crate::probe::ProbeResponse {
+                final_url: "https://example.com/".to_string(),
+                status: 404,
+                headers: BTreeMap::new(),
+                body: vec![],
+                redirects: 0,
+                elapsed: Duration::from_millis(10),
+            }),
+        );
+
+        assert!(check.passed, "tls check should reflect transport success");
+        assert_eq!(check.http_status, Some(404));
+        assert!(check.message.contains("HTTPS connection succeeded"));
+    }
+
+    #[test]
     fn tls_check_skipped_for_http() {
-        let check = VerifyLiveCheck {
-            id: "remote.tls".to_string(),
-            description: "HTTPS connection succeeded".to_string(),
-            severity: CheckSeverity::Skipped,
-            passed: false,
-            message: "skipped (URL is not HTTPS)".to_string(),
-            elapsed_ms: 0,
-            http_status: None,
-            headers_captured: None,
-        };
+        let check = build_tls_check(
+            "http://example.com",
+            &Ok(crate::probe::ProbeResponse {
+                final_url: "http://example.com/".to_string(),
+                status: 200,
+                headers: BTreeMap::new(),
+                body: vec![],
+                redirects: 0,
+                elapsed: Duration::from_millis(10),
+            }),
+        );
         assert_eq!(check.severity, CheckSeverity::Skipped);
+        assert_eq!(check.message, "skipped (URL is not HTTPS)");
+    }
+
+    #[test]
+    fn tls_check_accepts_mixed_case_https_scheme() {
+        let check = build_tls_check(
+            "HTTPS://example.com",
+            &Ok(crate::probe::ProbeResponse {
+                final_url: "HTTPS://example.com/".to_string(),
+                status: 200,
+                headers: BTreeMap::new(),
+                body: vec![],
+                redirects: 0,
+                elapsed: Duration::from_millis(10),
+            }),
+        );
+
+        assert!(check.passed);
+        assert_eq!(check.http_status, Some(200));
     }
 
     #[test]
@@ -3785,6 +3862,38 @@ mod tests {
         assert!(!report.stages.security.ran);
         assert!(report.stages.remote.checks.is_empty());
         assert!(report.stages.security.checks.is_empty());
+    }
+
+    #[test]
+    fn run_verify_live_fail_fast_short_circuits_security_after_remote_error() {
+        let opts = VerifyLiveOptions {
+            url: "http://127.0.0.1:1".to_string(),
+            bundle_path: None,
+            security_audit: true,
+            strict: false,
+            fail_fast: true,
+            probe_config: crate::probe::ProbeConfig {
+                timeout: Duration::from_millis(200),
+                retries: 0,
+                retry_delay: Duration::from_millis(1),
+                ..crate::probe::ProbeConfig::default()
+            },
+        };
+
+        let report = run_verify_live(&opts);
+        assert_eq!(report.verdict, VerifyVerdict::Fail);
+        assert!(!report.stages.local.ran);
+        assert!(report.stages.remote.ran);
+        assert!(!report.stages.security.ran);
+        assert!(report.stages.security.checks.is_empty());
+        assert!(
+            report
+                .stages
+                .remote
+                .checks
+                .iter()
+                .any(|check| check.id == "remote.root" && !check.passed)
+        );
     }
 
     #[test]

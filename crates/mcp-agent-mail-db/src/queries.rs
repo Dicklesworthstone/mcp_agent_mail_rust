@@ -1492,18 +1492,20 @@ pub async fn register_agent(
             // Update-first strategy keeps id stable even if backend UPSERT conflict handling
             // changes, and avoids duplicate row creation under mixed SQLite variants.
             let mut normalize_sets = vec!["program = ?", "model = ?", "last_active_ts = ?"];
+            let program_s = program.to_string();
+            let model_s = model.to_string();
+            let name_s = name.to_string();
             let mut normalize_base_params = vec![
-                Value::Text(program.to_string()),
-                Value::Text(model.to_string()),
+                Value::Text(program_s.clone()),
+                Value::Text(model_s.clone()),
                 Value::BigInt(now),
             ];
 
             // Keep behavior consistent with insert path: omitted task_description clears
             // to empty string instead of preserving stale content.
             normalize_sets.push("task_description = ?");
-            normalize_base_params.push(Value::Text(
-                task_description.unwrap_or_default().to_string(),
-            ));
+            let insert_task_desc = task_description.unwrap_or_default().to_string();
+            normalize_base_params.push(Value::Text(insert_task_desc.clone()));
             if let Some(ap) = attachments_policy {
                 normalize_sets.push("attachments_policy = ?");
                 normalize_base_params.push(Value::Text(ap.to_string()));
@@ -1515,7 +1517,7 @@ pub async fn register_agent(
             );
             let mut normalize_params = normalize_base_params.clone();
             normalize_params.push(Value::BigInt(project_id));
-            normalize_params.push(Value::Text(name.to_string()));
+            normalize_params.push(Value::Text(name_s.clone()));
             let _updated_rows = try_in_tx!(
                 cx,
                 &tracked,
@@ -1530,7 +1532,7 @@ pub async fn register_agent(
             let exists_sql = "SELECT 1 FROM agents \
                               WHERE project_id = ? AND name = ? COLLATE NOCASE \
                               LIMIT 1";
-            let exists_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
+            let exists_params = [Value::BigInt(project_id), Value::Text(name_s.clone())];
             let exists_rows = try_in_tx!(
                 cx,
                 &tracked,
@@ -1542,15 +1544,17 @@ pub async fn register_agent(
                 let insert_sql = "INSERT INTO agents \
                     (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                let attach_pol = attachments_policy
+                    .map_or_else(|| "auto".to_string(), |ap| ap.to_string());
                 let insert_params = [
                     Value::BigInt(project_id),
-                    Value::Text(name.to_string()),
-                    Value::Text(program.to_string()),
-                    Value::Text(model.to_string()),
-                    Value::Text(insert_task_desc.to_string()),
+                    Value::Text(name_s),
+                    Value::Text(program_s),
+                    Value::Text(model_s),
+                    Value::Text(insert_task_desc),
                     Value::BigInt(now),
                     Value::BigInt(now),
-                    Value::Text(insert_attach_pol.to_string()),
+                    Value::Text(attach_pol),
                     Value::Text("auto".to_string()),
                 ];
                 match map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
@@ -2988,46 +2992,84 @@ pub async fn list_thread_messages(
 
     let tracked = tracked(&*conn);
 
-    let mut sql = String::from(
-        "SELECT m.id AS id, m.project_id AS project_id, m.sender_id AS sender_id, \
-                m.thread_id AS thread_id, m.subject AS subject, m.body_md AS body_md, \
-                m.importance AS importance, m.ack_required AS ack_required, \
-                m.created_ts AS created_ts, m.recipients_json AS recipients_json, \
-                m.attachments AS attachments, \
-                a.name AS from_name \
-         FROM messages m \
-         JOIN agents a ON a.id = m.sender_id \
-         WHERE m.project_id = ? AND ",
-    );
-
     let mut params: Vec<Value> = vec![Value::BigInt(project_id)];
 
+    let is_root = thread_id.parse::<i64>().is_ok();
     if let Ok(root_id) = thread_id.parse::<i64>() {
-        sql.push_str("(m.id = ? OR m.thread_id = ?)");
         params.push(Value::BigInt(root_id));
-    } else {
-        sql.push_str("m.thread_id = ?");
     }
     params.push(Value::Text(thread_id.to_string()));
 
-    let reverse_to_chronological = if let Some(limit) = limit {
-        if limit < 1 {
-            return Outcome::Err(DbError::invalid("limit", "limit must be at least 1"));
+    let (sql, reverse_to_chronological) = match (is_root, limit) {
+        (true, Some(lim)) => {
+            let Ok(limit_i64) = i64::try_from(lim) else {
+                return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
+            };
+            params.push(Value::BigInt(limit_i64));
+            (
+                "SELECT m.id AS id, m.project_id AS project_id, m.sender_id AS sender_id, \
+                        m.thread_id AS thread_id, m.subject AS subject, m.body_md AS body_md, \
+                        m.importance AS importance, m.ack_required AS ack_required, \
+                        m.created_ts AS created_ts, m.recipients_json AS recipients_json, \
+                        m.attachments AS attachments, \
+                        a.name AS from_name \
+                 FROM messages m \
+                 JOIN agents a ON a.id = m.sender_id \
+                 WHERE m.project_id = ? AND (m.id = ? OR m.thread_id = ?) \
+                 ORDER BY created_ts DESC, id DESC \
+                 LIMIT ?",
+                 true
+            )
         }
-        let Ok(limit_i64) = i64::try_from(limit) else {
-            return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
-        };
-        // Select newest N first to avoid loading entire long-running threads.
-        sql.push_str(" ORDER BY created_ts DESC, id DESC");
-        sql.push_str(" LIMIT ?");
-        params.push(Value::BigInt(limit_i64));
-        true
-    } else {
-        sql.push_str(" ORDER BY created_ts ASC, id ASC");
-        false
+        (true, None) => (
+            "SELECT m.id AS id, m.project_id AS project_id, m.sender_id AS sender_id, \
+                    m.thread_id AS thread_id, m.subject AS subject, m.body_md AS body_md, \
+                    m.importance AS importance, m.ack_required AS ack_required, \
+                    m.created_ts AS created_ts, m.recipients_json AS recipients_json, \
+                    m.attachments AS attachments, \
+                    a.name AS from_name \
+             FROM messages m \
+             JOIN agents a ON a.id = m.sender_id \
+             WHERE m.project_id = ? AND (m.id = ? OR m.thread_id = ?) \
+             ORDER BY created_ts ASC, id ASC",
+             false
+        ),
+        (false, Some(lim)) => {
+            let Ok(limit_i64) = i64::try_from(lim) else {
+                return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
+            };
+            params.push(Value::BigInt(limit_i64));
+            (
+                "SELECT m.id AS id, m.project_id AS project_id, m.sender_id AS sender_id, \
+                        m.thread_id AS thread_id, m.subject AS subject, m.body_md AS body_md, \
+                        m.importance AS importance, m.ack_required AS ack_required, \
+                        m.created_ts AS created_ts, m.recipients_json AS recipients_json, \
+                        m.attachments AS attachments, \
+                        a.name AS from_name \
+                 FROM messages m \
+                 JOIN agents a ON a.id = m.sender_id \
+                 WHERE m.project_id = ? AND m.thread_id = ? \
+                 ORDER BY created_ts DESC, id DESC \
+                 LIMIT ?",
+                 true
+            )
+        }
+        (false, None) => (
+            "SELECT m.id AS id, m.project_id AS project_id, m.sender_id AS sender_id, \
+                    m.thread_id AS thread_id, m.subject AS subject, m.body_md AS body_md, \
+                    m.importance AS importance, m.ack_required AS ack_required, \
+                    m.created_ts AS created_ts, m.recipients_json AS recipients_json, \
+                    m.attachments AS attachments, \
+                    a.name AS from_name \
+             FROM messages m \
+             JOIN agents a ON a.id = m.sender_id \
+             WHERE m.project_id = ? AND m.thread_id = ? \
+             ORDER BY created_ts ASC, id ASC",
+             false
+        ),
     };
 
-    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
+    let rows_out = map_sql_outcome(traw_query(cx, &tracked, sql, &params).await);
     match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
@@ -5506,7 +5548,7 @@ pub async fn list_file_reservations(
                      WHEN fr.released_ts IS NULL THEN NULL \
                      WHEN typeof(fr.released_ts) = 'text' THEN CAST(strftime('%s', fr.released_ts) AS INTEGER) * 1000000 + \
                          CASE WHEN instr(fr.released_ts, '.') > 0 \
-                              THEN CAST(substr(fr.released_ts || '000000', instr(fr.released_ts, '.') + 1, 6) AS INTEGER) \
+                              THEN CAST(substr(REPLACE(fr.released_ts, 'Z', '') || '000000', instr(fr.released_ts, '.') + 1, 6) AS INTEGER) \
                               ELSE 0 \
                          END \
                      ELSE fr.released_ts \
@@ -5605,10 +5647,9 @@ pub async fn list_unreleased_file_reservations(
              WHEN released_ts IS NULL THEN NULL \
              WHEN typeof(released_ts) = 'text' THEN CAST(strftime('%s', released_ts) AS INTEGER) * 1000000 + \
                  CASE WHEN instr(released_ts, '.') > 0 \
-                      THEN CAST(substr(released_ts || '000000', instr(released_ts, '.') + 1, 6) AS INTEGER) \
+                      THEN CAST(substr(REPLACE(released_ts, 'Z', '') || '000000', instr(released_ts, '.') + 1, 6) AS INTEGER) \
                       ELSE 0 \
-                 END \
-             ELSE released_ts \
+                 END \             ELSE released_ts \
          END AS released_ts \
          FROM file_reservations WHERE project_id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) ORDER BY id"
     );

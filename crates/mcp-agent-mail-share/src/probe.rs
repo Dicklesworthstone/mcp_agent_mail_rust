@@ -139,17 +139,26 @@ enum Scheme {
     Https,
 }
 
+fn split_supported_scheme(url: &str) -> Option<(Scheme, &str)> {
+    let (scheme, rest) = url.split_once("://")?;
+    if scheme.eq_ignore_ascii_case("https") {
+        Some((Scheme::Https, rest))
+    } else if scheme.eq_ignore_ascii_case("http") {
+        Some((Scheme::Http, rest))
+    } else {
+        None
+    }
+}
+
+fn is_absolute_http_url(url: &str) -> bool {
+    split_supported_scheme(url).is_some()
+}
+
 impl ParsedUrl {
     fn parse(url: &str) -> Result<Self, ProbeError> {
-        let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
-            (Scheme::Https, rest)
-        } else if let Some(rest) = url.strip_prefix("http://") {
-            (Scheme::Http, rest)
-        } else {
-            return Err(ProbeError::InvalidUrl {
-                detail: format!("unsupported scheme in URL: {url}"),
-            });
-        };
+        let (scheme, rest) = split_supported_scheme(url).ok_or_else(|| ProbeError::InvalidUrl {
+            detail: format!("unsupported scheme in URL: {url}"),
+        })?;
 
         let (host_port, suffix) = match rest.find(['/', '?', '#']) {
             Some(i) => (&rest[..i], &rest[i..]),
@@ -484,8 +493,6 @@ fn probe_via_curl(
     capture_body: bool,
 ) -> Result<RawResponse, ProbeError> {
     let url = parsed.to_url();
-    #[allow(clippy::cast_possible_truncation)]
-    let timeout_secs = config.timeout.as_secs().max(1);
     let user_agent = sanitized_header_value(&config.user_agent);
 
     let mut command = std::process::Command::new("curl");
@@ -494,7 +501,7 @@ fn probe_via_curl(
         .arg("-D")
         .arg("-")
         .arg("--max-time")
-        .arg(timeout_secs.to_string())
+        .arg(format_curl_timeout(config.timeout))
         .arg("-A")
         .arg(user_agent)
         // Do not follow redirects — we handle them ourselves.
@@ -533,6 +540,19 @@ fn map_curl_failure(output: &std::process::Output, config: &ProbeConfig) -> Prob
             ProbeError::TlsError { detail }
         }
         _ => ProbeError::ConnectionError { detail },
+    }
+}
+
+fn format_curl_timeout(timeout: Duration) -> String {
+    let millis = timeout.as_millis().max(1);
+    let seconds = millis / 1000;
+    let remainder = millis % 1000;
+    if remainder == 0 {
+        seconds.to_string()
+    } else {
+        format!("{seconds}.{remainder:03}")
+            .trim_end_matches('0')
+            .to_string()
     }
 }
 
@@ -716,7 +736,7 @@ fn resolve_redirect(base: &ParsedUrl, location: &str) -> String {
     if location.is_empty() {
         return base.to_url();
     }
-    if location.starts_with("http://") || location.starts_with("https://") {
+    if is_absolute_http_url(location) {
         // Absolute URL
         location.to_string()
     } else if location.starts_with("//") {
@@ -1016,6 +1036,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_url_accepts_mixed_case_scheme() {
+        let p = ParsedUrl::parse("HTTPS://example.com/bar").unwrap();
+        assert_eq!(p.host, "example.com");
+        assert_eq!(p.port, 443);
+        assert_eq!(p.path, "/bar");
+        assert!(matches!(p.scheme, Scheme::Https));
+    }
+
+    #[test]
     fn parse_url_with_port() {
         let p = ParsedUrl::parse("http://localhost:9000/test").unwrap();
         assert_eq!(p.host, "localhost");
@@ -1098,6 +1127,13 @@ mod tests {
         let base = ParsedUrl::parse("http://a.com/old").unwrap();
         let resolved = resolve_redirect(&base, "https://b.com/new");
         assert_eq!(resolved, "https://b.com/new");
+    }
+
+    #[test]
+    fn redirect_absolute_url_accepts_mixed_case_scheme() {
+        let base = ParsedUrl::parse("http://a.com/old").unwrap();
+        let resolved = resolve_redirect(&base, "HTTPS://b.com/new");
+        assert_eq!(resolved, "HTTPS://b.com/new");
     }
 
     #[test]
@@ -1245,6 +1281,12 @@ mod tests {
         assert_eq!(cfg.retries, 2);
         assert_eq!(cfg.retry_delay, Duration::from_secs(1));
         assert_eq!(cfg.max_redirects, 5);
+    }
+
+    #[test]
+    fn format_curl_timeout_preserves_subsecond_precision() {
+        assert_eq!(format_curl_timeout(Duration::from_millis(250)), "0.25");
+        assert_eq!(format_curl_timeout(Duration::from_secs(2)), "2");
     }
 
     #[test]

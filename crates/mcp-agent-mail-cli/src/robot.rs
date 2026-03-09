@@ -10,6 +10,7 @@ use chrono::Utc;
 use clap::{Args, Subcommand};
 use serde::Serialize;
 use sqlmodel_core::Value;
+use std::path::{Path, PathBuf};
 
 use crate::CliError;
 
@@ -234,6 +235,145 @@ fn parse_attachments_json(attachments_json: &str) -> Vec<ParsedAttachment> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn parse_attachment_values(attachments_json: Option<&str>) -> Vec<serde_json::Value> {
+    attachments_json
+        .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(raw).ok())
+        .unwrap_or_default()
+}
+
+fn redact_navigate_database_url(url: &str) -> String {
+    if let Some((scheme, rest)) = url.split_once("://")
+        && let Some((_creds, host)) = rest.rsplit_once('@')
+    {
+        return format!("{scheme}://****@{host}");
+    }
+    url.to_string()
+}
+
+fn navigate_workspace_root_from(start: &Path) -> Option<PathBuf> {
+    for dir in start.ancestors() {
+        let cargo_toml = dir.join("Cargo.toml");
+        if !cargo_toml.exists() {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(&cargo_toml)
+            && content.contains("[workspace]")
+        {
+            return Some(dir.to_path_buf());
+        }
+    }
+    None
+}
+
+const NAVIGATE_I64_MIN_F64: f64 = -9_223_372_036_854_775_808.0;
+const NAVIGATE_I64_MAX_F64: f64 = 9_223_372_036_854_775_807.0;
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn navigate_ts_f64_to_rfc3339(timestamp: f64) -> Option<String> {
+    if !timestamp.is_finite() {
+        return None;
+    }
+    let secs_f = timestamp.floor();
+    if !(NAVIGATE_I64_MIN_F64..=NAVIGATE_I64_MAX_F64).contains(&secs_f) {
+        return None;
+    }
+    let secs = secs_f as i64;
+    let nanos = ((timestamp - secs_f) * 1e9).clamp(0.0, 999_999_999.0) as u32;
+    chrono::DateTime::from_timestamp(secs, nanos).map(|dt| dt.to_rfc3339())
+}
+
+fn build_navigate_tooling_locks_data(lock_info: serde_json::Value) -> serde_json::Value {
+    let raw_locks = lock_info
+        .get("locks")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut locks: Vec<serde_json::Value> = raw_locks
+        .iter()
+        .filter_map(|lock| {
+            let path = lock.get("path").and_then(serde_json::Value::as_str)?;
+            let project_slug = path
+                .split("projects/")
+                .nth(1)
+                .and_then(|value| value.split('/').next())
+                .filter(|value| !value.is_empty())?
+                .to_string();
+            let pid = lock
+                .get("owner")
+                .and_then(|owner| owner.get("pid"))
+                .and_then(serde_json::Value::as_u64)?;
+            let acquired_ts = lock
+                .get("owner")
+                .and_then(|owner| owner.get("created_ts"))
+                .and_then(serde_json::Value::as_f64)
+                .and_then(navigate_ts_f64_to_rfc3339)
+                .unwrap_or_default();
+
+            Some(serde_json::json!({
+                "project_slug": project_slug,
+                "holder": format!("pid:{pid}"),
+                "acquired_ts": acquired_ts,
+            }))
+        })
+        .collect();
+    locks.sort_by(|left, right| {
+        let left_project = left
+            .get("project_slug")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let right_project = right
+            .get("project_slug")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let left_holder = left
+            .get("holder")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let right_holder = right
+            .get("holder")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        left_project
+            .cmp(right_project)
+            .then(left_holder.cmp(right_holder))
+    });
+
+    let total = locks.len() as u64;
+    let total_raw = raw_locks.len() as u64;
+    let metadata_missing = total_raw.saturating_sub(total);
+    let stale = locks
+        .iter()
+        .filter(|lock| {
+            lock.get("holder")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|holder| holder.strip_prefix("pid:"))
+                .and_then(|pid| pid.parse::<u32>().ok())
+                .is_some_and(|pid| {
+                    #[cfg(target_os = "linux")]
+                    {
+                        !Path::new(&format!("/proc/{pid}")).exists()
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = pid;
+                        false
+                    }
+                })
+        })
+        .count() as u64;
+
+    serde_json::json!({
+        "locks": locks,
+        "summary": {
+            "total": total,
+            "active": total.saturating_sub(stale),
+            "stale": stale,
+            "metadata_missing": metadata_missing,
+        },
+    })
 }
 
 // ── Output format ────────────────────────────────────────────────────────────
@@ -984,6 +1124,19 @@ fn resolve_project_sync(conn: &DbConn, key: &str) -> Result<(i64, String), CliEr
     Err(CliError::InvalidArgument(format!(
         "project not found: {key}"
     )))
+}
+
+fn project_human_key_sync(conn: &DbConn, project_id: i64) -> Result<Option<String>, CliError> {
+    let rows = conn
+        .query_sync(
+            "SELECT human_key FROM projects WHERE id = ?",
+            &[Value::BigInt(project_id)],
+        )
+        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+    Ok(rows.first().and_then(|row| {
+        let human_key: String = row.get_as(0).unwrap_or_default();
+        (!human_key.is_empty()).then_some(human_key)
+    }))
 }
 
 /// Find the project for the current working directory.
@@ -1976,7 +2129,7 @@ fn load_thread_participants(
     let (sender_where, mut sender_params) = thread_scope_params("m1", project_id, thread_ref);
     let (recipient_where, mut recipient_params) = thread_scope_params("m2", project_id, thread_ref);
     let sql = format!(
-        "SELECT name
+        "SELECT name, MIN(first_ts), MIN(first_id), lower(name)
          FROM (
              SELECT a_sender.name AS name, MIN(m1.created_ts) AS first_ts, MIN(m1.id) AS first_id
              FROM messages m1
@@ -3472,6 +3625,431 @@ fn build_navigate_file_reservations(
     ))
 }
 
+fn build_navigate_config_environment() -> (NavigateResult, Option<String>) {
+    let config = mcp_agent_mail_core::Config::get();
+    (
+        NavigateResult::Generic {
+            resource_type: "config/environment".to_string(),
+            data: serde_json::json!({
+                "environment": config.app_environment.to_string(),
+                "database_url": redact_navigate_database_url(&config.database_url),
+                "http": {
+                    "host": config.http_host.clone(),
+                    "port": config.http_port,
+                    "path": config.http_path.clone(),
+                },
+            }),
+        },
+        None,
+    )
+}
+
+fn build_navigate_identity(
+    project_ref: &str,
+) -> Result<(NavigateResult, Option<String>), CliError> {
+    let resolved_human_key = {
+        let path = PathBuf::from(project_ref);
+        if path.is_absolute() {
+            path
+        } else {
+            let cwd = std::env::current_dir()
+                .map_err(|e| CliError::Other(format!("cannot get CWD for identity: {e}")))?;
+            let base = navigate_workspace_root_from(&cwd).unwrap_or(cwd);
+            base.join(path)
+        }
+    };
+    let resolved = resolved_human_key.to_string_lossy().to_string();
+    let identity = mcp_agent_mail_core::resolve_project_identity(&resolved);
+    let data = serde_json::to_value(identity)
+        .map_err(|e| CliError::Other(format!("identity serialization failed: {e}")))?;
+    Ok((
+        NavigateResult::Generic {
+            resource_type: "identity".to_string(),
+            data,
+        },
+        None,
+    ))
+}
+
+fn build_navigate_tooling(
+    parts_ref: &[&str],
+    query: &std::collections::HashMap<String, String>,
+) -> Result<(NavigateResult, Option<String>), CliError> {
+    let (resource_type, data) = match parts_ref {
+        ["tooling", "metrics"] => {
+            let config = mcp_agent_mail_core::Config::get();
+            let mut tools: Vec<serde_json::Value> =
+                mcp_agent_mail_tools::tool_metrics_snapshot_full()
+                    .into_iter()
+                    .map(|entry| {
+                        serde_json::json!({
+                            "name": entry.name,
+                            "calls": entry.calls,
+                            "errors": entry.errors,
+                            "cluster": entry.cluster,
+                            "capabilities": entry.capabilities,
+                            "complexity": entry.complexity,
+                        })
+                    })
+                    .collect();
+            if config.tool_filter.enabled {
+                tools.retain(|entry| {
+                    entry
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|name| {
+                            mcp_agent_mail_tools::tool_meta(name)
+                                .is_none_or(|meta| config.should_expose_tool(name, meta.cluster))
+                        })
+                });
+            }
+            (
+                "tooling/metrics".to_string(),
+                serde_json::json!({
+                    "generated_at": serde_json::Value::Null,
+                    "health_level": mcp_agent_mail_core::compute_health_level().to_string(),
+                    "tools": tools,
+                }),
+            )
+        }
+        ["tooling", "metrics_core"] => (
+            "tooling/metrics_core".to_string(),
+            serde_json::json!({
+                "generated_at": serde_json::Value::Null,
+                "health_level": mcp_agent_mail_core::compute_health_level().to_string(),
+                "metrics": mcp_agent_mail_core::global_metrics().snapshot(),
+                "lock_contention": mcp_agent_mail_core::lock_contention_snapshot(),
+            }),
+        ),
+        ["tooling", "diagnostics"] => {
+            let tools_detail: Vec<serde_json::Value> =
+                mcp_agent_mail_tools::tool_metrics_snapshot()
+                    .into_iter()
+                    .filter_map(|entry| serde_json::to_value(entry).ok())
+                    .collect();
+            let slow: Vec<serde_json::Value> = mcp_agent_mail_tools::slow_tools()
+                .into_iter()
+                .filter_map(|entry| serde_json::to_value(entry).ok())
+                .collect();
+            let report = mcp_agent_mail_core::DiagnosticReport::build(tools_detail, slow);
+            let data = serde_json::from_str::<serde_json::Value>(&report.to_json())
+                .map_err(|e| CliError::Other(format!("diagnostics serialization failed: {e}")))?;
+            ("tooling/diagnostics".to_string(), data)
+        }
+        ["tooling", "locks"] => {
+            let config = mcp_agent_mail_core::Config::get();
+            let lock_info =
+                mcp_agent_mail_storage::collect_lock_status(config).unwrap_or_else(|_err| {
+                    serde_json::json!({
+                        "archive_root": "",
+                        "exists": false,
+                        "locks": [],
+                    })
+                });
+            let data = build_navigate_tooling_locks_data(lock_info);
+            ("tooling/locks".to_string(), data)
+        }
+        ["tooling", "capabilities", agent_name] => (
+            "tooling/capabilities".to_string(),
+            serde_json::json!({
+                "agent": *agent_name,
+                "project": query.get("project").cloned().unwrap_or_default(),
+                "capabilities": mcp_agent_mail_tools::identity::DEFAULT_AGENT_CAPABILITIES,
+                "generated_at": serde_json::Value::Null,
+            }),
+        ),
+        ["tooling", "recent", window_seconds] => {
+            let parsed_window = window_seconds.parse::<u64>().unwrap_or(0);
+            (
+                "tooling/recent".to_string(),
+                serde_json::json!({
+                    "generated_at": serde_json::Value::Null,
+                    "window_seconds": parsed_window,
+                    "count": 0,
+                    "entries": [],
+                }),
+            )
+        }
+        _ => {
+            return Err(CliError::InvalidArgument(format!(
+                "unsupported tooling resource URI pattern: resource://{}",
+                parts_ref.join("/")
+            )));
+        }
+    };
+
+    Ok((
+        NavigateResult::Generic {
+            resource_type,
+            data,
+        },
+        None,
+    ))
+}
+
+#[derive(Clone, Copy)]
+enum NavigateViewKind {
+    UrgentUnread,
+    AckRequired,
+    AcksStale,
+    AckOverdue,
+}
+
+impl NavigateViewKind {
+    const fn resource_type(self) -> &'static str {
+        match self {
+            Self::UrgentUnread => "views/urgent-unread",
+            Self::AckRequired => "views/ack-required",
+            Self::AcksStale => "views/acks-stale",
+            Self::AckOverdue => "views/ack-overdue",
+        }
+    }
+}
+
+fn build_navigate_view(
+    conn: &DbConn,
+    project_id: i64,
+    project_slug: &str,
+    agent_name: &str,
+    query: &std::collections::HashMap<String, String>,
+    kind: NavigateViewKind,
+) -> Result<(NavigateResult, Option<String>), CliError> {
+    let limit = parse_resource_limit(query.get("limit"), 20);
+    let project_human_key =
+        project_human_key_sync(conn, project_id)?.unwrap_or_else(|| project_slug.to_string());
+    let Some((agent_id, resolved_agent_name)) =
+        resolve_agent_id(conn, project_id, Some(agent_name))?
+    else {
+        let empty = match kind {
+            NavigateViewKind::AcksStale => serde_json::json!({
+                "project": project_human_key,
+                "agent": agent_name,
+                "ttl_seconds": query
+                    .get("ttl_seconds")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(3600),
+                "count": 0,
+                "messages": [],
+            }),
+            NavigateViewKind::AckOverdue => serde_json::json!({
+                "project": project_human_key,
+                "agent": agent_name,
+                "count": 0,
+                "messages": [],
+            }),
+            _ => serde_json::json!({
+                "project": project_human_key,
+                "agent": agent_name,
+                "count": 0,
+                "messages": [],
+            }),
+        };
+        return Ok((
+            NavigateResult::Generic {
+                resource_type: kind.resource_type().to_string(),
+                data: empty,
+            },
+            Some(project_slug.to_string()),
+        ));
+    };
+
+    let data = match kind {
+        NavigateViewKind::UrgentUnread => {
+            let rows = conn
+                .query_sync(
+                    "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject,
+                            m.importance, m.ack_required, m.created_ts, m.attachments, mr.kind,
+                            a_sender.name AS sender_name
+                     FROM message_recipients mr
+                     JOIN messages m ON m.id = mr.message_id
+                     JOIN agents a_sender ON a_sender.id = m.sender_id
+                     WHERE mr.agent_id = ? AND m.project_id = ?
+                       AND mr.read_ts IS NULL
+                       AND m.importance IN ('urgent', 'high')
+                     ORDER BY m.created_ts DESC
+                     LIMIT ?",
+                    &[
+                        Value::BigInt(agent_id),
+                        Value::BigInt(project_id),
+                        Value::BigInt(limit.try_into().unwrap_or(i64::MAX)),
+                    ],
+                )
+                .map_err(|e| {
+                    CliError::Other(format!("navigate urgent-unread query failed: {e}"))
+                })?;
+
+            let messages: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|row| {
+                    let attachments = row
+                        .get_named::<String>("attachments")
+                        .ok()
+                        .map(|raw| parse_attachment_values(Some(raw.as_str())))
+                        .unwrap_or_default();
+                    let thread_id = row
+                        .get_named::<String>("thread_id")
+                        .ok()
+                        .filter(|value| !value.is_empty());
+                    serde_json::json!({
+                        "id": row.get_named::<i64>("id").unwrap_or(0),
+                        "project_id": row.get_named::<i64>("project_id").unwrap_or(0),
+                        "sender_id": row.get_named::<i64>("sender_id").unwrap_or(0),
+                        "thread_id": thread_id,
+                        "subject": row.get_named::<String>("subject").unwrap_or_default(),
+                        "importance": row.get_named::<String>("importance").unwrap_or_default(),
+                        "ack_required": row.get_named::<i64>("ack_required").unwrap_or(0) == 1,
+                        "created_ts": mcp_agent_mail_db::micros_to_iso(
+                            row.get_named::<i64>("created_ts").unwrap_or(0),
+                        ),
+                        "attachments": attachments,
+                        "from": row.get_named::<String>("sender_name").unwrap_or_default(),
+                        "kind": row.get_named::<String>("kind").unwrap_or_default(),
+                    })
+                })
+                .collect();
+
+            serde_json::json!({
+                "project": project_human_key,
+                "agent": resolved_agent_name,
+                "count": messages.len(),
+                "messages": messages,
+            })
+        }
+        NavigateViewKind::AckRequired
+        | NavigateViewKind::AcksStale
+        | NavigateViewKind::AckOverdue => {
+            let rows = conn
+                .query_sync(
+                    "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject,
+                            m.importance, m.created_ts, m.attachments, mr.kind, mr.read_ts
+                     FROM message_recipients mr
+                     JOIN messages m ON m.id = mr.message_id
+                     WHERE mr.agent_id = ? AND m.project_id = ?
+                       AND m.ack_required = 1 AND mr.ack_ts IS NULL
+                     ORDER BY m.created_ts DESC
+                     LIMIT ?",
+                    &[
+                        Value::BigInt(agent_id),
+                        Value::BigInt(project_id),
+                        Value::BigInt(limit.saturating_mul(5).try_into().unwrap_or(i64::MAX)),
+                    ],
+                )
+                .map_err(|e| CliError::Other(format!("navigate ack view query failed: {e}")))?;
+
+            let now_us = mcp_agent_mail_db::now_micros();
+            let ttl_seconds = query
+                .get("ttl_seconds")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(3600);
+            let ttl_minutes = query
+                .get("ttl_minutes")
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(60);
+            let ack_overdue_cutoff = now_us.saturating_sub(
+                i64::try_from(ttl_minutes.max(1))
+                    .unwrap_or(i64::MAX)
+                    .saturating_mul(60)
+                    .saturating_mul(1_000_000),
+            );
+            let stale_ttl_us = i64::try_from(ttl_seconds)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1_000_000);
+
+            let mut messages = Vec::new();
+            for row in &rows {
+                let created_ts = row.get_named::<i64>("created_ts").unwrap_or(0);
+                let include = match kind {
+                    NavigateViewKind::AckRequired => true,
+                    NavigateViewKind::AckOverdue => created_ts <= ack_overdue_cutoff,
+                    NavigateViewKind::AcksStale => {
+                        now_us.saturating_sub(created_ts) >= stale_ttl_us
+                    }
+                    NavigateViewKind::UrgentUnread => false,
+                };
+                if !include {
+                    continue;
+                }
+
+                let attachments = row
+                    .get_named::<String>("attachments")
+                    .ok()
+                    .map(|raw| parse_attachment_values(Some(raw.as_str())))
+                    .unwrap_or_default();
+                let thread_id = row
+                    .get_named::<String>("thread_id")
+                    .ok()
+                    .filter(|value| !value.is_empty());
+                let read_ts = row.get_named::<i64>("read_ts").ok();
+                let age_seconds = now_us.saturating_sub(created_ts) / 1_000_000;
+
+                let message = match kind {
+                    NavigateViewKind::AcksStale => serde_json::json!({
+                        "id": row.get_named::<i64>("id").unwrap_or(0),
+                        "project_id": row.get_named::<i64>("project_id").unwrap_or(0),
+                        "sender_id": row.get_named::<i64>("sender_id").unwrap_or(0),
+                        "thread_id": thread_id,
+                        "subject": row.get_named::<String>("subject").unwrap_or_default(),
+                        "importance": row.get_named::<String>("importance").unwrap_or_default(),
+                        "ack_required": true,
+                        "created_ts": mcp_agent_mail_db::micros_to_iso(created_ts),
+                        "attachments": attachments,
+                        "kind": row.get_named::<String>("kind").unwrap_or_default(),
+                        "read_at": read_ts.filter(|ts| *ts > 0).map(mcp_agent_mail_db::micros_to_iso),
+                        "age_seconds": age_seconds,
+                    }),
+                    _ => serde_json::json!({
+                        "id": row.get_named::<i64>("id").unwrap_or(0),
+                        "project_id": row.get_named::<i64>("project_id").unwrap_or(0),
+                        "sender_id": row.get_named::<i64>("sender_id").unwrap_or(0),
+                        "thread_id": thread_id,
+                        "subject": row.get_named::<String>("subject").unwrap_or_default(),
+                        "importance": row.get_named::<String>("importance").unwrap_or_default(),
+                        "ack_required": true,
+                        "created_ts": mcp_agent_mail_db::micros_to_iso(created_ts),
+                        "attachments": attachments,
+                        "kind": row.get_named::<String>("kind").unwrap_or_default(),
+                    }),
+                };
+                messages.push(message);
+                if messages.len() >= limit {
+                    break;
+                }
+            }
+
+            match kind {
+                NavigateViewKind::AcksStale => serde_json::json!({
+                    "project": project_human_key,
+                    "agent": resolved_agent_name,
+                    "ttl_seconds": ttl_seconds,
+                    "count": messages.len(),
+                    "messages": messages,
+                }),
+                NavigateViewKind::AckOverdue => serde_json::json!({
+                    "project": project_human_key,
+                    "agent": resolved_agent_name,
+                    "count": messages.len(),
+                    "messages": messages,
+                }),
+                NavigateViewKind::AckRequired => serde_json::json!({
+                    "project": project_human_key,
+                    "agent": resolved_agent_name,
+                    "count": messages.len(),
+                    "messages": messages,
+                }),
+                NavigateViewKind::UrgentUnread => unreachable!(),
+            }
+        }
+    };
+
+    Ok((
+        NavigateResult::Generic {
+            resource_type: kind.resource_type().to_string(),
+            data,
+        },
+        Some(project_slug.to_string()),
+    ))
+}
+
 fn build_navigate(
     conn: &DbConn,
     uri: &str,
@@ -3495,6 +4073,8 @@ fn build_navigate(
     let parts_ref: Vec<&str> = parts.iter().map(String::as_str).collect();
 
     match parts_ref.as_slice() {
+        ["config", "environment"] => Ok(build_navigate_config_environment()),
+        ["identity", project_ref] => build_navigate_identity(project_ref),
         ["projects"] => {
             let projects = build_projects(conn)?;
             Ok((NavigateResult::Projects { projects }, None))
@@ -3605,6 +4185,38 @@ fn build_navigate(
                 Some(effective_project_slug.clone()),
             ))
         }
+        ["views", "urgent-unread", agent_name] => build_navigate_view(
+            conn,
+            effective_project_id,
+            &effective_project_slug,
+            agent_name,
+            &query,
+            NavigateViewKind::UrgentUnread,
+        ),
+        ["views", "ack-required", agent_name] => build_navigate_view(
+            conn,
+            effective_project_id,
+            &effective_project_slug,
+            agent_name,
+            &query,
+            NavigateViewKind::AckRequired,
+        ),
+        ["views", "acks-stale", agent_name] => build_navigate_view(
+            conn,
+            effective_project_id,
+            &effective_project_slug,
+            agent_name,
+            &query,
+            NavigateViewKind::AcksStale,
+        ),
+        ["views", "ack-overdue", agent_name] => build_navigate_view(
+            conn,
+            effective_project_id,
+            &effective_project_slug,
+            agent_name,
+            &query,
+            NavigateViewKind::AckOverdue,
+        ),
         ["file_reservations"] | ["reservations"] => build_navigate_file_reservations(
             conn,
             effective_project_id,
@@ -3675,9 +4287,12 @@ fn build_navigate(
                 ))
             }
         }
+        ["tooling", ..] => build_navigate_tooling(&parts_ref, &query),
         _ => Err(CliError::InvalidArgument(format!(
             "unsupported resource URI pattern: {uri}\n\
              Supported patterns:\n\
+             - resource://config/environment\n\
+             - resource://identity/<project>\n\
              - resource://projects\n\
              - resource://project/<slug>\n\
              - resource://agents/<slug>\n\
@@ -3685,10 +4300,20 @@ fn build_navigate(
              - resource://inbox/<agent>\n\
              - resource://message/<id>\n\
              - resource://thread/<id>\n\
+             - resource://views/urgent-unread/<agent>\n\
+             - resource://views/ack-required/<agent>\n\
+             - resource://views/acks-stale/<agent>\n\
+             - resource://views/ack-overdue/<agent>\n\
              - resource://file_reservations/<slug>\n\
              - resource://file_reservations?project=<slug>\n\
              - resource://reservations/<slug>\n\
              - resource://reservations?project=<slug>\n\
+             - resource://tooling/metrics\n\
+             - resource://tooling/metrics_core\n\
+             - resource://tooling/diagnostics\n\
+             - resource://tooling/locks\n\
+             - resource://tooling/capabilities/<agent>\n\
+             - resource://tooling/recent/<window_seconds>\n\
              - resource://mailbox/<agent>\n\
              - resource://outbox/<agent>"
         ))),
@@ -4351,7 +4976,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     result,
                 },
             );
-            env._meta.project = Some(resolved_project.unwrap_or(project_slug));
+            env._meta.project = resolved_project;
             format_output(&env, format)?
         }
     };
@@ -7097,6 +7722,242 @@ mod tests {
             other => panic!("unexpected project result: {other:?}"),
         }
         assert_eq!(project_scope.as_deref(), Some("proj-plus"));
+    }
+
+    #[test]
+    fn test_build_navigate_supports_config_environment_resource() {
+        let conn = mcp_agent_mail_db::DbConn::open_memory().expect("open memory db");
+        let (result, scope) =
+            build_navigate(&conn, "resource://config/environment", 99, "wrong", None)
+                .expect("navigate config environment");
+
+        match result {
+            NavigateResult::Generic {
+                resource_type,
+                data,
+            } => {
+                assert_eq!(resource_type, "config/environment");
+                assert!(data["environment"].is_string());
+                assert!(data["http"]["path"].is_string());
+            }
+            other => panic!("unexpected config/environment result: {other:?}"),
+        }
+        assert!(scope.is_none());
+    }
+
+    #[test]
+    fn test_build_navigate_supports_identity_resource() {
+        let conn = mcp_agent_mail_db::DbConn::open_memory().expect("open memory db");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project_ref = temp_dir.path().join("identity-proj");
+        std::fs::create_dir_all(&project_ref).expect("create identity project dir");
+        let encoded = project_ref.to_string_lossy().replace('/', "%2F");
+
+        let (result, scope) = build_navigate(
+            &conn,
+            &format!("resource://identity/{encoded}"),
+            99,
+            "wrong",
+            None,
+        )
+        .expect("navigate identity");
+
+        match result {
+            NavigateResult::Generic {
+                resource_type,
+                data,
+            } => {
+                assert_eq!(resource_type, "identity");
+                assert_eq!(data["human_key"], project_ref.to_string_lossy().as_ref());
+                assert!(data["slug"].is_string());
+            }
+            other => panic!("unexpected identity result: {other:?}"),
+        }
+        assert!(scope.is_none());
+    }
+
+    #[test]
+    fn test_build_navigate_supports_urgent_unread_view() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let created_ts = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(301),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("Urgent unread".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("VIEW-URGENT".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("urgent".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_ts),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("body".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("[]".to_string()),
+            ],
+        )
+        .expect("insert urgent message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (301, 301, 2, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert urgent recipient");
+
+        let (result, scope) =
+            build_navigate(&conn, "resource://views/urgent-unread/Bob", 1, "proj", None)
+                .expect("navigate urgent-unread");
+
+        match result {
+            NavigateResult::Generic {
+                resource_type,
+                data,
+            } => {
+                assert_eq!(resource_type, "views/urgent-unread");
+                assert_eq!(data["project"], "/tmp/proj");
+                assert_eq!(data["count"], 1);
+                assert_eq!(data["messages"][0]["subject"], "Urgent unread");
+                assert_eq!(data["messages"][0]["from"], "Alice");
+                assert_eq!(data["messages"][0]["ack_required"], true);
+            }
+            other => panic!("unexpected urgent-unread result: {other:?}"),
+        }
+        assert_eq!(scope.as_deref(), Some("proj"));
+    }
+
+    #[test]
+    fn test_build_navigate_supports_ack_overdue_view_with_ttl_query() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let created_ts = mcp_agent_mail_db::now_micros() - 95 * 60 * 1_000_000;
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(302),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("Ack overdue".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("VIEW-ACK".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("normal".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_ts),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("body".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("[]".to_string()),
+            ],
+        )
+        .expect("insert ack overdue message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (302, 302, 2, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert ack overdue recipient");
+
+        let (result, scope) = build_navigate(
+            &conn,
+            "resource://views/ack-overdue/Bob?ttl_minutes=90",
+            1,
+            "proj",
+            None,
+        )
+        .expect("navigate ack-overdue");
+
+        match result {
+            NavigateResult::Generic {
+                resource_type,
+                data,
+            } => {
+                assert_eq!(resource_type, "views/ack-overdue");
+                assert_eq!(data["project"], "/tmp/proj");
+                assert!(data.get("ttl_minutes").is_none());
+                assert_eq!(data["count"], 1);
+                assert_eq!(data["messages"][0]["subject"], "Ack overdue");
+            }
+            other => panic!("unexpected ack-overdue result: {other:?}"),
+        }
+        assert_eq!(scope.as_deref(), Some("proj"));
+    }
+
+    #[test]
+    fn test_build_navigate_supports_tooling_metrics_resource() {
+        let conn = mcp_agent_mail_db::DbConn::open_memory().expect("open memory db");
+        let (result, scope) =
+            build_navigate(&conn, "resource://tooling/metrics", 99, "wrong", None)
+                .expect("navigate tooling metrics");
+
+        match result {
+            NavigateResult::Generic {
+                resource_type,
+                data,
+            } => {
+                assert_eq!(resource_type, "tooling/metrics");
+                assert!(data["health_level"].is_string());
+                assert!(data["tools"].is_array());
+            }
+            other => panic!("unexpected tooling metrics result: {other:?}"),
+        }
+        assert!(scope.is_none());
+    }
+
+    #[test]
+    fn test_build_navigate_tooling_locks_data_matches_resource_shape() {
+        let current_pid = u64::from(std::process::id());
+        let data = build_navigate_tooling_locks_data(serde_json::json!({
+            "locks": [
+                {
+                    "path": "/tmp/archive/projects/proj-a/lock.json",
+                    "owner": {
+                        "pid": current_pid,
+                        "created_ts": 1_735_689_600.5
+                    }
+                },
+                {
+                    "path": "/tmp/archive/projects/proj-b/lock.json",
+                    "owner": {
+                        "created_ts": 1_735_689_600.0
+                    }
+                }
+            ]
+        }));
+
+        let locks = data["locks"].as_array().expect("locks array");
+        assert_eq!(locks.len(), 1);
+        assert_eq!(locks[0]["project_slug"], "proj-a");
+        assert_eq!(locks[0]["holder"], format!("pid:{current_pid}"));
+        assert!(locks[0]["acquired_ts"].is_string());
+        assert_eq!(data["summary"]["total"], 1);
+        assert_eq!(data["summary"]["metadata_missing"], 1);
+    }
+
+    #[test]
+    fn test_navigate_global_resources_do_not_force_project_meta() {
+        let conn = mcp_agent_mail_db::DbConn::open_memory().expect("open memory db");
+        let (result, resolved_project) =
+            build_navigate(&conn, "resource://config/environment", 99, "proj", None)
+                .expect("navigate config environment");
+
+        #[derive(Serialize)]
+        struct NavigateData {
+            uri: String,
+            #[serde(flatten)]
+            result: NavigateResult,
+        }
+
+        let mut env = RobotEnvelope::new(
+            "robot navigate",
+            OutputFormat::Json,
+            NavigateData {
+                uri: "resource://config/environment".to_string(),
+                result,
+            },
+        );
+        env._meta.project = resolved_project;
+
+        let output = format_output(&env, OutputFormat::Json).expect("format output");
+        let value: Value = serde_json::from_str(&output).expect("json output");
+        assert!(value["_meta"].get("project").is_none());
     }
 
     #[test]

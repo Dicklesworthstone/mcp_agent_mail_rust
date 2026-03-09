@@ -86,8 +86,12 @@ impl ReservationIndex {
     /// Find all reservations that conflict with the given request path.
     ///
     /// `request_pat` must be a `CompiledPattern` for the same `request_path`.
-    pub fn find_conflicts<'a>(&'a self, request_pat: &CompiledPattern) -> Vec<&'a ReservationRef> {
-        let mut conflicts: Vec<&ReservationRef> = Vec::new();
+    pub fn find_conflicts<'a>(
+        &'a self,
+        request_pat: &CompiledPattern,
+        conflicts: &mut Vec<&'a ReservationRef>,
+    ) {
+        conflicts.clear();
         let req_norm = request_pat.normalized();
         let req_is_glob = request_pat.is_glob();
         let req_prefix = request_pat.first_literal_segment();
@@ -96,10 +100,10 @@ impl ReservationIndex {
             // Glob request: must scan relevant prefix groups + root for both
             // exact and glob reservations, because a glob request can overlap
             // exact paths via one-directional matching.
-            self.scan_glob_request(request_pat, req_prefix, &mut conflicts);
+            self.scan_glob_request(request_pat, req_prefix, conflicts);
         } else {
             // Exact request path: check for exact equality + overlapping globs.
-            self.scan_exact_request(request_pat, req_norm, req_prefix, &mut conflicts);
+            self.scan_exact_request(request_pat, req_norm, req_prefix, conflicts);
         }
 
         // Always check root-level globs.
@@ -108,8 +112,6 @@ impl ReservationIndex {
                 conflicts.push(rref);
             }
         }
-
-        conflicts
     }
 
     /// Scan for conflicts when the request is an exact path (no glob chars).
@@ -255,7 +257,8 @@ mod tests {
         let idx =
             ReservationIndex::build(vec![("src/main.rs".to_string(), make_ref(1))].into_iter());
         let req = CompiledPattern::new("src/main.rs");
-        let conflicts = idx.find_conflicts(&req);
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].agent_id, 1);
     }
@@ -265,7 +268,8 @@ mod tests {
         let idx =
             ReservationIndex::build(vec![("src/main.rs".to_string(), make_ref(1))].into_iter());
         let req = CompiledPattern::new("src/lib.rs");
-        let conflicts = idx.find_conflicts(&req);
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
         assert!(conflicts.is_empty());
     }
 
@@ -273,7 +277,8 @@ mod tests {
     fn glob_reservation_matches_exact_request() {
         let idx = ReservationIndex::build(vec![("src/**".to_string(), make_ref(1))].into_iter());
         let req = CompiledPattern::new("src/main.rs");
-        let conflicts = idx.find_conflicts(&req);
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
         assert_eq!(conflicts.len(), 1);
     }
 
@@ -282,7 +287,8 @@ mod tests {
         let idx =
             ReservationIndex::build(vec![("src/main.rs".to_string(), make_ref(1))].into_iter());
         let req = CompiledPattern::new("src/**");
-        let conflicts = idx.find_conflicts(&req);
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
         assert_eq!(conflicts.len(), 1);
     }
 
@@ -290,7 +296,8 @@ mod tests {
     fn root_glob_reservation_checked_against_all() {
         let idx = ReservationIndex::build(vec![("**/*.rs".to_string(), make_ref(1))].into_iter());
         let req = CompiledPattern::new("src/main.rs");
-        let conflicts = idx.find_conflicts(&req);
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
         assert_eq!(conflicts.len(), 1);
     }
 
@@ -299,7 +306,8 @@ mod tests {
         let idx =
             ReservationIndex::build(vec![("docs/readme.md".to_string(), make_ref(1))].into_iter());
         let req = CompiledPattern::new("src/main.rs");
-        let conflicts = idx.find_conflicts(&req);
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
         assert!(conflicts.is_empty());
     }
 
@@ -314,7 +322,8 @@ mod tests {
             .into_iter(),
         );
         let req = CompiledPattern::new("src/main.rs");
-        let conflicts = idx.find_conflicts(&req);
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
         // Should match exact src/main.rs and glob src/**/*.rs, but not docs/**
         assert_eq!(conflicts.len(), 2);
         let ids: Vec<i64> = conflicts.iter().map(|r| r.agent_id).collect();
@@ -332,7 +341,8 @@ mod tests {
             .into_iter(),
         );
         let req = CompiledPattern::new("**");
-        let conflicts = idx.find_conflicts(&req);
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
         // ** should match both files
         assert_eq!(conflicts.len(), 2);
     }
@@ -341,7 +351,8 @@ mod tests {
     fn empty_index_no_conflicts() {
         let idx = ReservationIndex::build(std::iter::empty());
         let req = CompiledPattern::new("src/main.rs");
-        let conflicts = idx.find_conflicts(&req);
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
         assert!(conflicts.is_empty());
     }
 
@@ -350,7 +361,8 @@ mod tests {
         let idx =
             ReservationIndex::build(vec![("src/**/*.rs".to_string(), make_ref(1))].into_iter());
         let req = CompiledPattern::new("src/**");
-        let conflicts = idx.find_conflicts(&req);
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
         assert_eq!(conflicts.len(), 1);
     }
 
@@ -360,7 +372,8 @@ mod tests {
         let idx =
             ReservationIndex::build(vec![("./src/main.rs".to_string(), make_ref(1))].into_iter());
         let req = CompiledPattern::new("src/main.rs");
-        let conflicts = idx.find_conflicts(&req);
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
         assert_eq!(conflicts.len(), 1);
     }
 
@@ -372,7 +385,8 @@ mod tests {
         let idx =
             ReservationIndex::build(vec![("Cargo.toml".to_string(), make_ref(1))].into_iter());
         let req = CompiledPattern::new("Cargo.toml");
-        let conflicts = idx.find_conflicts(&req);
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
         assert_eq!(conflicts.len(), 1);
     }
 
@@ -381,7 +395,8 @@ mod tests {
         let idx =
             ReservationIndex::build(vec![("Cargo.toml".to_string(), make_ref(1))].into_iter());
         let req = CompiledPattern::new("Cargo.lock");
-        let conflicts = idx.find_conflicts(&req);
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
         assert!(conflicts.is_empty());
     }
 
@@ -389,7 +404,8 @@ mod tests {
     fn star_glob_matches_root_files() {
         let idx = ReservationIndex::build(vec![("*.toml".to_string(), make_ref(1))].into_iter());
         let req = CompiledPattern::new("Cargo.toml");
-        let conflicts = idx.find_conflicts(&req);
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
         assert_eq!(conflicts.len(), 1);
     }
 
@@ -399,7 +415,8 @@ mod tests {
             vec![("crates/db/src/schema.rs".to_string(), make_ref(1))].into_iter(),
         );
         let req = CompiledPattern::new("crates/db/src/schema.rs");
-        let conflicts = idx.find_conflicts(&req);
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
         assert_eq!(conflicts.len(), 1);
     }
 
@@ -409,7 +426,8 @@ mod tests {
             vec![("crates/db/src/schema.rs".to_string(), make_ref(1))].into_iter(),
         );
         let req = CompiledPattern::new("crates/cli/src/schema.rs");
-        let conflicts = idx.find_conflicts(&req);
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
         assert!(conflicts.is_empty());
     }
 
@@ -423,7 +441,8 @@ mod tests {
             .into_iter(),
         );
         let req = CompiledPattern::new("src/main.rs");
-        let conflicts = idx.find_conflicts(&req);
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
         assert_eq!(conflicts.len(), 2);
         let ids: Vec<i64> = conflicts.iter().map(|r| r.agent_id).collect();
         assert!(ids.contains(&1));
@@ -435,7 +454,8 @@ mod tests {
         let idx =
             ReservationIndex::build(vec![("src/**/*.rs".to_string(), make_ref(1))].into_iter());
         let req = CompiledPattern::new("docs/readme.md");
-        let conflicts = idx.find_conflicts(&req);
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
         assert!(conflicts.is_empty());
     }
 
@@ -456,7 +476,8 @@ mod tests {
         };
         let idx = ReservationIndex::build(vec![("src/main.rs".to_string(), rref)].into_iter());
         let req = CompiledPattern::new("src/main.rs");
-        let conflicts = idx.find_conflicts(&req);
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].agent_id, 42);
         assert!(conflicts[0].exclusive);

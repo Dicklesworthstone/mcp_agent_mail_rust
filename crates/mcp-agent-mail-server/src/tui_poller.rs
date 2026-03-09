@@ -1250,7 +1250,7 @@ fn reservation_released_ts_sql(
                  WHEN typeof({table_ref}.released_ts) = 'text' THEN \
                      CAST(strftime('%s', REPLACE(REPLACE({table_ref}.released_ts, 'T', ' '), 'Z', '')) AS INTEGER) * 1000000 + \
                      CASE WHEN instr({table_ref}.released_ts, '.') > 0 \
-                          THEN CAST(substr({table_ref}.released_ts || '000000', instr({table_ref}.released_ts, '.') + 1, 6) AS INTEGER) \
+                          THEN CAST(substr(REPLACE({table_ref}.released_ts, 'Z', '') || '000000', instr({table_ref}.released_ts, '.') + 1, 6) AS INTEGER) \
                           ELSE 0 \
                      END \
                  ELSE {table_ref}.released_ts \

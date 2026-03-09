@@ -53,6 +53,8 @@ pub struct WizardOutcome {
     pub environment: DetectedEnvironment,
     /// The generated deployment plan.
     pub plan: DeploymentPlan,
+    /// Whether the wizard ran interactively or non-interactively.
+    pub mode: WizardMode,
     /// Whether the user confirmed execution.
     pub confirmed: bool,
 }
@@ -75,6 +77,11 @@ pub struct WizardOutcome {
 pub fn run_interactive_wizard(config: WizardConfig) -> Result<WizardOutcome, WizardError> {
     let is_tty = io::stdin().is_terminal();
     let interactive = is_tty && !config.non_interactive;
+    let mode = if interactive {
+        WizardMode::Interactive
+    } else {
+        WizardMode::NonInteractive
+    };
 
     // Detect environment
     let cwd = std::env::current_dir().map_err(|e| {
@@ -106,6 +113,18 @@ pub fn run_interactive_wizard(config: WizardConfig) -> Result<WizardOutcome, Wiz
     // Generate plan
     let plan = generate_plan(&inputs, Some(env.clone()))?;
 
+    if mode == WizardMode::NonInteractive
+        && !inputs.skip_confirm
+        && !inputs.dry_run
+        && plan.steps.iter().any(|step| step.requires_confirm)
+    {
+        return Err(WizardError::new(
+            WizardErrorCode::MissingRequiredOption,
+            "Non-interactive execution requires --yes when the deployment plan contains confirmable steps",
+        )
+        .with_hint("Re-run with --yes to execute automatically or --dry-run to preview the plan"));
+    }
+
     // Show plan and confirm
     let confirmed = if interactive && !inputs.skip_confirm {
         show_plan_and_confirm(&plan)?
@@ -118,6 +137,7 @@ pub fn run_interactive_wizard(config: WizardConfig) -> Result<WizardOutcome, Wiz
         inputs,
         environment: env,
         plan,
+        mode,
         confirmed,
     })
 }
@@ -208,6 +228,9 @@ fn validate_non_interactive(
 
     // Validate provider-specific requirements
     let provider = inputs.provider.unwrap_or_else(|| unreachable!());
+    if provider == HostingProvider::GithubPages && inputs.github_repo.is_none() {
+        inputs.github_repo = env.github_repo.clone();
+    }
     validate_provider_requirements(provider, &inputs)?;
 
     Ok(inputs)
@@ -644,11 +667,7 @@ pub fn format_json_output(
             metadata: WizardMetadata {
                 version: WIZARD_VERSION.to_string(),
                 timestamp: chrono::Utc::now().to_rfc3339(),
-                mode: if outcome.confirmed {
-                    WizardMode::Interactive
-                } else {
-                    WizardMode::NonInteractive
-                },
+                mode: outcome.mode,
                 dry_run: outcome.inputs.dry_run,
             },
         };
@@ -763,6 +782,23 @@ mod tests {
             .expect_err("github provider should require --github-repo");
         assert_eq!(err.code, WizardErrorCode::MissingRequiredOption);
         assert!(err.message.contains("GitHub repository"));
+    }
+
+    #[test]
+    fn validate_non_interactive_uses_detected_github_repo() {
+        let inputs = WizardInputs {
+            provider: Some(HostingProvider::GithubPages),
+            bundle_path: Some(PathBuf::from("/tmp/bundle")),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment {
+            github_repo: Some("owner/repo".to_string()),
+            ..Default::default()
+        };
+
+        let resolved = validate_non_interactive(inputs, &env)
+            .expect("detected repo should satisfy github provider requirements");
+        assert_eq!(resolved.github_repo.as_deref(), Some("owner/repo"));
     }
 
     #[test]
@@ -918,6 +954,58 @@ mod tests {
             Some(detected_bundle.path().to_path_buf())
         );
         assert_eq!(resolved.provider, Some(HostingProvider::Custom));
+    }
+
+    #[test]
+    fn run_interactive_wizard_rejects_non_interactive_confirmable_plan_without_yes() {
+        let bundle = tempfile::tempdir().unwrap();
+        std::fs::write(bundle.path().join("manifest.json"), "{}").unwrap();
+
+        let err = run_interactive_wizard(WizardConfig {
+            inputs: WizardInputs {
+                provider: Some(HostingProvider::GithubPages),
+                bundle_path: Some(bundle.path().to_path_buf()),
+                github_repo: Some("owner/repo".to_string()),
+                skip_confirm: false,
+                dry_run: false,
+                ..Default::default()
+            },
+            non_interactive: true,
+            json_output: true,
+            skip_detection: true,
+        })
+        .expect_err("confirmable non-interactive plans should require --yes");
+
+        assert_eq!(err.code, WizardErrorCode::MissingRequiredOption);
+        assert!(err.message.contains("--yes"));
+    }
+
+    #[test]
+    fn format_json_output_preserves_interactive_mode_when_not_confirmed() {
+        let outcome = WizardOutcome {
+            inputs: WizardInputs {
+                dry_run: true,
+                ..Default::default()
+            },
+            environment: DetectedEnvironment::default(),
+            plan: DeploymentPlan {
+                provider: HostingProvider::Custom,
+                bundle_path: PathBuf::from("/tmp/bundle"),
+                steps: vec![],
+                expected_url: None,
+                generated_files: vec![],
+                warnings: vec![],
+            },
+            mode: WizardMode::Interactive,
+            confirmed: false,
+        };
+
+        let payload =
+            serde_json::from_str::<serde_json::Value>(&format_json_output(&outcome, false, None))
+                .expect("wizard output should be valid json");
+
+        assert_eq!(payload["result"]["metadata"]["mode"], "interactive");
+        assert_eq!(payload["result"]["metadata"]["dry_run"], true);
     }
 
     #[test]

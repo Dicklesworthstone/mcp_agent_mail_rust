@@ -489,13 +489,15 @@ pub async fn file_reservation_paths(
         .map(|p| CompiledPattern::new(p))
         .collect();
 
+    let mut conflict_refs = Vec::new();
+
     for (path, path_pat) in normalized_paths.iter().zip(requested_compiled.iter()) {
         if !seen_paths.insert(path.clone()) {
             continue;
         }
 
         // Check conflicts with existing reservations
-        let conflict_refs = index.find_conflicts(path_pat);
+        index.find_conflicts(path_pat, &mut conflict_refs);
 
         if conflict_refs.is_empty() {
             paths_to_grant.push(path);

@@ -423,16 +423,19 @@ fn generate_github_pages_plan(
     });
 
     // Calculate expected URL
-    let expected_url = if let Some(ref repo) = env.github_repo {
-        let parts: Vec<&str> = repo.split('/').collect();
-        if parts.len() == 2 {
-            Some(format!("https://{}.github.io/{}", parts[0], parts[1]))
-        } else {
-            None
-        }
-    } else {
-        inputs.base_url.clone()
-    };
+    let expected_url = inputs
+        .github_repo
+        .as_ref()
+        .or(env.github_repo.as_ref())
+        .and_then(|repo| {
+            let parts: Vec<&str> = repo.split('/').collect();
+            if parts.len() == 2 {
+                Some(format!("https://{}.github.io/{}", parts[0], parts[1]))
+            } else {
+                None
+            }
+        })
+        .or_else(|| inputs.base_url.clone());
 
     // Add warnings
     if !env.is_git_repo {
@@ -1186,6 +1189,25 @@ mod tests {
         assert_eq!(
             plan.expected_url,
             Some("https://myuser.github.io/myrepo".to_string())
+        );
+    }
+
+    #[test]
+    fn github_plan_expected_url_from_explicit_repo_when_env_missing() {
+        let inputs = WizardInputs {
+            github_repo: Some("explicit/repo".to_string()),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment {
+            is_git_repo: true,
+            ..Default::default()
+        };
+        let bundle = tempfile::tempdir().unwrap();
+
+        let plan = generate_github_pages_plan(&inputs, &env, bundle.path()).unwrap();
+        assert_eq!(
+            plan.expected_url,
+            Some("https://explicit.github.io/repo".to_string())
         );
     }
 

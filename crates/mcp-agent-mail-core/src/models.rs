@@ -571,31 +571,15 @@ pub fn sanitize_agent_name(value: &str) -> Option<String> {
     Some(cleaned)
 }
 
-/// Precomputed set of all 9,900 valid lowercased agent names for O(1) lookup.
-///
-/// Initialized on first access. 75 adjectives × 132 nouns ≈ 300 KB.
-fn valid_names_set() -> &'static std::collections::HashSet<String> {
-    static SET: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
-    SET.get_or_init(|| {
-        let mut set =
-            std::collections::HashSet::with_capacity(VALID_ADJECTIVES.len() * VALID_NOUNS.len());
-        for adj in VALID_ADJECTIVES {
-            for noun in VALID_NOUNS {
-                set.insert(format!("{adj}{noun}"));
-            }
-        }
-        set
-    })
-}
-
 /// Validates that an agent name follows the adjective+noun pattern.
 ///
-/// Uses a precomputed `HashSet` of all 9,900 valid names for O(1) lookup,
-/// replacing the previous O(75×132) linear scan.
+/// Uses a zero-allocation, case-insensitive scan against the known adjectives
+/// and nouns to avoid the O(N) allocation of `.to_lowercase()` and the
+/// memory overhead of a 10,000-entry hash set.
 ///
 /// # Examples
 /// ```
-/// use mcp_agent_mail_core::is_valid_agent_name;
+/// use mcp_agent_mail_core::models::is_valid_agent_name;
 ///
 /// assert!(is_valid_agent_name("GreenLake"));
 /// assert!(is_valid_agent_name("blueDog"));
@@ -603,7 +587,17 @@ fn valid_names_set() -> &'static std::collections::HashSet<String> {
 /// ```
 #[must_use]
 pub fn is_valid_agent_name(name: &str) -> bool {
-    valid_names_set().contains(&name.to_lowercase())
+    for adj in VALID_ADJECTIVES {
+        if name.len() > adj.len() && name[..adj.len()].eq_ignore_ascii_case(adj) {
+            let rem = &name[adj.len()..];
+            for noun in VALID_NOUNS {
+                if rem.eq_ignore_ascii_case(noun) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1543,7 +1537,6 @@ mod tests {
         // 75 adjectives x 132 nouns = 9,900 valid names
         assert_eq!(VALID_ADJECTIVES.len(), 75);
         assert_eq!(VALID_NOUNS.len(), 132);
-        assert_eq!(valid_names_set().len(), 75 * 132);
     }
 
     // ── looks_like_email ─────────────────────────────────────────────

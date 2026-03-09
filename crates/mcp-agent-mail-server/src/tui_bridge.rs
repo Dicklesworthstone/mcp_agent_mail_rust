@@ -416,11 +416,12 @@ impl TuiSharedState {
 
     #[must_use]
     #[allow(clippy::needless_pass_by_value)] // 80+ call sites; by-value is clearer API intent
-    pub fn push_event(&self, event: MailEvent) -> bool {
+    pub fn push_event(&self, mut event: MailEvent) -> bool {
         // Keep event publication non-blocking so HTTP/tool handlers cannot stall
         // behind a contended TUI ring-buffer lock.
-        if self.events.try_push(event.clone()).is_some() {
-            return true;
+        match self.events.try_push(event) {
+            Ok(_) => return true,
+            Err(returned_event) => event = returned_event,
         }
 
         if event.severity() < EventSeverity::Info {
@@ -432,8 +433,9 @@ impl TuiSharedState {
         let mut backoff = std::time::Duration::from_millis(2);
         for _ in 0..3 {
             std::thread::sleep(backoff);
-            if self.events.try_push(event.clone()).is_some() {
-                return true;
+            match self.events.try_push(event) {
+                Ok(_) => return true,
+                Err(returned_event) => event = returned_event,
             }
             backoff = backoff
                 .checked_mul(2)
@@ -448,9 +450,10 @@ impl TuiSharedState {
     ///
     /// Use this in async contexts (like MCP tool handlers) to avoid blocking
     /// worker threads.
-    pub async fn push_event_async(&self, event: MailEvent) -> bool {
-        if self.events.try_push(event.clone()).is_some() {
-            return true;
+    pub async fn push_event_async(&self, mut event: MailEvent) -> bool {
+        match self.events.try_push(event) {
+            Ok(_) => return true,
+            Err(returned_event) => event = returned_event,
         }
 
         if event.severity() < EventSeverity::Info {
@@ -460,8 +463,9 @@ impl TuiSharedState {
         let mut backoff = std::time::Duration::from_millis(2);
         for _ in 0..3 {
             let _ = sleep(wall_now(), backoff).await;
-            if self.events.try_push(event.clone()).is_some() {
-                return true;
+            match self.events.try_push(event) {
+                Ok(_) => return true,
+                Err(returned_event) => event = returned_event,
             }
             backoff = backoff
                 .checked_mul(2)

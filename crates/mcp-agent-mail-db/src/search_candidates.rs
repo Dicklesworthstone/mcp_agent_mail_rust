@@ -9,7 +9,7 @@
 //! top of the `PreparedCandidate` stream produced by this module.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -564,7 +564,9 @@ pub fn prepare_candidates(
         .take(budget.semantic_limit)
         .collect::<Vec<_>>();
 
-    let mut map: BTreeMap<i64, PreparedCandidate> = BTreeMap::new();
+    let mut map: HashMap<i64, PreparedCandidate> = HashMap::with_capacity(
+        lexical_trimmed.len().saturating_add(semantic_trimmed.len()),
+    );
 
     for (idx, hit) in lexical_trimmed.iter().enumerate() {
         map.entry(hit.doc_id)

@@ -285,6 +285,9 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
 
         mcp_agent_mail_tools::record_call_idx(self.tool_index);
 
+        let (project, agent) = extract_project_agent(&arguments);
+        let masked = console::mask_json(&arguments);
+
         let qt_before = mcp_agent_mail_db::QUERY_TRACKER.snapshot();
         let start = Instant::now();
         let call_arguments = arguments.clone();

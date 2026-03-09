@@ -329,11 +329,6 @@ pub fn fuse_rrf(
             &fs_config,
         );
 
-        let first_source_by_doc: HashMap<i64, CandidateSource> = candidates
-            .iter()
-            .map(|candidate| (candidate.doc_id, candidate.first_source))
-            .collect();
-
         let mut fused: Vec<FusedHit> = fs_hits
             .into_iter()
             .filter_map(|hit| {
@@ -344,9 +339,12 @@ pub fn fuse_rrf(
                 let semantic_score = hit.semantic_score.map(f64::from);
                 let lexical_contrib = rrf_contribution(config.k, lexical_rank);
                 let semantic_contrib = rrf_contribution(config.k, semantic_rank);
-                let first_source = first_source_by_doc
-                    .get(&doc_id)
-                    .copied()
+
+                // Optimization: find first_source from candidates (small set, linear scan is fine).
+                let first_source = candidates
+                    .iter()
+                    .find(|c| c.doc_id == doc_id)
+                    .map(|c| c.first_source)
                     .unwrap_or_else(|| {
                         if lexical_rank.is_some() {
                             CandidateSource::Lexical

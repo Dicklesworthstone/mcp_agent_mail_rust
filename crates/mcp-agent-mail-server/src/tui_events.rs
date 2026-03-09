@@ -1128,24 +1128,24 @@ impl EventRingBuffer {
 
     /// Non-blocking push with backpressure policy.
     ///
-    /// Returns `Some(seq)` on success, `None` if the lock is contended
+    /// Returns `Ok(seq)` on success, `Err(event)` if the lock is contended
     /// or the event was dropped by the sampling policy.  This is the
     /// preferred path for the server thread where blocking on the TUI
     /// reader is unacceptable.
     #[must_use]
-    pub fn try_push(&self, event: MailEvent) -> Option<u64> {
+    pub fn try_push(&self, event: MailEvent) -> Result<u64, MailEvent> {
         let Ok(mut inner) = self.inner.try_lock() else {
             self.contention_drops.fetch_add(1, Ordering::Relaxed);
-            return None;
+            return Err(event);
         };
 
         // Apply sampling policy when buffer is filling up.
         if self.should_sample(&inner, &event) {
             self.sampled_drops.fetch_add(1, Ordering::Relaxed);
-            return None;
+            return Err(event);
         }
 
-        Some(Self::push_inner(&mut inner, event))
+        Ok(Self::push_inner(&mut inner, event))
     }
 
     /// Check whether the event should be dropped by the sampling policy.
@@ -2383,7 +2383,7 @@ mod tests {
     #[test]
     fn try_push_succeeds_when_unlocked() {
         let ring = EventRingBuffer::with_capacity(8);
-        let result = ring.try_push(sample_http("/ok", 200));
+        let result = ring.try_push(sample_http("/ok", 200)).ok();
         assert_eq!(result, Some(1));
         assert_eq!(ring.len(), 1);
     }
@@ -2393,7 +2393,7 @@ mod tests {
         let ring = EventRingBuffer::with_capacity(8);
         let _guard = ring.inner.lock().expect("lock");
         let ring2 = ring.clone();
-        assert!(ring2.try_push(sample_http("/blocked", 500)).is_none());
+        assert!(ring2.try_push(sample_http("/blocked", 500)).is_err());
     }
 
     #[test]
@@ -3189,8 +3189,8 @@ mod tests {
         // Hold the lock to force contention
         let guard = ring.inner.lock().expect("lock");
         let ring2 = ring.clone();
-        assert!(ring2.try_push(sample_http("/blocked", 500)).is_none());
-        assert!(ring2.try_push(sample_http("/blocked2", 500)).is_none());
+        assert!(ring2.try_push(sample_http("/blocked", 500)).is_err());
+        assert!(ring2.try_push(sample_http("/blocked2", 500)).is_err());
         // Can't read stats with lock held, drop first
         drop(guard);
         let stats = ring.stats();
@@ -3210,7 +3210,7 @@ mod tests {
         for i in 0..7 {
             let seq = ring.try_push(sample_http(&format!("/{i}"), 200));
             assert!(
-                seq.is_some(),
+                seq.is_ok(),
                 "event {i} should be accepted under threshold"
             );
         }
@@ -3222,8 +3222,8 @@ mod tests {
         let mut rejected = 0;
         for _ in 0..10 {
             match ring.try_push(sample_http("/sampled", 200)) {
-                Some(_) => accepted += 1,
-                None => rejected += 1,
+                Ok(_) => accepted += 1,
+                Err(_) => rejected += 1,
             }
         }
         // With sample_rate=2, roughly half should be accepted
@@ -3250,7 +3250,7 @@ mod tests {
         for _ in 0..10 {
             let event = MailEvent::message_sent(1, "A", vec![], "s", "t", "p", "");
             let result = ring.try_push(event);
-            assert!(result.is_some(), "Info events should never be sampled");
+            assert!(result.is_ok(), "Info events should never be sampled");
         }
         assert_eq!(ring.stats().sampled_drops, 0);
     }
@@ -3272,7 +3272,7 @@ mod tests {
         for _ in 0..10 {
             let event = MailEvent::http_request("GET", "/err", 500, 1, "127.0.0.1");
             let result = ring.try_push(event);
-            assert!(result.is_some(), "Error events should never be sampled");
+            assert!(result.is_ok(), "Error events should never be sampled");
         }
     }
 
@@ -3391,7 +3391,7 @@ mod tests {
         let policy = ring.policy();
         assert_eq!(policy.threshold_pct, 100);
         assert_eq!(policy.sample_rate, 1);
-        assert_eq!(ring.try_push(sample_tool_start("normalize")), Some(1));
+        assert_eq!(ring.try_push(sample_tool_start("normalize")).ok(), Some(1));
     }
 
     #[test]
@@ -3536,7 +3536,7 @@ mod tests {
         let mut sampled = 0u64;
         for _ in 0..20 {
             let event = MailEvent::tool_call_start("sampled_trace", Value::Null, None, None);
-            if ring.try_push(event).is_none() {
+            if ring.try_push(event).is_err() {
                 sampled += 1;
             }
         }
@@ -3593,7 +3593,7 @@ mod tests {
                 for i in 0..events_per_thread {
                     if ring
                         .try_push(sample_http(&format!("/t{t}/{i}"), 200))
-                        .is_some()
+                        .is_ok()
                     {
                         pushed += 1;
                     }
