@@ -1180,7 +1180,7 @@ fn run_tui_spin_watchdog_loop(
             continue;
         }
 
-        let now_us = chrono::Utc::now().timestamp_micros();
+        let now_us = mcp_agent_mail_core::timestamps::now_micros();
         let metrics = mcp_agent_mail_core::metrics::global_metrics();
         metrics.system.tui_spin_watchdog_trips_total.inc();
         metrics
@@ -4316,6 +4316,7 @@ fn fetch_dashboard_db_stats_cached(
 }
 
 fn fetch_dashboard_db_stats_from_conn(conn: &DbConn) -> DashboardDbStats {
+    let now_micros = mcp_agent_mail_db::timestamps::now_micros();
     let agents_list = conn
         .query_sync(
             "SELECT name, program, last_active_ts FROM agents \
@@ -4340,13 +4341,7 @@ fn fetch_dashboard_db_stats_from_conn(conn: &DbConn) -> DashboardDbStats {
         projects: dashboard_count(conn, "SELECT COUNT(*) AS c FROM projects"),
         agents: dashboard_count(conn, "SELECT COUNT(*) AS c FROM agents"),
         messages: dashboard_count(conn, "SELECT COUNT(*) AS c FROM messages"),
-        file_reservations: dashboard_count(
-            conn,
-            &format!(
-                "SELECT COUNT(*) AS c FROM file_reservations WHERE ({})",
-                mcp_agent_mail_db::queries::ACTIVE_RESERVATION_PREDICATE
-            ),
-        ),
+        file_reservations: dashboard_active_file_reservations(conn, now_micros),
         contact_links: dashboard_count(conn, "SELECT COUNT(*) AS c FROM agent_links"),
         ack_pending: dashboard_count(
             conn,
@@ -4358,8 +4353,65 @@ fn fetch_dashboard_db_stats_from_conn(conn: &DbConn) -> DashboardDbStats {
     }
 }
 
+fn dashboard_active_file_reservation_predicate(conn: &DbConn) -> &'static str {
+    if dashboard_has_release_ledger_table(conn) {
+        mcp_agent_mail_db::queries::ACTIVE_RESERVATION_PREDICATE
+    } else {
+        mcp_agent_mail_db::queries::ACTIVE_RESERVATION_LEGACY_PREDICATE
+    }
+}
+
+fn dashboard_has_release_ledger_table(conn: &DbConn) -> bool {
+    conn.query_sync(
+        "SELECT 1 AS present FROM sqlite_master \
+         WHERE type = 'table' AND name = 'file_reservation_releases' \
+         LIMIT 1",
+        &[],
+    )
+    .ok()
+    .is_some_and(|rows| !rows.is_empty())
+}
+
+fn dashboard_active_file_reservations(conn: &DbConn, now_micros: i64) -> u64 {
+    let active_predicate = dashboard_active_file_reservation_predicate(conn);
+
+    if crate::tui_poller::file_reservations_support_active_fast_scan(conn) {
+        return dashboard_count_with_params(
+            conn,
+            &format!(
+                "SELECT COUNT(*) AS c FROM file_reservations WHERE ({active_predicate}) AND expires_ts > ?1"
+            ),
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_micros)],
+        );
+    }
+
+    let legacy_sql = format!(
+        "SELECT expires_ts AS raw_expires_ts FROM file_reservations WHERE ({active_predicate})"
+    );
+    conn.query_sync(&legacy_sql, &[])
+        .ok()
+        .map(|rows| {
+            rows.into_iter().fold(0_u64, |count, row| {
+                if crate::tui_poller::parse_raw_ts(&row, "raw_expires_ts") > now_micros {
+                    count.saturating_add(1)
+                } else {
+                    count
+                }
+            })
+        })
+        .unwrap_or(0)
+}
+
 fn dashboard_count(conn: &DbConn, sql: &str) -> u64 {
-    conn.query_sync(sql, &[])
+    dashboard_count_with_params(conn, sql, &[])
+}
+
+fn dashboard_count_with_params(
+    conn: &DbConn,
+    sql: &str,
+    params: &[mcp_agent_mail_db::sqlmodel_core::Value],
+) -> u64 {
+    conn.query_sync(sql, params)
         .ok()
         .and_then(|rows| rows.into_iter().next())
         .and_then(|row| row.get_named::<i64>("c").ok())
@@ -14776,6 +14828,237 @@ mod tests {
     fn dashboard_db_stats_default_has_empty_agents_list() {
         let stats = DashboardDbStats::default();
         assert!(stats.agents_list.is_empty());
+    }
+
+    #[test]
+    fn dashboard_db_stats_excludes_expired_and_released_reservations() {
+        use mcp_agent_mail_db::sqlmodel_core::Value;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("dashboard-stats.sqlite3");
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_BASE_SQL)
+            .expect("init base pragmas");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+
+        let now = mcp_agent_mail_db::timestamps::now_micros();
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?1, ?2, ?3, ?4)",
+            &[
+                Value::BigInt(1),
+                Value::Text("dashboard-project".to_string()),
+                Value::Text("/tmp/dashboard-project".to_string()),
+                Value::BigInt(now),
+            ],
+        )
+        .expect("insert project");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            &[
+                Value::BigInt(1),
+                Value::BigInt(1),
+                Value::Text("BlueLake".to_string()),
+                Value::Text("codex-cli".to_string()),
+                Value::Text("gpt-5".to_string()),
+                Value::Text("dashboard test".to_string()),
+                Value::BigInt(now),
+                Value::BigInt(now),
+            ],
+        )
+        .expect("insert agent");
+
+        for (id, expires_ts) in [(1_i64, now + 60_000_000), (2_i64, now - 60_000_000)] {
+            conn.execute_sync(
+                "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                &[
+                    Value::BigInt(id),
+                    Value::BigInt(1),
+                    Value::BigInt(1),
+                    Value::Text(format!("src/path-{id}.rs")),
+                    Value::BigInt(1),
+                    Value::Text("dashboard test".to_string()),
+                    Value::BigInt(now - 120_000_000),
+                    Value::BigInt(expires_ts),
+                    Value::Null,
+                ],
+            )
+            .expect("insert unreleased reservation");
+        }
+
+        conn.execute_sync(
+            "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            &[
+                Value::BigInt(3),
+                Value::BigInt(1),
+                Value::BigInt(1),
+                Value::Text("src/released.rs".to_string()),
+                Value::BigInt(1),
+                Value::Text("released".to_string()),
+                Value::BigInt(now - 120_000_000),
+                Value::BigInt(now + 60_000_000),
+                Value::Null,
+            ],
+        )
+        .expect("insert released reservation shell");
+        conn.execute_sync(
+            "INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (?1, ?2)",
+            &[Value::BigInt(3), Value::BigInt(now - 10_000_000)],
+        )
+        .expect("insert release ledger row");
+
+        let stats = fetch_dashboard_db_stats_from_conn(&conn);
+        assert_eq!(
+            stats.file_reservations, 1,
+            "dashboard should count only non-expired unreleased reservations"
+        );
+    }
+
+    #[test]
+    fn dashboard_db_stats_accepts_legacy_text_reservation_timestamps() {
+        use mcp_agent_mail_db::sqlmodel_core::Value;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("dashboard-legacy-text.sqlite3");
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at DATETIME)",
+        )
+        .expect("create projects");
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, program TEXT, last_active_ts DATETIME)",
+        )
+        .expect("create agents");
+        conn.execute_raw(
+            "CREATE TABLE file_reservations (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                project_id INTEGER NOT NULL, \
+                agent_id INTEGER NOT NULL, \
+                path_pattern TEXT NOT NULL, \
+                exclusive INTEGER NOT NULL DEFAULT 1, \
+                reason TEXT NOT NULL DEFAULT '', \
+                created_ts DATETIME NOT NULL, \
+                expires_ts DATETIME NOT NULL, \
+                released_ts DATETIME\
+            )",
+        )
+        .expect("create legacy reservations");
+        conn.execute_raw(
+            "CREATE TABLE file_reservation_releases (reservation_id INTEGER PRIMARY KEY, released_ts INTEGER NOT NULL)",
+        )
+        .expect("create release ledger");
+
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?1, ?2, ?3, ?4)",
+            &[
+                Value::BigInt(1),
+                Value::Text("legacy-dashboard".to_string()),
+                Value::Text("/tmp/legacy-dashboard".to_string()),
+                Value::Text("2024-01-01 00:00:00".to_string()),
+            ],
+        )
+        .expect("insert project");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, last_active_ts) VALUES (?1, ?2, ?3, ?4, ?5)",
+            &[
+                Value::BigInt(1),
+                Value::BigInt(1),
+                Value::Text("LegacyAgent".to_string()),
+                Value::Text("python".to_string()),
+                Value::Text("2024-01-01 00:00:00".to_string()),
+            ],
+        )
+        .expect("insert agent");
+
+        for (id, expires_ts, released_ts) in [
+            (1_i64, "2100-01-01 00:00:00", None),
+            (2_i64, "2000-01-01 00:00:00", None),
+            (3_i64, "2100-01-01 00:00:00", Some("2025-01-01 00:00:00")),
+        ] {
+            conn.execute_sync(
+                "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                &[
+                    Value::BigInt(id),
+                    Value::BigInt(1),
+                    Value::BigInt(1),
+                    Value::Text(format!("src/legacy-{id}.rs")),
+                    Value::BigInt(1),
+                    Value::Text("legacy dashboard".to_string()),
+                    Value::Text("2024-01-01 00:00:00".to_string()),
+                    Value::Text(expires_ts.to_string()),
+                    released_ts.map_or(Value::Null, |value| Value::Text(value.to_string())),
+                ],
+            )
+            .expect("insert legacy reservation");
+        }
+
+        conn.execute_sync(
+            "INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (?1, ?2)",
+            &[Value::BigInt(3), Value::BigInt(1_700_000_000_000_000)],
+        )
+        .expect("insert legacy release ledger row");
+
+        let stats = fetch_dashboard_db_stats_from_conn(&conn);
+        assert_eq!(
+            stats.file_reservations, 1,
+            "dashboard should parse legacy TEXT timestamps and still honor release-ledger exclusions"
+        );
+    }
+
+    #[test]
+    fn dashboard_db_stats_handles_missing_release_ledger_table() {
+        use mcp_agent_mail_db::sqlmodel_core::Value;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("dashboard-no-release-ledger.sqlite3");
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+
+        conn.execute_raw(
+            "CREATE TABLE file_reservations (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                project_id INTEGER NOT NULL, \
+                agent_id INTEGER NOT NULL, \
+                path_pattern TEXT NOT NULL, \
+                exclusive INTEGER NOT NULL DEFAULT 1, \
+                reason TEXT NOT NULL DEFAULT '', \
+                created_ts INTEGER NOT NULL, \
+                expires_ts INTEGER NOT NULL, \
+                released_ts INTEGER\
+            )",
+        )
+        .expect("create reservations");
+
+        let now = mcp_agent_mail_db::timestamps::now_micros();
+        conn.execute_sync(
+            "INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            &[
+                Value::BigInt(1),
+                Value::BigInt(1),
+                Value::BigInt(1),
+                Value::Text("src/no-ledger.rs".to_string()),
+                Value::BigInt(1),
+                Value::Text("missing sidecar".to_string()),
+                Value::BigInt(now - 60_000_000),
+                Value::BigInt(now + 60_000_000),
+                Value::Null,
+            ],
+        )
+        .expect("insert reservation");
+
+        let stats = fetch_dashboard_db_stats_from_conn(&conn);
+        assert_eq!(
+            stats.file_reservations, 1,
+            "dashboard should still count active reservations when the sidecar release ledger table is absent"
+        );
     }
 
     #[test]

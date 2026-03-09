@@ -12,7 +12,7 @@
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_db::{iso_to_micros, micros_to_iso};
+use mcp_agent_mail_db::{DbError, iso_to_micros, micros_to_iso};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -22,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     tool_cluster,
-    tool_util::{db_outcome_to_mcp_result, get_db_pool},
+    tool_util::{db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool},
 };
 
 fn split_param_and_query(input: &str) -> (String, HashMap<String, String>) {
@@ -78,6 +78,30 @@ fn parse_resource_since_ts(query: &HashMap<String, String>) -> McpResult<Option<
     }
 }
 
+fn resource_sync_db_error_to_mcp_error(message: String) -> McpError {
+    let db_error = if mcp_agent_mail_db::is_lock_error(&message) {
+        DbError::ResourceBusy(message)
+    } else {
+        DbError::Sqlite(message)
+    };
+    db_error_to_mcp_error(db_error)
+}
+
+async fn acquire_resource_conn(
+    cx: &asupersync::Cx,
+    pool: &mcp_agent_mail_db::DbPool,
+) -> McpResult<impl std::ops::Deref<Target = mcp_agent_mail_db::DbConn>> {
+    match pool.acquire(cx).await {
+        Outcome::Ok(conn) => Ok(conn),
+        Outcome::Err(err) => Err(db_error_to_mcp_error(err)),
+        Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
+        Outcome::Panicked(panic) => Err(McpError::internal_error(format!(
+            "Internal panic: {}",
+            panic.message()
+        ))),
+    }
+}
+
 fn parse_attachment_metadata(input: &str) -> Vec<serde_json::Value> {
     serde_json::from_str(input).unwrap_or_default()
 }
@@ -98,6 +122,12 @@ fn recipient_names(recipients: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn redacted_bcc_recipients() -> Vec<String> {
+    // These resources are project-scoped rather than caller-scoped, so they
+    // cannot safely determine when BCC visibility is allowed.
+    Vec::new()
 }
 
 fn parse_query(query: &str) -> HashMap<String, String> {
@@ -175,17 +205,7 @@ async fn resolve_resource_agent(
     project_id: i64,
     agent_name: &str,
 ) -> McpResult<mcp_agent_mail_db::AgentRow> {
-    let conn = match pool.acquire(ctx.cx()).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(err) => return Err(McpError::internal_error(err.to_string())),
-        Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
-        Outcome::Panicked(panic) => {
-            return Err(McpError::internal_error(format!(
-                "Internal panic: {}",
-                panic.message()
-            )));
-        }
-    };
+    let conn = acquire_resource_conn(ctx.cx(), pool).await?;
     let rows = conn
         .query_sync(
             "SELECT id FROM agents \
@@ -196,7 +216,7 @@ async fn resolve_resource_agent(
                 mcp_agent_mail_db::sqlmodel::Value::Text(agent_name.to_string()),
             ],
         )
-        .map_err(|err| McpError::internal_error(err.to_string()))?;
+        .map_err(|err| resource_sync_db_error_to_mcp_error(err.to_string()))?;
 
     if rows.len() > 1 {
         return Err(McpError::new(
@@ -216,7 +236,7 @@ async fn resolve_resource_agent(
 
     match mcp_agent_mail_db::queries::get_agent_by_id(ctx.cx(), pool, agent_id).await {
         Outcome::Ok(agent) => Ok(agent),
-        Outcome::Err(err) => Err(McpError::internal_error(err.to_string())),
+        Outcome::Err(err) => Err(db_error_to_mcp_error(err)),
         Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
         Outcome::Panicked(p) => Err(McpError::internal_error(format!(
             "Internal panic: {}",
@@ -416,17 +436,7 @@ pub async fn agents_list(ctx: &McpContext, project_key: String) -> McpResult<Str
     )?;
 
     // Get unread counts for all agents in one query
-    let conn = match pool.acquire(ctx.cx()).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Err(McpError::internal_error(e.to_string())),
-        Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
-        Outcome::Panicked(p) => {
-            return Err(McpError::internal_error(format!(
-                "Internal panic: {}",
-                p.message()
-            )));
-        }
-    };
+    let conn = acquire_resource_conn(ctx.cx(), &pool).await?;
     let sql = "SELECT r.agent_id, COUNT(*) as unread \
                FROM message_recipients r \
                JOIN messages m ON m.id = r.message_id \
@@ -436,7 +446,8 @@ pub async fn agents_list(ctx: &McpContext, project_key: String) -> McpResult<Str
     let start = mcp_agent_mail_db::query_timer();
     let unread_rows = conn.query_sync(sql, &params);
     mcp_agent_mail_db::record_query(sql, mcp_agent_mail_db::elapsed_us(start));
-    let unread_rows = unread_rows.map_err(|e| McpError::internal_error(e.to_string()))?;
+    let unread_rows =
+        unread_rows.map_err(|e| resource_sync_db_error_to_mcp_error(e.to_string()))?;
 
     let mut unread_counts: std::collections::HashMap<i64, i64> =
         std::collections::HashMap::with_capacity(agents.len());
@@ -1852,24 +1863,14 @@ pub async fn product_details(ctx: &McpContext, key: String) -> McpResult<String>
     ) -> McpResult<Option<mcp_agent_mail_db::ProductRow>> {
         use mcp_agent_mail_db::sqlmodel::{Model, Value};
 
-        let conn = match pool.acquire(cx).await {
-            Outcome::Ok(c) => c,
-            Outcome::Err(e) => return Err(McpError::internal_error(e.to_string())),
-            Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
-            Outcome::Panicked(p) => {
-                return Err(McpError::internal_error(format!(
-                    "Internal panic: {}",
-                    p.message()
-                )));
-            }
-        };
+        let conn = acquire_resource_conn(cx, pool).await?;
 
         let sql = "SELECT id, product_uid, name, created_at FROM products WHERE product_uid = ? OR name = ? LIMIT 1";
         let params = [Value::Text(key.to_string()), Value::Text(key.to_string())];
         let start = mcp_agent_mail_db::query_timer();
         let rows = conn.query_sync(sql, &params);
         mcp_agent_mail_db::record_query(sql, mcp_agent_mail_db::elapsed_us(start));
-        let rows = rows.map_err(|e| McpError::internal_error(e.to_string()))?;
+        let rows = rows.map_err(|e| resource_sync_db_error_to_mcp_error(e.to_string()))?;
         let Some(row) = rows.into_iter().next() else {
             return Ok(None);
         };
@@ -1943,7 +1944,6 @@ pub struct MessageDetails {
     pub from: String,
     pub to: Vec<String>,
     pub cc: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub bcc: Vec<String>,
 }
 
@@ -1989,7 +1989,7 @@ pub async fn message_details(ctx: &McpContext, message_id: String) -> McpResult<
     let recipients = parse_recipients_json(&msg.recipients_json);
     let to = recipient_names(&recipients, "to");
     let cc = recipient_names(&recipients, "cc");
-    let bcc = recipient_names(&recipients, "bcc");
+    let bcc = redacted_bcc_recipients();
 
     let message = MessageDetails {
         id: msg.id.unwrap_or(0),
@@ -2029,7 +2029,6 @@ pub struct ThreadMessageEntry {
     pub from: String,
     pub to: Vec<String>,
     pub cc: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub bcc: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_md: Option<String>,
@@ -2110,7 +2109,7 @@ pub async fn thread_details(ctx: &McpContext, thread_id: String) -> McpResult<St
         let recipients = parse_recipients_json(&row.recipients);
         let to = recipient_names(&recipients, "to");
         let cc = recipient_names(&recipients, "cc");
-        let bcc = recipient_names(&recipients, "bcc");
+        let bcc = redacted_bcc_recipients();
 
         messages.push(ThreadMessageEntry {
             id: row.id,
@@ -2590,17 +2589,7 @@ async fn load_outbox_messages(
 ) -> McpResult<Vec<OutboxMessageEntry>> {
     use mcp_agent_mail_db::sqlmodel::Value;
 
-    let conn = match pool.acquire(ctx.cx()).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Err(McpError::internal_error(e.to_string())),
-        Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
-        Outcome::Panicked(p) => {
-            return Err(McpError::internal_error(format!(
-                "Internal panic: {}",
-                p.message()
-            )));
-        }
-    };
+    let conn = acquire_resource_conn(ctx.cx(), pool).await?;
 
     let limit_i64 = i64::try_from(options.limit).unwrap_or(20);
     let (sql, params): (String, Vec<Value>) = outbox_query(&options, limit_i64);
@@ -2608,7 +2597,7 @@ async fn load_outbox_messages(
     let start = mcp_agent_mail_db::query_timer();
     let rows = conn.query_sync(&sql, &params);
     mcp_agent_mail_db::record_query(&sql, mcp_agent_mail_db::elapsed_us(start));
-    let rows = rows.map_err(|e| McpError::internal_error(e.to_string()))?;
+    let rows = rows.map_err(|e| resource_sync_db_error_to_mcp_error(e.to_string()))?;
 
     let mut messages: Vec<OutboxMessageEntry> = Vec::with_capacity(rows.len());
     for row in rows {
@@ -2620,7 +2609,8 @@ async fn load_outbox_messages(
         let recip_start = mcp_agent_mail_db::query_timer();
         let recip_rows = conn.query_sync(recip_sql, &recip_params);
         mcp_agent_mail_db::record_query(recip_sql, mcp_agent_mail_db::elapsed_us(recip_start));
-        let recip_rows = recip_rows.map_err(|e| McpError::internal_error(e.to_string()))?;
+        let recip_rows =
+            recip_rows.map_err(|e| resource_sync_db_error_to_mcp_error(e.to_string()))?;
         let (to_list, cc_list, bcc_list) = split_outbox_recipient_lists(recip_rows);
         messages.push(outbox_message_from_row(
             &options, &row, to_list, cc_list, bcc_list,
@@ -4234,6 +4224,39 @@ mod resource_shape_tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn create_message_with_bcc(
+        cx: &Cx,
+        pool: &DbPool,
+        project_id: i64,
+        sender_id: i64,
+        to_recipient_id: i64,
+        bcc_recipient_id: i64,
+        subject: &str,
+        body_md: &str,
+        thread_id: &str,
+        ack_required: bool,
+    ) -> MessageRow {
+        match queries::create_message_with_recipients(
+            cx,
+            pool,
+            project_id,
+            sender_id,
+            subject,
+            body_md,
+            Some(thread_id),
+            "high",
+            ack_required,
+            "[]",
+            &[(to_recipient_id, "to"), (bcc_recipient_id, "bcc")],
+        )
+        .await
+        {
+            Outcome::Ok(message) => message,
+            other => panic!("create_message_with_recipients with bcc failed: {other:?}"),
+        }
+    }
+
     fn parse_json(payload: &str) -> Value {
         serde_json::from_str(payload).expect("valid JSON")
     }
@@ -4387,6 +4410,81 @@ mod resource_shape_tests {
             thread_value["messages"][0]["body_md"],
             "Hello from integration test."
         );
+    }
+
+    #[test]
+    fn message_and_thread_resources_redact_bcc_recipients() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/resources-bcc-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let sender = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let recipient = register_agent(&cx, &pool, project_id, "RedPeak").await;
+                let hidden = register_agent(&cx, &pool, project_id, "GreyOwl").await;
+                let thread_id = format!("thread-bcc-{}", unique_suffix());
+                let message = create_message_with_bcc(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender.id.unwrap_or(0),
+                    recipient.id.unwrap_or(0),
+                    hidden.id.unwrap_or(0),
+                    "Hidden Subject",
+                    "Hidden body.",
+                    &thread_id,
+                    true,
+                )
+                .await;
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let project_ref = project.human_key.clone();
+
+                let message_value = parse_json(
+                    &message_details(
+                        &ctx,
+                        format!("{}?project={project_ref}", message.id.unwrap_or(0)),
+                    )
+                    .await
+                    .expect("message details"),
+                );
+                assert_eq!(message_value["to"][0], recipient.name);
+                assert!(
+                    message_value["bcc"]
+                        .as_array()
+                        .is_some_and(|bcc| bcc.is_empty()),
+                    "message resource should never expose hidden recipients"
+                );
+                assert!(
+                    !message_value.to_string().contains(&hidden.name),
+                    "message resource leaked hidden recipient name"
+                );
+
+                let thread_value = parse_json(
+                    &thread_details(
+                        &ctx,
+                        format!("{thread_id}?project={project_ref}&include_bodies=true"),
+                    )
+                    .await
+                    .expect("thread details"),
+                );
+                let thread_messages = thread_value["messages"]
+                    .as_array()
+                    .expect("thread messages array");
+                assert_eq!(thread_messages.len(), 1);
+                assert!(
+                    thread_messages[0]["bcc"]
+                        .as_array()
+                        .is_some_and(|bcc| bcc.is_empty()),
+                    "thread resource should never expose hidden recipients"
+                );
+                assert!(
+                    !thread_value.to_string().contains(&hidden.name),
+                    "thread resource leaked hidden recipient name"
+                );
+            });
+        });
     }
 
     async fn assert_mailbox_uses_canonical_agent_names(cx: &Cx) {
@@ -6041,6 +6139,22 @@ mod query_param_tests {
         let mut query = HashMap::new();
         query.insert("limit".to_string(), i64::MAX.to_string());
         assert_eq!(parse_resource_limit(&query), RESOURCE_LIMIT_MAX);
+    }
+
+    #[test]
+    fn resource_sync_lock_error_maps_to_resource_busy() {
+        let err = resource_sync_db_error_to_mcp_error("database is locked".to_string());
+        let data = err.data.expect("expected data payload");
+        assert_eq!(data["error"]["type"], "RESOURCE_BUSY");
+        assert_eq!(data["error"]["recoverable"], true);
+    }
+
+    #[test]
+    fn resource_sync_generic_sqlite_error_stays_database_error() {
+        let err = resource_sync_db_error_to_mcp_error("constraint violation".to_string());
+        let data = err.data.expect("expected data payload");
+        assert_eq!(data["error"]["type"], "DATABASE_ERROR");
+        assert_eq!(data["error"]["recoverable"], true);
     }
 
     #[test]

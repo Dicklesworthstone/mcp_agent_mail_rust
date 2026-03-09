@@ -1008,7 +1008,7 @@ fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
 /// - Text containing only digits → parsed as integer microseconds
 /// - Text in `YYYY-MM-DD HH:MM:SS.ffffff` format → parsed via chrono-free manual conversion
 /// - Anything else → 0
-fn parse_raw_ts(row: &Row, col: &str) -> i64 {
+pub(crate) fn parse_raw_ts(row: &Row, col: &str) -> i64 {
     match row.get_by_name(col) {
         Some(Value::Timestamp(v) | Value::TimestampTz(v) | Value::Time(v) | Value::BigInt(v)) => *v,
         Some(Value::Date(v) | Value::Int(v)) => i64::from(*v),
@@ -1261,6 +1261,10 @@ fn reservation_scan_mode(conn: &DbConn, sqlite_path: Option<&str>) -> Reservatio
     }
 
     detect_reservation_scan_mode(conn)
+}
+
+pub(crate) fn file_reservations_support_active_fast_scan(conn: &DbConn) -> bool {
+    detect_reservation_scan_mode(conn) == ReservationScanMode::ActiveFast
 }
 
 fn detect_reservation_scan_mode(conn: &DbConn) -> ReservationScanMode {
