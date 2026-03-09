@@ -2157,6 +2157,7 @@ dependencies = [
 name = "fsqlite-btree"
 version = "0.1.1"
 dependencies = [
+ "foldhash 0.2.0",
  "fsqlite-error",
  "fsqlite-pager",
  "fsqlite-types",
@@ -2170,6 +2171,7 @@ version = "0.1.1"
 dependencies = [
  "asupersync",
  "blake3",
+ "foldhash 0.1.5",
  "fsqlite-ast",
  "fsqlite-btree",
  "fsqlite-error",
@@ -2188,10 +2190,14 @@ dependencies = [
  "fsqlite-vfs",
  "fsqlite-wal",
  "hashbrown 0.14.5",
+ "lazy_static",
  "lru 0.12.5",
+ "regex",
  "serde",
  "serde_json",
+ "smallvec",
  "tracing",
+ "tracing-subscriber",
  "xxhash-rust",
 ]
 
@@ -2276,6 +2282,7 @@ dependencies = [
  "nix 0.29.0",
  "parking_lot",
  "serde",
+ "serde_json",
  "smallvec",
  "tracing",
  "xxhash-rust",
@@ -2309,11 +2316,13 @@ version = "0.1.1"
 dependencies = [
  "argon2",
  "chacha20poly1305",
+ "foldhash 0.1.5",
  "fsqlite-error",
  "fsqlite-types",
  "fsqlite-vfs",
  "hashbrown 0.14.5",
  "parking_lot",
+ "smallvec",
  "xxhash-rust",
 ]
 
