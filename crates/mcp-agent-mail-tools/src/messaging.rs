@@ -1250,11 +1250,8 @@ pub async fn send_message(
 ) -> McpResult<String> {
     // Truncate subject at 200 chars (parity with Python legacy).
     // Use char_indices to avoid panicking on multi-byte UTF-8 boundaries.
-    let subject = if subject.chars().count() > 200 {
-        tracing::warn!(
-            "Subject exceeds 200 characters ({}); truncating",
-            subject.chars().count()
-        );
+    let subject = if subject.chars().nth(200).is_some() {
+        tracing::warn!("Subject exceeds 200 characters; truncating");
         subject.chars().take(200).collect::<String>()
     } else {
         subject
@@ -2138,11 +2135,8 @@ effective_free_bytes={free}"
     };
     // Truncate subject at 200 chars (parity with Python legacy).
     // Use char_indices to avoid panicking on multi-byte UTF-8 boundaries.
-    let subject = if subject.chars().count() > 200 {
-        tracing::warn!(
-            "Reply subject exceeds 200 characters ({}); truncating",
-            subject.chars().count()
-        );
+    let subject = if subject.chars().nth(200).is_some() {
+        tracing::warn!("Reply subject exceeds 200 characters; truncating");
         subject.chars().take(200).collect::<String>()
     } else {
         subject
@@ -3610,7 +3604,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn truncate_subject(subject: &str) -> String {
-        if subject.chars().count() > 200 {
+        if subject.chars().nth(200).is_some() {
             subject.chars().take(200).collect::<String>()
         } else {
             subject.to_string()

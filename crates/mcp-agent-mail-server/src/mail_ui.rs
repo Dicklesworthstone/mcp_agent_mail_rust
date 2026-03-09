@@ -348,6 +348,66 @@ mod route_regressions {
     }
 
     #[test]
+    fn render_inbox_root_seed_uses_numeric_thread_reference() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool("inbox-root-thread");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-inbox-root-thread-{}", unique_nonce()),
+        )));
+        let project_id = project.id.unwrap_or(0);
+
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project_id,
+            "GreenCastle",
+            "test",
+            "test",
+            None,
+            None,
+        )));
+        let recipient = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
+        )));
+
+        let root = outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            sender.id.unwrap_or(0),
+            "Inbox numeric thread root",
+            "Kickoff",
+            None,
+            "normal",
+            false,
+            "[]",
+            &[(recipient.id.unwrap_or(0), "to")],
+        )));
+        let root_id = root.id.unwrap_or(0);
+        let root_thread_ref = root_id.to_string();
+        outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            recipient.id.unwrap_or(0),
+            "Inbox numeric thread reply",
+            "Reply",
+            Some(&root_thread_ref),
+            "normal",
+            false,
+            "[]",
+            &[(sender.id.unwrap_or(0), "to")],
+        )));
+
+        let html = render_inbox(&cx, &pool, &project.slug, &recipient.name, 50, 1, false)
+            .expect("inbox render should succeed")
+            .expect("inbox route should return html");
+        assert!(html.contains(&format!("/mail/{}/thread/{root_id}", project.slug)));
+    }
+
+    #[test]
     fn render_unified_inbox_static_export_marks_snapshot_mode() {
         let cx = Cx::for_testing();
         let pool = make_test_pool("unified-static");
@@ -1213,23 +1273,35 @@ struct UnifiedMessageAggregate {
 }
 
 impl UnifiedMessageAggregate {
-    fn from_inbox_row(project: &ProjectRow, recipient_name: &str, row: &queries::InboxRow) -> Self {
+    fn from_inbox_row(
+        cx: &Cx,
+        pool: &DbPool,
+        project: &ProjectRow,
+        recipient_name: &str,
+        row: &queries::InboxRow,
+    ) -> Result<Self, (u16, String)> {
         let message = &row.message;
         let mut recipients = std::collections::BTreeSet::new();
         recipients.insert(recipient_name.to_string());
-        Self {
+        Ok(Self {
             id: message.id.unwrap_or(0),
             subject: message.subject.clone(),
             body_md: message.body_md.clone(),
             created_ts: message.created_ts,
             importance: message.importance.clone(),
-            thread_id: message.thread_id.clone().unwrap_or_default(),
+            thread_id: display_thread_ref_for_message(
+                cx,
+                pool,
+                project.id.unwrap_or(0),
+                message.id.unwrap_or(0),
+                message.thread_id.as_deref(),
+            )?,
             project_slug: project.slug.clone(),
             project_name: project.human_key.clone(),
             sender: row.sender_name.clone(),
             recipients,
             all_read: row.read_ts.is_some(),
-        }
+        })
     }
 
     fn absorb(&mut self, recipient_name: &str, row: &queries::InboxRow) {
@@ -1260,6 +1332,39 @@ impl UnifiedMessageAggregate {
     }
 }
 
+fn explicit_thread_ref(thread_id: Option<&str>) -> Option<String> {
+    thread_id
+        .map(str::trim)
+        .filter(|thread_id| !thread_id.is_empty())
+        .map(str::to_string)
+}
+
+fn display_thread_ref_for_message(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    message_id: i64,
+    thread_id: Option<&str>,
+) -> Result<String, (u16, String)> {
+    if let Some(thread_ref) = explicit_thread_ref(thread_id) {
+        return Ok(thread_ref);
+    }
+    if message_id <= 0 {
+        return Ok(String::new());
+    }
+
+    let candidate_thread_ref = message_id.to_string();
+    let thread_items = block_on_outcome(
+        cx,
+        queries::list_thread_messages(cx, pool, project_id, &candidate_thread_ref, Some(2)),
+    )?;
+    if thread_items.len() > 1 {
+        Ok(candidate_thread_ref)
+    } else {
+        Ok(String::new())
+    }
+}
+
 fn collect_unified_message_aggregates(
     cx: &Cx,
     pool: &DbPool,
@@ -1286,10 +1391,14 @@ fn collect_unified_message_aggregates(
                 let Some(message_id) = message.id else {
                     continue;
                 };
-                let entry = messages.entry(message_id).or_insert_with(|| {
-                    UnifiedMessageAggregate::from_inbox_row(project, &agent.name, &row)
-                });
-                entry.absorb(&agent.name, &row);
+                if let Some(entry) = messages.get_mut(&message_id) {
+                    entry.absorb(&agent.name, &row);
+                    continue;
+                }
+
+                let aggregate =
+                    UnifiedMessageAggregate::from_inbox_row(cx, pool, project, &agent.name, &row)?;
+                messages.insert(message_id, aggregate);
             }
         }
     }
@@ -1517,26 +1626,28 @@ fn render_inbox(
     // Offset-based pagination (Python: offset = (page - 1) * limit).
     let page = page.max(1);
     let offset = (page - 1).saturating_mul(limit.max(1));
-    let items: Vec<InboxMessage> = inbox
-        .iter()
-        .skip(offset)
-        .take(limit)
-        .map(|row| {
-            let m = &row.message;
-            InboxMessage {
-                id: m.id.unwrap_or(0),
-                subject: m.subject.clone(),
-                body_html: markdown::render_markdown_to_safe_html(&m.body_md),
-                sender: row.sender_name.clone(),
-                importance: m.importance.clone(),
-                thread_id: m.thread_id.clone().unwrap_or_default(),
-                created: ts_display(m.created_ts),
-                ack_required: m.ack_required_bool(),
-                acked: row.ack_ts.is_some(),
-                read: row.read_ts.is_some(),
-            }
-        })
-        .collect();
+    let mut items = Vec::new();
+    for row in inbox.iter().skip(offset).take(limit) {
+        let m = &row.message;
+        items.push(InboxMessage {
+            id: m.id.unwrap_or(0),
+            subject: m.subject.clone(),
+            body_html: markdown::render_markdown_to_safe_html(&m.body_md),
+            sender: row.sender_name.clone(),
+            importance: m.importance.clone(),
+            thread_id: display_thread_ref_for_message(
+                cx,
+                pool,
+                pid,
+                m.id.unwrap_or(0),
+                m.thread_id.as_deref(),
+            )?,
+            created: ts_display(m.created_ts),
+            ack_required: m.ack_required_bool(),
+            acked: row.ack_ts.is_some(),
+            read: row.read_ts.is_some(),
+        });
+    }
 
     let prev_page = if page > 1 { Some(page - 1) } else { None };
     let next_page = if offset.saturating_add(limit) < total {
@@ -1620,11 +1731,7 @@ fn render_message(
         cx,
         queries::list_message_recipients_by_message(cx, pool, pid, message_id),
     )?;
-    let stored_thread_ref = m
-        .thread_id
-        .as_deref()
-        .filter(|thread| !thread.is_empty())
-        .map(str::to_string);
+    let stored_thread_ref = explicit_thread_ref(m.thread_id.as_deref());
     let candidate_thread_ref = stored_thread_ref
         .clone()
         .or_else(|| (current_message_id > 0).then(|| current_message_id.to_string()));
@@ -3504,6 +3611,64 @@ mod fresh_eyes_regression_tests {
             !aggregates[0].all_read,
             "message should stay unread while any recipient remains unread"
         );
+    }
+
+    #[test]
+    fn unified_message_aggregation_root_seed_uses_numeric_thread_reference() {
+        let cx = Cx::for_testing();
+        let pool = make_test_pool("mail-ui-unified-root-thread");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            "/tmp/mail-ui-unified-root-thread",
+        )));
+        let project_id = project.id.expect("project id");
+
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "RedFox", "test", "test", None, None,
+        )));
+        let recipient = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
+        )));
+
+        let root = outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            sender.id.expect("sender id"),
+            "Unified root",
+            "Shared body",
+            None,
+            "normal",
+            false,
+            "[]",
+            &[(recipient.id.expect("recipient id"), "to")],
+        )));
+        let root_id = root.id.expect("root id");
+        let root_thread_ref = root_id.to_string();
+
+        outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            recipient.id.expect("recipient id"),
+            "Unified reply",
+            "Reply body",
+            Some(&root_thread_ref),
+            "normal",
+            false,
+            "[]",
+            &[(sender.id.expect("sender id"), "to")],
+        )));
+
+        let projects = outcome_ok(block_on(queries::list_projects(&cx, &pool)));
+        let aggregates = collect_unified_message_aggregates(&cx, &pool, &projects, 10, None)
+            .expect("aggregation should succeed");
+        let root_aggregate = aggregates
+            .iter()
+            .find(|aggregate| aggregate.id == root_id)
+            .expect("root aggregate should exist");
+        assert_eq!(root_aggregate.thread_id, root_thread_ref);
     }
 
     #[test]
