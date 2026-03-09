@@ -203,6 +203,14 @@ fn normalize_filter_paths(
                         json!({ "path": path }),
                     ));
                 }
+                if let Some(message) = invalid_file_reservation_pattern(&rel) {
+                    return Err(legacy_tool_error(
+                        "INVALID_PATH",
+                        message,
+                        true,
+                        json!({ "path": path }),
+                    ));
+                }
                 normalized_paths.push(rel);
             }
             None => {
@@ -284,15 +292,18 @@ fn renewal_filter_matches(
     if row.agent_id != agent_id || row.released_ts.is_some() {
         return false;
     }
-    if let Some(ids) = reservation_ids
-        && !ids.is_empty()
-        && !row.id.is_some_and(|id| ids.contains(&id))
-    {
-        return false;
+    if let Some(ids) = reservation_ids {
+        if ids.is_empty() {
+            return false;
+        }
+        if !row.id.is_some_and(|id| ids.contains(&id)) {
+            return false;
+        }
     }
-    if let Some(path_patterns) = paths
-        && !path_patterns.is_empty()
-    {
+    if let Some(path_patterns) = paths {
+        if path_patterns.is_empty() {
+            return false;
+        }
         let mut matched = false;
         for pat in path_patterns {
             if row.path_pattern == *pat {
@@ -1776,6 +1787,14 @@ mod tests {
     }
 
     #[test]
+    fn normalize_filter_paths_rejects_invalid_glob_pattern() {
+        let root = "/project";
+        let err = normalize_filter_paths(root, Some(vec!["src/[abc".to_string()]));
+        let rendered = err.expect_err("invalid glob should fail").to_string();
+        assert!(rendered.contains("not a valid glob pattern"));
+    }
+
+    #[test]
     fn expand_tilde_double_tilde_unchanged() {
         // "~~" is not a valid tilde expansion
         let result = expand_tilde("~~");
@@ -1978,5 +1997,31 @@ mod tests {
     fn valid_glob_pattern_not_rejected() {
         let warning = invalid_file_reservation_pattern("src/**/*.{rs,toml}");
         assert!(warning.is_none(), "valid glob syntax should remain allowed");
+    }
+
+    #[test]
+    fn renewal_filter_matches_treats_explicit_empty_filters_as_match_none() {
+        let row = mcp_agent_mail_db::FileReservationRow {
+            id: Some(42),
+            project_id: 1,
+            agent_id: 7,
+            path_pattern: "src/main.rs".to_string(),
+            exclusive: 1,
+            reason: String::new(),
+            created_ts: 0,
+            expires_ts: 1,
+            released_ts: None,
+        };
+        let empty_paths: Vec<String> = Vec::new();
+        let empty_ids: Vec<i64> = Vec::new();
+
+        assert!(!renewal_filter_matches(&row, 7, Some(&empty_paths), None));
+        assert!(!renewal_filter_matches(&row, 7, None, Some(&empty_ids)));
+        assert!(!renewal_filter_matches(
+            &row,
+            7,
+            Some(&empty_paths),
+            Some(&empty_ids),
+        ));
     }
 }

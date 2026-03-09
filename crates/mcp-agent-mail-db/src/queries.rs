@@ -1489,7 +1489,7 @@ pub async fn register_agent(
                 DbError::Sqlite(msg) => {
                     let msg = msg.to_ascii_lowercase();
                     msg.contains("unique constraint failed")
-                        && (msg.contains("agents.project_id") || msg.contains("agents.name"))
+                        && (msg.contains("project_id") || msg.contains("name"))
                 }
                 _ => false,
             };
@@ -4999,6 +4999,12 @@ enum ReleaseReservationChunkTarget {
     Paths,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReleasedReservationMarker {
+    id: i64,
+    released_ts: i64,
+}
+
 fn release_reservation_chunk_plan(
     path_count: usize,
     reservation_id_count: usize,
@@ -5036,33 +5042,62 @@ fn append_release_reservation_filters(
     reservation_ids: Option<&[i64]>,
     paths: Option<&[&str]>,
 ) {
-    if let Some(ids) = reservation_ids
-        && !ids.is_empty()
-    {
-        sql.push_str(" AND id IN (");
-        for (i, id) in ids.iter().enumerate() {
-            if i > 0 {
-                sql.push(',');
+    if let Some(ids) = reservation_ids {
+        if ids.is_empty() {
+            sql.push_str(" AND 0");
+        } else {
+            sql.push_str(" AND id IN (");
+            for (i, id) in ids.iter().enumerate() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                sql.push('?');
+                params.push(Value::BigInt(*id));
             }
-            sql.push('?');
-            params.push(Value::BigInt(*id));
+            sql.push(')');
         }
-        sql.push(')');
     }
 
-    if let Some(pats) = paths
-        && !pats.is_empty()
-    {
-        sql.push_str(" AND (");
-        for (i, pat) in pats.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(" OR ");
+    if let Some(pats) = paths {
+        if pats.is_empty() {
+            sql.push_str(" AND 0");
+        } else {
+            sql.push_str(" AND (");
+            for (i, pat) in pats.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(" OR ");
+                }
+                sql.push_str("path_pattern = ?");
+                params.push(Value::Text((*pat).to_string()));
             }
-            sql.push_str("path_pattern = ?");
-            params.push(Value::Text((*pat).to_string()));
+            sql.push(')');
         }
-        sql.push(')');
     }
+}
+
+fn apply_release_markers(
+    mut reservations: Vec<FileReservationRow>,
+    markers: &[ReleasedReservationMarker],
+) -> Vec<FileReservationRow> {
+    if reservations.is_empty() || markers.is_empty() {
+        return Vec::new();
+    }
+
+    let released_ts_by_id: std::collections::HashMap<i64, i64> = markers
+        .iter()
+        .map(|marker| (marker.id, marker.released_ts))
+        .collect();
+    reservations.retain(|reservation| {
+        reservation
+            .id
+            .is_some_and(|id| released_ts_by_id.contains_key(&id))
+    });
+    for reservation in &mut reservations {
+        reservation.released_ts = reservation
+            .id
+            .and_then(|id| released_ts_by_id.get(&id).copied());
+    }
+    reservations
 }
 
 /// Release file reservations
@@ -5134,8 +5169,6 @@ pub fn release_reservations<'a>(
             }
             return Outcome::Ok(released);
         }
-
-        let now = now_micros();
 
         let conn = match acquire_conn(cx, pool).await {
             Outcome::Ok(c) => c,
@@ -5213,19 +5246,95 @@ pub fn release_reservations<'a>(
         // Commit the read transaction first, then delegate writes to the
         // per-id release path which is more stable on FrankenSQLite.
         try_in_tx!(cx, &tracked_conn, commit_tx(cx, &tracked_conn).await);
-        match release_reservations_by_ids(cx, pool, &target_ids).await {
-            Outcome::Ok(_) => {}
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        }
+        let released_markers =
+            match release_reservations_by_ids_matching_expiry(cx, pool, &target_ids, None).await {
+                Outcome::Ok(markers) => markers,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
 
-        for reservation in &mut reservations {
-            reservation.released_ts = Some(now);
-        }
-
-        Outcome::Ok(reservations)
+        Outcome::Ok(apply_release_markers(reservations, &released_markers))
     }) // Box::pin(async move {
+}
+
+async fn release_reservations_by_ids_matching_expiry(
+    cx: &Cx,
+    pool: &DbPool,
+    ids: &[i64],
+    expires_at_or_before: Option<i64>,
+) -> Outcome<Vec<ReleasedReservationMarker>, DbError> {
+    if ids.is_empty() {
+        return Outcome::Ok(Vec::new());
+    }
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+    try_in_tx!(
+        cx,
+        &tracked,
+        map_sql_outcome(
+            traw_execute(
+                cx,
+                &tracked,
+                "CREATE TABLE IF NOT EXISTS file_reservation_releases (\
+                    reservation_id INTEGER PRIMARY KEY,\
+                    released_ts INTEGER NOT NULL\
+                 )",
+                &[],
+            )
+            .await
+        )
+    );
+
+    let mut release_marker = now_micros();
+    let mut released = Vec::with_capacity(ids.len());
+    let mut probe_sql = format!(
+        "SELECT 1 FROM file_reservations WHERE id = ? AND ({ACTIVE_RESERVATION_PREDICATE})"
+    );
+    if expires_at_or_before.is_some() {
+        probe_sql.push_str(" AND expires_ts <= ?");
+    }
+    probe_sql.push_str(" LIMIT 1");
+    let release_sql = "INSERT OR REPLACE INTO file_reservation_releases (reservation_id, released_ts) VALUES (?, ?)";
+
+    for id in ids {
+        let mut probe_params = Vec::with_capacity(2);
+        probe_params.push(Value::BigInt(*id));
+        if let Some(expiry_cutoff) = expires_at_or_before {
+            probe_params.push(Value::BigInt(expiry_cutoff));
+        }
+        let rows = try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_query(cx, &tracked, &probe_sql, &probe_params).await)
+        );
+        if rows.is_empty() {
+            continue;
+        }
+
+        let released_ts = release_marker;
+        let release_params = [Value::BigInt(*id), Value::BigInt(released_ts)];
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, release_sql, &release_params).await)
+        );
+        release_marker = release_marker.saturating_add(1);
+        released.push(ReleasedReservationMarker {
+            id: *id,
+            released_ts,
+        });
+    }
+
+    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+    Outcome::Ok(released)
 }
 
 /// Renew file reservations
@@ -5266,32 +5375,36 @@ pub async fn renew_reservations(
         Value::BigInt(now),
     ];
 
-    if let Some(ids) = reservation_ids
-        && !ids.is_empty()
-    {
-        sql.push_str(" AND id IN (");
-        for (i, id) in ids.iter().enumerate() {
-            if i > 0 {
-                sql.push(',');
+    if let Some(ids) = reservation_ids {
+        if ids.is_empty() {
+            sql.push_str(" AND 0");
+        } else {
+            sql.push_str(" AND id IN (");
+            for (i, id) in ids.iter().enumerate() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                sql.push('?');
+                params.push(Value::BigInt(*id));
             }
-            sql.push('?');
-            params.push(Value::BigInt(*id));
+            sql.push(')');
         }
-        sql.push(')');
     }
 
-    if let Some(pats) = paths
-        && !pats.is_empty()
-    {
-        sql.push_str(" AND (");
-        for (i, pat) in pats.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(" OR ");
+    if let Some(pats) = paths {
+        if pats.is_empty() {
+            sql.push_str(" AND 0");
+        } else {
+            sql.push_str(" AND (");
+            for (i, pat) in pats.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(" OR ");
+                }
+                sql.push_str("path_pattern = ?");
+                params.push(Value::Text((*pat).to_string()));
             }
-            sql.push_str("path_pattern = ?");
-            params.push(Value::Text((*pat).to_string()));
+            sql.push(')');
         }
-        sql.push(')');
     }
 
     let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
@@ -6455,8 +6568,8 @@ pub async fn release_expired_reservations(
         return Outcome::Ok(ids);
     }
 
-    match release_reservations_by_ids(cx, pool, &ids).await {
-        Outcome::Ok(_) => Outcome::Ok(ids),
+    match release_reservations_by_ids_matching_expiry(cx, pool, &ids, Some(now)).await {
+        Outcome::Ok(markers) => Outcome::Ok(markers.into_iter().map(|marker| marker.id).collect()),
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -6529,65 +6642,12 @@ pub async fn release_reservations_by_ids(
     pool: &DbPool,
     ids: &[i64],
 ) -> Outcome<usize, DbError> {
-    if ids.is_empty() {
-        return Outcome::Ok(0);
+    match release_reservations_by_ids_matching_expiry(cx, pool, ids, None).await {
+        Outcome::Ok(markers) => Outcome::Ok(markers.len()),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
     }
-
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-    let tracked = tracked(&*conn);
-    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
-    try_in_tx!(
-        cx,
-        &tracked,
-        map_sql_outcome(
-            traw_execute(
-                cx,
-                &tracked,
-                "CREATE TABLE IF NOT EXISTS file_reservation_releases (\
-                    reservation_id INTEGER PRIMARY KEY,\
-                    released_ts INTEGER NOT NULL\
-                 )",
-                &[],
-            )
-            .await
-        )
-    );
-
-    let mut total_affected = 0usize;
-    let mut release_marker = now_micros();
-    let probe_sql = format!(
-        "SELECT 1 FROM file_reservations WHERE id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) LIMIT 1"
-    );
-    let release_sql = "INSERT OR REPLACE INTO file_reservation_releases (reservation_id, released_ts) VALUES (?, ?)";
-
-    for id in ids {
-        let probe_params = [Value::BigInt(*id)];
-        let rows = try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_query(cx, &tracked, &probe_sql, &probe_params).await)
-        );
-        if rows.is_empty() {
-            continue;
-        }
-
-        let release_params = [Value::BigInt(*id), Value::BigInt(release_marker)];
-        try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, release_sql, &release_params).await)
-        );
-        release_marker = release_marker.saturating_add(1);
-        total_affected = total_affected.saturating_add(1);
-    }
-
-    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-    Outcome::Ok(total_affected)
 }
 
 // =============================================================================
@@ -7266,6 +7326,46 @@ mod tests {
             id_count + chunk_size <= MAX_RELEASE_RESERVATION_FILTER_ITEMS,
             "chunked paths must fit SQLite bind limit"
         );
+    }
+
+    #[test]
+    fn apply_release_markers_keeps_only_rows_released_by_this_call() {
+        let reservations = vec![
+            FileReservationRow {
+                id: Some(11),
+                project_id: 1,
+                agent_id: 2,
+                path_pattern: "src/a.rs".to_string(),
+                exclusive: 1,
+                reason: "first".to_string(),
+                created_ts: 10,
+                expires_ts: 20,
+                released_ts: None,
+            },
+            FileReservationRow {
+                id: Some(12),
+                project_id: 1,
+                agent_id: 2,
+                path_pattern: "src/b.rs".to_string(),
+                exclusive: 1,
+                reason: "second".to_string(),
+                created_ts: 11,
+                expires_ts: 21,
+                released_ts: None,
+            },
+        ];
+
+        let released = apply_release_markers(
+            reservations,
+            &[ReleasedReservationMarker {
+                id: 12,
+                released_ts: 99,
+            }],
+        );
+
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].id, Some(12));
+        assert_eq!(released[0].released_ts, Some(99));
     }
 
     #[test]
@@ -8186,6 +8286,245 @@ mod tests {
             .expect("list numeric thread roots with replies");
 
             assert_eq!(roots, vec![root_with_reply_id]);
+        });
+    }
+
+    #[test]
+    fn release_reservations_empty_id_filter_matches_nothing() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("release_empty_filter.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project =
+                ensure_project(&cx, &pool, &format!("/tmp/am-release-empty-filter-{base}"))
+                    .await
+                    .into_result()
+                    .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let agent = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("holder"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register agent");
+            let agent_id = agent.id.expect("agent id");
+
+            create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                &["src/main.rs"],
+                3600,
+                true,
+                "test",
+            )
+            .await
+            .into_result()
+            .expect("create reservation");
+
+            let released = release_reservations(&cx, &pool, project_id, agent_id, None, Some(&[]))
+                .await
+                .into_result()
+                .expect("release reservations");
+            assert!(released.is_empty(), "empty filter must not release all");
+
+            let active = list_file_reservations(&cx, &pool, project_id, true)
+                .await
+                .into_result()
+                .expect("list active reservations");
+            assert_eq!(active.len(), 1, "reservation should remain active");
+        });
+    }
+
+    #[test]
+    fn release_reservations_by_ids_matching_expiry_skips_rows_renewed_after_scan() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("release_matching_expiry.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-release-matching-expiry-{base}"),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let agent = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("holder"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register agent");
+            let agent_id = agent.id.expect("agent id");
+
+            let created = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                &["src/main.rs"],
+                3600,
+                true,
+                "test",
+            )
+            .await
+            .into_result()
+            .expect("create reservation");
+            let reservation_id = created[0].id.expect("reservation id");
+            let cutoff = now_micros();
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            let tracked = tracked(&*conn);
+
+            let expired_params = [
+                Value::BigInt(cutoff.saturating_sub(1)),
+                Value::BigInt(reservation_id),
+            ];
+            map_sql_outcome(
+                traw_execute(
+                    &cx,
+                    &tracked,
+                    "UPDATE file_reservations SET expires_ts = ? WHERE id = ?",
+                    &expired_params,
+                )
+                .await,
+            )
+            .into_result()
+            .expect("mark reservation expired");
+
+            let renewed_params = [
+                Value::BigInt(cutoff.saturating_add(60_000_000)),
+                Value::BigInt(reservation_id),
+            ];
+            map_sql_outcome(
+                traw_execute(
+                    &cx,
+                    &tracked,
+                    "UPDATE file_reservations SET expires_ts = ? WHERE id = ?",
+                    &renewed_params,
+                )
+                .await,
+            )
+            .into_result()
+            .expect("renew reservation after scan");
+            drop(conn);
+
+            let released = release_reservations_by_ids_matching_expiry(
+                &cx,
+                &pool,
+                &[reservation_id],
+                Some(cutoff),
+            )
+            .await
+            .into_result()
+            .expect("release matching expiry");
+            assert!(
+                released.is_empty(),
+                "renewed reservation must not be force-released by stale expiry snapshot"
+            );
+
+            let active = list_file_reservations(&cx, &pool, project_id, true)
+                .await
+                .into_result()
+                .expect("list active reservations");
+            assert_eq!(active.len(), 1);
+            assert_eq!(active[0].id, Some(reservation_id));
+            assert!(active[0].released_ts.is_none());
+        });
+    }
+
+    #[test]
+    fn renew_reservations_empty_id_filter_matches_nothing() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("renew_empty_filter.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-renew-empty-filter-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let agent = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("holder"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register agent");
+            let agent_id = agent.id.expect("agent id");
+
+            let created = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                &["src/main.rs"],
+                3600,
+                true,
+                "test",
+            )
+            .await
+            .into_result()
+            .expect("create reservation");
+            let original_expires = created[0].expires_ts;
+
+            let renewed =
+                renew_reservations(&cx, &pool, project_id, agent_id, 600, None, Some(&[]))
+                    .await
+                    .into_result()
+                    .expect("renew reservations");
+            assert!(renewed.is_empty(), "empty filter must not renew all");
+
+            let active = list_file_reservations(&cx, &pool, project_id, true)
+                .await
+                .into_result()
+                .expect("list active reservations");
+            assert_eq!(active.len(), 1);
+            assert_eq!(active[0].expires_ts, original_expires);
         });
     }
 
