@@ -620,7 +620,14 @@ fn command_line_has_agent_mail_signature(command: &str) -> bool {
 fn executable_name_has_agent_mail_signature(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "mcp-agent-mail" | "mcp_agent_mail" | "mcp-agent-mail.exe" | "mcp_agent_mail.exe"
+        "mcp-agent-mail"
+            | "mcp_agent_mail"
+            | "mcp-agent-mail.exe"
+            | "mcp_agent_mail.exe"
+            | "mcp-agent-mail-cli"
+            | "mcp_agent_mail_cli"
+            | "mcp-agent-mail-cli.exe"
+            | "mcp_agent_mail_cli.exe"
     )
 }
 
@@ -1699,9 +1706,18 @@ mod tests {
         assert!(command_line_has_agent_mail_signature(
             "/opt/tools/mcp_agent_mail daemon"
         ));
+        assert!(command_line_has_agent_mail_signature(
+            "/home/ubuntu/.cargo/bin/mcp-agent-mail-cli serve-http"
+        ));
         assert!(executable_name_has_agent_mail_signature("mcp-agent-mail"));
         assert!(executable_name_has_agent_mail_signature(
+            "mcp-agent-mail-cli"
+        ));
+        assert!(executable_name_has_agent_mail_signature(
             "mcp_agent_mail.exe"
+        ));
+        assert!(executable_name_has_agent_mail_signature(
+            "mcp_agent_mail_cli.exe"
         ));
     }
 

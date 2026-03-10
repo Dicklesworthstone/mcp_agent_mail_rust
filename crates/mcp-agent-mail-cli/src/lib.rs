@@ -2312,13 +2312,46 @@ fn auto_clear_port(host: &str, port: u16) -> CliResult<()> {
 /// Kill Agent Mail processes holding `port` using bounded listener PID lookup.
 /// Attempts graceful termination (SIGTERM) before forceful kill (SIGKILL).
 fn kill_port_holder(host: &str, port: u16) -> CliResult<()> {
-    use mcp_agent_mail_server::startup_checks::agent_mail_port_holder_pids_with_hint;
+    kill_port_holder_with_pids(host, port, resolved_agent_mail_listener_pids(host, port))
+}
 
-    kill_port_holder_with_pids(
-        host,
-        port,
-        agent_mail_port_holder_pids_with_hint(host, port),
+/// Choose the listener PIDs we can safely terminate for a verified Agent Mail
+/// server. Prefer explicit Agent Mail signatures, but once the server has
+/// positively identified itself via the health check, fall back to the raw
+/// listener PID set so installations launched as `am` still restart cleanly.
+fn resolved_agent_mail_listener_pids(host: &str, port: u16) -> Vec<u32> {
+    use mcp_agent_mail_server::startup_checks::{
+        PortStatus, agent_mail_port_holder_pids_with_hint, check_port_status,
+        listener_port_holder_pids_with_hint,
+    };
+
+    let agent_mail_pids = agent_mail_port_holder_pids_with_hint(host, port);
+    if !agent_mail_pids.is_empty() {
+        return agent_mail_pids;
+    }
+
+    select_killable_agent_mail_pids(
+        &check_port_status(host, port),
+        agent_mail_pids,
+        listener_port_holder_pids_with_hint(host, port),
     )
+}
+
+fn select_killable_agent_mail_pids(
+    status: &mcp_agent_mail_server::startup_checks::PortStatus,
+    agent_mail_pids: Vec<u32>,
+    listener_pids: Vec<u32>,
+) -> Vec<u32> {
+    if !agent_mail_pids.is_empty() {
+        agent_mail_pids
+    } else if matches!(
+        status,
+        mcp_agent_mail_server::startup_checks::PortStatus::AgentMailServer
+    ) {
+        listener_pids
+    } else {
+        Vec::new()
+    }
 }
 
 #[cfg(unix)]
@@ -2459,6 +2492,42 @@ mod invocation_name_tests {
         let cmd = Cli::command().name("am").bin_name("am");
         let help = long_help_text(cmd);
         assert!(help.contains("am"), "expected help to reference am");
+    }
+}
+
+#[cfg(test)]
+mod port_kill_tests {
+    use super::*;
+    use mcp_agent_mail_server::startup_checks::PortStatus;
+
+    #[test]
+    fn select_killable_agent_mail_pids_prefers_signed_agent_mail_processes() {
+        assert_eq!(
+            select_killable_agent_mail_pids(&PortStatus::AgentMailServer, vec![11], vec![22]),
+            vec![11]
+        );
+    }
+
+    #[test]
+    fn select_killable_agent_mail_pids_uses_verified_listener_when_alias_is_unsigned() {
+        assert_eq!(
+            select_killable_agent_mail_pids(&PortStatus::AgentMailServer, vec![], vec![22]),
+            vec![22]
+        );
+    }
+
+    #[test]
+    fn select_killable_agent_mail_pids_rejects_unverified_listener_pids() {
+        assert!(
+            select_killable_agent_mail_pids(
+                &PortStatus::OtherProcess {
+                    description: "foreign listener".to_string(),
+                },
+                vec![],
+                vec![22],
+            )
+            .is_empty()
+        );
     }
 }
 
@@ -10050,7 +10119,7 @@ fn doctor_cleanup_orphaned_message_recipients(
     conn.execute_raw("BEGIN IMMEDIATE")
         .map_err(|e| CliError::Other(format!("failed to begin orphan-recipient cleanup: {e}")))?;
 
-        let cleanup_result = (|| -> CliResult<()> {
+    let cleanup_result = (|| -> CliResult<()> {
         let delete_sql = "DELETE FROM message_recipients WHERE message_id = ? AND agent_id = ?";
         for orphan in &orphaned {
             let params = [
