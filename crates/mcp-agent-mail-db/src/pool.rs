@@ -1132,16 +1132,13 @@ async fn run_sqlite_init_once(
     sqlite_path: &str,
     run_migrations: bool,
 ) -> Outcome<(), SqlError> {
-    // Run schema migrations through canonical SQLite to avoid known
-    // malformed-index behavior seen in Franken migration paths on legacy
-    // fixtures. Runtime traffic still uses Franken pooled connections.
     if run_migrations {
         let mig_conn = crate::guard_db_conn(
-            match open_sqlite_file_with_lock_retry_canonical(sqlite_path) {
+            match open_sqlite_file_with_lock_retry(sqlite_path) {
                 Ok(conn) => conn,
                 Err(err) => {
                     return Outcome::Err(SqlError::Custom(format!(
-                        "sqlite init stage=open_file_canonical failed: {err}"
+                        "sqlite init stage=open_file failed: {err}"
                     )));
                 }
             },
@@ -1150,11 +1147,11 @@ async fn run_sqlite_init_once(
 
         if let Err(err) = mig_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL) {
             return Outcome::Err(SqlError::Custom(format!(
-                "sqlite init stage=base_pragmas_canonical failed: {err}"
+                "sqlite init stage=base_pragmas failed: {err}"
             )));
         }
 
-        match schema::migrate_to_latest_base(cx, &mig_conn).await {
+        match schema::migrate_to_latest_base(cx, &*mig_conn).await {
             Outcome::Ok(_) => {}
             Outcome::Err(err) => {
                 return Outcome::Err(SqlError::Custom(format!(

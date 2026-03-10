@@ -127,14 +127,8 @@ pub use sqlmodel_sqlite;
 /// `BEGIN CONCURRENT` write paths.
 pub type DbConn = sqlmodel_frankensqlite::FrankenConnection;
 
-pub fn close_db_conn(conn: DbConn, context: &'static str) {
-    if let Err(err) = conn.close_sync() {
-        tracing::warn!(
-            context,
-            error = %err,
-            "failed to close sqlite connection cleanly"
-        );
-    }
+pub fn close_db_conn(conn: DbConn, _context: &'static str) {
+    drop(conn);
 }
 
 pub struct DbConnGuard {
