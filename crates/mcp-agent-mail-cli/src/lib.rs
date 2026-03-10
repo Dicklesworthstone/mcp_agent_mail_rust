@@ -9889,6 +9889,165 @@ fn open_db_for_doctor_check(database_url: &str) -> CliResult<mcp_agent_mail_db::
     open_db_for_doctor_check_with_context(database_url).map(|opened| opened.conn)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorForeignKeyViolation {
+    table: String,
+    rowid: i64,
+    parent: String,
+    fkid: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorOrphanedMessageRecipient {
+    rowid: i64,
+    message_id: i64,
+    agent_id: i64,
+}
+
+fn doctor_foreign_key_violations(
+    conn: &mcp_agent_mail_db::DbConn,
+) -> CliResult<Vec<DoctorForeignKeyViolation>> {
+    let rows = conn
+        .query_sync("PRAGMA foreign_key_check", &[])
+        .map_err(|e| CliError::Other(format!("foreign key check failed: {e}")))?;
+    let mut violations = Vec::with_capacity(rows.len());
+    for row in rows {
+        violations.push(DoctorForeignKeyViolation {
+            table: row
+                .get_as(0)
+                .map_err(|e| CliError::Other(format!("foreign key check decode failed: {e}")))?,
+            rowid: row
+                .get_as(1)
+                .map_err(|e| CliError::Other(format!("foreign key check decode failed: {e}")))?,
+            parent: row
+                .get_as(2)
+                .map_err(|e| CliError::Other(format!("foreign key check decode failed: {e}")))?,
+            fkid: row
+                .get_as(3)
+                .map_err(|e| CliError::Other(format!("foreign key check decode failed: {e}")))?,
+        });
+    }
+    Ok(violations)
+}
+
+fn doctor_orphaned_message_recipients(
+    conn: &mcp_agent_mail_db::DbConn,
+) -> CliResult<Vec<DoctorOrphanedMessageRecipient>> {
+    let rows = conn
+        .query_sync(
+            "SELECT mr.rowid, mr.message_id, mr.agent_id \
+             FROM message_recipients mr \
+             LEFT JOIN messages m ON m.id = mr.message_id \
+             LEFT JOIN agents a ON a.id = mr.agent_id \
+             WHERE m.id IS NULL OR a.id IS NULL \
+             ORDER BY mr.rowid ASC",
+            &[],
+        )
+        .map_err(|e| CliError::Other(format!("orphaned recipient query failed: {e}")))?;
+    let mut recipients = Vec::with_capacity(rows.len());
+    for row in rows {
+        recipients.push(DoctorOrphanedMessageRecipient {
+            rowid: row
+                .get_as(0)
+                .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
+            message_id: row
+                .get_as(1)
+                .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
+            agent_id: row
+                .get_as(2)
+                .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
+        });
+    }
+    Ok(recipients)
+}
+
+fn doctor_rebuild_inbox_stats_for_agents(
+    conn: &mcp_agent_mail_db::DbConn,
+    agent_ids: &[i64],
+) -> CliResult<()> {
+    let delete_sql = "DELETE FROM inbox_stats WHERE agent_id = ?";
+    let rebuild_sql = "INSERT INTO inbox_stats \
+         (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+         SELECT \
+             r.agent_id, \
+             COUNT(*) AS total_count, \
+             SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
+             SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END) AS ack_pending_count, \
+             MAX(m.created_ts) AS last_message_ts \
+         FROM message_recipients r \
+         JOIN messages m ON m.id = r.message_id \
+         WHERE r.agent_id = ? \
+         GROUP BY r.agent_id";
+
+    for agent_id in agent_ids {
+        let params = [mcp_agent_mail_db::sqlmodel_core::Value::BigInt(*agent_id)];
+        conn.execute_sync(delete_sql, &params).map_err(|e| {
+            CliError::Other(format!(
+                "failed to clear inbox_stats for agent {agent_id}: {e}"
+            ))
+        })?;
+        conn.execute_sync(rebuild_sql, &params).map_err(|e| {
+            CliError::Other(format!(
+                "failed to rebuild inbox_stats for agent {agent_id}: {e}"
+            ))
+        })?;
+    }
+
+    Ok(())
+}
+
+fn doctor_cleanup_orphaned_message_recipients(
+    conn: &mcp_agent_mail_db::DbConn,
+    dry_run: bool,
+) -> CliResult<(usize, usize)> {
+    let orphaned = doctor_orphaned_message_recipients(conn)?;
+    if orphaned.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let affected_agents: Vec<i64> = orphaned
+        .iter()
+        .map(|row| row.agent_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    if dry_run {
+        return Ok((orphaned.len(), affected_agents.len()));
+    }
+
+    conn.execute_raw("BEGIN IMMEDIATE")
+        .map_err(|e| CliError::Other(format!("failed to begin orphan-recipient cleanup: {e}")))?;
+
+    let cleanup_result = (|| -> CliResult<()> {
+        let delete_sql = "DELETE FROM message_recipients WHERE rowid = ?";
+        for orphan in &orphaned {
+            let params = [mcp_agent_mail_db::sqlmodel_core::Value::BigInt(
+                orphan.rowid,
+            )];
+            conn.execute_sync(delete_sql, &params).map_err(|e| {
+                CliError::Other(format!(
+                    "failed to delete orphaned recipient row {}: {e}",
+                    orphan.rowid
+                ))
+            })?;
+        }
+        doctor_rebuild_inbox_stats_for_agents(conn, &affected_agents)
+    })();
+
+    match cleanup_result {
+        Ok(()) => conn.execute_raw("COMMIT").map_err(|e| {
+            CliError::Other(format!("failed to commit orphan-recipient cleanup: {e}"))
+        })?,
+        Err(err) => {
+            let _ = conn.execute_raw("ROLLBACK");
+            return Err(err);
+        }
+    }
+
+    Ok((orphaned.len(), affected_agents.len()))
+}
+
 fn beads_issue_awareness_counts_from(
     start: Option<&Path>,
 ) -> Result<(usize, usize, usize), String> {
@@ -10458,6 +10617,83 @@ fn handle_doctor_check_with(
                     "Database reopen probe failed"
                 },
             }));
+        }
+    }
+
+    // Check 1d: Foreign-key integrity, including orphaned message recipients.
+    {
+        if db_file_sanity_failed {
+            checks.push(serde_json::json!({
+                "check": "foreign_key_integrity",
+                "status": "fail",
+                "detail": "Skipped because db_file_sanity failed (potential corruption)",
+            }));
+        } else {
+            match open_db_for_doctor_check(database_url).and_then(|conn| {
+                let violations = doctor_foreign_key_violations(&conn)?;
+                let orphaned = doctor_orphaned_message_recipients(&conn)?;
+                Ok((violations, orphaned))
+            }) {
+                Ok((violations, orphaned)) => {
+                    if violations.is_empty() {
+                        checks.push(serde_json::json!({
+                            "check": "foreign_key_integrity",
+                            "status": "ok",
+                            "detail": "No foreign key violations detected",
+                        }));
+                    } else {
+                        let violation_examples = violations
+                            .iter()
+                            .take(5)
+                            .map(|violation| {
+                                format!(
+                                    "{} rowid {} -> {} (fk {})",
+                                    violation.table,
+                                    violation.rowid,
+                                    violation.parent,
+                                    violation.fkid
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let orphan_detail = if orphaned.is_empty() {
+                            String::new()
+                        } else {
+                            let orphan_examples = orphaned
+                                .iter()
+                                .take(5)
+                                .map(|row| {
+                                    format!(
+                                        "rowid {} (message_id={}, agent_id={})",
+                                        row.rowid, row.message_id, row.agent_id
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            format!(
+                                "; orphaned message_recipients={} [{}]",
+                                orphaned.len(),
+                                orphan_examples
+                            )
+                        };
+                        checks.push(serde_json::json!({
+                            "check": "foreign_key_integrity",
+                            "status": "fail",
+                            "detail": format!(
+                                "{} foreign key violation(s){}; examples: {}",
+                                violations.len(),
+                                orphan_detail,
+                                violation_examples
+                            ),
+                        }));
+                    }
+                }
+                Err(err) => checks.push(serde_json::json!({
+                    "check": "foreign_key_integrity",
+                    "status": "fail",
+                    "detail": format!("Foreign-key integrity probe failed: {err}"),
+                })),
+            }
         }
     }
 
@@ -21469,6 +21705,58 @@ command = "mcp-agent-mail"
     }
 
     #[test]
+    fn integration_doctor_check_reports_foreign_key_integrity_failures() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("doctor_fk_fail.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        handle_migrate_with_database_url(&db_url).expect("migrate");
+
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys for fixture");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'doctor-fk', '/tmp/doctor-fk', 0)",
+        )
+        .expect("insert project");
+        conn.execute_raw(
+            "INSERT INTO agents
+             (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+             VALUES (1, 1, 'RedLake', 'codex-cli', 'gpt-5', 'doctor test', 0, 0, 'auto', 'auto')",
+        )
+        .expect("insert agent");
+        conn.execute_raw(
+            "INSERT INTO message_recipients (message_id, agent_id, kind)
+             VALUES (999, 1, 'to')",
+        )
+        .expect("insert orphaned recipient");
+        drop(conn);
+
+        let parsed = run_doctor_check_json(&db_url, dir.path());
+        assert_eq!(
+            parsed["healthy"],
+            serde_json::Value::Bool(false),
+            "doctor check should mark foreign-key corruption unhealthy"
+        );
+        let checks = parsed["checks"].as_array().expect("checks array");
+        let fk_check = checks
+            .iter()
+            .find(|c| c["check"].as_str() == Some("foreign_key_integrity"))
+            .expect("foreign_key_integrity check should be present");
+        assert_eq!(fk_check["status"].as_str(), Some("fail"));
+        let detail = fk_check["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("message_recipients") && detail.contains("message_id=999"),
+            "expected orphan recipient detail, got: {detail}"
+        );
+    }
+
+    #[test]
     fn integration_doctor_check_reports_installed_agents_probe() {
         let _guard = stdio_capture_lock()
             .lock()
@@ -25848,6 +26136,101 @@ command = "mcp-agent-mail"
             .expect("marker value in sibling backup");
         assert_eq!(sibling_marker, "from-wal");
     }
+
+    #[test]
+    fn doctor_repair_removes_orphaned_message_recipients_and_rebuilds_inbox_stats() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("doctor_repair_orphaned_recipients.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let backup_dir = dir.path().join("backups");
+
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init pragmas");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys for fixture");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'repair-fk', '/tmp/repair-fk', 0)",
+        )
+        .expect("insert project");
+        conn.execute_raw(
+            "INSERT INTO agents
+             (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+             VALUES
+                (1, 1, 'Sender', 'codex-cli', 'gpt-5', 'sender', 0, 0, 'auto', 'auto'),
+                (2, 1, 'Recipient', 'codex-cli', 'gpt-5', 'recipient', 0, 0, 'auto', 'auto')",
+        )
+        .expect("insert agents");
+        conn.execute_raw(
+            "INSERT INTO messages
+             (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments)
+             VALUES (1, 1, 1, 'THREAD-REPAIR', 'repair', 'body', 'normal', 1, 100, '[]')",
+        )
+        .expect("insert message");
+        conn.execute_raw(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES
+                (1, 2, 'to', NULL, NULL),
+                (999, 2, 'to', NULL, NULL)",
+        )
+        .expect("insert valid + orphaned recipients");
+        drop(conn);
+
+        let _capture = ftui_runtime::StdioCapture::install().unwrap();
+        handle_doctor_repair_with(&db_url, &backup_dir, None, false, true).expect("repair");
+
+        let verify =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("reopen db");
+        let fk_rows = verify
+            .query_sync("PRAGMA foreign_key_check", &[])
+            .expect("foreign key check");
+        assert!(
+            fk_rows.is_empty(),
+            "repair should clear foreign-key violations, got: {fk_rows:?}"
+        );
+
+        let recipient_rows = verify
+            .query_sync(
+                "SELECT COUNT(*) AS count FROM message_recipients WHERE agent_id = 2",
+                &[],
+            )
+            .expect("recipient count");
+        assert_eq!(
+            recipient_rows[0].get_named::<i64>("count").unwrap_or(-1),
+            1,
+            "repair should keep only the valid recipient row"
+        );
+
+        let stats_rows = verify
+            .query_sync(
+                "SELECT total_count, unread_count, ack_pending_count
+                 FROM inbox_stats WHERE agent_id = 2",
+                &[],
+            )
+            .expect("inbox_stats");
+        assert_eq!(stats_rows.len(), 1, "recipient stats row should remain");
+        assert_eq!(
+            stats_rows[0].get_named::<i64>("total_count").unwrap_or(-1),
+            1
+        );
+        assert_eq!(
+            stats_rows[0].get_named::<i64>("unread_count").unwrap_or(-1),
+            1
+        );
+        assert_eq!(
+            stats_rows[0]
+                .get_named::<i64>("ack_pending_count")
+                .unwrap_or(-1),
+            1
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28403,36 +28786,7 @@ fn handle_doctor_repair_with(
         }
     }
 
-    // 3. Rebuild FTS if tables exist
-    if !dry_run {
-        let fts_tables = conn
-            .query_sync(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_fts%'",
-                &[],
-            )
-            .unwrap_or_default();
-        if !fts_tables.is_empty() {
-            for row in &fts_tables {
-                let name: String = row.get_named("name").unwrap_or_default();
-                let rebuild_sql = format!("INSERT INTO {name}({name}) VALUES('rebuild')");
-                match conn.execute_raw(&rebuild_sql) {
-                    Ok(_) => ftui_runtime::ftui_println!("  Rebuilt FTS: {name}"),
-                    Err(e) => ftui_runtime::ftui_eprintln!("  FTS rebuild failed for {name}: {e}"),
-                }
-            }
-        }
-    }
-
-    // 4. VACUUM + ANALYZE
-    if !dry_run {
-        conn.execute_raw("VACUUM")
-            .map_err(|e| CliError::Other(format!("VACUUM failed: {e}")))?;
-        conn.execute_raw("ANALYZE")
-            .map_err(|e| CliError::Other(format!("ANALYZE failed: {e}")))?;
-        ftui_runtime::ftui_println!("  VACUUM + ANALYZE complete.");
-    }
-
-    // 5. Check orphan records
+    // 3. Check orphan records
     let orphan_msgs = conn
         .query_sync(
             "SELECT COUNT(*) AS cnt FROM messages m \
@@ -28454,6 +28808,49 @@ fn handle_doctor_repair_with(
             .ok();
             ftui_runtime::ftui_println!("  Cleaned orphan messages.");
         }
+    }
+
+    let (orphaned_recipients, affected_agents) =
+        doctor_cleanup_orphaned_message_recipients(&conn, dry_run)?;
+    if orphaned_recipients > 0 {
+        if dry_run {
+            ftui_runtime::ftui_println!(
+                "  Orphaned message recipients: {orphaned_recipients} (would rebuild inbox_stats for {affected_agents} agent(s))"
+            );
+        } else {
+            ftui_runtime::ftui_println!(
+                "  Cleaned orphaned message recipients: {orphaned_recipients} (rebuilt inbox_stats for {affected_agents} agent(s))"
+            );
+        }
+    }
+
+    // 4. Rebuild FTS if tables exist
+    if !dry_run {
+        let fts_tables = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_fts%'",
+                &[],
+            )
+            .unwrap_or_default();
+        if !fts_tables.is_empty() {
+            for row in &fts_tables {
+                let name: String = row.get_named("name").unwrap_or_default();
+                let rebuild_sql = format!("INSERT INTO {name}({name}) VALUES('rebuild')");
+                match conn.execute_raw(&rebuild_sql) {
+                    Ok(_) => ftui_runtime::ftui_println!("  Rebuilt FTS: {name}"),
+                    Err(e) => ftui_runtime::ftui_eprintln!("  FTS rebuild failed for {name}: {e}"),
+                }
+            }
+        }
+    }
+
+    // 5. VACUUM + ANALYZE
+    if !dry_run {
+        conn.execute_raw("VACUUM")
+            .map_err(|e| CliError::Other(format!("VACUUM failed: {e}")))?;
+        conn.execute_raw("ANALYZE")
+            .map_err(|e| CliError::Other(format!("ANALYZE failed: {e}")))?;
+        ftui_runtime::ftui_println!("  VACUUM + ANALYZE complete.");
     }
 
     if let Some(ref slug) = project {
