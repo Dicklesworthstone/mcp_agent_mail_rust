@@ -126,3 +126,59 @@ pub use sqlmodel_sqlite;
 /// Runtime DB traffic uses `FrankenConnection` to enable pure-Rust `SQLite` with
 /// `BEGIN CONCURRENT` write paths.
 pub type DbConn = sqlmodel_frankensqlite::FrankenConnection;
+
+pub fn close_db_conn(conn: DbConn, context: &'static str) {
+    if let Err(err) = conn.close_sync() {
+        tracing::warn!(
+            context,
+            error = %err,
+            "failed to close sqlite connection cleanly"
+        );
+    }
+}
+
+pub struct DbConnGuard {
+    conn: Option<DbConn>,
+    context: &'static str,
+}
+
+impl DbConnGuard {
+    #[must_use]
+    pub fn new(conn: DbConn, context: &'static str) -> Self {
+        Self {
+            conn: Some(conn),
+            context,
+        }
+    }
+
+    pub fn into_inner(mut self) -> DbConn {
+        self.conn.take().expect("DbConnGuard already released")
+    }
+}
+
+impl std::ops::Deref for DbConnGuard {
+    type Target = DbConn;
+
+    fn deref(&self) -> &Self::Target {
+        self.conn.as_ref().expect("DbConnGuard already released")
+    }
+}
+
+impl std::ops::DerefMut for DbConnGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.conn.as_mut().expect("DbConnGuard already released")
+    }
+}
+
+impl Drop for DbConnGuard {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            close_db_conn(conn, self.context);
+        }
+    }
+}
+
+#[must_use]
+pub fn guard_db_conn(conn: DbConn, context: &'static str) -> DbConnGuard {
+    DbConnGuard::new(conn, context)
+}
