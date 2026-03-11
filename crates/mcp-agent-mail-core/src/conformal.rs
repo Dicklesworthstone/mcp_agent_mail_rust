@@ -12,6 +12,7 @@
 //! in a Random World*. Springer.
 
 use std::collections::VecDeque;
+use std::cell::RefCell;
 
 /// Minimum calibration window size before predictions are emitted.
 const MIN_CALIBRATION: usize = 30;
@@ -54,6 +55,10 @@ pub struct PredictionInterval {
 pub struct ConformalPredictor {
     /// Recent observations (sliding window).
     observations: VecDeque<f64>,
+    /// Scratch buffer for median computation.
+    scratch_values: RefCell<Vec<f64>>,
+    /// Scratch buffer for nonconformity scores.
+    scratch_scores: RefCell<Vec<f64>>,
     /// Maximum calibration window size.
     window: usize,
     /// Coverage level (1 - alpha), e.g., 0.90 for 90% coverage.
@@ -77,8 +82,11 @@ impl ConformalPredictor {
     #[must_use]
     pub fn new(window: usize, coverage: f64) -> Self {
         let coverage = coverage.clamp(f64::MIN_POSITIVE, 1.0 - f64::EPSILON);
+        let cap = window.min(1024);
         Self {
-            observations: VecDeque::with_capacity(window.min(1024)),
+            observations: VecDeque::with_capacity(cap),
+            scratch_values: RefCell::new(Vec::with_capacity(cap)),
+            scratch_scores: RefCell::new(Vec::with_capacity(cap)),
             window,
             coverage,
             total_count: 0,
@@ -129,18 +137,18 @@ impl ConformalPredictor {
         let median = self.median();
 
         // Compute nonconformity scores: |obs - median|.
-        let mut scores: Vec<f64> = self
-            .observations
-            .iter()
-            .map(|&x| (x - median).abs())
-            .collect();
+        let mut scratch_scores = self.scratch_scores.borrow_mut();
+        scratch_scores.clear();
+        for &x in &self.observations {
+            scratch_scores.push((x - median).abs());
+        }
 
         // The conformal quantile: ceil((n+1) * coverage) / n.
         // This ensures finite-sample coverage >= nominal coverage.
         let quantile_idx = ((n as f64 + 1.0) * self.coverage).ceil() as usize;
         let quantile_idx = quantile_idx.min(n).saturating_sub(1); // 0-indexed, capped at n-1
 
-        let (_, q, _) = scores.select_nth_unstable_by(quantile_idx, |a, b| {
+        let (_, q, _) = scratch_scores.select_nth_unstable_by(quantile_idx, |a, b| {
             a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
         });
         let q = *q;
@@ -155,14 +163,18 @@ impl ConformalPredictor {
 
     /// Compute the median of the calibration window.
     fn median(&self) -> f64 {
-        let mut values: Vec<f64> = self.observations.iter().copied().collect();
-        let n = values.len();
+        let mut scratch_values = self.scratch_values.borrow_mut();
+        scratch_values.clear();
+        for &x in &self.observations {
+            scratch_values.push(x);
+        }
+        let n = scratch_values.len();
         if n == 0 {
             return 0.0;
         }
 
         let mid_idx = n / 2;
-        let (_, median, _) = values.select_nth_unstable_by(mid_idx, |a, b| {
+        let (_, median, _) = scratch_values.select_nth_unstable_by(mid_idx, |a, b| {
             a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
         });
         let median_val = *median;
@@ -171,7 +183,7 @@ impl ConformalPredictor {
             // Even number of elements: median is avg of sorted[mid-1] and sorted[mid].
             // select_nth_unstable puts element at mid_idx in place, and everything
             // smaller to the left. The max of the left partition is sorted[mid-1].
-            let left_max = values[..mid_idx]
+            let left_max = scratch_values[..mid_idx]
                 .iter()
                 .copied()
                 .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))

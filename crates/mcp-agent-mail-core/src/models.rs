@@ -5,6 +5,7 @@
 
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
+use std::{borrow::Cow, cell::RefCell, collections::HashMap, sync::LazyLock};
 
 // =============================================================================
 // Project
@@ -546,36 +547,83 @@ pub const VALID_NOUNS: &[&str] = &[
     "fortress",
 ];
 
-/// Normalize a user-provided agent name; return `None` if nothing remains.
-///
-/// Mirrors legacy Python `sanitize_agent_name()`:
-/// - `value.strip()`
-/// - Remove all non `[A-Za-z0-9]` characters
-/// - Truncate to max length 128
-#[must_use]
-pub fn sanitize_agent_name(value: &str) -> Option<String> {
-    let mut cleaned: String = value
-        .trim()
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .collect();
+static VALID_ADJECTIVE_LOOKUP: LazyLock<HashMap<&'static str, &'static str>> =
+    LazyLock::new(|| {
+        VALID_ADJECTIVES
+            .iter()
+            .copied()
+            .map(|word| (word, word))
+            .collect()
+    });
 
-    if cleaned.is_empty() {
+static VALID_NOUN_LOOKUP: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
+    VALID_NOUNS
+        .iter()
+        .copied()
+        .map(|word| (word, word))
+        .collect()
+});
+
+static VALID_ADJECTIVE_LENGTHS_DESC: LazyLock<Vec<usize>> = LazyLock::new(|| {
+    let mut lengths = VALID_ADJECTIVES
+        .iter()
+        .map(|word| word.len())
+        .collect::<Vec<_>>();
+    lengths.sort_unstable();
+    lengths.dedup();
+    lengths.reverse();
+    lengths
+});
+
+const MIN_VALID_AGENT_NAME_LEN: usize = 5;
+
+thread_local! {
+    /// Zero-allocation cache for frequent agent name lookups.
+    /// Maps raw lowercase input -> Normalized PascalCase output.
+    static NORM_CACHE: RefCell<HashMap<String, String>> = RefCell::new(HashMap::with_capacity(32));
+}
+
+/// Normalize a valid agent name to PascalCase (e.g. "bluedog" -> "BlueDog").
+///
+/// Returns `None` if the name is not a valid adjective+noun combination.
+#[must_use]
+pub fn normalize_agent_name(name: &str) -> Option<String> {
+    let name = name.trim();
+    if !name.is_ascii() || name.len() < MIN_VALID_AGENT_NAME_LEN {
         return None;
     }
 
-    if cleaned.len() > 128 {
-        cleaned.truncate(128);
+    let lower = if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(name)
+    };
+
+    // Check per-thread LRU cache first.
+    if let Some(cached) = NORM_CACHE.with(|c| c.borrow().get(lower.as_ref()).cloned()) {
+        return Some(cached);
     }
 
-    Some(cleaned)
+    let (adjective, noun) = split_valid_agent_name(lower.as_ref())?;
+    let normalized = pascal_case_agent_name(adjective, noun);
+
+    // Update cache with simple capacity management.
+    NORM_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        if cache.len() >= 128 {
+            cache.clear();
+        }
+        cache.insert(lower.into_owned(), normalized.clone());
+    });
+
+    Some(normalized)
 }
 
 /// Validates that an agent name follows the adjective+noun pattern.
 ///
-/// Uses a zero-allocation, case-insensitive scan against the known adjectives
-/// and nouns to avoid the O(N) allocation of `.to_lowercase()` and the
-/// memory overhead of a 10,000-entry hash set.
+/// Uses a lowercase-once split strategy plus lazy vocabulary lookups, which
+/// avoids scanning every adjective+noun pair on each call while preserving the
+/// same accepted name set.
 ///
 /// # Examples
 /// ```
@@ -587,35 +635,7 @@ pub fn sanitize_agent_name(value: &str) -> Option<String> {
 /// ```
 #[must_use]
 pub fn is_valid_agent_name(name: &str) -> bool {
-    for adj in VALID_ADJECTIVES {
-        if name.len() > adj.len() && name[..adj.len()].eq_ignore_ascii_case(adj) {
-            let rem = &name[adj.len()..];
-            for noun in VALID_NOUNS {
-                if rem.eq_ignore_ascii_case(noun) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-/// Normalize a valid agent name to PascalCase (e.g. "bluedog" -> "BlueDog").
-///
-/// Returns `None` if the name is not a valid adjective+noun combination.
-#[must_use]
-pub fn normalize_agent_name(name: &str) -> Option<String> {
-    for adj in VALID_ADJECTIVES {
-        if name.len() > adj.len() && name[..adj.len()].eq_ignore_ascii_case(adj) {
-            let rem = &name[adj.len()..];
-            for noun in VALID_NOUNS {
-                if rem.eq_ignore_ascii_case(noun) {
-                    return Some(format!("{}{}", capitalize_first(adj), capitalize_first(noun)));
-                }
-            }
-        }
-    }
-    None
+    normalize_agent_name(name).is_some()
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -687,17 +707,25 @@ pub const DESCRIPTIVE_NAME_KEYWORDS: &[&str] = &[
 /// Check if a value looks like a known program name.
 #[must_use]
 pub fn looks_like_program_name(value: &str) -> bool {
-    let v = value.to_lowercase();
-    let v = v.trim();
-    KNOWN_PROGRAM_NAMES.contains(&v)
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    KNOWN_PROGRAM_NAMES.contains(&lower.as_str())
 }
 
 /// Check if a value looks like a model name.
 #[must_use]
 pub fn looks_like_model_name(value: &str) -> bool {
-    let v = value.to_lowercase();
-    let v = v.trim();
-    MODEL_NAME_PATTERNS.iter().any(|p| v.contains(p))
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    MODEL_NAME_PATTERNS
+        .iter()
+        .any(|pattern| lower.contains(pattern))
 }
 
 /// Check if a value looks like an email address.
@@ -720,16 +748,25 @@ pub fn looks_like_email(value: &str) -> bool {
 /// Check if a value looks like an attempt to broadcast to all agents.
 #[must_use]
 pub fn looks_like_broadcast(value: &str) -> bool {
-    let v = value.to_lowercase();
-    let v = v.trim();
-    BROADCAST_TOKENS.contains(&v)
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    BROADCAST_TOKENS.contains(&lower.as_str())
 }
 
 /// Check if a value looks like a descriptive role name.
 #[must_use]
 pub fn looks_like_descriptive_name(value: &str) -> bool {
-    let v = value.to_lowercase();
-    DESCRIPTIVE_NAME_KEYWORDS.iter().any(|kw| v.contains(kw))
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    DESCRIPTIVE_NAME_KEYWORDS
+        .iter()
+        .any(|keyword| lower.contains(keyword))
 }
 
 /// Check if a value looks like a Unix username (e.g. from `$USER`).
@@ -738,40 +775,23 @@ pub fn looks_like_descriptive_name(value: &str) -> bool {
 /// known adjective or noun from the agent name vocabulary.
 #[must_use]
 pub fn looks_like_unix_username(value: &str) -> bool {
-    let v = value.trim();
-    if v.is_empty() {
+    let value = value.trim();
+    if value.is_empty()
+        || !(2..=16).contains(&value.len())
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
         return false;
     }
-    // Agent names are PascalCase; unix usernames are all lowercase
-    if v.chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        && (2..=16).contains(&v.len())
-    {
-        // If it matches a known adjective or noun, it's not a username
-        let lower = v.to_lowercase();
-        if VALID_ADJECTIVES.iter().any(|a| a.to_lowercase() == lower) {
-            return false;
-        }
-        if VALID_NOUNS.iter().any(|n| n.to_lowercase() == lower) {
-            return false;
-        }
-        return true;
-    }
-    false
+
+    !VALID_ADJECTIVE_LOOKUP.contains_key(value) && !VALID_NOUN_LOOKUP.contains_key(value)
 }
 
 /// Detect common mistakes when agents provide invalid agent names.
 ///
 /// Returns `Some((mistake_type, helpful_message))` or `None` if no obvious
-/// mistake detected.  Only the first matching category is returned.
-///
-/// Categories checked (in order):
-/// 1. `PROGRAM_NAME_AS_AGENT` — value is a known program name
-/// 2. `MODEL_NAME_AS_AGENT`  — value contains a model name pattern
-/// 3. `EMAIL_AS_AGENT` — value looks like an email address
-/// 4. `BROADCAST_ATTEMPT` — value is a broadcast token
-/// 5. `DESCRIPTIVE_NAME` — value looks like a descriptive role name
-/// 6. `UNIX_USERNAME_AS_AGENT` — value looks like a Unix username
+/// mistake detected. Only the first matching category is returned.
 #[must_use]
 pub fn detect_agent_name_mistake(value: &str) -> Option<(&'static str, String)> {
     if looks_like_program_name(value) {
@@ -837,14 +857,52 @@ pub fn detect_agent_name_mistake(value: &str) -> Option<(&'static str, String)> 
     None
 }
 
-fn capitalize_first(s: &str) -> String {
-    let mut chars = s.chars();
-    let Some(first) = chars.next() else {
-        return String::new();
+#[inline]
+fn split_valid_agent_name(name: &str) -> Option<(&'static str, &'static str)> {
+    if !name.is_ascii() || name.len() < MIN_VALID_AGENT_NAME_LEN {
+        return None;
+    }
+
+    let lower_name = if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(name.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(name)
     };
-    let mut out: String = first.to_uppercase().collect();
-    out.push_str(chars.as_str());
+
+    for adjective_len in VALID_ADJECTIVE_LENGTHS_DESC.iter().copied() {
+        if lower_name.len() <= adjective_len {
+            continue;
+        }
+
+        let (adjective_candidate, noun_candidate) = lower_name.split_at(adjective_len);
+        let Some(adjective) = VALID_ADJECTIVE_LOOKUP.get(adjective_candidate).copied() else {
+            continue;
+        };
+        let Some(noun) = VALID_NOUN_LOOKUP.get(noun_candidate).copied() else {
+            continue;
+        };
+        return Some((adjective, noun));
+    }
+
+    None
+}
+
+#[inline]
+fn pascal_case_agent_name(adjective: &str, noun: &str) -> String {
+    let mut out = String::with_capacity(adjective.len() + noun.len());
+    push_pascal_case_word(&mut out, adjective);
+    push_pascal_case_word(&mut out, noun);
     out
+}
+
+#[inline]
+fn push_pascal_case_word(out: &mut String, word: &str) {
+    let mut chars = word.chars();
+    let Some(first) = chars.next() else {
+        return;
+    };
+    out.extend(first.to_uppercase());
+    out.push_str(chars.as_str());
 }
 
 /// Generates a random valid agent name.
@@ -868,11 +926,7 @@ pub fn generate_agent_name() -> String {
     let adj = VALID_ADJECTIVES[adj_idx];
     let noun = VALID_NOUNS[noun_idx];
 
-    // Capitalize first letter of each (UTF-8 safe).
-    let adj_cap = capitalize_first(adj);
-    let noun_cap = capitalize_first(noun);
-
-    format!("{adj_cap}{noun_cap}")
+    pascal_case_agent_name(adj, noun)
 }
 
 #[cfg(test)]
@@ -912,6 +966,42 @@ mod tests {
         assert!(!is_valid_agent_name("DatabaseMigrator"));
         assert!(!is_valid_agent_name("Alice"));
         assert!(!is_valid_agent_name(""));
+    }
+
+    #[test]
+    fn test_normalize_agent_name_cases() {
+        assert_eq!(
+            normalize_agent_name("greenlake"),
+            Some("GreenLake".to_string())
+        );
+        assert_eq!(
+            normalize_agent_name("GREENLAKE"),
+            Some("GreenLake".to_string())
+        );
+        assert_eq!(normalize_agent_name("BlueDog"), Some("BlueDog".to_string()));
+        assert_eq!(normalize_agent_name("BackendHarmonizer"), None);
+    }
+
+    #[test]
+    fn test_non_ascii_agent_names_are_rejected() {
+        assert!(!is_valid_agent_name("BlåLake"));
+        assert_eq!(normalize_agent_name("BlåLake"), None);
+    }
+
+    #[test]
+    fn test_all_agent_name_combinations_round_trip() {
+        for adjective in VALID_ADJECTIVES {
+            for noun in VALID_NOUNS {
+                let lower = format!("{adjective}{noun}");
+                let expected = pascal_case_agent_name(adjective, noun);
+                assert!(is_valid_agent_name(&lower), "'{lower}' should validate");
+                assert_eq!(
+                    normalize_agent_name(&lower),
+                    Some(expected),
+                    "'{lower}' should normalize deterministically"
+                );
+            }
+        }
     }
 
     #[test]

@@ -161,6 +161,12 @@ pub struct BocpdDetector {
     log_run_dist: Vec<f64>,
     /// NIG sufficient statistics per run length.
     stats: Vec<NigStats>,
+    /// Scratch buffer for next log run distribution.
+    next_log_run_dist: Vec<f64>,
+    /// Scratch buffer for next stats.
+    next_stats: Vec<NigStats>,
+    /// Scratch buffer for predictive probabilities.
+    log_pred: Vec<f64>,
     /// Maximum run length to track (truncation bound).
     max_run_length: usize,
     /// Threshold on cumulative mass for short run lengths.
@@ -192,6 +198,9 @@ impl BocpdDetector {
             hazard,
             log_run_dist: vec![0.0],
             stats: vec![prior.clone()],
+            next_log_run_dist: Vec::with_capacity(max_run_length + 1),
+            next_stats: Vec::with_capacity(max_run_length + 1),
+            log_pred: Vec::with_capacity(max_run_length + 1),
             max_run_length,
             threshold,
             index: 0,
@@ -222,6 +231,9 @@ impl BocpdDetector {
             hazard,
             log_run_dist: vec![0.0],
             stats: vec![prior.clone()],
+            next_log_run_dist: Vec::with_capacity(max_run_length + 1),
+            next_stats: Vec::with_capacity(max_run_length + 1),
+            log_pred: Vec::with_capacity(max_run_length + 1),
             max_run_length,
             threshold,
             index: 0,
@@ -241,30 +253,45 @@ impl BocpdDetector {
         let log_1_minus_hazard = (1.0 - self.hazard).ln();
 
         // Compute log predictive probabilities for each run length.
-        let log_pred: Vec<f64> = self.stats.iter().map(|s| s.log_predictive(x)).collect();
+        self.log_pred.clear();
+        for s in &self.stats {
+            self.log_pred.push(s.log_predictive(x));
+        }
 
         // Compute growth + change-point probabilities.
-        let mut new_log_run_dist = Vec::with_capacity(n + 1);
+        self.next_log_run_dist.clear();
 
-        // Change-point: run length resets to 0.
-        let cp_terms: Vec<f64> = self
-            .log_run_dist
-            .iter()
-            .zip(log_pred.iter())
-            .map(|(log_r, log_p)| log_r + log_p + log_hazard)
-            .collect();
-        let log_cp = log_sum_exp(&cp_terms);
-        new_log_run_dist.push(log_cp);
+        // Change-point: run length resets to 0. Avoid allocating a temporary Vec.
+        let mut max_cp_term = f64::NEG_INFINITY;
+        for (&log_r, &log_p) in self.log_run_dist.iter().zip(self.log_pred.iter()) {
+            let term = log_r + log_p + log_hazard;
+            if term > max_cp_term {
+                max_cp_term = term;
+            }
+        }
+        
+        let log_cp = if max_cp_term == f64::NEG_INFINITY {
+            f64::NEG_INFINITY
+        } else if max_cp_term == f64::INFINITY {
+            f64::INFINITY
+        } else {
+            let sum_exp: f64 = self.log_run_dist.iter().zip(self.log_pred.iter())
+                .map(|(&log_r, &log_p)| ((log_r + log_p + log_hazard) - max_cp_term).exp())
+                .sum();
+            max_cp_term + sum_exp.ln()
+        };
+        
+        self.next_log_run_dist.push(log_cp);
 
         // Growth: run length increases by 1.
-        for (log_r, log_p) in self.log_run_dist.iter().zip(log_pred.iter()) {
+        for (&log_r, &log_p) in self.log_run_dist.iter().zip(self.log_pred.iter()) {
             let log_growth = log_r + log_p + log_1_minus_hazard;
-            new_log_run_dist.push(log_growth);
+            self.next_log_run_dist.push(log_growth);
         }
 
         // Normalize.
-        let log_evidence = log_sum_exp(&new_log_run_dist);
-        for v in &mut new_log_run_dist {
+        let log_evidence = log_sum_exp(&self.next_log_run_dist);
+        for v in &mut self.next_log_run_dist {
             *v -= log_evidence;
         }
 
@@ -283,39 +310,38 @@ impl BocpdDetector {
         };
 
         // Update sufficient statistics.
-        let mut new_stats = Vec::with_capacity(new_log_run_dist.len());
-        new_stats.push(self.prior.clone());
+        self.next_stats.clear();
+        self.next_stats.push(self.prior.clone());
         for s in &self.stats {
-            new_stats.push(s.update(x));
+            self.next_stats.push(s.update(x));
         }
 
         // Truncate.
-        if new_log_run_dist.len() > self.max_run_length {
-            new_log_run_dist.truncate(self.max_run_length);
-            new_stats.truncate(self.max_run_length);
-            let log_total = log_sum_exp(&new_log_run_dist);
-            for v in &mut new_log_run_dist {
+        if self.next_log_run_dist.len() > self.max_run_length {
+            self.next_log_run_dist.truncate(self.max_run_length);
+            self.next_stats.truncate(self.max_run_length);
+            let log_total = log_sum_exp(&self.next_log_run_dist);
+            for v in &mut self.next_log_run_dist {
                 *v -= log_total;
             }
         }
 
         // Post-change mean estimate from the new short-run-length stats.
-        // Use the most probable short run length's model.
-        let window = CHANGE_WINDOW.min(new_log_run_dist.len());
+        let window = CHANGE_WINDOW.min(self.next_log_run_dist.len());
         let post_mean = if window > 0 {
-            let best_short = new_log_run_dist[..window]
+            let best_short = self.next_log_run_dist[..window]
                 .iter()
                 .enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 .map_or(0, |(r, _)| r);
-            new_stats[best_short].predictive_mean()
+            self.next_stats[best_short].predictive_mean()
         } else {
-            new_stats[0].predictive_mean()
+            self.next_stats[0].predictive_mean()
         };
 
-        // Save state.
-        self.log_run_dist = new_log_run_dist;
-        self.stats = new_stats;
+        // Save state by swapping buffers
+        std::mem::swap(&mut self.log_run_dist, &mut self.next_log_run_dist);
+        std::mem::swap(&mut self.stats, &mut self.next_stats);
         self.index += 1;
 
         // Detection: cumulative mass on short run lengths.
