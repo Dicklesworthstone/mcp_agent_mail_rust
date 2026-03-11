@@ -3824,7 +3824,13 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
     for row in all_rows.iter().filter(|r| r.expires_ts <= now_micros) {
         let Some(id) = row.id else { continue };
         let updated = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::force_release_reservation(ctx.cx(), &pool, id).await,
+            mcp_agent_mail_db::queries::force_release_reservation(
+                ctx.cx(),
+                &pool,
+                id,
+                Some(row.expires_ts),
+            )
+            .await,
         )?;
         if updated == 0 {
             continue;
@@ -3901,7 +3907,13 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
         }
 
         let updated = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::force_release_reservation(ctx.cx(), &pool, id).await,
+            mcp_agent_mail_db::queries::force_release_reservation(
+                ctx.cx(),
+                &pool,
+                id,
+                Some(row.expires_ts),
+            )
+            .await,
         )?;
         if updated == 0 {
             continue;

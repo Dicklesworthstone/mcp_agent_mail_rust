@@ -171,6 +171,7 @@ fn filter_importance_normal_is_active() {
 fn filter_all_six_fields_active() {
     let filter = SearchFilter {
         sender: Some("Alice".to_string()),
+        agent: None,
         project_id: Some(42),
         thread_id: Some("br-123".to_string()),
         doc_kind: Some(mcp_agent_mail_search_core::DocKind::Message),

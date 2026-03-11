@@ -311,6 +311,7 @@ mod tests {
     fn active_filter_count_multiple() {
         let filter = SearchFilter {
             sender: Some("A".to_string()),
+            agent: None,
             project_id: Some(1),
             thread_id: Some("t".to_string()),
             doc_kind: Some(DocKind::Message),
@@ -919,6 +920,7 @@ mod tests {
             let (index, handles) = setup_index();
             let filter = SearchFilter {
                 sender: Some("BlueLake".to_string()),
+                agent: None,
                 project_id: Some(2), // mismatch
                 thread_id: Some("br-123".to_string()),
                 doc_kind: Some(DocKind::Message),
@@ -1042,6 +1044,7 @@ mod tests {
             let (_, handles) = setup_index();
             let filter = SearchFilter {
                 sender: Some("A".to_string()),
+                agent: None,
                 project_id: Some(1),
                 thread_id: Some("t".to_string()),
                 doc_kind: Some(DocKind::Message),

@@ -510,9 +510,7 @@ pub async fn register_agent(
     task_description: Option<String>,
     attachments_policy: Option<String>,
 ) -> McpResult<String> {
-    use mcp_agent_mail_core::models::{
-        detect_agent_name_mistake, generate_agent_name, is_valid_agent_name,
-    };
+    use mcp_agent_mail_core::models::{detect_agent_name_mistake, generate_agent_name};
 
     // Validate program and model are non-empty
     let program = program.trim().to_string();
@@ -552,8 +550,7 @@ pub async fn register_agent(
                 match mcp_agent_mail_core::models::normalize_agent_name(n) {
                     Some(normalized) => normalized,
                     None => {
-                        let (err_type, msg) = mcp_agent_mail_core::models::detect_agent_name_mistake(n)
-                            .unwrap_or_else(|| {
+                        let (err_type, msg) = detect_agent_name_mistake(n).unwrap_or_else(|| {
                                 (
                                     "INVALID_AGENT_NAME",
                                     format!("Invalid agent name '{n}'. MUST be an adjective+noun combination (e.g. GreenLake).")
@@ -683,7 +680,7 @@ pub async fn create_agent_identity(
     task_description: Option<String>,
     attachments_policy: Option<String>,
 ) -> McpResult<String> {
-    use mcp_agent_mail_core::models::{generate_agent_name, is_valid_agent_name};
+    use mcp_agent_mail_core::models::{detect_agent_name_mistake, generate_agent_name};
 
     // Validate program and model are non-empty
     let program = program.trim().to_string();
@@ -723,8 +720,7 @@ pub async fn create_agent_identity(
                 match mcp_agent_mail_core::models::normalize_agent_name(hint) {
                     Some(normalized) => normalized,
                     None => {
-                        let (err_type, msg) = mcp_agent_mail_core::models::detect_agent_name_mistake(hint)
-                            .unwrap_or_else(|| {
+                        let (err_type, msg) = detect_agent_name_mistake(hint).unwrap_or_else(|| {
                                 (
                                     "INVALID_AGENT_NAME",
                                     format!("Invalid agent name hint '{hint}'. MUST be an adjective+noun combination (e.g. GreenLake).")
@@ -882,8 +878,8 @@ pub async fn whois(
     include_recent_commits: Option<bool>,
     commit_limit: Option<u32>,
 ) -> McpResult<String> {
-    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
-        .unwrap_or(agent_name);
+    let agent_name =
+        mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
     let pool = get_db_pool()?;
 

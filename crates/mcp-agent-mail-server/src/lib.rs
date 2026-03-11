@@ -1000,16 +1000,21 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
     mcp_agent_mail_storage::wbq_start();
 
     // Start background backfill for Search V3 if enabled.
-    let _ = mcp_agent_mail_db::search_service::spawn_startup_search_backfill(config);
+    spawn_startup_search_backfill(config);
 
     build_server(config).run_stdio();
 
-    // After run_stdio() returns (e.g. on EOF), perform graceful shutdown.
-    tracing::info!("stdio loop exited; performing graceful shutdown of background services");
-    integrity_guard::shutdown();
-    disk_monitor::shutdown();
-    mcp_agent_mail_storage::wbq_shutdown();
-    mcp_agent_mail_storage::flush_async_commits();
+    // run_stdio() returns `!` so the lines below are unreachable today.
+    // They are kept as documentation of the intended graceful-shutdown
+    // sequence should the transport ever change to a fallible loop.
+    #[allow(unreachable_code)]
+    {
+        tracing::info!("stdio loop exited; performing graceful shutdown of background services");
+        integrity_guard::shutdown();
+        disk_monitor::shutdown();
+        mcp_agent_mail_storage::wbq_shutdown();
+        mcp_agent_mail_storage::flush_async_commits();
+    }
 }
 
 const HTTP_RUNTIME_MIN_WORKERS: usize = 4;
@@ -7380,6 +7385,7 @@ fn startup_integrity_cache_is_fresh(
     age_secs <= startup_integrity_cache_ttl_secs()
 }
 
+#[allow(dead_code)]
 fn readiness_check(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
     readiness_check_with_integrity(config, true)
 }
@@ -8631,10 +8637,7 @@ mod tests {
     }
 
     fn safe_component(value: &str) -> String {
-        let mut out = value.trim().to_string();
-        for ch in ['/', '\\', ':', '*', '?', '"', '<', '>', '|', ' '] {
-            out = out.replace(ch, "_");
-        }
+        let out = value.trim().replace(|c| matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | ' '), "_");
         if out.is_empty() {
             "unknown".to_string()
         } else {

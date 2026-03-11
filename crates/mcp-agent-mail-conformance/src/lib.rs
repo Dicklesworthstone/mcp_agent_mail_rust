@@ -7,8 +7,6 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use chrono::DateTime;
-use chrono::format::strftime::StrftimeItems;
-use chrono::format::ParseError;
 
 pub const FIXTURE_PATH: &str = "tests/conformance/fixtures/python_reference.json";
 

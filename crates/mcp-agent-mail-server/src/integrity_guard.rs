@@ -68,6 +68,7 @@ fn full_check_due(
 ///
 /// Used by HTTP/TUI startup to avoid immediately repeating the same quick-check
 /// in the background worker before the first interval elapses.
+#[allow(dead_code)]
 pub fn note_startup_integrity_probe_completed() {
     SKIP_NEXT_QUICK_CYCLE.store(true, Ordering::Release);
 }

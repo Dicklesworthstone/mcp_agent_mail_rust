@@ -440,11 +440,11 @@ impl AttachmentExplorerScreen {
                 }
                 if !filter.is_empty() {
                     let lower = filter.to_lowercase();
-                    let matches = e.media_type.to_lowercase().contains(&lower)
-                        || e.sender_name.to_lowercase().contains(&lower)
-                        || e.subject.to_lowercase().contains(&lower)
-                        || e.project_slug.to_lowercase().contains(&lower)
-                        || e.sha1.contains(&lower);
+                    let matches = crate::tui_screens::contains_ci(&e.media_type, &lower)
+                        || crate::tui_screens::contains_ci(&e.sender_name, &lower)
+                        || crate::tui_screens::contains_ci(&e.subject, &lower)
+                        || crate::tui_screens::contains_ci(&e.project_slug, &lower)
+                        || crate::tui_screens::contains_ci(&e.sha1, &lower);
                     if !matches {
                         return false;
                     }

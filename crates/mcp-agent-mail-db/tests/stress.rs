@@ -3328,14 +3328,14 @@ fn edge_case_force_release_idempotency() {
         let res_id = reservations[0].id.unwrap();
 
         // First force-release: should affect 1 row
-        let released = match queries::force_release_reservation(&cx, &pool, res_id).await {
+        let released = match queries::force_release_reservation(&cx, &pool, res_id, None).await {
             Outcome::Ok(n) => n,
             other => panic!("first force_release failed: {other:?}"),
         };
         assert_eq!(released, 1, "first force-release should update 1 row");
 
         // Second force-release (idempotent): should affect 0 rows (already released)
-        let released_again = match queries::force_release_reservation(&cx, &pool, res_id).await {
+        let released_again = match queries::force_release_reservation(&cx, &pool, res_id, None).await {
             Outcome::Ok(n) => n,
             other => panic!("second force_release failed: {other:?}"),
         };

@@ -4702,6 +4702,7 @@ name = "mcp-agent-mail-conformance"
 version = "0.2.3"
 dependencies = [
  "asupersync",
+ "chrono",
  "clap",
  "fastmcp-core",
  "fastmcp-rust",

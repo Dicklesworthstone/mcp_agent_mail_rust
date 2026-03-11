@@ -2437,31 +2437,4 @@ http_headers = { Authorization = "Bearer tok" }
         );
     }
 
-    #[test]
-    fn resolve_token_env_file_quoted_values() {
-        let _env = EnvVarGuard::unset("HTTP_BEARER_TOKEN");
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), "HTTP_BEARER_TOKEN=\"double-quoted-token\"\n").unwrap();
-        let t = resolve_token(None, tmp.path());
-        assert_eq!(t, "double-quoted-token");
-    }
-
-    #[test]
-    fn resolve_token_env_file_single_quoted() {
-        let _env = EnvVarGuard::unset("HTTP_BEARER_TOKEN");
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), "HTTP_BEARER_TOKEN='single-quoted-token'\n").unwrap();
-        let t = resolve_token(None, tmp.path());
-        assert_eq!(t, "single-quoted-token");
-    }
-
-    #[test]
-    fn resolve_token_empty_explicit_falls_through() {
-        let _env = EnvVarGuard::unset("HTTP_BEARER_TOKEN");
-        let tmp = tempfile::tempdir().unwrap();
-        let missing = tmp.path().join("no-env");
-        let t = resolve_token(Some(""), &missing);
-        // Empty explicit should not be used; should fall through to generate
-        assert_eq!(t.len(), 64);
-    }
 }

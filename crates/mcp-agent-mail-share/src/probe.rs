@@ -513,6 +513,7 @@ fn parse_status_line(line: &str) -> Result<u16, ProbeError> {
         })
 }
 
+#[allow(dead_code)]
 fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, ProbeError> {
     let mut body = Vec::new();
     loop {
@@ -857,7 +858,6 @@ pub fn run_probe_checks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread;

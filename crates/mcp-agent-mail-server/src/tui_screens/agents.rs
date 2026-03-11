@@ -1137,24 +1137,24 @@ impl AgentsScreen {
                 let name_display = format!("{} {}", status.icon(), agent.name);
 
                 if narrow {
-                    Row::new(vec![name_display.into(), active_str.into(), msg_str.into()]).style(style)
+                    Row::new(vec![name_display, active_str, msg_str]).style(style)
                 } else if wide {
                     Row::new(vec![
-                        name_display.into(),
-                        agent.program.as_str().into(),
-                        agent.model.as_str().into(),
-                        active_str.into(),
-                        msg_str.into(),
+                        name_display,
+                        agent.program.to_string(),
+                        agent.model.to_string(),
+                        active_str,
+                        msg_str,
                     ])
                     .style(style)
                 } else {
                     Row::new(vec![
-                        name_display.into(),
-                        agent.program.as_str().into(),
-                        active_str.into(),
-                        msg_str.into()
+                        name_display,
+                        agent.program.to_string(),
+                        active_str,
+                        msg_str,
                     ])
-                        .style(style)
+                    .style(style)
                 }
             })
             .collect();

@@ -11,7 +11,7 @@ use mcp_agent_mail_core::{
 use mcp_agent_mail_db::DbPoolConfig;
 use std::collections::BTreeSet;
 use std::fmt;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -60,6 +60,7 @@ impl PortStatus {
 /// Keep this short to avoid multi-second startup stalls when probing a port
 /// occupied by an unrelated process that accepts TCP but does not speak HTTP.
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_millis(750);
+#[allow(dead_code)]
 const MAX_HEALTH_BODY_BYTES: usize = 4096;
 const LISTENER_PID_HINT_DIR: &str = "mcp-agent-mail-port-pids";
 pub(crate) const HEALTH_SIGNATURE_HEADER_NAME: &str = "x-agent-mail-health";
@@ -190,6 +191,7 @@ fn is_agent_mail_health_check(host: &str, port: u16) -> bool {
     result
 }
 
+#[allow(dead_code)]
 fn parse_content_length(headers: &str) -> Option<usize> {
     headers.lines().find_map(|line| {
         let (name, value) = line.split_once(':')?;
@@ -201,6 +203,7 @@ fn parse_content_length(headers: &str) -> Option<usize> {
     })
 }
 
+#[allow(dead_code)]
 fn has_agent_mail_signature(headers: &str) -> bool {
     headers.lines().any(|line| {
         let Some((name, value)) = line.split_once(':') else {

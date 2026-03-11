@@ -8,7 +8,7 @@
 
 use std::cmp::Ordering;
 #[cfg(feature = "hybrid")]
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 

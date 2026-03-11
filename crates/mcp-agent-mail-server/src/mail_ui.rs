@@ -1000,6 +1000,24 @@ mod route_hardening_tests {
 #[cfg(test)]
 mod auth_route_hardening_regression_suite {
     use super::*;
+    use asupersync::Outcome;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn outcome_ok<T>(outcome: Outcome<T, mcp_agent_mail_db::DbError>) -> T {
+        match outcome {
+            Outcome::Ok(value) => value,
+            Outcome::Err(err) => panic!("db error: {err}"),
+            Outcome::Cancelled(_) => panic!("db operation cancelled"),
+            Outcome::Panicked(panic) => panic!("db operation panicked: {}", panic.message()),
+        }
+    }
+
+    fn unique_nonce() -> u128 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos()
+    }
 
     fn make_test_pool() -> DbPool {
         initialized_test_pool("mail-ui-f4")

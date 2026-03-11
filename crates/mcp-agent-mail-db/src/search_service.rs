@@ -459,14 +459,12 @@ fn unresolved_result_matches_agent_filter(query: &SearchQuery, result: &SearchRe
     // If the result has recipient info, check it.
     let recipient_matches = if let Some(to) = &result.to {
         to.iter().any(|r| r.eq_ignore_ascii_case(agent_name))
-            || result
-                .cc
-                .as_ref()
-                .map_or(false, |cc| cc.iter().any(|r| r.eq_ignore_ascii_case(agent_name)))
-            || result
-                .bcc
-                .as_ref()
-                .map_or(false, |bcc| bcc.iter().any(|r| r.eq_ignore_ascii_case(agent_name)))
+            || result.cc.as_ref().map_or(false, |cc| {
+                cc.iter().any(|r| r.eq_ignore_ascii_case(agent_name))
+            })
+            || result.bcc.as_ref().map_or(false, |bcc| {
+                bcc.iter().any(|r| r.eq_ignore_ascii_case(agent_name))
+            })
     } else {
         // If recipient data is missing (raw index hit), assume it might match.
         true
@@ -3541,43 +3539,22 @@ pub async fn execute_search(
         let mut lexical_query = candidate_query.clone();
         lexical_query.limit = Some(plan.derivation.budget.lexical_limit);
 
-        // OPTIMIZATION: Execute lexical and semantic candidate retrieval in parallel via asupersync Scope.
-        // This reduces total latency from L_lex + L_sem to max(L_lex, L_sem).
-        let (lexical_outcome, semantic_data_outcome) = cx.scope(|s| {
-            let lex_task = s.spawn(|_| try_tantivy_search(&lexical_query));
-            let sem_task = s.spawn(|cx_inner| {
-                #[cfg(feature = "hybrid")]
-                if plan.derivation.budget.semantic_limit == 0 {
-                    (Vec::new(), None)
-                } else {
-                    try_two_tier_search_with_cx(
-                        cx_inner,
-                        &candidate_query,
-                        plan.derivation.budget.semantic_limit,
-                    )
-                    .map_or((Vec::new(), None), |outcome| {
-                        (outcome.results, Some(outcome.telemetry))
-                    })
-                }
-                #[cfg(not(feature = "hybrid"))]
-                (Vec::new(), None)
-            });
-            (lex_task.join(), sem_task.join())
-        });
-
-        // Propagate task-level failures (cancellation or panics)
-        let lexical_results = match lexical_outcome {
-            Outcome::Ok(res) => res,
-            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            Outcome::Err(_) => unreachable!("try_tantivy_search does not return Result"),
+        // The old closure-style `cx.scope(|scope| ...)` API is gone in current
+        // asupersync, and this crate does not enable the proc-macro helpers that
+        // would replace it. Keep the hybrid orchestration behavior intact while
+        // running candidate retrieval directly in the current task.
+        let lexical_results = try_tantivy_search(&lexical_query);
+        #[cfg(feature = "hybrid")]
+        let (semantic_results, two_tier_telemetry) = if plan.derivation.budget.semantic_limit == 0 {
+            (Vec::new(), None)
+        } else {
+            try_two_tier_search_with_cx(cx, &candidate_query, plan.derivation.budget.semantic_limit)
+                .map_or((Vec::new(), None), |outcome| {
+                    (outcome.results, Some(outcome.telemetry))
+                })
         };
-        let (semantic_results, two_tier_telemetry) = match semantic_data_outcome {
-            Outcome::Ok(data) => data,
-            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-            Outcome::Err(_) => unreachable!("try_two_tier_search_with_cx logic does not return Result"),
-        };
+        #[cfg(not(feature = "hybrid"))]
+        let semantic_results: Vec<SearchResult> = Vec::new();
 
         if let Some(lexical_results) = lexical_results {
             let (mut raw_results, mut rerank_audit) =
@@ -3967,6 +3944,7 @@ mod tests {
             created_ts: None,
             thread_id: None,
             from_agent: None,
+            from_agent_id: None,
             to: None,
             cc: None,
             bcc: None,
@@ -4025,6 +4003,7 @@ mod tests {
             created_ts: Some(1_700_000_000_000_123),
             thread_id: None,
             from_agent: None,
+            from_agent_id: None,
             to: None,
             cc: None,
             bcc: None,
@@ -4056,6 +4035,7 @@ mod tests {
             created_ts: None,
             thread_id: None,
             from_agent: None,
+            from_agent_id: None,
             to: None,
             cc: None,
             bcc: None,
@@ -4537,6 +4517,7 @@ mod tests {
             created_ts: Some(2_400),
             thread_id: Some("br-240".to_string()),
             from_agent: Some("RedPeak".to_string()),
+            from_agent_id: None,
             to: None,
             cc: None,
             bcc: None,
@@ -4722,6 +4703,7 @@ mod tests {
             created_ts: None,
             thread_id: None,
             from_agent: None,
+            from_agent_id: None,
             to: None,
             cc: None,
             bcc: None,

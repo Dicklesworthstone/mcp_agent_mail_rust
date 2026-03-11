@@ -2321,7 +2321,7 @@ fn kill_port_holder(host: &str, port: u16) -> CliResult<()> {
 /// listener PID set so installations launched as `am` still restart cleanly.
 fn resolved_agent_mail_listener_pids(host: &str, port: u16) -> Vec<u32> {
     use mcp_agent_mail_server::startup_checks::{
-        PortStatus, agent_mail_port_holder_pids_with_hint, check_port_status,
+        agent_mail_port_holder_pids_with_hint, check_port_status,
         listener_port_holder_pids_with_hint,
     };
 
@@ -27250,10 +27250,7 @@ fn lease_conflicts_with_request(
 }
 
 fn safe_component(value: &str) -> String {
-    let mut out = value.trim().to_string();
-    for ch in ['/', '\\', ':', '*', '?', '"', '<', '>', '|', ' '] {
-        out = out.replace(ch, "_");
-    }
+    let out = value.trim().replace(|c| matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | ' '), "_");
     // Prevent path traversal via special components.
     if out.is_empty() || out == "." || out == ".." {
         "unknown".to_string()

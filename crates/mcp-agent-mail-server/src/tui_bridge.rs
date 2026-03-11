@@ -4,7 +4,7 @@ use crate::console;
 use crate::tui_events::{
     DbStatSnapshot, EventRingBuffer, EventRingStats, EventSeverity, MailEvent,
 };
-use asupersync::channel::mpsc::{self, SendError, Sender};
+use asupersync::channel::mpsc::{SendError, Sender};
 use asupersync::time::{sleep, wall_now};
 use mcp_agent_mail_core::Config;
 use std::collections::VecDeque;
@@ -1162,6 +1162,7 @@ fn next_active_reservation_expiry_micros(snapshot: &DbStatSnapshot) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::channel::mpsc;
     use crate::tui_events::MailEventKind;
     use std::thread;
 

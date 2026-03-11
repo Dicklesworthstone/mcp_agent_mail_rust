@@ -85,7 +85,7 @@ pub enum PatternSegment {
 }
 
 impl PatternSegment {
-    fn matches_literal(&self, literal: &str) -> bool {
+    fn _matches_literal(&self, literal: &str) -> bool {
         match self {
             Self::Literal(l) => l == literal,
             Self::Glob(m) => m.is_match(literal),

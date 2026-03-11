@@ -4604,7 +4604,7 @@ fn render_recent_activity_panel(
         usize::from(column_width).saturating_sub(20usize.saturating_add(kind_width).max(1));
     for entry in filtered.iter().take(list_budget) {
         lines.push(Line::from_spans([
-            Span::styled(entry.timestamp.as_str(), crate::tui_theme::text_meta(&tp)),
+            Span::styled(entry.timestamp.clone(), crate::tui_theme::text_meta(&tp)),
             Span::raw(" "),
             Span::styled(
                 entry.icon.to_string(),

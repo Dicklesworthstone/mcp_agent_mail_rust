@@ -546,7 +546,7 @@ impl ArchiveBrowserScreen {
                 entry.metadata().map_or(0, |metadata| metadata.len())
             };
 
-            if !filter_lc.is_empty() && !is_dir && !name.to_lowercase().contains(&filter_lc) {
+            if !filter_lc.is_empty() && !is_dir && !crate::tui_screens::contains_ci(&name, &filter_lc) {
                 continue;
             }
 

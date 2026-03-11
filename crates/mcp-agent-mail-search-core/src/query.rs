@@ -190,6 +190,7 @@ mod tests {
     fn search_filter_all_fields_set() {
         let filter = SearchFilter {
             sender: Some("Agent".to_owned()),
+            agent: None,
             project_id: Some(1),
             date_range: Some(DateRange {
                 start: Some(100),

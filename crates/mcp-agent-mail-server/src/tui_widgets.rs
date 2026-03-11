@@ -4397,7 +4397,7 @@ pub struct LatencyProvider {
 impl LatencyProvider {
     /// Create a new latency provider.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         ring: Arc<EventRingBuffer>,
         granularity: Granularity,
         max_window: Duration,

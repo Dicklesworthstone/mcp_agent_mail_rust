@@ -12,7 +12,6 @@ use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_core::pattern_overlap::{CompiledPattern, has_glob_meta};
-use mcp_agent_mail_core::prelude::*;
 use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -155,24 +154,23 @@ fn path_looks_absolute(input: &str) -> bool {
 }
 
 fn relativize_path(project_root: &str, path: &str) -> Option<String> {
-    fn normalize_parts(input: &str) -> Option<Vec<String>> {
+    fn normalize_parts(input: &str) -> Option<Vec<&str>> {
         let mut parts = Vec::new();
-        for piece in input.replace('\\', "/").split('/') {
+        for piece in input.split(['/', '\\']) {
             match piece {
                 "" | "." => {}
                 ".." => {
                     parts.pop()?;
                 }
-                other => parts.push(other.to_string()),
+                other => parts.push(other),
             }
         }
         Some(parts)
     }
 
-    let normalized_slash = path.replace('\\', "/");
-    let path_is_absolute = path_looks_absolute(&normalized_slash);
+    let path_is_absolute = path_looks_absolute(path);
 
-    let path_parts = normalize_parts(&normalized_slash)?;
+    let path_parts = normalize_parts(path)?;
     if path_is_absolute {
         let root_parts = normalize_parts(project_root)?;
         if path_parts.len() < root_parts.len() || path_parts[..root_parts.len()] != root_parts[..] {
@@ -305,15 +303,16 @@ fn renewal_filter_matches(
         if path_patterns.is_empty() {
             return false;
         }
+        let row_pattern = CompiledPattern::new(&row.path_pattern);
         let mut matched = false;
         for pat in path_patterns {
             if row.path_pattern == *pat {
                 matched = true;
                 break;
             }
-            // Use CompiledPattern for robust glob matching parity with creation logic.
-            let cp = mcp_agent_mail_core::pattern_overlap::CompiledPattern::new(pat);
-            if cp.matches(&row.path_pattern) {
+            // Match the same overlap semantics used by reservation conflict detection,
+            // so narrower literals can target broader held globs and vice versa.
+            if CompiledPattern::new(pat).overlaps(&row_pattern) {
                 matched = true;
                 break;
             }
@@ -361,8 +360,8 @@ pub async fn file_reservation_paths(
     exclusive: Option<bool>,
     reason: Option<String>,
 ) -> McpResult<String> {
-    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
-        .unwrap_or(agent_name);
+    let agent_name =
+        mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
     if paths.is_empty() {
         return Err(legacy_tool_error(
@@ -667,8 +666,8 @@ pub async fn release_file_reservations(
     paths: Option<Vec<String>>,
     file_reservation_ids: Option<Vec<i64>>,
 ) -> McpResult<String> {
-    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
-        .unwrap_or(agent_name);
+    let agent_name =
+        mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
@@ -688,8 +687,12 @@ pub async fn release_file_reservations(
 
     let ids_to_release = if normalized_paths.is_some() || file_reservation_ids.is_some() {
         let existing_rows = db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::list_file_reservations(ctx.cx(), &pool, project_id, true)
-                .await,
+            mcp_agent_mail_db::queries::list_unreleased_file_reservations(
+                ctx.cx(),
+                &pool,
+                project_id,
+            )
+            .await,
         )?;
         let mut ids = Vec::new();
         for res in existing_rows {
@@ -797,8 +800,8 @@ pub async fn renew_file_reservations(
     paths: Option<Vec<String>>,
     file_reservation_ids: Option<Vec<i64>>,
 ) -> McpResult<String> {
-    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
-        .unwrap_or(agent_name);
+    let agent_name =
+        mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
     // Legacy parity: clamp too-small values up to 60 seconds.
     let extend = extend_seconds.map_or(1800, |t| t.clamp(60, 31_536_000));
@@ -934,8 +937,8 @@ pub async fn force_release_file_reservation(
     note: Option<String>,
     notify_previous: Option<bool>,
 ) -> McpResult<String> {
-    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
-        .unwrap_or(agent_name);
+    let agent_name =
+        mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
     let should_notify = notify_previous.unwrap_or(true);
 
@@ -1459,7 +1462,95 @@ fn guard_is_installed(repo_path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::runtime::RuntimeBuilder;
+    use asupersync::{Cx, Outcome};
+    use fastmcp::McpContext;
+    use mcp_agent_mail_db::{DbPool, ProjectRow, queries};
+    use serde_json::Value;
     use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static RESERVATION_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static RESERVATION_TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn unique_suffix() -> u64 {
+        let micros = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros();
+        let time_component = u64::try_from(micros).unwrap_or(u64::MAX);
+        time_component.wrapping_add(RESERVATION_TEST_COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn with_serialized_reservations<F, T>(f: F) -> T
+    where
+        F: FnOnce() -> T,
+    {
+        let _lock = RESERVATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("reservation test tempdir");
+        let storage_root = temp.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("reservation test storage root");
+        let database_path = temp.path().join("storage.sqlite3");
+        let database_url = format!("sqlite://{}", database_path.display());
+        let storage_root_str = storage_root
+            .to_str()
+            .expect("reservation test storage root utf-8")
+            .to_string();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_str.as_str()),
+            ],
+            f,
+        )
+    }
+
+    fn run_async<F, Fut, T>(f: F) -> T
+    where
+        F: FnOnce(Cx) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let cx = Cx::for_testing();
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        rt.block_on(f(cx))
+    }
+
+    async fn ensure_project(cx: &Cx, pool: &DbPool, human_key: &str) -> ProjectRow {
+        match queries::ensure_project(cx, pool, human_key).await {
+            Outcome::Ok(project) => project,
+            other => panic!("ensure_project failed: {other:?}"),
+        }
+    }
+
+    async fn register_agent(
+        cx: &Cx,
+        pool: &DbPool,
+        project_id: i64,
+        name: &str,
+    ) -> mcp_agent_mail_db::AgentRow {
+        match queries::register_agent(
+            cx,
+            pool,
+            project_id,
+            name,
+            "codex-cli",
+            "gpt-5",
+            Some("reservation test"),
+            None,
+        )
+        .await
+        {
+            Outcome::Ok(agent) => agent,
+            other => panic!("register_agent({name}) failed: {other:?}"),
+        }
+    }
 
     // -----------------------------------------------------------------------
     // expand_tilde
@@ -1808,7 +1899,10 @@ mod tests {
         let root = "/project";
         let err = normalize_filter_paths(root, Some(vec!["C:\\other\\main.rs".to_string()]));
         let rendered = err.expect_err("expected invalid path").to_string();
-        assert!(rendered.contains("outside the project root"), "expected outside-root error, got: {rendered}");
+        assert!(
+            rendered.contains("outside the project root"),
+            "expected outside-root error, got: {rendered}"
+        );
         assert!(
             !rendered.contains(root),
             "error details must not leak absolute project root"
@@ -2059,5 +2153,77 @@ mod tests {
             Some(&empty_paths),
             Some(&empty_ids),
         ));
+    }
+
+    #[test]
+    fn renewal_filter_matches_uses_symmetric_overlap_for_paths() {
+        let row = reservation_row(42, 7, "src/**", 1, None);
+        assert!(renewal_filter_matches(
+            &row,
+            7,
+            Some(&["src/main.rs".to_string()]),
+            None,
+        ));
+    }
+
+    #[test]
+    fn release_file_reservations_filtered_ids_include_expired_unreleased_rows() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/release-expired-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let agent = register_agent(&cx, &pool, project_id, "AmberRiver").await;
+                let agent_id = agent.id.unwrap_or(0);
+
+                let created = match queries::create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    &["src/**"],
+                    3600,
+                    true,
+                    "expired release regression",
+                )
+                .await
+                {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("create_file_reservations failed: {other:?}"),
+                };
+                let reservation_id = created[0].id.unwrap_or(0);
+
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(err) => panic!("acquire failed: {err}"),
+                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                    Outcome::Panicked(panic) => panic!("acquire panicked: {}", panic.message()),
+                };
+                conn.execute_sync(
+                    "UPDATE file_reservations SET expires_ts = ? WHERE id = ?",
+                    &[
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(
+                            mcp_agent_mail_db::now_micros().saturating_sub(1),
+                        ),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(reservation_id),
+                    ],
+                )
+                .expect("expire reservation");
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let payload = release_file_reservations(
+                    &ctx,
+                    project.human_key.clone(),
+                    agent.name.clone(),
+                    None,
+                    Some(vec![reservation_id]),
+                )
+                .await
+                .expect("release_file_reservations");
+                let parsed: Value = serde_json::from_str(&payload).expect("valid JSON");
+                assert_eq!(parsed["released"].as_i64(), Some(1));
+            });
+        });
     }
 }

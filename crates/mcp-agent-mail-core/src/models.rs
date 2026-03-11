@@ -933,6 +933,20 @@ pub fn generate_agent_name() -> String {
 mod tests {
     use super::*;
 
+    /// Strip non-alphabetic characters, returning `None` if nothing remains.
+    /// Truncates to 128 chars.
+    fn sanitize_agent_name(name: &str) -> Option<String> {
+        let cleaned: String = name.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+        if cleaned.is_empty() {
+            return None;
+        }
+        if cleaned.len() > 128 {
+            Some(cleaned[..128].to_string())
+        } else {
+            Some(cleaned)
+        }
+    }
+
     #[test]
     fn test_valid_agent_names() {
         assert!(is_valid_agent_name("GreenLake"));

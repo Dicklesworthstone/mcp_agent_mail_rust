@@ -42,6 +42,22 @@ pub fn cmp_ci(a: &str, b: &str) -> std::cmp::Ordering {
         .cmp(b.bytes().map(|b| b.to_ascii_lowercase()))
 }
 
+/// Zero-allocation case-insensitive substring check for ASCII search queries.
+/// Falls back to allocating `to_lowercase` if the query contains Unicode.
+#[inline]
+#[must_use]
+pub fn contains_ci(text: &str, query_lower: &str) -> bool {
+    if query_lower.is_empty() {
+        return true;
+    }
+    if query_lower.is_ascii() {
+        let q_bytes = query_lower.as_bytes();
+        text.as_bytes().windows(q_bytes.len()).any(|w| w.eq_ignore_ascii_case(q_bytes))
+    } else {
+        text.to_lowercase().contains(query_lower)
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // MailScreenId — type-safe screen identifiers
 // ──────────────────────────────────────────────────────────────────────

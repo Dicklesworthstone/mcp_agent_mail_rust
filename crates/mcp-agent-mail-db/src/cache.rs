@@ -1570,7 +1570,7 @@ mod tests {
 
         // Verify the entry has extended effective TTL
         let mut by_slug = cache.projects_by_slug.write();
-        let slug_key = (scope_fingerprint(""), "hot-proj".to_owned());
+        let slug_key = (scope_fingerprint(""), InternedStr::new("hot-proj"));
         if let Some(entry) = by_slug.get(&slug_key) {
             let effective = entry.effective_ttl(PROJECT_TTL);
             assert!(

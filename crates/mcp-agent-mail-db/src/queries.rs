@@ -1474,10 +1474,6 @@ pub async fn register_agent(
 
         let (provisional, inserted_new) = {
             let tracked = tracked(&*conn);
-            // Defaults for INSERT (new row).
-            let insert_attach_pol = attachments_policy.unwrap_or("auto");
-            let insert_task_desc = task_description.unwrap_or_default();
-
             let is_agent_unique_violation = |err: &DbError| match err {
                 DbError::Sqlite(msg) => {
                     let msg = msg.to_ascii_lowercase();
@@ -5279,7 +5275,7 @@ pub fn release_reservations<'a>(
         let select_sql = format!("{FILE_RESERVATION_SELECT_COLUMNS_SQL}{filter_sql}");
         let rows_out =
             map_sql_outcome(traw_query(cx, &tracked_conn, &select_sql, &filter_params).await);
-        let mut reservations: Vec<FileReservationRow> = match rows_out {
+        let reservations: Vec<FileReservationRow> = match rows_out {
             Outcome::Ok(rows) => {
                 let mut out = Vec::with_capacity(rows.len());
                 for row in rows {
@@ -11317,6 +11313,7 @@ mod tests {
     fn global_search_row_struct_has_project_context() {
         let row = GlobalSearchRow {
             id: 1,
+            sender_id: 0,
             subject: "Hello".to_string(),
             importance: "high".to_string(),
             ack_required: 1,

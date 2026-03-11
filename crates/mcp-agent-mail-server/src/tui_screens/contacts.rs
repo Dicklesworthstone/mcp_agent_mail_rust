@@ -223,10 +223,10 @@ impl ContactsScreen {
         if !self.filter.is_empty() {
             let f = self.filter.to_lowercase();
             rows.retain(|r| {
-                r.from_agent.to_lowercase().contains(&f)
-                    || r.to_agent.to_lowercase().contains(&f)
-                    || r.reason.to_lowercase().contains(&f)
-                    || r.from_project_slug.to_lowercase().contains(&f)
+                crate::tui_screens::contains_ci(&r.from_agent, &f)
+                    || crate::tui_screens::contains_ci(&r.to_agent, &f)
+                    || crate::tui_screens::contains_ci(&r.reason, &f)
+                    || crate::tui_screens::contains_ci(&r.from_project_slug, &f)
             });
         }
 

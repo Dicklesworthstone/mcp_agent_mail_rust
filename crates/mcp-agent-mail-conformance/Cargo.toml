@@ -14,6 +14,7 @@ serde.workspace = true
 serde_json.workspace = true
 indexmap = { version = "2", features = ["serde"] }
 clap.workspace = true
+chrono.workspace = true
 mcp-agent-mail-server = { path = "../mcp-agent-mail-server" }
 
 [dev-dependencies]
