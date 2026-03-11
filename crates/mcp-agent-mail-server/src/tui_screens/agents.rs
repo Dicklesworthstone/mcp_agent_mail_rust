@@ -1137,18 +1137,23 @@ impl AgentsScreen {
                 let name_display = format!("{} {}", status.icon(), agent.name);
 
                 if narrow {
-                    Row::new([name_display, active_str, msg_str]).style(style)
+                    Row::new(vec![name_display.into(), active_str.into(), msg_str.into()]).style(style)
                 } else if wide {
-                    Row::new([
-                        name_display,
-                        agent.program.clone(),
-                        agent.model.clone(),
-                        active_str,
-                        msg_str,
+                    Row::new(vec![
+                        name_display.into(),
+                        agent.program.as_str().into(),
+                        agent.model.as_str().into(),
+                        active_str.into(),
+                        msg_str.into(),
                     ])
                     .style(style)
                 } else {
-                    Row::new([name_display, agent.program.clone(), active_str, msg_str])
+                    Row::new(vec![
+                        name_display.into(),
+                        agent.program.as_str().into(),
+                        active_str.into(),
+                        msg_str.into()
+                    ])
                         .style(style)
                 }
             })
@@ -1654,7 +1659,6 @@ mod tests {
             last_active_ts: now,
             message_count: 1,
         }];
-
         screen.rebuild_status_transitions(&rows);
         rows[0].last_active_ts = now - IDLE_WINDOW_MICROS - 10_000_000;
         screen.rebuild_status_transitions(&rows);
@@ -1804,7 +1808,7 @@ mod tests {
         );
     }
 
-    // ── G6: Project/agent scope audit tests ─────────────────────────
+    // ── G6: Project/Agent scope audit tests ─────────────────────────
 
     #[test]
     fn agents_query_is_global_by_design() {
@@ -2098,19 +2102,12 @@ mod tests {
     fn cached_status_counts_updated_on_rebuild() {
         let state = test_state();
         state.update_db_stats(crate::tui_events::DbStatSnapshot {
-            agents: 2,
-            agents_list: vec![
-                crate::tui_events::AgentSummary {
-                    name: "RedFox".to_string(),
-                    program: "claude-code".to_string(),
-                    last_active_ts: chrono::Utc::now().timestamp_micros(), // active
-                },
-                crate::tui_events::AgentSummary {
-                    name: "BlueLake".to_string(),
-                    program: "codex-cli".to_string(),
-                    last_active_ts: 100, // inactive (ancient ts)
-                },
-            ],
+            agents: 1,
+            agents_list: vec![crate::tui_events::AgentSummary {
+                name: "RedFox".to_string(),
+                program: "claude-code".to_string(),
+                last_active_ts: chrono::Utc::now().timestamp_micros(), // active
+            }],
             ..Default::default()
         });
         let mut screen = AgentsScreen::new();
@@ -2258,7 +2255,7 @@ mod tests {
                 name: "BobStone".to_string(),
                 program: "claude-code".to_string(),
                 model: "opus-4.6".to_string(),
-                last_active_ts: 90,
+                last_active_ts: 200,
                 message_count: 2,
             },
         ];

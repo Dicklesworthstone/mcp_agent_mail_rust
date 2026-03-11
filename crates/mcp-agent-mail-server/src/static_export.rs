@@ -262,6 +262,10 @@ fn export_thread_ref(message_id: i64, thread_id: Option<&str>) -> Option<String>
     }
 }
 
+fn export_thread_route(project_slug: &str, thread_id: &str) -> String {
+    crate::mail_ui::mail_thread_href(project_slug, thread_id)
+}
+
 const fn export_inbox_scan_is_truncated(row_count: usize) -> bool {
     row_count > EXPORT_INBOX_SCAN_LIMIT
 }
@@ -421,7 +425,7 @@ fn emit_project_routes(
 
     // Render thread pages.
     for tid in &seen_threads {
-        emit_html_route(&format!("{prefix}/thread/{tid}"), "", output_dir, files)?;
+        emit_html_route(&export_thread_route(slug, tid), "", output_dir, files)?;
     }
 
     // Render message detail pages.
@@ -865,6 +869,16 @@ mod tests {
     fn export_thread_ref_uses_message_id_for_root_messages() {
         assert_eq!(export_thread_ref(42, None), Some("42".to_string()));
         assert_eq!(export_thread_ref(42, Some("")), Some("42".to_string()));
+    }
+
+    #[test]
+    fn export_thread_route_encodes_path_special_thread_ids() {
+        let route = export_thread_route("demo", "topic/with space+plus");
+        assert_eq!(route, "/mail/demo/thread/topic%2Fwith%20space%2Bplus");
+        assert_eq!(
+            route_html_output_path(&route),
+            "mail/demo/thread/topic%2Fwith%20space%2Bplus/index.html"
+        );
     }
 
     #[test]

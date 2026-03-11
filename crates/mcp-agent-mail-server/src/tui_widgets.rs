@@ -3727,13 +3727,21 @@ impl<'a> MessageCard<'a> {
             MessageCardState::Expanded => {
                 // Header: 1 line
                 // Separator: 1 line
-                // Body: estimate lines from body length (rough: 80 chars/line).
+                // Body: count actual lines and estimate wrapping for long lines.
                 // Footer: 1 line
                 // Borders: 2 lines
-                let body_chars = self.body.chars().count();
-                #[allow(clippy::cast_possible_truncation)]
-                let body_lines = ((body_chars / 60).max(1) + 1) as u16;
-                2 + 1 + 1 + body_lines + 1 + 2
+                let mut body_lines = 0u16;
+                for line in self.body.lines() {
+                    let chars = line.chars().count();
+                    // Estimate wrapping at 80 chars (safe default for thread view).
+                    #[allow(clippy::cast_possible_truncation)]
+                    let wrapped = (chars / 80) as u16 + 1;
+                    body_lines = body_lines.saturating_add(wrapped);
+                }
+                body_lines = body_lines.max(1);
+
+                // 2 (borders) + 1 (header) + 1 (separator) + body_lines + 1 (footer separator) + 1 (footer)
+                body_lines.saturating_add(6)
             }
         }
     }
@@ -4379,7 +4387,9 @@ pub struct LatencyProvider {
     granularity: Granularity,
     series: AggregatedTimeSeries,
     /// Raw samples per bucket for percentile computation: `(bucket_start, samples)`.
-    raw_samples: Vec<(i64, Vec<f64>)>,
+    raw_samples: std::collections::BTreeMap<i64, Vec<f64>>,
+    /// Tracks which buckets have changed since their last percentile computation.
+    dirty_buckets: std::collections::HashSet<i64>,
     last_seq: u64,
     max_window: Duration,
 }
@@ -4396,7 +4406,8 @@ impl LatencyProvider {
             ring,
             granularity,
             series: AggregatedTimeSeries::new(granularity, 3),
-            raw_samples: Vec::new(),
+            raw_samples: std::collections::BTreeMap::new(),
+            dirty_buckets: std::collections::HashSet::new(),
             last_seq: 0,
             max_window,
         }
@@ -4470,36 +4481,41 @@ impl ChartDataProvider for LatencyProvider {
                 let bucket_start = (timestamp_micros / bucket_w) * bucket_w;
                 let dur = *duration_ms as f64;
 
-                if let Some(last) = self.raw_samples.last_mut()
-                    && last.0 == bucket_start
-                {
-                    last.1.push(dur);
-                    continue;
-                }
-
-                self.raw_samples.push((bucket_start, vec![dur]));
+                let samples = self.raw_samples.entry(bucket_start).or_default();
+                samples.push(dur);
+                self.dirty_buckets.insert(bucket_start);
             }
         }
 
-        // Recompute percentiles for all buckets.
-        self.series.buckets.clear();
-        self.series.buckets.reserve(self.raw_samples.len());
-        for (bucket_start, samples) in &mut self.raw_samples {
-            samples.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let p50 = Self::percentile(samples, 0.50);
-            let p95 = Self::percentile(samples, 0.95);
-            let p99 = Self::percentile(samples, 0.99);
-            self.series
-                .buckets
-                .push((*bucket_start, vec![p50, p95, p99]));
+        // Update percentiles only for dirty buckets.
+        let mut added_any = false;
+        for &bucket_start in &self.dirty_buckets {
+            if let Some(samples) = self.raw_samples.get_mut(&bucket_start) {
+                samples.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let p50 = Self::percentile(samples, 0.50);
+                let p95 = Self::percentile(samples, 0.95);
+                let p99 = Self::percentile(samples, 0.99);
+
+                // Update or insert in AggregatedTimeSeries.
+                if let Some(pos) = self.series.buckets.iter().position(|b| b.0 == bucket_start) {
+                    self.series.buckets[pos].1 = vec![p50, p95, p99];
+                } else {
+                    self.series.buckets.push((bucket_start, vec![p50, p95, p99]));
+                    added_any = true;
+                }
+            }
         }
+        if added_any {
+            self.series.buckets.sort_unstable_by_key(|b| b.0);
+        }
+        self.dirty_buckets.clear();
 
         self.series.last_seq = self.last_seq;
 
         // Trim old data.
         let cutoff_micros =
-            self.raw_samples.last().map_or(0, |b| b.0) - duration_to_micros_i64(self.max_window);
-        self.raw_samples.retain(|b| b.0 >= cutoff_micros);
+            self.raw_samples.keys().next_back().copied().unwrap_or(0) - duration_to_micros_i64(self.max_window);
+        self.raw_samples.retain(|&start, _| start >= cutoff_micros);
         self.series.trim_to_window(self.max_window);
     }
 }

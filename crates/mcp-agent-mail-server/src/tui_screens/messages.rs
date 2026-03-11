@@ -4362,7 +4362,15 @@ fn stable_hash<T: Hash>(value: T) -> u64 {
 }
 
 fn contains_case_insensitive(text: &str, query_lower: &str) -> bool {
-    text.to_lowercase().contains(query_lower)
+    if query_lower.is_empty() {
+        return true;
+    }
+    if query_lower.is_ascii() {
+        let q_bytes = query_lower.as_bytes();
+        text.as_bytes().windows(q_bytes.len()).any(|w| w.eq_ignore_ascii_case(q_bytes))
+    } else {
+        text.to_lowercase().contains(query_lower)
+    }
 }
 
 fn live_message_event_matches_query(

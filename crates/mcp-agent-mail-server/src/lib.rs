@@ -998,8 +998,18 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
     integrity_guard::start(config);
     disk_monitor::start(config);
     mcp_agent_mail_storage::wbq_start();
+
+    // Start background backfill for Search V3 if enabled.
+    let _ = mcp_agent_mail_db::search_service::spawn_startup_search_backfill(config);
+
     build_server(config).run_stdio();
-    // run_stdio() does not return; WBQ drain thread exits with the process.
+
+    // After run_stdio() returns (e.g. on EOF), perform graceful shutdown.
+    tracing::info!("stdio loop exited; performing graceful shutdown of background services");
+    integrity_guard::shutdown();
+    disk_monitor::shutdown();
+    mcp_agent_mail_storage::wbq_shutdown();
+    mcp_agent_mail_storage::flush_async_commits();
 }
 
 const HTTP_RUNTIME_MIN_WORKERS: usize = 4;
@@ -4547,18 +4557,20 @@ enum AnsiState {
     OscEsc,
 }
 
-/// Strip ANSI escape sequences and return the visible character count.
+/// Strip ANSI escape sequences and return the visible character width.
 #[allow(dead_code)]
 fn strip_ansi_len(s: &str) -> usize {
     let mut len = 0usize;
     let mut state = AnsiState::Normal;
+    let mut buf = [0u8; 4];
     for ch in s.chars() {
         match state {
             AnsiState::Normal => {
                 if ch == '\x1b' {
                     state = AnsiState::Esc;
                 } else {
-                    len += unicode_char_width(ch);
+                    let s_char = ch.encode_utf8(&mut buf);
+                    len += ftui::text::display_width(s_char);
                 }
             }
             AnsiState::Esc => {

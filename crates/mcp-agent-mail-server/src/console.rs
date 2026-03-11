@@ -118,8 +118,12 @@ fn sanitize_url_userinfo(value: &str) -> Option<String> {
     // - masks ONLY the password segment
     let scheme_end = value.find("://")?;
     let after_scheme = scheme_end + 3;
+    
+    // Find the '@' that separates userinfo from host.
+    // We must find it AFTER the scheme.
     let at_pos = value[after_scheme..].rfind('@')? + after_scheme;
     let userinfo = &value[after_scheme..at_pos];
+    
     let colon_pos = userinfo.find(':')?;
     let user = &userinfo[..colon_pos];
     let pass = &userinfo[(colon_pos + 1)..];
@@ -882,17 +886,19 @@ enum AnsiState {
     OscEsc,
 }
 
-/// Strip ANSI escape sequences and return the visible character count.
+/// Strip ANSI escape sequences and return the visible character width.
 fn strip_ansi_len(s: &str) -> usize {
     let mut count = 0usize;
     let mut state = AnsiState::Normal;
+    let mut buf = [0u8; 4];
     for c in s.chars() {
         match state {
             AnsiState::Normal => {
                 if c == '\x1b' {
                     state = AnsiState::Esc;
                 } else {
-                    count += 1;
+                    let s_char = c.encode_utf8(&mut buf);
+                    count += ftui::text::display_width(s_char);
                 }
             }
             AnsiState::Esc => {
@@ -929,7 +935,7 @@ fn strip_ansi_len(s: &str) -> usize {
 }
 
 /// Truncate a string (possibly containing ANSI escapes) so that at most
-/// `max_vis` visible characters are retained.  Any active ANSI escape
+/// `max_vis` visible cells are retained. Any active ANSI escape
 /// sequence at the truncation point is completed so the output remains valid.
 /// An ellipsis `…` is appended when truncation occurs.
 fn truncate_to_vis_width(s: &str, max_vis: usize) -> String {
@@ -937,24 +943,29 @@ fn truncate_to_vis_width(s: &str, max_vis: usize) -> String {
     if total_vis <= max_vis {
         return s.to_string();
     }
-    // Reserve 1 char for the ellipsis
+    // Reserve 1 cell for the ellipsis
     let keep = max_vis.saturating_sub(1);
     let mut out = String::with_capacity(s.len());
     let mut vis = 0usize;
     let mut state = AnsiState::Normal;
+    let mut buf = [0u8; 4];
     for c in s.chars() {
         match state {
             AnsiState::Normal => {
                 if c == '\x1b' {
                     state = AnsiState::Esc;
                     out.push(c);
-                } else if vis < keep {
-                    out.push(c);
-                    vis += 1;
                 } else {
-                    out.push('…');
-                    out.push_str("\x1b[0m\x1b]8;;\x07"); // Close potential color/OSC 8 link
-                    break;
+                    let s_char = c.encode_utf8(&mut buf);
+                    let w = ftui::text::display_width(s_char);
+                    if vis + w <= keep {
+                        out.push(c);
+                        vis += w;
+                    } else {
+                        // Ellipsis is width 1
+                        out.push('…');
+                        return out;
+                    }
                 }
             }
             AnsiState::Esc => {
@@ -1241,7 +1252,7 @@ pub fn ansi_to_line(input: &str) -> ftui::text::Line<'static> {
             }
         } else {
             // Regular character — accumulate into buffer
-            // Handle multi-byte UTF-8 properly
+            // Handle multi-byte UTF-8 properly without panicking
             let c = input[i..].chars().next().unwrap_or('?');
             buf.push(c);
             i += c.len_utf8();

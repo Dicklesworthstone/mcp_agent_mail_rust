@@ -730,14 +730,15 @@ impl DashboardScreen {
 
     /// Return parsed query terms, using cache to avoid 15+ re-parses per frame.
     fn cached_parsed_query_terms(&self) -> Vec<String> {
-        let query = self.quick_query().to_string();
-        let cache = self.cached_query_terms.borrow();
-        if cache.0 == query {
-            return cache.1.clone();
+        let query = self.quick_query();
+        {
+            let cache = self.cached_query_terms.borrow();
+            if cache.0 == query {
+                return cache.1.clone();
+            }
         }
-        drop(cache);
-        let terms = parse_query_terms(&query);
-        *self.cached_query_terms.borrow_mut() = (query, terms.clone());
+        let terms = parse_query_terms(query);
+        *self.cached_query_terms.borrow_mut() = (query.to_string(), terms.clone());
         terms
     }
 
@@ -4603,7 +4604,7 @@ fn render_recent_activity_panel(
         usize::from(column_width).saturating_sub(20usize.saturating_add(kind_width).max(1));
     for entry in filtered.iter().take(list_budget) {
         lines.push(Line::from_spans([
-            Span::styled(entry.timestamp.clone(), crate::tui_theme::text_meta(&tp)),
+            Span::styled(entry.timestamp.as_str(), crate::tui_theme::text_meta(&tp)),
             Span::raw(" "),
             Span::styled(
                 entry.icon.to_string(),

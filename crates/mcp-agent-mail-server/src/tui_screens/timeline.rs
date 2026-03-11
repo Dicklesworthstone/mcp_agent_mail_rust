@@ -190,7 +190,7 @@ impl RenderItem for TimelineEntry {
                 format!(" {:<10} ", self.display.kind.compact_label()),
                 meta_style,
             ),
-            Span::styled(self.display.summary.clone(), summary_style),
+            Span::styled(self.display.summary.as_str(), summary_style),
         ]);
         if selected {
             line.apply_base_style(cursor_style);

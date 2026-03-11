@@ -621,7 +621,7 @@ fn percent_encode_path_segment(input: &str) -> String {
     out
 }
 
-fn mail_thread_href(project_slug: &str, thread_id: &str) -> String {
+pub(crate) fn mail_thread_href(project_slug: &str, thread_id: &str) -> String {
     format!(
         "/mail/{project_slug}/thread/{}",
         percent_encode_path_segment(thread_id)
