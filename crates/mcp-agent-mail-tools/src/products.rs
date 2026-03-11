@@ -440,7 +440,7 @@ pub async fn search_messages_product(
         "sender",
         sender,
         &[("from_agent", from_agent), ("sender_name", sender_name)],
-    )?;
+    )?.map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n));
     let project_filter = crate::search::resolve_text_filter_alias(
         "project",
         project,
@@ -528,6 +528,9 @@ pub async fn fetch_inbox_product(
     include_bodies: Option<bool>,
     since_ts: Option<String>,
 ) -> McpResult<String> {
+    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
+        .unwrap_or(agent_name);
+
     let config = &Config::get();
     if !config.worktrees_enabled {
         return Err(worktrees_required());

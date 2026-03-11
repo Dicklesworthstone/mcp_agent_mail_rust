@@ -93,6 +93,8 @@ pub async fn macro_start_session(
     file_reservation_ttl_seconds: Option<i64>,
     inbox_limit: Option<i32>,
 ) -> McpResult<String> {
+    let agent_name = agent_name.map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n));
+
     // Validate human_key is absolute
     if !std::path::Path::new(&human_key).is_absolute() {
         return Err(legacy_tool_error(
@@ -219,6 +221,8 @@ pub async fn macro_prepare_thread(
     llm_model: Option<String>,
     inbox_limit: Option<i32>,
 ) -> McpResult<String> {
+    let agent_name = agent_name.map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n));
+
     let pool = get_db_pool()?;
     let project_row = resolve_project(ctx, &pool, &project_key).await?;
     let project = ProjectResponse {
@@ -402,6 +406,9 @@ pub async fn macro_file_reservation_cycle(
     reason: Option<String>,
     auto_release: Option<bool>,
 ) -> McpResult<String> {
+    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
+        .unwrap_or(agent_name);
+
     let ttl = ttl_seconds.map_or(3600, |t| t.clamp(60, 31_536_000));
     if ttl_seconds.is_some_and(|t| t < 60) {
         tracing::warn!(
@@ -527,6 +534,8 @@ pub async fn macro_contact_handshake(
             serde_json::json!({ "field": "requester" }),
         )
     })?;
+    let from_agent = mcp_agent_mail_core::models::normalize_agent_name(&from_agent)
+        .unwrap_or(from_agent);
 
     let target_agent = target.or(to_agent).ok_or_else(|| {
         legacy_tool_error(
@@ -536,6 +545,8 @@ pub async fn macro_contact_handshake(
             serde_json::json!({ "field": "target" }),
         )
     })?;
+    let target_agent = mcp_agent_mail_core::models::normalize_agent_name(&target_agent)
+        .unwrap_or(target_agent);
 
     let should_auto_accept = auto_accept.unwrap_or(false);
     let ttl = match ttl_seconds {

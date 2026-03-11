@@ -866,8 +866,11 @@ pub async fn whois(
     project_key: String,
     agent_name: String,
     include_recent_commits: Option<bool>,
-    commit_limit: Option<i32>,
+    commit_limit: Option<u32>,
 ) -> McpResult<String> {
+    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
+        .unwrap_or(agent_name);
+
     let pool = get_db_pool()?;
 
     let include_commits = include_recent_commits.unwrap_or(true);

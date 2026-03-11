@@ -227,9 +227,11 @@ async fn resolve_canonical_agent_name(
     project_id: i64,
     agent_name: &str,
 ) -> String {
-    match mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, agent_name).await {
+    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(agent_name)
+        .unwrap_or_else(|| agent_name.to_string());
+    match mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, &agent_name).await {
         asupersync::Outcome::Ok(agent) => agent.name,
-        _ => agent_name.to_string(),
+        _ => agent_name,
     }
 }
 

@@ -205,6 +205,9 @@ async fn resolve_resource_agent(
     project_id: i64,
     agent_name: &str,
 ) -> McpResult<mcp_agent_mail_db::AgentRow> {
+    let agent_name_norm = mcp_agent_mail_core::models::normalize_agent_name(agent_name)
+        .unwrap_or_else(|| agent_name.to_string());
+
     let conn = acquire_resource_conn(ctx.cx(), pool).await?;
     let rows = conn
         .query_sync(
@@ -213,7 +216,7 @@ async fn resolve_resource_agent(
              ORDER BY id ASC LIMIT 2",
             &[
                 mcp_agent_mail_db::sqlmodel::Value::BigInt(project_id),
-                mcp_agent_mail_db::sqlmodel::Value::Text(agent_name.to_string()),
+                mcp_agent_mail_db::sqlmodel::Value::Text(agent_name_norm.clone()),
             ],
         )
         .map_err(|err| resource_sync_db_error_to_mcp_error(err.to_string()))?;
@@ -222,7 +225,7 @@ async fn resolve_resource_agent(
         return Err(McpError::new(
             McpErrorCode::InvalidParams,
             format!(
-                "Ambiguous agent name '{agent_name}' in project {project_id}; run `am migrate` to deduplicate legacy case-duplicate rows"
+                "Ambiguous agent name '{agent_name_norm}' in project {project_id}; run `am migrate` to deduplicate legacy case-duplicate rows"
             ),
         ));
     }

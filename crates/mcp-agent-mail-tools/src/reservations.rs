@@ -11,6 +11,8 @@
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
 use mcp_agent_mail_core::Config;
+use mcp_agent_mail_core::pattern_overlap::{CompiledPattern, has_glob_meta};
+use mcp_agent_mail_core::prelude::*;
 use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -28,7 +30,6 @@ use crate::resources::{
 use crate::tool_util::{
     db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_agent, resolve_project,
 };
-use mcp_agent_mail_core::pattern_overlap::{CompiledPattern, has_glob_meta};
 
 /// Granted reservation record
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -360,6 +361,9 @@ pub async fn file_reservation_paths(
     exclusive: Option<bool>,
     reason: Option<String>,
 ) -> McpResult<String> {
+    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
+        .unwrap_or(agent_name);
+
     if paths.is_empty() {
         return Err(legacy_tool_error(
             "EMPTY_PATHS",
@@ -663,6 +667,9 @@ pub async fn release_file_reservations(
     paths: Option<Vec<String>>,
     file_reservation_ids: Option<Vec<i64>>,
 ) -> McpResult<String> {
+    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
+        .unwrap_or(agent_name);
+
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
@@ -790,6 +797,9 @@ pub async fn renew_file_reservations(
     paths: Option<Vec<String>>,
     file_reservation_ids: Option<Vec<i64>>,
 ) -> McpResult<String> {
+    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
+        .unwrap_or(agent_name);
+
     // Legacy parity: clamp too-small values up to 60 seconds.
     let extend = extend_seconds.map_or(1800, |t| t.clamp(60, 31_536_000));
 
@@ -924,6 +934,9 @@ pub async fn force_release_file_reservation(
     note: Option<String>,
     notify_previous: Option<bool>,
 ) -> McpResult<String> {
+    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
+        .unwrap_or(agent_name);
+
     let should_notify = notify_previous.unwrap_or(true);
 
     let pool = get_db_pool()?;
@@ -1793,10 +1806,7 @@ mod tests {
         let root = "/project";
         let err = normalize_filter_paths(root, Some(vec!["C:\\other\\main.rs".to_string()]));
         let rendered = err.expect_err("expected invalid path").to_string();
-        assert!(
-            rendered.contains("outside the project root"),
-            "expected outside-root error, got: {rendered}"
-        );
+        assert!(rendered.contains("outside the project root"), "expected outside-root error, got: {rendered}");
         assert!(
             !rendered.contains(root),
             "error details must not leak absolute project root"
