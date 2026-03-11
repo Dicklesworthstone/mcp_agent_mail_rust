@@ -12823,8 +12823,12 @@ fn handle_mail_status_sync(conn: &mcp_agent_mail_db::DbConn, action: MailCommand
 
 #[allow(clippy::too_many_lines)]
 async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
-    let ctx = context::AsyncCliContext::open()?;
-    let cx = asupersync::Cx::for_request();
+    let server_config = mcp_agent_mail_core::config::Config::from_env();
+    let server_url = format!(
+        "http://{}:{}{}",
+        server_config.http_host, server_config.http_port, server_config.http_path
+    );
+    let bearer = server_config.http_bearer_token;
 
     match action {
         MailCommand::Status { .. } => unreachable!("handled in sync path"),
@@ -12843,22 +12847,71 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
-            let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
-            let pid = proj.id.unwrap_or(0);
-            let sender_row = resolve_agent_async(&cx, &ctx.pool, pid, &sender).await?;
-
-            // Parse recipients
-            let to_names: Vec<&str> = to
+            let to_names: Vec<String> = to
                 .split(',')
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
+                .map(str::to_string)
                 .collect();
             if to_names.is_empty() {
                 return Err(CliError::InvalidArgument(
                     "--to requires at least one recipient".into(),
                 ));
             }
+            let cc_names: Option<Vec<String>> = cc.as_ref().map(|cc_str| {
+                cc_str
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            });
+            if let Some(payload) = try_call_server_tool(
+                &server_url,
+                bearer.as_deref(),
+                "send_message",
+                serde_json::json!({
+                    "project_key": &project_key,
+                    "sender_name": &sender,
+                    "to": &to_names,
+                    "subject": &subject,
+                    "body_md": &body,
+                    "cc": cc_names.as_ref(),
+                    "importance": &importance,
+                    "ack_required": ack_required,
+                    "thread_id": thread_id.as_deref(),
+                }),
+            )
+            .await
+            .and_then(coerce_tool_result_json)
+            .and_then(server_message_payload_to_cli_json)
+            {
+                output::emit_output(&payload, fmt, || {
+                    let message_id = payload.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let rendered_to = payload
+                        .get("to")
+                        .and_then(|v| v.as_array())
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        })
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or_else(|| to.clone());
+                    output::success(&format!("Message sent (id={message_id}) to {rendered_to}"));
+                });
+                return Ok(());
+            }
 
+            let ctx = context::AsyncCliContext::open()?;
+            let cx = asupersync::Cx::for_request();
+            let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
+            let pid = proj.id.unwrap_or(0);
+            let sender_row = resolve_agent_async(&cx, &ctx.pool, pid, &sender).await?;
+
+            // Parse recipients
             let mut recipients: Vec<(i64, &str)> = Vec::new();
             for name in &to_names {
                 let agent = resolve_agent_async(&cx, &ctx.pool, pid, name).await?;
@@ -12909,6 +12962,43 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
+            let explicit_to: Option<Vec<String>> = to.as_ref().map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            });
+            if let Some(payload) = try_call_server_tool(
+                &server_url,
+                bearer.as_deref(),
+                "reply_message",
+                serde_json::json!({
+                    "project_key": &project_key,
+                    "message_id": message_id,
+                    "sender_name": &sender,
+                    "body_md": &body,
+                    "to": explicit_to.as_ref(),
+                }),
+            )
+            .await
+            .and_then(coerce_tool_result_json)
+            .and_then(server_message_payload_to_cli_json)
+            {
+                output::emit_output(&payload, fmt, || {
+                    let message_id = payload.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let thread_id = payload
+                        .get("thread_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    output::success(&format!("Reply sent (id={message_id}, thread={thread_id})"));
+                });
+                return Ok(());
+            }
+
+            let ctx = context::AsyncCliContext::open()?;
+            let cx = asupersync::Cx::for_request();
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
             let pid = proj.id.unwrap_or(0);
             let sender_row = resolve_agent_async(&cx, &ctx.pool, pid, &sender).await?;
@@ -12988,6 +13078,78 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
+            if let Some(data) = try_call_server_tool(
+                &server_url,
+                bearer.as_deref(),
+                "fetch_inbox",
+                serde_json::json!({
+                    "project_key": &project_key,
+                    "agent_name": &agent_name,
+                    "urgent_only": urgent_only,
+                    "since_ts": since.as_deref(),
+                    "limit": limit.max(0),
+                    "include_bodies": include_bodies,
+                }),
+            )
+            .await
+            .and_then(coerce_tool_result_json)
+            .and_then(|payload| server_inbox_payload_to_cli_json(&payload, include_bodies))
+            {
+                if data.is_empty() {
+                    output::emit_empty(fmt, "No messages.");
+                    return Ok(());
+                }
+
+                output::emit_output(&data, fmt, || {
+                    let mut table =
+                        output::CliTable::new(vec!["ID", "FROM", "SUBJECT", "IMPORTANCE", "TIME"]);
+                    for row in &data {
+                        table.add_row(vec![
+                            row.get("id")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0)
+                                .to_string(),
+                            row.get("from")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            truncate_str(
+                                row.get("subject")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default(),
+                                50,
+                            ),
+                            row.get("importance")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            row.get("created_ts")
+                                .and_then(|v| v.as_str())
+                                .map(format_iso_timestamp_short)
+                                .unwrap_or_default(),
+                        ]);
+                    }
+                    table.render();
+
+                    if include_bodies {
+                        for row in &data {
+                            ftui_runtime::ftui_println!(
+                                "\n--- #{} {} ---",
+                                row.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
+                                row.get("subject").and_then(|v| v.as_str()).unwrap_or_default()
+                            );
+                            ftui_runtime::ftui_println!(
+                                "{}",
+                                row.get("body_md").and_then(|v| v.as_str()).unwrap_or_default()
+                            );
+                        }
+                    }
+                });
+                return Ok(());
+            }
+
+            let ctx = context::AsyncCliContext::open()?;
+            let cx = asupersync::Cx::for_request();
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
             let pid = proj.id.unwrap_or(0);
             let agent = resolve_agent_async(&cx, &ctx.pool, pid, &agent_name).await?;
@@ -13056,6 +13218,30 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             agent_name,
             message_id,
         } => {
+            if let Some(payload) = try_call_server_tool(
+                &server_url,
+                bearer.as_deref(),
+                "mark_message_read",
+                serde_json::json!({
+                    "project_key": &project_key,
+                    "agent_name": &agent_name,
+                    "message_id": message_id,
+                }),
+            )
+            .await
+            .and_then(coerce_tool_result_json)
+            {
+                let read_at = payload
+                    .get("read_at")
+                    .and_then(|v| v.as_str())
+                    .map(format_iso_timestamp)
+                    .unwrap_or_else(|| "unknown".to_string());
+                output::success(&format!("Message {message_id} marked as read at {read_at}"));
+                return Ok(());
+            }
+
+            let ctx = context::AsyncCliContext::open()?;
+            let cx = asupersync::Cx::for_request();
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
             let pid = proj.id.unwrap_or(0);
             let agent = resolve_agent_async(&cx, &ctx.pool, pid, &agent_name).await?;
@@ -13081,6 +13267,38 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             agent_name,
             message_id,
         } => {
+            if let Some(payload) = try_call_server_tool(
+                &server_url,
+                bearer.as_deref(),
+                "acknowledge_message",
+                serde_json::json!({
+                    "project_key": &project_key,
+                    "agent_name": &agent_name,
+                    "message_id": message_id,
+                }),
+            )
+            .await
+            .and_then(coerce_tool_result_json)
+            {
+                let read_ts = payload
+                    .get("read_at")
+                    .and_then(|v| v.as_str())
+                    .map(format_iso_timestamp)
+                    .unwrap_or_else(|| "unknown".to_string());
+                let ack_ts = payload
+                    .get("acknowledged_at")
+                    .and_then(|v| v.as_str())
+                    .map(format_iso_timestamp)
+                    .unwrap_or_else(|| "unknown".to_string());
+                output::success(&format!(
+                    "Message {message_id} acknowledged (read={}, ack={})",
+                    read_ts, ack_ts
+                ));
+                return Ok(());
+            }
+
+            let ctx = context::AsyncCliContext::open()?;
+            let cx = asupersync::Cx::for_request();
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
             let pid = proj.id.unwrap_or(0);
             let agent = resolve_agent_async(&cx, &ctx.pool, pid, &agent_name).await?;
@@ -14274,6 +14492,138 @@ fn truncate_str(s: &str, max: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max.saturating_sub(3)).collect();
         format!("{truncated}...")
+    }
+}
+
+fn server_message_payload_to_cli_json(payload: serde_json::Value) -> Option<serde_json::Value> {
+    let delivery_payload = payload
+        .get("deliveries")
+        .and_then(|v| v.as_array())
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("payload"))?;
+    Some(serde_json::json!({
+        "id": delivery_payload.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
+        "subject": delivery_payload.get("subject").and_then(|v| v.as_str()).unwrap_or_default(),
+        "body_md": delivery_payload.get("body_md").and_then(|v| v.as_str()).unwrap_or_default(),
+        "importance": delivery_payload.get("importance").and_then(|v| v.as_str()).unwrap_or("normal"),
+        "ack_required": delivery_payload.get("ack_required").and_then(|v| v.as_bool()).unwrap_or(false),
+        "thread_id": delivery_payload.get("thread_id").cloned().unwrap_or(serde_json::Value::Null),
+        "created_ts": delivery_payload.get("created_ts").and_then(|v| v.as_str()).unwrap_or_default(),
+        "from": delivery_payload.get("from").and_then(|v| v.as_str()).unwrap_or_default(),
+        "to": delivery_payload.get("to").cloned().unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+    }))
+}
+
+fn format_iso_timestamp(iso: &str) -> String {
+    mcp_agent_mail_db::iso_to_micros(iso)
+        .map(context::format_ts)
+        .unwrap_or_else(|| iso.to_string())
+}
+
+fn format_iso_timestamp_short(iso: &str) -> String {
+    mcp_agent_mail_db::iso_to_micros(iso)
+        .map(context::format_ts_short)
+        .unwrap_or_else(|| iso.to_string())
+}
+
+fn server_inbox_payload_to_cli_json(
+    payload: &serde_json::Value,
+    include_body: bool,
+) -> Option<Vec<serde_json::Value>> {
+    let rows = payload.as_array()?;
+    Some(
+        rows.iter()
+            .map(|row| {
+                let mut value = serde_json::json!({
+                    "id": row.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
+                    "subject": row.get("subject").and_then(|v| v.as_str()).unwrap_or_default(),
+                    "from": row.get("from").and_then(|v| v.as_str()).unwrap_or_default(),
+                    "importance": row.get("importance").and_then(|v| v.as_str()).unwrap_or("normal"),
+                    "ack_required": row.get("ack_required").and_then(|v| v.as_bool()).unwrap_or(false),
+                    "created_ts": row.get("created_ts").and_then(|v| v.as_str()).unwrap_or_default(),
+                    "kind": row.get("kind").and_then(|v| v.as_str()).unwrap_or_default(),
+                    "thread_id": row.get("thread_id").cloned().unwrap_or(serde_json::Value::Null),
+                });
+                if include_body
+                    && let Some(body) = row.get("body_md").and_then(|v| v.as_str())
+                {
+                    value.as_object_mut().expect("json object").insert(
+                        "body_md".to_string(),
+                        serde_json::Value::String(body.to_string()),
+                    );
+                }
+                value
+            })
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod mail_server_cli_bridge_tests {
+    use super::{server_inbox_payload_to_cli_json, server_message_payload_to_cli_json};
+
+    #[test]
+    fn server_message_payload_bridge_uses_first_delivery_payload() {
+        let payload = serde_json::json!({
+            "deliveries": [
+                {
+                    "payload": {
+                        "id": 42,
+                        "subject": "Plan",
+                        "body_md": "Body",
+                        "importance": "high",
+                        "ack_required": true,
+                        "thread_id": "br-42",
+                        "created_ts": "2026-03-11T21:30:00Z",
+                        "from": "BlueLake",
+                        "to": ["GreenStone"]
+                    }
+                }
+            ],
+            "count": 1
+        });
+
+        let bridged = server_message_payload_to_cli_json(payload).expect("bridge result");
+        assert_eq!(bridged.get("id").and_then(|v| v.as_i64()), Some(42));
+        assert_eq!(bridged.get("from").and_then(|v| v.as_str()), Some("BlueLake"));
+        assert_eq!(bridged.get("thread_id").and_then(|v| v.as_str()), Some("br-42"));
+        assert_eq!(
+            bridged
+                .get("to")
+                .and_then(|v| v.as_array())
+                .and_then(|items| items.first())
+                .and_then(|v| v.as_str()),
+            Some("GreenStone")
+        );
+    }
+
+    #[test]
+    fn server_inbox_payload_bridge_respects_include_bodies() {
+        let payload = serde_json::json!([
+            {
+                "id": 7,
+                "subject": "Inbox",
+                "from": "SwiftCardinal",
+                "importance": "urgent",
+                "ack_required": true,
+                "created_ts": "2026-03-11T21:31:00Z",
+                "kind": "to",
+                "thread_id": "br-7",
+                "body_md": "Visible body"
+            }
+        ]);
+
+        let without_body =
+            server_inbox_payload_to_cli_json(&payload, false).expect("bridge without body");
+        assert_eq!(without_body.len(), 1);
+        assert!(without_body[0].get("body_md").is_none());
+
+        let with_body =
+            server_inbox_payload_to_cli_json(&payload, true).expect("bridge with body");
+        assert_eq!(
+            with_body[0].get("body_md").and_then(|v| v.as_str()),
+            Some("Visible body")
+        );
     }
 }
 
