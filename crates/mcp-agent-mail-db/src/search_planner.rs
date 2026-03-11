@@ -380,14 +380,27 @@ impl SearchQuery {
             })
         };
 
-        SearchFilter {
-            sender: self.agent_name.clone(),
+        let mut filter = SearchFilter {
+            sender: None,
+            agent: None,
             project_id: self.project_id,
             date_range,
             importance,
             thread_id: self.thread_id.clone(),
             doc_kind: None, // doc_kind is part of the query text normalization, not filter
+        };
+
+        // If direction is Outbox, agent_name refers to the sender.
+        // Otherwise (Inbox or None), it refers to an agent identity generally.
+        if let Some(ref name) = self.agent_name {
+            if self.direction == Some(Direction::Outbox) {
+                filter.sender = Some(name.clone());
+            } else {
+                filter.agent = Some(name.clone());
+            }
         }
+
+        filter
     }
 }
 

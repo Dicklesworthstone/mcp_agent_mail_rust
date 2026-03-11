@@ -444,14 +444,38 @@ fn unresolved_result_matches_agent_filter(query: &SearchQuery, result: &SearchRe
     let Some(agent_name) = query.agent_name.as_deref() else {
         return true;
     };
-    let Some(from_agent) = result.from_agent.as_deref() else {
-        return false;
+
+    // If the result has sender info, check it.
+    let sender_matches = if let Some(from_agent) = result.from_agent.as_deref() {
+        from_agent.eq_ignore_ascii_case(agent_name)
+    } else {
+        // If sender is missing, we can't definitively exclude it for Outbox,
+        // but for Outbox it's likely a mismatch. However, for candidate
+        // generation, we prefer false positives over false negatives.
+        // If both sender and recipients are missing (raw index hit), return true.
+        result.to.is_none()
     };
-    let sender_matches = from_agent.eq_ignore_ascii_case(agent_name);
+
+    // If the result has recipient info, check it.
+    let recipient_matches = if let Some(to) = &result.to {
+        to.iter().any(|r| r.eq_ignore_ascii_case(agent_name))
+            || result
+                .cc
+                .as_ref()
+                .map_or(false, |cc| cc.iter().any(|r| r.eq_ignore_ascii_case(agent_name)))
+            || result
+                .bcc
+                .as_ref()
+                .map_or(false, |bcc| bcc.iter().any(|r| r.eq_ignore_ascii_case(agent_name)))
+    } else {
+        // If recipient data is missing (raw index hit), assume it might match.
+        true
+    };
 
     match query.direction {
-        Some(Direction::Inbox) => false,
-        Some(Direction::Outbox) | None => sender_matches,
+        Some(Direction::Outbox) => sender_matches,
+        Some(Direction::Inbox) => recipient_matches,
+        None => sender_matches || recipient_matches,
     }
 }
 

@@ -153,6 +153,9 @@ pub struct SearchFilter {
     /// Filter by sender agent name
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sender: Option<String>,
+    /// Filter by agent name (matches sender OR recipient)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// Filter by project ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_id: Option<i64>,

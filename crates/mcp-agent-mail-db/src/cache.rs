@@ -505,21 +505,28 @@ impl ReadCache {
     #[allow(clippy::significant_drop_tightening)]
     pub fn get_inbox_stats_scoped(&self, scope: &str, agent_id: i64) -> Option<InboxStatsRow> {
         let key = (scope_fingerprint(scope), agent_id);
-        let mut cache = self.inbox_stats.write();
-        let mut should_remove = false;
-        if let Some(entry) = cache.get_mut(&key) {
-            if entry.is_expired(INBOX_STATS_TTL) {
-                should_remove = true;
-            } else {
-                entry.touch();
-                return Some(entry.value.clone());
+        
+        // Phase 1: Read lock for hit check and expiry check.
+        // If not in cache, we can return None without a write lock.
+        {
+            let cache = self.inbox_stats.read();
+            match cache.get(&key) {
+                Some(entry) => {
+                    if !entry.is_expired(INBOX_STATS_TTL) {
+                        return Some(entry.value.clone());
+                    }
+                    // Entry exists but is expired; fall through to write lock for cleanup.
+                }
+                None => return None,
             }
-        } else {
-            return None;
         }
 
-        if should_remove {
-            cache.remove(&key);
+        // Phase 2: Write lock for removal of expired entry.
+        let mut cache = self.inbox_stats.write();
+        if let Some(entry) = cache.get(&key) {
+            if entry.is_expired(INBOX_STATS_TTL) {
+                cache.remove(&key);
+            }
         }
         None
     }
