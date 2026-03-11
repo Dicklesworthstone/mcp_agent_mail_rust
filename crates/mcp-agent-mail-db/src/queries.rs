@@ -4178,7 +4178,15 @@ pub async fn search_messages_for_product(
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
+                // Use positional access for aliased columns where ORM column name inference
+                // incorrectly parses "a.name as from_name" as "name as" instead of "from_name".
+                // Column order: id(0), sender_id(1), subject(2), importance(3), ack_required(4),
+                // created_ts(5), thread_id(6), from_name(7), body_md(8), project_id(9)
                 let id: i64 = match row.get_named("id") {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                let sender_id: i64 = match row.get_as(1) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
@@ -4202,22 +4210,19 @@ pub async fn search_messages_for_product(
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                // Use positional access for aliased columns where ORM column name inference
-                // incorrectly parses "a.name as from_name" as "name as" instead of "from_name".
-                // Column order: id(0), subject(1), importance(2), ack_required(3),
-                // created_ts(4), thread_id(5), from_name(6), body_md(7), project_id(8)
-                let from: String = match row.get_as(6) {
+                let from: String = match row.get_as(7) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let body_md: String = row.get_as(7).unwrap_or_default();
-                let project_id: i64 = match row.get_as(8) {
+                let body_md: String = row.get_as(8).unwrap_or_default();
+                let project_id: i64 = match row.get_as(9) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
 
                 out.push(SearchRowWithProject {
                     id,
+                    sender_id,
                     subject,
                     importance,
                     ack_required,
@@ -4469,18 +4474,20 @@ pub async fn search_messages_global(
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
                 let id: i64 = row.get_as(0).unwrap_or_default();
-                let subject: String = row.get_as(1).unwrap_or_default();
-                let importance: String = row.get_as(2).unwrap_or_default();
-                let ack_required: i64 = row.get_as(3).unwrap_or_default();
-                let created_ts: i64 = row.get_as(4).unwrap_or_default();
-                let thread_id: Option<String> = row.get_as(5).ok();
-                let from: String = row.get_as(6).unwrap_or_default();
-                let body_md: String = row.get_as(7).unwrap_or_default();
-                let project_id: i64 = row.get_as(8).unwrap_or_default();
-                let project_slug: String = row.get_as(9).unwrap_or_default();
+                let sender_id: i64 = row.get_as(1).unwrap_or_default();
+                let subject: String = row.get_as(2).unwrap_or_default();
+                let importance: String = row.get_as(3).unwrap_or_default();
+                let ack_required: i64 = row.get_as(4).unwrap_or_default();
+                let created_ts: i64 = row.get_as(5).unwrap_or_default();
+                let thread_id: Option<String> = row.get_as(6).ok();
+                let from: String = row.get_as(7).unwrap_or_default();
+                let body_md: String = row.get_as(8).unwrap_or_default();
+                let project_id: i64 = row.get_as(9).unwrap_or_default();
+                let project_slug: String = row.get_as(10).unwrap_or_default();
 
                 out.push(GlobalSearchRow {
                     id,
+                    sender_id,
                     subject,
                     importance,
                     ack_required,

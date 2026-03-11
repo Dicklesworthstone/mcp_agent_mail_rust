@@ -709,6 +709,7 @@ async fn canonicalize_message_results(
         result.created_ts = Some(detail.created_ts);
         result.thread_id.clone_from(&detail.thread_id);
         result.from_agent = Some(detail.from.clone());
+        result.from_agent_id = Some(detail.sender_id);
         result.to = Some(to);
         result.cc = Some(cc);
         result.bcc = Some(bcc);
@@ -3302,6 +3303,7 @@ pub async fn execute_search(
                         created_ts: Some(row.created_ts),
                         thread_id: row.thread_id,
                         from_agent: Some(row.from),
+                        from_agent_id: Some(row.sender_id),
                         reason_codes: Vec::new(),
                         score_factors: Vec::new(),
                         redacted: false,
@@ -3337,6 +3339,7 @@ pub async fn execute_search(
                         created_ts: Some(row.created_ts),
                         thread_id: row.thread_id,
                         from_agent: Some(row.from),
+                        from_agent_id: Some(row.sender_id),
                         reason_codes: Vec::new(),
                         score_factors: Vec::new(),
                         redacted: false,
@@ -3364,6 +3367,7 @@ pub async fn execute_search(
                         created_ts: Some(row.created_ts),
                         thread_id: row.thread_id,
                         from_agent: Some(row.from),
+                        from_agent_id: Some(row.sender_id),
                         reason_codes: Vec::new(),
                         score_factors: Vec::new(),
                         redacted: false,
