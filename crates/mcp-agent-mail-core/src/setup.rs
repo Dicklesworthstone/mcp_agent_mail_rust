@@ -686,11 +686,18 @@ fn merge_toml_section(
 
 fn strip_toml_inline_comment(line: &str) -> &str {
     let mut in_quote = None;
+    let mut escape = false;
 
     for (idx, ch) in line.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
         match in_quote {
             Some('"') => {
-                if ch == '"' {
+                if ch == '\\' {
+                    escape = true;
+                } else if ch == '"' {
                     in_quote = None;
                 }
             }
@@ -866,7 +873,6 @@ impl AgentPlatform {
             permissions: 0o600,
             backup: true,
         }];
-
         if !params.skip_user_config {
             actions.push(ConfigAction {
                 platform: self,
@@ -1452,13 +1458,28 @@ mod tests {
     fn resolve_token_reads_env_file() {
         let _env = EnvVarGuard::unset("HTTP_BEARER_TOKEN");
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            tmp.path(),
-            "FOO=bar\nHTTP_BEARER_TOKEN=from-file\nBAZ=qux\n",
-        )
-        .unwrap();
+        std::fs::write(tmp.path(), "HTTP_BEARER_TOKEN=\"double-quoted-token\"\n").unwrap();
         let t = resolve_token(None, tmp.path());
-        assert_eq!(t, "from-file");
+        assert_eq!(t, "double-quoted-token");
+    }
+
+    #[test]
+    fn resolve_token_env_file_single_quoted() {
+        let _env = EnvVarGuard::unset("HTTP_BEARER_TOKEN");
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "HTTP_BEARER_TOKEN='single-quoted-token'\n").unwrap();
+        let t = resolve_token(None, tmp.path());
+        assert_eq!(t, "single-quoted-token");
+    }
+
+    #[test]
+    fn resolve_token_empty_explicit_falls_through() {
+        let _env = EnvVarGuard::unset("HTTP_BEARER_TOKEN");
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-env");
+        let t = resolve_token(Some(""), &missing);
+        // Empty explicit should not be used; should fall through to generate
+        assert_eq!(t.len(), 64);
     }
 
     #[test]
