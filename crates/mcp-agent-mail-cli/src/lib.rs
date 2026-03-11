@@ -27517,23 +27517,6 @@ fn ensure_share_zip_target_absent(bundle_dir: &Path) -> CliResult<Option<PathBuf
     Ok(Some(zip_path))
 }
 
-fn sha256_file(path: &Path) -> CliResult<String> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
 struct ShareExportParams {
     output: PathBuf,
     projects: Vec<String>,
@@ -27661,51 +27644,38 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
         snap_ctx.scrub_summary.bodies_redacted
     );
 
-    // 2. Bundle attachments
-    ftui_runtime::ftui_println!("Bundling attachments...");
     let config = Config::from_env();
-    let att_manifest = share::bundle_attachments(
-        &snapshot_path,
+    ftui_runtime::ftui_println!("Assembling bundle assets...");
+    let export = share::export_bundle_from_snapshot_context(
+        &snap_ctx,
         output,
         &config.storage_root,
-        params.inline_threshold,
-        params.detach_threshold,
-        config.allow_absolute_attachment_paths,
+        &share::BundleExportConfig {
+            inline_attachment_threshold: params.inline_threshold,
+            detach_attachment_threshold: params.detach_threshold,
+            chunk_threshold: params.chunk_threshold,
+            chunk_size: params.chunk_size,
+            scrub_preset: params.scrub_preset,
+            allow_absolute_attachment_paths: config.allow_absolute_attachment_paths,
+            hosting_hints_root: None,
+        },
     )?;
     ftui_runtime::ftui_println!(
         "  Attachments: {} inline, {} copied, {} external, {} missing",
-        att_manifest.stats.inline,
-        att_manifest.stats.copied,
-        att_manifest.stats.externalized,
-        att_manifest.stats.missing
+        export.attachment_manifest.stats.inline,
+        export.attachment_manifest.stats.copied,
+        export.attachment_manifest.stats.externalized,
+        export.attachment_manifest.stats.missing
     );
-
-    // 3. Copy DB to bundle
-    let db_dest = output.join("mailbox.sqlite3");
-    std::fs::copy(&snapshot_path, &db_dest)?;
-    let db_sha256 = sha256_file(&db_dest)?;
-    let db_size = db_dest.metadata()?.len();
-
-    // 4. Maybe chunk
-    let chunk =
-        share::maybe_chunk_database(&db_dest, output, params.chunk_threshold, params.chunk_size)?;
-    if let Some(ref c) = chunk {
+    if let Some(ref c) = export.chunk_manifest {
         ftui_runtime::ftui_println!("  Database chunked into {} parts", c.chunk_count);
     }
+    ftui_runtime::ftui_println!("  Viewer assets: {} files", export.viewer_assets.len());
+    ftui_runtime::ftui_println!(
+        "  Static pages generated: {}",
+        export.static_render.pages_generated
+    );
 
-    // 5. Viewer assets
-    ftui_runtime::ftui_println!("Copying viewer assets...");
-    let copied = share::copy_viewer_assets(output)?;
-    ftui_runtime::ftui_println!("  Viewer assets: {} files", copied.len());
-
-    // 6. Viewer data
-    ftui_runtime::ftui_println!("Exporting viewer data...");
-    let viewer_data = share::export_viewer_data(&snapshot_path, output, snap_ctx.fts_enabled)?;
-
-    // 7. SRI hashes
-    let sri = share::compute_viewer_sri(output);
-
-    // 8. Hosting hints
     let hints = share::detect_hosting_hints(output);
     if !hints.is_empty() {
         ftui_runtime::ftui_println!(
@@ -27714,25 +27684,6 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
             hints[0].signals.len()
         );
     }
-
-    // 9. Scaffolding
-    ftui_runtime::ftui_println!("Writing manifest and scaffolding...");
-    share::write_bundle_scaffolding(
-        output,
-        &snap_ctx.scope,
-        &snap_ctx.scrub_summary,
-        &att_manifest,
-        chunk.as_ref(),
-        params.chunk_threshold,
-        params.chunk_size,
-        &hints,
-        snap_ctx.fts_enabled,
-        "mailbox.sqlite3",
-        &db_sha256,
-        db_size,
-        Some(&viewer_data),
-        &sri,
-    )?;
 
     // 10. Sign
     if let Some(ref key_path) = params.signing_key {
@@ -27897,54 +27848,38 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
         snap_ctx.scrub_summary.bodies_redacted
     );
 
-    // 2. Bundle attachments
-    ftui_runtime::ftui_println!("Bundling attachments...");
     let config = Config::from_env();
-    let att_manifest = share::bundle_attachments(
-        &snapshot_path,
+    ftui_runtime::ftui_println!("Assembling updated bundle...");
+    let export = share::export_bundle_from_snapshot_context(
+        &snap_ctx,
         &temp_bundle,
         &config.storage_root,
-        params.inline_threshold,
-        params.detach_threshold,
-        config.allow_absolute_attachment_paths,
+        &share::BundleExportConfig {
+            inline_attachment_threshold: params.inline_threshold,
+            detach_attachment_threshold: params.detach_threshold,
+            chunk_threshold: params.chunk_threshold,
+            chunk_size: params.chunk_size,
+            scrub_preset: params.scrub_preset,
+            allow_absolute_attachment_paths: config.allow_absolute_attachment_paths,
+            hosting_hints_root: Some(params.bundle.clone()),
+        },
     )?;
     ftui_runtime::ftui_println!(
         "  Attachments: {} inline, {} copied, {} external, {} missing",
-        att_manifest.stats.inline,
-        att_manifest.stats.copied,
-        att_manifest.stats.externalized,
-        att_manifest.stats.missing
+        export.attachment_manifest.stats.inline,
+        export.attachment_manifest.stats.copied,
+        export.attachment_manifest.stats.externalized,
+        export.attachment_manifest.stats.missing
     );
-
-    // 3. Copy DB to bundle
-    let db_dest = temp_bundle.join("mailbox.sqlite3");
-    std::fs::copy(&snapshot_path, &db_dest)?;
-    let db_sha256 = sha256_file(&db_dest)?;
-    let db_size = db_dest.metadata()?.len();
-
-    // 4. Maybe chunk
-    let chunk = share::maybe_chunk_database(
-        &db_dest,
-        &temp_bundle,
-        params.chunk_threshold,
-        params.chunk_size,
-    )?;
+    let chunk = export.chunk_manifest.clone();
     if let Some(ref c) = chunk {
         ftui_runtime::ftui_println!("  Database chunked into {} parts", c.chunk_count);
     }
-
-    // 5. Viewer assets
-    ftui_runtime::ftui_println!("Copying viewer assets...");
-    let copied = share::copy_viewer_assets(&temp_bundle)?;
-    ftui_runtime::ftui_println!("  Viewer assets: {} files", copied.len());
-
-    // 6. Viewer data
-    ftui_runtime::ftui_println!("Exporting viewer data...");
-    let viewer_data =
-        share::export_viewer_data(&snapshot_path, &temp_bundle, snap_ctx.fts_enabled)?;
-
-    // 7. SRI hashes
-    let sri = share::compute_viewer_sri(&temp_bundle);
+    ftui_runtime::ftui_println!("  Viewer assets: {} files", export.viewer_assets.len());
+    ftui_runtime::ftui_println!(
+        "  Static pages generated: {}",
+        export.static_render.pages_generated
+    );
 
     // 8. Hosting hints (use destination bundle location for parity; temp dirs don't have git remotes).
     let hints = share::detect_hosting_hints(&params.bundle);
@@ -27955,25 +27890,6 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
             hints[0].signals.len()
         );
     }
-
-    // 9. Scaffolding
-    ftui_runtime::ftui_println!("Writing manifest and scaffolding...");
-    share::write_bundle_scaffolding(
-        &temp_bundle,
-        &snap_ctx.scope,
-        &snap_ctx.scrub_summary,
-        &att_manifest,
-        chunk.as_ref(),
-        params.chunk_threshold,
-        params.chunk_size,
-        &hints,
-        snap_ctx.fts_enabled,
-        "mailbox.sqlite3",
-        &db_sha256,
-        db_size,
-        Some(&viewer_data),
-        &sri,
-    )?;
 
     // 10. Clean up snapshot
     let _ = std::fs::remove_file(&snapshot_path);

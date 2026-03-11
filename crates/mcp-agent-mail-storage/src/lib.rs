@@ -1680,7 +1680,6 @@ impl CommitCoalescer {
                 }
             }
         }
-        rq.depth.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Enqueue a commit request. **Non-blocking, fire-and-forget.**
@@ -1791,10 +1790,14 @@ impl CommitCoalescer {
 
             // Check if all repos are empty and not being processed
             let all_empty = {
-                let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
-                repos.values().all(|rq| {
-                    rq.depth.load(Ordering::Relaxed) == 0 && !rq.processing.load(Ordering::Relaxed)
-                })
+                if self.pending_requests.load(Ordering::Relaxed) > 0 {
+                    false
+                } else {
+                    let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
+                    repos.values().all(|rq| {
+                        rq.depth.load(Ordering::Relaxed) == 0 && !rq.processing.load(Ordering::Relaxed)
+                    })
+                }
             };
 
             if all_empty {

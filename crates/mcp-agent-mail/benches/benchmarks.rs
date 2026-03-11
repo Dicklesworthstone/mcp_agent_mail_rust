@@ -1772,61 +1772,31 @@ fn run_share_export_once(
     let finalize = mcp_agent_mail_share::finalize_export_db(&snapshot_path).expect("finalize");
     let finalize_us = t3.elapsed().as_micros() as u64;
 
-    // Bundle pipeline (attachments -> viewer -> scaffold). Keep this timed separately from zip.
+    let context = mcp_agent_mail_share::SnapshotContext {
+        snapshot_path: snapshot_path.clone(),
+        scope,
+        scrub_summary,
+        fts_enabled: finalize.fts_enabled,
+    };
+
+    // Canonical bundle pipeline (attachments -> viewer -> static render -> scaffold).
     let t4 = Instant::now();
-    let att_manifest = mcp_agent_mail_share::bundle_attachments(
-        &snapshot_path,
+    let export = mcp_agent_mail_share::export_bundle_from_snapshot_context(
+        &context,
         &bundle_dir,
         &fixture.storage_root,
-        inline_threshold,
-        detach_threshold,
-        true,
+        &mcp_agent_mail_share::BundleExportConfig {
+            inline_attachment_threshold: inline_threshold,
+            detach_attachment_threshold: detach_threshold,
+            chunk_threshold: scenario.chunk_threshold_bytes(),
+            chunk_size: scenario.chunk_size_bytes(),
+            scrub_preset: mcp_agent_mail_share::ScrubPreset::Standard,
+            allow_absolute_attachment_paths: true,
+            hosting_hints_root: None,
+        },
     )
-    .expect("bundle_attachments");
-
-    // Copy DB to bundle
-    let db_dest = bundle_dir.join("mailbox.sqlite3");
-    std::fs::copy(&snapshot_path, &db_dest).expect("copy db");
-    let db_bytes = std::fs::read(&db_dest).expect("read db");
-    let db_sha256 = sha256_bytes(&db_bytes);
-    let db_size = db_bytes.len() as u64;
-
-    // Maybe chunk
-    let chunk = mcp_agent_mail_share::maybe_chunk_database(
-        &db_dest,
-        &bundle_dir,
-        scenario.chunk_threshold_bytes(),
-        scenario.chunk_size_bytes(),
-    )
-    .expect("maybe_chunk_database");
-    let chunk_count = chunk.as_ref().map_or(0, |c| c.chunk_count);
-
-    // Viewer assets + data + SRI
-    let _ = mcp_agent_mail_share::copy_viewer_assets(&bundle_dir).expect("copy viewer assets");
-    let viewer_data =
-        mcp_agent_mail_share::export_viewer_data(&snapshot_path, &bundle_dir, finalize.fts_enabled)
-            .expect("export viewer data");
-    let sri = mcp_agent_mail_share::compute_viewer_sri(&bundle_dir);
-
-    let hints = mcp_agent_mail_share::detect_hosting_hints(&bundle_dir);
-    mcp_agent_mail_share::write_bundle_scaffolding(
-        &bundle_dir,
-        &scope,
-        &scrub_summary,
-        &att_manifest,
-        chunk.as_ref(),
-        scenario.chunk_threshold_bytes(),
-        scenario.chunk_size_bytes(),
-        &hints,
-        finalize.fts_enabled,
-        "mailbox.sqlite3",
-        &db_sha256,
-        db_size,
-        Some(&viewer_data),
-        &sri,
-    )
-    .expect("write scaffolding");
-
+    .expect("export bundle");
+    let chunk_count = export.chunk_manifest.as_ref().map_or(0, |c| c.chunk_count);
     let bundle_us = t4.elapsed().as_micros() as u64;
 
     let t5 = Instant::now();

@@ -2181,6 +2181,7 @@ dependencies = [
  "fsqlite-ext-icu",
  "fsqlite-ext-json",
  "fsqlite-ext-misc",
+ "fsqlite-ext-rtree",
  "fsqlite-func",
  "fsqlite-mvcc",
  "fsqlite-observability 0.1.1",
@@ -2258,6 +2259,7 @@ name = "fsqlite-ext-rtree"
 version = "0.1.1"
 dependencies = [
  "fsqlite-error",
+ "fsqlite-func",
  "fsqlite-types",
 ]
 

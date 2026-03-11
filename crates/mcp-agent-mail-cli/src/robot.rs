@@ -3568,9 +3568,7 @@ fn navigate_mcp_error_to_cli_error(err: McpError) -> CliError {
     }
 }
 
-fn navigate_query_string(
-    query: &std::collections::HashMap<String, String>,
-) -> String {
+fn navigate_query_string(query: &std::collections::HashMap<String, String>) -> String {
     let mut entries: Vec<(&str, &str)> = query
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
@@ -3712,9 +3710,11 @@ fn build_navigate_from_canonical_resource(
             let effective_query = navigate_query_with_default_project(&query, default_project);
             let project_scope = effective_query.get("project").cloned();
             let agent = navigate_param_with_query(agent_name, &effective_query);
-            navigate_async_resource("mailbox-with-commits", project_scope, move |ctx| async move {
-                mcp_agent_mail_tools::mailbox_with_commits(&ctx, agent).await
-            })
+            navigate_async_resource(
+                "mailbox-with-commits",
+                project_scope,
+                move |ctx| async move { mcp_agent_mail_tools::mailbox_with_commits(&ctx, agent).await },
+            )
         }
         ["outbox", agent_name] => {
             let effective_query = navigate_query_with_default_project(&query, default_project);
@@ -3728,9 +3728,11 @@ fn build_navigate_from_canonical_resource(
             let effective_query = navigate_query_with_default_project(&query, default_project);
             let project_scope = effective_query.get("project").cloned();
             let agent = navigate_param_with_query(agent_name, &effective_query);
-            navigate_async_resource("views/urgent-unread", project_scope, move |ctx| async move {
-                mcp_agent_mail_tools::views_urgent_unread(&ctx, agent).await
-            })
+            navigate_async_resource(
+                "views/urgent-unread",
+                project_scope,
+                move |ctx| async move { mcp_agent_mail_tools::views_urgent_unread(&ctx, agent).await },
+            )
         }
         ["views", "ack-required", agent_name] => {
             let effective_query = navigate_query_with_default_project(&query, default_project);
@@ -5234,11 +5236,7 @@ mod tests {
 
     static NAVIGATE_RESOURCE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    fn with_navigate_resource_env<F, T>(
-        database_url: &str,
-        storage_root: &str,
-        f: F,
-    ) -> T
+    fn with_navigate_resource_env<F, T>(database_url: &str, storage_root: &str, f: F) -> T
     where
         F: FnOnce() -> T,
     {
@@ -5246,7 +5244,10 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("DATABASE_URL", database_url), ("STORAGE_ROOT", storage_root)],
+            &[
+                ("DATABASE_URL", database_url),
+                ("STORAGE_ROOT", storage_root),
+            ],
             f,
         )
     }
@@ -7181,7 +7182,9 @@ mod tests {
     #[test]
     fn test_build_navigate_from_canonical_resource_projects_honors_query_options() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let db_path = temp_dir.path().join("robot_navigate_canonical_projects.sqlite3");
+        let db_path = temp_dir
+            .path()
+            .join("robot_navigate_canonical_projects.sqlite3");
         let storage_root = temp_dir.path().join("storage-root");
         std::fs::create_dir_all(&storage_root).expect("create storage root");
         let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
@@ -7209,16 +7212,12 @@ mod tests {
 
         let database_url = format!("sqlite://{}", db_path.display());
         let storage_root_str = storage_root.display().to_string();
-        let (result, scope) = with_navigate_resource_env(
-            &database_url,
-            &storage_root_str,
-            || {
-                build_navigate_from_canonical_resource(
-                    "resource://projects?contains=beta&limit=1",
-                    None,
-                )
-            },
-        )
+        let (result, scope) = with_navigate_resource_env(&database_url, &storage_root_str, || {
+            build_navigate_from_canonical_resource(
+                "resource://projects?contains=beta&limit=1",
+                None,
+            )
+        })
         .expect("canonical navigate projects");
 
         match result {
