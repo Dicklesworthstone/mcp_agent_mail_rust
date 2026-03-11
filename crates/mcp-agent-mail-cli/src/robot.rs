@@ -8,6 +8,8 @@
 use asupersync::Outcome;
 use chrono::Utc;
 use clap::{Args, Subcommand};
+use fastmcp::McpErrorCode;
+use fastmcp::prelude::{McpContext, McpError, McpResult};
 use serde::Serialize;
 use sqlmodel_core::Value;
 use std::path::{Path, PathBuf};
@@ -181,15 +183,23 @@ fn parse_attachment_name(value: &serde_json::Value) -> String {
     value
         .get("name")
         .and_then(|v| v.as_str())
-        .or_else(|| {
-            value.get("path").and_then(|v| v.as_str()).and_then(|path| {
-                std::path::Path::new(path)
-                    .file_name()
-                    .and_then(std::ffi::OsStr::to_str)
-            })
+        .map(ToString::to_string)
+        .unwrap_or_else(|| {
+            value
+                .get("path")
+                .and_then(|v| v.as_str())
+                .and_then(|path| {
+                    let file_part = path.rsplit('/').next().unwrap_or(path);
+                    let name_only = file_part.split('?').next().unwrap_or(file_part);
+                    let name_only = name_only.split('#').next().unwrap_or(name_only);
+                    if name_only.is_empty() {
+                        None
+                    } else {
+                        Some(name_only.to_string())
+                    }
+                })
+                .unwrap_or_else(|| "attachment".to_string())
         })
-        .unwrap_or("attachment")
-        .to_string()
 }
 
 fn parse_attachment_mime_type(value: &serde_json::Value) -> String {
@@ -3549,6 +3559,233 @@ enum NavigateResult {
     },
 }
 
+fn navigate_mcp_error_to_cli_error(err: McpError) -> CliError {
+    match err.code {
+        McpErrorCode::InvalidParams | McpErrorCode::ResourceNotFound => {
+            CliError::InvalidArgument(err.message)
+        }
+        _ => CliError::Other(err.message),
+    }
+}
+
+fn navigate_query_string(
+    query: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut entries: Vec<(&str, &str)> = query
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    entries.sort_by(|left, right| left.0.cmp(right.0).then_with(|| left.1.cmp(right.1)));
+    entries
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn navigate_param_with_query(
+    base: &str,
+    query: &std::collections::HashMap<String, String>,
+) -> String {
+    if query.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", navigate_query_string(query))
+    }
+}
+
+fn navigate_query_with_default_project(
+    query: &std::collections::HashMap<String, String>,
+    default_project: Option<&str>,
+) -> std::collections::HashMap<String, String> {
+    let mut effective = query.clone();
+    if !effective.contains_key("project")
+        && let Some(project) = default_project
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        effective.insert("project".to_string(), project.to_string());
+    }
+    effective
+}
+
+fn navigate_json_result(
+    resource_type: &str,
+    payload: String,
+    project_scope: Option<String>,
+) -> Result<(NavigateResult, Option<String>), CliError> {
+    let data = serde_json::from_str::<serde_json::Value>(&payload)
+        .map_err(|e| CliError::Other(format!("navigate resource JSON parse failed: {e}")))?;
+    Ok((
+        NavigateResult::Generic {
+            resource_type: resource_type.to_string(),
+            data,
+        },
+        project_scope,
+    ))
+}
+
+fn navigate_async_resource<F, Fut>(
+    resource_type: &str,
+    project_scope: Option<String>,
+    call: F,
+) -> Result<(NavigateResult, Option<String>), CliError>
+where
+    F: FnOnce(McpContext) -> Fut,
+    Fut: std::future::Future<Output = McpResult<String>>,
+{
+    let payload = crate::context::run_async(async move {
+        let ctx = McpContext::new(asupersync::Cx::for_request(), 1);
+        call(ctx).await.map_err(navigate_mcp_error_to_cli_error)
+    })?;
+    navigate_json_result(resource_type, payload, project_scope)
+}
+
+fn navigate_should_use_canonical_resource(uri: &str) -> bool {
+    let Ok((path, _query)) = split_resource_path_and_query(uri) else {
+        return false;
+    };
+    let parts: Vec<String> = path
+        .split('/')
+        .map(percent_decode_resource_path_component)
+        .collect();
+    let parts_ref: Vec<&str> = parts.iter().map(String::as_str).collect();
+    matches!(
+        parts_ref.as_slice(),
+        ["projects"]
+            | ["inbox", ..]
+            | ["mailbox", ..]
+            | ["mailbox-with-commits", ..]
+            | ["outbox", ..]
+            | ["views", "urgent-unread", ..]
+            | ["views", "ack-required", ..]
+            | ["views", "acks-stale", ..]
+            | ["views", "ack-overdue", ..]
+            | ["file_reservations"]
+            | ["file_reservations", ..]
+            | ["reservations"]
+            | ["reservations", ..]
+    )
+}
+
+fn build_navigate_from_canonical_resource(
+    uri: &str,
+    default_project: Option<&str>,
+) -> Result<(NavigateResult, Option<String>), CliError> {
+    let (path, query) = split_resource_path_and_query(uri)?;
+    let parts: Vec<String> = path
+        .split('/')
+        .map(percent_decode_resource_path_component)
+        .collect();
+    let parts_ref: Vec<&str> = parts.iter().map(String::as_str).collect();
+
+    match parts_ref.as_slice() {
+        ["projects"] => {
+            if query.is_empty() {
+                navigate_async_resource("projects", None, |ctx| async move {
+                    mcp_agent_mail_tools::projects_list(&ctx).await
+                })
+            } else {
+                let query_string = navigate_query_string(&query);
+                navigate_async_resource("projects", None, move |ctx| async move {
+                    mcp_agent_mail_tools::projects_list_query(&ctx, query_string).await
+                })
+            }
+        }
+        ["inbox", agent_name] => {
+            let effective_query = navigate_query_with_default_project(&query, default_project);
+            let project_scope = effective_query.get("project").cloned();
+            let agent = navigate_param_with_query(agent_name, &effective_query);
+            navigate_async_resource("inbox", project_scope, move |ctx| async move {
+                mcp_agent_mail_tools::inbox(&ctx, agent).await
+            })
+        }
+        ["mailbox", agent_name] => {
+            let effective_query = navigate_query_with_default_project(&query, default_project);
+            let project_scope = effective_query.get("project").cloned();
+            let agent = navigate_param_with_query(agent_name, &effective_query);
+            navigate_async_resource("mailbox", project_scope, move |ctx| async move {
+                mcp_agent_mail_tools::mailbox(&ctx, agent).await
+            })
+        }
+        ["mailbox-with-commits", agent_name] => {
+            let effective_query = navigate_query_with_default_project(&query, default_project);
+            let project_scope = effective_query.get("project").cloned();
+            let agent = navigate_param_with_query(agent_name, &effective_query);
+            navigate_async_resource("mailbox-with-commits", project_scope, move |ctx| async move {
+                mcp_agent_mail_tools::mailbox_with_commits(&ctx, agent).await
+            })
+        }
+        ["outbox", agent_name] => {
+            let effective_query = navigate_query_with_default_project(&query, default_project);
+            let project_scope = effective_query.get("project").cloned();
+            let agent = navigate_param_with_query(agent_name, &effective_query);
+            navigate_async_resource("outbox", project_scope, move |ctx| async move {
+                mcp_agent_mail_tools::outbox(&ctx, agent).await
+            })
+        }
+        ["views", "urgent-unread", agent_name] => {
+            let effective_query = navigate_query_with_default_project(&query, default_project);
+            let project_scope = effective_query.get("project").cloned();
+            let agent = navigate_param_with_query(agent_name, &effective_query);
+            navigate_async_resource("views/urgent-unread", project_scope, move |ctx| async move {
+                mcp_agent_mail_tools::views_urgent_unread(&ctx, agent).await
+            })
+        }
+        ["views", "ack-required", agent_name] => {
+            let effective_query = navigate_query_with_default_project(&query, default_project);
+            let project_scope = effective_query.get("project").cloned();
+            let agent = navigate_param_with_query(agent_name, &effective_query);
+            navigate_async_resource("views/ack-required", project_scope, move |ctx| async move {
+                mcp_agent_mail_tools::views_ack_required(&ctx, agent).await
+            })
+        }
+        ["views", "acks-stale", agent_name] => {
+            let effective_query = navigate_query_with_default_project(&query, default_project);
+            let project_scope = effective_query.get("project").cloned();
+            let agent = navigate_param_with_query(agent_name, &effective_query);
+            navigate_async_resource("views/acks-stale", project_scope, move |ctx| async move {
+                mcp_agent_mail_tools::views_acks_stale(&ctx, agent).await
+            })
+        }
+        ["views", "ack-overdue", agent_name] => {
+            let effective_query = navigate_query_with_default_project(&query, default_project);
+            let project_scope = effective_query.get("project").cloned();
+            let agent = navigate_param_with_query(agent_name, &effective_query);
+            navigate_async_resource("views/ack-overdue", project_scope, move |ctx| async move {
+                mcp_agent_mail_tools::views_ack_overdue(&ctx, agent).await
+            })
+        }
+        ["file_reservations", project_key] | ["reservations", project_key] => {
+            let scope = Some((*project_key).to_string());
+            let slug = navigate_param_with_query(project_key, &query);
+            navigate_async_resource("file_reservations", scope, move |ctx| async move {
+                mcp_agent_mail_tools::file_reservations(&ctx, slug).await
+            })
+        }
+        ["file_reservations"] | ["reservations"] => {
+            let mut effective_query = query.clone();
+            let Some(project_key) = effective_query
+                .remove("project")
+                .or_else(|| default_project.map(str::to_string))
+                .filter(|value| !value.trim().is_empty())
+            else {
+                return Err(CliError::InvalidArgument(
+                    "project query parameter is required".to_string(),
+                ));
+            };
+            let scope = Some(project_key.clone());
+            let slug = navigate_param_with_query(&project_key, &effective_query);
+            navigate_async_resource("file_reservations", scope, move |ctx| async move {
+                mcp_agent_mail_tools::file_reservations(&ctx, slug).await
+            })
+        }
+        _ => Err(CliError::InvalidArgument(format!(
+            "unsupported canonical navigate resource URI pattern: {uri}"
+        ))),
+    }
+}
+
 fn build_navigate_file_reservations(
     conn: &DbConn,
     project_id: i64,
@@ -4954,12 +5191,14 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             format_output(&env, format)?
         }
         RobotSubcommand::Navigate { uri } => {
-            let conn = crate::open_db_sync()?;
-            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
-            let agent = resolve_optional_agent_id(&conn, project_id, args.agent.as_deref())?;
-
-            let (result, resolved_project) =
-                build_navigate(&conn, &uri, project_id, &project_slug, agent)?;
+            let (result, resolved_project) = if navigate_should_use_canonical_resource(&uri) {
+                build_navigate_from_canonical_resource(&uri, args.project.as_deref())?
+            } else {
+                let conn = crate::open_db_sync()?;
+                let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
+                let agent = resolve_optional_agent_id(&conn, project_id, args.agent.as_deref())?;
+                build_navigate(&conn, &uri, project_id, &project_slug, agent)?
+            };
 
             #[derive(Serialize)]
             struct NavigateData {
@@ -4991,6 +5230,26 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
 mod tests {
     use super::*;
     use serde_json::Value;
+    use std::sync::Mutex;
+
+    static NAVIGATE_RESOURCE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_navigate_resource_env<F, T>(
+        database_url: &str,
+        storage_root: &str,
+        f: F,
+    ) -> T
+    where
+        F: FnOnce() -> T,
+    {
+        let _lock = NAVIGATE_RESOURCE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("DATABASE_URL", database_url), ("STORAGE_ROOT", storage_root)],
+            f,
+        )
+    }
 
     #[derive(Debug, Serialize)]
     struct TestData {
@@ -6910,6 +7169,72 @@ mod tests {
         let out = format_output(&env, OutputFormat::Json).unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["uri"], "resource://projects");
+    }
+
+    #[test]
+    fn test_navigate_should_use_canonical_resource_for_mailbox_with_commits() {
+        assert!(navigate_should_use_canonical_resource(
+            "resource://mailbox-with-commits/BlueLake?project=/tmp/proj"
+        ));
+    }
+
+    #[test]
+    fn test_build_navigate_from_canonical_resource_projects_honors_query_options() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_navigate_canonical_projects.sqlite3");
+        let storage_root = temp_dir.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create projects");
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES
+                (1, 'alpha-proj', '/tmp/alpha-proj', 1000),
+                (2, 'beta-proj', '/tmp/beta-proj', 2000)",
+            &empty,
+        )
+        .expect("insert projects");
+
+        let database_url = format!("sqlite://{}", db_path.display());
+        let storage_root_str = storage_root.display().to_string();
+        let (result, scope) = with_navigate_resource_env(
+            &database_url,
+            &storage_root_str,
+            || {
+                build_navigate_from_canonical_resource(
+                    "resource://projects?contains=beta&limit=1",
+                    None,
+                )
+            },
+        )
+        .expect("canonical navigate projects");
+
+        match result {
+            NavigateResult::Generic {
+                resource_type,
+                data,
+            } => {
+                assert_eq!(resource_type, "projects");
+                let projects = data.as_array().expect("projects array");
+                assert_eq!(projects.len(), 1);
+                assert_eq!(projects[0]["slug"], "beta-proj");
+                assert_eq!(projects[0]["human_key"], "/tmp/beta-proj");
+            }
+            other => panic!("unexpected canonical navigate result: {other:?}"),
+        }
+        assert!(scope.is_none());
     }
 
     #[test]
