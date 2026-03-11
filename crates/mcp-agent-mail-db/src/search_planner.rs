@@ -460,6 +460,7 @@ pub struct SearchResult {
     pub created_ts: Option<i64>,
     pub thread_id: Option<String>,
     pub from_agent: Option<String>,
+    pub from_agent_id: Option<i64>,
 
     pub to: Option<Vec<String>>,
     pub cc: Option<Vec<String>>,
@@ -500,6 +501,7 @@ impl Default for SearchResult {
             created_ts: None,
             thread_id: None,
             from_agent: None,
+            from_agent_id: None,
             to: None,
             cc: None,
             bcc: None,
