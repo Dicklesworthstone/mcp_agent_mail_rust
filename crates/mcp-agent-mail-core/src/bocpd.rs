@@ -56,6 +56,7 @@ impl NigStats {
         let kappa_new = self.kappa + 1.0;
         let mu_new = self.kappa.mul_add(self.mu, x) / kappa_new;
         let alpha_new = self.alpha + 0.5;
+        // Correct conjugate NIG update: beta_new = beta + 0.5 * kappa * (x - mu)^2 / kappa_new
         let beta_new = self.beta + 0.5 * self.kappa * (x - self.mu).powi(2) / kappa_new;
         Self {
             mu: mu_new,
@@ -328,7 +329,7 @@ impl BocpdDetector {
             self.in_change = false;
         }
 
-        if short_mass > self.threshold && !self.in_change && self.prev_max_rl >= CHANGE_WINDOW {
+        if short_mass > self.threshold && !self.in_change {
             self.in_change = true;
             self.prev_max_rl = cur_max_rl;
             Some(ChangePoint {
@@ -381,7 +382,14 @@ fn log_sum_exp(log_vals: &[f64]) -> f64 {
     if max == f64::NEG_INFINITY {
         return f64::NEG_INFINITY;
     }
-    max + log_vals.iter().map(|v| (v - max).exp()).sum::<f64>().ln()
+    if max == f64::INFINITY {
+        return f64::INFINITY;
+    }
+    max + log_vals
+        .iter()
+        .map(|v| (v - max).exp())
+        .sum::<f64>()
+        .ln()
 }
 
 // ---------------------------------------------------------------------------

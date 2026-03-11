@@ -170,6 +170,9 @@ pub fn iso_to_micros(s: &str) -> Option<i64> {
     if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.fZ") {
         return Some(naive_to_micros(dt));
     }
+    if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
+        return Some(naive_to_micros(dt));
+    }
     if let Ok(dt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
         return Some(naive_to_micros(dt));
     }
