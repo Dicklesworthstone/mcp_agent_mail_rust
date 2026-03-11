@@ -2806,6 +2806,8 @@ pub async fn fetch_inbox(
     include_bodies: Option<bool>,
     topic: Option<String>,
 ) -> McpResult<String> {
+    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
+        .unwrap_or(agent_name);
     let mut msg_limit = limit.unwrap_or(20);
     if msg_limit < 1 {
         return Err(legacy_tool_error(
@@ -2978,6 +2980,9 @@ pub async fn mark_message_read(
     agent_name: String,
     message_id: i64,
 ) -> McpResult<String> {
+    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
+        .unwrap_or(agent_name);
+
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
@@ -3033,6 +3038,9 @@ pub async fn acknowledge_message(
     agent_name: String,
     message_id: i64,
 ) -> McpResult<String> {
+    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
+        .unwrap_or(agent_name);
+
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
