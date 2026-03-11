@@ -1771,7 +1771,6 @@ effective_free_bytes={free}"
         let approved_set: HashSet<i64> = approved_ids.into_iter().collect();
 
         let mut blocked: Vec<(String, String)> = Vec::new();
-        let mut to_remove_names: HashSet<String> = HashSet::new();
 
         // Check policy for each resolved recipient
         let mut check_policy = |name: &String, kind: &str| {
@@ -1788,19 +1787,11 @@ effective_free_bytes={free}"
                 ) {
                     ContactPolicyDecision::Allow => {}
                     ContactPolicyDecision::BlockAll => {
-                        if broadcast {
-                            to_remove_names.insert(name.clone());
-                        } else {
-                            // Non-broadcast: immediate failure for BlockAll
-                            return Some(Err(contact_blocked_error()));
-                        }
+                        // immediate failure for BlockAll
+                        return Some(Err(contact_blocked_error()));
                     }
                     ContactPolicyDecision::RequireApproval => {
-                        if broadcast {
-                            to_remove_names.insert(name.clone());
-                        } else {
-                            blocked.push((agent.name.clone(), kind.to_string()));
-                        }
+                        blocked.push((agent.name.clone(), kind.to_string()));
                     }
                 }
             }
@@ -1820,28 +1811,6 @@ effective_free_bytes={free}"
         for name in &resolved_bcc_recipients {
             if let Some(err) = check_policy(name, "bcc") {
                 return err;
-            }
-        }
-
-        if !to_remove_names.is_empty() {
-            resolved_to.retain(|n| !to_remove_names.contains(n));
-            resolved_cc_recipients.retain(|n| !to_remove_names.contains(n));
-            resolved_bcc_recipients.retain(|n| !to_remove_names.contains(n));
-
-            let remove_ids: HashSet<i64> = to_remove_names
-                .iter()
-                .filter_map(|n| recipient_map.get(&n.to_lowercase()).and_then(|a| a.id))
-                .collect();
-
-            all_recipients.retain(|(id, _)| !remove_ids.contains(id));
-
-            if all_recipients.is_empty() {
-                return Err(legacy_tool_error(
-                    "NO_RECIPIENTS",
-                    "Broadcast failed: no eligible recipients found (all potential recipients blocked the message via contact policies).",
-                    true,
-                    json!({}),
-                ));
             }
         }
 

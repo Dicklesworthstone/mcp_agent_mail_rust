@@ -804,7 +804,10 @@ impl AgentPlatform {
                 "Windsurf project-local MCP config",
             )],
             Self::Codex => {
-                let mut key_values = vec![("url".into(), format!("\"{url}\""))];
+                let mut key_values = vec![
+                    ("url".into(), format!("\"{url}\"")),
+                    ("startup_timeout_sec".into(), "30".into()),
+                ];
                 if !token.is_empty() {
                     key_values.push((
                         "http_headers".into(),
@@ -1607,6 +1610,7 @@ mod tests {
                 assert!(
                     key_values.contains(&("url".into(), "\"http://127.0.0.1:8765/api/\"".into()))
                 );
+                assert!(key_values.contains(&("startup_timeout_sec".into(), "30".into())));
                 assert!(key_values.contains(&(
                     "http_headers".into(),
                     "{ Authorization = \"Bearer tok\" }".into(),

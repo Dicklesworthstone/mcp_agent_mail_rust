@@ -953,6 +953,15 @@ pub async fn whois(
         .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
 }
 
+fn resolve_identity_from_project_keys(
+    project_keys: &[String],
+    pane_id: &str,
+) -> Option<(String, std::path::PathBuf)> {
+    project_keys.iter().find_map(|project_key| {
+        mcp_agent_mail_core::resolve_identity_with_path(project_key, pane_id)
+    })
+}
+
 /// Resolve the agent name for a tmux pane from the canonical identity file.
 ///
 /// # Parameters
@@ -964,8 +973,8 @@ pub async fn whois(
 #[tool(
     description = "Resolve the agent name for a tmux pane from the canonical per-pane identity file.\n\nChecks the following locations in priority order:\n1. Canonical: ~/.config/agent-mail/identity/<project_hash>/<pane_id>\n2. Legacy Claude Code: ~/.claude/agent-mail/identity.<pane_id>\n3. Legacy NTM: /tmp/agent-mail-name.<project_hash>.<pane_id>\n\nParameters\n----------\nproject_key : str\n    Absolute path to the project directory (used to scope the lookup).\npane_id : Optional[str]\n    Tmux pane identifier (e.g., \"%0\", \"%3\"). If omitted, reads $TMUX_PANE.\n\nReturns\n-------\ndict\n    { agent_name, pane_id, identity_path }"
 )]
-pub fn resolve_pane_identity(
-    _ctx: &McpContext,
+pub async fn resolve_pane_identity(
+    ctx: &McpContext,
     project_key: String,
     pane_id: Option<String>,
 ) -> McpResult<String> {
@@ -984,10 +993,23 @@ pub fn resolve_pane_identity(
         ));
     }
 
-    let canonical_path =
-        mcp_agent_mail_core::canonical_identity_path(&project_key, &effective_pane);
+    let mut project_keys = vec![project_key.clone()];
+    if !Path::new(&project_key).is_absolute() {
+        if let Ok(pool) = get_db_pool() {
+            if let Ok(project) = resolve_project(ctx, &pool, &project_key).await {
+                if project.human_key != project_key {
+                    project_keys.push(project.human_key);
+                }
+            }
+        }
+    }
 
-    mcp_agent_mail_core::resolve_identity_with_path(&project_key, &effective_pane).map_or_else(
+    let checked_path = mcp_agent_mail_core::canonical_identity_path(
+        project_keys.last().unwrap_or(&project_key),
+        &effective_pane,
+    );
+
+    resolve_identity_from_project_keys(&project_keys, &effective_pane).map_or_else(
         || {
             Err(legacy_tool_error(
                 "IDENTITY_NOT_FOUND",
@@ -999,11 +1021,11 @@ pub fn resolve_pane_identity(
                 json!({
                     "pane_id": effective_pane,
                     "project_key": project_key,
-                    "checked_path": canonical_path.to_string_lossy(),
+                    "checked_path": checked_path.to_string_lossy(),
                 }),
             ))
         },
-        |(agent_name, resolved_path): (String, std::path::PathBuf)| {
+        |(agent_name, resolved_path)| {
             let response = json!({
                 "agent_name": agent_name,
                 "pane_id": effective_pane,
@@ -1481,5 +1503,27 @@ mod tests {
         // Edge case: multiple @ signs — last one is the host separator
         let result = redact_database_url("postgres://user:p@ss@host/db");
         assert_eq!(result, "postgres://****@host/db");
+    }
+
+    #[test]
+    fn resolve_identity_from_project_keys_falls_back_to_human_key() {
+        let raw_project_key = "test-project".to_string();
+        let human_key = format!("/tmp/test-pane-identity-human-key-{}", std::process::id());
+        let pane = "%17";
+        let written_path =
+            mcp_agent_mail_core::write_identity(&human_key, pane, "BlueLake").expect("write");
+
+        let resolved = resolve_identity_from_project_keys(
+            &[raw_project_key, human_key.clone()],
+            pane,
+        )
+        .expect("resolve identity across project keys");
+        assert_eq!(resolved.0, "BlueLake");
+        assert_eq!(resolved.1, written_path);
+
+        let _ = std::fs::remove_file(&written_path);
+        if let Some(parent) = written_path.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
     }
 }

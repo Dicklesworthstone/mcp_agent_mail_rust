@@ -6873,15 +6873,9 @@ pub fn check_archive_consistency(
             }
         };
 
-        let iso_filename = msg.created_ts_iso.replace(':', "-").replace('+', "");
-        // Truncate to seconds-level precision for filename matching
-        let iso_prefix = if iso_filename.len() >= 19 {
-            &iso_filename[..19]
-        } else {
-            &iso_filename
-        };
+        let iso_prefix = archive_filename_timestamp_prefix(&msg.created_ts_iso);
         let subject_slug = slugify_message_subject(&msg.subject);
-        let fallback_prefix = format!("{iso_prefix}__{subject_slug}");
+        let fallback_subject_marker = format!("__{subject_slug}");
 
         let messages_dir = project_dir.join("messages").join(&year).join(&month);
 
@@ -6893,22 +6887,27 @@ pub fn check_archive_consistency(
         // canonical frontmatter IDs, so the `__{id}.md` suffix in the
         // filename might not match the current DB row ID. To avoid
         // false-positive "missing" reports, we also accept same-second files
-        // that still match the subject slug.
+        // whose filename matches the subject slug and whose frontmatter still
+        // matches the DB row's subject, sender, and created second.
         // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/10
         let found_file = if messages_dir.is_dir() {
             let id_suffix = format!("__{}.md", msg.message_id);
             match std::fs::read_dir(&messages_dir) {
                 Ok(entries) => entries.flatten().any(|entry| {
+                    let path = entry.path();
                     let name = entry.file_name();
                     let name_str = name.to_string_lossy();
                     // Primary match: timestamp prefix + exact DB ID suffix
-                    if name_str.starts_with(iso_prefix) && name_str.ends_with(&id_suffix) {
+                    if name_str.starts_with(&iso_prefix) && name_str.ends_with(&id_suffix) {
                         return true;
                     }
-                    // Fallback: same-second timestamp + matching subject slug
-                    // + any `.md` suffix (covers post-reconstruct ID drift
-                    // where archive still has the canonical ID)
-                    name_str.starts_with(&fallback_prefix) && name_str.ends_with(".md")
+                    archive_fallback_matches_message_ref(
+                        &path,
+                        &name_str,
+                        msg,
+                        &iso_prefix,
+                        &fallback_subject_marker,
+                    )
                 }),
                 Err(_) => false,
             }
@@ -6938,6 +6937,53 @@ pub fn check_archive_consistency(
         missing,
         missing_ids,
     }
+}
+
+fn archive_filename_timestamp_prefix(iso: &str) -> String {
+    let iso_filename = iso.replace(':', "-").replace('+', "");
+    if iso_filename.len() >= 19 {
+        iso_filename[..19].to_string()
+    } else {
+        iso_filename
+    }
+}
+
+fn archive_fallback_matches_message_ref(
+    path: &Path,
+    entry_name: &str,
+    msg: &ConsistencyMessageRef,
+    expected_iso_prefix: &str,
+    fallback_subject_marker: &str,
+) -> bool {
+    if !entry_name.starts_with(expected_iso_prefix)
+        || !entry_name.contains(fallback_subject_marker)
+        || !entry_name.ends_with(".md")
+    {
+        return false;
+    }
+
+    let Ok((frontmatter, _body)) = read_message_file(path) else {
+        return false;
+    };
+    let Some(frontmatter_subject) = frontmatter.get("subject").and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    let Some(frontmatter_sender) = frontmatter.get("from").and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    let Some(frontmatter_created) = frontmatter
+        .get("created")
+        .or_else(|| frontmatter.get("created_ts"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+
+    frontmatter_subject == msg.subject
+        && frontmatter_sender == msg.sender_name
+        && archive_filename_timestamp_prefix(frontmatter_created) == expected_iso_prefix
 }
 
 /// Parse year and month from an ISO 8601 timestamp string.
@@ -9783,6 +9829,90 @@ mod tests {
         let report = check_archive_consistency(dir.path(), &refs);
         assert_eq!(report.sampled, 2);
         assert_eq!(report.found, 1);
+        assert_eq!(report.missing, 1);
+        assert_eq!(report.missing_ids, vec![99]);
+    }
+
+    #[test]
+    fn consistency_same_second_id_drift_with_matching_frontmatter_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let slug = "test-project";
+        let msg_dir = dir
+            .path()
+            .join("projects")
+            .join(slug)
+            .join("messages")
+            .join("2026")
+            .join("02");
+        fs::create_dir_all(&msg_dir).unwrap();
+
+        let message = serde_json::json!({
+            "id": 42,
+            "from": "BlueLake",
+            "subject": "hello world",
+            "created": "2026-02-08T03:29:30+00:00",
+            "to": ["RedFox"],
+        });
+        let content = render_message_bundle_content(&message, "body").unwrap();
+        fs::write(
+            msg_dir.join("2026-02-08T03-29-30+00-00__hello-world__42.md"),
+            content,
+        )
+        .unwrap();
+
+        let refs = vec![ConsistencyMessageRef {
+            project_slug: slug.into(),
+            message_id: 99,
+            sender_name: "BlueLake".into(),
+            subject: "hello world".into(),
+            created_ts_iso: "2026-02-08T03:29:30+00:00".into(),
+        }];
+
+        let report = check_archive_consistency(dir.path(), &refs);
+        assert_eq!(report.sampled, 1);
+        assert_eq!(report.found, 1);
+        assert_eq!(report.missing, 0);
+        assert!(report.missing_ids.is_empty());
+    }
+
+    #[test]
+    fn consistency_same_second_same_subject_different_sender_stays_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let slug = "test-project";
+        let msg_dir = dir
+            .path()
+            .join("projects")
+            .join(slug)
+            .join("messages")
+            .join("2026")
+            .join("02");
+        fs::create_dir_all(&msg_dir).unwrap();
+
+        let message = serde_json::json!({
+            "id": 42,
+            "from": "BlueLake",
+            "subject": "hello world",
+            "created": "2026-02-08T03:29:30+00:00",
+            "to": ["RedFox"],
+        });
+        let content = render_message_bundle_content(&message, "body").unwrap();
+        fs::write(
+            msg_dir.join("2026-02-08T03-29-30+00-00__hello-world__42.md"),
+            content,
+        )
+        .unwrap();
+
+        let refs = vec![ConsistencyMessageRef {
+            project_slug: slug.into(),
+            message_id: 99,
+            sender_name: "RedFox".into(),
+            subject: "hello world".into(),
+            created_ts_iso: "2026-02-08T03:29:30+00:00".into(),
+        }];
+
+        let report = check_archive_consistency(dir.path(), &refs);
+        assert_eq!(report.sampled, 1);
+        assert_eq!(report.found, 0);
         assert_eq!(report.missing, 1);
         assert_eq!(report.missing_ids, vec![99]);
     }

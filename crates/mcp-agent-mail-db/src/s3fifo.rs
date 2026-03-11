@@ -230,10 +230,23 @@ where
                 break;
             };
 
-            let Some(Node::Small { value, freq }) = self.index.remove(&key) else {
+            // Peek before remove: if this key was already promoted to Main or removed,
+            // the entry in the index won't be Node::Small. Unconditionally calling
+            // remove() would steal the live entry from the other queue.
+            if !matches!(self.index.get(&key), Some(Node::Small { .. })) {
+                continue;
+            }
+
+            let Some(node) = self.index.remove(&key) else {
                 continue;
             };
             self.small_live_count -= 1;
+
+            let Node::Small { value, freq } = node else {
+                // This should be unreachable due to matches! check above, but 
+                // we handle it gracefully just in case.
+                continue;
+            };
 
             if freq >= 1 {
                 if self.main_capacity == 0 {
@@ -273,8 +286,10 @@ where
     fn evict_main_if_full(&mut self) {
         if self.main_capacity == 0 {
             while let Some(key) = self.main.pop_front() {
-                if let Some(Node::Main { .. }) = self.index.remove(&key) {
-                    self.main_live_count -= 1;
+                if matches!(self.index.get(&key), Some(Node::Main { .. })) {
+                    if let Some(Node::Main { .. }) = self.index.remove(&key) {
+                        self.main_live_count -= 1;
+                    }
                 }
             }
             return;
@@ -290,10 +305,20 @@ where
                 break;
             };
 
-            let Some(Node::Main { value, freq }) = self.index.remove(&key) else {
+            if !matches!(self.index.get(&key), Some(Node::Main { .. })) {
+                continue;
+            }
+
+            let Some(node) = self.index.remove(&key) else {
                 continue;
             };
             self.main_live_count -= 1;
+
+            let Node::Main { value, freq } = node else {
+                // This should be unreachable due to matches! check above, but
+                // we handle it gracefully just in case.
+                continue;
+            };
 
             if freq >= 1 {
                 self.main.push_back(key.clone());
