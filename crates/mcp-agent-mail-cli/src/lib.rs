@@ -3601,7 +3601,8 @@ fn normalize_connect_host_for_client_url(host: &str) -> std::borrow::Cow<'_, str
         .unwrap_or(trimmed);
 
     match unbracketed {
-        "0.0.0.0" | "::" => std::borrow::Cow::Borrowed("127.0.0.1"),
+        "0.0.0.0" => std::borrow::Cow::Borrowed("127.0.0.1"),
+        "::" => std::borrow::Cow::Borrowed("[::1]"),
         _ => {
             if unbracketed.contains(':') && !trimmed.starts_with('[') {
                 std::borrow::Cow::Owned(format!("[{unbracketed}]"))
@@ -15606,7 +15607,11 @@ mod tests {
         );
         assert_eq!(
             check_inbox_server_url("::", 8765, "api"),
-            "http://127.0.0.1:8765/api/"
+            "http://[::1]:8765/api/"
+        );
+        assert_eq!(
+            check_inbox_server_url("[::]", 8765, "mcp"),
+            "http://[::1]:8765/mcp/"
         );
     }
 

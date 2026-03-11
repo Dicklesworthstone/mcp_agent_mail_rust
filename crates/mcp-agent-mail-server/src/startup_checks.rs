@@ -195,7 +195,8 @@ fn normalize_connect_host_for_health_check(host: &str) -> std::borrow::Cow<'_, s
         .unwrap_or(trimmed);
 
     match unbracketed {
-        "0.0.0.0" | "::" => std::borrow::Cow::Borrowed("127.0.0.1"),
+        "0.0.0.0" => std::borrow::Cow::Borrowed("127.0.0.1"),
+        "::" => std::borrow::Cow::Borrowed("[::1]"),
         _ => {
             if unbracketed.contains(':') && !trimmed.starts_with('[') {
                 std::borrow::Cow::Owned(format!("[{unbracketed}]"))
@@ -1766,6 +1767,22 @@ mod tests {
         );
 
         server_thread.join().expect("join test server");
+    }
+
+    #[test]
+    fn normalize_connect_host_for_health_check_preserves_ipv6_loopback() {
+        assert_eq!(
+            normalize_connect_host_for_health_check("0.0.0.0"),
+            std::borrow::Cow::Borrowed("127.0.0.1")
+        );
+        assert_eq!(
+            normalize_connect_host_for_health_check("::"),
+            std::borrow::Cow::Borrowed("[::1]")
+        );
+        assert_eq!(
+            normalize_connect_host_for_health_check("[::]"),
+            std::borrow::Cow::Borrowed("[::1]")
+        );
     }
 
     #[test]
