@@ -168,6 +168,33 @@ jobs:
           echo "=== SHA256SUMS ==="
           cat SHA256SUMS
 
+      - name: Validate release bundle completeness
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cd dist
+          archives=(mcp-agent-mail-*.tar.xz mcp-agent-mail-*.zip)
+          if [ "${#archives[@]}" -eq 0 ]; then
+            echo "No release archives found in dist/" >&2
+            exit 1
+          fi
+          test -s SHA256SUMS
+          for artifact in "${archives[@]}"; do
+            test -s "$artifact"
+            test -s "${artifact}.sha256"
+            test -s "${artifact}.sigstore.json"
+            sidecar_hash="$(awk '{print $1; exit}' "${artifact}.sha256")"
+            sums_hash="$(awk -v artifact="$artifact" '$2 == artifact || $2 == ("./" artifact) || $2 == ("*" artifact) {print $1; exit}' SHA256SUMS)"
+            if [ -z "$sums_hash" ]; then
+              echo "SHA256SUMS missing entry for ${artifact}" >&2
+              exit 1
+            fi
+            if [ "$sidecar_hash" != "$sums_hash" ]; then
+              echo "Checksum mismatch between ${artifact}.sha256 and SHA256SUMS for ${artifact}" >&2
+              exit 1
+            fi
+          done
+
       - name: Copy install scripts to dist
         run: |
           cp install.sh dist/ 2>/dev/null || echo "No install.sh found"

@@ -207,7 +207,7 @@ download_to_file() {
   if [ "$VERBOSE" -eq 1 ] && [ "$QUIET" -eq 0 ]; then
     curl -fL --progress-bar "$url" -o "$out" || rc=$?
   else
-    curl -fsSL "$url" -o "$out" || rc=$?
+    curl -fsSL "$url" -o "$out" 2>/dev/null || rc=$?
   fi
   end_ts=$(date +%s)
   duration_s=$((end_ts - start_ts))
@@ -461,6 +461,8 @@ PYTHON_DETECTED=0
 PYTHON_DB_FOUND=0
 PYTHON_DB_PATH=""
 PYTHON_DB_MIGRATED_PATH=""
+PYTHON_DB_FORMAT=""
+PYTHON_DB_PROBE_OUTPUT=""
 MIGRATED_BEARER_TOKEN=""
 RUST_DB_PATH=""
 PYTHON_ALIAS_DISPLACED_COUNT=0
@@ -663,6 +665,63 @@ copy_sqlite_snapshot() {
   # Sidecars are intentionally omitted to avoid propagating stale WAL/SHM state.
   cp -p "$src_db" "$dest_db"
   rm -f "${dest_db}-wal" "${dest_db}-shm" 2>/dev/null || true
+}
+
+extract_migrate_check_format() {
+  local output="$1"
+  printf "%s\n" "$output" | sed -n 's/^Database format: //p' | head -1
+}
+
+python_db_format_needs_import() {
+  local format="$1"
+  case "$format" in
+    TEXT\ timestamps\ \(*|mixed\ format\ \(*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+probe_database_format_with_installed_am() {
+  local db_path="$1"
+  local cli_bin="${DEST}/${BIN_CLI}"
+  local output="" fallback_output=""
+  PYTHON_DB_FORMAT=""
+  PYTHON_DB_PROBE_OUTPUT=""
+
+  [ -x "$cli_bin" ] || return 1
+
+  if output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$db_path" "$cli_bin" migrate --check 2>&1); then
+    :
+  else
+    verbose "db_probe:primary_nonzero db=${db_path}"
+  fi
+  PYTHON_DB_FORMAT=$(extract_migrate_check_format "$output")
+
+  if [ -z "$PYTHON_DB_FORMAT" ]; then
+    if fallback_output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite+aiosqlite:///$db_path" "$cli_bin" migrate --check 2>&1); then
+      :
+    else
+      verbose "db_probe:fallback_nonzero db=${db_path}"
+    fi
+    if [ -n "$fallback_output" ]; then
+      if [ -n "$output" ]; then
+        output="${output}"$'\n'"${fallback_output}"
+      else
+        output="$fallback_output"
+      fi
+    fi
+    PYTHON_DB_FORMAT=$(extract_migrate_check_format "$fallback_output")
+  fi
+
+  PYTHON_DB_PROBE_OUTPUT="$output"
+  if [ -n "$PYTHON_DB_FORMAT" ]; then
+    verbose "db_probe:format db=${db_path} format=${PYTHON_DB_FORMAT}"
+    return 0
+  fi
+
+  while IFS= read -r line; do
+    [ -n "$line" ] && verbose "db_probe:output ${line}"
+  done <<< "$output"
+  return 1
 }
 
 # T1.3: Detect Python virtualenv and git clone
@@ -1040,6 +1099,8 @@ stop_python_server() {
 resolve_database_path() {
   PYTHON_DB_FOUND=0
   PYTHON_DB_PATH=""
+  PYTHON_DB_FORMAT=""
+  PYTHON_DB_PROBE_OUTPUT=""
   RUST_STORAGE_ROOT="${STORAGE_ROOT:-$HOME/.mcp_agent_mail_git_mailbox_repo}"
   RUST_DB_PATH=""
 
@@ -1135,18 +1196,36 @@ resolve_database_path() {
       local magic
       magic=$(head -c 16 "$candidate" 2>/dev/null | strings 2>/dev/null | head -1)
       if echo "$magic" | grep -q "SQLite format"; then
-        PYTHON_DB_FOUND=1
-        PYTHON_DB_PATH="$candidate"
-        break
+        if ! probe_database_format_with_installed_am "$candidate"; then
+          warn "Skipping automatic database import from $candidate because the installed Rust CLI could not determine its timestamp format safely."
+          continue
+        fi
+        case "$PYTHON_DB_FORMAT" in
+          TEXT\ timestamps\ \(*|mixed\ format\ \(*)
+            PYTHON_DB_FOUND=1
+            PYTHON_DB_PATH="$candidate"
+            break
+            ;;
+          i64\ microseconds\ \(*|empty\ database\ \(*)
+            verbose "resolve_database_path:skip_non_migratable candidate=${candidate} format=${PYTHON_DB_FORMAT}"
+            ;;
+          *)
+            warn "Skipping automatic database import from $candidate because the detected format is '${PYTHON_DB_FORMAT}'."
+            ;;
+        esac
       fi
     fi
   done
 
   if [ "$PYTHON_DB_FOUND" -eq 0 ]; then
+    if [ "$PYTHON_DETECTED" -eq 1 ]; then
+      info "No legacy Python timestamp database found that requires automatic import"
+    fi
     return 0
   fi
 
   info "Found Python database at: $PYTHON_DB_PATH"
+  info "Detected database format: $PYTHON_DB_FORMAT"
 
   # Determine if the DB is already in the Rust storage root
   local rust_db="$RUST_DB_PATH"
@@ -1156,7 +1235,13 @@ resolve_database_path() {
   abs_rust_db=$(cd "$(dirname "$rust_db")" 2>/dev/null && echo "$(pwd)/$(basename "$rust_db")" 2>/dev/null || echo "$rust_db")
 
   if [ "$abs_python_db" = "$abs_rust_db" ]; then
-    info "Python database is already at the Rust storage location"
+    if python_db_format_needs_import "$PYTHON_DB_FORMAT"; then
+      info "Legacy Python database is already at the Rust storage location"
+      export DATABASE_URL="sqlite+aiosqlite:///$rust_db"
+      PYTHON_DB_MIGRATED_PATH="$rust_db"
+    else
+      info "Database at the Rust storage location does not require migration"
+    fi
     return 0
   fi
 
@@ -3134,25 +3219,24 @@ else
     CHECKSUM_FILE="$TMP/checksum.sha256"
     CHECKSUM_RESOLVED=0
 
-    # Strategy 1: per-artifact .sha256 sidecar (preferred)
-    if [ -z "$CHECKSUM_URL" ]; then
-      CHECKSUM_URL="${URL}.sha256"
-    fi
-    info "Fetching checksum from ${CHECKSUM_URL}"
-    if download_to_file "$CHECKSUM_URL" "$CHECKSUM_FILE" "checksum-download" && [ -f "$CHECKSUM_FILE" ]; then
-      CHECKSUM=$(awk '{print $1}' "$CHECKSUM_FILE")
-      if [ -n "$CHECKSUM" ]; then
-        CHECKSUM_RESOLVED=1
-        verbose "checksum:resolved_via_sidecar sha256=${CHECKSUM}"
+    # Strategy 1: explicit checksum URL when the caller supplied one.
+    if [ -n "$CHECKSUM_URL" ]; then
+      info "Fetching checksum from ${CHECKSUM_URL}"
+      if download_to_file "$CHECKSUM_URL" "$CHECKSUM_FILE" "checksum-download" && [ -f "$CHECKSUM_FILE" ]; then
+        CHECKSUM=$(awk '{print $1}' "$CHECKSUM_FILE")
+        if [ -n "$CHECKSUM" ]; then
+          CHECKSUM_RESOLVED=1
+          verbose "checksum:resolved_via_explicit_url sha256=${CHECKSUM}"
+        fi
       fi
     fi
 
-    # Strategy 2: consolidated SHA256SUMS file from release
+    # Strategy 2: consolidated SHA256SUMS file from release (default path).
     if [ "$CHECKSUM_RESOLVED" -eq 0 ]; then
       SHA256SUMS_URL="$(dirname "$URL")/SHA256SUMS"
       SHA256SUMS_FILE="$TMP/SHA256SUMS"
       verbose "checksum:trying_sha256sums url=${SHA256SUMS_URL}"
-      info "Trying consolidated checksum file SHA256SUMS"
+      info "Fetching checksum manifest from ${SHA256SUMS_URL}"
       if download_to_file "$SHA256SUMS_URL" "$SHA256SUMS_FILE" "sha256sums-download" && [ -f "$SHA256SUMS_FILE" ]; then
         CHECKSUM=$(awk -v artifact="$TAR" '$2 == artifact || $2 == ("./" artifact) || $2 == ("*" artifact) {print $1; exit}' "$SHA256SUMS_FILE")
         if [ -n "$CHECKSUM" ]; then
@@ -3161,6 +3245,20 @@ else
         else
           verbose "checksum:SHA256SUMS_no_match artifact=${TAR}"
           warn "SHA256SUMS file found but no entry for ${TAR}"
+        fi
+      fi
+    fi
+
+    # Strategy 3: per-artifact .sha256 sidecar (older/manual release layouts).
+    if [ "$CHECKSUM_RESOLVED" -eq 0 ] && [ -z "$CHECKSUM_URL" ]; then
+      CHECKSUM_URL="${URL}.sha256"
+      verbose "checksum:trying_sidecar url=${CHECKSUM_URL}"
+      info "Trying per-artifact checksum sidecar ${CHECKSUM_URL}"
+      if download_to_file "$CHECKSUM_URL" "$CHECKSUM_FILE" "checksum-download" && [ -f "$CHECKSUM_FILE" ]; then
+        CHECKSUM=$(awk '{print $1}' "$CHECKSUM_FILE")
+        if [ -n "$CHECKSUM" ]; then
+          CHECKSUM_RESOLVED=1
+          verbose "checksum:resolved_via_sidecar sha256=${CHECKSUM}"
         fi
       fi
     fi
@@ -3406,6 +3504,38 @@ migration_core_counts_preserved() {
   return 0
 }
 
+extract_migration_error_line() {
+  local output="$1"
+  local line
+
+  line=$(printf "%s\n" "$output" | awk '
+    BEGIN { IGNORECASE = 1 }
+    /error:|failed|panic|aborted|integrity_check|timestamp conversion failed|unknown timestamp format/ {
+      print
+      exit
+    }
+  ')
+  if [ -n "$line" ]; then
+    printf "%s" "$line"
+    return 0
+  fi
+
+  printf "%s\n" "$output" | awk '
+    NF &&
+    $0 !~ /^Database format:/ &&
+    $0 !~ /^Backup created:/ &&
+    $0 !~ /^Converting timestamps/ &&
+    $0 !~ /^Migration complete/ &&
+    $0 !~ /^Migration needed:/ &&
+    $0 !~ /^No migration needed/ &&
+    $0 !~ /^Database does not contain migratable TEXT timestamps/ &&
+    $0 !~ /^  (Converted|Skipped|NULLs|Backup|Format|Row count):/ {
+      print
+      exit
+    }
+  '
+}
+
 sqlite_table_exists() {
   local db_path="$1"
   local table="$2"
@@ -3421,6 +3551,48 @@ sqlite_column_exists() {
   local exists
   exists=$(sqlite3 "$db_path" "SELECT 1 FROM pragma_table_info('${table}') WHERE name='${column}' LIMIT 1;" 2>/dev/null || true)
   [ "$exists" = "1" ]
+}
+
+sqlite_text_timestamp_columns_remaining() {
+  local db_path="$1"
+  local timestamp_columns=(
+    "projects:created_at"
+    "agents:inception_ts"
+    "agents:last_active_ts"
+    "messages:created_ts"
+    "message_recipients:read_ts"
+    "message_recipients:ack_ts"
+    "file_reservations:created_ts"
+    "file_reservations:expires_ts"
+    "file_reservations:released_ts"
+    "agent_links:created_ts"
+    "agent_links:updated_ts"
+    "agent_links:expires_ts"
+    "products:created_at"
+    "product_project_links:created_at"
+  )
+  local remaining="" pair table column detected
+
+  if ! command -v sqlite3 >/dev/null 2>&1 || [ ! -f "$db_path" ]; then
+    printf ''
+    return 0
+  fi
+
+  for pair in "${timestamp_columns[@]}"; do
+    table="${pair%%:*}"
+    column="${pair##*:}"
+    sqlite_table_exists "$db_path" "$table" || continue
+    sqlite_column_exists "$db_path" "$table" "$column" || continue
+    detected=$(sqlite3 "$db_path" "SELECT typeof(${column}) FROM ${table} WHERE ${column} IS NOT NULL LIMIT 1;" 2>/dev/null | head -1 || true)
+    if [ "$detected" = "text" ]; then
+      if [ -n "$remaining" ]; then
+        remaining="${remaining}, "
+      fi
+      remaining="${remaining}${table}.${column}"
+    fi
+  done
+
+  printf '%s' "$remaining"
 }
 
 sqlite_timestamp_fallback_migration() {
@@ -3515,8 +3687,15 @@ SQL
     return 1
   fi
 
+  local remaining_text_columns
+  remaining_text_columns=$(sqlite_text_timestamp_columns_remaining "$db_path")
+  if [ -n "$remaining_text_columns" ]; then
+    warn "sqlite3 fallback left TEXT timestamps in: ${remaining_text_columns}"
+    return 1
+  fi
+
   verbose "migration:fallback_sqlite ok db=${db_path} update_statements=${updates} backup=${SQLITE_FALLBACK_BACKUP_PATH:-<none>}"
-  ok "Database schema migrated (sqlite3 fallback)"
+  ok "Database timestamps normalized (sqlite3 fallback)"
   return 0
 }
 
@@ -3616,10 +3795,16 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
     while IFS= read -r line; do
       [ -n "$line" ] && verbose "migration:output_fallback ${line}"
     done <<< "$migration_output_fallback"
-    first_error_line=$(printf "%s\n" "$migration_output" | head -1)
-    retry_error_line=$(printf "%s\n" "$migration_output_fallback" | head -1)
-    [ -n "$first_error_line" ] && warn "Primary migration error: $first_error_line"
-    [ -n "$retry_error_line" ] && warn "Fallback migration error: $retry_error_line"
+    first_error_line=$(extract_migration_error_line "$migration_output")
+    retry_error_line=$(extract_migration_error_line "$migration_output_fallback")
+    [ -n "$first_error_line" ] && warn "Primary migration failure summary: $first_error_line"
+    [ -n "$retry_error_line" ] && warn "Fallback migration failure summary: $retry_error_line"
+    if [ -z "$first_error_line" ] && [ -n "$migration_output" ]; then
+      warn "Primary migration command exited non-zero; see --verbose log for full output."
+    fi
+    if [ -z "$retry_error_line" ] && [ -n "$migration_output_fallback" ]; then
+      warn "Fallback migration command exited non-zero; see --verbose log for full output."
+    fi
     if [ -n "$migration_pristine_backup" ] && [ -f "$migration_pristine_backup" ]; then
       if copy_sqlite_snapshot "$migration_pristine_backup" "$PYTHON_DB_MIGRATED_PATH"; then
         migration_restore_ok=1
@@ -3693,6 +3878,11 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
     if [ "$migration_integrity" != "ok" ]; then
       migration_succeeded=0
       warn "Final migration integrity_check failed: '${migration_integrity:-<empty>}'"
+    fi
+    migration_remaining_text_columns=$(sqlite_text_timestamp_columns_remaining "$PYTHON_DB_MIGRATED_PATH")
+    if [ -n "${migration_remaining_text_columns:-}" ]; then
+      migration_succeeded=0
+      warn "Final migration verification found remaining TEXT timestamps in: ${migration_remaining_text_columns}"
     fi
     if ! migration_core_counts_preserved "$migration_before_counts" "$migration_after_counts"; then
       migration_succeeded=0

@@ -1945,7 +1945,89 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     mcp_agent_mail_storage::flush_async_commits();
 
     // Return first error encountered
-    tui_result.and(supervisor_result)
+    combine_tui_and_supervisor_results(tui_result, supervisor_result)
+}
+
+fn tui_signal_termination_signal(err: &std::io::Error) -> Option<i32> {
+    if err.kind() != std::io::ErrorKind::Interrupted {
+        return None;
+    }
+    err.to_string()
+        .strip_prefix("terminated by signal ")
+        .and_then(|value| value.trim().parse::<i32>().ok())
+}
+
+fn combine_tui_and_supervisor_results(
+    tui_result: std::io::Result<()>,
+    supervisor_result: std::io::Result<()>,
+) -> std::io::Result<()> {
+    match tui_result {
+        Ok(()) => supervisor_result,
+        Err(err) => {
+            if let Some(signal) = tui_signal_termination_signal(&err) {
+                tracing::warn!(
+                    signal,
+                    "TUI runtime terminated after receiving a shutdown signal"
+                );
+                supervisor_result
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tui_result_tests {
+    use super::{combine_tui_and_supervisor_results, tui_signal_termination_signal};
+
+    #[test]
+    fn signal_termination_is_detected_from_interrupted_error() {
+        let err = std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "terminated by signal 15",
+        );
+        assert_eq!(tui_signal_termination_signal(&err), Some(15));
+    }
+
+    #[test]
+    fn signal_termination_with_clean_supervisor_is_not_fatal() {
+        let result = combine_tui_and_supervisor_results(
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "terminated by signal 15",
+            )),
+            Ok(()),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn signal_termination_preserves_supervisor_failure() {
+        let result = combine_tui_and_supervisor_results(
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "terminated by signal 15",
+            )),
+            Err(std::io::Error::other("listener failed")),
+        );
+        assert_eq!(
+            result.expect_err("supervisor error should surface").to_string(),
+            "listener failed"
+        );
+    }
+
+    #[test]
+    fn non_signal_tui_error_still_fails() {
+        let result = combine_tui_and_supervisor_results(
+            Err(std::io::Error::other("render failed")),
+            Ok(()),
+        );
+        assert_eq!(
+            result.expect_err("tui error should surface").to_string(),
+            "render failed"
+        );
+    }
 }
 
 struct HttpServerInstance {
