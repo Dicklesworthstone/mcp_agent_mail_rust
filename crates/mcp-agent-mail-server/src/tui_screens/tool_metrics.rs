@@ -437,6 +437,19 @@ impl ToolMetricsScreen {
             });
     }
 
+    fn selected_tool_name(&self) -> Option<&str> {
+        self.table_state
+            .selected
+            .and_then(|index| self.sorted_tools.get(index))
+            .map(String::as_str)
+    }
+
+    fn set_selected_index(&mut self, index: Option<usize>) {
+        self.table_state.selected = index;
+        self.detail_scroll = 0;
+        self.sync_focused_event();
+    }
+
     fn ingest_events(&mut self, state: &TuiSharedState) {
         let events = state.tick_events_since_limited(self.last_seq, EVENT_INGEST_BATCH_LIMIT);
         for event in &events {
@@ -444,18 +457,16 @@ impl ToolMetricsScreen {
             if let MailEvent::ToolCallEnd {
                 tool_name,
                 duration_ms,
-                result_preview,
                 ..
             } = event
             {
-                let is_error = result_preview
-                    .as_deref()
-                    .is_some_and(|p| p.contains("error") || p.contains("Error"));
+                // `result_preview` is only populated for successful tool outcomes, so
+                // it cannot be treated as an authoritative error signal here.
                 let cp = self
                     .tool_map
                     .entry(tool_name.clone())
                     .or_insert_with(|| ToolStats::new(tool_name.clone()))
-                    .record(*duration_ms, is_error);
+                    .record(*duration_ms, false);
 
                 // Handle change-point detection.
                 if let Some(tcp) = cp {
@@ -499,23 +510,38 @@ impl ToolMetricsScreen {
 
         let mut updated = false;
         for metric in &persisted {
-            let tool_stats = self
-                .tool_map
-                .entry(metric.tool_name.clone())
-                .or_insert_with(|| ToolStats::new(metric.tool_name.clone()));
-            if tool_stats.calls > metric.calls {
-                continue;
-            }
+            if let Some(tool_stats) = self.tool_map.get_mut(&metric.tool_name) {
+                let previous_calls = tool_stats.calls;
+                if previous_calls > metric.calls {
+                    continue;
+                }
 
-            tool_stats.calls = metric.calls;
-            tool_stats.errors = metric.errors.min(metric.calls);
-            tool_stats.total_duration_ms = total_duration_ms_from_avg(metric.avg_ms, metric.calls);
-            tool_stats.recent_latencies = synthesize_recent_latency_samples(
-                metric.avg_ms,
-                metric.p50_ms,
-                metric.p95_ms,
-                metric.p99_ms,
-            );
+                tool_stats.calls = metric.calls;
+                tool_stats.errors = metric.errors.min(metric.calls);
+                if previous_calls < metric.calls || tool_stats.recent_latencies.is_empty() {
+                    tool_stats.total_duration_ms =
+                        total_duration_ms_from_avg(metric.avg_ms, metric.calls);
+                    tool_stats.recent_latencies = synthesize_recent_latency_samples(
+                        metric.avg_ms,
+                        metric.p50_ms,
+                        metric.p95_ms,
+                        metric.p99_ms,
+                    );
+                }
+            } else {
+                let mut tool_stats = ToolStats::new(metric.tool_name.clone());
+                tool_stats.calls = metric.calls;
+                tool_stats.errors = metric.errors.min(metric.calls);
+                tool_stats.total_duration_ms =
+                    total_duration_ms_from_avg(metric.avg_ms, metric.calls);
+                tool_stats.recent_latencies = synthesize_recent_latency_samples(
+                    metric.avg_ms,
+                    metric.p50_ms,
+                    metric.p95_ms,
+                    metric.p99_ms,
+                );
+                self.tool_map.insert(metric.tool_name.clone(), tool_stats);
+            }
             updated = true;
         }
 
@@ -526,36 +552,48 @@ impl ToolMetricsScreen {
 
     #[allow(clippy::cast_precision_loss)]
     fn hydrate_from_runtime_snapshot(&mut self) {
-        let runtime = mcp_agent_mail_tools::tool_metrics_snapshot_full();
+        let runtime = mcp_agent_mail_tools::tool_metrics_snapshot();
         if runtime.is_empty() {
             return;
         }
 
         let mut updated = false;
         for metric in runtime {
-            let tool_stats = self
-                .tool_map
-                .entry(metric.name.clone())
-                .or_insert_with(|| ToolStats::new(metric.name.clone()));
+            if let Some(tool_stats) = self.tool_map.get_mut(&metric.name) {
+                let previous_calls = tool_stats.calls;
+                if previous_calls > metric.calls {
+                    continue;
+                }
 
-            if tool_stats.calls > metric.calls {
-                continue;
-            }
-
-            tool_stats.calls = metric.calls;
-            tool_stats.errors = metric.errors.min(metric.calls);
-            if let Some(latency) = metric.latency {
-                tool_stats.total_duration_ms =
-                    total_duration_ms_from_avg(latency.avg_ms, metric.calls);
-                tool_stats.recent_latencies = synthesize_recent_latency_samples(
-                    latency.avg_ms,
-                    latency.p50_ms,
-                    latency.p95_ms,
-                    latency.p99_ms,
-                );
-            } else if metric.calls == 0 {
-                tool_stats.total_duration_ms = 0;
-                tool_stats.recent_latencies.clear();
+                tool_stats.calls = metric.calls;
+                tool_stats.errors = metric.errors.min(metric.calls);
+                if (previous_calls < metric.calls || tool_stats.recent_latencies.is_empty())
+                    && let Some(latency) = metric.latency
+                {
+                    tool_stats.total_duration_ms =
+                        total_duration_ms_from_avg(latency.avg_ms, metric.calls);
+                    tool_stats.recent_latencies = synthesize_recent_latency_samples(
+                        latency.avg_ms,
+                        latency.p50_ms,
+                        latency.p95_ms,
+                        latency.p99_ms,
+                    );
+                }
+            } else {
+                let mut tool_stats = ToolStats::new(metric.name.clone());
+                tool_stats.calls = metric.calls;
+                tool_stats.errors = metric.errors.min(metric.calls);
+                if let Some(latency) = metric.latency {
+                    tool_stats.total_duration_ms =
+                        total_duration_ms_from_avg(latency.avg_ms, metric.calls);
+                    tool_stats.recent_latencies = synthesize_recent_latency_samples(
+                        latency.avg_ms,
+                        latency.p50_ms,
+                        latency.p95_ms,
+                        latency.p99_ms,
+                    );
+                }
+                self.tool_map.insert(metric.name.clone(), tool_stats);
             }
             updated = true;
         }
@@ -566,6 +604,8 @@ impl ToolMetricsScreen {
     }
 
     fn rebuild_sorted(&mut self) {
+        let previous_selection = self.table_state.selected;
+        let previous_selected_name = self.selected_tool_name().map(|name| name.to_owned());
         let mut tools: Vec<&ToolStats> = self.tool_map.values().collect();
         tools.sort_by(|a, b| {
             let cmp = match self.sort_col {
@@ -584,16 +624,26 @@ impl ToolMetricsScreen {
         });
         self.sorted_tools = tools.iter().map(|t| t.name.clone()).collect();
 
-        // Clamp selection
-        if let Some(sel) = self.table_state.selected
-            && sel >= self.sorted_tools.len()
-        {
-            self.table_state.selected = if self.sorted_tools.is_empty() {
-                None
-            } else {
-                Some(self.sorted_tools.len() - 1)
-            };
+        let next_selection = previous_selected_name
+            .as_deref()
+            .and_then(|name| self.sorted_tools.iter().position(|tool| tool == name))
+            .or_else(|| {
+                previous_selection.and_then(|sel| {
+                    if self.sorted_tools.is_empty() {
+                        None
+                    } else {
+                        Some(sel.min(self.sorted_tools.len() - 1))
+                    }
+                })
+            });
+        let next_selected_name = next_selection
+            .and_then(|index| self.sorted_tools.get(index))
+            .map(String::as_str);
+        if next_selected_name != previous_selected_name.as_deref() {
+            self.detail_scroll = 0;
         }
+        self.table_state.selected = next_selection;
+        self.sync_focused_event();
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -607,8 +657,7 @@ impl ToolMetricsScreen {
         } else {
             current.saturating_sub(delta.unsigned_abs())
         };
-        self.table_state.selected = Some(next);
-        self.detail_scroll = 0;
+        self.set_selected_index(Some(next));
     }
 
     /// Get total stats across all tools.
@@ -1290,11 +1339,13 @@ fn render_kv_lines(
             break;
         }
 
-        let label_area = Rect::new(inner.x, y, label_w.min(inner.width), 1);
-        let label_text = format!("{label}:");
-        Paragraph::new(label_text)
-            .style(Style::default().fg(tp.text_muted).bold())
-            .render(label_area, frame);
+        if !label.is_empty() {
+            let label_area = Rect::new(inner.x, y, label_w.min(inner.width), 1);
+            let label_text = format!("{label}:");
+            Paragraph::new(label_text)
+                .style(Style::default().fg(tp.text_muted).bold())
+                .render(label_area, frame);
+        }
 
         let val_x = inner.x + label_w + 1;
         if val_x < inner.x + inner.width {
@@ -1347,12 +1398,12 @@ impl MailScreen for ToolMetricsScreen {
                 KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
                 KeyCode::Char('G') | KeyCode::End => {
                     if !self.sorted_tools.is_empty() {
-                        self.table_state.selected = Some(self.sorted_tools.len() - 1);
+                        self.set_selected_index(Some(self.sorted_tools.len() - 1));
                     }
                 }
                 KeyCode::Char('g') | KeyCode::Home => {
                     if !self.sorted_tools.is_empty() {
-                        self.table_state.selected = Some(0);
+                        self.set_selected_index(Some(0));
                     }
                 }
                 KeyCode::Char('s') => {
@@ -1441,12 +1492,10 @@ impl MailScreen for ToolMetricsScreen {
         if dirty.events {
             self.ingest_events(state);
         }
-        if dirty.requests {
+        if dirty.events || dirty.requests {
             self.pending_runtime_hydrate = true;
         }
-        if self.tool_map.is_empty()
-            || (self.pending_runtime_hydrate && tick_count.is_multiple_of(20))
-        {
+        if self.tool_map.is_empty() || self.pending_runtime_hydrate {
             self.hydrate_from_runtime_snapshot();
             self.pending_runtime_hydrate = false;
         }
@@ -1574,7 +1623,7 @@ impl MailScreen for ToolMetricsScreen {
         if let DeepLinkTarget::ToolByName(name) = target
             && let Some(pos) = self.sorted_tools.iter().position(|t| t == name)
         {
-            self.table_state.selected = Some(pos);
+            self.set_selected_index(Some(pos));
             return true;
         }
         false
@@ -1601,9 +1650,18 @@ mod tests {
     use mcp_agent_mail_core::Config;
     use mcp_agent_mail_db::DbConn;
     use mcp_agent_mail_db::sqlmodel::Value;
+    use mcp_agent_mail_tools::{record_call, record_error, record_latency, reset_tool_metrics};
+
+    static TOOL_METRICS_RUNTIME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn test_state() -> std::sync::Arc<TuiSharedState> {
         TuiSharedState::new(&Config::default())
+    }
+
+    fn lock_tool_metrics_runtime_test() -> std::sync::MutexGuard<'static, ()> {
+        TOOL_METRICS_RUNTIME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn test_state_with_database_url(database_url: String) -> std::sync::Arc<TuiSharedState> {
@@ -1795,6 +1853,29 @@ mod tests {
     }
 
     #[test]
+    fn ingest_events_does_not_treat_preview_mentions_of_error_as_failures() {
+        let state = test_state();
+        let mut screen = ToolMetricsScreen::new();
+
+        let _ = state.push_event(MailEvent::tool_call_end(
+            "send_message",
+            42,
+            Some("{\"note\":\"no errors detected\"}".into()),
+            1,
+            0.5,
+            vec![],
+            None,
+            None,
+        ));
+
+        screen.ingest_events(&state);
+
+        let stats = &screen.tool_map["send_message"];
+        assert_eq!(stats.calls, 1);
+        assert_eq!(stats.errors, 0);
+    }
+
+    #[test]
     fn cadence_rebuild_uses_latched_dirty_signal() {
         let state = test_state();
         let mut screen = ToolMetricsScreen::new();
@@ -1842,6 +1923,83 @@ mod tests {
         let handled = screen.receive_deep_link(&DeepLinkTarget::ToolByName("fetch_inbox".into()));
         assert!(handled);
         assert_eq!(screen.table_state.selected, Some(1));
+    }
+
+    #[test]
+    fn move_selection_updates_focused_event_immediately() {
+        let mut screen = ToolMetricsScreen::new();
+        screen.sorted_tools = vec!["alpha".into(), "beta".into()];
+        screen
+            .tool_map
+            .insert("alpha".into(), ToolStats::new("alpha".into()));
+        screen
+            .tool_map
+            .insert("beta".into(), ToolStats::new("beta".into()));
+        screen.detail_scroll = 9;
+
+        screen.move_selection(1);
+
+        assert_eq!(screen.table_state.selected, Some(1));
+        assert_eq!(screen.detail_scroll, 0);
+        match screen.focused_event() {
+            Some(MailEvent::ToolCallEnd { tool_name, .. }) => assert_eq!(tool_name, "beta"),
+            other => panic!("expected focused beta tool event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rebuild_sorted_preserves_selected_tool_identity_across_sort_changes() {
+        let mut screen = ToolMetricsScreen::new();
+        let mut alpha = ToolStats::new("alpha".into());
+        alpha.calls = 10;
+        alpha.total_duration_ms = 100;
+        let mut beta = ToolStats::new("beta".into());
+        beta.calls = 5;
+        beta.total_duration_ms = 50;
+        screen.tool_map.insert("alpha".into(), alpha);
+        screen.tool_map.insert("beta".into(), beta);
+
+        screen.rebuild_sorted();
+        screen.set_selected_index(Some(1));
+
+        screen.sort_col = COL_NAME;
+        screen.sort_asc = false;
+        screen.rebuild_sorted();
+
+        assert_eq!(
+            screen.sorted_tools,
+            vec!["beta".to_string(), "alpha".to_string()]
+        );
+        assert_eq!(screen.table_state.selected, Some(0));
+        match screen.focused_event() {
+            Some(MailEvent::ToolCallEnd { tool_name, .. }) => assert_eq!(tool_name, "beta"),
+            other => panic!("expected focused beta tool event after sort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deep_link_resets_detail_scroll_and_updates_focused_event() {
+        let mut screen = ToolMetricsScreen::new();
+        screen.sorted_tools = vec!["send_message".into(), "fetch_inbox".into()];
+        screen
+            .tool_map
+            .insert("send_message".into(), ToolStats::new("send_message".into()));
+        screen
+            .tool_map
+            .insert("fetch_inbox".into(), ToolStats::new("fetch_inbox".into()));
+        screen.detail_scroll = 7;
+
+        let handled = screen.receive_deep_link(&DeepLinkTarget::ToolByName("fetch_inbox".into()));
+
+        assert!(handled);
+        assert_eq!(screen.table_state.selected, Some(1));
+        assert_eq!(screen.detail_scroll, 0);
+        match screen.focused_event() {
+            Some(MailEvent::ToolCallEnd { tool_name, .. }) => {
+                assert_eq!(tool_name, "fetch_inbox")
+            }
+            other => panic!("expected focused fetch_inbox tool event, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1996,6 +2154,56 @@ mod tests {
         });
         screen.checkpoint_ranks();
         assert_eq!(screen.tool_map["tool"].prev_calls, 42);
+    }
+
+    #[test]
+    fn hydrate_from_runtime_snapshot_preserves_equal_call_live_history() {
+        let _guard = lock_tool_metrics_runtime_test();
+        reset_tool_metrics();
+        record_call("resolve_pane_identity");
+        record_latency("resolve_pane_identity", 900_000);
+
+        let mut screen = ToolMetricsScreen::new();
+        let mut stats = ToolStats::new("resolve_pane_identity".into());
+        let _ = stats.record(42, false);
+        screen.tool_map.insert("resolve_pane_identity".into(), stats);
+
+        screen.hydrate_from_runtime_snapshot();
+
+        let live_stats = &screen.tool_map["resolve_pane_identity"];
+        assert_eq!(live_stats.calls, 1);
+        assert_eq!(
+            live_stats.recent_latencies.iter().copied().collect::<Vec<_>>(),
+            vec![42]
+        );
+    }
+
+    #[test]
+    fn tick_uses_runtime_snapshot_for_authoritative_error_counts() {
+        let _guard = lock_tool_metrics_runtime_test();
+        reset_tool_metrics();
+        record_call("resolve_pane_identity");
+        record_error("resolve_pane_identity");
+        record_latency("resolve_pane_identity", 42_000);
+
+        let state = test_state();
+        let mut screen = ToolMetricsScreen::new();
+        let _ = state.push_event(MailEvent::tool_call_end(
+            "resolve_pane_identity",
+            42,
+            None,
+            1,
+            0.5,
+            vec![],
+            None,
+            None,
+        ));
+
+        screen.tick(1, &state);
+
+        let stats = &screen.tool_map["resolve_pane_identity"];
+        assert_eq!(stats.calls, 1);
+        assert_eq!(stats.errors, 1);
     }
 
     #[test]

@@ -1755,23 +1755,37 @@ fn text_matches_query_terms(haystack: &str, query_terms: &[String]) -> bool {
     if query_terms.is_empty() {
         return true;
     }
-    let lower = haystack.to_ascii_lowercase();
-    query_terms.iter().all(|term| lower.contains(term))
+    query_terms
+        .iter()
+        .all(|term| crate::tui_screens::contains_ci(haystack, term))
+}
+
+fn fields_match_query_terms(fields: &[&str], query_terms: &[String]) -> bool {
+    if query_terms.is_empty() {
+        return true;
+    }
+    query_terms.iter().all(|term| {
+        fields
+            .iter()
+            .any(|field| crate::tui_screens::contains_ci(field, term))
+    })
 }
 
 fn event_entry_matches_query(entry: &EventEntry, query_terms: &[String]) -> bool {
     if query_terms.is_empty() {
         return true;
     }
-    let searchable = format!(
-        "{} {} {} {} {}",
-        entry.kind.compact_label(),
-        entry.summary,
-        entry.timestamp,
-        entry.severity.badge(),
-        entry.icon
-    );
-    text_matches_query_terms(&searchable, query_terms)
+    let icon = entry.icon.to_string();
+    fields_match_query_terms(
+        &[
+            entry.kind.compact_label(),
+            &entry.summary,
+            &entry.timestamp,
+            entry.severity.badge(),
+            icon.as_str(),
+        ],
+        query_terms,
+    )
 }
 
 fn event_entry_search_key(entry: &EventEntry) -> String {
@@ -1819,14 +1833,19 @@ fn ratio_bar(value: u64, max: u64, cells: usize) -> String {
     out
 }
 
-fn format_sample_with_overflow(samples: &[String], total: usize) -> String {
+fn format_sample_with_overflow<S: AsRef<str>>(samples: &[S], total: usize) -> String {
     if total == 0 || samples.is_empty() {
         return "none".to_string();
     }
+    let joined = samples
+        .iter()
+        .map(std::convert::AsRef::as_ref)
+        .collect::<Vec<_>>()
+        .join(", ");
     if total > samples.len() {
-        return format!("{} +{}", samples.join(", "), total - samples.len());
+        return format!("{joined} +{}", total - samples.len());
     }
-    samples.join(", ")
+    joined
 }
 
 fn format_relative_micros(timestamp_micros: i64, now_micros: i64) -> String {
@@ -2611,15 +2630,15 @@ fn render_dashboard_query_bar(
         .agents_list
         .iter()
         .filter(|agent| {
-            text_matches_query_terms(&format!("{} {}", agent.name, agent.program), &query_terms)
+            fields_match_query_terms(&[&agent.name, &agent.program], &query_terms)
         })
         .count();
     let project_matches = db_snapshot
         .projects_list
         .iter()
         .filter(|project| {
-            text_matches_query_terms(
-                &format!("{} {}", project.slug, project.human_key),
+            fields_match_query_terms(
+                &[&project.slug, &project.human_key],
                 &query_terms,
             )
         })
@@ -2628,11 +2647,10 @@ fn render_dashboard_query_bar(
         .reservation_snapshots
         .iter()
         .filter(|reservation| {
-            text_matches_query_terms(
-                &format!(
-                    "{} {} {}",
-                    reservation.project_slug, reservation.agent_name, reservation.path_pattern
-                ),
+            fields_match_query_terms(
+                &[
+                    &reservation.project_slug, &reservation.agent_name, &reservation.path_pattern
+                ],
                 &query_terms,
             )
         })
@@ -3264,7 +3282,7 @@ fn render_agents_snapshot_panel(
     let mut rows: Vec<&AgentSummary> = agents
         .iter()
         .filter(|agent| {
-            text_matches_query_terms(&format!("{} {}", agent.name, agent.program), &query_terms)
+            fields_match_query_terms(&[&agent.name, &agent.program], &query_terms)
         })
         .collect();
     rows.sort_by_key(|agent| std::cmp::Reverse(agent.last_active_ts));
@@ -3375,16 +3393,15 @@ fn render_contacts_snapshot_panel(
     let mut rows: Vec<&ContactSummary> = contacts
         .iter()
         .filter(|contact| {
-            text_matches_query_terms(
-                &format!(
-                    "{} {} {} {} {} {}",
-                    contact.from_agent,
-                    contact.to_agent,
-                    contact.from_project_slug,
-                    contact.to_project_slug,
-                    contact.status,
-                    contact.reason
-                ),
+            fields_match_query_terms(
+                &[
+                    &contact.from_agent,
+                    &contact.to_agent,
+                    &contact.from_project_slug,
+                    &contact.to_project_slug,
+                    &contact.status,
+                    &contact.reason
+                ],
                 &query_terms,
             )
         })
@@ -3501,8 +3518,8 @@ fn render_projects_snapshot_panel(
     let mut rows: Vec<&ProjectSummary> = projects
         .iter()
         .filter(|project| {
-            text_matches_query_terms(
-                &format!("{} {}", project.slug, project.human_key),
+            fields_match_query_terms(
+                &[&project.slug, &project.human_key],
                 &query_terms,
             )
         })
@@ -3610,8 +3627,8 @@ fn render_project_load_panel(
     let mut rows: Vec<(&ProjectSummary, u64)> = projects
         .iter()
         .filter(|project| {
-            text_matches_query_terms(
-                &format!("{} {}", project.slug, project.human_key),
+            fields_match_query_terms(
+                &[&project.slug, &project.human_key],
                 &query_terms,
             )
         })
@@ -3722,11 +3739,10 @@ fn render_reservation_watch_panel(
         .iter()
         .filter(|reservation| !reservation.is_released())
         .filter(|reservation| {
-            text_matches_query_terms(
-                &format!(
-                    "{} {} {}",
-                    reservation.project_slug, reservation.agent_name, reservation.path_pattern
-                ),
+            fields_match_query_terms(
+                &[
+                    &reservation.project_slug, &reservation.agent_name, &reservation.path_pattern
+                ],
                 &query_terms,
             )
         })
@@ -3867,11 +3883,10 @@ fn render_reservation_ttl_buckets_panel(
         .iter()
         .filter(|reservation| !reservation.is_released())
         .filter(|reservation| {
-            text_matches_query_terms(
-                &format!(
-                    "{} {} {}",
-                    reservation.project_slug, reservation.agent_name, reservation.path_pattern
-                ),
+            fields_match_query_terms(
+                &[
+                    &reservation.project_slug, &reservation.agent_name, &reservation.path_pattern
+                ],
                 &query_terms,
             )
         })
@@ -4063,8 +4078,8 @@ fn render_signal_panel(
 
     let mut pushed = 1usize;
     for anomaly in anomalies.iter().filter(|anomaly| {
-        text_matches_query_terms(
-            &format!("{} {}", anomaly.headline, anomaly.rationale),
+        fields_match_query_terms(
+            &[&anomaly.headline, &anomaly.rationale],
             &query_terms,
         )
     }) {
@@ -4360,8 +4375,8 @@ fn render_event_mix_panel(
         .iter()
         .copied()
         .filter(|entry| {
-            text_matches_query_terms(
-                &format!("{} {}", entry.kind.compact_label(), entry.summary),
+            fields_match_query_terms(
+                &[entry.kind.compact_label(), &entry.summary],
                 &query_terms,
             )
         })
@@ -4530,8 +4545,8 @@ fn render_recent_activity_panel(
         .rev()
         .copied()
         .filter(|entry| {
-            text_matches_query_terms(
-                &format!("{} {}", entry.kind.compact_label(), entry.summary),
+            fields_match_query_terms(
+                &[entry.kind.compact_label(), &entry.summary],
                 &query_terms,
             )
         })
@@ -4783,8 +4798,8 @@ fn render_runtime_digest_panel(
         .iter()
         .copied()
         .filter(|entry| {
-            text_matches_query_terms(
-                &format!("{} {}", entry.kind.compact_label(), entry.summary),
+            fields_match_query_terms(
+                &[entry.kind.compact_label(), &entry.summary],
                 &query_terms,
             )
         })
@@ -4987,25 +5002,25 @@ fn render_query_matches_panel(
         let mut matched_agents = Vec::new();
         let mut matched_agents_total = 0usize;
         for agent in db_snapshot.agents_list.iter().filter(|agent| {
-            text_matches_query_terms(&format!("{} {}", agent.name, agent.program), &query_terms)
+            fields_match_query_terms(&[&agent.name, &agent.program], &query_terms)
         }) {
             matched_agents_total += 1;
             if matched_agents.len() < TOP_MATCH_SAMPLE_CAP {
-                matched_agents.push(agent.name.clone());
+                matched_agents.push(agent.name.as_str());
             }
         }
 
         let mut matched_projects = Vec::new();
         let mut matched_projects_total = 0usize;
         for project in db_snapshot.projects_list.iter().filter(|project| {
-            text_matches_query_terms(
-                &format!("{} {}", project.slug, project.human_key),
+            fields_match_query_terms(
+                &[&project.slug, &project.human_key],
                 &query_terms,
             )
         }) {
             matched_projects_total += 1;
             if matched_projects.len() < TOP_MATCH_SAMPLE_CAP {
-                matched_projects.push(project.slug.clone());
+                matched_projects.push(project.slug.as_str());
             }
         }
 
@@ -5015,33 +5030,31 @@ fn render_query_matches_panel(
             .reservation_snapshots
             .iter()
             .filter(|reservation| {
-                text_matches_query_terms(
-                    &format!(
-                        "{} {} {}",
-                        reservation.project_slug, reservation.agent_name, reservation.path_pattern
-                    ),
-                    &query_terms,
-                )
+            fields_match_query_terms(
+                &[
+                    &reservation.project_slug, &reservation.agent_name, &reservation.path_pattern
+                ],
+                &query_terms,
+            )
             })
         {
             matched_paths_total += 1;
             if matched_paths.len() < TOP_MATCH_SAMPLE_CAP {
-                matched_paths.push(reservation.path_pattern.clone());
+                matched_paths.push(reservation.path_pattern.as_str());
             }
         }
         let mut matched_contacts = Vec::new();
         let mut matched_contacts_total = 0usize;
         for contact in db_snapshot.contacts_list.iter().filter(|contact| {
-            text_matches_query_terms(
-                &format!(
-                    "{} {} {} {} {} {}",
-                    contact.from_agent,
-                    contact.to_agent,
-                    contact.from_project_slug,
-                    contact.to_project_slug,
-                    contact.status,
-                    contact.reason
-                ),
+            fields_match_query_terms(
+                &[
+                    &contact.from_agent,
+                    &contact.to_agent,
+                    &contact.from_project_slug,
+                    &contact.to_project_slug,
+                    &contact.status,
+                    &contact.reason
+                ],
                 &query_terms,
             )
         }) {
@@ -6319,6 +6332,15 @@ mod tests {
         assert_eq!(
             format_sample_with_overflow(&Vec::<String>::new(), 5),
             "none"
+        );
+    }
+
+    #[test]
+    fn format_sample_with_overflow_accepts_borrowed_samples() {
+        let sample = vec!["agent-a", "agent-b"];
+        assert_eq!(
+            format_sample_with_overflow(&sample, 4),
+            "agent-a, agent-b +2"
         );
     }
 

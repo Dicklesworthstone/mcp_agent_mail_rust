@@ -155,12 +155,12 @@ impl<'a> DbStatQueryBatcher<'a> {
         }
     }
 
-    fn fetch_snapshot(&self) -> DbStatSnapshot {
+    fn fetch_snapshot(&self, previous: Option<&DbStatSnapshot>) -> DbStatSnapshot {
         let now = now_micros();
         let reservation_bundle =
             fetch_reservation_snapshot_bundle(self.conn, now, self.sqlite_path);
         let counts = self.fetch_counts_with_reservation_count(reservation_bundle.active_count);
-        DbStatSnapshot {
+        let mut snapshot = DbStatSnapshot {
             projects: counts.projects,
             agents: counts.agents,
             messages: counts.messages,
@@ -175,7 +175,9 @@ impl<'a> DbStatQueryBatcher<'a> {
             contacts_list: fetch_contacts_list(self.conn),
             reservation_snapshots: reservation_bundle.snapshots,
             timestamp_micros: now,
-        }
+        };
+        restore_missing_detail_lists_from_previous(previous, &mut snapshot, self.sqlite_path);
+        snapshot
     }
 
     #[cfg(test)]
@@ -575,7 +577,7 @@ where
 #[cfg(test)]
 fn fetch_db_stats(database_url: &str) -> Option<DbStatSnapshot> {
     let (conn, sqlite_path) = open_sync_connection_with_path(database_url)?;
-    Some(DbStatQueryBatcher::new_with_path(&conn, &sqlite_path).fetch_snapshot())
+    Some(DbStatQueryBatcher::new_with_path(&conn, &sqlite_path).fetch_snapshot(None))
 }
 
 fn open_poller_connection_state(database_url: &str) -> Option<PollerConnectionState> {
@@ -605,13 +607,17 @@ fn fetch_db_stats_with_connection(
         now,
         state.last_reservation_snapshot_gap_refresh_micros,
     );
+    let must_refresh_for_detail_gap = snapshot_has_missing_detail_lists(previous);
     if let Some(version) = data_version
         && state
             .last_data_version
             .is_some_and(|previous_version| previous_version == version)
         && previous.timestamp_micros > 0
     {
-        let update = if must_refresh_for_expiry || must_refresh_for_snapshot_gap {
+        let update = if must_refresh_for_detail_gap {
+            DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path)
+                .fetch_snapshot(Some(previous))
+        } else if must_refresh_for_expiry || must_refresh_for_snapshot_gap {
             refresh_reservation_time_sensitive_snapshot(state, previous, now)
         } else {
             state.last_data_version = data_version;
@@ -633,7 +639,7 @@ fn fetch_db_stats_with_connection(
         return DbPollSnapshotUpdate::Snapshot(update);
     }
     let snapshot =
-        DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path).fetch_snapshot();
+        DbStatQueryBatcher::new_with_path(&state.conn, &state.sqlite_path).fetch_snapshot(Some(previous));
     state.last_data_version = data_version;
     update_reservation_snapshot_gap_refresh_state(
         state,
@@ -785,12 +791,70 @@ fn query_data_version(conn: &DbConn, sqlite_path: Option<&str>) -> Option<i64> {
     }
 }
 
+fn snapshot_has_missing_detail_lists(snapshot: &DbStatSnapshot) -> bool {
+    (snapshot.agents > 0 && snapshot.agents_list.is_empty())
+        || (snapshot.projects > 0 && snapshot.projects_list.is_empty())
+        || (snapshot.contact_links > 0 && snapshot.contacts_list.is_empty())
+}
+
+fn restore_missing_detail_lists_from_previous(
+    previous: Option<&DbStatSnapshot>,
+    snapshot: &mut DbStatSnapshot,
+    sqlite_path: Option<&str>,
+) {
+    let Some(previous) = previous else {
+        return;
+    };
+
+    maybe_reuse_previous_detail_list(
+        "agents",
+        snapshot.agents,
+        &mut snapshot.agents_list,
+        &previous.agents_list,
+        sqlite_path,
+    );
+    maybe_reuse_previous_detail_list(
+        "projects",
+        snapshot.projects,
+        &mut snapshot.projects_list,
+        &previous.projects_list,
+        sqlite_path,
+    );
+    maybe_reuse_previous_detail_list(
+        "contacts",
+        snapshot.contact_links,
+        &mut snapshot.contacts_list,
+        &previous.contacts_list,
+        sqlite_path,
+    );
+}
+
+fn maybe_reuse_previous_detail_list<T: Clone>(
+    label: &str,
+    total_count: u64,
+    current_rows: &mut Vec<T>,
+    previous_rows: &[T],
+    sqlite_path: Option<&str>,
+) {
+    if total_count == 0 || !current_rows.is_empty() || previous_rows.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        path = sqlite_path.unwrap_or("<unknown>"),
+        list = label,
+        total_count,
+        preserved_rows = previous_rows.len(),
+        "tui poller detail list came back empty while summary count remained nonzero; preserving previous rows"
+    );
+    *current_rows = previous_rows.to_vec();
+}
+
 /// Fetch the agent list ordered by most recently active.
 fn fetch_agents_list(conn: &DbConn) -> Vec<AgentSummary> {
     conn.query_sync(
         &format!(
             "SELECT name, program, last_active_ts FROM agents \
-             ORDER BY last_active_ts DESC, id DESC LIMIT {MAX_AGENTS}"
+             ORDER BY CAST(last_active_ts AS INTEGER) DESC, id DESC LIMIT {MAX_AGENTS}"
         ),
         &[],
     )
@@ -823,7 +887,7 @@ fn fetch_projects_list_with_reservation_counts(
         "WITH recent_projects AS ( \
            SELECT id, slug, human_key, created_at \
            FROM projects \
-           ORDER BY created_at DESC, id DESC \
+           ORDER BY CAST(created_at AS INTEGER) DESC, id DESC \
            LIMIT {MAX_PROJECTS} \
          ), \
          agent_counts AS ( \
@@ -844,7 +908,7 @@ fn fetch_projects_list_with_reservation_counts(
          FROM recent_projects p \
          LEFT JOIN agent_counts ac ON ac.project_id = p.id \
          LEFT JOIN message_counts mc ON mc.project_id = p.id \
-         ORDER BY p.created_at DESC, p.id DESC"
+         ORDER BY CAST(p.created_at AS INTEGER) DESC, p.id DESC"
     );
     let fallback_reservation_counts = reservation_counts_override
         .is_none()
@@ -923,7 +987,7 @@ fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
              JOIN agents a2 ON a2.id = al.b_agent_id \
              JOIN projects p1 ON p1.id = al.a_project_id \
              JOIN projects p2 ON p2.id = al.b_project_id \
-             ORDER BY al.updated_ts DESC, al.id DESC \
+             ORDER BY CAST(al.updated_ts AS INTEGER) DESC, al.id DESC \
              LIMIT {MAX_CONTACTS}"
         ),
         &[],

@@ -77,10 +77,21 @@ pub fn write_identity(
 /// Returns `None` if no identity file is found or all are empty.
 #[must_use]
 pub fn resolve_identity(project_key: &str, pane_id: &str) -> Option<String> {
+    resolve_identity_with_path(project_key, pane_id).map(|(name, _)| name)
+}
+
+/// Resolve the agent name and the identity file path actually used.
+///
+/// This follows the same lookup order as [`resolve_identity`], but returns the
+/// concrete file path that produced the winning match. Callers that surface the
+/// resolved path to operators should prefer this helper so diagnostics reflect
+/// reality when a legacy fallback file is read.
+#[must_use]
+pub fn resolve_identity_with_path(project_key: &str, pane_id: &str) -> Option<(String, PathBuf)> {
     // 1. Canonical path
     let canonical = canonical_identity_path(project_key, pane_id);
     if let Some(name) = read_identity_file(&canonical) {
-        return Some(name);
+        return Some((name, canonical));
     }
 
     // 2. Legacy Claude Code path: ~/.claude/agent-mail/identity.$TMUX_PANE
@@ -91,7 +102,7 @@ pub fn resolve_identity(project_key: &str, pane_id: &str) -> Option<String> {
             .join("agent-mail")
             .join(format!("identity.{sanitized}"));
         if let Some(name) = read_identity_file(&legacy_claude) {
-            return Some(name);
+            return Some((name, legacy_claude));
         }
     }
 
@@ -100,7 +111,7 @@ pub fn resolve_identity(project_key: &str, pane_id: &str) -> Option<String> {
     let sanitized = sanitize_pane_id(pane_id);
     let legacy_ntm = PathBuf::from(format!("/tmp/agent-mail-name.{hash}.{sanitized}"));
     if let Some(name) = read_identity_file(&legacy_ntm) {
-        return Some(name);
+        return Some((name, legacy_ntm));
     }
 
     None
@@ -487,5 +498,22 @@ mod tests {
         assert!(resolve_identity_for_pane("/data/test", None).is_none());
         assert!(resolve_identity_for_pane("/data/test", Some("")).is_none());
         assert!(resolve_identity_for_pane("/data/test", Some("   ")).is_none());
+    }
+
+    #[test]
+    fn resolve_identity_with_path_reports_legacy_ntm_path() {
+        let unique_key = format!("/tmp/test-pane-identity-legacy-{}", std::process::id());
+        let pane = "%42";
+        let hash = project_hash(&unique_key);
+        let sanitized = sanitize_pane_id(pane);
+        let legacy_ntm = PathBuf::from(format!("/tmp/agent-mail-name.{hash}.{sanitized}"));
+        std::fs::write(&legacy_ntm, "BlueLake\n").expect("write legacy identity");
+
+        let resolved =
+            resolve_identity_with_path(&unique_key, pane).expect("resolve legacy identity");
+        assert_eq!(resolved.0, "BlueLake");
+        assert_eq!(resolved.1, legacy_ntm);
+
+        let _ = std::fs::remove_file(&resolved.1);
     }
 }

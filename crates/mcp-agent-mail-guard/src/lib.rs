@@ -570,7 +570,7 @@ def glob_to_regex(pattern):
     # Restore ** as .*
     regex = regex.replace("\0", ".*")
     # Handle {{a,b}} bash-style brace expansion
-    regex = re.sub(r"\\{{([^}}]+)\\}}", lambda m: "(" + m.group(1).replace(",", "|") + ")", regex)
+    regex = re.sub(r"\\?\{{(.+?)\\?\}}", lambda m: "(" + m.group(1).replace("\\", "").replace(",", "|") + ")", regex)
     return regex
 
 def glob_match(path, pattern):

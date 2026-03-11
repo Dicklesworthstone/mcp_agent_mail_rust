@@ -383,53 +383,60 @@ async fn resolve_or_register_agent(
     let agent_name_norm = mcp_agent_mail_core::models::normalize_agent_name(agent_name)
         .unwrap_or_else(|| agent_name.to_string());
 
-    let agent = match mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, &agent_name_norm)
-        .await
-    {
-        Outcome::Ok(agent) => Ok(agent),
-        Outcome::Err(DbError::NotFound { .. }) if config.messaging_auto_register_recipients => {
-            match mcp_agent_mail_db::queries::register_agent(
-                ctx.cx(),
-                pool,
-                project_id,
-                &agent_name_norm,
-                "unknown",
-                "unknown",
-                None,
-                None,
-            )
+    let agent =
+        match mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, &agent_name_norm)
             .await
-            {
-                Outcome::Ok(_) => {}
-                Outcome::Err(DbError::Sqlite(message))
-                    if is_agent_unique_constraint_error(&message) =>
+        {
+            Outcome::Ok(agent) => Ok(agent),
+            Outcome::Err(DbError::NotFound { .. }) if config.messaging_auto_register_recipients => {
+                match mcp_agent_mail_db::queries::register_agent(
+                    ctx.cx(),
+                    pool,
+                    project_id,
+                    &agent_name_norm,
+                    "unknown",
+                    "unknown",
+                    None,
+                    None,
+                )
+                .await
                 {
-                    tracing::debug!(
+                    Outcome::Ok(_) => {}
+                    Outcome::Err(DbError::Sqlite(message))
+                        if is_agent_unique_constraint_error(&message) =>
+                    {
+                        tracing::debug!(
+                            project_id,
+                            agent = %agent_name,
+                            "auto-register race detected; loading existing agent row"
+                        );
+                    }
+                    Outcome::Err(e) => return Err(db_error_to_mcp_error(e)),
+                    Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+                    Outcome::Panicked(p) => {
+                        return Err(McpError::internal_error(format!(
+                            "Internal panic: {}",
+                            p.message()
+                        )));
+                    }
+                }
+                db_outcome_to_mcp_result(
+                    mcp_agent_mail_db::queries::get_agent(
+                        ctx.cx(),
+                        pool,
                         project_id,
-                        agent = %agent_name,
-                        "auto-register race detected; loading existing agent row"
-                    );
-                }
-                Outcome::Err(e) => return Err(db_error_to_mcp_error(e)),
-                Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
-                Outcome::Panicked(p) => {
-                    return Err(McpError::internal_error(format!(
-                        "Internal panic: {}",
-                        p.message()
-                    )));
-                }
+                        &agent_name_norm,
+                    )
+                    .await,
+                )
             }
-            db_outcome_to_mcp_result(
-                mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, &agent_name_norm).await,
-            )
-        }
-        Outcome::Err(e) => Err(db_error_to_mcp_error(e)),
-        Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
-        Outcome::Panicked(p) => Err(McpError::internal_error(format!(
-            "Internal panic: {}",
-            p.message()
-        ))),
-    }?;
+            Outcome::Err(e) => Err(db_error_to_mcp_error(e)),
+            Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
+            Outcome::Panicked(p) => Err(McpError::internal_error(format!(
+                "Internal panic: {}",
+                p.message()
+            ))),
+        }?;
     enqueue_agent_semantic_index(&agent);
     Ok(agent)
 }
@@ -1216,7 +1223,7 @@ pub struct InboxMessage {
     pub from: String,
     pub to: Vec<String>,
     pub cc: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bcc: Vec<String>,
     pub created_ts: Option<String>,
     pub kind: String,
@@ -1311,17 +1318,22 @@ pub async fn send_message(
     auto_contact_if_blocked: Option<bool>,
 ) -> McpResult<String> {
     // Normalize names
-    let sender_name = mcp_agent_mail_core::models::normalize_agent_name(&sender_name)
-        .unwrap_or(sender_name);
-    let to: Vec<String> = to.into_iter()
+    let sender_name =
+        mcp_agent_mail_core::models::normalize_agent_name(&sender_name).unwrap_or(sender_name);
+    let to: Vec<String> = to
+        .into_iter()
         .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
         .collect();
-    let cc: Option<Vec<String>> = cc.map(|v| v.into_iter()
-        .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
-        .collect());
-    let bcc: Option<Vec<String>> = bcc.map(|v| v.into_iter()
-        .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
-        .collect());
+    let cc: Option<Vec<String>> = cc.map(|v| {
+        v.into_iter()
+            .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
+            .collect()
+    });
+    let bcc: Option<Vec<String>> = bcc.map(|v| {
+        v.into_iter()
+            .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
+            .collect()
+    });
 
     // Truncate subject at 200 chars (parity with Python legacy).
     // Use char_indices to avoid panicking on multi-byte UTF-8 boundaries.
@@ -1796,13 +1808,19 @@ effective_free_bytes={free}"
         };
 
         for name in &resolved_to {
-            if let Some(err) = check_policy(name, "to") { return err; }
+            if let Some(err) = check_policy(name, "to") {
+                return err;
+            }
         }
         for name in &resolved_cc_recipients {
-            if let Some(err) = check_policy(name, "cc") { return err; }
+            if let Some(err) = check_policy(name, "cc") {
+                return err;
+            }
         }
         for name in &resolved_bcc_recipients {
-            if let Some(err) = check_policy(name, "bcc") { return err; }
+            if let Some(err) = check_policy(name, "bcc") {
+                return err;
+            }
         }
 
         if !to_remove_names.is_empty() {
@@ -1897,10 +1915,11 @@ effective_free_bytes={free}"
                     true
                 });
 
-                // For any remaining blocked ones, remove them from the active lists so the 
+                // For any remaining blocked ones, remove them from the active lists so the
                 // final DB insert and archive write don't include them.
                 if !blocked.is_empty() {
-                    let still_blocked_names: HashSet<String> = blocked.iter().map(|(n, _)| n.clone()).collect();
+                    let still_blocked_names: HashSet<String> =
+                        blocked.iter().map(|(n, _)| n.clone()).collect();
                     resolved_to.retain(|n| !still_blocked_names.contains(n));
                     resolved_cc_recipients.retain(|n| !still_blocked_names.contains(n));
                     resolved_bcc_recipients.retain(|n| !still_blocked_names.contains(n));
@@ -2115,17 +2134,23 @@ pub async fn reply_message(
     ack_required: Option<bool>,
 ) -> McpResult<String> {
     // Normalize names
-    let sender_name = mcp_agent_mail_core::models::normalize_agent_name(&sender_name)
-        .unwrap_or(sender_name);
-    let to: Option<Vec<String>> = to.map(|v| v.into_iter()
-        .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
-        .collect());
-    let cc: Option<Vec<String>> = cc.map(|v| v.into_iter()
-        .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
-        .collect());
-    let bcc: Option<Vec<String>> = bcc.map(|v| v.into_iter()
-        .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
-        .collect());
+    let sender_name =
+        mcp_agent_mail_core::models::normalize_agent_name(&sender_name).unwrap_or(sender_name);
+    let to: Option<Vec<String>> = to.map(|v| {
+        v.into_iter()
+            .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
+            .collect()
+    });
+    let cc: Option<Vec<String>> = cc.map(|v| {
+        v.into_iter()
+            .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
+            .collect()
+    });
+    let bcc: Option<Vec<String>> = bcc.map(|v| {
+        v.into_iter()
+            .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
+            .collect()
+    });
 
     let prefix = subject_prefix.unwrap_or_else(|| "Re:".to_string());
     let config = &Config::get();
@@ -2835,8 +2860,8 @@ pub async fn fetch_inbox(
     include_bodies: Option<bool>,
     topic: Option<String>,
 ) -> McpResult<String> {
-    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
-        .unwrap_or(agent_name);
+    let agent_name =
+        mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
     let mut msg_limit = limit.unwrap_or(20);
     if msg_limit < 1 {
         return Err(legacy_tool_error(
@@ -3001,8 +3026,8 @@ pub async fn mark_message_read(
     agent_name: String,
     message_id: i64,
 ) -> McpResult<String> {
-    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
-        .unwrap_or(agent_name);
+    let agent_name =
+        mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
@@ -3059,8 +3084,8 @@ pub async fn acknowledge_message(
     agent_name: String,
     message_id: i64,
 ) -> McpResult<String> {
-    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
-        .unwrap_or(agent_name);
+    let agent_name =
+        mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
@@ -3921,6 +3946,28 @@ mod tests {
         assert_eq!(json["ack_required"], true);
         assert_eq!(json["thread_id"], "thread-1");
         assert_eq!(json["attachments"][0]["path"], "img.webp");
+    }
+
+    #[test]
+    fn inbox_message_deserializes_missing_bcc_as_empty() {
+        let json = json!({
+            "id": 1,
+            "project_id": 1,
+            "sender_id": 1,
+            "thread_id": "thread-1",
+            "subject": "test",
+            "importance": "normal",
+            "ack_required": false,
+            "from": "BlueLake",
+            "to": ["RedFox"],
+            "cc": [],
+            "created_ts": "2026-02-06T00:00:00Z",
+            "kind": "to",
+            "attachments": [],
+        });
+
+        let parsed: InboxMessage = serde_json::from_value(json).expect("deserialize inbox message");
+        assert!(parsed.bcc.is_empty());
     }
 
     #[test]

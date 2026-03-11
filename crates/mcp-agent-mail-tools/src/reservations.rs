@@ -168,11 +168,14 @@ fn relativize_path(project_root: &str, path: &str) -> Option<String> {
         Some(parts)
     }
 
-    let path_is_absolute = path_looks_absolute(path);
+    let expanded_path = expand_tilde(path).to_string_lossy().into_owned();
+    let expanded_root = expand_tilde(project_root).to_string_lossy().into_owned();
 
-    let path_parts = normalize_parts(path)?;
+    let path_is_absolute = path_looks_absolute(&expanded_path);
+
+    let path_parts = normalize_parts(&expanded_path)?;
     if path_is_absolute {
-        let root_parts = normalize_parts(project_root)?;
+        let root_parts = normalize_parts(&expanded_root)?;
         if path_parts.len() < root_parts.len() || path_parts[..root_parts.len()] != root_parts[..] {
             return None;
         }

@@ -3805,6 +3805,23 @@ fn subject_slug_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"[^a-zA-Z0-9._-]+").unwrap_or_else(|_| unreachable!()))
 }
 
+fn slugify_message_subject(subject: &str) -> String {
+    let raw = subject_slug_re().replace_all(subject, "-");
+    let trimmed = raw
+        .trim_matches(|c: char| c == '-' || c == '_')
+        .to_lowercase();
+    let truncated = if trimmed.len() > 80 {
+        truncate_utf8(&trimmed, 80).to_string()
+    } else {
+        trimmed
+    };
+    if truncated.is_empty() {
+        "message".to_string()
+    } else {
+        truncated
+    }
+}
+
 fn sanitize_thread_id(thread_id: &str) -> String {
     // Strip path traversal components before slugifying
     let no_traversal: String = thread_id
@@ -3917,22 +3934,7 @@ pub fn message_paths(
     let m = created.format("%m").to_string();
     let iso = created.format("%Y-%m-%dT%H-%M-%SZ").to_string();
 
-    let slug = {
-        let raw = subject_slug_re().replace_all(subject, "-");
-        let trimmed = raw
-            .trim_matches(|c: char| c == '-' || c == '_')
-            .to_lowercase();
-        let truncated = if trimmed.len() > 80 {
-            truncate_utf8(&trimmed, 80).to_string()
-        } else {
-            trimmed
-        };
-        if truncated.is_empty() {
-            "message".to_string()
-        } else {
-            truncated
-        }
-    };
+    let slug = slugify_message_subject(subject);
 
     let filename = if id > 0 {
         format!("{iso}__{slug}__{id}.md")
@@ -6878,18 +6880,20 @@ pub fn check_archive_consistency(
         } else {
             &iso_filename
         };
+        let subject_slug = slugify_message_subject(&msg.subject);
+        let fallback_prefix = format!("{iso_prefix}__{subject_slug}");
 
         let messages_dir = project_dir.join("messages").join(&year).join(&month);
 
         // Look for a file matching the pattern: {iso}__{slug}__{id}.md
         // We check both the computed path and do a directory scan fallback
-        // because the subject slug can vary.
+        // because the archive ID suffix can vary.
         //
         // After `doctor reconstruct`, DB IDs may have been remapped from
         // canonical frontmatter IDs, so the `__{id}.md` suffix in the
         // filename might not match the current DB row ID. To avoid
-        // false-positive "missing" reports, we also accept any `.md` file
-        // that matches the ISO timestamp prefix alone.
+        // false-positive "missing" reports, we also accept same-second files
+        // that still match the subject slug.
         // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/10
         let found_file = if messages_dir.is_dir() {
             let id_suffix = format!("__{}.md", msg.message_id);
@@ -6901,10 +6905,10 @@ pub fn check_archive_consistency(
                     if name_str.starts_with(iso_prefix) && name_str.ends_with(&id_suffix) {
                         return true;
                     }
-                    // Fallback: timestamp prefix + any .md suffix (covers
-                    // post-reconstruct ID drift where archive still has the
-                    // canonical ID)
-                    name_str.starts_with(iso_prefix) && name_str.ends_with(".md")
+                    // Fallback: same-second timestamp + matching subject slug
+                    // + any `.md` suffix (covers post-reconstruct ID drift
+                    // where archive still has the canonical ID)
+                    name_str.starts_with(&fallback_prefix) && name_str.ends_with(".md")
                 }),
                 Err(_) => false,
             }
@@ -9734,6 +9738,48 @@ mod tests {
                 created_ts_iso: "2026-02-08T04:00:00+00:00".into(),
             },
         ];
+        let report = check_archive_consistency(dir.path(), &refs);
+        assert_eq!(report.sampled, 2);
+        assert_eq!(report.found, 1);
+        assert_eq!(report.missing, 1);
+        assert_eq!(report.missing_ids, vec![99]);
+    }
+
+    #[test]
+    fn consistency_same_second_wrong_subject_stays_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let slug = "test-project";
+        let msg_dir = dir
+            .path()
+            .join("projects")
+            .join(slug)
+            .join("messages")
+            .join("2026")
+            .join("02");
+        fs::create_dir_all(&msg_dir).unwrap();
+        fs::write(
+            msg_dir.join("2026-02-08T03-29-30+00-00__hello__42.md"),
+            "content",
+        )
+        .unwrap();
+
+        let refs = vec![
+            ConsistencyMessageRef {
+                project_slug: slug.into(),
+                message_id: 42,
+                sender_name: "BlueLake".into(),
+                subject: "hello".into(),
+                created_ts_iso: "2026-02-08T03:29:30+00:00".into(),
+            },
+            ConsistencyMessageRef {
+                project_slug: slug.into(),
+                message_id: 99,
+                sender_name: "RedFox".into(),
+                subject: "different subject".into(),
+                created_ts_iso: "2026-02-08T03:29:30+00:00".into(),
+            },
+        ];
+
         let report = check_archive_consistency(dir.path(), &refs);
         assert_eq!(report.sampled, 2);
         assert_eq!(report.found, 1);

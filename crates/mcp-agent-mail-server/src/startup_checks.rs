@@ -60,7 +60,6 @@ impl PortStatus {
 /// Keep this short to avoid multi-second startup stalls when probing a port
 /// occupied by an unrelated process that accepts TCP but does not speak HTTP.
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_millis(750);
-#[allow(dead_code)]
 const MAX_HEALTH_BODY_BYTES: usize = 4096;
 const LISTENER_PID_HINT_DIR: &str = "mcp-agent-mail-port-pids";
 pub(crate) const HEALTH_SIGNATURE_HEADER_NAME: &str = "x-agent-mail-health";
@@ -181,12 +180,36 @@ fn is_agent_mail_health_check(host: &str, port: u16) -> bool {
             Err(_) => return false,
         };
 
-        // Ensure we explicitly close the connection per UBS warning
-        let _ = stream.shutdown(std::net::Shutdown::Both);
+        if !(200..=399).contains(&status_code) {
+            return false;
+        }
 
-        // Treat 2xx and 3xx as success
-        (200..=399).contains(&status_code)
+        let mut headers = String::new();
+        let mut header_bytes = 0_usize;
+        loop {
+            let mut line = String::new();
+            let bytes = match reader.read_line(&mut line) {
+                Ok(bytes) => bytes,
+                Err(_) => return false,
+            };
+            if bytes == 0 {
+                return false;
+            }
+            if line == "\r\n" {
+                break;
+            }
+            header_bytes = header_bytes.saturating_add(bytes);
+            if header_bytes > MAX_HEALTH_BODY_BYTES {
+                return false;
+            }
+            headers.push_str(&line);
+        }
+
+        has_agent_mail_signature(&headers)
     })();
+
+    // Ensure we explicitly close the connection per UBS warning.
+    let _ = stream.shutdown(std::net::Shutdown::Both);
 
     result
 }
@@ -203,7 +226,6 @@ fn parse_content_length(headers: &str) -> Option<usize> {
     })
 }
 
-#[allow(dead_code)]
 fn has_agent_mail_signature(headers: &str) -> bool {
     headers.lines().any(|line| {
         let Some((name, value)) = line.split_once(':') else {

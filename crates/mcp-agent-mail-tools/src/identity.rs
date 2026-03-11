@@ -621,7 +621,8 @@ Check that all parameters have valid values."
     try_write_agent_profile(config, &project.slug, &agent_json);
 
     // Write per-pane identity file (best-effort, only when $TMUX_PANE is set)
-    if let Some(result) = mcp_agent_mail_core::write_identity_current_pane(&project_key, &row.name)
+    if let Some(result) =
+        mcp_agent_mail_core::write_identity_current_pane(&project.human_key, &row.name)
     {
         match result {
             Ok(path) => {
@@ -818,7 +819,8 @@ Choose a different name (or omit the name to auto-generate one)."
     try_write_agent_profile(config, &project.slug, &agent_json);
 
     // Write per-pane identity file (best-effort, only when $TMUX_PANE is set)
-    if let Some(result) = mcp_agent_mail_core::write_identity_current_pane(&project_key, &row.name)
+    if let Some(result) =
+        mcp_agent_mail_core::write_identity_current_pane(&project.human_key, &row.name)
     {
         match result {
             Ok(path) => {
@@ -985,7 +987,7 @@ pub fn resolve_pane_identity(
     let canonical_path =
         mcp_agent_mail_core::canonical_identity_path(&project_key, &effective_pane);
 
-    mcp_agent_mail_core::resolve_identity(&project_key, &effective_pane).map_or_else(
+    mcp_agent_mail_core::resolve_identity_with_path(&project_key, &effective_pane).map_or_else(
         || {
             Err(legacy_tool_error(
                 "IDENTITY_NOT_FOUND",
@@ -1001,11 +1003,11 @@ pub fn resolve_pane_identity(
                 }),
             ))
         },
-        |agent_name| {
+        |(agent_name, resolved_path): (String, std::path::PathBuf)| {
             let response = json!({
                 "agent_name": agent_name,
                 "pane_id": effective_pane,
-                "identity_path": canonical_path.to_string_lossy(),
+                "identity_path": resolved_path.to_string_lossy(),
             });
             serde_json::to_string(&response)
                 .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))

@@ -92,8 +92,8 @@ pub use models::{
 };
 pub use pane_identity::{
     canonical_identity_path, cleanup_all_stale_identities, cleanup_stale_identities,
-    list_identities, resolve_identity, resolve_identity_current_pane, write_identity,
-    write_identity_current_pane,
+    list_identities, resolve_identity, resolve_identity_current_pane, resolve_identity_with_path,
+    write_identity, write_identity_current_pane,
 };
 pub use search_types::{
     DateRange, DocChange, DocId, DocKind, Document, ExplainComposerConfig, ExplainReasonCode,

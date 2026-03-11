@@ -8638,7 +8638,7 @@ mod tests {
 
     fn safe_component(value: &str) -> String {
         let out = value.trim().replace(|c| matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | ' '), "_");
-        if out.is_empty() {
+        if out.is_empty() || out == "." || out == ".." {
             "unknown".to_string()
         } else {
             out
