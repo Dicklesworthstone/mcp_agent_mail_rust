@@ -1252,6 +1252,7 @@ mod tests {
             importance: "normal".to_string(),
             ack_required: 0,
             created_ts: 0,
+            recipients: "[]".to_string(),
             attachments: "[]".to_string(),
             from: from.to_string(),
         }
@@ -1682,6 +1683,9 @@ mod tests {
             created_ts: Some("2025-01-01T00:00:00Z".to_string()),
             thread_id: Some("thread-123".to_string()),
             from: "Alice".to_string(),
+            to: vec![],
+            cc: vec![],
+            bcc: vec![],
             reason_codes: Vec::new(),
             score_factors: Vec::new(),
         };
@@ -1704,6 +1708,9 @@ mod tests {
             created_ts: None,
             thread_id: None,
             from: "Bob".to_string(),
+            to: vec![],
+            cc: vec![],
+            bcc: vec![],
             reason_codes: Vec::new(),
             score_factors: Vec::new(),
         };
@@ -1726,6 +1733,9 @@ mod tests {
             created_ts: None,
             thread_id: None,
             from: "Alice".to_string(),
+            to: vec![],
+            cc: vec![],
+            bcc: vec![],
             reason_codes: vec!["LexicalBm25".to_string(), "FusionWeightedBlend".to_string()],
             score_factors: vec![ScoreFactorSummary {
                 key: "bm25".to_string(),

@@ -4440,6 +4440,32 @@ fn recover_sqlite_file(path: &Path) -> CliResult<()> {
                 path.display()
             )));
         }
+    } else {
+        // Fall back to archive reconstruction if no backup is available
+        let config = Config::from_env();
+        let storage_root = config.storage_root;
+        if storage_root.is_dir() && storage_root.join("projects").is_dir() {
+            ftui_runtime::ftui_println!(
+                "No backup found. Reconstructing database from archive at {}...",
+                storage_root.display()
+            );
+            match mcp_agent_mail_db::reconstruct_from_archive(path, &storage_root) {
+                Ok(stats) => {
+                    ftui_runtime::ftui_println!("Reconstruction complete: {}", stats);
+                    if !sqlite_file_is_healthy(path)? {
+                        return Err(CliError::Other(format!(
+                            "reconstruction from archive completed, but health checks still failed for {}",
+                            path.display()
+                        )));
+                    }
+                }
+                Err(e) => {
+                    return Err(CliError::Other(format!(
+                        "failed to reconstruct database from archive: {e}"
+                    )));
+                }
+            }
+        }
     }
 
     Ok(())
@@ -29225,9 +29251,10 @@ fn handle_doctor_repair_with(
 
     if !integrity_ok && !dry_run {
         ftui_runtime::ftui_eprintln!(
-            "  Database corruption detected. Consider restoring from backup."
+            "  Database corruption detected. Automatically falling back to archive reconstruction..."
         );
-        return Err(CliError::ExitCode(1));
+        // Fall back to reconstruction from archive
+        return handle_doctor_reconstruct_with(None, None, false, yes, false);
     }
 
     // 2. Optional backup before repair
