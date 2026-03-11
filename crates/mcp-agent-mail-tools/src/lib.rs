@@ -565,7 +565,11 @@ pub mod tool_util {
             ));
         }
 
-        let name = agent_name.trim();
+        let name_raw = agent_name.trim();
+        // Normalize name if it follows the adj+noun pattern, otherwise keep as-is.
+        let name_norm = mcp_agent_mail_core::models::normalize_agent_name(name_raw)
+            .unwrap_or_else(|| name_raw.to_string());
+        let name = &name_norm;
 
         // 2. Agent placeholder detection
         let name_upper = name.to_ascii_uppercase();

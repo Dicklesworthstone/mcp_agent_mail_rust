@@ -127,11 +127,16 @@ pub(crate) async fn resolve_or_register_sender(
     project_human_key: &str,
 ) -> McpResult<mcp_agent_mail_db::AgentRow> {
     let from_agent = from_agent.trim();
+    // Normalize name if it follows the adj+noun pattern, otherwise keep as-is
+    // (fallback for legacy or special names during resolution).
+    let from_agent_norm = mcp_agent_mail_core::models::normalize_agent_name(from_agent)
+        .unwrap_or_else(|| from_agent.to_string());
+
     match resolve_agent(
         ctx,
         pool,
         project_id,
-        from_agent,
+        &from_agent_norm,
         project_slug,
         project_human_key,
     )
@@ -161,7 +166,7 @@ pub(crate) async fn resolve_or_register_sender(
                 ctx.cx(),
                 pool,
                 project_id,
-                from_agent,
+                &from_agent_norm,
                 &program,
                 &model,
                 task_description,
@@ -245,6 +250,10 @@ pub async fn request_contact(
 
     let (target_project_key, target_agent_name) =
         parse_contact_target(&to_agent, to_project, &project_key);
+    // Normalize target agent name
+    let target_agent_name = mcp_agent_mail_core::models::normalize_agent_name(&target_agent_name)
+        .unwrap_or(target_agent_name);
+
     let target_project_row = resolve_project(ctx, &pool, &target_project_key).await?;
     let target_project_id = target_project_row.id.unwrap_or(0);
 
@@ -388,6 +397,12 @@ pub async fn respond_contact(
     accept: bool,
     ttl_seconds: Option<i64>,
 ) -> McpResult<String> {
+    // Normalize names
+    let to_agent = mcp_agent_mail_core::models::normalize_agent_name(&to_agent)
+        .unwrap_or(to_agent);
+    let from_agent = mcp_agent_mail_core::models::normalize_agent_name(&from_agent)
+        .unwrap_or(from_agent);
+
     let pool = get_db_pool()?;
 
     let project = resolve_project(ctx, &pool, &project_key).await?;
@@ -470,6 +485,10 @@ pub async fn list_contacts(
     project_key: String,
     agent_name: String,
 ) -> McpResult<String> {
+    // Normalize agent name
+    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
+        .unwrap_or(agent_name);
+
     use std::collections::HashMap;
 
     let pool = get_db_pool()?;
@@ -564,6 +583,9 @@ pub async fn set_contact_policy(
     policy: String,
 ) -> McpResult<String> {
     let policy_norm = parse_contact_policy(&policy);
+    // Normalize agent name
+    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
+        .unwrap_or(agent_name);
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;

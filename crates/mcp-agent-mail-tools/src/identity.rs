@@ -545,36 +545,22 @@ pub async fn register_agent(
     // Validate or generate agent name
     let agent_name = match name {
         Some(n) => {
-            let n = n.trim().to_string();
-            if !is_valid_agent_name(&n) {
-                // Check for specific mistake types before generic error
-                if let Some((mistake_type, message)) = detect_agent_name_mistake(&n) {
-                    return Err(legacy_tool_error(
-                        mistake_type,
-                        &message,
-                        true,
-                        json!({
-                            "provided_name": n,
-                            "valid_examples": ["BlueLake", "GreenCastle", "RedStone"],
-                        }),
-                    ));
+            let n = n.trim();
+            if n.is_empty() {
+                generate_agent_name()
+            } else {
+                match mcp_agent_mail_core::models::normalize_agent_name(n) {
+                    Some(normalized) => normalized,
+                    None => {
+                        return Err(legacy_tool_error(
+                            &mcp_agent_mail_core::models::detect_agent_name_mistake(n)
+                                .unwrap_or_else(|| {
+                                    format!("Invalid agent name '{n}'. MUST be an adjective+noun combination (e.g. GreenLake).")
+                                }),
+                        ));
+                    }
                 }
-                return Err(legacy_tool_error(
-                    "INVALID_AGENT_NAME",
-                    format!(
-                        "Invalid agent name format: '{n}'. \
-Agent names MUST be randomly generated adjective+noun combinations \
-(e.g., 'GreenLake', 'BlueDog'), NOT descriptive names. \
-Omit the 'name' parameter to auto-generate a valid name."
-                    ),
-                    true,
-                    json!({
-                        "provided_name": n,
-                        "valid_examples": ["BlueLake", "GreenCastle", "RedStone"],
-                    }),
-                ));
             }
-            n
         }
         None => generate_agent_name(),
     };
@@ -723,39 +709,22 @@ pub async fn create_agent_identity(
     // Generate or validate agent name
     let agent_name = match name_hint {
         Some(hint) => {
-            let hint = hint.trim().to_string();
-            // Strict validation: name_hint MUST be a valid agent name format.
-            if !is_valid_agent_name(&hint) {
-                // Check for specific mistake types before generic error
-                if let Some((mistake_type, message)) =
-                    mcp_agent_mail_core::models::detect_agent_name_mistake(&hint)
-                {
-                    return Err(legacy_tool_error(
-                        mistake_type,
-                        &message,
-                        true,
-                        json!({
-                            "field": "name_hint",
-                            "error_detail": hint,
-                            "valid_examples": ["BlueLake", "GreenCastle", "RedStone"],
-                        }),
-                    ));
+            let hint = hint.trim();
+            if hint.is_empty() {
+                generate_agent_name()
+            } else {
+                match mcp_agent_mail_core::models::normalize_agent_name(hint) {
+                    Some(normalized) => normalized,
+                    None => {
+                        return Err(legacy_tool_error(
+                            &mcp_agent_mail_core::models::detect_agent_name_mistake(hint)
+                                .unwrap_or_else(|| {
+                                    format!("Invalid agent name hint '{hint}'. MUST be an adjective+noun combination (e.g. GreenLake).")
+                                }),
+                        ));
+                    }
                 }
-                return Err(legacy_tool_error(
-                    "INVALID_ARGUMENT",
-                    format!(
-                        "Invalid argument value: Invalid name_hint '{hint}'. \
-Names must be adjective+noun format (e.g., BlueLake). \
-Check that all parameters have valid values."
-                    ),
-                    true,
-                    json!({
-                        "field": "name_hint",
-                        "error_detail": hint,
-                    }),
-                ));
             }
-            hint
         }
         None => generate_agent_name(),
     };

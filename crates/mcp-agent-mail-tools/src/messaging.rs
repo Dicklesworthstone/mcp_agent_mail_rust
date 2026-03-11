@@ -378,7 +378,12 @@ async fn resolve_or_register_agent(
     _sender: &mcp_agent_mail_db::AgentRow,
     config: &Config,
 ) -> McpResult<mcp_agent_mail_db::AgentRow> {
-    let agent = match mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, agent_name)
+    let agent_name = agent_name.trim();
+    // Normalize name if it follows the adj+noun pattern, otherwise keep as-is.
+    let agent_name_norm = mcp_agent_mail_core::models::normalize_agent_name(agent_name)
+        .unwrap_or_else(|| agent_name.to_string());
+
+    let agent = match mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, &agent_name_norm)
         .await
     {
         Outcome::Ok(agent) => Ok(agent),
@@ -387,7 +392,7 @@ async fn resolve_or_register_agent(
                 ctx.cx(),
                 pool,
                 project_id,
-                agent_name,
+                &agent_name_norm,
                 "unknown",
                 "unknown",
                 None,
@@ -415,7 +420,7 @@ async fn resolve_or_register_agent(
                 }
             }
             db_outcome_to_mcp_result(
-                mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, agent_name).await,
+                mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, &agent_name_norm).await,
             )
         }
         Outcome::Err(e) => Err(db_error_to_mcp_error(e)),
@@ -445,10 +450,10 @@ fn is_valid_thread_id(tid: &str) -> bool {
 
 /// Validate an explicit `thread_id` passed to `send_message`.
 ///
-/// Bare numeric ids are reserved for reply-seeded threads when `reply_message`
-/// falls back to the original message id.
+/// We allow both alphanumeric slugs and bare numeric IDs (which often refer
+/// to root message IDs from reply-seeded threads).
 fn is_valid_explicit_thread_id(tid: &str) -> bool {
-    is_valid_thread_id(tid) && !tid.bytes().all(|b| b.is_ascii_digit())
+    is_valid_thread_id(tid)
 }
 
 /// Defense-in-depth sanitization for `thread_id` values derived from DB rows.
@@ -1305,6 +1310,19 @@ pub async fn send_message(
     broadcast: Option<bool>,
     auto_contact_if_blocked: Option<bool>,
 ) -> McpResult<String> {
+    // Normalize names
+    let sender_name = mcp_agent_mail_core::models::normalize_agent_name(&sender_name)
+        .unwrap_or(sender_name);
+    let to: Vec<String> = to.into_iter()
+        .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
+        .collect();
+    let cc: Option<Vec<String>> = cc.map(|v| v.into_iter()
+        .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
+        .collect());
+    let bcc: Option<Vec<String>> = bcc.map(|v| v.into_iter()
+        .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
+        .collect());
+
     // Truncate subject at 200 chars (parity with Python legacy).
     // Use char_indices to avoid panicking on multi-byte UTF-8 boundaries.
     let subject = if let Some((idx, _)) = subject.char_indices().nth(200) {
@@ -2070,6 +2088,19 @@ pub async fn reply_message(
     importance: Option<String>,
     ack_required: Option<bool>,
 ) -> McpResult<String> {
+    // Normalize names
+    let sender_name = mcp_agent_mail_core::models::normalize_agent_name(&sender_name)
+        .unwrap_or(sender_name);
+    let to: Option<Vec<String>> = to.map(|v| v.into_iter()
+        .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
+        .collect());
+    let cc: Option<Vec<String>> = cc.map(|v| v.into_iter()
+        .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
+        .collect());
+    let bcc: Option<Vec<String>> = bcc.map(|v| v.into_iter()
+        .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
+        .collect());
+
     let prefix = subject_prefix.unwrap_or_else(|| "Re:".to_string());
     let config = &Config::get();
 

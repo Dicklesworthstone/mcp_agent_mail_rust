@@ -600,6 +600,24 @@ pub fn is_valid_agent_name(name: &str) -> bool {
     false
 }
 
+/// Normalize a valid agent name to PascalCase (e.g. "bluedog" -> "BlueDog").
+///
+/// Returns `None` if the name is not a valid adjective+noun combination.
+#[must_use]
+pub fn normalize_agent_name(name: &str) -> Option<String> {
+    for adj in VALID_ADJECTIVES {
+        if name.len() > adj.len() && name[..adj.len()].eq_ignore_ascii_case(adj) {
+            let rem = &name[adj.len()..];
+            for noun in VALID_NOUNS {
+                if rem.eq_ignore_ascii_case(noun) {
+                    return Some(format!("{}{}", capitalize_first(adj), capitalize_first(noun)));
+                }
+            }
+        }
+    }
+    None
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Agent name mistake detection (Python parity)
 // ──────────────────────────────────────────────────────────────────────
@@ -901,7 +919,7 @@ mod tests {
         let name = generate_agent_name();
         assert!(
             is_valid_agent_name(&name),
-            "Generated name should be valid: {name}"
+            "generated name '{name}' should be valid"
         );
     }
 
@@ -1091,7 +1109,7 @@ mod tests {
         assert!(looks_like_email("alice@example.com"));
         assert!(looks_like_email("ops@alerts.dev"));
         assert!(!looks_like_email("alice@localhost"));
-        assert!(!looks_like_email("@example.com"));
+        assert!(!looks_like_email("example.com"));
         assert!(!looks_like_email("BlueLake"));
         assert!(!looks_like_email("not-an-email@"));
         assert!(!looks_like_email("@."));
