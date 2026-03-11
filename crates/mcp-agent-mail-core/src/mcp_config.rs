@@ -114,6 +114,7 @@ pub fn detect_mcp_config_locations_default() -> Vec<McpConfigLocation> {
 }
 
 const TARGET_SERVER_NAME: &str = "mcp-agent-mail";
+const TARGET_SERVER_ALIASES: &[&str] = &[TARGET_SERVER_NAME, "mcp_agent_mail"];
 const SERVER_CONTAINER_KEYS: &[&str] = &["mcpServers", "servers", "mcp", "mcp_servers"];
 
 /// Result of updating MCP config text.
@@ -163,7 +164,8 @@ pub enum McpConfigUpdateError {
 /// Update a config text blob by rewriting only the `mcp-agent-mail` server entry.
 ///
 /// - Preserves sibling MCP servers untouched
-/// - Preserves `env` object from existing `mcp-agent-mail` entry
+/// - Preserves `env` object from an existing `mcp-agent-mail` or
+///   `mcp_agent_mail` entry
 /// - Rewrites `command` to an absolute Rust binary path
 /// - Translates Python invocation args to Rust equivalents
 /// - Accepts JSON and JSON5-like input (comments/trailing commas/BOM)
@@ -299,18 +301,41 @@ fn update_target_entry(
         let Some(servers_obj) = servers.as_object_mut() else {
             continue;
         };
-        let Some(existing_entry) = servers_obj.get_mut(TARGET_SERVER_NAME) else {
+        let Some(existing_key) = find_target_server_key(servers_obj) else {
             continue;
         };
 
-        let old = existing_entry.clone();
+        let old = servers_obj
+            .get(existing_key)
+            .cloned()
+            .expect("target server key must exist");
         let updated = build_updated_server_entry(&old, rust_binary_path);
-        let changed = updated != old;
-        *existing_entry = updated;
+        let removed_aliases = remove_noncanonical_target_aliases(servers_obj);
+        let changed = updated != old || removed_aliases || existing_key != TARGET_SERVER_NAME;
+        servers_obj.insert(TARGET_SERVER_NAME.to_string(), updated);
         return Ok((true, changed));
     }
 
     Ok((false, false))
+}
+
+fn find_target_server_key(servers_obj: &Map<String, Value>) -> Option<&'static str> {
+    TARGET_SERVER_ALIASES
+        .iter()
+        .copied()
+        .find(|name| servers_obj.contains_key(*name))
+}
+
+fn remove_noncanonical_target_aliases(servers_obj: &mut Map<String, Value>) -> bool {
+    let mut removed = false;
+    for alias in TARGET_SERVER_ALIASES
+        .iter()
+        .copied()
+        .filter(|name| *name != TARGET_SERVER_NAME)
+    {
+        removed |= servers_obj.remove(alias).is_some();
+    }
+    removed
 }
 
 fn build_updated_server_entry(existing: &Value, rust_binary_path: &Path) -> Value {
@@ -768,7 +793,8 @@ pub fn build_new_server_entry(params: &NewServerEntryParams) -> Value {
 
 /// Insert the `mcp-agent-mail` server entry into an existing config text.
 ///
-/// If the config already contains the entry, returns unchanged.
+/// If the config already contains the entry under either `mcp-agent-mail` or
+/// `mcp_agent_mail`, returns unchanged.
 /// If the server container key exists but has no `mcp-agent-mail`, adds it.
 /// If neither `mcpServers` nor alternatives exist, creates `mcpServers`.
 pub fn insert_server_entry_text(
@@ -787,7 +813,7 @@ pub fn insert_server_entry_text(
     for key in SERVER_CONTAINER_KEYS {
         if let Some(servers) = root_obj.get(*key)
             && let Some(servers_obj) = servers.as_object()
-            && servers_obj.contains_key(TARGET_SERVER_NAME)
+            && find_target_server_key(servers_obj).is_some()
         {
             return Ok(McpConfigTextUpdate {
                 updated_text: text.to_string(),
@@ -1584,6 +1610,36 @@ mod tests {
     }
 
     #[test]
+    fn setup_mcp_config_file_noop_when_underscore_entry_exists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = tmp.path().join("mcp.json");
+        let original = r#"{
+  "mcpServers": {
+    "mcp_agent_mail": {
+      "command": "/home/user/.local/bin/mcp-agent-mail",
+      "args": []
+    }
+  }
+}
+"#;
+        std::fs::write(&config, original).expect("write");
+        let result = setup_mcp_config_file(&config, &default_params()).expect("setup");
+        assert!(!result.created_new);
+        assert!(!result.changed);
+        assert!(result.backup_path.is_none());
+
+        let doc: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).expect("read")).expect("json");
+        assert!(
+            doc.get("mcpServers")
+                .and_then(Value::as_object)
+                .unwrap()
+                .contains_key("mcp_agent_mail"),
+            "fresh-install path should not duplicate an existing underscore entry"
+        );
+    }
+
+    #[test]
     fn preferred_config_path_returns_expected_paths() {
         let home = Path::new("/home/user");
         assert_eq!(
@@ -1731,6 +1787,44 @@ mod tests {
             target.get("args"),
             Some(&json!([])),
             "-m mcp_agent_mail stripped, no remaining args"
+        );
+    }
+
+    #[test]
+    fn update_config_text_updates_underscore_entry_and_canonicalizes_key() {
+        let rust_bin = Path::new("/home/user/.local/bin/mcp-agent-mail");
+        let original = r#"{
+  "mcpServers": {
+    "mcp_agent_mail": {
+      "command": "python3",
+      "args": ["-m", "mcp_agent_mail", "serve-http", "--port", "8765"]
+    }
+  }
+}
+"#;
+        let update = update_mcp_config_text(original, rust_bin).expect("update succeeds");
+        assert!(update.changed);
+        assert!(update.target_found);
+
+        let doc: Value = serde_json::from_str(&update.updated_text).expect("valid JSON");
+        let servers = doc
+            .get("mcpServers")
+            .and_then(Value::as_object)
+            .expect("mcpServers object");
+        assert!(
+            !servers.contains_key("mcp_agent_mail"),
+            "legacy underscore alias should be removed"
+        );
+        let target = servers
+            .get("mcp-agent-mail")
+            .expect("canonical target present");
+        assert_eq!(
+            target.get("command").and_then(Value::as_str),
+            Some("/home/user/.local/bin/mcp-agent-mail")
+        );
+        assert_eq!(
+            target.get("args"),
+            Some(&json!(["serve", "--port", "8765"]))
         );
     }
 

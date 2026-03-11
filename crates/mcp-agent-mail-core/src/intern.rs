@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -209,37 +209,46 @@ impl<'de> Deserialize<'de> for InternedStr {
 // Global interner
 // ---------------------------------------------------------------------------
 
-/// The global intern table.  Uses a plain `Mutex` (not `OrderedMutex`) because
+/// The global intern table.  Uses a plain `RwLock` because
 /// the interner is a leaf lock that is never held while acquiring other locks.
-static INTERNER: LazyLock<Mutex<HashSet<Arc<str>>>> =
-    LazyLock::new(|| Mutex::new(HashSet::with_capacity(256)));
+static INTERNER: LazyLock<RwLock<HashSet<Arc<str>>>> =
+    LazyLock::new(|| RwLock::new(HashSet::with_capacity(256)));
 
 /// Intern a string, returning a shared `InternedStr`.
 ///
-/// Thread-safe.  The mutex is only contended on first encounter of a new
-/// string value; subsequent calls for known strings are a hash lookup + Arc clone.
+/// Thread-safe.  Optimized for concurrent reads: the write lock is only
+/// acquired on the first encounter of a new string value.
 pub fn intern(s: &str) -> InternedStr {
+    // Fast path: try to get the existing Arc under a read lock.
+    {
+        let table = INTERNER
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = table.get(s) {
+            return InternedStr(Arc::clone(existing));
+        }
+    }
+
+    // Slow path: acquire write lock to insert new string.
     let mut table = INTERNER
-        .lock()
+        .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Can't use map_or_else: get() borrows immutably, insert() borrows mutably.
-    #[allow(clippy::option_if_let_else)]
-    let result = if let Some(existing) = table.get(s) {
+
+    // Re-check under write lock to avoid double-insertion.
+    if let Some(existing) = table.get(s) {
         InternedStr(Arc::clone(existing))
     } else {
         let arc: Arc<str> = Arc::from(s);
         table.insert(Arc::clone(&arc));
         InternedStr(arc)
-    };
-    drop(table);
-    result
+    }
 }
 
 /// Number of unique strings currently interned.
 #[must_use]
 pub fn intern_count() -> usize {
     INTERNER
-        .lock()
+        .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .len()
 }
@@ -249,7 +258,7 @@ pub fn intern_count() -> usize {
 /// Call once at startup to avoid mutex contention on the first real request.
 pub fn pre_intern(strings: &[&str]) {
     let mut table = INTERNER
-        .lock()
+        .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     for &s in strings {
         if !table.contains(s) {

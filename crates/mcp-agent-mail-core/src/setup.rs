@@ -437,6 +437,13 @@ pub fn merge_mcp_server(
     let servers = obj.entry(servers_key).or_insert_with(|| json!({}));
     let servers_obj = servers.as_object_mut().ok_or(SetupError::NotJsonObject)?;
 
+    if matches!(server_name, "mcp-agent-mail" | "mcp_agent_mail") {
+        for alias in ["mcp-agent-mail", "mcp_agent_mail"] {
+            if alias != server_name {
+                servers_obj.remove(alias);
+            }
+        }
+    }
     servers_obj.insert(server_name.to_string(), server_value);
 
     Ok(serde_json::to_string_pretty(&doc)? + "\n")
@@ -1254,21 +1261,27 @@ fn check_config_file(path: &Path, expected_url: &str) -> (bool, bool) {
         return (false, false);
     };
 
-    // Search for "mcp-agent-mail" at any nesting level in known keys
-    for key in &["mcpServers", "mcp", "servers"] {
-        if let Some(servers) = doc.get(key).and_then(|v| v.as_object())
-            && let Some(entry) = servers.get("mcp-agent-mail")
-        {
-            let url_match = entry
-                .get("url")
-                .or_else(|| entry.get("httpUrl"))
-                .and_then(|v| v.as_str())
-                .is_some_and(|u| urls_match_for_status(u, expected_url));
-            return (true, url_match);
+    let mut has_server = false;
+    for key in &["mcpServers", "mcp", "servers", "mcp_servers"] {
+        if let Some(servers) = doc.get(key).and_then(|v| v.as_object()) {
+            for server_name in ["mcp-agent-mail", "mcp_agent_mail"] {
+                let Some(entry) = servers.get(server_name) else {
+                    continue;
+                };
+                has_server = true;
+                let url_match = entry
+                    .get("url")
+                    .or_else(|| entry.get("httpUrl"))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|u| urls_match_for_status(u, expected_url));
+                if url_match {
+                    return (true, true);
+                }
+            }
         }
     }
 
-    (false, false)
+    (has_server, false)
 }
 
 fn urls_match_for_status(actual_url: &str, expected_url: &str) -> bool {
@@ -1525,6 +1538,26 @@ mod tests {
         .unwrap();
         let doc: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(doc["mcpServers"]["mcp-agent-mail"]["url"], "http://new");
+    }
+
+    #[test]
+    fn merge_mcp_server_rewrites_underscore_alias_without_duplicate() {
+        let existing = r#"{"mcpServers": {"mcp_agent_mail": {"url": "http://old"}, "other": {"url": "http://other"}}}"#;
+        let result = merge_mcp_server(
+            Some(existing),
+            "mcpServers",
+            "mcp-agent-mail",
+            json!({"url": "http://new"}),
+        )
+        .unwrap();
+        let doc: Value = serde_json::from_str(&result).unwrap();
+        let servers = doc["mcpServers"].as_object().expect("servers object");
+        assert_eq!(servers["mcp-agent-mail"]["url"], "http://new");
+        assert!(
+            !servers.contains_key("mcp_agent_mail"),
+            "legacy underscore alias should be removed"
+        );
+        assert_eq!(servers["other"]["url"], "http://other");
     }
 
     #[test]
@@ -1902,6 +1935,44 @@ mod tests {
 
         let (_, wrong_url) = check_config_file(&path, "http://127.0.0.1:9999/mcp/");
         assert!(!wrong_url);
+    }
+
+    #[test]
+    fn check_config_file_detects_underscore_server_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.json");
+        let content = r#"{
+  "mcpServers": {
+    "mcp_agent_mail": {
+      "url": "http://127.0.0.1:8765/mcp/"
+    }
+  }
+}
+"#;
+        std::fs::write(&path, content).unwrap();
+
+        let (has_server, url_matches) = check_config_file(&path, "http://127.0.0.1:8765/mcp/");
+        assert!(has_server);
+        assert!(url_matches);
+    }
+
+    #[test]
+    fn check_config_file_detects_mcp_servers_container() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.json");
+        let content = r#"{
+  "mcp_servers": {
+    "mcp-agent-mail": {
+      "url": "http://127.0.0.1:8765/mcp/"
+    }
+  }
+}
+"#;
+        std::fs::write(&path, content).unwrap();
+
+        let (has_server, url_matches) = check_config_file(&path, "http://127.0.0.1:8765/mcp/");
+        assert!(has_server);
+        assert!(url_matches);
     }
 
     #[test]
@@ -2440,5 +2511,4 @@ http_headers = { Authorization = "Bearer tok" }
             "\"open-code\""
         );
     }
-
 }
