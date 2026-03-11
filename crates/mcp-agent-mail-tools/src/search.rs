@@ -381,15 +381,25 @@ pub(crate) fn summarize_messages(
                 }
             }
 
-            let upper = stripped.to_ascii_uppercase();
-            if keywords.iter().any(|k| upper.contains(k)) {
-                if seen_actions.insert(stripped.to_string()) {
-                    if upper.contains("FIXME") || upper.contains("TODO") || upper.contains("ACTION")
-                    {
-                        open_actions += 1;
+            let mut has_keyword = false;
+            let mut is_open_action = false;
+            let stripped_bytes = stripped.as_bytes();
+            for &k in keywords.iter() {
+                let k_bytes = k.as_bytes();
+                if stripped_bytes.windows(k_bytes.len()).any(|w| w.eq_ignore_ascii_case(k_bytes)) {
+                    has_keyword = true;
+                    if k == "FIXME" || k == "TODO" || k == "ACTION" {
+                        is_open_action = true;
+                        break; // No need to check others if we already know it's an open action
                     }
-                    action_items.push(stripped.to_string());
                 }
+            }
+
+            if has_keyword && seen_actions.insert(stripped.to_string()) {
+                if is_open_action {
+                    open_actions += 1;
+                }
+                action_items.push(stripped.to_string());
             }
         }
     }

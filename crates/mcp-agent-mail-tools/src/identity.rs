@@ -552,11 +552,18 @@ pub async fn register_agent(
                 match mcp_agent_mail_core::models::normalize_agent_name(n) {
                     Some(normalized) => normalized,
                     None => {
-                        return Err(legacy_tool_error(
-                            &mcp_agent_mail_core::models::detect_agent_name_mistake(n)
-                                .unwrap_or_else(|| {
+                        let (err_type, msg) = mcp_agent_mail_core::models::detect_agent_name_mistake(n)
+                            .unwrap_or_else(|| {
+                                (
+                                    "INVALID_AGENT_NAME",
                                     format!("Invalid agent name '{n}'. MUST be an adjective+noun combination (e.g. GreenLake).")
-                                }),
+                                )
+                            });
+                        return Err(legacy_tool_error(
+                            err_type,
+                            msg,
+                            true,
+                            json!({ "provided": n }),
                         ));
                     }
                 }
@@ -716,11 +723,18 @@ pub async fn create_agent_identity(
                 match mcp_agent_mail_core::models::normalize_agent_name(hint) {
                     Some(normalized) => normalized,
                     None => {
-                        return Err(legacy_tool_error(
-                            &mcp_agent_mail_core::models::detect_agent_name_mistake(hint)
-                                .unwrap_or_else(|| {
+                        let (err_type, msg) = mcp_agent_mail_core::models::detect_agent_name_mistake(hint)
+                            .unwrap_or_else(|| {
+                                (
+                                    "INVALID_AGENT_NAME",
                                     format!("Invalid agent name hint '{hint}'. MUST be an adjective+noun combination (e.g. GreenLake).")
-                                }),
+                                )
+                            });
+                        return Err(legacy_tool_error(
+                            err_type,
+                            msg,
+                            true,
+                            json!({ "provided": hint }),
                         ));
                     }
                 }

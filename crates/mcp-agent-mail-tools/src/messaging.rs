@@ -1758,43 +1758,51 @@ effective_free_bytes={free}"
         .unwrap_or_default();
         let approved_set: HashSet<i64> = approved_ids.into_iter().collect();
 
-        let mut blocked: Vec<String> = Vec::new();
+        let mut blocked: Vec<(String, String)> = Vec::new();
         let mut to_remove_names: HashSet<String> = HashSet::new();
 
-        for name in resolved_to
-            .iter()
-            .chain(resolved_cc_recipients.iter())
-            .chain(resolved_bcc_recipients.iter())
-        {
-            let Some(agent) = recipient_map.get(&name.to_lowercase()) else {
-                continue;
-            };
-            let rec_id = agent.id.unwrap_or(0);
-            let recent_ok = auto_ok_names.contains(&agent.name) || recent_set.contains(&rec_id);
-            let approved = approved_set.contains(&rec_id);
-            match contact_policy_decision(
-                &sender.name,
-                &agent.name,
-                &agent.contact_policy,
-                recent_ok,
-                approved,
-            ) {
-                ContactPolicyDecision::Allow => {}
-                ContactPolicyDecision::BlockAll => {
-                    if broadcast {
-                        to_remove_names.insert(name.clone());
-                    } else {
-                        return Err(contact_blocked_error());
+        // Check policy for each resolved recipient
+        let mut check_policy = |name: &String, kind: &str| {
+            if let Some(agent) = recipient_map.get(&name.to_lowercase()) {
+                let rec_id = agent.id.unwrap_or(0);
+                let recent_ok = auto_ok_names.contains(&agent.name) || recent_set.contains(&rec_id);
+                let approved = approved_set.contains(&rec_id);
+                match contact_policy_decision(
+                    &sender.name,
+                    &agent.name,
+                    &agent.contact_policy,
+                    recent_ok,
+                    approved,
+                ) {
+                    ContactPolicyDecision::Allow => {}
+                    ContactPolicyDecision::BlockAll => {
+                        if broadcast {
+                            to_remove_names.insert(name.clone());
+                        } else {
+                            // Non-broadcast: immediate failure for BlockAll
+                            return Some(Err(contact_blocked_error()));
+                        }
                     }
-                }
-                ContactPolicyDecision::RequireApproval => {
-                    if broadcast {
-                        to_remove_names.insert(name.clone());
-                    } else {
-                        blocked.push(agent.name.clone());
+                    ContactPolicyDecision::RequireApproval => {
+                        if broadcast {
+                            to_remove_names.insert(name.clone());
+                        } else {
+                            blocked.push((agent.name.clone(), kind.to_string()));
+                        }
                     }
                 }
             }
+            None
+        };
+
+        for name in &resolved_to {
+            if let Some(err) = check_policy(name, "to") { return err; }
+        }
+        for name in &resolved_cc_recipients {
+            if let Some(err) = check_policy(name, "cc") { return err; }
+        }
+        for name in &resolved_bcc_recipients {
+            if let Some(err) = check_policy(name, "bcc") { return err; }
         }
 
         if !to_remove_names.is_empty() {
@@ -1824,7 +1832,7 @@ effective_free_bytes={free}"
             let effective_auto_contact =
                 auto_contact_if_blocked.unwrap_or(config.messaging_auto_handshake_on_block);
             if effective_auto_contact {
-                for name in &blocked {
+                for (name, _) in &blocked {
                     if Box::pin(crate::macros::macro_contact_handshake(
                         ctx,
                         project.human_key.clone(),
@@ -1864,7 +1872,9 @@ effective_free_bytes={free}"
                 .unwrap_or_default();
                 let approved_set: HashSet<i64> = approved_ids.into_iter().collect();
 
-                blocked.retain(|name| {
+                // Remove agents who are STILL blocked from the delivery lists.
+                // Agents who are now approved remain in the lists (they were added by push_recipient).
+                blocked.retain(|(name, _kind)| {
                     if let Some(agent) = recipient_map.get(&name.to_lowercase()) {
                         let rec_id = agent.id.unwrap_or(0);
                         let mut policy = agent.contact_policy.to_lowercase();
@@ -1874,26 +1884,42 @@ effective_free_bytes={free}"
                             policy = "auto".to_string();
                         }
                         let approved = approved_set.contains(&rec_id);
-                        if policy == "open" {
-                            return false;
-                        }
-                        if policy == "auto" && approved {
-                            return false;
-                        }
-                        if policy == "contacts_only" && approved {
-                            return false;
+                        let is_blocked = match policy.as_str() {
+                            "open" => false,
+                            "auto" | "contacts_only" => !approved,
+                            _ => true, // block_all
+                        };
+
+                        if !is_blocked {
+                            return false; // No longer blocked
                         }
                     }
                     true
                 });
+
+                // For any remaining blocked ones, remove them from the active lists so the 
+                // final DB insert and archive write don't include them.
+                if !blocked.is_empty() {
+                    let still_blocked_names: HashSet<String> = blocked.iter().map(|(n, _)| n.clone()).collect();
+                    resolved_to.retain(|n| !still_blocked_names.contains(n));
+                    resolved_cc_recipients.retain(|n| !still_blocked_names.contains(n));
+                    resolved_bcc_recipients.retain(|n| !still_blocked_names.contains(n));
+
+                    let still_blocked_ids: HashSet<i64> = still_blocked_names
+                        .iter()
+                        .filter_map(|n| recipient_map.get(&n.to_lowercase()).and_then(|a| a.id))
+                        .collect();
+                    all_recipients.retain(|(id, _)| !still_blocked_ids.contains(id));
+                }
             }
         }
 
         if !blocked.is_empty() {
+            let blocked_names: Vec<String> = blocked.into_iter().map(|(n, _)| n).collect();
             return Err(contact_required_error(
                 &project.human_key,
                 &sender.name,
-                &blocked,
+                &blocked_names,
                 &attempted,
                 ttl_seconds,
             ));
@@ -2212,10 +2238,13 @@ effective_free_bytes={free}"
     };
 
     // Apply subject prefix if not already present (case-insensitive)
+    // Check for prefix followed by a space to avoid false positives like "Regarding"
+    let prefix_with_space = format!("{prefix} ");
     let subject = if original
         .subject
         .to_ascii_lowercase()
-        .starts_with(&prefix.to_ascii_lowercase())
+        .starts_with(&prefix_with_space.to_ascii_lowercase())
+        || original.subject.eq_ignore_ascii_case(&prefix)
     {
         original.subject.clone()
     } else {
@@ -2886,36 +2915,28 @@ pub async fn fetch_inbox(
         .await,
     )?;
 
+    #[derive(serde::Deserialize, Default)]
+    struct FastRecipients {
+        #[serde(default)]
+        to: Vec<String>,
+        #[serde(default)]
+        cc: Vec<String>,
+        #[serde(default)]
+        bcc: Vec<String>,
+    }
+
     let messages: Vec<InboxMessage> = inbox_rows
         .into_iter()
         .map(|row| {
             let attachments: Vec<serde_json::Value> =
                 serde_json::from_str(&row.message.attachments).unwrap_or_default();
-            let recipients: serde_json::Value =
-                serde_json::from_str(&row.message.recipients_json).unwrap_or_else(|_| json!({}));
+            let recipients: FastRecipients =
+                serde_json::from_str(&row.message.recipients_json).unwrap_or_default();
 
-            let to = recipients["to"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            let cc = recipients["cc"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
+            let to = recipients.to;
+            let cc = recipients.cc;
             let bcc = if row.message.sender_id == agent_id {
-                recipients["bcc"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
+                recipients.bcc
             } else {
                 Vec::new()
             };

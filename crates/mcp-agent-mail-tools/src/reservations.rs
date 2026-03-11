@@ -1085,26 +1085,28 @@ pub async fn force_release_file_reservation(
         ));
     }
 
-    // Double-check: if we are force-releasing because of expiry only,
-    // ensure we don't accidentally release a reservation that was JUST renewed
-    // by another agent while we were calculating heuristics.
-    if is_expired {
-        let current_now = mcp_agent_mail_db::now_micros();
-        if reservation.expires_ts > current_now {
-             return Err(legacy_tool_error(
-                "CONFLICT",
-                "Reservation was renewed by another agent while heuristics were being calculated.",
-                true,
-                json!({ "file_reservation_id": file_reservation_id }),
-            ));
-        }
-    }
-
-    // Actually release the reservation in DB
+    // Actually release the reservation in DB.
+    // We pass the expires_ts we used for heuristics to perform an ATOMIC release.
+    // If another agent renewed the reservation while we were calculating
+    // inactivity, this call will return 0 released rows (MATCH failure).
     let released_count = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::force_release_reservation(ctx.cx(), &pool, file_reservation_id)
-            .await,
+        mcp_agent_mail_db::queries::force_release_reservation(
+            ctx.cx(),
+            &pool,
+            file_reservation_id,
+            Some(reservation.expires_ts),
+        )
+        .await,
     )?;
+
+    if released_count == 0 {
+        return Err(legacy_tool_error(
+            "CONFLICT",
+            "Reservation was renewed, released, or expired by another agent while heuristics were being calculated.",
+            true,
+            json!({ "file_reservation_id": file_reservation_id }),
+        ));
+    }
 
     let now_iso = micros_to_iso(mcp_agent_mail_db::now_micros());
 

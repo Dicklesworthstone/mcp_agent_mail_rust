@@ -171,14 +171,11 @@ fn read_active_leases(slot_path: &Path, now: chrono::DateTime<chrono::Utc>) -> V
         };
         let Ok(exp) = chrono::DateTime::parse_from_rfc3339(&lease.expires_ts) else {
             // Ignore malformed leases: invalid expiration should not block slots forever.
-            // Clean it up to prevent unlimited file accumulation.
-            let _ = std::fs::remove_file(&path);
             continue;
         };
         if exp.with_timezone(&chrono::Utc) <= now {
-            // Lease expired. Clean it up to prevent unlimited file accumulation.
-            // Best-effort; ignore errors.
-            let _ = std::fs::remove_file(&path);
+            // Lease expired. We do not delete the file here to prevent a TOCTOU race
+            // where another agent just renewed it. The file will be overwritten on next acquire.
             continue;
         }
         results.push(lease);

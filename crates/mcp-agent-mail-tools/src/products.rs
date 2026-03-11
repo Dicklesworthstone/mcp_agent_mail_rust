@@ -586,33 +586,28 @@ pub async fn fetch_inbox_product(
             let msg = row.message;
             let created_ts = msg.created_ts;
             let id = msg.id.unwrap_or(0);
-            let recipients: serde_json::Value = serde_json::from_str(&msg.recipients_json)
-                .unwrap_or_else(|_| serde_json::json!({}));
-            let to = recipients["to"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|value| value.as_str().map(str::to_string))
-                .collect();
-            let cc = recipients["cc"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|value| value.as_str().map(str::to_string))
-                .collect();
+            
+            #[derive(serde::Deserialize, Default)]
+            struct FastRecipients {
+                #[serde(default)]
+                to: Vec<String>,
+                #[serde(default)]
+                cc: Vec<String>,
+                #[serde(default)]
+                bcc: Vec<String>,
+            }
+
+            let recipients: FastRecipients =
+                serde_json::from_str(&msg.recipients_json).unwrap_or_default();
+                
+            let to = recipients.to;
+            let cc = recipients.cc;
             let bcc = if msg.sender_id == agent.id.unwrap_or(0) {
-                recipients["bcc"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|value| value.as_str().map(str::to_string))
-                    .collect()
+                recipients.bcc
             } else {
                 Vec::new()
             };
+            
             items.push((
                 created_ts,
                 id,
