@@ -64,6 +64,32 @@ pub struct AttachmentConfig {
     pub detach_threshold: usize,
 }
 
+/// Canonical configuration for exporting a deployable bundle from a prepared snapshot.
+#[derive(Debug, Clone)]
+pub struct BundleExportConfig {
+    pub inline_attachment_threshold: usize,
+    pub detach_attachment_threshold: usize,
+    pub chunk_threshold: usize,
+    pub chunk_size: usize,
+    pub scrub_preset: crate::ScrubPreset,
+    pub allow_absolute_attachment_paths: bool,
+    pub hosting_hints_root: Option<PathBuf>,
+}
+
+impl Default for BundleExportConfig {
+    fn default() -> Self {
+        Self {
+            inline_attachment_threshold: crate::INLINE_ATTACHMENT_THRESHOLD,
+            detach_attachment_threshold: crate::DETACH_ATTACHMENT_THRESHOLD,
+            chunk_threshold: crate::DEFAULT_CHUNK_THRESHOLD,
+            chunk_size: crate::DEFAULT_CHUNK_SIZE,
+            scrub_preset: crate::ScrubPreset::Standard,
+            allow_absolute_attachment_paths: false,
+            hosting_hints_root: None,
+        }
+    }
+}
+
 fn rewrite_original_path(obj: &mut serde_json::Map<String, Value>, original_path: &Option<String>) {
     match original_path {
         Some(path) => {
@@ -534,6 +560,102 @@ pub fn write_bundle_scaffolding(
     std::fs::write(output_dir.join("_headers"), headers)?;
 
     Ok(())
+}
+
+/// Result of the canonical bundle export assembly path.
+#[derive(Debug, Clone)]
+pub struct BundleExportResult {
+    pub attachment_manifest: AttachmentManifest,
+    pub chunk_manifest: Option<ChunkManifest>,
+    pub viewer_assets: Vec<String>,
+    pub viewer_data: ViewerDataManifest,
+    pub static_render: crate::StaticRenderResult,
+    pub db_sha256: String,
+    pub db_size_bytes: u64,
+}
+
+/// Assemble a deployable bundle from a prepared snapshot context.
+///
+/// This is the canonical post-snapshot export path: it copies viewer assets,
+/// exports cached viewer data, runs the static-render defense pass, and writes
+/// the bundle scaffolding/manifest in one place so callers do not silently
+/// skip the renderer.
+pub fn export_bundle_from_snapshot_context(
+    context: &crate::snapshot::SnapshotContext,
+    output_dir: &Path,
+    storage_root: &Path,
+    config: &BundleExportConfig,
+) -> ShareResult<BundleExportResult> {
+    std::fs::create_dir_all(output_dir)?;
+    let detach_attachment_threshold = crate::adjust_detach_threshold(
+        config.inline_attachment_threshold,
+        config.detach_attachment_threshold,
+    );
+
+    let attachment_manifest = bundle_attachments(
+        &context.snapshot_path,
+        output_dir,
+        storage_root,
+        config.inline_attachment_threshold,
+        detach_attachment_threshold,
+        config.allow_absolute_attachment_paths,
+    )?;
+
+    let viewer_assets = copy_viewer_assets(output_dir)?;
+
+    let db_dest = output_dir.join("mailbox.sqlite3");
+    std::fs::copy(&context.snapshot_path, &db_dest)?;
+    let db_bytes = std::fs::read(&db_dest)?;
+    let db_sha256 = hex::encode(Sha256::digest(&db_bytes));
+    let db_size_bytes = db_bytes.len() as u64;
+
+    let chunk_manifest = maybe_chunk_database(
+        &db_dest,
+        output_dir,
+        config.chunk_threshold,
+        config.chunk_size,
+    )?;
+
+    let viewer_data = export_viewer_data(&context.snapshot_path, output_dir, context.fts_enabled)?;
+    let static_render = crate::render_static_site(
+        &context.snapshot_path,
+        output_dir,
+        &crate::StaticRenderConfig {
+            redaction: crate::ExportRedactionPolicy::from_preset(config.scrub_preset),
+            ..crate::StaticRenderConfig::default()
+        },
+    )?;
+
+    let viewer_sri = compute_viewer_sri(output_dir);
+    let hosting_hints =
+        hosting::detect_hosting_hints(config.hosting_hints_root.as_deref().unwrap_or(output_dir));
+
+    write_bundle_scaffolding(
+        output_dir,
+        &context.scope,
+        &context.scrub_summary,
+        &attachment_manifest,
+        chunk_manifest.as_ref(),
+        config.chunk_threshold,
+        config.chunk_size,
+        &hosting_hints,
+        context.fts_enabled,
+        "mailbox.sqlite3",
+        &db_sha256,
+        db_size_bytes,
+        Some(&viewer_data),
+        &viewer_sri,
+    )?;
+
+    Ok(BundleExportResult {
+        attachment_manifest,
+        chunk_manifest,
+        viewer_assets,
+        viewer_data,
+        static_render,
+        db_sha256,
+        db_size_bytes,
+    })
 }
 
 /// Create a deterministic ZIP archive of a directory.

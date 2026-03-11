@@ -845,17 +845,11 @@ mod tests {
         );
     }
 
-    /// Full pipeline integration: snapshot → scope → scrub → finalize →
-    /// attachments → chunk → scaffold → sign → verify
+    /// Full pipeline integration: snapshot → scope/scrub/finalize →
+    /// canonical bundle export → sign → verify
     #[test]
     fn full_pipeline_integration() {
-        use crate::bundle::{
-            bundle_attachments, compute_viewer_sri, export_viewer_data, maybe_chunk_database,
-            write_bundle_scaffolding,
-        };
         use crate::crypto::{sign_manifest, verify_bundle};
-        use crate::hosting::detect_hosting_hints;
-        use sha2::{Digest, Sha256};
         let dir = tempfile::tempdir().unwrap();
 
         // 1. Create a seeded source database with FrankenSQLite (like runtime).
@@ -915,80 +909,36 @@ mod tests {
         std::fs::create_dir_all(&storage).unwrap();
         std::fs::write(storage.join("test.txt"), b"attachment content").unwrap();
 
-        // 2. Snapshot (FrankenSQLite → C SQLite conversion)
         let snapshot = dir.path().join("snapshot.sqlite3");
-        create_sqlite_snapshot(&source, &snapshot, false).unwrap();
-        assert!(snapshot.exists());
+        let context =
+            create_snapshot_context(&source, &snapshot, &[], crate::ScrubPreset::Standard).unwrap();
+        assert!(context.snapshot_path.exists());
+        assert!(!context.scope.projects.is_empty());
+        assert!(context.scrub_summary.secrets_replaced >= 0);
 
-        // 3. Project scope (keep all)
-        let scope = crate::apply_project_scope(&snapshot, &[]).unwrap();
-        assert!(!scope.projects.is_empty());
-
-        // 4. Scrub (standard preset)
-        let scrub = crate::scrub_snapshot(&snapshot, crate::ScrubPreset::Standard).unwrap();
-        assert!(scrub.secrets_replaced >= 0);
-
-        // 5. Finalize (FTS + views + indexes)
-        let finalize = crate::finalize_export_db(&snapshot).unwrap();
-
-        // 6. Bundle attachments
         let output = dir.path().join("bundle");
-        std::fs::create_dir_all(&output).unwrap();
-        let att_manifest = bundle_attachments(
-            &snapshot,
+        let export = crate::export_bundle_from_snapshot_context(
+            &context,
             &output,
             &storage,
-            crate::INLINE_ATTACHMENT_THRESHOLD,
-            crate::DETACH_ATTACHMENT_THRESHOLD,
-            true,
+            &crate::BundleExportConfig {
+                allow_absolute_attachment_paths: true,
+                ..crate::BundleExportConfig::default()
+            },
         )
         .unwrap();
-        assert_eq!(att_manifest.stats.inline, 1); // small file → inline
-
-        // 7. Copy DB to bundle
-        let db_dest = output.join("mailbox.sqlite3");
-        std::fs::copy(&snapshot, &db_dest).unwrap();
-        let db_bytes = std::fs::read(&db_dest).unwrap();
-        let db_sha256 = hex::encode(Sha256::digest(&db_bytes));
-
-        // 8. Maybe chunk (should not chunk — small DB)
-        let chunk = maybe_chunk_database(
-            &db_dest,
-            &output,
-            crate::DEFAULT_CHUNK_THRESHOLD,
-            crate::DEFAULT_CHUNK_SIZE,
-        )
-        .unwrap();
-        assert!(chunk.is_none());
-
-        // 9. Viewer data export
-        let viewer_data = export_viewer_data(&snapshot, &output, finalize.fts_enabled).unwrap();
+        assert_eq!(export.attachment_manifest.stats.inline, 1); // small file → inline
+        assert!(export.chunk_manifest.is_none());
+        assert!(
+            export
+                .viewer_assets
+                .iter()
+                .any(|path| path == "viewer/index.html")
+        );
         assert!(output.join("viewer/data/messages.json").exists());
-
-        // 10. Viewer SRI
-        let sri = compute_viewer_sri(&output);
-
-        // 11. Hosting hints
-        let hints = detect_hosting_hints(&output);
-
-        // 12. Write scaffolding
-        write_bundle_scaffolding(
-            &output,
-            &scope,
-            &scrub,
-            &att_manifest,
-            chunk.as_ref(),
-            crate::DEFAULT_CHUNK_THRESHOLD,
-            crate::DEFAULT_CHUNK_SIZE,
-            &hints,
-            finalize.fts_enabled,
-            "mailbox.sqlite3",
-            &db_sha256,
-            db_bytes.len() as u64,
-            Some(&viewer_data),
-            &sri,
-        )
-        .unwrap();
+        assert!(output.join("viewer/index.html").exists());
+        assert!(output.join("viewer/pages/index.html").exists());
+        assert!(export.static_render.pages_generated > 0);
         assert!(output.join("manifest.json").exists());
         assert!(output.join("README.md").exists());
         assert!(output.join("HOW_TO_DEPLOY.md").exists());
@@ -1001,7 +951,7 @@ mod tests {
         let manifest: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
         assert_eq!(manifest["schema_version"], "0.1.0");
         assert_eq!(manifest["database"]["path"], "mailbox.sqlite3");
-        assert_eq!(manifest["database"]["sha256"], db_sha256);
+        assert_eq!(manifest["database"]["sha256"], export.db_sha256);
 
         // Keys should be alphabetically sorted
         if let Some(obj) = manifest.as_object() {

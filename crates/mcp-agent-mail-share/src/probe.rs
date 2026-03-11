@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::{self, BufRead, BufReader, Read as _};
+use std::io::{self, BufRead, Read as _, Write as _};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
@@ -343,95 +343,62 @@ fn probe_single_get(
     capture_body: bool,
 ) -> Result<RawResponse, ProbeError> {
     let addr = format!("{}:{}", parsed.host, parsed.port);
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+        parsed.path,
+        parsed.authority(),
+        sanitized_header_value(&config.user_agent),
+    );
 
     let stream = TcpStream::connect_timeout(
-        &addr
-            .parse()
-            .or_else(|_| {
-                // DNS resolution via std::net
-                use std::net::ToSocketAddrs;
-                addr.to_socket_addrs()
-                    .map_err(|e| ProbeError::DnsError {
-                        detail: e.to_string(),
-                    })?
-                    .next()
-                    .ok_or_else(|| ProbeError::DnsError {
-                        detail: "No addresses found".to_string(),
-                    })
-            })?,
+        &addr.parse().or_else(|_| {
+            // DNS resolution via std::net
+            use std::net::ToSocketAddrs;
+            addr.to_socket_addrs()
+                .map_err(|e| ProbeError::DnsError {
+                    detail: e.to_string(),
+                })?
+                .next()
+                .ok_or_else(|| ProbeError::DnsError {
+                    detail: "No addresses found".to_string(),
+                })
+        })?,
         config.timeout,
     )
-    .map_err(|e| ProbeError::ConnectionError {
-        detail: e.to_string(),
-    })?;
+    .map_err(|e| categorize_connect_error(e, config.timeout))?;
 
     let _ = stream.set_read_timeout(Some(config.timeout));
     let _ = stream.set_write_timeout(Some(config.timeout));
 
     let mut response_buf = Vec::new();
     let result = (|| -> Result<RawResponse, ProbeError> {
-        if parsed.is_https {
-            #[cfg(feature = "native-tls")]
-            {
-                let connector = native_tls::TlsConnector::new().map_err(|e| ProbeError::TlsError {
-                    detail: e.to_string(),
-                })?;
-                let mut tls_stream = connector.connect(&parsed.host, stream).map_err(|e| {
-                    ProbeError::TlsError {
-                        detail: e.to_string(),
-                    }
-                })?;
+        if matches!(parsed.scheme, Scheme::Https) {
+            return Err(ProbeError::TlsError {
+                detail: "HTTPS probing is not enabled in this build".to_string(),
+            });
+        }
 
-                tls_stream
-                    .write_all(request.as_bytes())
-                    .map_err(|e| ProbeError::IoError {
-                        detail: e.to_string(),
-                    })?;
-                tls_stream.flush().map_err(|e| ProbeError::IoError {
-                    detail: e.to_string(),
-                })?;
-
-                tls_stream
-                    .read_to_end(&mut response_buf)
-                    .map_err(|e| ProbeError::IoError {
-                        detail: e.to_string(),
-                    })?;
-                
-                // TLS shutdown if possible
-                let _ = tls_stream.shutdown();
-            }
-            #[cfg(not(feature = "native-tls"))]
-            {
-                return Err(ProbeError::TlsError {
-                    detail: "HTTPS not supported (compile with native-tls feature)".to_string(),
-                });
-            }
-        } else {
-            let mut stream = stream.try_clone().map_err(|e| ProbeError::IoError {
-                detail: format!("Failed to clone stream: {}", e),
+        let mut stream = stream;
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|e| ProbeError::IoError {
+                detail: e.to_string(),
             })?;
-            
-            stream
-                .write_all(request.as_bytes())
-                .map_err(|e| ProbeError::IoError {
-                    detail: e.to_string(),
-                })?;
-            stream.flush().map_err(|e| ProbeError::IoError {
+        stream.flush().map_err(|e| ProbeError::IoError {
+            detail: e.to_string(),
+        })?;
+
+        stream
+            .read_to_end(&mut response_buf)
+            .map_err(|e| ProbeError::IoError {
                 detail: e.to_string(),
             })?;
 
-            stream
-                .read_to_end(&mut response_buf)
-                .map_err(|e| ProbeError::IoError {
-                    detail: e.to_string(),
-                })?;
-                
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-        }
+        let _ = stream.shutdown(std::net::Shutdown::Both);
 
         parse_http_response(&response_buf, capture_body)
     })();
-    
+
     result
 }
 
@@ -468,6 +435,43 @@ fn parse_http_response(raw: &[u8], capture_body: bool) -> Result<RawResponse, Pr
         headers,
         body: body_bytes,
     })
+}
+
+#[cfg(test)]
+fn parse_curl_http_response(raw: &[u8], capture_body: bool) -> Result<RawResponse, ProbeError> {
+    parse_http_response(raw, capture_body)
+}
+
+#[cfg(test)]
+fn map_curl_failure(output: &std::process::Output, config: &ProbeConfig) -> ProbeError {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stderr_lower = stderr.to_ascii_lowercase();
+    if output.status.code() == Some(28) || stderr_lower.contains("timed out") {
+        #[allow(clippy::cast_possible_truncation)]
+        return ProbeError::Timeout {
+            timeout_ms: config.timeout.as_millis() as u64,
+        };
+    }
+
+    ProbeError::ConnectionError {
+        detail: if stderr.is_empty() {
+            format!("probe helper exited with status {}", output.status)
+        } else {
+            stderr
+        },
+    }
+}
+
+#[cfg(test)]
+fn format_curl_timeout(duration: Duration) -> String {
+    let mut rendered = format!("{:.3}", duration.as_secs_f64());
+    while rendered.contains('.') && rendered.ends_with('0') {
+        rendered.pop();
+    }
+    if rendered.ends_with('.') {
+        rendered.pop();
+    }
+    rendered
 }
 
 fn split_http_response(raw: &[u8]) -> Option<(&[u8], &[u8])> {

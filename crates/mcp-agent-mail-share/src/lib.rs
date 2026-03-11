@@ -17,8 +17,9 @@ pub mod static_render;
 pub mod wizard;
 
 pub use bundle::{
-    AttachmentConfig, AttachmentItem, AttachmentManifest, AttachmentStats, ChunkManifest,
-    ViewerDataManifest, ViewerMetaInfo, bundle_attachments, compute_viewer_sri, copy_viewer_assets,
+    AttachmentConfig, AttachmentItem, AttachmentManifest, AttachmentStats, BundleExportConfig,
+    BundleExportResult, ChunkManifest, ViewerDataManifest, ViewerMetaInfo, bundle_attachments,
+    compute_viewer_sri, copy_viewer_assets, export_bundle_from_snapshot_context,
     export_viewer_data, maybe_chunk_database, package_directory_as_zip, write_bundle_scaffolding,
 };
 pub use crypto::{

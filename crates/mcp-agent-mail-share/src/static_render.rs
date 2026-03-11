@@ -137,6 +137,21 @@ struct ThreadInfo {
     latest_ts: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ThreadRouteKey {
+    project_slug: String,
+    thread_id: String,
+}
+
+impl ThreadRouteKey {
+    fn new(project_slug: &str, thread_id: &str) -> Self {
+        Self {
+            project_slug: project_slug.to_string(),
+            thread_id: thread_id.to_string(),
+        }
+    }
+}
+
 // ── Redaction helpers ────────────────────────────────────────────────────
 
 const BODY_REDACTED_PLACEHOLDER: &str = "[Message body redacted]";
@@ -297,6 +312,7 @@ pub fn render_static_site(
         .collect();
 
     let threads = build_thread_index(&messages);
+    let thread_routes = build_thread_routes(&threads);
 
     // ── Render index page ───────────────────────────────────────────
     let index_html = render_index_page(&projects, config);
@@ -358,7 +374,7 @@ pub fn render_static_site(
 
     for msg in &messages {
         let body_was_redacted = config.redaction.redact_bodies || is_redacted_body(&msg.body_md);
-        let msg_html = render_message_page(msg, body_was_redacted, config);
+        let msg_html = render_message_page(msg, body_was_redacted, config, &thread_routes);
         let filename = format!("{}.html", msg.id);
         write_page(&msg_pages_dir, &filename, &msg_html)?;
         generated_files.push(format!("viewer/pages/messages/{filename}"));
@@ -401,15 +417,19 @@ pub fn render_static_site(
     let thread_pages_dir = pages_dir.join("threads");
     std::fs::create_dir_all(&thread_pages_dir)?;
 
-    for (tid, info) in &threads {
+    for (key, info) in &threads {
         let thread_messages: Vec<&MessageInfo> = messages
             .iter()
-            .filter(|m| m.thread_id.as_deref() == Some(tid.as_str()))
+            .filter(|m| {
+                m.project_slug == info.project_slug
+                    && normalized_thread_id(m.thread_id.as_deref()) == Some(info.thread_id.as_str())
+            })
             .collect();
 
         let thread_html = render_thread_page(info, &thread_messages, config);
-        let safe_id = sanitize_filename(tid);
-        let filename = format!("{safe_id}.html");
+        let filename = thread_routes
+            .get(key)
+            .expect("thread route must exist for every indexed thread");
         write_page(&thread_pages_dir, &filename, &thread_html)?;
         generated_files.push(format!("viewer/pages/threads/{filename}"));
         sitemap.push(SitemapEntry {
@@ -439,7 +459,7 @@ pub fn render_static_site(
     generated_files.push("viewer/data/search_index.json".to_string());
 
     // ── Write navigation.json ───────────────────────────────────────
-    let nav = build_navigation(&projects, &threads);
+    let nav = build_navigation(&projects, &threads, &thread_routes);
     let nav_json = serde_json::to_string_pretty(&nav).unwrap_or_else(|_| "{}".to_string());
     std::fs::write(data_dir.join("navigation.json"), &nav_json)?;
     generated_files.push("viewer/data/navigation.json".to_string());
@@ -567,28 +587,26 @@ fn fetch_recipients(conn: &SqliteConnection, message_id: i64) -> Vec<String> {
     .collect()
 }
 
-fn build_thread_index(messages: &[MessageInfo]) -> BTreeMap<String, ThreadInfo> {
-    let mut threads: BTreeMap<String, ThreadInfo> = BTreeMap::new();
+fn normalized_thread_id(thread_id: Option<&str>) -> Option<&str> {
+    thread_id.map(str::trim).filter(|tid| !tid.is_empty())
+}
+
+fn build_thread_index(messages: &[MessageInfo]) -> BTreeMap<ThreadRouteKey, ThreadInfo> {
+    let mut threads: BTreeMap<ThreadRouteKey, ThreadInfo> = BTreeMap::new();
 
     for msg in messages {
-        let Some(tid) = msg
-            .thread_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|tid| !tid.is_empty())
-        else {
+        let Some(tid) = normalized_thread_id(msg.thread_id.as_deref()) else {
             continue;
         };
-        let entry = threads
-            .entry(tid.to_string())
-            .or_insert_with(|| ThreadInfo {
-                thread_id: tid.to_string(),
-                project_slug: msg.project_slug.clone(),
-                subject: msg.subject.clone(),
-                message_count: 0,
-                participants: BTreeSet::new(),
-                latest_ts: String::new(),
-            });
+        let key = ThreadRouteKey::new(&msg.project_slug, tid);
+        let entry = threads.entry(key).or_insert_with(|| ThreadInfo {
+            thread_id: tid.to_string(),
+            project_slug: msg.project_slug.clone(),
+            subject: msg.subject.clone(),
+            message_count: 0,
+            participants: BTreeSet::new(),
+            latest_ts: String::new(),
+        });
         entry.message_count += 1;
         entry.participants.insert(msg.sender_name.clone());
         for r in &msg.recipients {
@@ -599,6 +617,32 @@ fn build_thread_index(messages: &[MessageInfo]) -> BTreeMap<String, ThreadInfo> 
         }
     }
     threads
+}
+
+fn build_thread_routes(
+    threads: &BTreeMap<ThreadRouteKey, ThreadInfo>,
+) -> BTreeMap<ThreadRouteKey, String> {
+    let mut thread_id_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for info in threads.values() {
+        *thread_id_counts.entry(info.thread_id.as_str()).or_insert(0) += 1;
+    }
+
+    threads
+        .keys()
+        .map(|key| {
+            let filename = if thread_id_counts
+                .get(key.thread_id.as_str())
+                .copied()
+                .unwrap_or(0)
+                > 1
+            {
+                scoped_thread_page_filename(&key.project_slug, &key.thread_id)
+            } else {
+                thread_page_filename(&key.thread_id)
+            };
+            (key.clone(), filename)
+        })
+        .collect()
 }
 
 // ── HTML rendering helpers ──────────────────────────────────────────────
@@ -858,18 +902,18 @@ fn render_message_page(
     msg: &MessageInfo,
     body_was_redacted: bool,
     config: &StaticRenderConfig,
+    thread_routes: &BTreeMap<ThreadRouteKey, String>,
 ) -> String {
-    let thread_link = msg
-        .thread_id
-        .as_ref()
-        .map(|tid| tid.trim())
-        .filter(|tid| !tid.is_empty())
-        .map(|tid| {
-            let safe_id = sanitize_filename(tid);
-            format!(
-                "<p>Thread: <a href=\"../threads/{safe_id}.html\">{tid}</a></p>",
-                tid = html_escape(tid),
-            )
+    let thread_link = normalized_thread_id(msg.thread_id.as_deref())
+        .and_then(|tid| {
+            let key = ThreadRouteKey::new(&msg.project_slug, tid);
+            thread_routes.get(&key).map(|filename| {
+                format!(
+                    "<p>Thread: <a href=\"../threads/{filename}\">{tid}</a></p>",
+                    filename = filename,
+                    tid = html_escape(tid),
+                )
+            })
         })
         .unwrap_or_default();
 
@@ -996,7 +1040,8 @@ fn render_thread_page(
 
 fn build_navigation(
     projects: &[ProjectInfo],
-    threads: &BTreeMap<String, ThreadInfo>,
+    threads: &BTreeMap<ThreadRouteKey, ThreadInfo>,
+    thread_routes: &BTreeMap<ThreadRouteKey, String>,
 ) -> serde_json::Value {
     let project_entries: Vec<serde_json::Value> = projects
         .iter()
@@ -1015,16 +1060,20 @@ fn build_navigation(
         .collect();
 
     let thread_entries: Vec<serde_json::Value> = threads
-        .values()
-        .map(|t| {
-            let safe_id = sanitize_filename(&t.thread_id);
+        .iter()
+        .map(|(key, t)| {
             serde_json::json!({
                 "thread_id": t.thread_id,
                 "project": t.project_slug,
                 "subject": t.subject,
                 "message_count": t.message_count,
                 "participants": t.participants.iter().collect::<Vec<_>>(),
-                "route": format!("threads/{safe_id}.html"),
+                "route": format!(
+                    "threads/{}",
+                    thread_routes
+                        .get(key)
+                        .expect("thread route must exist for every navigation entry")
+                ),
             })
         })
         .collect();
@@ -1045,15 +1094,33 @@ fn write_page(dir: &Path, filename: &str, content: &str) -> ShareResult<()> {
 }
 
 fn sanitize_filename(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '_'
+    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'-' | b'_' | b'.' => {
+                out.push(char::from(byte));
             }
-        })
-        .collect()
+            _ => {
+                out.push('~');
+                out.push(char::from(HEX_CHARS[(byte >> 4) as usize]));
+                out.push(char::from(HEX_CHARS[(byte & 0x0f) as usize]));
+            }
+        }
+    }
+    out
+}
+
+fn thread_page_filename(thread_id: &str) -> String {
+    format!("{}.html", sanitize_filename(thread_id))
+}
+
+fn scoped_thread_page_filename(project_slug: &str, thread_id: &str) -> String {
+    format!(
+        "{}~~{}.html",
+        sanitize_filename(project_slug),
+        sanitize_filename(thread_id)
+    )
 }
 
 fn find_char_boundary(s: &str, target: usize) -> usize {
@@ -1117,12 +1184,19 @@ mod tests {
 
     #[test]
     fn sanitize_filename_replaces_special() {
-        assert_eq!(sanitize_filename("a/b\\c:d"), "a_b_c_d");
+        assert_eq!(sanitize_filename("a/b\\c:d"), "a~2fb~5cc~3ad");
     }
 
     #[test]
     fn sanitize_filename_handles_spaces() {
-        assert_eq!(sanitize_filename("my thread id"), "my_thread_id");
+        assert_eq!(sanitize_filename("my thread id"), "my~20thread~20id");
+    }
+
+    #[test]
+    fn sanitize_filename_avoids_collisions_for_distinct_ids() {
+        assert_ne!(sanitize_filename("a/b"), sanitize_filename("a?b"));
+        assert_eq!(thread_page_filename("a/b"), "a~2fb.html");
+        assert_eq!(thread_page_filename("a?b"), "a~3fb.html");
     }
 
     // ── normalize_timestamp ─────────────────────────────────────────
@@ -1256,11 +1330,101 @@ mod tests {
 
         let threads = build_thread_index(&messages);
         assert_eq!(threads.len(), 1);
-        let t1 = &threads["t1"];
+        let t1 = &threads[&ThreadRouteKey::new("proj", "t1")];
         assert_eq!(t1.message_count, 2);
         assert!(t1.participants.contains("Alice"));
         assert!(t1.participants.contains("Bob"));
         assert_eq!(t1.latest_ts, "2024-01-01T01:00:00Z");
+    }
+
+    #[test]
+    fn build_thread_index_separates_projects_with_same_thread_id() {
+        let messages = vec![
+            MessageInfo {
+                id: 1,
+                subject: "Alpha hello".to_string(),
+                body_md: "body".to_string(),
+                importance: "normal".to_string(),
+                created_ts: "2024-01-01T00:00:00Z".to_string(),
+                sender_name: "Alice".to_string(),
+                project_slug: "alpha".to_string(),
+                thread_id: Some("shared".to_string()),
+                recipients: vec!["Bob".to_string()],
+            },
+            MessageInfo {
+                id: 2,
+                subject: "Beta hello".to_string(),
+                body_md: "reply".to_string(),
+                importance: "normal".to_string(),
+                created_ts: "2024-01-01T01:00:00Z".to_string(),
+                sender_name: "Carol".to_string(),
+                project_slug: "beta".to_string(),
+                thread_id: Some("shared".to_string()),
+                recipients: vec!["Dan".to_string()],
+            },
+        ];
+
+        let threads = build_thread_index(&messages);
+        assert_eq!(threads.len(), 2);
+
+        let alpha = &threads[&ThreadRouteKey::new("alpha", "shared")];
+        let beta = &threads[&ThreadRouteKey::new("beta", "shared")];
+        assert_eq!(alpha.message_count, 1);
+        assert_eq!(beta.message_count, 1);
+        assert_eq!(alpha.project_slug, "alpha");
+        assert_eq!(beta.project_slug, "beta");
+    }
+
+    #[test]
+    fn build_thread_routes_scopes_colliding_thread_ids_by_project() {
+        let mut threads = BTreeMap::new();
+        threads.insert(
+            ThreadRouteKey::new("alpha", "shared"),
+            ThreadInfo {
+                thread_id: "shared".to_string(),
+                project_slug: "alpha".to_string(),
+                subject: "Alpha".to_string(),
+                message_count: 1,
+                participants: BTreeSet::new(),
+                latest_ts: "2024-01-01T00:00:00Z".to_string(),
+            },
+        );
+        threads.insert(
+            ThreadRouteKey::new("beta", "shared"),
+            ThreadInfo {
+                thread_id: "shared".to_string(),
+                project_slug: "beta".to_string(),
+                subject: "Beta".to_string(),
+                message_count: 1,
+                participants: BTreeSet::new(),
+                latest_ts: "2024-01-01T01:00:00Z".to_string(),
+            },
+        );
+        threads.insert(
+            ThreadRouteKey::new("alpha", "unique"),
+            ThreadInfo {
+                thread_id: "unique".to_string(),
+                project_slug: "alpha".to_string(),
+                subject: "Unique".to_string(),
+                message_count: 1,
+                participants: BTreeSet::new(),
+                latest_ts: "2024-01-01T02:00:00Z".to_string(),
+            },
+        );
+
+        let routes = build_thread_routes(&threads);
+        assert_eq!(
+            routes[&ThreadRouteKey::new("alpha", "shared")],
+            "alpha~~shared.html"
+        );
+        assert_eq!(
+            routes[&ThreadRouteKey::new("beta", "shared")],
+            "beta~~shared.html"
+        );
+        assert_eq!(
+            routes[&ThreadRouteKey::new("alpha", "unique")],
+            "unique.html"
+        );
     }
 
     #[test]
@@ -1521,6 +1685,168 @@ mod tests {
         assert!(msg_html.contains("Hello World"));
         assert!(msg_html.contains("RedFox"));
         assert!(msg_html.contains("test-project"));
+    }
+
+    #[test]
+    fn render_distinct_thread_ids_to_distinct_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("thread-collision.sqlite3");
+
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, \
+             subject TEXT, body_md TEXT, importance TEXT, created_ts TEXT, thread_id TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, agent_id INTEGER, \
+             read_ts TEXT, ack_ts TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key) VALUES (1, 'test-project', '/tmp/test')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES (1, 1, 'RedFox')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, created_ts, thread_id) \
+             VALUES (1, 1, 1, 'Slash thread', 'Body one.', 'normal', '2024-01-01T00:00:00Z', 'a/b')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, created_ts, thread_id) \
+             VALUES (2, 1, 1, 'Question thread', 'Body two.', 'normal', '2024-01-01T01:00:00Z', 'a?b')",
+            &[],
+        )
+        .unwrap();
+        drop(conn);
+
+        let output = dir.path().join("output");
+        render_static_site(&db_path, &output, &StaticRenderConfig::default()).unwrap();
+
+        assert!(output.join("viewer/pages/threads/a~2fb.html").exists());
+        assert!(output.join("viewer/pages/threads/a~3fb.html").exists());
+
+        let nav_json = std::fs::read_to_string(output.join("viewer/data/navigation.json")).unwrap();
+        let nav: serde_json::Value = serde_json::from_str(&nav_json).unwrap();
+        let routes: Vec<String> = nav["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["route"].as_str().map(ToString::to_string))
+            .collect();
+        assert!(routes.contains(&"threads/a~2fb.html".to_string()));
+        assert!(routes.contains(&"threads/a~3fb.html".to_string()));
+    }
+
+    #[test]
+    fn render_same_thread_id_in_different_projects_to_distinct_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("cross-project-thread.sqlite3");
+
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, \
+             subject TEXT, body_md TEXT, importance TEXT, created_ts TEXT, thread_id TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, agent_id INTEGER, \
+             read_ts TEXT, ack_ts TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key) VALUES \
+             (1, 'alpha', '/tmp/alpha'), \
+             (2, 'beta', '/tmp/beta')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES \
+             (1, 1, 'RedFox'), \
+             (2, 2, 'BlueLake')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, created_ts, thread_id) \
+             VALUES (1, 1, 1, 'Alpha thread', 'Alpha body.', 'normal', '2024-01-01T00:00:00Z', 'shared-thread')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, created_ts, thread_id) \
+             VALUES (2, 2, 2, 'Beta thread', 'Beta body.', 'normal', '2024-01-01T01:00:00Z', 'shared-thread')",
+            &[],
+        )
+        .unwrap();
+        drop(conn);
+
+        let output = dir.path().join("output");
+        render_static_site(&db_path, &output, &StaticRenderConfig::default()).unwrap();
+
+        let alpha_thread = output.join("viewer/pages/threads/alpha~~shared-thread.html");
+        let beta_thread = output.join("viewer/pages/threads/beta~~shared-thread.html");
+        assert!(alpha_thread.exists());
+        assert!(beta_thread.exists());
+
+        let alpha_html = std::fs::read_to_string(alpha_thread).unwrap();
+        let beta_html = std::fs::read_to_string(beta_thread).unwrap();
+        assert!(alpha_html.contains("Project: <a href=\"../projects/alpha/index.html\">alpha</a>"));
+        assert!(beta_html.contains("Project: <a href=\"../projects/beta/index.html\">beta</a>"));
+        assert!(alpha_html.contains("Alpha thread"));
+        assert!(!alpha_html.contains("Beta thread"));
+        assert!(beta_html.contains("Beta thread"));
+        assert!(!beta_html.contains("Alpha thread"));
+
+        let alpha_msg =
+            std::fs::read_to_string(output.join("viewer/pages/messages/1.html")).unwrap();
+        let beta_msg =
+            std::fs::read_to_string(output.join("viewer/pages/messages/2.html")).unwrap();
+        assert!(alpha_msg.contains("../threads/alpha~~shared-thread.html"));
+        assert!(beta_msg.contains("../threads/beta~~shared-thread.html"));
+
+        let nav_json = std::fs::read_to_string(output.join("viewer/data/navigation.json")).unwrap();
+        let nav: serde_json::Value = serde_json::from_str(&nav_json).unwrap();
+        let routes: Vec<String> = nav["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["route"].as_str().map(ToString::to_string))
+            .collect();
+        assert!(routes.contains(&"threads/alpha~~shared-thread.html".to_string()));
+        assert!(routes.contains(&"threads/beta~~shared-thread.html".to_string()));
     }
 
     #[test]

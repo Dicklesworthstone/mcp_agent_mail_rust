@@ -45,7 +45,8 @@ static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         // Bearer tokens
         Regex::new(r"(?i)bearer\s+[A-Za-z0-9_\-\./+=]{16,}").unwrap_or_else(|_| unreachable!()),
         // URL-embedded basic auth credentials (broader URI support)
-        Regex::new(r"(?i)[a-z][a-z0-9+.-]*://[^/\s@]+:[^@\s/]+@").unwrap_or_else(|_| unreachable!()),
+        Regex::new(r"(?i)[a-z][a-z0-9+.-]*://[^/\s@]+:[^@\s/]+@")
+            .unwrap_or_else(|_| unreachable!()),
         // Environment-variable references likely to contain secrets
         Regex::new(r"(?i)\$[A-Z_][A-Z0-9_]*(?:SECRET|TOKEN|KEY|PASSWORD)[A-Z0-9_]*")
             .unwrap_or_else(|_| unreachable!()),
