@@ -1659,6 +1659,7 @@ impl CommitCoalescer {
 
         entry.pending_requests = entry.pending_requests.saturating_add(1);
         entry.message_total = entry.message_total.saturating_add(1);
+        rq.depth.fetch_add(1, Ordering::Relaxed);
         if fields.enqueued_at < entry.earliest_enqueued_at {
             entry.earliest_enqueued_at = fields.enqueued_at;
         }
@@ -1795,7 +1796,8 @@ impl CommitCoalescer {
                 } else {
                     let repos = self.repos.lock().unwrap_or_else(|e| e.into_inner());
                     repos.values().all(|rq| {
-                        rq.depth.load(Ordering::Relaxed) == 0 && !rq.processing.load(Ordering::Relaxed)
+                        rq.depth.load(Ordering::Relaxed) == 0
+                            && !rq.processing.load(Ordering::Relaxed)
                     })
                 }
             };
@@ -2009,14 +2011,15 @@ fn self_process_repo(
             }
         }
         if !batch.is_empty() {
-            rq.depth.fetch_sub(batch.len() as u64, Ordering::Relaxed);
+            coalescer_depth_decrement(&rq.depth, batch.len() as u64);
         }
     }
 
     // Drain spill if we have room
     let spilled_work = coalescer_drain_repo_spill(rq, repo_root);
 
-    let drained_count = batch.len() as u64 + spilled_work.as_ref().map_or(0, |w| w.pending_requests);
+    let drained_count =
+        batch.len() as u64 + spilled_work.as_ref().map_or(0, |w| w.pending_requests);
 
     if drained_count == 0 {
         // Defensive self-heal: if depth and queue contents diverge, reconcile
@@ -2123,7 +2126,8 @@ fn self_process_repo(
     }
 
     // Release processing lock (via guard drop) + update last_serviced timestamp
-    rq.last_serviced_us.store(now_micros_u64(), Ordering::Relaxed);
+    rq.last_serviced_us
+        .store(now_micros_u64(), Ordering::Relaxed);
 
     // If any repo still has work, wake another worker
     let more_work = {
@@ -2168,6 +2172,15 @@ fn coalescer_update_pending(pending_requests: &Arc<AtomicU64>, drained: u64) {
     }
 }
 
+fn coalescer_depth_decrement(depth: &AtomicU64, drained: u64) -> u64 {
+    depth
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_sub(drained))
+        })
+        .unwrap_or(0)
+        .saturating_sub(drained)
+}
+
 /// Drain a single repo's spill buffer into a `CoalescerSpilledWork`.
 fn coalescer_drain_repo_spill(rq: &RepoQueue, repo_root: &Path) -> Option<CoalescerSpilledWork> {
     let mut guard = rq.spill.lock().unwrap_or_else(|e| e.into_inner());
@@ -2175,7 +2188,7 @@ fn coalescer_drain_repo_spill(rq: &RepoQueue, repo_root: &Path) -> Option<Coales
     if repo.pending_requests == 0 {
         return None;
     }
-    rq.depth.fetch_sub(repo.pending_requests, Ordering::Relaxed);
+    coalescer_depth_decrement(&rq.depth, repo.pending_requests);
     Some(CoalescerSpilledWork {
         repo_root: repo_root.to_path_buf(),
         pending_requests: repo.pending_requests,
@@ -6990,7 +7003,9 @@ fn archive_fallback_matches_message_ref(
     let Ok((frontmatter, _body)) = read_message_file(path) else {
         return false;
     };
-    let Some(frontmatter_subject) = frontmatter.get("subject").and_then(serde_json::Value::as_str)
+    let Some(frontmatter_subject) = frontmatter
+        .get("subject")
+        .and_then(serde_json::Value::as_str)
     else {
         return false;
     };
@@ -10574,6 +10589,54 @@ mod tests {
         assert!(restored.paths.contains("a.txt"));
         assert!(restored.paths.contains("b.txt"));
         assert_eq!(restored.message_total, 2);
+    }
+
+    #[test]
+    fn spill_depth_roundtrip_tracks_spilled_requests_without_underflow() {
+        let rq = RepoQueue {
+            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            spill: std::sync::Mutex::new(CoalescerSpillState::default()),
+            depth: AtomicU64::new(0),
+            processing: AtomicBool::new(false),
+            last_serviced_us: AtomicU64::new(0),
+            metrics: RepoCommitMetrics::default(),
+        };
+
+        CommitCoalescer::spill_to_repo(
+            &rq,
+            CoalescerCommitFields {
+                enqueued_at: std::time::Instant::now(),
+                git_author_name: "Spill".to_string(),
+                git_author_email: "spill@example.com".to_string(),
+                message: "first".to_string(),
+                rel_paths: vec!["a.txt".to_string()],
+            },
+        );
+        CommitCoalescer::spill_to_repo(
+            &rq,
+            CoalescerCommitFields {
+                enqueued_at: std::time::Instant::now(),
+                git_author_name: "Spill".to_string(),
+                git_author_email: "spill@example.com".to_string(),
+                message: "second".to_string(),
+                rel_paths: vec!["b.txt".to_string()],
+            },
+        );
+
+        assert_eq!(rq.depth.load(Ordering::Relaxed), 2);
+
+        let drained =
+            coalescer_drain_repo_spill(&rq, std::path::Path::new("/tmp/fake-repo")).expect("spill");
+        assert_eq!(drained.pending_requests, 2);
+        assert_eq!(rq.depth.load(Ordering::Relaxed), 0);
+
+        coalescer_restore_spilled_work(&rq, drained);
+        assert_eq!(rq.depth.load(Ordering::Relaxed), 2);
+        let spill = rq.spill.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            spill.inner.as_ref().map(|repo| repo.pending_requests),
+            Some(2)
+        );
     }
 
     #[test]
