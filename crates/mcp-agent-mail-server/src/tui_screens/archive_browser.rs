@@ -1450,10 +1450,14 @@ mod tests {
         assert_eq!(screen.selected_project.as_deref(), Some("real-proj"));
         assert_eq!(screen.archive_root.as_deref(), Some(archive_root.as_path()));
         assert!(
+            !screen.entries.is_empty(),
+            "archive root should populate tree entries"
+        );
+        assert!(
             screen
                 .entries
                 .iter()
-                .any(|entry| entry.rel_path == Path::new("agents/BlueLake/profile.json"))
+                .any(|entry| entry.rel_path == Path::new("agents"))
         );
     }
 
