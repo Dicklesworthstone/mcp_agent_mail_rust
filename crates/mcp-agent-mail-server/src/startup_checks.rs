@@ -144,9 +144,10 @@ pub(crate) const HEALTH_SIGNATURE_HEADER_VALUE: &str = "1";
 #[must_use]
 pub fn check_port_status(host: &str, port: u16) -> PortStatus {
     let addr = format!("{host}:{port}");
+    let bind_host = normalize_bind_host_for_socket(host);
 
     // Step 1: Try to bind to the port
-    match TcpListener::bind(&addr) {
+    match TcpListener::bind((bind_host.as_ref(), port)) {
         Ok(_listener) => {
             // Port is free (listener is dropped immediately, releasing the port)
             return PortStatus::Free;
@@ -181,6 +182,17 @@ pub fn check_port_status(host: &str, port: u16) -> PortStatus {
     PortStatus::OtherProcess {
         description: format!("Unknown process listening on {addr}"),
     }
+}
+
+fn normalize_bind_host_for_socket(host: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = host.trim();
+    trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .map_or_else(
+            || std::borrow::Cow::Borrowed(trimmed),
+            std::borrow::Cow::Borrowed,
+        )
 }
 
 fn normalize_connect_host_for_health_check(host: &str) -> std::borrow::Cow<'_, str> {
@@ -1373,18 +1385,34 @@ fn probe_db_lock(config: &Config) -> ProbeResult {
 ///
 /// The probes are ordered from fastest to slowest, and all probes run
 /// even if earlier ones fail (so the user sees all problems at once).
-#[must_use]
-pub fn run_startup_probes(config: &Config) -> StartupReport {
-    let results = vec![
-        probe_http_path(config),
-        probe_auth(config),
+fn shared_runtime_startup_probes(config: &Config) -> Vec<ProbeResult> {
+    vec![
         probe_database(config),
         probe_db_lock(config),
         probe_storage_root(config),
-        probe_port(config),
+        probe_integrity(config),
         probe_fd_limit(config),
-    ];
+    ]
+}
+
+/// Run the full HTTP/TUI startup probe set.
+#[must_use]
+pub fn run_startup_probes(config: &Config) -> StartupReport {
+    let mut results = vec![probe_http_path(config), probe_auth(config)];
+    results.extend(shared_runtime_startup_probes(config));
+    results.push(probe_port(config));
     StartupReport { results }
+}
+
+/// Run the stdio startup probe set.
+///
+/// Stdio transport does not bind an HTTP listener, so HTTP-path/auth/port
+/// checks are intentionally omitted to avoid noisy false positives.
+#[must_use]
+pub fn run_stdio_startup_probes(config: &Config) -> StartupReport {
+    StartupReport {
+        results: shared_runtime_startup_probes(config),
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1588,9 +1616,39 @@ mod tests {
     fn run_startup_probes_returns_results() {
         let config = default_config();
         let report = run_startup_probes(&config);
-        // Should have 6 critical probes (integrity now runs in readiness_check;
-        // consistency is background/advisory).
-        assert_eq!(report.results.len(), 6);
+        assert_eq!(report.results.len(), 8);
+        assert!(report.results.iter().any(|result| matches!(
+            result,
+            ProbeResult::Ok { name: "integrity" }
+                | ProbeResult::Fail(ProbeFailure {
+                    name: "integrity",
+                    ..
+                })
+        )));
+    }
+
+    #[test]
+    fn run_stdio_startup_probes_omits_http_only_checks() {
+        let config = default_config();
+        let report = run_stdio_startup_probes(&config);
+        assert_eq!(report.results.len(), 5);
+        assert!(!report.results.iter().any(|result| matches!(
+            result,
+            ProbeResult::Ok {
+                name: "port" | "http-path" | "auth"
+            } | ProbeResult::Fail(ProbeFailure {
+                name: "port" | "http-path" | "auth",
+                ..
+            })
+        )));
+        assert!(report.results.iter().any(|result| matches!(
+            result,
+            ProbeResult::Ok { name: "integrity" }
+                | ProbeResult::Fail(ProbeFailure {
+                    name: "integrity",
+                    ..
+                })
+        )));
     }
 
     #[test]
@@ -1786,6 +1844,22 @@ mod tests {
         );
 
         server_thread.join().expect("join test server");
+    }
+
+    #[test]
+    fn check_port_status_accepts_raw_ipv6_loopback_host() {
+        let listener = match TcpListener::bind("[::1]:0") {
+            Ok(listener) => listener,
+            Err(_) => return,
+        };
+        let port = listener.local_addr().expect("listener addr").port();
+        drop(listener);
+
+        let status = check_port_status("::1", port);
+        assert!(
+            matches!(status, PortStatus::Free),
+            "expected Free, got {status:?}"
+        );
     }
 
     #[test]

@@ -2273,14 +2273,44 @@ fn env_var_is_truthy(name: &str) -> bool {
     })
 }
 
+fn normalize_bind_host_for_socket(host: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = host.trim();
+    trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .map_or_else(
+            || std::borrow::Cow::Borrowed(trimmed),
+            std::borrow::Cow::Borrowed,
+        )
+}
+
+fn bind_tcp_listener(host: &str, port: u16) -> std::io::Result<std::net::TcpListener> {
+    let bind_host = normalize_bind_host_for_socket(host);
+    std::net::TcpListener::bind((bind_host.as_ref(), port))
+}
+
+fn resolve_socket_bind_addr(host: &str, port: u16) -> std::io::Result<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+
+    let bind_host = normalize_bind_host_for_socket(host);
+    (bind_host.as_ref(), port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("no socket addresses resolved for {host}:{port}"),
+            )
+        })
+}
+
 /// If an Agent Mail server is already listening on `host:port`, stop it so we can start fresh.
 ///
 /// Refuses to terminate non-Agent-Mail processes.
 fn auto_clear_port(host: &str, port: u16) -> CliResult<()> {
     use mcp_agent_mail_server::startup_checks::{PortStatus, check_port_status};
-    use std::net::TcpListener;
 
-    match TcpListener::bind(format!("{host}:{port}")) {
+    match bind_tcp_listener(host, port) {
         Ok(_listener) => return Ok(()),
         Err(error) if error.kind() != std::io::ErrorKind::AddrInUse => {
             eprintln!("[warn] Could not check port {port}: {error} — proceeding anyway");
@@ -2392,7 +2422,6 @@ fn kill_port_holder_with_pids(host: &str, port: u16, pids: Vec<u32>) -> CliResul
         PortStatus, agent_mail_pids_all_stopped, agent_mail_port_holder_pids_with_hint,
         check_port_status,
     };
-    use std::net::TcpListener;
     use std::time::{Duration, Instant};
 
     const TERM_GRACE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -2400,7 +2429,7 @@ fn kill_port_holder_with_pids(host: &str, port: u16, pids: Vec<u32>) -> CliResul
     const PORT_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
     fn port_is_free(host: &str, port: u16) -> bool {
-        TcpListener::bind(format!("{host}:{port}")).is_ok()
+        bind_tcp_listener(host, port).is_ok()
     }
 
     fn wait_for_port_release(host: &str, port: u16, timeout: Duration) -> bool {
@@ -4057,16 +4086,10 @@ fn sqlite_conn_requires_canonical_init(conn: &mcp_agent_mail_db::DbConn) -> CliR
     Ok(false)
 }
 
-const SQLITE_ROBOT_READ_TABLES: [&str; 6] = [
-    "projects",
-    "agents",
-    "messages",
-    "message_recipients",
-    "file_reservations",
-    "agent_links",
-];
+const SQLITE_ROBOT_READ_TABLES: [&str; 4] =
+    ["projects", "agents", "messages", "message_recipients"];
 
-const SQLITE_ROBOT_READ_COLUMNS: [(&str, &str); 28] = [
+const SQLITE_ROBOT_READ_COLUMNS: [(&str, &str); 22] = [
     ("projects", "slug"),
     ("projects", "human_key"),
     ("projects", "created_at"),
@@ -4089,12 +4112,6 @@ const SQLITE_ROBOT_READ_COLUMNS: [(&str, &str); 28] = [
     ("message_recipients", "kind"),
     ("message_recipients", "read_ts"),
     ("message_recipients", "ack_ts"),
-    ("file_reservations", "project_id"),
-    ("file_reservations", "agent_id"),
-    ("file_reservations", "path_pattern"),
-    ("file_reservations", "expires_ts"),
-    ("agent_links", "a_agent_id"),
-    ("agent_links", "updated_ts"),
 ];
 
 fn sqlite_conn_supports_robot_reads(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
@@ -4102,8 +4119,7 @@ fn sqlite_conn_supports_robot_reads(conn: &mcp_agent_mail_db::DbConn) -> CliResu
         .query_sync(
             "SELECT name FROM sqlite_master \
              WHERE type='table' \
-               AND name IN ('projects', 'agents', 'messages', 'message_recipients', \
-                            'file_reservations', 'agent_links')",
+               AND name IN ('projects', 'agents', 'messages', 'message_recipients')",
             &[],
         )
         .map_err(|e| CliError::Other(format!("sqlite_master robot probe failed: {e}")))?;
@@ -15848,6 +15864,17 @@ mod tests {
     }
 
     #[test]
+    fn resolve_socket_bind_addr_accepts_raw_ipv6_loopback_host() {
+        if std::net::TcpListener::bind("[::1]:0").is_err() {
+            return;
+        }
+
+        let addr = resolve_socket_bind_addr("::1", 8765).expect("resolve ipv6 bind addr");
+        assert!(addr.is_ipv6(), "expected IPv6 socket addr, got {addr}");
+        assert_eq!(addr.port(), 8765);
+    }
+
+    #[test]
     fn detect_legacy_am_aliases_in_text_finds_python_aliases() {
         let content = r#"
             # legacy install line
@@ -27436,8 +27463,6 @@ startup_timeout_sec = 42
             "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT NOT NULL, inception_ts DATETIME NOT NULL, last_active_ts DATETIME NOT NULL, attachments_policy TEXT NOT NULL DEFAULT 'auto', contact_policy TEXT NOT NULL DEFAULT 'auto')",
             "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts DATETIME NOT NULL, attachments TEXT NOT NULL DEFAULT '[]')",
             "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
-            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, path_pattern TEXT NOT NULL, exclusive INTEGER NOT NULL, reason TEXT, created_ts DATETIME NOT NULL, expires_ts DATETIME NOT NULL, released_ts DATETIME)",
-            "CREATE TABLE agent_links (id INTEGER PRIMARY KEY, a_project_id INTEGER NOT NULL, a_agent_id INTEGER NOT NULL, b_project_id INTEGER NOT NULL, b_agent_id INTEGER NOT NULL, status TEXT NOT NULL, reason TEXT DEFAULT '', created_ts DATETIME NOT NULL, updated_ts DATETIME NOT NULL, expires_ts DATETIME)",
         ] {
             conn.execute_raw(sql).expect("create robot-readable table");
         }
@@ -28913,6 +28938,39 @@ struct ShareUpdateParams {
 }
 
 fn run_share_export(params: ShareExportParams) -> CliResult<()> {
+    struct SnapshotCleanupGuard {
+        path: PathBuf,
+        cleaned: bool,
+    }
+
+    impl SnapshotCleanupGuard {
+        fn new(path: PathBuf) -> Self {
+            Self {
+                path,
+                cleaned: false,
+            }
+        }
+
+        fn try_cleanup(&mut self) -> std::io::Result<()> {
+            if self.cleaned {
+                return Ok(());
+            }
+            match std::fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+            self.cleaned = true;
+            Ok(())
+        }
+    }
+
+    impl Drop for SnapshotCleanupGuard {
+        fn drop(&mut self) {
+            let _ = self.try_cleanup();
+        }
+    }
+
     validate_share_archive_options(params.zip, &params.age_recipients)?;
 
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
@@ -28996,6 +29054,7 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
     if snapshot_path.exists() {
         std::fs::remove_file(&snapshot_path)?;
     }
+    let mut snapshot_cleanup = SnapshotCleanupGuard::new(snapshot_path.clone());
     let snap_ctx = share::create_snapshot_context(
         source,
         &snapshot_path,
@@ -29068,7 +29127,7 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
     }
 
     // 11. Clean up snapshot
-    let _ = std::fs::remove_file(&snapshot_path);
+    snapshot_cleanup.try_cleanup()?;
 
     let zip_path = if params.zip {
         ensure_share_zip_target_absent(output)?
@@ -33035,8 +33094,7 @@ fn start_preview_server(
     // Avoid serving files outside the preview root via symlink escape.
     let base_dir = dir.canonicalize().unwrap_or(dir);
 
-    let socket_addr: std::net::SocketAddr = format!("{host}:{port}")
-        .parse()
+    let socket_addr = resolve_socket_bind_addr(&host, port)
         .map_err(|e| CliError::InvalidArgument(format!("invalid address: {e}")))?;
 
     let (ready_tx, ready_rx) = mpsc::channel::<
@@ -34320,6 +34378,66 @@ fn ensure_share_zip_target_absent_rejects_existing_archive() {
     let err = ensure_share_zip_target_absent(&bundle)
         .expect_err("existing zip archive should fail preflight");
     assert!(format!("{err}").contains("refusing to overwrite existing ZIP archive"));
+}
+
+#[test]
+fn run_share_export_removes_snapshot_when_signing_fails() {
+    let _lock = ARCHIVE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source_db = temp.path().join("share-export-source.sqlite3");
+    let storage_root = temp.path().join("storage");
+    let output = temp.path().join("bundle");
+    std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+    let conn = mcp_agent_mail_db::DbConn::open_file(source_db.display().to_string())
+        .expect("open source db");
+    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+        .expect("init source schema");
+    conn.query_sync(
+        "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+        &[
+            mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+            mcp_agent_mail_db::sqlmodel_core::Value::Text("proj".to_string()),
+            mcp_agent_mail_db::sqlmodel_core::Value::Text("/tmp/proj".to_string()),
+            mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+        ],
+    )
+    .expect("insert project");
+    drop(conn);
+
+    let database_url = format!("sqlite:///{}", source_db.display());
+    let storage_root_text = storage_root.to_string_lossy().to_string();
+    let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        &[
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root_text.as_str()),
+        ],
+        || {
+            run_share_export(ShareExportParams {
+                output: output.clone(),
+                projects: vec![],
+                inline_threshold: share::INLINE_ATTACHMENT_THRESHOLD,
+                detach_threshold: share::DETACH_ATTACHMENT_THRESHOLD,
+                scrub_preset: share::ScrubPreset::Standard,
+                chunk_threshold: share::DEFAULT_CHUNK_THRESHOLD,
+                chunk_size: share::DEFAULT_CHUNK_SIZE,
+                dry_run: false,
+                zip: false,
+                signing_key: Some(temp.path().join("missing-signing.key")),
+                signing_public_out: None,
+                age_recipients: vec![],
+            })
+        },
+    );
+
+    assert!(result.is_err(), "missing signing key should fail export");
+    assert!(
+        !output.join("_snapshot.sqlite3").exists(),
+        "snapshot should be removed after export failure"
+    );
 }
 
 #[test]
