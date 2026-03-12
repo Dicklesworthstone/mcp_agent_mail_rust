@@ -210,6 +210,15 @@ gemini.mcp.json
 .beads/*.pre_repair_*
 .beads/*.repair_candidate_*
 .beads/*.bak-corrupt
+
+# Beads ephemeral artifacts (recovery, backup, bad/rebuild snapshots)
+.beads/*.bad_*
+.beads/*.backup_*
+.beads/*.rebuild_*
+.beads/*.reindex_test_*
+.beads/*.vacuum_test_*
+.beads/recovery*/
+
 .rch-bin/
 .rch-target*/
 
