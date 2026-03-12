@@ -1164,8 +1164,15 @@ static MVCC_RETRIES_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 static MVCC_EXHAUSTED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Check if a [`DbError`] is an MVCC write conflict.
+///
+/// `BusySnapshot` arrives from frankensqlite as a lock-classified
+/// `ResourceBusy("database is busy (snapshot conflict on pages: ...)")`,
+/// so we must recognize both variants to restart the whole transaction.
 fn is_mvcc_error(e: &DbError) -> bool {
-    matches!(e, DbError::Sqlite(msg) if crate::error::is_mvcc_conflict(msg))
+    matches!(
+        e,
+        DbError::Sqlite(msg) | DbError::ResourceBusy(msg) if crate::error::is_mvcc_conflict(msg)
+    )
 }
 
 /// Sleep with exponential backoff for MVCC retry.
@@ -7254,6 +7261,21 @@ mod tests {
             }
             other => panic!("expected Sqlite, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn busy_snapshot_resource_busy_still_counts_as_mvcc_error() {
+        let err = map_sql_error(&SqlError::Custom(
+            "database is busy (snapshot conflict on pages: 7)".to_string(),
+        ));
+        assert!(matches!(
+            &err,
+            DbError::ResourceBusy(message) if message.contains("snapshot conflict on pages: 7")
+        ));
+        assert!(
+            is_mvcc_error(&err),
+            "BusySnapshot must trigger whole-transaction MVCC retry"
+        );
     }
 
     fn setup_test_pool(db_name: &str) -> (Cx, DbPool, tempfile::TempDir) {

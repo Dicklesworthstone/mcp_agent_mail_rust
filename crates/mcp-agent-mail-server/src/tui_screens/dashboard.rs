@@ -1445,12 +1445,26 @@ impl MailScreen for DashboardScreen {
         }
 
         // ── Render bands ─────────────────────────────────────────
+        let summary_current_fallback;
+        let summary_current_stats = if self.current_db_stats.timestamp_micros > 0 {
+            &self.current_db_stats
+        } else {
+            summary_current_fallback = state.db_stats_snapshot().unwrap_or_default();
+            &summary_current_fallback
+        };
+        let summary_prev_fallback;
+        let summary_prev_stats = if self.prev_db_stats.timestamp_micros > 0 {
+            &self.prev_db_stats
+        } else {
+            summary_prev_fallback = summary_current_stats.clone();
+            &summary_prev_fallback
+        };
         render_summary_band(
             frame,
             summary_area,
             state,
-            &self.current_db_stats,
-            &self.prev_db_stats,
+            summary_current_stats,
+            summary_prev_stats,
             density,
         );
 
@@ -2035,10 +2049,22 @@ fn render_insight_panel_slot(
 ) {
     match slot {
         InsightPanelSlot::Agents => {
-            render_agents_snapshot_panel(frame, area, &db_snapshot.agents_list, query_text);
+            render_agents_snapshot_panel(
+                frame,
+                area,
+                &db_snapshot.agents_list,
+                db_snapshot.agents,
+                query_text,
+            );
         }
         InsightPanelSlot::Contacts => {
-            render_contacts_snapshot_panel(frame, area, &db_snapshot.contacts_list, query_text);
+            render_contacts_snapshot_panel(
+                frame,
+                area,
+                &db_snapshot.contacts_list,
+                db_snapshot.contact_links,
+                query_text,
+            );
         }
         InsightPanelSlot::Projects => {
             render_projects_snapshot_panel(
@@ -2842,8 +2868,20 @@ fn render_insight_rail(
         let (c_top, c_bottom) = split_height_ratio_with_gap(col_c, 0.5, 1);
         let (d_top, d_bottom) = split_height_ratio_with_gap(col_d, 0.5, 1);
 
-        render_agents_snapshot_panel(frame, a_top, &db_snapshot.agents_list, query_text);
-        render_contacts_snapshot_panel(frame, a_bottom, &db_snapshot.contacts_list, query_text);
+        render_agents_snapshot_panel(
+            frame,
+            a_top,
+            &db_snapshot.agents_list,
+            db_snapshot.agents,
+            query_text,
+        );
+        render_contacts_snapshot_panel(
+            frame,
+            a_bottom,
+            &db_snapshot.contacts_list,
+            db_snapshot.contact_links,
+            query_text,
+        );
         render_projects_snapshot_panel(
             frame,
             b_top,
@@ -2893,8 +2931,20 @@ fn render_insight_rail(
         let (b_top, b_bottom) = split_height_ratio_with_gap(col_b, 0.5, 1);
         let (c_top, c_bottom) = split_height_ratio_with_gap(col_c, 0.5, 1);
 
-        render_agents_snapshot_panel(frame, a_top, &db_snapshot.agents_list, query_text);
-        render_contacts_snapshot_panel(frame, a_bottom, &db_snapshot.contacts_list, query_text);
+        render_agents_snapshot_panel(
+            frame,
+            a_top,
+            &db_snapshot.agents_list,
+            db_snapshot.agents,
+            query_text,
+        );
+        render_contacts_snapshot_panel(
+            frame,
+            a_bottom,
+            &db_snapshot.contacts_list,
+            db_snapshot.contact_links,
+            query_text,
+        );
         render_projects_snapshot_panel(
             frame,
             b_top,
@@ -2923,7 +2973,13 @@ fn render_insight_rail(
 
     if remaining.width < 50 || remaining.height < 12 {
         let (top, bottom) = split_height_ratio_with_gap(remaining, 0.5, 1);
-        render_agents_snapshot_panel(frame, top, &db_snapshot.agents_list, query_text);
+        render_agents_snapshot_panel(
+            frame,
+            top,
+            &db_snapshot.agents_list,
+            db_snapshot.agents,
+            query_text,
+        );
         render_reservation_watch_panel(
             frame,
             bottom,
@@ -2938,7 +2994,13 @@ fn render_insight_rail(
     let (top_left, top_right) = split_width_ratio_with_gap(top_row, 0.54, 1);
     let (bottom_left, bottom_right) = split_width_ratio_with_gap(bottom_row, 0.54, 1);
 
-    render_agents_snapshot_panel(frame, top_left, &db_snapshot.agents_list, query_text);
+    render_agents_snapshot_panel(
+        frame,
+        top_left,
+        &db_snapshot.agents_list,
+        db_snapshot.agents,
+        query_text,
+    );
     render_projects_snapshot_panel(
         frame,
         top_right,
@@ -3239,6 +3301,7 @@ fn render_agents_snapshot_panel(
     frame: &mut Frame<'_>,
     area: Rect,
     agents: &[AgentSummary],
+    total_agents: u64,
     query_text: &str,
 ) {
     if area.width < 18 || area.height < 3 {
@@ -3271,7 +3334,7 @@ fn render_agents_snapshot_panel(
     }
 
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let title = format!("Agents · {}", rows.len());
+    let title = panel_title_with_total("Agents", rows.len(), total_agents);
     let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
@@ -3348,6 +3411,7 @@ fn render_contacts_snapshot_panel(
     frame: &mut Frame<'_>,
     area: Rect,
     contacts: &[ContactSummary],
+    total_contacts: u64,
     query_text: &str,
 ) {
     if area.width < 18 || area.height < 3 {
@@ -3382,7 +3446,10 @@ fn render_contacts_snapshot_panel(
         .count();
 
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let title = format!("Contacts · {} (p:{pending})", rows.len());
+    let title = format!(
+        "{} (p:{pending})",
+        panel_title_with_total("Contacts", rows.len(), total_contacts)
+    );
     let block = Block::bordered()
         .title(&title)
         .border_type(BorderType::Rounded)
@@ -7315,6 +7382,46 @@ mod tests {
         screen.tick(STAT_REFRESH_TICKS * 2, &state);
         assert_eq!(screen.throughput_history.len(), 2);
         assert!((screen.throughput_history[1] - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn dashboard_summary_band_falls_back_to_live_state_before_stat_tick() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let screen = DashboardScreen::new();
+
+        state.update_db_stats(DbStatSnapshot {
+            messages: 6578,
+            ack_pending: 573,
+            agents: 4054,
+            contact_links: 37,
+            projects: 2535,
+            timestamp_micros: 200,
+            ..Default::default()
+        });
+        state.record_request(200, 9);
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(200, 50, &mut pool);
+        screen.view(&mut frame, Rect::new(0, 0, 200, 50), &state);
+        let text = frame_text(&frame);
+
+        assert!(
+            text.contains("6578"),
+            "summary band should show live message count"
+        );
+        assert!(
+            text.contains("573"),
+            "summary band should show live ack count"
+        );
+        assert!(
+            text.contains("4054"),
+            "summary band should show live agent count"
+        );
+        assert!(
+            text.contains("2535"),
+            "summary band should show live project count"
+        );
     }
 
     #[test]

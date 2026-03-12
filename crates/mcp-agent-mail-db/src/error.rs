@@ -177,7 +177,9 @@ pub fn is_lock_error(msg: &str) -> bool {
 pub fn is_mvcc_conflict(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     lower.contains("write conflict on page")
+        || lower.contains("snapshot conflict on pages")
         || lower.contains("serialization failure")
+        || lower.contains("busy_snapshot")
         || lower.contains("snapshot too old")
 }
 
@@ -426,6 +428,9 @@ mod tests {
     fn mvcc_conflict_patterns() {
         assert!(is_mvcc_conflict(
             "write conflict on page 42: held by transaction 7"
+        ));
+        assert!(is_mvcc_conflict(
+            "database is busy (snapshot conflict on pages: 42)"
         ));
         assert!(is_mvcc_conflict(
             "serialization failure: page 5 was modified after snapshot"

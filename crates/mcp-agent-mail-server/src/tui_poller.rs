@@ -968,23 +968,34 @@ fn parse_project_summary_rows(
 ) -> Vec<ProjectSummary> {
     rows.into_iter()
         .filter_map(|row| {
-            let project_id = row.get_named::<i64>("id").ok()?;
+            let project_id = row
+                .get_named::<i64>("id")
+                .ok()
+                .or_else(|| row.get_as::<i64>(0).ok())?;
             Some(ProjectSummary {
                 id: project_id,
-                slug: row.get_named::<String>("slug").ok()?,
-                human_key: row.get_named::<String>("human_key").ok()?,
+                slug: row
+                    .get_named::<String>("slug")
+                    .ok()
+                    .or_else(|| row.get_as::<String>(1).ok())?,
+                human_key: row
+                    .get_named::<String>("human_key")
+                    .ok()
+                    .or_else(|| row.get_as::<String>(2).ok())?,
                 agent_count: row
                     .get_named::<i64>("agent_count")
                     .ok()
+                    .or_else(|| row.get_as::<i64>(4).ok())
                     .and_then(|v| u64::try_from(v).ok())
                     .unwrap_or(0),
                 message_count: row
                     .get_named::<i64>("message_count")
                     .ok()
+                    .or_else(|| row.get_as::<i64>(5).ok())
                     .and_then(|v| u64::try_from(v).ok())
                     .unwrap_or(0),
                 reservation_count: reservation_counts.get(&project_id).copied().unwrap_or(0),
-                created_at: parse_raw_ts(&row, "created_at"),
+                created_at: parse_raw_ts_with_index(&row, "created_at", 3),
             })
         })
         .collect()
@@ -1088,6 +1099,21 @@ pub(crate) fn parse_raw_ts(row: &Row, col: &str) -> i64 {
         Some(Value::Float(v)) => parse_float_ts(f64::from(*v)),
         Some(Value::Decimal(s) | Value::Text(s)) => parse_text_timestamp(s),
         _ => 0,
+    }
+}
+
+fn parse_raw_ts_with_index(row: &Row, col: &str, index: usize) -> i64 {
+    match row.get_by_name(col) {
+        Some(_) => parse_raw_ts(row, col),
+        None => row
+            .get_as::<i64>(index)
+            .ok()
+            .or_else(|| {
+                row.get_as::<String>(index)
+                    .ok()
+                    .map(|value| parse_text_timestamp(&value))
+            })
+            .unwrap_or(0),
     }
 }
 
@@ -3717,6 +3743,42 @@ mod tests {
         assert_eq!(projects[0].human_key, "/tmp/proj");
         assert_eq!(projects[0].agent_count, 0);
         assert_eq!(projects[0].message_count, 0);
+    }
+
+    #[test]
+    fn parse_project_summary_rows_falls_back_to_column_positions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_projects_positional_parse.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (9, 'proj', '/tmp/proj', 123)",
+            &[],
+        )
+        .expect("insert project");
+
+        let rows = conn
+            .query_sync(
+                "SELECT id AS project_id, slug AS project_slug, human_key AS project_key, \
+                        created_at AS created_micros, 2 AS agents_total, 3 AS messages_total \
+                 FROM projects",
+                &[],
+            )
+            .expect("query rows");
+
+        let projects = parse_project_summary_rows(rows, &HashMap::new());
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].id, 9);
+        assert_eq!(projects[0].slug, "proj");
+        assert_eq!(projects[0].human_key, "/tmp/proj");
+        assert_eq!(projects[0].created_at, 123);
+        assert_eq!(projects[0].agent_count, 2);
+        assert_eq!(projects[0].message_count, 3);
     }
 
     #[test]
