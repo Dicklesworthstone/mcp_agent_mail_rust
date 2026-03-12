@@ -989,8 +989,60 @@ fn fetch_projects_list_with_reservation_counts(
                 error = ?err,
                 "tui_poller.fetch_projects_list aggregate query failed; falling back to minimal project rows"
             );
-            fetch_projects_list_minimal(conn, reservation_counts)
+            let mut projects = fetch_projects_list_minimal(conn, reservation_counts);
+            hydrate_project_summary_counts(conn, &mut projects);
+            projects
         }
+    }
+}
+
+pub(crate) fn fetch_project_count_map(
+    conn: &DbConn,
+    table: &str,
+    project_ids: &[i64],
+) -> HashMap<i64, u64> {
+    if project_ids.is_empty() {
+        return HashMap::new();
+    }
+    let ids = project_ids
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT project_id, COUNT(*) AS cnt \
+         FROM {table} \
+         WHERE project_id IN ({ids}) \
+         GROUP BY project_id"
+    );
+    conn.query_sync(&sql, &[])
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    Some((
+                        row.get_named::<i64>("project_id")
+                            .ok()
+                            .or_else(|| row.get_as::<i64>(0).ok())?,
+                        row.get_named::<i64>("cnt")
+                            .ok()
+                            .or_else(|| row.get_as::<i64>(1).ok())
+                            .and_then(|count| u64::try_from(count.max(0)).ok())
+                            .unwrap_or(0),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn hydrate_project_summary_counts(conn: &DbConn, projects: &mut [ProjectSummary]) {
+    let project_ids: Vec<i64> = projects.iter().map(|project| project.id).collect();
+    let agent_counts = fetch_project_count_map(conn, "agents", &project_ids);
+    let message_counts = fetch_project_count_map(conn, "messages", &project_ids);
+    for project in projects {
+        project.agent_count = agent_counts.get(&project.id).copied().unwrap_or(0);
+        project.message_count = message_counts.get(&project.id).copied().unwrap_or(0);
     }
 }
 
@@ -1046,7 +1098,66 @@ fn fetch_projects_list_minimal(
     );
     conn.query_sync(&sql, &[])
         .ok()
-        .map(|rows| parse_project_summary_rows(rows, reservation_counts))
+        .map(|rows| {
+            let mut projects = parse_project_summary_rows(rows, reservation_counts);
+            backfill_project_group_counts(conn, &mut projects);
+            projects
+        })
+        .unwrap_or_default()
+}
+
+fn backfill_project_group_counts(conn: &DbConn, projects: &mut [ProjectSummary]) {
+    let project_ids: Vec<i64> = projects.iter().map(|project| project.id).collect();
+    if project_ids.is_empty() {
+        return;
+    }
+
+    let agent_counts = fetch_project_group_count_map(conn, "agents", &project_ids);
+    let message_counts = fetch_project_group_count_map(conn, "messages", &project_ids);
+    for project in projects {
+        project.agent_count = agent_counts.get(&project.id).copied().unwrap_or(0);
+        project.message_count = message_counts.get(&project.id).copied().unwrap_or(0);
+    }
+}
+
+fn fetch_project_group_count_map(
+    conn: &DbConn,
+    table: &str,
+    project_ids: &[i64],
+) -> HashMap<i64, u64> {
+    if project_ids.is_empty() {
+        return HashMap::new();
+    }
+
+    let ids = project_ids
+        .iter()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT project_id, COUNT(*) AS cnt \
+         FROM {table} \
+         WHERE project_id IN ({ids}) \
+         GROUP BY project_id"
+    );
+    conn.query_sync(&sql, &[])
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    Some((
+                        row.get_named::<i64>("project_id")
+                            .ok()
+                            .or_else(|| row.get_as::<i64>(0).ok())?,
+                        row.get_named::<i64>("cnt")
+                            .ok()
+                            .or_else(|| row.get_as::<i64>(1).ok())
+                            .and_then(|count| u64::try_from(count.max(0)).ok())
+                            .unwrap_or(0),
+                    ))
+                })
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -3835,18 +3946,71 @@ mod tests {
         )
         .expect("create projects");
         conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, program TEXT, last_active_ts INTEGER)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
             "INSERT INTO projects (id, slug, human_key, created_at) VALUES (7, 'proj', '/tmp/proj', 100)",
             &[],
         )
         .expect("insert project");
+        conn.execute_sync(
+            "INSERT INTO agents (project_id, name, program, last_active_ts) VALUES (7, 'A', 'x', 0), (7, 'B', 'y', 0)",
+            &[],
+        )
+        .expect("insert agents");
 
         let projects = fetch_projects_list(&conn);
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].id, 7);
         assert_eq!(projects[0].slug, "proj");
         assert_eq!(projects[0].human_key, "/tmp/proj");
-        assert_eq!(projects[0].agent_count, 0);
+        assert_eq!(projects[0].agent_count, 2);
         assert_eq!(projects[0].message_count, 0);
+    }
+
+    #[test]
+    fn fetch_projects_list_minimal_backfills_counts_with_group_queries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("test_projects_minimal_count_backfill.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open");
+
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT, program TEXT, last_active_ts INTEGER)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL)",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (7, 'proj', '/tmp/proj', 100)",
+            &[],
+        )
+        .expect("insert project");
+        conn.execute_sync(
+            "INSERT INTO agents (project_id, name, program, last_active_ts) VALUES (7, 'A', 'x', 0), (7, 'B', 'y', 0)",
+            &[],
+        )
+        .expect("insert agents");
+        conn.execute_sync(
+            "INSERT INTO messages (project_id) VALUES (7), (7), (7)",
+            &[],
+        )
+        .expect("insert messages");
+
+        let projects = fetch_projects_list_minimal(&conn, &HashMap::new());
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].agent_count, 2);
+        assert_eq!(projects[0].message_count, 3);
     }
 
     #[test]

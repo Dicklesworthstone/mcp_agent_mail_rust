@@ -12,6 +12,8 @@ use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
+use mcp_agent_mail_db::DbConn;
+use mcp_agent_mail_db::pool::DbPoolConfig;
 
 use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_events::MailEvent;
@@ -141,6 +143,53 @@ fn sanitize_diagnostic_value(value: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn recover_agent_message_counts_from_sqlite(database_url: &str) -> Option<HashMap<String, u64>> {
+    let cfg = DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let path = cfg.sqlite_path().ok()?;
+    let conn = crate::open_best_effort_sync_db_connection(&path).ok()?;
+    Some(fetch_agent_message_count_map(&conn))
+}
+
+fn fetch_agent_message_count_map(conn: &DbConn) -> HashMap<String, u64> {
+    conn.query_sync(
+        "WITH agent_messages AS ( \
+           SELECT a.id AS agent_id, m.id AS message_id \
+           FROM agents a \
+           JOIN messages m ON m.sender_id = a.id \
+           UNION \
+           SELECT a.id AS agent_id, mr.message_id AS message_id \
+           FROM agents a \
+           JOIN message_recipients mr ON mr.agent_id = a.id \
+         ) \
+         SELECT a.name, COUNT(DISTINCT am.message_id) AS cnt \
+         FROM agents a \
+         LEFT JOIN agent_messages am ON am.agent_id = a.id \
+         GROUP BY a.id, a.name",
+        &[],
+    )
+    .ok()
+    .map(|rows| {
+        rows.into_iter()
+            .filter_map(|row| {
+                Some((
+                    row.get_named::<String>("name")
+                        .ok()
+                        .or_else(|| row.get_as::<String>(0).ok())?,
+                    row.get_named::<i64>("cnt")
+                        .ok()
+                        .or_else(|| row.get_as::<i64>(1).ok())
+                        .and_then(|count| u64::try_from(count.max(0)).ok())
+                        .unwrap_or(0),
+                ))
+            })
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Truth assertion: when the DB reports non-zero agents but the rendered
@@ -299,21 +348,31 @@ impl AgentsScreen {
 
     fn rebuild_from_state(&mut self, state: &TuiSharedState) {
         let db = state.db_stats_snapshot().unwrap_or_default();
+        let cfg = state.config_snapshot();
         let total_rows = db.agents;
         let raw_count = u64::try_from(db.agents_list.len()).unwrap_or(u64::MAX);
         let previous_selection = self.table_state.selected;
         let previous_selected_name = previous_selection
             .and_then(|index| self.agents.get(index))
             .map(|agent| agent.name.clone());
+        let historical_msg_counts = if total_rows > 0 && db.messages > 0 {
+            recover_agent_message_counts_from_sqlite(&cfg.raw_database_url).unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
         let mut rows: Vec<AgentRow> = db
             .agents_list
             .iter()
-            .map(|a| AgentRow {
-                name: a.name.clone(),
-                program: a.program.clone(),
-                model: self.model_names.get(&a.name).cloned().unwrap_or_default(),
-                last_active_ts: a.last_active_ts,
-                message_count: self.msg_counts.get(&a.name).copied().unwrap_or(0),
+            .map(|a| {
+                let recent_count = self.msg_counts.get(&a.name).copied().unwrap_or(0);
+                let historical_count = historical_msg_counts.get(&a.name).copied().unwrap_or(0);
+                AgentRow {
+                    name: a.name.clone(),
+                    program: a.program.clone(),
+                    model: self.model_names.get(&a.name).cloned().unwrap_or_default(),
+                    last_active_ts: a.last_active_ts,
+                    message_count: historical_count.max(recent_count),
+                }
             })
             .collect();
 
@@ -369,7 +428,6 @@ impl AgentsScreen {
         // Detect when list was capped by poller LIMIT (total_rows > list length).
         let list_capped = total_rows > raw_count;
 
-        let cfg = state.config_snapshot();
         let transport_mode = cfg.transport_mode().to_string();
         state.push_screen_diagnostic(ScreenDiagnosticSnapshot {
             screen: "agents".to_string(),
@@ -395,7 +453,11 @@ impl AgentsScreen {
 
         // Cache derived data used by multiple render methods.
         self.cached_status_counts = self.compute_status_counts();
-        self.cached_total_msgs = self.msg_counts.values().sum();
+        self.cached_total_msgs = if db.messages > 0 {
+            db.messages
+        } else {
+            self.agents.iter().map(|agent| agent.message_count).sum()
+        };
         self.sparkline_dirty = true;
 
         self.table_state.selected = previous_selected_name
@@ -419,7 +481,6 @@ impl AgentsScreen {
             match event {
                 MailEvent::MessageSent { from, .. } => {
                     *self.msg_counts.entry(from.clone()).or_insert(0) += 1;
-                    self.cached_total_msgs = self.cached_total_msgs.saturating_add(1);
                     self.total_msgs_this_tick += 1;
                     if !self.reduced_motion {
                         self.message_flash_ticks
@@ -1310,9 +1371,17 @@ fn render_kv_lines(
 mod tests {
     use super::*;
     use mcp_agent_mail_core::Config;
+    use tempfile::tempdir;
 
     fn test_state() -> std::sync::Arc<TuiSharedState> {
         TuiSharedState::new(&Config::default())
+    }
+
+    fn set_database_url(state: &std::sync::Arc<TuiSharedState>, database_url: String) {
+        let mut snapshot = state.config_snapshot();
+        snapshot.database_url = database_url.clone();
+        snapshot.raw_database_url = database_url;
+        state.update_config_snapshot(snapshot);
     }
 
     #[test]
@@ -2135,6 +2204,125 @@ mod tests {
         screen.msg_counts.insert("RedFox".to_string(), 42);
         screen.rebuild_from_state(&state);
         assert_eq!(screen.cached_total_msgs, 42);
+    }
+
+    #[test]
+    fn fetch_agent_message_count_map_counts_sent_and_received_messages() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("agents-message-counts.sqlite3");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open sqlite");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT NOT NULL, program TEXT NOT NULL, last_active_ts INTEGER NOT NULL)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, sender_id INTEGER NOT NULL)",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL)",
+            &[],
+        )
+        .expect("create message_recipients");
+        conn.execute_sync(
+            "INSERT INTO agents (id, name, program, last_active_ts) VALUES \
+             (1, 'RedFox', 'claude-code', 100), \
+             (2, 'BlueLake', 'codex-cli', 200)",
+            &[],
+        )
+        .expect("insert agents");
+        conn.execute_sync(
+            "INSERT INTO messages (id, sender_id) VALUES (10, 1), (11, 1), (12, 2)",
+            &[],
+        )
+        .expect("insert messages");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES \
+             (10, 2, 'to'), \
+             (11, 2, 'to'), \
+             (12, 1, 'to')",
+            &[],
+        )
+        .expect("insert recipients");
+
+        let counts = fetch_agent_message_count_map(&conn);
+        assert_eq!(counts.get("RedFox"), Some(&3));
+        assert_eq!(counts.get("BlueLake"), Some(&3));
+    }
+
+    #[test]
+    fn rebuild_uses_sqlite_message_counts_when_event_counts_are_empty() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("agents-rebuild-message-counts.sqlite3");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open sqlite");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT NOT NULL, program TEXT NOT NULL, last_active_ts INTEGER NOT NULL)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, sender_id INTEGER NOT NULL)",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL)",
+            &[],
+        )
+        .expect("create message_recipients");
+        conn.execute_sync(
+            "INSERT INTO agents (id, name, program, last_active_ts) VALUES \
+             (1, 'RedFox', 'claude-code', 100), \
+             (2, 'BlueLake', 'codex-cli', 200)",
+            &[],
+        )
+        .expect("insert agents");
+        conn.execute_sync(
+            "INSERT INTO messages (id, sender_id) VALUES (10, 1), (11, 1), (12, 2), (13, 1)",
+            &[],
+        )
+        .expect("insert messages");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES \
+             (10, 2, 'to'), \
+             (11, 2, 'to'), \
+             (12, 1, 'to'), \
+             (13, 2, 'cc')",
+            &[],
+        )
+        .expect("insert recipients");
+
+        let state = test_state();
+        set_database_url(&state, format!("sqlite://{}", db_path.to_string_lossy()));
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            agents: 2,
+            messages: 4,
+            agents_list: vec![
+                crate::tui_events::AgentSummary {
+                    name: "RedFox".to_string(),
+                    program: "claude-code".to_string(),
+                    last_active_ts: 100,
+                },
+                crate::tui_events::AgentSummary {
+                    name: "BlueLake".to_string(),
+                    program: "codex-cli".to_string(),
+                    last_active_ts: 200,
+                },
+            ],
+            ..Default::default()
+        });
+
+        let mut screen = AgentsScreen::new();
+        screen.cached_now_ts = chrono::Utc::now().timestamp_micros();
+        screen.rebuild_from_state(&state);
+
+        assert_eq!(screen.cached_total_msgs, 4);
+        assert_eq!(screen.agents[0].name, "BlueLake");
+        assert_eq!(screen.agents[0].message_count, 4);
+        assert_eq!(screen.agents[1].name, "RedFox");
+        assert_eq!(screen.agents[1].message_count, 4);
     }
 
     #[test]

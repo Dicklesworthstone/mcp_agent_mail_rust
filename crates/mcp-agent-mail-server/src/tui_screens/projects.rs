@@ -79,8 +79,9 @@ fn recover_projects_list_from_sqlite(database_url: &str) -> Option<Vec<ProjectSu
     }
 
     let project_ids: Vec<i64> = projects.iter().map(|project| project.id).collect();
-    let agent_counts = fetch_project_count_map(&conn, "agents", &project_ids);
-    let message_counts = fetch_project_count_map(&conn, "messages", &project_ids);
+    let agent_counts = crate::tui_poller::fetch_project_count_map(&conn, "agents", &project_ids);
+    let message_counts =
+        crate::tui_poller::fetch_project_count_map(&conn, "messages", &project_ids);
     let reservation_counts = crate::tui_poller::fetch_active_reservation_counts_by_project(
         &conn,
         chrono::Utc::now().timestamp_micros(),
@@ -161,42 +162,6 @@ fn parse_recovered_created_at_text(value: &str) -> i64 {
         .unwrap_or(0)
 }
 
-fn fetch_project_count_map(conn: &DbConn, table: &str, project_ids: &[i64]) -> HashMap<i64, u64> {
-    if project_ids.is_empty() {
-        return HashMap::new();
-    }
-    let ids = project_ids
-        .iter()
-        .map(std::string::ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT project_id, COUNT(*) AS cnt \
-         FROM {table} \
-         WHERE project_id IN ({ids}) \
-         GROUP BY project_id"
-    );
-    conn.query_sync(&sql, &[])
-        .ok()
-        .map(|rows| {
-            rows.into_iter()
-                .filter_map(|row| {
-                    Some((
-                        row.get_named::<i64>("project_id")
-                            .ok()
-                            .or_else(|| row.get_as::<i64>(0).ok())?,
-                        row.get_named::<i64>("cnt")
-                            .ok()
-                            .or_else(|| row.get_as::<i64>(1).ok())
-                            .and_then(|count| u64::try_from(count.max(0)).ok())
-                            .unwrap_or(0),
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 #[allow(clippy::struct_excessive_bools)]
 pub struct ProjectsScreen {
     table_state: TableState,
@@ -256,8 +221,13 @@ impl ProjectsScreen {
         let total_rows = db.projects;
         let raw_count = u64::try_from(db.projects_list.len()).unwrap_or(u64::MAX);
         let mut rows: Vec<ProjectSummary> = db.projects_list;
+        let zero_only_counts = !rows.is_empty()
+            && ((db.agents > 0 && rows.iter().all(|project| project.agent_count == 0))
+                || (db.messages > 0 && rows.iter().all(|project| project.message_count == 0))
+                || (db.file_reservations > 0
+                    && rows.iter().all(|project| project.reservation_count == 0)));
         let detail_recovered = if total_rows > 0
-            && rows.is_empty()
+            && (rows.is_empty() || zero_only_counts)
             && let Some(recovered) = recover_projects_list_from_sqlite(&cfg.raw_database_url)
             && !recovered.is_empty()
         {
@@ -1840,6 +1810,94 @@ mod tests {
             diag.query_params.contains("recovered=true"),
             "diagnostic should record direct sqlite recovery"
         );
+    }
+
+    #[test]
+    fn rebuild_recovers_zero_only_project_counts_from_sqlite() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("projects-zero-count-recovery.sqlite3");
+        let db_path_str = db_path.display().to_string();
+        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open sqlite");
+        conn.execute_raw(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+        )
+        .expect("create projects");
+        conn.execute_raw(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                program TEXT NOT NULL,
+                last_active_ts INTEGER NOT NULL
+            )",
+        )
+        .expect("create agents");
+        conn.execute_raw(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL
+            )",
+        )
+        .expect("create messages");
+        conn.execute_raw(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                released_ts INTEGER,
+                expires_ts INTEGER NOT NULL
+            )",
+        )
+        .expect("create reservations");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'demo', '/tmp/demo', 100)",
+        )
+        .expect("insert project");
+        conn.execute_raw(
+            "INSERT INTO agents (project_id, name, program, last_active_ts)
+             VALUES (1, 'BlueLake', 'codex-cli', 10), (1, 'RedFox', 'claude-code', 20)",
+        )
+        .expect("insert agents");
+        conn.execute_raw(
+            "INSERT INTO messages (project_id, sender_id) VALUES (1, 1), (1, 1), (1, 2)",
+        )
+        .expect("insert messages");
+        conn.execute_raw(
+            "INSERT INTO file_reservations (project_id, released_ts, expires_ts)
+             VALUES (1, NULL, 4102444800000000)",
+        )
+        .expect("insert reservation");
+
+        let state = test_state();
+        set_database_url(&state, format!("sqlite:///{db_path_str}"));
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 1,
+            agents: 2,
+            messages: 3,
+            file_reservations: 1,
+            projects_list: vec![ProjectSummary {
+                id: 1,
+                slug: "demo".into(),
+                human_key: "/tmp/demo".into(),
+                created_at: 100,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let mut screen = ProjectsScreen::new();
+        screen.rebuild_from_state(&state);
+
+        assert_eq!(screen.projects.len(), 1);
+        assert_eq!(screen.projects[0].agent_count, 2);
+        assert_eq!(screen.projects[0].message_count, 3);
+        assert_eq!(screen.projects[0].reservation_count, 1);
     }
 
     // ── B8: DB context binding guardrail regression tests ─────────────

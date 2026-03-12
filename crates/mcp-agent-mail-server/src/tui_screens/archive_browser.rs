@@ -297,6 +297,37 @@ impl ArchiveBrowserScreen {
             .map(|entry| entry.rel_path.clone())
     }
 
+    fn choose_archive_project_slug(
+        projects_root: &Path,
+        selected_project: Option<&str>,
+        projects: &[crate::tui_events::ProjectSummary],
+    ) -> Option<String> {
+        let archive_exists = |slug: &str| projects_root.join(slug).is_dir();
+
+        if let Some(slug) = selected_project.filter(|slug| archive_exists(slug)) {
+            return Some(slug.to_string());
+        }
+
+        if let Some(slug) = projects
+            .iter()
+            .map(|project| project.slug.as_str())
+            .find(|slug| archive_exists(slug))
+        {
+            return Some(slug.to_string());
+        }
+
+        let mut on_disk_projects = std::fs::read_dir(projects_root)
+            .ok()?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                entry.file_type().ok()?.is_dir().then_some(entry)
+            })
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect::<Vec<_>>();
+        on_disk_projects.sort();
+        on_disk_projects.into_iter().next()
+    }
+
     /// Rebuild the entry list from the archive on disk.
     fn refresh_entries(&mut self, state: &TuiSharedState) {
         let config = state.config_snapshot();
@@ -308,12 +339,13 @@ impl ArchiveBrowserScreen {
             return;
         }
 
-        // Find the first project's archive directory.
+        let projects_root = PathBuf::from(&config.storage_root).join("projects");
         let db = state.db_stats_snapshot().unwrap_or_default();
-        let project_slug = self
-            .selected_project
-            .clone()
-            .or_else(|| db.projects_list.first().map(|p| p.slug.clone()));
+        let project_slug = Self::choose_archive_project_slug(
+            &projects_root,
+            self.selected_project.as_deref(),
+            &db.projects_list,
+        );
 
         let Some(slug) = project_slug else {
             self.archive_root = None;
@@ -328,9 +360,7 @@ impl ArchiveBrowserScreen {
         let selected_rel_path = self.selected_rel_path();
         let had_preview = self.preview_content.is_some() || !self.preview_path.is_empty();
 
-        let archive_path = PathBuf::from(&config.storage_root)
-            .join("projects")
-            .join(&slug);
+        let archive_path = projects_root.join(&slug);
         if !archive_path.is_dir() {
             self.archive_root = None;
             self.entries.clear();
@@ -1377,6 +1407,53 @@ mod tests {
                 .preview_content
                 .as_deref()
                 .is_some_and(|content| content.contains("RedFox"))
+        );
+    }
+
+    #[test]
+    fn refresh_entries_falls_back_to_existing_archive_when_selected_or_first_slug_is_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let archive_root = tmp.path().join("projects").join("real-proj");
+        std::fs::create_dir_all(archive_root.join("agents/BlueLake")).expect("create archive");
+        std::fs::write(
+            archive_root.join("agents/BlueLake/profile.json"),
+            "{\"name\":\"BlueLake\"}",
+        )
+        .expect("write profile");
+
+        let config = mcp_agent_mail_core::Config {
+            storage_root: tmp.path().to_path_buf(),
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let state = TuiSharedState::new(&config);
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 2,
+            projects_list: vec![
+                crate::tui_events::ProjectSummary {
+                    id: 1,
+                    slug: "missing-proj".into(),
+                    ..Default::default()
+                },
+                crate::tui_events::ProjectSummary {
+                    id: 2,
+                    slug: "real-proj".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        let mut screen = ArchiveBrowserScreen::new();
+        screen.selected_project = Some("stale-proj".into());
+        screen.refresh_entries(&state);
+
+        assert_eq!(screen.selected_project.as_deref(), Some("real-proj"));
+        assert_eq!(screen.archive_root.as_deref(), Some(archive_root.as_path()));
+        assert!(
+            screen
+                .entries
+                .iter()
+                .any(|entry| entry.rel_path == Path::new("agents/BlueLake/profile.json"))
         );
     }
 
