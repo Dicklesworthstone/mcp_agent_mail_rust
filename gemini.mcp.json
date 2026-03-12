@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "mcp-agent-mail": {
-      "httpUrl": "http://127.0.0.1:8787/mcp/",
+      "httpUrl": "http://127.0.0.1:8788/mcp/",
       "headers": {
         "Authorization": "Bearer codexauditlongtoken"
       }
