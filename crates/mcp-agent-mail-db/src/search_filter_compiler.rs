@@ -215,6 +215,7 @@ fn date_range_filter(
 #[must_use]
 pub fn has_active_filters(filter: &SearchFilter) -> bool {
     filter.sender.is_some()
+        || filter.agent.is_some()
         || filter.project_id.is_some()
         || filter.thread_id.is_some()
         || filter.doc_kind.is_some()
@@ -230,6 +231,9 @@ pub fn has_active_filters(filter: &SearchFilter) -> bool {
 pub fn active_filter_count(filter: &SearchFilter) -> usize {
     let mut count = 0;
     if filter.sender.is_some() {
+        count += 1;
+    }
+    if filter.agent.is_some() {
         count += 1;
     }
     if filter.project_id.is_some() {
@@ -285,6 +289,15 @@ mod tests {
     }
 
     #[test]
+    fn has_active_filters_agent() {
+        let filter = SearchFilter {
+            agent: Some("BlueLake".to_string()),
+            ..SearchFilter::default()
+        };
+        assert!(has_active_filters(&filter));
+    }
+
+    #[test]
     fn has_active_filters_importance_any_is_inactive() {
         let filter = SearchFilter {
             importance: Some(ImportanceFilter::Any),
@@ -331,6 +344,15 @@ mod tests {
             ..SearchFilter::default()
         };
         assert_eq!(active_filter_count(&filter), 0);
+    }
+
+    #[test]
+    fn active_filter_count_agent_only() {
+        let filter = SearchFilter {
+            agent: Some("BlueLake".to_string()),
+            ..SearchFilter::default()
+        };
+        assert_eq!(active_filter_count(&filter), 1);
     }
 
     // ── Individual field checks for has_active_filters ──

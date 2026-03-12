@@ -583,7 +583,7 @@ thread_local! {
     static NORM_CACHE: RefCell<HashMap<String, String>> = RefCell::new(HashMap::with_capacity(32));
 }
 
-/// Normalize a valid agent name to PascalCase (e.g. "bluedog" -> "BlueDog").
+/// Normalize a valid agent name to `PascalCase` (e.g. `"bluedog"` -> `"BlueDog"`).
 ///
 /// Returns `None` if the name is not a valid adjective+noun combination.
 #[must_use]

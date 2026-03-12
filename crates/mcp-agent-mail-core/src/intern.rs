@@ -235,12 +235,16 @@ pub fn intern(s: &str) -> InternedStr {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // Re-check under write lock to avoid double-insertion.
-    if let Some(existing) = table.get(s) {
-        InternedStr(Arc::clone(existing))
-    } else {
-        let arc: Arc<str> = Arc::from(s);
-        table.insert(Arc::clone(&arc));
-        InternedStr(arc)
+    match table.get(s).cloned() {
+        Some(existing) => {
+            drop(table);
+            InternedStr(existing)
+        }
+        None => {
+            let arc: Arc<str> = Arc::from(s);
+            table.insert(Arc::clone(&arc));
+            InternedStr(arc)
+        }
     }
 }
 

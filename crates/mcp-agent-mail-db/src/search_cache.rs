@@ -101,6 +101,10 @@ fn hash_filter(filter: &SearchFilter) -> u64 {
         "sender".hash(&mut hasher);
         sender.hash(&mut hasher);
     }
+    if let Some(ref agent) = filter.agent {
+        "agent".hash(&mut hasher);
+        agent.hash(&mut hasher);
+    }
     if let Some(project_id) = filter.project_id {
         "project_id".hash(&mut hasher);
         project_id.hash(&mut hasher);
@@ -1175,6 +1179,23 @@ mod tests {
             hash_filter(&filter_sender),
             hash_filter(&filter_thread),
             "same value in different fields should produce different hashes"
+        );
+    }
+
+    #[test]
+    fn test_filter_hash_agent_differs_from_sender() {
+        let filter_sender = SearchFilter {
+            sender: Some("alice".to_string()),
+            ..Default::default()
+        };
+        let filter_agent = SearchFilter {
+            agent: Some("alice".to_string()),
+            ..Default::default()
+        };
+        assert_ne!(
+            hash_filter(&filter_sender),
+            hash_filter(&filter_agent),
+            "sender and agent filters must not share a cache hash"
         );
     }
 

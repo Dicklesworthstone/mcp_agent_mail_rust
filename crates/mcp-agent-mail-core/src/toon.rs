@@ -605,9 +605,9 @@ pub fn run_encoder(config: &Config, json_payload: &str) -> Result<EncoderSuccess
         .map_err(|e| EncoderError::OsError(format!("TOON encoder failed: {e}")))?;
 
     // Join stdin thread to catch write errors
-    if let Err(e) = stdin_thread.join().unwrap_or_else(|_| {
-        Err(std::io::Error::new(std::io::ErrorKind::Other, "stdin writer thread panicked"))
-    }) {
+    if let Err(e) =
+        stdin_thread.join().unwrap_or_else(|_| Err(std::io::Error::other("stdin writer thread panicked")))
+    {
         return Err(EncoderError::OsError(format!(
             "TOON encoder stdin write failed: {e}"
         )));

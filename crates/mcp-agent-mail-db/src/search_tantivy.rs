@@ -359,8 +359,18 @@ fn convert_query_to_filter(query: &SearchQuery) -> SearchFilter {
         DocKind::Project => Some(ScDocKind::Project),
     };
 
+    let (sender, agent) = if query.doc_kind == DocKind::Message {
+        match query.direction {
+            Some(crate::search_planner::Direction::Outbox) => (query.agent_name.clone(), None),
+            _ => (None, query.agent_name.clone()),
+        }
+    } else {
+        (None, None)
+    };
+
     SearchFilter {
-        sender: query.agent_name.clone(),
+        sender,
+        agent,
         project_id: query.project_id,
         date_range,
         importance,
@@ -751,6 +761,32 @@ mod tests {
         let outcome = backend.search(&query);
         assert_eq!(outcome.method, PlanMethod::FilterOnly);
         assert_eq!(outcome.results.len(), 1);
+    }
+
+    #[test]
+    fn convert_query_to_filter_uses_sender_for_outbox_agent_queries() {
+        let query = SearchQuery {
+            doc_kind: DocKind::Message,
+            direction: Some(crate::search_planner::Direction::Outbox),
+            agent_name: Some("BlueLake".to_string()),
+            ..Default::default()
+        };
+        let filter = convert_query_to_filter(&query);
+        assert_eq!(filter.sender.as_deref(), Some("BlueLake"));
+        assert!(filter.agent.is_none());
+    }
+
+    #[test]
+    fn convert_query_to_filter_preserves_agent_for_non_outbox_queries() {
+        let query = SearchQuery {
+            doc_kind: DocKind::Message,
+            direction: Some(crate::search_planner::Direction::Inbox),
+            agent_name: Some("BlueLake".to_string()),
+            ..Default::default()
+        };
+        let filter = convert_query_to_filter(&query);
+        assert!(filter.sender.is_none());
+        assert_eq!(filter.agent.as_deref(), Some("BlueLake"));
     }
 
     use std::collections::HashMap;

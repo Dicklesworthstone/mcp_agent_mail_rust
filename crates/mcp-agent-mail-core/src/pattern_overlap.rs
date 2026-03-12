@@ -95,10 +95,9 @@ impl PatternSegment {
 
     fn overlaps(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Recursive, _) | (_, Self::Recursive) => true,
             (Self::Literal(l1), Self::Literal(l2)) => l1 == l2,
             (Self::Glob(m), Self::Literal(l)) | (Self::Literal(l), Self::Glob(m)) => m.is_match(l),
-            (Self::Glob(_), Self::Glob(_)) => true, // conservative
+            (Self::Recursive, _) | (_, Self::Recursive) | (Self::Glob(_), Self::Glob(_)) => true,
         }
     }
 }
@@ -155,11 +154,10 @@ impl CompiledPattern {
                         .build()
                         .ok()
                         .map(|g| g.compile_matcher());
-                    if let Some(m) = m {
-                        PatternSegment::Glob(m)
-                    } else {
-                        PatternSegment::Literal(s.to_string())
-                    }
+                    m.map_or_else(
+                        || PatternSegment::Literal(s.to_string()),
+                        PatternSegment::Glob,
+                    )
                 } else {
                     PatternSegment::Literal(s.to_string())
                 }
