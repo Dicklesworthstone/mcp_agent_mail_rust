@@ -2522,8 +2522,8 @@ fn coalescer_commit_batch(
             s.avg_batch_size = (avg * 100.0).round() / 100.0;
 
             return CoalescerCommitOutcome {
-                committed_requests: u64::try_from(total).unwrap_or(u64::MAX),
-                committed_commits: u64::try_from(total).unwrap_or(u64::MAX),
+                committed_requests: u64::try_from(committed).unwrap_or(u64::MAX),
+                committed_commits: u64::try_from(committed).unwrap_or(u64::MAX),
                 failed_requests,
             };
         }
@@ -10556,6 +10556,48 @@ mod tests {
         assert_eq!(outcome.failed_requests.len(), 1);
         assert_eq!(outcome.failed_requests[0].message, request.message);
         assert_eq!(stats.lock().unwrap_or_else(|e| e.into_inner()).errors, 1);
+    }
+
+    #[test]
+    fn coalescer_commit_batch_tracks_partial_sequential_success_counts() {
+        let tmp = TempDir::new().unwrap();
+        Repository::init(tmp.path()).expect("init repository");
+        std::fs::write(tmp.path().join("ok.txt"), "ok\n").expect("write tracked file");
+
+        let stats = std::sync::Arc::new(std::sync::Mutex::new(CommitQueueStats::default()));
+        let batch_sizes =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+        let ok_request = CoalescerCommitFields {
+            enqueued_at: std::time::Instant::now(),
+            git_author_name: "Test".to_string(),
+            git_author_email: "test@example.com".to_string(),
+            message: "good commit".to_string(),
+            rel_paths: vec!["ok.txt".to_string()],
+        };
+        let failing_request = CoalescerCommitFields {
+            enqueued_at: std::time::Instant::now(),
+            git_author_name: "Test".to_string(),
+            git_author_email: "test@example.com".to_string(),
+            message: "broken commit".to_string(),
+            rel_paths: vec!["ok.txt".to_string(), "../missing.txt".to_string()],
+        };
+
+        let outcome = coalescer_commit_batch(
+            tmp.path(),
+            &[ok_request.clone(), failing_request.clone()],
+            &stats,
+            &batch_sizes,
+        );
+
+        assert_eq!(outcome.committed_requests, 1);
+        assert_eq!(outcome.committed_commits, 1);
+        assert_eq!(outcome.failed_requests.len(), 1);
+        assert_eq!(outcome.failed_requests[0].message, failing_request.message);
+
+        let stats = stats.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(stats.commits, 1);
+        assert_eq!(stats.batched, 1);
+        assert_eq!(stats.errors, 1);
     }
 
     #[test]

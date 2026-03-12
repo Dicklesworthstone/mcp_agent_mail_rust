@@ -320,7 +320,7 @@ pub fn evaluate_scope(result: &SearchResult, ctx: &ScopeContext) -> ScopeDecisio
     let sender_project_id = result.project_id.unwrap_or(0);
     let in_same_project = ctx.viewer_project_ids.contains(&sender_project_id);
 
-    if !in_same_project && !has_approved_contact_in_project(result, viewer, ctx) {
+    if !in_same_project && !has_approved_contact(result, viewer, ctx) {
         return ScopeDecision {
             verdict: ScopeVerdict::Deny,
             reason: ScopeReason::CrossProjectDenied,
@@ -385,21 +385,11 @@ fn has_approved_contact(
 ) -> bool {
     let sender_project_id = result.project_id.unwrap_or(0);
     if let Some(sender_id) = result.from_agent_id {
-        return ctx.approved_contacts.contains(&(sender_project_id, sender_id));
+        return ctx
+            .approved_contacts
+            .contains(&(sender_project_id, sender_id));
     }
     false
-}
-
-/// Check if viewer has any approved contact in the sender's project.
-fn has_approved_contact_in_project(
-    result: &SearchResult,
-    _viewer: ViewerIdentity,
-    ctx: &ScopeContext,
-) -> bool {
-    let sender_project_id = result.project_id.unwrap_or(0);
-    ctx.approved_contacts
-        .iter()
-        .any(|(pid, _)| *pid == sender_project_id)
 }
 
 /// Look up the sender's contact policy from the pre-fetched cache.
@@ -581,7 +571,12 @@ mod tests {
     use super::*;
     use crate::search_planner::DocKind;
 
-    fn make_message_result(id: i64, project_id: i64, from_agent: &str, sender_id: i64) -> SearchResult {
+    fn make_message_result(
+        id: i64,
+        project_id: i64,
+        from_agent: &str,
+        sender_id: i64,
+    ) -> SearchResult {
         SearchResult {
             doc_kind: DocKind::Message,
             id,
@@ -813,6 +808,21 @@ mod tests {
         assert_eq!(decision.reason, ScopeReason::ApprovedContact);
     }
 
+    #[test]
+    fn cross_project_denied_with_only_unrelated_project_contact() {
+        let result = make_message_result(1, 99, "BlueLake", 30);
+        let mut ctx = viewer_ctx(10, 1);
+        ctx.approved_contacts.push((99, 31));
+        ctx.sender_policies.push(SenderPolicy {
+            project_id: 99,
+            agent_id: 30,
+            policy: ContactPolicyKind::Auto,
+        });
+        let decision = evaluate_scope(&result, &ctx);
+        assert_eq!(decision.verdict, ScopeVerdict::Deny);
+        assert_eq!(decision.reason, ScopeReason::CrossProjectDenied);
+    }
+
     // ── Redaction ─────────────────────────────────────────────────
 
     #[test]
@@ -845,7 +855,7 @@ mod tests {
         let results = vec![
             make_message_result(1, 1, "BlueLake", 20),
             make_message_result(2, 99, "RedFox", 30), // cross-project
-            make_agent_result(3),                 // non-message
+            make_agent_result(3),                     // non-message
         ];
         let ctx = viewer_ctx(10, 1);
         let policy = RedactionPolicy::default();
@@ -951,7 +961,7 @@ mod tests {
             make_message_result(1, 1, "BlueLake", 20),   // allowed
             make_message_result(2, 99, "RedFox", 30),    // denied (cross-project)
             make_message_result(3, 99, "GreenLake", 40), // denied (cross-project)
-            make_agent_result(4),                    // allowed (non-message)
+            make_agent_result(4),                        // allowed (non-message)
         ];
         let ctx = viewer_ctx(10, 1);
         let policy = RedactionPolicy::default();
@@ -1018,9 +1028,9 @@ mod tests {
     #[test]
     fn mixed_batch_all_verdicts() {
         let results = vec![
-            make_message_result(1, 1, "BlueLake", 20),   // recipient → Allow
-            make_message_result(2, 1, "RedFox", 30),     // contacts_only → Deny
-            make_agent_result(3),                    // non-message → Allow
+            make_message_result(1, 1, "BlueLake", 20), // recipient → Allow
+            make_message_result(2, 1, "RedFox", 30),   // contacts_only → Deny
+            make_agent_result(3),                      // non-message → Allow
             make_message_result(4, 99, "GreenLake", 40), // cross-project → Deny
         ];
         let mut ctx = viewer_ctx(10, 1);

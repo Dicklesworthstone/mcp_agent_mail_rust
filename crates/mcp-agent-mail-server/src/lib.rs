@@ -1529,7 +1529,9 @@ fn startup_readiness_fast_path_active() -> bool {
 }
 
 pub(crate) const SERVER_SYNC_DB_BUSY_TIMEOUT_MS: u32 = 60_000;
-pub(crate) const BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS: u32 = 250;
+// The TUI poller and observability paths must tolerate short-lived writer bursts
+// without degrading into chronic "counts present, detail rows missing" snapshots.
+pub(crate) const BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS: u32 = 5_000;
 
 pub(crate) fn open_server_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
     let conn = DbConn::open_file(path)

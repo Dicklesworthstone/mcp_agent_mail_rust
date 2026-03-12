@@ -216,13 +216,26 @@ fn is_agent_mail_health_check(host: &str, port: u16) -> bool {
         .strip_prefix('[')
         .and_then(|value| value.strip_suffix(']'))
         .unwrap_or(connect_host.as_ref());
-    let Ok(mut addr_iter) = (host_for_resolution, port).to_socket_addrs() else {
+    let Ok(addrs) = (host_for_resolution, port).to_socket_addrs() else {
         return false;
     };
-    let Some(addr) = addr_iter.next() else {
-        return false;
-    };
+    is_agent_mail_health_check_addrs(connect_host.as_ref(), port, addrs)
+}
 
+fn is_agent_mail_health_check_addrs(
+    connect_host: &str,
+    port: u16,
+    addrs: impl IntoIterator<Item = std::net::SocketAddr>,
+) -> bool {
+    for addr in addrs {
+        if probe_agent_mail_health_addr(connect_host, port, addr) {
+            return true;
+        }
+    }
+    false
+}
+
+fn probe_agent_mail_health_addr(connect_host: &str, port: u16, addr: std::net::SocketAddr) -> bool {
     // Try to connect with a short timeout
     let Ok(stream) = TcpStream::connect_timeout(&addr, HEALTH_CHECK_TIMEOUT) else {
         return false;
@@ -1771,6 +1784,54 @@ mod tests {
             matches!(status, PortStatus::AgentMailServer),
             "expected AgentMailServer, got {status:?}"
         );
+
+        server_thread.join().expect("join test server");
+    }
+
+    #[test]
+    fn health_check_tries_all_resolved_addresses() {
+        let dead_listener = TcpListener::bind("127.0.0.1:0").expect("bind dead listener");
+        let dead_port = dead_listener.local_addr().expect("dead listener addr").port();
+        drop(dead_listener);
+
+        let live_listener = TcpListener::bind("127.0.0.1:0").expect("bind live listener");
+        let live_port = live_listener.local_addr().expect("live listener addr").port();
+        let live_addr = std::net::SocketAddr::from(([127, 0, 0, 1], live_port));
+        let dead_addr = std::net::SocketAddr::from(([127, 0, 0, 1], dead_port));
+
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _) = live_listener.accept().expect("accept health request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            loop {
+                let mut line = String::new();
+                let bytes = reader.read_line(&mut line).expect("read request line");
+                if bytes == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+
+            let body = r#"{"status":"healthy"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/json\r\n\
+                 X-Agent-Mail-Health: 1\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write health response");
+            stream.flush().expect("flush health response");
+        });
+
+        assert!(is_agent_mail_health_check_addrs(
+            "127.0.0.1",
+            live_port,
+            [dead_addr, live_addr]
+        ));
 
         server_thread.join().expect("join test server");
     }

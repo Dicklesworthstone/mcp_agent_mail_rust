@@ -1414,13 +1414,7 @@ impl Widget for MetricTile<'_> {
         let label_truncated = truncate_width(self.label, inner.width);
         let label_line = Line::styled(
             label_truncated,
-            Style::new()
-                .fg(crate::tui_theme::lerp_color(
-                    tp.text_muted,
-                    trend_color,
-                    0.30,
-                ))
-                .bg(tile_bg),
+            Style::new().fg(tp.text_secondary).bg(tile_bg),
         );
         Paragraph::new(label_line).render(
             Rect {

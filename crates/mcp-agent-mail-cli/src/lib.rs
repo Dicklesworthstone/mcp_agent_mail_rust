@@ -13231,6 +13231,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
 
             // Get original message to derive thread_id and default recipient
             let orig = get_message_by_id_async(&cx, &ctx.pool, message_id).await?;
+            ensure_message_in_project(&orig, pid, message_id)?;
             let thread_id = orig
                 .thread_id
                 .clone()
@@ -14714,6 +14715,20 @@ async fn get_message_by_id_async(
         .map_err(|_| CliError::InvalidArgument(format!("message not found: {message_id}")))
 }
 
+fn ensure_message_in_project(
+    message: &mcp_agent_mail_db::MessageRow,
+    project_id: i64,
+    message_id: i64,
+) -> CliResult<()> {
+    if message.project_id == project_id {
+        Ok(())
+    } else {
+        Err(CliError::InvalidArgument(format!(
+            "message not found: {message_id}"
+        )))
+    }
+}
+
 fn message_row_to_json(m: &mcp_agent_mail_db::MessageRow, sender_name: &str) -> serde_json::Value {
     serde_json::json!({
         "id": m.id.unwrap_or(0),
@@ -14827,7 +14842,8 @@ fn server_inbox_payload_to_cli_json(
 mod mail_server_cli_bridge_tests {
     use super::{
         CliError, ServerToolCall, classify_server_tool_call, coerce_tool_result_json_or_error,
-        server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
+        ensure_message_in_project, server_inbox_payload_to_cli_json,
+        server_message_payload_to_cli_json,
     };
 
     #[test]
@@ -14937,6 +14953,28 @@ mod mail_server_cli_bridge_tests {
                 .to_string()
                 .contains("server returned empty or unparseable result for send_message")
         );
+    }
+
+    #[test]
+    fn ensure_message_in_project_accepts_matching_project() {
+        let message = mcp_agent_mail_db::MessageRow {
+            project_id: 7,
+            ..mcp_agent_mail_db::MessageRow::default()
+        };
+
+        ensure_message_in_project(&message, 7, 42).expect("matching project should pass");
+    }
+
+    #[test]
+    fn ensure_message_in_project_rejects_cross_project_message() {
+        let message = mcp_agent_mail_db::MessageRow {
+            project_id: 7,
+            ..mcp_agent_mail_db::MessageRow::default()
+        };
+
+        let error = ensure_message_in_project(&message, 8, 42)
+            .expect_err("cross-project message should be hidden");
+        assert!(matches!(error, CliError::InvalidArgument(message) if message == "message not found: 42"));
     }
 }
 
