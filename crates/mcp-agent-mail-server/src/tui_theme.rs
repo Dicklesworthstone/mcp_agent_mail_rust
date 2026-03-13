@@ -1656,22 +1656,39 @@ impl TuiThemePalette {
 
     /// Resolve the palette for the currently active named theme.
     ///
-    /// Uses a thread-local cache keyed on a generation counter so the
+    /// Uses a thread-local cache keyed on a composite of generation
+    /// counter, named theme index, and the ftui-extras theme ID so the
     /// expensive `normalized_for_contrast()` pass only runs once per
-    /// theme change instead of every frame.
+    /// theme change instead of every frame.  The extra keys ensure
+    /// correctness when external code (e.g. `ScopedThemeLock` in tests)
+    /// changes the theme without going through our mutation functions.
     #[must_use]
     pub fn current() -> Self {
         let generation = PALETTE_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
+        let named_idx = active_named_theme_index();
+        // Include the ftui-extras theme index so external callers like
+        // `ScopedThemeLock` that bypass our mutation functions still
+        // invalidate the cache.
+        let current_ftui = theme::current_theme();
+        let ftui_idx = ThemeId::ALL
+            .iter()
+            .position(|t| *t == current_ftui)
+            .unwrap_or(0) as u64;
+        let composite = generation
+            .wrapping_mul(1_000_003)
+            .wrapping_add(named_idx as u64)
+            .wrapping_mul(1_000_033)
+            .wrapping_add(ftui_idx);
         CACHED_PALETTE.with(|cell| {
             let cached = cell.borrow();
-            if cached.0 == generation
+            if cached.0 == composite
                 && let Some(palette) = cached.1
             {
                 return palette;
             }
             drop(cached);
             let palette = active_named_palette();
-            *cell.borrow_mut() = (generation, Some(palette));
+            *cell.borrow_mut() = (composite, Some(palette));
             palette
         })
     }

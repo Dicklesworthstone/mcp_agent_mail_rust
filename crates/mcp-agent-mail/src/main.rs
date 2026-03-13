@@ -38,10 +38,6 @@ fn parse_am_interface_mode(raw: Option<&str>) -> Result<InterfaceMode, String> {
     }
 }
 
-fn am_interface_mode_from_env() -> Result<InterfaceMode, String> {
-    parse_am_interface_mode(env::var("AM_INTERFACE_MODE").ok().as_deref())
-}
-
 fn invocation_file_name(arg0: Option<&str>) -> Option<String> {
     let arg0 = arg0?;
     let normalized = arg0.replace('\\', "/");
@@ -58,8 +54,38 @@ fn invocation_is_am(arg0: Option<&str>) -> bool {
     })
 }
 
-const fn should_dispatch_to_cli_surface(invoked_as_am: bool, mode: InterfaceMode) -> bool {
-    invoked_as_am || mode.is_cli()
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum EarlyDispatch {
+    Mcp,
+    Cli {
+        invocation_name: &'static str,
+        deny_command: Option<String>,
+    },
+}
+
+fn resolve_early_dispatch(
+    arg0: Option<&str>,
+    raw_mode: Option<&str>,
+    first_command: Option<&str>,
+) -> Result<EarlyDispatch, String> {
+    if invocation_is_am(arg0) {
+        return Ok(EarlyDispatch::Cli {
+            invocation_name: "am",
+            deny_command: None,
+        });
+    }
+
+    let mode = parse_am_interface_mode(raw_mode)?;
+    if mode.is_cli() {
+        return Ok(EarlyDispatch::Cli {
+            invocation_name: "mcp-agent-mail",
+            deny_command: first_command
+                .filter(|command| *command == "serve")
+                .map(std::string::ToString::to_string),
+        });
+    }
+
+    Ok(EarlyDispatch::Mcp)
 }
 
 const fn default_mcp_log_filter() -> &'static str {
@@ -324,8 +350,8 @@ fn unquote_env_value(raw: &str) -> &str {
     }
 }
 
-fn load_env_file_value(path: &Path, key: &str) -> Option<String> {
-    let contents = fs::read_to_string(path).ok()?;
+fn load_env_file_value(path: &Path, key: &str) -> std::io::Result<Option<String>> {
+    let contents = fs::read_to_string(path)?;
     let mut matched: Option<Option<String>> = None;
     for line in contents.lines() {
         let trimmed = line.trim();
@@ -346,18 +372,25 @@ fn load_env_file_value(path: &Path, key: &str) -> Option<String> {
         }
         matched = Some(Some(value));
     }
-    matched.flatten()
+    Ok(matched.flatten())
 }
 
 fn resolve_http_bearer_token_for_serve(
     current_token: Option<&str>,
     env_file: Option<&str>,
-) -> Option<String> {
+) -> Result<Option<String>, String> {
     if current_token.is_some_and(|token| !token.trim().is_empty()) {
-        return None;
+        return Ok(None);
     }
-    let path = env_file?;
-    load_env_file_value(Path::new(path), "HTTP_BEARER_TOKEN")
+    let Some(path) = env_file else {
+        return Ok(None);
+    };
+    load_env_file_value(Path::new(path), "HTTP_BEARER_TOKEN").map_err(|err| {
+        format!(
+            "Failed to read --env-file {}: {err}",
+            Path::new(path).display()
+        )
+    })
 }
 
 fn resolve_reuse_running_setting(
@@ -410,10 +443,14 @@ fn main() {
     // Initialize process start time immediately for accurate uptime.
     mcp_agent_mail_core::diagnostics::init_process_start();
 
-    // Decide runtime mode before setting up logging or parsing the MCP CLI.
-    // This ensures `--help` renders the correct surface and avoids polluting CLI-mode output.
-    let mode = match am_interface_mode_from_env() {
-        Ok(m) => m,
+    let arg0 = env::args().next();
+    let first_command = env::args().nth(1);
+    let early_dispatch = match resolve_early_dispatch(
+        arg0.as_deref(),
+        env::var("AM_INTERFACE_MODE").ok().as_deref(),
+        first_command.as_deref(),
+    ) {
+        Ok(dispatch) => dispatch,
         Err(msg) => {
             eprintln!("Error: {msg}");
             eprintln!("Usage: AM_INTERFACE_MODE={{mcp|cli}} mcp-agent-mail ...");
@@ -421,34 +458,24 @@ fn main() {
         }
     };
 
-    let invoked_as_am = invocation_is_am(env::args().next().as_deref());
-    if should_dispatch_to_cli_surface(invoked_as_am, mode) {
-        // If this process is invoked as `am`, always route to the CLI surface.
-        //
-        // This protects users from environment misconfiguration (for example,
-        // `AM_INTERFACE_MODE=mcp` exported in their shell), and from packaging/path
-        // regressions where `am` points at the `mcp-agent-mail` binary.
-        if invoked_as_am {
-            std::process::exit(mcp_agent_mail_cli::run_with_invocation_name("am"));
+    match early_dispatch {
+        EarlyDispatch::Mcp => {}
+        EarlyDispatch::Cli {
+            invocation_name,
+            deny_command,
+        } => {
+            if let Some(cmd) = deny_command {
+                // Deterministic wrong-mode denial for MCP-only commands that users commonly try.
+                //
+                // Note: `config` is NOT denied because the CLI surface has its own `config` command.
+                render_cli_mode_denial(&cmd);
+                std::process::exit(2);
+            }
+
+            std::process::exit(mcp_agent_mail_cli::run_with_invocation_name(
+                invocation_name,
+            ));
         }
-
-        let Some(cmd) = env::args().nth(1) else {
-            render_cli_mode_missing_command();
-            std::process::exit(2);
-        };
-
-        // Deterministic wrong-mode denial for MCP-only commands that users commonly try.
-        //
-        // Note: `config` is NOT denied because the CLI surface has its own `config` command.
-        if cmd == "serve" {
-            render_cli_mode_denial(&cmd);
-            std::process::exit(2);
-        }
-
-        // Route to the CLI surface with the correct invocation name for help/usage.
-        std::process::exit(mcp_agent_mail_cli::run_with_invocation_name(
-            "mcp-agent-mail",
-        ));
     }
 
     let cli = Cli::parse();
@@ -504,11 +531,16 @@ fn main() {
             let resolved_path =
                 resolve_serve_http_path(path.as_deref(), transport, env_value("HTTP_PATH"));
             config.http_path = resolved_path.path;
-            if let Some(token) = resolve_http_bearer_token_for_serve(
+            match resolve_http_bearer_token_for_serve(
                 config.http_bearer_token.as_deref(),
                 env_file.as_deref(),
             ) {
-                config.http_bearer_token = Some(token);
+                Ok(Some(token)) => config.http_bearer_token = Some(token),
+                Ok(None) => {}
+                Err(msg) => {
+                    eprintln!("Error: {msg}");
+                    std::process::exit(2);
+                }
             }
             let reuse_running_enabled = resolve_reuse_running_setting(
                 reuse_running,
@@ -618,17 +650,6 @@ fn render_denial(command: &str) {
     }
 }
 
-fn render_cli_mode_missing_command() {
-    eprintln!(
-        "Error: CLI mode is enabled (AM_INTERFACE_MODE=cli) but no subcommand was provided.\n\n\
-         To run the CLI:\n\
-           mcp-agent-mail --help\n\n\
-         To start the MCP server:\n\
-           unset AM_INTERFACE_MODE   # (or set AM_INTERFACE_MODE=mcp)\n\
-           mcp-agent-mail serve ..."
-    );
-}
-
 /// CLI-mode denial renderer for MCP-only commands.
 ///
 /// CLI mode is enabled by `AM_INTERFACE_MODE=cli` (ADR-002, SPEC-interface-mode-switch).
@@ -659,11 +680,52 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_to_cli_surface_behavior() {
-        assert!(should_dispatch_to_cli_surface(true, InterfaceMode::Mcp));
-        assert!(should_dispatch_to_cli_surface(true, InterfaceMode::Cli));
-        assert!(should_dispatch_to_cli_surface(false, InterfaceMode::Cli));
-        assert!(!should_dispatch_to_cli_surface(false, InterfaceMode::Mcp));
+    fn resolve_early_dispatch_prefers_invocation_name_over_invalid_mode() {
+        assert_eq!(
+            resolve_early_dispatch(Some("/usr/local/bin/am"), Some("wat"), None).unwrap(),
+            EarlyDispatch::Cli {
+                invocation_name: "am",
+                deny_command: None,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_early_dispatch_routes_zero_arg_cli_mode_to_cli_surface() {
+        assert_eq!(
+            resolve_early_dispatch(Some("mcp-agent-mail"), Some("cli"), None).unwrap(),
+            EarlyDispatch::Cli {
+                invocation_name: "mcp-agent-mail",
+                deny_command: None,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_early_dispatch_denies_serve_in_cli_mode() {
+        assert_eq!(
+            resolve_early_dispatch(Some("mcp-agent-mail"), Some("cli"), Some("serve")).unwrap(),
+            EarlyDispatch::Cli {
+                invocation_name: "mcp-agent-mail",
+                deny_command: Some("serve".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_early_dispatch_stays_in_mcp_mode_by_default() {
+        assert_eq!(
+            resolve_early_dispatch(Some("mcp-agent-mail"), None, None).unwrap(),
+            EarlyDispatch::Mcp
+        );
+    }
+
+    #[test]
+    fn resolve_early_dispatch_rejects_invalid_mode_when_not_invoked_as_am() {
+        let err = resolve_early_dispatch(Some("mcp-agent-mail"), Some("wat"), None).unwrap_err();
+        assert!(err.contains("AM_INTERFACE_MODE"));
+        assert!(err.contains("mcp"));
+        assert!(err.contains("cli"));
     }
 
     #[test]
@@ -894,7 +956,7 @@ mod tests {
             "export HTTP_BEARER_TOKEN='token-from-custom-env'\n",
         )
         .expect("write env file");
-        let resolved = resolve_http_bearer_token_for_serve(None, tmp.path().to_str());
+        let resolved = resolve_http_bearer_token_for_serve(None, tmp.path().to_str()).unwrap();
         assert_eq!(resolved.as_deref(), Some("token-from-custom-env"));
     }
 
@@ -903,7 +965,8 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().expect("temp file");
         fs::write(tmp.path(), "HTTP_BEARER_TOKEN=token-from-file\n").expect("write env file");
         let resolved =
-            resolve_http_bearer_token_for_serve(Some("from-process-env"), tmp.path().to_str());
+            resolve_http_bearer_token_for_serve(Some("from-process-env"), tmp.path().to_str())
+                .unwrap();
         assert!(resolved.is_none());
     }
 
@@ -911,7 +974,7 @@ mod tests {
     fn load_env_file_value_handles_double_quoted_values() {
         let tmp = tempfile::NamedTempFile::new().expect("temp file");
         fs::write(tmp.path(), "HTTP_BEARER_TOKEN=\"quoted-token\"\n").expect("write env file");
-        let token = load_env_file_value(tmp.path(), "HTTP_BEARER_TOKEN");
+        let token = load_env_file_value(tmp.path(), "HTTP_BEARER_TOKEN").unwrap();
         assert_eq!(token.as_deref(), Some("quoted-token"));
     }
 
@@ -923,7 +986,7 @@ mod tests {
             "HTTP_BEARER_TOKEN=first-token\nHTTP_BEARER_TOKEN=second-token\n",
         )
         .expect("write env file");
-        let token = load_env_file_value(tmp.path(), "HTTP_BEARER_TOKEN");
+        let token = load_env_file_value(tmp.path(), "HTTP_BEARER_TOKEN").unwrap();
         assert_eq!(token.as_deref(), Some("second-token"));
     }
 
@@ -935,7 +998,7 @@ mod tests {
             "  export HTTP_BEARER_TOKEN =   'trimmed-token'   \n",
         )
         .expect("write env file");
-        let token = load_env_file_value(tmp.path(), "HTTP_BEARER_TOKEN");
+        let token = load_env_file_value(tmp.path(), "HTTP_BEARER_TOKEN").unwrap();
         assert_eq!(token.as_deref(), Some("trimmed-token"));
     }
 
@@ -947,15 +1010,16 @@ mod tests {
             "HTTP_BEARER_TOKEN=present\nHTTP_BEARER_TOKEN=\n",
         )
         .expect("write env file");
-        let token = load_env_file_value(tmp.path(), "HTTP_BEARER_TOKEN");
+        let token = load_env_file_value(tmp.path(), "HTTP_BEARER_TOKEN").unwrap();
         assert!(token.is_none());
     }
 
     #[test]
-    fn resolve_http_bearer_token_for_serve_handles_missing_file() {
+    fn resolve_http_bearer_token_for_serve_errors_on_missing_file() {
         let missing = "/tmp/this-file-should-not-exist-agent-mail.env";
-        let resolved = resolve_http_bearer_token_for_serve(None, Some(missing));
-        assert!(resolved.is_none());
+        let err = resolve_http_bearer_token_for_serve(None, Some(missing)).unwrap_err();
+        assert!(err.contains("--env-file"));
+        assert!(err.contains(missing));
     }
 
     #[test]

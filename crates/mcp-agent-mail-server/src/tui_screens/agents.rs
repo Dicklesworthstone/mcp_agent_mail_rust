@@ -37,11 +37,32 @@ const IDLE_WINDOW_MICROS: i64 = 5 * 60 * 1_000_000;
 /// Max sparkline history samples.
 const SPARKLINE_CAP: usize = 30;
 const EVENT_INGEST_BATCH_LIMIT: usize = 1024;
+/// Mirror the poller-side cap when reconstructing richer rows from SQLite.
+const SQLITE_AGENT_RECOVERY_LIMIT: usize = 500;
+
+/// Agent names are unique only within a project, so screen-local caches must
+/// keep project-qualified identities to avoid cross-project collisions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AgentIdentity {
+    project: String,
+    name: String,
+}
+
+impl AgentIdentity {
+    fn new(project: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            project: project.into(),
+            name: name.into(),
+        }
+    }
+}
 
 /// An agent row with computed fields.
 #[derive(Debug, Clone)]
 struct AgentRow {
+    identity: AgentIdentity,
     name: String,
+    project: String,
     program: String,
     model: String,
     last_active_ts: i64,
@@ -145,47 +166,81 @@ fn sanitize_diagnostic_value(value: &str) -> String {
         .join(" ")
 }
 
-fn recover_agent_message_counts_from_sqlite(database_url: &str) -> Option<HashMap<String, u64>> {
+fn recover_agent_rows_from_sqlite(database_url: &str) -> Option<Vec<AgentRow>> {
     let cfg = DbPoolConfig {
         database_url: database_url.to_string(),
         ..Default::default()
     };
     let path = cfg.sqlite_path().ok()?;
     let conn = crate::open_best_effort_sync_db_connection(&path).ok()?;
-    Some(fetch_agent_message_count_map(&conn))
+    Some(fetch_agent_rows_from_sqlite(&conn))
 }
 
-fn fetch_agent_message_count_map(conn: &DbConn) -> HashMap<String, u64> {
+fn fetch_agent_rows_from_sqlite(conn: &DbConn) -> Vec<AgentRow> {
+    let last_active_sort = crate::tui_poller::timestamp_sort_expr("a.last_active_ts");
     conn.query_sync(
-        "WITH agent_messages AS ( \
-           SELECT a.id AS agent_id, m.id AS message_id \
-           FROM agents a \
-           JOIN messages m ON m.sender_id = a.id \
-           UNION \
-           SELECT a.id AS agent_id, mr.message_id AS message_id \
-           FROM agents a \
-           JOIN message_recipients mr ON mr.agent_id = a.id \
-         ) \
-         SELECT a.name, COUNT(DISTINCT am.message_id) AS cnt \
-         FROM agents a \
-         LEFT JOIN agent_messages am ON am.agent_id = a.id \
-         GROUP BY a.id, a.name",
+        &format!(
+            "WITH agent_messages AS ( \
+               SELECT a.id AS agent_id, m.id AS message_id \
+               FROM agents a \
+               JOIN messages m ON m.sender_id = a.id \
+               UNION \
+               SELECT a.id AS agent_id, mr.message_id AS message_id \
+               FROM agents a \
+               JOIN message_recipients mr ON mr.agent_id = a.id \
+             ) \
+             SELECT \
+               COALESCE(p.slug, '') AS project_slug, \
+               a.name, \
+               a.program, \
+               COALESCE(a.model, '') AS model, \
+               a.last_active_ts, \
+               COUNT(DISTINCT am.message_id) AS cnt \
+             FROM agents a \
+             LEFT JOIN projects p ON p.id = a.project_id \
+             LEFT JOIN agent_messages am ON am.agent_id = a.id \
+             GROUP BY a.id, project_slug, a.name, a.program, a.model, a.last_active_ts \
+             ORDER BY {last_active_sort} DESC, a.id DESC \
+             LIMIT {SQLITE_AGENT_RECOVERY_LIMIT}"
+        ),
         &[],
     )
     .ok()
     .map(|rows| {
         rows.into_iter()
             .filter_map(|row| {
-                Some((
-                    row.get_named::<String>("name")
+                let project = row
+                    .get_named::<String>("project_slug")
+                    .ok()
+                    .or_else(|| row.get_as::<String>(0).ok())
+                    .unwrap_or_default();
+                let name = row
+                    .get_named::<String>("name")
+                    .ok()
+                    .or_else(|| row.get_as::<String>(1).ok())?;
+                let program = row
+                    .get_named::<String>("program")
+                    .ok()
+                    .or_else(|| row.get_as::<String>(2).ok())?;
+                let model = row
+                    .get_named::<String>("model")
+                    .ok()
+                    .or_else(|| row.get_as::<String>(3).ok())
+                    .unwrap_or_default();
+                Some(AgentRow {
+                    identity: AgentIdentity::new(project.clone(), name.clone()),
+                    name,
+                    project,
+                    program,
+                    model,
+                    last_active_ts: crate::tui_poller::parse_raw_ts(&row, "last_active_ts"),
+                    message_count: row
+                        .get_named::<i64>("cnt")
                         .ok()
-                        .or_else(|| row.get_as::<String>(0).ok())?,
-                    row.get_named::<i64>("cnt")
-                        .ok()
-                        .or_else(|| row.get_as::<i64>(1).ok())
+                        .or_else(|| row.get_as::<i64>(5).ok())
                         .and_then(|count| u64::try_from(count.max(0)).ok())
                         .unwrap_or(0),
-                ))
+                })
             })
             .collect()
     })
@@ -236,19 +291,19 @@ pub struct AgentsScreen {
     filter_active: bool,
     last_seq: u64,
     /// Per-agent message counts from events.
-    msg_counts: HashMap<String, u64>,
+    msg_counts: HashMap<AgentIdentity, u64>,
     /// Per-agent model names from `AgentRegistered` events.
-    model_names: HashMap<String, String>,
+    model_names: HashMap<AgentIdentity, String>,
     /// Last computed presence status for each known agent.
-    status_by_agent: HashMap<String, AgentStatus>,
+    status_by_agent: HashMap<AgentIdentity, AgentStatus>,
     /// Fade transition state when an agent status changes.
-    status_fades: HashMap<String, StatusFadeState>,
+    status_fades: HashMap<AgentIdentity, StatusFadeState>,
     /// Brief row highlight when a message event is observed for an agent.
-    message_flash_ticks: HashMap<String, u8>,
+    message_flash_ticks: HashMap<AgentIdentity, u8>,
     /// New rows reveal with a staggered delay to avoid hard pop-in.
-    stagger_reveal_ticks: HashMap<String, u8>,
+    stagger_reveal_ticks: HashMap<AgentIdentity, u8>,
     /// Last row set, used to detect newly appearing agents.
-    seen_agents: HashSet<String>,
+    seen_agents: HashSet<AgentIdentity>,
     /// Reduced-motion mode skips all per-tick visual interpolation.
     reduced_motion: bool,
     /// Synthetic event for the focused agent (palette quick actions).
@@ -347,7 +402,7 @@ impl AgentsScreen {
                     &row.name,
                     &row.program,
                     &row.model,
-                    "", // agents span projects
+                    &row.project,
                 )
             });
     }
@@ -359,29 +414,45 @@ impl AgentsScreen {
         let total_rows = db.agents;
         let raw_count = u64::try_from(db.agents_list.len()).unwrap_or(u64::MAX);
         let previous_selection = self.table_state.selected;
-        let previous_selected_name = previous_selection
+        let previous_selected_identity = previous_selection
             .and_then(|index| self.agents.get(index))
-            .map(|agent| agent.name.clone());
-        let historical_msg_counts = if total_rows > 0 && db.messages > 0 {
-            recover_agent_message_counts_from_sqlite(&cfg.raw_database_url).unwrap_or_default()
+            .map(|agent| agent.identity.clone());
+        let recovered_rows = if total_rows > 0 {
+            recover_agent_rows_from_sqlite(&cfg.raw_database_url).unwrap_or_default()
         } else {
-            HashMap::new()
+            Vec::new()
         };
-        let mut rows: Vec<AgentRow> = db
-            .agents_list
-            .iter()
-            .map(|a| {
-                let recent_count = self.msg_counts.get(&a.name).copied().unwrap_or(0);
-                let historical_count = historical_msg_counts.get(&a.name).copied().unwrap_or(0);
-                AgentRow {
-                    name: a.name.clone(),
-                    program: a.program.clone(),
-                    model: self.model_names.get(&a.name).cloned().unwrap_or_default(),
-                    last_active_ts: a.last_active_ts,
-                    message_count: historical_count.max(recent_count),
-                }
-            })
-            .collect();
+        let recovered_rows_usable =
+            !recovered_rows.is_empty() && recovered_rows.len() >= db.agents_list.len();
+        let mut rows: Vec<AgentRow> = if recovered_rows_usable {
+            recovered_rows
+                .into_iter()
+                .map(|mut row| {
+                    let recent_count = self.msg_counts.get(&row.identity).copied().unwrap_or(0);
+                    if let Some(model_name) = self.model_names.get(&row.identity) {
+                        row.model = model_name.clone();
+                    }
+                    row.message_count = row.message_count.max(recent_count);
+                    row
+                })
+                .collect()
+        } else {
+            db.agents_list
+                .iter()
+                .map(|a| {
+                    let identity = AgentIdentity::new("", a.name.clone());
+                    AgentRow {
+                        identity: identity.clone(),
+                        name: a.name.clone(),
+                        project: String::new(),
+                        program: a.program.clone(),
+                        model: self.model_names.get(&identity).cloned().unwrap_or_default(),
+                        last_active_ts: a.last_active_ts,
+                        message_count: self.msg_counts.get(&identity).copied().unwrap_or(0),
+                    }
+                })
+                .collect()
+        };
 
         // Apply filter
         let filter_text = self.filter.trim().to_ascii_lowercase();
@@ -467,8 +538,8 @@ impl AgentsScreen {
         };
         self.sparkline_dirty = true;
 
-        self.table_state.selected = previous_selected_name
-            .and_then(|name| self.agents.iter().position(|agent| agent.name == name));
+        self.table_state.selected = previous_selected_identity
+            .and_then(|identity| self.agents.iter().position(|agent| agent.identity == identity));
 
         if self.table_state.selected.is_none()
             && let Some(sel) = previous_selection
@@ -487,28 +558,39 @@ impl AgentsScreen {
         for event in &events {
             self.last_seq = event.seq().max(self.last_seq);
             match event {
-                MailEvent::MessageSent { from, .. } => {
-                    *self.msg_counts.entry(from.clone()).or_insert(0) += 1;
+                MailEvent::MessageSent { from, project, .. } => {
+                    let identity = AgentIdentity::new(project.clone(), from.clone());
+                    *self.msg_counts.entry(identity.clone()).or_insert(0) += 1;
                     self.total_msgs_this_tick += 1;
                     if !self.reduced_motion {
                         self.message_flash_ticks
-                            .insert(from.clone(), MESSAGE_FLASH_TICKS);
+                            .insert(identity, MESSAGE_FLASH_TICKS);
                     }
                 }
-                MailEvent::MessageReceived { from, to, .. } => {
+                MailEvent::MessageReceived {
+                    from, to, project, ..
+                } => {
                     if !self.reduced_motion {
                         self.message_flash_ticks
-                            .insert(from.clone(), MESSAGE_FLASH_TICKS);
+                            .insert(AgentIdentity::new(project.clone(), from.clone()), MESSAGE_FLASH_TICKS);
                         for recipient in to {
-                            self.message_flash_ticks
-                                .insert(recipient.clone(), MESSAGE_FLASH_TICKS);
+                            self.message_flash_ticks.insert(
+                                AgentIdentity::new(project.clone(), recipient.clone()),
+                                MESSAGE_FLASH_TICKS,
+                            );
                         }
                     }
                 }
                 MailEvent::AgentRegistered {
-                    name, model_name, ..
+                    name,
+                    model_name,
+                    project,
+                    ..
                 } => {
-                    self.model_names.insert(name.clone(), model_name.clone());
+                    self.model_names.insert(
+                        AgentIdentity::new(project.clone(), name.clone()),
+                        model_name.clone(),
+                    );
                 }
                 _ => {}
             }
@@ -542,13 +624,13 @@ impl AgentsScreen {
         for row in rows {
             let next = AgentStatus::from_last_active(row.last_active_ts, now_ts);
             if !self.reduced_motion
-                && let Some(prev) = self.status_by_agent.get(&row.name)
+                && let Some(prev) = self.status_by_agent.get(&row.identity)
                 && *prev != next
             {
                 self.status_fades
-                    .insert(row.name.clone(), StatusFadeState::new(*prev, next));
+                    .insert(row.identity.clone(), StatusFadeState::new(*prev, next));
             }
-            next_statuses.insert(row.name.clone(), next);
+            next_statuses.insert(row.identity.clone(), next);
         }
         self.status_by_agent = next_statuses;
         if self.reduced_motion {
@@ -570,12 +652,12 @@ impl AgentsScreen {
     fn track_stagger_reveals(&mut self, rows: &[AgentRow]) {
         let mut next_seen = HashSet::with_capacity(rows.len());
         for (index, row) in rows.iter().enumerate() {
-            if !self.reduced_motion && !self.seen_agents.contains(&row.name) {
+            if !self.reduced_motion && !self.seen_agents.contains(&row.identity) {
                 let capped = index.min(usize::from(STAGGER_MAX_TICKS - 1));
                 let delay = u8::try_from(capped).map_or(STAGGER_MAX_TICKS, |value| value + 1);
-                self.stagger_reveal_ticks.insert(row.name.clone(), delay);
+                self.stagger_reveal_ticks.insert(row.identity.clone(), delay);
             }
-            next_seen.insert(row.name.clone());
+            next_seen.insert(row.identity.clone());
         }
         self.seen_agents = next_seen;
         if self.reduced_motion {
@@ -632,7 +714,7 @@ impl AgentsScreen {
             let (r, g, b) = target.rgb();
             return PackedRgba::rgb(r, g, b);
         }
-        if let Some(fade) = self.status_fades.get(&agent.name) {
+        if let Some(fade) = self.status_fades.get(&agent.identity) {
             let progress =
                 1.0 - (f32::from(fade.ticks_remaining) / f32::from(STATUS_FADE_TICKS.max(1)));
             let (r, g, b) = blend_rgb(fade.from.rgb(), fade.to.rgb(), progress);
@@ -647,14 +729,14 @@ impl AgentsScreen {
         if Some(row_index) == self.table_state.selected {
             return Style::default().fg(tp.selection_fg).bg(tp.selection_bg);
         }
-        if !self.reduced_motion && self.stagger_reveal_ticks.contains_key(&agent.name) {
+        if !self.reduced_motion && self.stagger_reveal_ticks.contains_key(&agent.identity) {
             return crate::tui_theme::text_disabled(&tp);
         }
 
         let status_color = self.status_color(agent, now_ts);
         let mut style = Style::default().fg(status_color);
         if !self.reduced_motion
-            && let Some(remaining) = self.message_flash_ticks.get(&agent.name)
+            && let Some(remaining) = self.message_flash_ticks.get(&agent.identity)
         {
             let intensity = f32::from(*remaining) / f32::from(MESSAGE_FLASH_TICKS.max(1));
             let dim = (tp.text_muted.r(), tp.text_muted.g(), tp.text_muted.b());
@@ -1064,6 +1146,9 @@ impl AgentsScreen {
         let mut lines: Vec<(String, String, Option<PackedRgba>)> = Vec::new();
 
         lines.push(("Name".into(), agent.name.clone(), None));
+        if !agent.project.is_empty() {
+            lines.push(("Project".into(), agent.project.clone(), None));
+        }
         lines.push((
             "Status".into(),
             format!(
@@ -1199,6 +1284,10 @@ impl AgentsScreen {
         };
 
         let header = Row::new(header_cells).style(Style::default().bold());
+        let mut name_counts: HashMap<&str, usize> = HashMap::new();
+        for agent in &self.agents {
+            *name_counts.entry(agent.name.as_str()).or_insert(0) += 1;
+        }
 
         let rows: Vec<Row> = self
             .agents
@@ -1211,7 +1300,12 @@ impl AgentsScreen {
 
                 // Status badge prepended to name
                 let status = AgentStatus::from_last_active(agent.last_active_ts, now_ts);
-                let name_display = format!("{} {}", status.icon(), agent.name);
+                let duplicate_name = name_counts.get(agent.name.as_str()).copied().unwrap_or(0) > 1;
+                let name_display = if duplicate_name && !agent.project.is_empty() {
+                    format!("{} {} [{}]", status.icon(), agent.name, agent.project)
+                } else {
+                    format!("{} {}", status.icon(), agent.name)
+                };
 
                 if narrow {
                     Row::new(vec![name_display, active_str, msg_str]).style(style)
@@ -1400,6 +1494,29 @@ mod tests {
         state.update_config_snapshot(snapshot);
     }
 
+    fn agent_identity(project: &str, name: &str) -> AgentIdentity {
+        AgentIdentity::new(project.to_string(), name.to_string())
+    }
+
+    fn test_agent_row(
+        name: &str,
+        project: &str,
+        program: &str,
+        model: &str,
+        last_active_ts: i64,
+        message_count: u64,
+    ) -> AgentRow {
+        AgentRow {
+            identity: agent_identity(project, name),
+            name: name.to_string(),
+            project: project.to_string(),
+            program: program.to_string(),
+            model: model.to_string(),
+            last_active_ts,
+            message_count,
+        }
+    }
+
     #[test]
     fn new_screen_has_defaults() {
         let screen = AgentsScreen::new();
@@ -1519,13 +1636,9 @@ mod tests {
     #[test]
     fn deep_link_agent_by_name() {
         let mut screen = AgentsScreen::new();
-        screen.agents.push(AgentRow {
-            name: "RedFox".to_string(),
-            program: "claude-code".to_string(),
-            model: "opus-4.6".to_string(),
-            last_active_ts: 100,
-            message_count: 5,
-        });
+        screen
+            .agents
+            .push(test_agent_row("RedFox", "", "claude-code", "opus-4.6", 100, 5));
         let handled = screen.receive_deep_link(&DeepLinkTarget::AgentByName("RedFox".into()));
         assert!(handled);
         assert_eq!(screen.table_state.selected, Some(0));
@@ -1535,20 +1648,12 @@ mod tests {
     fn down_key_selects_first_agent_when_nothing_is_selected() {
         let state = test_state();
         let mut screen = AgentsScreen::new();
-        screen.agents.push(AgentRow {
-            name: "RedFox".to_string(),
-            program: "claude-code".to_string(),
-            model: "opus-4.6".to_string(),
-            last_active_ts: 100,
-            message_count: 5,
-        });
-        screen.agents.push(AgentRow {
-            name: "BlueLake".to_string(),
-            program: "codex-cli".to_string(),
-            model: "gpt-5".to_string(),
-            last_active_ts: 200,
-            message_count: 7,
-        });
+        screen
+            .agents
+            .push(test_agent_row("RedFox", "", "claude-code", "opus-4.6", 100, 5));
+        screen
+            .agents
+            .push(test_agent_row("BlueLake", "", "codex-cli", "gpt-5", 200, 7));
 
         let down = Event::Key(ftui::KeyEvent::new(KeyCode::Down));
         screen.update(&down, &state);
@@ -1705,13 +1810,7 @@ mod tests {
         screen.reduced_motion = false;
         let now = chrono::Utc::now().timestamp_micros();
         screen.cached_now_ts = now;
-        let mut rows = vec![AgentRow {
-            name: "RedFox".to_string(),
-            program: "claude-code".to_string(),
-            model: "opus".to_string(),
-            last_active_ts: now,
-            message_count: 1,
-        }];
+        let mut rows = vec![test_agent_row("RedFox", "", "claude-code", "opus", now, 1)];
 
         screen.rebuild_status_transitions(&rows);
         assert!(screen.status_fades.is_empty());
@@ -1720,7 +1819,7 @@ mod tests {
         screen.rebuild_status_transitions(&rows);
         let fade = screen
             .status_fades
-            .get("RedFox")
+            .get(&agent_identity("", "RedFox"))
             .expect("status transition should create fade");
         assert_eq!(fade.from, AgentStatus::Active);
         assert_eq!(fade.to, AgentStatus::Inactive);
@@ -1737,13 +1836,7 @@ mod tests {
         let mut screen = AgentsScreen::new();
         screen.reduced_motion = true;
         let now = chrono::Utc::now().timestamp_micros();
-        let mut rows = vec![AgentRow {
-            name: "BlueFox".to_string(),
-            program: "claude-code".to_string(),
-            model: "opus".to_string(),
-            last_active_ts: now,
-            message_count: 1,
-        }];
+        let mut rows = vec![test_agent_row("BlueFox", "", "claude-code", "opus", now, 1)];
         screen.rebuild_status_transitions(&rows);
         rows[0].last_active_ts = now - IDLE_WINDOW_MICROS - 10_000_000;
         screen.rebuild_status_transitions(&rows);
@@ -1756,12 +1849,14 @@ mod tests {
         screen.reduced_motion = false;
         screen
             .message_flash_ticks
-            .insert("RedFox".to_string(), MESSAGE_FLASH_TICKS);
+            .insert(agent_identity("", "RedFox"), MESSAGE_FLASH_TICKS);
 
         for _ in 0..MESSAGE_FLASH_TICKS {
             screen.advance_message_flashes();
         }
-        assert!(!screen.message_flash_ticks.contains_key("RedFox"));
+        assert!(!screen
+            .message_flash_ticks
+            .contains_key(&agent_identity("", "RedFox")));
     }
 
     #[test]
@@ -1770,37 +1865,21 @@ mod tests {
         screen.reduced_motion = false;
         let now = chrono::Utc::now().timestamp_micros();
         let rows = vec![
-            AgentRow {
-                name: "A".to_string(),
-                program: "p".to_string(),
-                model: "m".to_string(),
-                last_active_ts: now,
-                message_count: 0,
-            },
-            AgentRow {
-                name: "B".to_string(),
-                program: "p".to_string(),
-                model: "m".to_string(),
-                last_active_ts: now,
-                message_count: 0,
-            },
-            AgentRow {
-                name: "C".to_string(),
-                program: "p".to_string(),
-                model: "m".to_string(),
-                last_active_ts: now,
-                message_count: 0,
-            },
+            test_agent_row("A", "", "p", "m", now, 0),
+            test_agent_row("B", "", "p", "m", now, 0),
+            test_agent_row("C", "", "p", "m", now, 0),
         ];
 
         screen.track_stagger_reveals(&rows);
-        assert_eq!(screen.stagger_reveal_ticks.get("A"), Some(&1));
-        assert_eq!(screen.stagger_reveal_ticks.get("B"), Some(&2));
-        assert_eq!(screen.stagger_reveal_ticks.get("C"), Some(&3));
+        assert_eq!(screen.stagger_reveal_ticks.get(&agent_identity("", "A")), Some(&1));
+        assert_eq!(screen.stagger_reveal_ticks.get(&agent_identity("", "B")), Some(&2));
+        assert_eq!(screen.stagger_reveal_ticks.get(&agent_identity("", "C")), Some(&3));
 
         screen.advance_stagger_reveals();
-        assert!(!screen.stagger_reveal_ticks.contains_key("A"));
-        assert_eq!(screen.stagger_reveal_ticks.get("B"), Some(&1));
+        assert!(!screen
+            .stagger_reveal_ticks
+            .contains_key(&agent_identity("", "A")));
+        assert_eq!(screen.stagger_reveal_ticks.get(&agent_identity("", "B")), Some(&1));
     }
 
     // ── focused_event tests ───────────────────────────────────────
@@ -2404,20 +2483,28 @@ mod tests {
     #[test]
     fn sync_focused_event_gated_by_selection_change() {
         let mut screen = AgentsScreen::new();
-        screen.agents.push(AgentRow {
-            name: "RedFox".to_string(),
-            program: "claude-code".to_string(),
-            model: "opus-4.6".to_string(),
-            last_active_ts: 100,
-            message_count: 0,
-        });
+        screen.agents.push(test_agent_row(
+            "RedFox",
+            "proj-a",
+            "claude-code",
+            "opus-4.6",
+            100,
+            0,
+        ));
         // No selection → sync_focused_event produces None
         screen.sync_focused_event();
         assert!(screen.focused_synthetic.is_none());
         // Set selection → sync produces Some
         screen.table_state.selected = Some(0);
         screen.sync_focused_event();
-        assert!(screen.focused_synthetic.is_some());
+        assert!(matches!(
+            screen.focused_event(),
+            Some(crate::tui_events::MailEvent::AgentRegistered {
+                project,
+                model_name,
+                ..
+            }) if project == "proj-a" && model_name == "opus-4.6"
+        ));
         // Gate: last_selection tracks changes
         screen.last_selection = Some(0);
         let current_sel = screen.table_state.selected;
@@ -2431,19 +2518,23 @@ mod tests {
     fn sync_focused_event_refreshes_when_agent_list_changes() {
         let state = test_state();
         let mut screen = AgentsScreen::new();
-        screen.agents.push(AgentRow {
-            name: "RedFox".to_string(),
-            program: "claude-code".to_string(),
-            model: "opus-4.6".to_string(),
-            last_active_ts: 100,
-            message_count: 0,
-        });
+        screen.agents.push(test_agent_row(
+            "RedFox",
+            "proj-a",
+            "claude-code",
+            "opus-4.6",
+            100,
+            0,
+        ));
         screen.table_state.selected = Some(0);
         screen.sync_focused_event();
         assert!(matches!(
             screen.focused_event(),
-            Some(crate::tui_events::MailEvent::AgentRegistered { model_name, .. })
-                if model_name == "opus-4.6"
+            Some(crate::tui_events::MailEvent::AgentRegistered {
+                model_name,
+                project,
+                ..
+            }) if model_name == "opus-4.6" && project == "proj-a"
         ));
 
         screen.last_selection = Some(0);
@@ -2495,20 +2586,8 @@ mod tests {
         let state = test_state();
         let mut screen = AgentsScreen::new();
         screen.agents = vec![
-            AgentRow {
-                name: "AliceRiver".to_string(),
-                program: "codex-cli".to_string(),
-                model: "gpt-5".to_string(),
-                last_active_ts: 100,
-                message_count: 1,
-            },
-            AgentRow {
-                name: "BobStone".to_string(),
-                program: "claude-code".to_string(),
-                model: "opus-4.6".to_string(),
-                last_active_ts: 200,
-                message_count: 2,
-            },
+            test_agent_row("AliceRiver", "alpha", "codex-cli", "gpt-5", 100, 1),
+            test_agent_row("BobStone", "beta", "claude-code", "opus-4.6", 200, 2),
         ];
         screen.table_state.selected = Some(1);
 
