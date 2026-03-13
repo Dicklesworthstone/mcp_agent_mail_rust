@@ -15050,9 +15050,13 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 }
                 ServerToolCall::Unavailable(_) => {}
                 ServerToolCall::Rejected(message) => {
-                    return Err(CliError::Other(format!(
-                        "fetch_inbox via server failed: {message}"
-                    )));
+                    if fetch_inbox_server_rejection_allows_local_fallback(&message) {
+                        server_error = Some(message);
+                    } else {
+                        return Err(CliError::Other(format!(
+                            "fetch_inbox via server failed: {message}"
+                        )));
+                    }
                 }
             }
 
@@ -16518,7 +16522,8 @@ mod mail_server_cli_bridge_tests {
     use super::{
         CliError, ServerToolCall, classify_server_tool_call, coerce_tool_result_json,
         coerce_tool_result_json_or_error, ensure_message_in_project,
-        server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
+        fetch_inbox_server_rejection_allows_local_fallback, server_inbox_payload_to_cli_json,
+        server_message_payload_to_cli_json,
     };
 
     #[test]
@@ -16672,6 +16677,26 @@ mod mail_server_cli_bridge_tests {
             result,
             ServerToolCall::Rejected("agent not found: LegacyReceiver".to_string())
         );
+    }
+
+    #[test]
+    fn fetch_inbox_server_rejection_allows_local_fallback_for_missing_scope() {
+        assert!(fetch_inbox_server_rejection_allows_local_fallback(
+            "Agent 'LegacyReceiver' not found. Project '/tmp/legacy-project' has no registered agents yet. Use register_agent to create an agent identity first."
+        ));
+        assert!(fetch_inbox_server_rejection_allows_local_fallback(
+            "Project '/tmp/legacy-project' not found"
+        ));
+    }
+
+    #[test]
+    fn fetch_inbox_server_rejection_blocks_fallback_for_rpc_or_auth_errors() {
+        assert!(!fetch_inbox_server_rejection_allows_local_fallback(
+            "JSON-RPC error -32601: method not found; data=null"
+        ));
+        assert!(!fetch_inbox_server_rejection_allows_local_fallback(
+            "authentication failed (HTTP 401) while calling http://127.0.0.1:8765/mcp/; check AGENT_MAIL_TOKEN/HTTP_BEARER_TOKEN"
+        ));
     }
 
     #[test]
@@ -34403,6 +34428,21 @@ fn server_tool_error_is_unavailable(error: &CliError) -> bool {
         }
         _ => false,
     }
+}
+
+fn fetch_inbox_server_rejection_allows_local_fallback(message: &str) -> bool {
+    let lower = message.trim().to_ascii_lowercase();
+    if lower.is_empty()
+        || lower.starts_with("json-rpc error")
+        || lower.starts_with("authentication failed")
+        || lower.starts_with("server returned http ")
+    {
+        return false;
+    }
+
+    (lower.starts_with("project '") && lower.contains(" not found"))
+        || (lower.starts_with("agent '") && lower.contains(" not found"))
+        || lower.contains("has no registered agents yet")
 }
 
 fn classify_server_tool_call(

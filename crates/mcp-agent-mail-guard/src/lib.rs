@@ -651,7 +651,7 @@ def get_active_reservations():
         if is_expired(record.get("expires_ts"), now):
             continue
 
-        pattern = str(record.get("path_pattern", "")).strip()
+        pattern = str(record.get("path_pattern") or record.get("path") or "").strip()
         holder = str(record.get("agent_name") or record.get("agent") or "").strip()
         if not pattern or not holder or record.get("exclusive") is not True:
             continue
@@ -1353,7 +1353,12 @@ fn read_active_reservations_from_archive(
         }
 
         // Extract fields
-        let pattern = val["path_pattern"].as_str().unwrap_or("").to_string();
+        let pattern = val["path_pattern"]
+            .as_str()
+            .or_else(|| val["path"].as_str())
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
         if pattern.is_empty() {
             continue;
         }
@@ -2870,6 +2875,29 @@ mod tests {
     }
 
     #[test]
+    fn read_reservations_uses_path_field_fallback() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let archive = td.path().join("archive");
+        let res_dir = archive.join("file_reservations");
+        std::fs::create_dir_all(&res_dir).expect("mkdir");
+
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let legacy_path = serde_json::json!({
+            "path": "src/**/*.rs",
+            "agent": "LegacyPathAgent",
+            "exclusive": true,
+            "expires_ts": future.to_rfc3339(),
+            "released_ts": null
+        });
+        std::fs::write(res_dir.join("legacy-path.json"), legacy_path.to_string()).expect("write");
+
+        let records = read_active_reservations_from_archive(&archive, false).expect("read");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].path_pattern, "src/**/*.rs");
+        assert_eq!(records[0].agent_name, "LegacyPathAgent");
+    }
+
+    #[test]
     fn read_reservations_missing_agent_is_skipped() {
         let td = tempfile::TempDir::new().expect("tempdir");
         let archive = td.path().join("archive");
@@ -3123,6 +3151,7 @@ mod tests {
         assert!(script.contains("self_agent = AGENT_NAME.lower()"));
         assert!(script.contains("if holder.lower() == self_agent:"));
         assert!(script.contains("has_glob = any(c in pattern for c in \"*?[{\")"));
+        assert!(script.contains("record.get(\"path_pattern\") or record.get(\"path\")"));
         assert!(script.contains("def resolve_archive_root"));
         assert!(script.contains("project.json"));
         assert!(script.contains("STORAGE_ROOT"));

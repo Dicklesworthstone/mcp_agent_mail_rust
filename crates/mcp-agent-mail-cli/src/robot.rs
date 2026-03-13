@@ -1417,12 +1417,28 @@ fn archive_project_dir_for_key(storage_root: &Path, project_key: &str) -> Option
 
 fn archive_has_agent_profile(project_dir: &Path, agent_name: &str) -> bool {
     let agent_name = agent_name.trim();
-    !agent_name.is_empty()
-        && project_dir
-            .join("agents")
-            .join(agent_name)
-            .join("profile.json")
-            .is_file()
+    if agent_name.is_empty() {
+        return false;
+    }
+
+    let agents_dir = project_dir.join("agents");
+    let Ok(entries) = std::fs::read_dir(&agents_dir) else {
+        return false;
+    };
+
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            return false;
+        };
+        file_type.is_dir()
+            && !file_type.is_symlink()
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(agent_name)
+            && path.join("profile.json").is_file()
+    })
 }
 
 fn should_try_archive_snapshot(
@@ -5340,7 +5356,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             format_output(&env, format)?
         }
         RobotSubcommand::Agents { active, sort } => {
-            let scope = resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
+            let scope = resolve_robot_scope(args.project.as_deref(), None)?;
             let agents = build_agents(scope.conn(), scope.project_id, active, sort.as_deref())?;
 
             #[derive(Serialize)]
@@ -8737,7 +8753,7 @@ mod tests {
         let err = resolve_robot_scope_with_handle(
             RobotDbHandle::from_conn(conn),
             Some("/tmp/demo-project"),
-            Some("CoralMarsh"),
+            Some("coralmarsh"),
         )
         .err()
         .expect("local db should still miss CoralMarsh");
@@ -8745,7 +8761,7 @@ mod tests {
             should_try_archive_snapshot(
                 &err,
                 Some("/tmp/demo-project"),
-                Some("CoralMarsh"),
+                Some("coralmarsh"),
                 storage_root.path(),
             ),
             "archive snapshot should be eligible when the profile exists in the archive"
@@ -8757,7 +8773,7 @@ mod tests {
             RobotDbHandle::from_conn(local_conn),
             storage_root.path(),
             Some("/tmp/demo-project"),
-            Some("CoralMarsh"),
+            Some("coralmarsh"),
         )
         .expect("archive fallback should resolve CoralMarsh");
 

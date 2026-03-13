@@ -6,17 +6,17 @@
 //! - **Projects** — from subdirectory names under `{storage_root}/projects/`
 //!   plus optional `project.json` metadata for exact `human_key` recovery
 //! - **Agents** — from `agents/{name}/profile.json` files
+//! - **File reservations** — from `file_reservations/*.json` artifacts
 //! - **Messages** — from `messages/{YYYY}/{MM}/*.md` files (JSON frontmatter)
 //! - **Message recipients** — from the `to`, `cc`, `bcc` arrays in frontmatter
 //!
 //! The reconstructed database will be missing:
 //! - `read_ts` / `ack_ts` on `message_recipients` (no archive artifact for these)
-//! - `file_reservations` (ephemeral by design; TTL-based)
 //! - `agent_links` / contacts (handshake state not archived)
 //! - `products` / `product_project_links` (not archived)
 //!
-//! These are acceptable losses because reservations and contacts are transient,
-//! and the core data (messages + agents) is fully recovered.
+//! These are acceptable losses because contacts are transient, and the core
+//! archive-backed data is fully recovered.
 
 use crate::error::{DbError, DbResult};
 use crate::schema;
@@ -695,18 +695,23 @@ fn insert_recipient(conn: &DbConn, message_id: i64, agent_id: i64, kind: &str) -
     .map_err(|e| DbError::Sqlite(format!("insert recipient: {e}")))
 }
 
-fn discover_file_reservations(
-    conn: &DbConn,
-    reservations_dir: &Path,
-    project_id: i64,
-    agent_ids: &mut HashMap<(i64, String), i64>,
-    stats: &mut ReconstructStats,
-) -> DbResult<()> {
+struct ArchivedFileReservation {
+    reservation_id: Option<i64>,
+    agent_name: String,
+    path_pattern: String,
+    exclusive: bool,
+    reason: String,
+    created_ts: i64,
+    expires_ts: i64,
+    released_ts: Option<i64>,
+}
+
+fn reservation_artifact_paths(reservations_dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(reservations_dir) else {
-        return Ok(());
+        return Vec::new();
     };
 
-    let mut reservation_files: Vec<PathBuf> = Vec::new();
+    let mut reservation_files = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         let Ok(file_type) = entry.file_type() else {
@@ -720,108 +725,150 @@ fn discover_file_reservations(
         }
     }
     reservation_files.sort();
+    reservation_files
+}
 
-    for file_path in &reservation_files {
-        let reservation_data = match std::fs::read_to_string(file_path) {
-            Ok(data) => data,
-            Err(e) => {
-                stats.parse_errors += 1;
-                stats.warnings.push(format!(
-                    "Cannot read reservation artifact {}: {e}",
-                    file_path.display()
-                ));
-                continue;
-            }
-        };
-
-        let reservation: serde_json::Value = match serde_json::from_str(&reservation_data) {
-            Ok(value) => value,
-            Err(e) => {
-                stats.parse_errors += 1;
-                stats.warnings.push(format!(
-                    "Cannot parse reservation artifact {}: {e}",
-                    file_path.display()
-                ));
-                continue;
-            }
-        };
-
-        let Some(path_pattern) = json_str(&reservation, "path_pattern")
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-        else {
+fn parse_archived_file_reservation(
+    file_path: &Path,
+    stats: &mut ReconstructStats,
+) -> Option<ArchivedFileReservation> {
+    let reservation_data = match std::fs::read_to_string(file_path) {
+        Ok(data) => data,
+        Err(e) => {
             stats.parse_errors += 1;
             stats.warnings.push(format!(
-                "Reservation artifact {} is missing path_pattern",
+                "Cannot read reservation artifact {}: {e}",
                 file_path.display()
             ));
+            return None;
+        }
+    };
+
+    let reservation: serde_json::Value = match serde_json::from_str(&reservation_data) {
+        Ok(value) => value,
+        Err(e) => {
+            stats.parse_errors += 1;
+            stats.warnings.push(format!(
+                "Cannot parse reservation artifact {}: {e}",
+                file_path.display()
+            ));
+            return None;
+        }
+    };
+
+    let Some(path_pattern) = json_str(&reservation, "path_pattern")
+        .or_else(|| json_str(&reservation, "path"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    else {
+        stats.parse_errors += 1;
+        stats.warnings.push(format!(
+            "Reservation artifact {} is missing path_pattern/path",
+            file_path.display()
+        ));
+        return None;
+    };
+
+    let agent_name = normalized_archive_agent_name(json_str(&reservation, "agent"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let exclusive = reservation
+        .get("exclusive")
+        .and_then(|value| value.as_bool().or_else(|| value.as_i64().map(|n| n != 0)))
+        .unwrap_or(true);
+    let reason = json_str(&reservation, "reason").unwrap_or("").to_string();
+    let created_ts =
+        parse_ts_from_json(&reservation, "created_ts").unwrap_or_else(crate::now_micros);
+    let expires_ts = parse_ts_from_json(&reservation, "expires_ts").unwrap_or(created_ts);
+    let released_ts = parse_ts_from_json(&reservation, "released_ts");
+    let reservation_id = reservation
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|id| *id > 0);
+
+    Some(ArchivedFileReservation {
+        reservation_id,
+        agent_name,
+        path_pattern,
+        exclusive,
+        reason,
+        created_ts,
+        expires_ts,
+        released_ts,
+    })
+}
+
+fn insert_archived_file_reservation(
+    conn: &DbConn,
+    project_id: i64,
+    reservation: &ArchivedFileReservation,
+    file_path: &Path,
+    agent_ids: &mut HashMap<(i64, String), i64>,
+) -> DbResult<()> {
+    let agent_id = ensure_agent_exists(conn, project_id, &reservation.agent_name, agent_ids)?;
+
+    if let Some(id) = reservation.reservation_id {
+        conn.execute_sync(
+            "INSERT OR REPLACE INTO file_reservations \
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(id),
+                Value::BigInt(project_id),
+                Value::BigInt(agent_id),
+                Value::Text(reservation.path_pattern.clone()),
+                Value::BigInt(i64::from(reservation.exclusive)),
+                Value::Text(reservation.reason.clone()),
+                Value::BigInt(reservation.created_ts),
+                Value::BigInt(reservation.expires_ts),
+                reservation.released_ts.map_or(Value::Null, Value::BigInt),
+            ],
+        )
+        .map_err(|e| {
+            DbError::Sqlite(format!(
+                "reconstruct: insert file reservation {}: {e}",
+                file_path.display()
+            ))
+        })?;
+    } else {
+        conn.execute_sync(
+            "INSERT INTO file_reservations \
+             (project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(project_id),
+                Value::BigInt(agent_id),
+                Value::Text(reservation.path_pattern.clone()),
+                Value::BigInt(i64::from(reservation.exclusive)),
+                Value::Text(reservation.reason.clone()),
+                Value::BigInt(reservation.created_ts),
+                Value::BigInt(reservation.expires_ts),
+                reservation.released_ts.map_or(Value::Null, Value::BigInt),
+            ],
+        )
+        .map_err(|e| {
+            DbError::Sqlite(format!(
+                "reconstruct: insert file reservation {}: {e}",
+                file_path.display()
+            ))
+        })?;
+    }
+
+    Ok(())
+}
+
+fn discover_file_reservations(
+    conn: &DbConn,
+    reservations_dir: &Path,
+    project_id: i64,
+    agent_ids: &mut HashMap<(i64, String), i64>,
+    stats: &mut ReconstructStats,
+) -> DbResult<()> {
+    for file_path in reservation_artifact_paths(reservations_dir) {
+        let Some(reservation) = parse_archived_file_reservation(&file_path, stats) else {
             continue;
         };
-
-        let agent_name = normalized_archive_agent_name(json_str(&reservation, "agent"))
-            .unwrap_or_else(|| "unknown".to_string());
-        let agent_id = ensure_agent_exists(conn, project_id, &agent_name, agent_ids)?;
-        let exclusive = reservation
-            .get("exclusive")
-            .and_then(|value| value.as_bool().or_else(|| value.as_i64().map(|n| n != 0)))
-            .unwrap_or(true);
-        let reason = json_str(&reservation, "reason").unwrap_or("").to_string();
-        let created_ts =
-            parse_ts_from_json(&reservation, "created_ts").unwrap_or_else(crate::now_micros);
-        let expires_ts = parse_ts_from_json(&reservation, "expires_ts").unwrap_or(created_ts);
-        let released_ts = parse_ts_from_json(&reservation, "released_ts");
-        let reservation_id = reservation
-            .get("id")
-            .and_then(serde_json::Value::as_i64)
-            .filter(|id| *id > 0);
-
-        if let Some(id) = reservation_id {
-            conn.execute_sync(
-                "INSERT OR REPLACE INTO file_reservations \
-                 (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                &[
-                    Value::BigInt(id),
-                    Value::BigInt(project_id),
-                    Value::BigInt(agent_id),
-                    Value::Text(path_pattern),
-                    Value::BigInt(i64::from(exclusive)),
-                    Value::Text(reason),
-                    Value::BigInt(created_ts),
-                    Value::BigInt(expires_ts),
-                    released_ts.map_or(Value::Null, Value::BigInt),
-                ],
-            )
-            .map_err(|e| {
-                DbError::Sqlite(format!(
-                    "reconstruct: insert file reservation {}: {e}",
-                    file_path.display()
-                ))
-            })?;
-        } else {
-            conn.execute_sync(
-                "INSERT INTO file_reservations \
-                 (project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                &[
-                    Value::BigInt(project_id),
-                    Value::BigInt(agent_id),
-                    Value::Text(path_pattern),
-                    Value::BigInt(i64::from(exclusive)),
-                    Value::Text(reason),
-                    Value::BigInt(created_ts),
-                    Value::BigInt(expires_ts),
-                    released_ts.map_or(Value::Null, Value::BigInt),
-                ],
-            )
-            .map_err(|e| {
-                DbError::Sqlite(format!(
-                    "reconstruct: insert file reservation {}: {e}",
-                    file_path.display()
-                ))
-            })?;
-        }
+        insert_archived_file_reservation(conn, project_id, &reservation, &file_path, agent_ids)?;
     }
 
     Ok(())
@@ -2434,6 +2481,20 @@ body
             reservation_json,
         )
         .expect("write mirrored reservation artifact");
+        std::fs::write(
+            reservations_dir.join("id-905.json"),
+            r#"{
+                "id": 905,
+                "project": "/reservation-project",
+                "agent": "BlueLake",
+                "path": "crates/mcp-agent-mail-db/src/reconstruct.rs",
+                "exclusive": false,
+                "reason": "python-compat",
+                "created_ts": "2026-03-13T21:40:00Z",
+                "expires_ts": "2026-03-13T23:40:00Z"
+            }"#,
+        )
+        .expect("write python-format reservation artifact");
 
         let db_path = db_dir.path().join("reconstruct_reservations.sqlite3");
         reconstruct_from_archive(&db_path, storage_root.path()).expect("reconstruct");
@@ -2449,11 +2510,7 @@ body
             )
             .expect("query reservations");
 
-        assert_eq!(
-            rows.len(),
-            1,
-            "mirrored reservation artifacts should dedupe"
-        );
+        assert_eq!(rows.len(), 2, "reconstruction should recover both formats");
         assert_eq!(rows[0].get_named::<i64>("id").unwrap(), 904);
         assert_eq!(
             rows[0].get_named::<String>("agent_name").unwrap(),
@@ -2465,6 +2522,20 @@ body
         );
         assert_eq!(rows[0].get_named::<i64>("exclusive").unwrap(), 1);
         assert_eq!(rows[0].get_named::<String>("reason").unwrap(), "br-q0e0u");
+        assert_eq!(rows[1].get_named::<i64>("id").unwrap(), 905);
+        assert_eq!(
+            rows[1].get_named::<String>("agent_name").unwrap(),
+            "BlueLake"
+        );
+        assert_eq!(
+            rows[1].get_named::<String>("path_pattern").unwrap(),
+            "crates/mcp-agent-mail-db/src/reconstruct.rs"
+        );
+        assert_eq!(rows[1].get_named::<i64>("exclusive").unwrap(), 0);
+        assert_eq!(
+            rows[1].get_named::<String>("reason").unwrap(),
+            "python-compat"
+        );
     }
 
     #[allow(clippy::too_many_lines)]

@@ -2963,6 +2963,8 @@ mod tests {
         };
         screen.focus = AnalyticsFocus::Detail;
         screen.detail_focus_available.set(true);
+        // Set a high max so the clamp does not suppress the scroll.
+        screen.last_detail_max_scroll.set(100);
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('j'))), &state);
         assert_eq!(screen.selected, 0);
@@ -3377,6 +3379,8 @@ mod tests {
     fn scroll_detail_down_increments() {
         let mut screen = AnalyticsScreen::new();
         screen.detail_scroll = 0;
+        // Set a high max so the clamp does not suppress the scroll.
+        screen.last_detail_max_scroll.set(100);
         screen.scroll_detail_down();
         assert_eq!(screen.detail_scroll, 1);
         screen.scroll_detail_down();
@@ -3597,6 +3601,9 @@ mod tests {
         let mut pool = ftui::GraphemePool::new();
         let mut frame = Frame::new(140, 30, &mut pool);
         screen.view(&mut frame, Rect::new(0, 0, 140, 30), &state);
+        // Override the layout-derived max so the fast-scroll range is
+        // not clamped by the compact test viewport.
+        screen.last_detail_max_scroll.set(100);
 
         screen.update(&Event::Key(ftui::KeyEvent::new(KeyCode::Char('J'))), &state);
         assert_eq!(screen.detail_scroll, 5);

@@ -520,10 +520,12 @@ impl AgentsScreen {
             return;
         }
         let len = self.agents.len();
-        let current = match self.table_state.selected {
-            Some(selected) => selected,
-            None if delta > 0 => 0,
-            None => len - 1,
+        // First press with no selection: jump to the boundary without
+        // applying the delta so that Down → first item, Up → last item.
+        let Some(current) = self.table_state.selected else {
+            self.table_state.selected = Some(if delta > 0 { 0 } else { len - 1 });
+            self.detail_scroll = 0;
+            return;
         };
         let next = if delta > 0 {
             current.saturating_add(delta.unsigned_abs()).min(len - 1)
@@ -2241,8 +2243,11 @@ mod tests {
         screen.cached_now_ts = chrono::Utc::now().timestamp_micros();
         screen.rebuild_from_state(&state);
         let (active, _idle, inactive) = screen.cached_status_counts;
-        assert_eq!(active, 1);
-        assert_eq!(inactive, 1);
+        assert_eq!(
+            active, 1,
+            "recent last_active_ts should be counted as active"
+        );
+        assert_eq!(inactive, 0, "no agents should be inactive");
     }
 
     #[test]

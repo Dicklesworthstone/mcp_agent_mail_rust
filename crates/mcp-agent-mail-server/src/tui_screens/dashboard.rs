@@ -12,7 +12,7 @@ use ftui::layout::Rect;
 use ftui::text::{Line, Span, Text};
 use ftui::widgets::Widget;
 use ftui::widgets::block::Block;
-use ftui::widgets::borders::BorderType;
+use ftui::widgets::borders::{BorderType, Borders};
 use ftui::widgets::paragraph::Paragraph;
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba};
 use ftui_extras::canvas::{Canvas, Mode, Painter};
@@ -7477,8 +7477,6 @@ mod tests {
         let mut frame = Frame::new(200, 50, &mut pool);
         screen.view(&mut frame, Rect::new(0, 0, 200, 50), &state);
         let text = frame_text(&frame);
-
-
 
         assert!(
             text.contains("6578"),
