@@ -154,13 +154,20 @@ fn ensure_export_features_supported(config: &ExportConfig) -> Result<(), String>
 }
 
 fn ensure_output_dir_empty(output_dir: &Path) -> Result<(), String> {
-    if !output_dir.exists() {
-        return Ok(());
+    let metadata = match fs::symlink_metadata(output_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!("stat output dir {}: {error}", output_dir.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "static export output path must not be a symlink: {}",
+            output_dir.display()
+        ));
     }
-
-    let metadata = fs::metadata(output_dir)
-        .map_err(|e| format!("stat output dir {}: {e}", output_dir.display()))?;
-    if !metadata.is_dir() {
+    if !metadata.file_type().is_dir() {
         return Err(format!(
             "static export output path is not a directory: {}",
             output_dir.display()
@@ -682,16 +689,71 @@ fn emit_hosting_files(
 
 fn write_html(dest: &Path, html: &str) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        ensure_real_directory(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    if fs::symlink_metadata(dest).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(format!(
+            "refusing to write through symlinked export path {}",
+            dest.display()
+        ));
     }
     fs::write(dest, html.as_bytes()).map_err(|e| format!("write {}: {e}", dest.display()))
 }
 
 fn write_to_file(dest: &Path, data: &[u8]) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        ensure_real_directory(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    if fs::symlink_metadata(dest).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(format!(
+            "refusing to write through symlinked export path {}",
+            dest.display()
+        ));
     }
     fs::write(dest, data).map_err(|e| format!("write {}: {e}", dest.display()))
+}
+
+fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        use std::path::Component;
+
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(std::io::Error::other(format!(
+                    "refusing to create directory with parent traversal: {}",
+                    path.display()
+                )));
+            }
+            Component::Normal(segment) => {
+                current.push(segment);
+                match fs::symlink_metadata(&current) {
+                    Ok(metadata) => {
+                        if metadata.file_type().is_symlink() {
+                            return Err(std::io::Error::other(format!(
+                                "refusing to traverse symlinked export directory {}",
+                                current.display()
+                            )));
+                        }
+                        if !metadata.file_type().is_dir() {
+                            return Err(std::io::Error::other(format!(
+                                "expected export directory but found non-directory {}",
+                                current.display()
+                            )));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        fs::create_dir(&current)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn write_and_record(
@@ -959,6 +1021,22 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ensure_output_dir_empty_rejects_symlink_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_output = dir.path().join("real-output");
+        std::fs::create_dir(&real_output).unwrap();
+        let symlink_output = dir.path().join("output-link");
+        symlink(&real_output, &symlink_output).unwrap();
+
+        let err = ensure_output_dir_empty(&symlink_output)
+            .expect_err("symlinked output dir should be rejected");
+        assert!(err.contains("must not be a symlink"));
+    }
+
     #[test]
     fn write_and_record_creates_file() {
         let dir = PathBuf::from("/tmp/static_export_test_write");
@@ -971,6 +1049,24 @@ mod tests {
         assert_eq!(files["test.txt"].route, "/test");
         assert_eq!(fs::read_to_string(dir.join("test.txt")).unwrap(), "hello");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_and_record_rejects_symlinked_descendant_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("output");
+        fs::create_dir_all(&output).unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, output.join("nested")).unwrap();
+
+        let mut files = BTreeMap::new();
+        let err = write_and_record(&output, "nested/test.txt", b"hello", "/test", &mut files)
+            .expect_err("symlinked descendant directory should be rejected");
+        assert!(err.contains("symlinked export directory"));
     }
 
     #[test]
