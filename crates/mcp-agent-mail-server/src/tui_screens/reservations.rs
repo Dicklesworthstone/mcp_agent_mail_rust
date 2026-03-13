@@ -615,7 +615,7 @@ impl ReservationsScreen {
             }
         };
 
-        let conn = match crate::open_server_sync_db_connection(&path) {
+        let conn = match crate::open_interactive_sync_db_connection(&path) {
             Ok(conn) => conn,
             Err(err) => {
                 self.fallback_issue = Some(format!(

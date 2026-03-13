@@ -664,7 +664,7 @@ fn fetch_db_stats_with_connection(
     Some(DbPollSnapshotUpdate::Snapshot(snapshot))
 }
 
-fn snapshot_is_empty(snapshot: &DbStatSnapshot) -> bool {
+const fn snapshot_is_empty(snapshot: &DbStatSnapshot) -> bool {
     snapshot.projects == 0
         && snapshot.agents == 0
         && snapshot.messages == 0
@@ -946,7 +946,7 @@ fn refill_missing_detail_lists_from_sqlite(
     let Some(sqlite_path) = sqlite_path else {
         return;
     };
-    let Ok(conn) = crate::open_server_sync_db_connection(sqlite_path) else {
+    let Ok(conn) = crate::open_best_effort_sync_db_connection(sqlite_path) else {
         return;
     };
 

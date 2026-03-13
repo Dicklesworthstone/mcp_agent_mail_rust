@@ -1512,6 +1512,13 @@ pub fn is_corruption_error_message(message: &str) -> bool {
         || lower.contains("malformed database schema")
         || lower.contains("database schema is corrupt")
         || lower.contains("file is not a database")
+        || lower.contains("database file too small for header")
+        || lower.contains("invalid database header")
+        || lower.contains("invalid database header magic")
+        || lower.contains("invalid page size")
+        || lower.contains("malformed page")
+        || lower.contains("page checksum mismatch")
+        || lower.contains("header checksum mismatch")
         || lower.contains("no healthy backup was found")
 }
 
@@ -2765,7 +2772,7 @@ mod tests {
             .expect("hold reserved sqlite lock");
 
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
-        let pool_for_thread = pool.clone();
+        let pool_for_thread = pool;
         let acquire_thread = std::thread::spawn(move || {
             let rt = RuntimeBuilder::current_thread()
                 .build()
@@ -3599,6 +3606,12 @@ mod tests {
         ));
         assert!(is_corruption_error_message("database schema is corrupt"));
         assert!(is_corruption_error_message("file is not a database"));
+        assert!(is_corruption_error_message(
+            "database file too small for header: 14 bytes (< 100)"
+        ));
+        assert!(is_corruption_error_message(
+            "page 12: xxh3 page checksum mismatch"
+        ));
         assert!(is_corruption_error_message(
             "database file tmp/storage.sqlite3 is malformed and no healthy backup was found"
         ));

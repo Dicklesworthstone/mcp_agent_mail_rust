@@ -193,7 +193,13 @@ pub fn is_corruption_error(msg: &str) -> bool {
         || lower.contains("malformed database schema")
         || lower.contains("database schema is corrupt")
         || lower.contains("file is not a database")
+        || lower.contains("database file too small for header")
+        || lower.contains("invalid database header")
+        || lower.contains("invalid database header magic")
+        || lower.contains("invalid page size")
         || lower.contains("malformed page")
+        || lower.contains("page checksum mismatch")
+        || lower.contains("header checksum mismatch")
 }
 
 /// Check whether an error message indicates pool exhaustion.
@@ -512,6 +518,11 @@ mod tests {
         assert!(is_corruption_error("malformed database schema: agents"));
         assert!(is_corruption_error("database schema is corrupt"));
         assert!(is_corruption_error("file is not a database"));
+        assert!(is_corruption_error(
+            "database file too small for header: 14 bytes (< 100)"
+        ));
+        assert!(is_corruption_error("invalid database header: bad magic"));
+        assert!(is_corruption_error("page 12: xxh3 page checksum mismatch"));
         assert!(is_corruption_error("malformed page 42 in btree"));
     }
 

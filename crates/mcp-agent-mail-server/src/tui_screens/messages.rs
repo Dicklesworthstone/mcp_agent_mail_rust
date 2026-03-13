@@ -1189,7 +1189,7 @@ impl MessageBrowserScreen {
         MESSAGE_URGENT_PULSE_ON.store(pulse_on, Ordering::Relaxed);
     }
 
-    fn compose_project_slug(&self) -> Option<String> {
+    fn compose_project_slug_from_context(&self) -> Option<String> {
         match &self.inbox_mode {
             InboxMode::Local(slug) if !slug.is_empty() && slug != "default" => {
                 return Some(slug.clone());
@@ -1203,7 +1203,7 @@ impl MessageBrowserScreen {
             return Some(entry.project_slug.clone());
         }
 
-        self.latest_project_slug()
+        None
     }
 
     fn latest_project_slug(&self) -> Option<String> {
@@ -1215,9 +1215,9 @@ impl MessageBrowserScreen {
             .and_then(|row| row.get_named::<String>("slug").ok())
     }
 
-    fn load_agent_names_for_project(&self, project_slug: &str) -> Vec<String> {
+    fn load_agent_names_for_project(&self, project_slug: &str) -> Result<Vec<String>, String> {
         let Some(conn) = &self.db_conn else {
-            return Vec::new();
+            return Err("Database connection unavailable".to_string());
         };
         let sql = "SELECT a.name AS name \
              FROM agents a \
@@ -1226,13 +1226,24 @@ impl MessageBrowserScreen {
              ORDER BY a.name";
         let params = vec![Value::Text(project_slug.to_string())];
         conn.query_sync(sql, &params)
-            .ok()
+            .map_err(|err| format!("Failed to load agents for compose: {err}"))
             .map(|rows| {
                 rows.into_iter()
                     .filter_map(|row| row.get_named::<String>("name").ok())
                     .collect()
             })
-            .unwrap_or_default()
+    }
+
+    fn open_compose_error_form(
+        &mut self,
+        project_slug: String,
+        prefill_to: Option<String>,
+        error: String,
+    ) {
+        let mut form = ComposeFormState::new(project_slug, prefill_to, Vec::new());
+        form.errors.general = Some(error);
+        self.quick_reply_form = None;
+        self.compose_form = Some(form);
     }
 
     fn open_compose_modal(&mut self, state: Option<&TuiSharedState>, prefill_to: Option<String>) {
@@ -1242,22 +1253,42 @@ impl MessageBrowserScreen {
             } else {
                 let cfg = DbPoolConfig::from_env();
                 if let Ok(path) = cfg.sqlite_path() {
-                    self.db_conn = crate::open_server_sync_db_connection(&path).ok();
+                    self.db_conn = crate::open_interactive_sync_db_connection(&path).ok();
                     self.db_conn_attempted = true;
                 }
             }
         }
-        let Some(project_slug) = self.compose_project_slug() else {
-            let mut form = ComposeFormState::new(String::new(), prefill_to, Vec::new());
-            form.errors.general = Some(
+        let project_slug = if let Some(project_slug) = self.compose_project_slug_from_context() {
+            project_slug
+        } else if let Some(project_slug) = self.latest_project_slug() {
+            project_slug
+        } else {
+            if self.db_conn.is_none() {
+                self.db_conn_attempted = false;
+                self.open_compose_error_form(
+                    String::new(),
+                    prefill_to,
+                    "Database connection unavailable".to_string(),
+                );
+                return;
+            }
+            self.open_compose_error_form(
+                String::new(),
+                prefill_to,
                 "Unable to determine project for compose. Select a message first or switch to Local mode."
                     .to_string(),
             );
-            self.compose_form = Some(form);
             return;
         };
 
-        let agents = self.load_agent_names_for_project(&project_slug);
+        let agents = match self.load_agent_names_for_project(&project_slug) {
+            Ok(agents) => agents,
+            Err(error) => {
+                self.db_conn_attempted = false;
+                self.open_compose_error_form(project_slug, prefill_to, error);
+                return;
+            }
+        };
         let mut form = ComposeFormState::new(project_slug, prefill_to, agents);
         if form.available_agents.is_empty() {
             form.errors.general = Some(
@@ -1265,6 +1296,7 @@ impl MessageBrowserScreen {
                     .to_string(),
             );
         }
+        self.quick_reply_form = None;
         self.compose_form = Some(form);
     }
 
@@ -1280,7 +1312,7 @@ impl MessageBrowserScreen {
         }
         let cfg = DbPoolConfig::from_env();
         if let Ok(path) = cfg.sqlite_path() {
-            self.db_conn = crate::open_server_sync_db_connection(&path).ok();
+            self.db_conn = crate::open_interactive_sync_db_connection(&path).ok();
             self.db_conn_attempted = true;
         }
     }
@@ -2486,7 +2518,7 @@ impl MessageBrowserScreen {
             ..Default::default()
         };
         if let Ok(path) = cfg.sqlite_path() {
-            self.db_conn = crate::open_server_sync_db_connection(&path).ok();
+            self.db_conn = crate::open_interactive_sync_db_connection(&path).ok();
         }
     }
 
@@ -7193,6 +7225,46 @@ mod tests {
         assert!(handled);
         let form = screen.compose_form.expect("compose form");
         assert_eq!(form.to_input.value(), "BlueLake");
+    }
+
+    #[test]
+    fn receive_deep_link_compose_clears_quick_reply_modal() {
+        let mut screen = MessageBrowserScreen::new();
+        let entry = test_message_entry(77, "thread-77", "Escalation update");
+        screen.quick_reply_form = QuickReplyFormState::from_entry(&entry);
+
+        let handled =
+            screen.receive_deep_link(&DeepLinkTarget::ComposeToAgent("BlueLake".to_string()));
+
+        assert!(handled);
+        assert!(screen.quick_reply_form.is_none());
+        let form = screen.compose_form.expect("compose form");
+        assert_eq!(form.to_input.value(), "BlueLake");
+    }
+
+    #[test]
+    fn load_agent_names_for_project_requires_database_connection() {
+        let screen = MessageBrowserScreen::new();
+        let err = screen
+            .load_agent_names_for_project("proj")
+            .expect_err("expected missing-connection error");
+        assert_eq!(err, "Database connection unavailable");
+    }
+
+    #[test]
+    fn open_compose_modal_without_project_context_and_db_reports_database_unavailable() {
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+        let mut screen = MessageBrowserScreen::new();
+        screen.db_conn_attempted = true;
+
+        screen.open_compose_modal(Some(&state), None);
+
+        let form = screen.compose_form.expect("compose form");
+        assert_eq!(
+            form.errors.general.as_deref(),
+            Some("Database connection unavailable")
+        );
+        assert!(!screen.db_conn_attempted);
     }
 
     #[test]

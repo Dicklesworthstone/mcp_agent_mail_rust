@@ -192,7 +192,7 @@ pub struct ProjectsScreen {
     db_context_unavailable: bool,
     /// Banner copy explaining why poller-driven data is unavailable.
     db_context_banner: &'static str,
-    /// Latest db_stats generation that this screen has actually rebuilt from.
+    /// Latest `db_stats` generation that this screen has actually rebuilt from.
     applied_db_stats_gen: u64,
 }
 

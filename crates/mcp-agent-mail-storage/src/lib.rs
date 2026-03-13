@@ -2900,6 +2900,13 @@ fn lock_file_age_seconds(lock_path: &Path) -> Option<f64> {
 /// 3. If the PID is dead (or no owner file), use age-based threshold
 ///
 /// Returns `true` if a stale lock was removed.
+pub fn clean_stale_git_index_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
+    try_clean_stale_git_lock(repo_root, max_age_seconds)
+}
+
+/// Try to clean up a stale `.git/index.lock` file with PID-aware safety.
+///
+/// See [`clean_stale_git_index_lock`] for the supported cleanup semantics.
 fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
     let lock_path = repo_root.join(".git").join("index.lock");
     if !lock_path.exists() {

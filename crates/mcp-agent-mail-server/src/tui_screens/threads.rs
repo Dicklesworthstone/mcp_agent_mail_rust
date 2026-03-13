@@ -718,7 +718,7 @@ impl ThreadExplorerScreen {
             ..Default::default()
         };
         if let Ok(path) = cfg.sqlite_path() {
-            self.db_conn = crate::open_server_sync_db_connection(&path).ok();
+            self.db_conn = crate::open_interactive_sync_db_connection(&path).ok();
         }
         self.db_context_unavailable = self.db_conn.is_none();
     }

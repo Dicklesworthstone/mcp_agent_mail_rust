@@ -92,7 +92,9 @@ pub use pool::{
     is_sqlite_recovery_error_message, open_sqlite_file_with_recovery,
 };
 pub use queries::{MvccRetryMetrics, mvcc_retry_metrics};
-pub use reconstruct::{ReconstructStats, reconstruct_from_archive};
+pub use reconstruct::{
+    ReconstructStats, reconstruct_from_archive, reconstruct_from_archive_with_salvage,
+};
 pub use retry::{
     CIRCUIT_BREAKER, CIRCUIT_DB, CIRCUIT_GIT, CIRCUIT_LLM, CIRCUIT_SIGNAL, CircuitBreaker,
     CircuitState, DbHealthStatus, RetryConfig, Subsystem, SubsystemCircuitStatus, circuit_for,

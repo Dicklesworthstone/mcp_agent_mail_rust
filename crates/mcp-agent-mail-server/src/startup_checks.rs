@@ -653,7 +653,7 @@ fn listener_host_matches_request(listener_host: &str, requested_host: &str) -> b
     let requested_host = normalize_socket_host(requested_host);
 
     if is_wildcard_host(&requested_host) {
-        return is_wildcard_host(&listener_host);
+        return wildcard_request_conflicts_with_listener(&listener_host, &requested_host);
     }
     if is_wildcard_host(&listener_host) {
         return true;
@@ -670,6 +670,22 @@ fn listener_host_matches_request(listener_host: &str, requested_host: &str) -> b
     ) {
         (Some(listener_ip), Some(requested_ip)) => listener_ip == requested_ip,
         _ => listener_host.eq_ignore_ascii_case(&requested_host),
+    }
+}
+
+fn wildcard_request_conflicts_with_listener(listener_host: &str, requested_host: &str) -> bool {
+    if is_wildcard_host(listener_host) || listener_host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    match (
+        parse_canonical_ip(listener_host),
+        parse_canonical_ip(requested_host),
+    ) {
+        (Some(listener_ip), Some(requested_ip)) => listener_ip.is_ipv4() == requested_ip.is_ipv4(),
+        // Be conservative for named hosts: if we cannot prove they do not conflict,
+        // keep them in the candidate set so restart logic can inspect the listener PID.
+        _ => true,
     }
 }
 
@@ -1881,9 +1897,8 @@ mod tests {
 
     #[test]
     fn check_port_status_accepts_raw_ipv6_loopback_host() {
-        let listener = match TcpListener::bind("[::1]:0") {
-            Ok(listener) => listener,
-            Err(_) => return,
+        let Ok(listener) = TcpListener::bind("[::1]:0") else {
+            return;
         };
         let port = listener.local_addr().expect("listener addr").port();
         drop(listener);
@@ -2090,6 +2105,21 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn parse_ss_port_holder_pids_for_wildcard_request_matches_specific_conflicting_hosts() {
+        let output = concat!(
+            "LISTEN 0 4096 127.0.0.1:8765 0.0.0.0:* users:((\"am\",pid=1234,fd=7))\n",
+            "LISTEN 0 4096 127.0.0.2:8765 0.0.0.0:* users:((\"am\",pid=5678,fd=8))\n",
+            "LISTEN 0 4096 [::1]:8765 [::]:* users:((\"am\",pid=9999,fd=9))\n"
+        );
+        assert_eq!(
+            parse_ss_port_holder_pids_for_host(output, "0.0.0.0"),
+            vec![1234, 5678]
+        );
+        assert_eq!(parse_ss_port_holder_pids_for_host(output, "::"), vec![9999]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn parse_proc_stat_state_extracts_state_after_command_name() {
         assert_eq!(parse_proc_stat_state("123 (am) T 1 2 3 4"), Some('T'));
         assert_eq!(
@@ -2126,7 +2156,7 @@ mod tests {
     }
 
     #[test]
-    fn listener_host_matches_request_handles_loopback_wildcard_and_ipv4_mapped_ipv6() {
+    fn listener_host_matches_request_handles_conflicting_listener_hosts() {
         assert!(listener_host_matches_request("*", "127.0.0.1"));
         assert!(listener_host_matches_request("0.0.0.0", "127.0.0.1"));
         assert!(listener_host_matches_request("::", "127.0.0.1"));
@@ -2136,8 +2166,9 @@ mod tests {
         ));
         assert!(listener_host_matches_request("127.0.0.1", "localhost"));
         assert!(!listener_host_matches_request("127.0.0.2", "127.0.0.1"));
-        assert!(!listener_host_matches_request("127.0.0.1", "0.0.0.0"));
-        assert!(!listener_host_matches_request("::1", "::"));
+        assert!(listener_host_matches_request("127.0.0.1", "0.0.0.0"));
+        assert!(!listener_host_matches_request("::1", "0.0.0.0"));
+        assert!(listener_host_matches_request("::1", "::"));
     }
 
     #[test]

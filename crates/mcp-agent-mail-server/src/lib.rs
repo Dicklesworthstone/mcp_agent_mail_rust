@@ -1528,27 +1528,41 @@ fn startup_readiness_fast_path_active() -> bool {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SERVER_SYNC_DB_BUSY_TIMEOUT_MS: u32 = 60_000;
+// Interactive TUI and web-UI surfaces should degrade quickly under lock
+// contention instead of blocking the operator behind minute-long waits.
+pub(crate) const INTERACTIVE_SYNC_DB_BUSY_TIMEOUT_MS: u32 = 1_000;
 // The TUI poller and observability paths must tolerate short-lived writer bursts
 // without degrading into chronic "counts present, detail rows missing" snapshots.
 pub(crate) const BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS: u32 = 5_000;
 
-pub(crate) fn open_server_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
+fn open_sync_db_connection_with_busy_timeout(
+    path: &str,
+    busy_timeout_ms: u32,
+) -> std::io::Result<DbConn> {
     let conn = DbConn::open_file(path)
         .map_err(|err| std::io::Error::other(format!("open sqlite file {path}: {err}")))?;
-    let _ = conn.execute_raw(&format!(
-        "PRAGMA busy_timeout = {SERVER_SYNC_DB_BUSY_TIMEOUT_MS};"
-    ));
+    conn.execute_raw(&format!("PRAGMA busy_timeout = {busy_timeout_ms};"))
+        .map_err(|err| {
+            std::io::Error::other(format!(
+                "configure sqlite busy_timeout={busy_timeout_ms} on {path}: {err}"
+            ))
+        })?;
     Ok(conn)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn open_server_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
+    open_sync_db_connection_with_busy_timeout(path, SERVER_SYNC_DB_BUSY_TIMEOUT_MS)
+}
+
+pub(crate) fn open_interactive_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
+    open_sync_db_connection_with_busy_timeout(path, INTERACTIVE_SYNC_DB_BUSY_TIMEOUT_MS)
+}
+
 pub(crate) fn open_best_effort_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
-    let conn = DbConn::open_file(path)
-        .map_err(|err| std::io::Error::other(format!("open sqlite file {path}: {err}")))?;
-    let _ = conn.execute_raw(&format!(
-        "PRAGMA busy_timeout = {BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS};"
-    ));
-    Ok(conn)
+    open_sync_db_connection_with_busy_timeout(path, BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS)
 }
 
 fn tui_readiness_warmup_failure_message(error: &str) -> String {
@@ -15623,6 +15637,27 @@ mod tests {
             })
             .unwrap_or_default();
         assert_eq!(configured, i64::from(SERVER_SYNC_DB_BUSY_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn open_interactive_sync_db_connection_uses_interactive_busy_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("interactive-busy-timeout.db");
+        let conn =
+            open_interactive_sync_db_connection(&db_path.display().to_string()).expect("open");
+
+        let configured = conn
+            .query_sync("PRAGMA busy_timeout", &[])
+            .expect("pragma query")
+            .into_iter()
+            .next()
+            .and_then(|row| {
+                row.get_named::<i64>("timeout")
+                    .ok()
+                    .or_else(|| row.get_as(0).ok())
+            })
+            .unwrap_or_default();
+        assert_eq!(configured, i64::from(INTERACTIVE_SYNC_DB_BUSY_TIMEOUT_MS));
     }
 
     #[test]

@@ -273,7 +273,7 @@ pub struct AgentsScreen {
     db_context_unavailable: bool,
     /// Banner copy explaining why poller-driven data is unavailable.
     db_context_banner: &'static str,
-    /// Latest db_stats generation that this screen has actually rebuilt from.
+    /// Latest `db_stats` generation that this screen has actually rebuilt from.
     applied_db_stats_gen: u64,
     // ── Cached derived data (computed once per rebuild, reused in render) ──
     /// Cached (active, idle, inactive) agent counts.
@@ -352,6 +352,7 @@ impl AgentsScreen {
             });
     }
 
+    #[allow(clippy::too_many_lines)]
     fn rebuild_from_state(&mut self, state: &TuiSharedState) {
         let (db, db_stats_gen) = state.db_stats_snapshot_with_generation();
         let cfg = state.config_snapshot();

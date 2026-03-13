@@ -959,7 +959,7 @@ Verification checklist:
 
 ## Mailbox Diagnostics (`am doctor`)
 
-Over time, mailbox state can drift: stale locks from crashed processes, orphaned records, FTS index desync, expired reservations piling up. The `doctor` command group detects and repairs these issues.
+Over time, mailbox state can drift: stale locks from crashed processes, unresponsive local servers, MCP config skew, archive/SQLite divergence, orphaned rows, FTS index desync, or outright database corruption. The `doctor` command group detects these issues, explains what it found, and can now automatically apply the common fixes.
 
 ```bash
 # Run diagnostics (fast, non-destructive)
@@ -972,6 +972,13 @@ am doctor repair --dry-run      # Preview what would change
 am doctor repair                # Apply safe fixes, prompt for data fixes
 am doctor repair --yes          # Auto-confirm everything (CI/automation)
 
+# Archive-first recovery
+am doctor reconstruct           # Rebuild SQLite from the Git archive (+ salvage what it can)
+
+# Full auto-remediation
+am doctor fix --dry-run         # Preview all safe/automatic fixes
+am doctor fix --yes             # Apply them without prompting
+
 # Backup management
 am doctor backups               # List available backups
 am doctor restore /path/to/backup.sqlite3
@@ -981,14 +988,15 @@ What `check` inspects:
 
 | Check | Detects |
 |-------|---------|
-| Locks | Stale `.archive.lock` / `.commit.lock` from crashed processes |
-| Database | SQLite corruption via `PRAGMA integrity_check` |
-| Orphaned records | Message recipients without corresponding agents |
-| FTS index | Message count vs FTS index entry mismatch |
-| File reservations | Expired reservations pending cleanup |
-| WAL files | Orphan SQLite WAL/SHM files |
+| Local runtime | Port ownership, `/health`, JSON-RPC `health_check`, and runaway `mcp-agent-mail` CPU usage |
+| MCP config | Legacy stdio/Python launcher entries, wrong HTTP URLs, missing Codex timeout settings |
+| Database file sanity | Missing/zero-byte files, malformed relative paths, corruption signatures, reopen probe failures |
+| Archive vs DB parity | Cases where Git-backed canonical mail artifacts are ahead of SQLite and a reconstruct is safer than repair |
+| Database integrity | `PRAGMA integrity_check`, foreign-key violations, orphaned recipient rows, missing core tables |
+| Search/index state | FTS table presence and rebuildability |
+| Storage/runtime hygiene | Stale archive locks, WAL mode, expired reservations, writable storage root |
 
-The repair command applies safe fixes (stale locks, expired reservations) automatically and prompts before data-affecting changes (orphan cleanup, FTS rebuild). A backup is always created before any modifications.
+`am doctor repair` is the in-place path: it creates a backup, cleans orphaned rows, rebuilds FTS, and runs `VACUUM`/`ANALYZE`. `am doctor reconstruct` is the archive-first disaster-recovery path: it quarantines the bad database, rebuilds a fresh SQLite index from the Git archive, and merges any salvageable rows recovered from the old file. `am doctor fix` sits above both: it runs the full diagnostic pass, repairs MCP config and shell integration issues, removes stale archive lockfiles, enables WAL when needed, stops unhealthy local Agent Mail processes when the runtime health probes fail, and chooses between repair vs reconstruction based on what the probes found.
 
 ---
 

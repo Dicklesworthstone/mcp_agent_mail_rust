@@ -2527,7 +2527,7 @@ fn load_recipes(pool: &DbPool) -> Vec<RecipeView> {
     if path == ":memory:" {
         return Vec::new();
     }
-    let Ok(conn) = crate::open_server_sync_db_connection(path) else {
+    let Ok(conn) = crate::open_interactive_sync_db_connection(path) else {
         return Vec::new();
     };
     let recipes = mcp_agent_mail_db::search_recipes::list_recipes(&conn).unwrap_or_default();

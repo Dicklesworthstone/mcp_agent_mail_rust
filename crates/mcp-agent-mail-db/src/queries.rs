@@ -1175,7 +1175,7 @@ fn is_mvcc_error(e: &DbError) -> bool {
     )
 }
 
-/// Check if a [`DbError`] is a plain SQLite write-contention failure.
+/// Check if a [`DbError`] is a plain `SQLite` write-contention failure.
 ///
 /// This intentionally stays narrower than [`crate::error::is_lock_error`]:
 /// we retry lock/busy contention, but we do not loop on broader open/I/O
@@ -1199,7 +1199,7 @@ fn is_plain_write_contention_error(e: &DbError) -> bool {
 /// `BEGIN CONCURRENT` conflicts cannot be retried in-place at the failed
 /// statement or `COMMIT`; the entire transaction body must restart from the
 /// beginning so reads are re-bound against the latest snapshot. The helper also
-/// retries plain SQLite busy/locked contention for the same reason: once a
+/// retries plain `SQLite` busy/locked contention for the same reason: once a
 /// write transaction has failed mid-flight, retrying a single statement is not
 /// sufficient to guarantee a coherent outcome.
 async fn run_with_mvcc_retry<T, F, Fut>(
@@ -9870,7 +9870,7 @@ mod tests {
             .expect("hold reserved sqlite lock");
 
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
-        let pool_for_thread = pool.clone();
+        let pool_for_thread = pool;
         let probe_thread = std::thread::spawn(move || {
             let rt = RuntimeBuilder::current_thread()
                 .build()
@@ -10521,13 +10521,13 @@ mod tests {
                 .await
                 .into_result()
                 .expect("ensure project B");
-            let project_a_id = project_a.id.expect("project A id");
-            let project_b_id = project_b.id.expect("project B id");
+            let sender_project_id = project_a.id.expect("project A id");
+            let recipient_project_id = project_b.id.expect("project B id");
 
             let from = register_agent(
                 &cx,
                 &pool,
-                project_a_id,
+                sender_project_id,
                 "BlueLake",
                 "codex-cli",
                 "gpt-5",
@@ -10540,7 +10540,7 @@ mod tests {
             let to = register_agent(
                 &cx,
                 &pool,
-                project_b_id,
+                recipient_project_id,
                 "GreenStone",
                 "codex-cli",
                 "gpt-5",
@@ -10586,9 +10586,9 @@ mod tests {
             let result = request_contact(
                 &cx,
                 &pool,
-                project_a_id,
+                sender_project_id,
                 from.id.expect("sender id"),
-                project_b_id,
+                recipient_project_id,
                 to.id.expect("recipient id"),
                 "transient busy retry",
                 300,
