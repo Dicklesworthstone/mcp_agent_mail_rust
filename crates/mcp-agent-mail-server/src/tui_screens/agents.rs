@@ -538,8 +538,11 @@ impl AgentsScreen {
         };
         self.sparkline_dirty = true;
 
-        self.table_state.selected = previous_selected_identity
-            .and_then(|identity| self.agents.iter().position(|agent| agent.identity == identity));
+        self.table_state.selected = previous_selected_identity.and_then(|identity| {
+            self.agents
+                .iter()
+                .position(|agent| agent.identity == identity)
+        });
 
         if self.table_state.selected.is_none()
             && let Some(sel) = previous_selection
@@ -571,8 +574,10 @@ impl AgentsScreen {
                     from, to, project, ..
                 } => {
                     if !self.reduced_motion {
-                        self.message_flash_ticks
-                            .insert(AgentIdentity::new(project.clone(), from.clone()), MESSAGE_FLASH_TICKS);
+                        self.message_flash_ticks.insert(
+                            AgentIdentity::new(project.clone(), from.clone()),
+                            MESSAGE_FLASH_TICKS,
+                        );
                         for recipient in to {
                             self.message_flash_ticks.insert(
                                 AgentIdentity::new(project.clone(), recipient.clone()),
@@ -655,7 +660,8 @@ impl AgentsScreen {
             if !self.reduced_motion && !self.seen_agents.contains(&row.identity) {
                 let capped = index.min(usize::from(STAGGER_MAX_TICKS - 1));
                 let delay = u8::try_from(capped).map_or(STAGGER_MAX_TICKS, |value| value + 1);
-                self.stagger_reveal_ticks.insert(row.identity.clone(), delay);
+                self.stagger_reveal_ticks
+                    .insert(row.identity.clone(), delay);
             }
             next_seen.insert(row.identity.clone());
         }
@@ -1636,9 +1642,14 @@ mod tests {
     #[test]
     fn deep_link_agent_by_name() {
         let mut screen = AgentsScreen::new();
-        screen
-            .agents
-            .push(test_agent_row("RedFox", "", "claude-code", "opus-4.6", 100, 5));
+        screen.agents.push(test_agent_row(
+            "RedFox",
+            "",
+            "claude-code",
+            "opus-4.6",
+            100,
+            5,
+        ));
         let handled = screen.receive_deep_link(&DeepLinkTarget::AgentByName("RedFox".into()));
         assert!(handled);
         assert_eq!(screen.table_state.selected, Some(0));
@@ -1648,9 +1659,14 @@ mod tests {
     fn down_key_selects_first_agent_when_nothing_is_selected() {
         let state = test_state();
         let mut screen = AgentsScreen::new();
-        screen
-            .agents
-            .push(test_agent_row("RedFox", "", "claude-code", "opus-4.6", 100, 5));
+        screen.agents.push(test_agent_row(
+            "RedFox",
+            "",
+            "claude-code",
+            "opus-4.6",
+            100,
+            5,
+        ));
         screen
             .agents
             .push(test_agent_row("BlueLake", "", "codex-cli", "gpt-5", 200, 7));
@@ -1854,9 +1870,11 @@ mod tests {
         for _ in 0..MESSAGE_FLASH_TICKS {
             screen.advance_message_flashes();
         }
-        assert!(!screen
-            .message_flash_ticks
-            .contains_key(&agent_identity("", "RedFox")));
+        assert!(
+            !screen
+                .message_flash_ticks
+                .contains_key(&agent_identity("", "RedFox"))
+        );
     }
 
     #[test]
@@ -1871,15 +1889,29 @@ mod tests {
         ];
 
         screen.track_stagger_reveals(&rows);
-        assert_eq!(screen.stagger_reveal_ticks.get(&agent_identity("", "A")), Some(&1));
-        assert_eq!(screen.stagger_reveal_ticks.get(&agent_identity("", "B")), Some(&2));
-        assert_eq!(screen.stagger_reveal_ticks.get(&agent_identity("", "C")), Some(&3));
+        assert_eq!(
+            screen.stagger_reveal_ticks.get(&agent_identity("", "A")),
+            Some(&1)
+        );
+        assert_eq!(
+            screen.stagger_reveal_ticks.get(&agent_identity("", "B")),
+            Some(&2)
+        );
+        assert_eq!(
+            screen.stagger_reveal_ticks.get(&agent_identity("", "C")),
+            Some(&3)
+        );
 
         screen.advance_stagger_reveals();
-        assert!(!screen
-            .stagger_reveal_ticks
-            .contains_key(&agent_identity("", "A")));
-        assert_eq!(screen.stagger_reveal_ticks.get(&agent_identity("", "B")), Some(&1));
+        assert!(
+            !screen
+                .stagger_reveal_ticks
+                .contains_key(&agent_identity("", "A"))
+        );
+        assert_eq!(
+            screen.stagger_reveal_ticks.get(&agent_identity("", "B")),
+            Some(&1)
+        );
     }
 
     // ── focused_event tests ───────────────────────────────────────
@@ -1893,20 +1925,25 @@ mod tests {
     #[test]
     fn focused_event_returns_agent_registered_synthetic() {
         let mut screen = AgentsScreen::new();
-        screen.agents.push(AgentRow {
-            name: "RedFox".to_string(),
-            program: "claude-code".to_string(),
-            model: "opus-4.6".to_string(),
-            last_active_ts: 0,
-            message_count: 0,
-        });
+        screen.agents.push(test_agent_row(
+            "RedFox",
+            "proj-a",
+            "claude-code",
+            "opus-4.6",
+            0,
+            0,
+        ));
         screen.table_state.selected = Some(0);
         screen.sync_focused_event();
 
         assert!(matches!(
             screen.focused_event(),
-            Some(crate::tui_events::MailEvent::AgentRegistered { name, program, .. })
-                if name == "RedFox" && program == "claude-code"
+            Some(crate::tui_events::MailEvent::AgentRegistered {
+                name,
+                program,
+                project,
+                ..
+            }) if name == "RedFox" && program == "claude-code" && project == "proj-a"
         ));
     }
 
@@ -2343,18 +2380,23 @@ mod tests {
         });
         let mut screen = AgentsScreen::new();
         screen.cached_now_ts = chrono::Utc::now().timestamp_micros();
-        screen.msg_counts.insert("RedFox".to_string(), 42);
+        screen.msg_counts.insert(agent_identity("", "RedFox"), 42);
         screen.rebuild_from_state(&state);
         assert_eq!(screen.cached_total_msgs, 42);
     }
 
     #[test]
-    fn fetch_agent_message_count_map_counts_sent_and_received_messages() {
+    fn fetch_agent_rows_from_sqlite_counts_sent_and_received_messages() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("agents-message-counts.sqlite3");
         let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open sqlite");
         conn.execute_sync(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT NOT NULL, program TEXT NOT NULL, last_active_ts INTEGER NOT NULL)",
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL, created_at INTEGER NOT NULL)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, last_active_ts INTEGER NOT NULL)",
             &[],
         )
         .expect("create agents");
@@ -2369,9 +2411,16 @@ mod tests {
         )
         .expect("create message_recipients");
         conn.execute_sync(
-            "INSERT INTO agents (id, name, program, last_active_ts) VALUES \
-             (1, 'RedFox', 'claude-code', 100), \
-             (2, 'BlueLake', 'codex-cli', 200)",
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES \
+             (1, 'alpha', '/tmp/alpha', 10), \
+             (2, 'beta', '/tmp/beta', 20)",
+            &[],
+        )
+        .expect("insert projects");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, last_active_ts) VALUES \
+             (1, 1, 'RedFox', 'claude-code', 'opus', 100), \
+             (2, 2, 'BlueLake', 'codex-cli', 'gpt-5', 200)",
             &[],
         )
         .expect("insert agents");
@@ -2389,9 +2438,14 @@ mod tests {
         )
         .expect("insert recipients");
 
-        let counts = fetch_agent_message_count_map(&conn);
-        assert_eq!(counts.get("RedFox"), Some(&3));
-        assert_eq!(counts.get("BlueLake"), Some(&3));
+        let rows = fetch_agent_rows_from_sqlite(&conn);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].identity, agent_identity("beta", "BlueLake"));
+        assert_eq!(rows[0].model, "gpt-5");
+        assert_eq!(rows[0].message_count, 3);
+        assert_eq!(rows[1].identity, agent_identity("alpha", "RedFox"));
+        assert_eq!(rows[1].model, "opus");
+        assert_eq!(rows[1].message_count, 3);
     }
 
     #[test]
@@ -2400,7 +2454,12 @@ mod tests {
         let db_path = dir.path().join("agents-rebuild-message-counts.sqlite3");
         let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open sqlite");
         conn.execute_sync(
-            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT NOT NULL, program TEXT NOT NULL, last_active_ts INTEGER NOT NULL)",
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL, created_at INTEGER NOT NULL)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, last_active_ts INTEGER NOT NULL)",
             &[],
         )
         .expect("create agents");
@@ -2415,9 +2474,16 @@ mod tests {
         )
         .expect("create message_recipients");
         conn.execute_sync(
-            "INSERT INTO agents (id, name, program, last_active_ts) VALUES \
-             (1, 'RedFox', 'claude-code', 100), \
-             (2, 'BlueLake', 'codex-cli', 200)",
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES \
+             (1, 'alpha', '/tmp/alpha', 10), \
+             (2, 'beta', '/tmp/beta', 20)",
+            &[],
+        )
+        .expect("insert projects");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, last_active_ts) VALUES \
+             (1, 1, 'RedFox', 'claude-code', 'opus', 100), \
+             (2, 2, 'BlueLake', 'codex-cli', 'gpt-5', 200)",
             &[],
         )
         .expect("insert agents");
@@ -2465,6 +2531,119 @@ mod tests {
         assert_eq!(screen.agents[0].message_count, 4);
         assert_eq!(screen.agents[1].name, "RedFox");
         assert_eq!(screen.agents[1].message_count, 4);
+    }
+
+    #[test]
+    fn ingest_events_scopes_models_by_project_for_duplicate_names() {
+        let state = test_state();
+        let mut screen = AgentsScreen::new();
+
+        assert!(
+            state.push_event(crate::tui_events::MailEvent::agent_registered(
+                "RedFox",
+                "claude-code",
+                "opus-4.6",
+                "alpha"
+            ))
+        );
+        assert!(
+            state.push_event(crate::tui_events::MailEvent::agent_registered(
+                "RedFox",
+                "codex-cli",
+                "gpt-5",
+                "beta"
+            ))
+        );
+
+        screen.ingest_events(&state);
+
+        assert_eq!(
+            screen.model_names.get(&agent_identity("alpha", "RedFox")),
+            Some(&"opus-4.6".to_string())
+        );
+        assert_eq!(
+            screen.model_names.get(&agent_identity("beta", "RedFox")),
+            Some(&"gpt-5".to_string())
+        );
+    }
+
+    #[test]
+    fn rebuild_uses_sqlite_roster_to_keep_duplicate_agent_names_project_scoped() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("agents-duplicate-names.sqlite3");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open sqlite");
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL, created_at INTEGER NOT NULL)",
+            &[],
+        )
+        .expect("create projects");
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, last_active_ts INTEGER NOT NULL)",
+            &[],
+        )
+        .expect("create agents");
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, sender_id INTEGER NOT NULL)",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL)",
+            &[],
+        )
+        .expect("create message_recipients");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES \
+             (1, 'alpha', '/tmp/alpha', 10), \
+             (2, 'beta', '/tmp/beta', 20)",
+            &[],
+        )
+        .expect("insert projects");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, last_active_ts) VALUES \
+             (1, 1, 'RedFox', 'claude-code', 'opus-4.6', 100), \
+             (2, 2, 'RedFox', 'codex-cli', 'gpt-5', 200)",
+            &[],
+        )
+        .expect("insert agents");
+
+        let state = test_state();
+        set_database_url(&state, format!("sqlite://{}", db_path.to_string_lossy()));
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            agents: 2,
+            agents_list: vec![
+                crate::tui_events::AgentSummary {
+                    name: "RedFox".to_string(),
+                    program: "claude-code".to_string(),
+                    last_active_ts: 100,
+                },
+                crate::tui_events::AgentSummary {
+                    name: "RedFox".to_string(),
+                    program: "codex-cli".to_string(),
+                    last_active_ts: 200,
+                },
+            ],
+            ..Default::default()
+        });
+
+        let mut screen = AgentsScreen::new();
+        screen.cached_now_ts = chrono::Utc::now().timestamp_micros();
+        screen.rebuild_from_state(&state);
+
+        assert_eq!(screen.agents.len(), 2);
+        let alpha = screen
+            .agents
+            .iter()
+            .find(|agent| agent.identity == agent_identity("alpha", "RedFox"))
+            .expect("alpha RedFox row");
+        let beta = screen
+            .agents
+            .iter()
+            .find(|agent| agent.identity == agent_identity("beta", "RedFox"))
+            .expect("beta RedFox row");
+        assert_eq!(alpha.model, "opus-4.6");
+        assert_eq!(beta.model, "gpt-5");
+        assert_ne!(alpha.identity, beta.identity);
     }
 
     #[test]
