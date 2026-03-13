@@ -14410,7 +14410,7 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
                     match run_doctor_subcommand_quietly(json, || {
                         handle_doctor_repair_with(
                             &cfg.database_url,
-                            &storage_root,
+                            storage_root,
                             &backup_dir,
                             None,
                             false,
