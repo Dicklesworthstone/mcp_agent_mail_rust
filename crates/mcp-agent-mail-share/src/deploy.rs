@@ -6,7 +6,7 @@
 //! Netlify, and S3.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -952,7 +952,7 @@ pub struct DeployHistory {
 /// Returns a deployment report with check results, platform detection,
 /// bundle statistics, and file integrity checksums.
 pub fn validate_bundle(bundle_dir: &Path) -> ShareResult<DeployReport> {
-    if !bundle_dir.is_dir() {
+    if !is_real_dir(bundle_dir) {
         return Err(ShareError::BundleNotFound {
             path: bundle_dir.display().to_string(),
         });
@@ -993,7 +993,7 @@ pub fn validate_bundle(bundle_dir: &Path) -> ShareResult<DeployReport> {
     );
 
     // ── Database ────────────────────────────────────────────────────
-    let has_db = bundle_dir.join("mailbox.sqlite3").is_file();
+    let has_db = is_real_file(&bundle_dir.join("mailbox.sqlite3"));
     checks.push(DeployCheck {
         name: "database_present".to_string(),
         passed: has_db,
@@ -1006,7 +1006,7 @@ pub fn validate_bundle(bundle_dir: &Path) -> ShareResult<DeployReport> {
     });
 
     // ── Static pages ────────────────────────────────────────────────
-    let has_pages = bundle_dir.join("viewer/pages").is_dir();
+    let has_pages = is_real_dir(&bundle_dir.join("viewer/pages"));
     checks.push(DeployCheck {
         name: "static_pages_present".to_string(),
         passed: has_pages,
@@ -1019,7 +1019,7 @@ pub fn validate_bundle(bundle_dir: &Path) -> ShareResult<DeployReport> {
     });
 
     // ── Data files ──────────────────────────────────────────────────
-    let _has_data = bundle_dir.join("viewer/data").is_dir();
+    let _has_data = is_real_dir(&bundle_dir.join("viewer/data"));
     check_file_exists(
         bundle_dir,
         "viewer/data/messages.json",
@@ -1035,7 +1035,7 @@ pub fn validate_bundle(bundle_dir: &Path) -> ShareResult<DeployReport> {
 
     // ── Manifest validation ─────────────────────────────────────────
     let manifest_path = bundle_dir.join("manifest.json");
-    if manifest_path.is_file() {
+    if is_real_file(&manifest_path) {
         match std::fs::read_to_string(&manifest_path) {
             Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
                 Ok(manifest) => {
@@ -1079,7 +1079,7 @@ pub fn validate_bundle(bundle_dir: &Path) -> ShareResult<DeployReport> {
 
     // ── Cross-origin headers check ──────────────────────────────────
     let headers_path = bundle_dir.join("_headers");
-    if headers_path.is_file()
+    if is_real_file(&headers_path)
         && let Ok(content) = std::fs::read_to_string(&headers_path)
     {
         let has_coop = content.contains("Cross-Origin-Opener-Policy");
@@ -1486,7 +1486,7 @@ fn check_file_exists(
     severity: CheckSeverity,
     checks: &mut Vec<DeployCheck>,
 ) {
-    let exists = bundle_dir.join(relative_path).is_file();
+    let exists = is_real_file(&bundle_dir.join(relative_path));
     checks.push(DeployCheck {
         name: format!("file_{}", relative_path.replace('/', "_")),
         passed: exists,
@@ -1505,7 +1505,7 @@ fn check_dir_exists(
     severity: CheckSeverity,
     checks: &mut Vec<DeployCheck>,
 ) {
-    let exists = bundle_dir.join(relative_path).is_dir();
+    let exists = is_real_dir(&bundle_dir.join(relative_path));
     checks.push(DeployCheck {
         name: format!("dir_{}", relative_path.replace('/', "_")),
         passed: exists,
@@ -1531,7 +1531,7 @@ fn build_platform_info(
         id: "github_pages".to_string(),
         name: "GitHub Pages".to_string(),
         detected: detected_ids.contains(&"github_pages"),
-        config_present: bundle_dir.join(".nojekyll").is_file(),
+        config_present: is_real_file(&bundle_dir.join(".nojekyll")),
         deploy_command: Some(format!("gh-pages -d {bundle_arg}")),
     });
 
@@ -1539,7 +1539,7 @@ fn build_platform_info(
         id: "cloudflare_pages".to_string(),
         name: "Cloudflare Pages".to_string(),
         detected: detected_ids.contains(&"cloudflare_pages"),
-        config_present: bundle_dir.join("_headers").is_file(),
+        config_present: is_real_file(&bundle_dir.join("_headers")),
         deploy_command: Some(format!(
             "wrangler pages deploy {bundle_arg} --project-name=agent-mail"
         )),
@@ -1549,7 +1549,7 @@ fn build_platform_info(
         id: "netlify".to_string(),
         name: "Netlify".to_string(),
         detected: detected_ids.contains(&"netlify"),
-        config_present: bundle_dir.join("_headers").is_file(),
+        config_present: is_real_file(&bundle_dir.join("_headers")),
         deploy_command: Some(format!("netlify deploy --prod --dir={bundle_arg}")),
     });
 
@@ -1594,9 +1594,9 @@ fn compute_bundle_stats(bundle_dir: &Path) -> BundleStats {
         html_pages,
         data_files,
         asset_files,
-        has_database: bundle_dir.join("mailbox.sqlite3").is_file(),
-        has_viewer: bundle_dir.join("viewer/index.html").is_file(),
-        has_pages: bundle_dir.join("viewer/pages").is_dir(),
+        has_database: is_real_file(&bundle_dir.join("mailbox.sqlite3")),
+        has_viewer: is_real_file(&bundle_dir.join("viewer/index.html")),
+        has_pages: is_real_dir(&bundle_dir.join("viewer/pages")),
     }
 }
 
@@ -1617,7 +1617,7 @@ fn compute_integrity(bundle_dir: &Path) -> BTreeMap<String, String> {
 
     for rel in &key_files {
         let path = bundle_dir.join(rel);
-        if path.is_file()
+        if is_real_file(&path)
             && let Ok(hash) = sha256_file_streaming(&path)
         {
             checksums.insert((*rel).to_string(), hash);
@@ -1648,7 +1648,7 @@ fn validate_database_artifacts(
     integrity: &BTreeMap<String, String>,
 ) -> Vec<DeployCheck> {
     let db_path = bundle_dir.join("mailbox.sqlite3");
-    if !db_path.is_file() {
+    if !is_real_file(&db_path) {
         return Vec::new();
     }
 
@@ -1883,48 +1883,49 @@ fn validate_chunk_artifacts(
 
     let config_path = bundle_dir.join("mailbox.sqlite3.config.json");
     let mut expected_chunk_count = manifest_chunk.map(|manifest| manifest.chunk_count);
-    let config_chunk = match std::fs::read_to_string(&config_path) {
-        Ok(text) => match serde_json::from_str::<crate::ChunkManifest>(&text) {
-            Ok(config) => {
-                expected_chunk_count = Some(config.chunk_count);
-                checks.push(DeployCheck {
-                    name: "database_chunk_config_valid".to_string(),
-                    passed: true,
-                    message: format!(
-                        "mailbox.sqlite3.config.json is valid for {} chunks",
-                        config.chunk_count
-                    ),
-                    severity: CheckSeverity::Info,
-                });
-                Some(config)
-            }
+    let config_chunk = if !is_real_file(&config_path) {
+        checks.push(DeployCheck {
+            name: "database_chunk_config_valid".to_string(),
+            passed: false,
+            message: "mailbox.sqlite3.config.json is missing".to_string(),
+            severity: CheckSeverity::Error,
+        });
+        None
+    } else {
+        match std::fs::read_to_string(&config_path) {
+            Ok(text) => match serde_json::from_str::<crate::ChunkManifest>(&text) {
+                Ok(config) => {
+                    expected_chunk_count = Some(config.chunk_count);
+                    checks.push(DeployCheck {
+                        name: "database_chunk_config_valid".to_string(),
+                        passed: true,
+                        message: format!(
+                            "mailbox.sqlite3.config.json is valid for {} chunks",
+                            config.chunk_count
+                        ),
+                        severity: CheckSeverity::Info,
+                    });
+                    Some(config)
+                }
+                Err(err) => {
+                    checks.push(DeployCheck {
+                        name: "database_chunk_config_valid".to_string(),
+                        passed: false,
+                        message: format!("mailbox.sqlite3.config.json is invalid: {err}"),
+                        severity: CheckSeverity::Error,
+                    });
+                    None
+                }
+            },
             Err(err) => {
                 checks.push(DeployCheck {
                     name: "database_chunk_config_valid".to_string(),
                     passed: false,
-                    message: format!("mailbox.sqlite3.config.json is invalid: {err}"),
+                    message: format!("cannot read mailbox.sqlite3.config.json: {err}"),
                     severity: CheckSeverity::Error,
                 });
                 None
             }
-        },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            checks.push(DeployCheck {
-                name: "database_chunk_config_valid".to_string(),
-                passed: false,
-                message: "mailbox.sqlite3.config.json is missing".to_string(),
-                severity: CheckSeverity::Error,
-            });
-            None
-        }
-        Err(err) => {
-            checks.push(DeployCheck {
-                name: "database_chunk_config_valid".to_string(),
-                passed: false,
-                message: format!("cannot read mailbox.sqlite3.config.json: {err}"),
-                severity: CheckSeverity::Error,
-            });
-            None
         }
     };
 
@@ -1993,7 +1994,7 @@ fn validate_chunk_artifacts(
         for index in 0..expected_chunk_count {
             let rel = format!("chunks/{index:05}.bin");
             let chunk_path = bundle_dir.join(&rel);
-            if !chunk_path.is_file() {
+            if !is_real_file(&chunk_path) {
                 issues.push(format!("{rel} is missing"));
                 continue;
             }
@@ -2035,6 +2036,9 @@ fn validate_chunk_artifacts(
 }
 
 fn parse_chunk_checksums(path: &Path) -> Result<BTreeMap<String, String>, String> {
+    if !is_real_file(path) {
+        return Err("chunks.sha256 is missing".to_string());
+    }
     let text = std::fs::read_to_string(path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
             "chunks.sha256 is missing".to_string()
@@ -2084,16 +2088,20 @@ fn walk_dir_inner(
     current: &Path,
     entries: &mut Vec<FileEntry>,
 ) -> Result<(), std::io::Error> {
-    if !current.is_dir() {
+    if !is_real_dir(current) {
         return Ok(());
     }
 
     for entry in std::fs::read_dir(current)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             walk_dir_inner(root, &path, entries)?;
-        } else if path.is_file() {
+        } else if file_type.is_file() {
             let rel = path
                 .strip_prefix(root)
                 .unwrap_or(&path)
@@ -2110,7 +2118,7 @@ fn walk_dir_inner(
 
 fn build_security_expectations(bundle_dir: &Path, stats: &BundleStats) -> SecurityExpectations {
     let headers_path = bundle_dir.join("_headers");
-    let cross_origin = if headers_path.is_file() {
+    let cross_origin = if is_real_file(&headers_path) {
         std::fs::read_to_string(&headers_path)
             .map(|c| {
                 c.contains("Cross-Origin-Opener-Policy")
@@ -2121,25 +2129,24 @@ fn build_security_expectations(bundle_dir: &Path, stats: &BundleStats) -> Securi
         false
     };
 
-    let scrub_preset = bundle_dir
-        .join("manifest.json")
-        .is_file()
-        .then(|| {
-            std::fs::read_to_string(bundle_dir.join("manifest.json"))
-                .ok()
-                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-                .and_then(|m| {
-                    m.get("scrub")
-                        .and_then(|s| s.get("preset"))
-                        .and_then(|p| p.as_str().map(|s| s.to_string()))
-                        .or_else(|| {
-                            m.get("export_config")
-                                .and_then(|e| e.get("scrub_preset"))
-                                .and_then(|p| p.as_str().map(|s| s.to_string()))
-                        })
-                })
-        })
-        .flatten();
+    let manifest_path = bundle_dir.join("manifest.json");
+    let scrub_preset = if is_real_file(&manifest_path) {
+        std::fs::read_to_string(&manifest_path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .and_then(|m| {
+                m.get("scrub")
+                    .and_then(|s| s.get("preset"))
+                    .and_then(|p| p.as_str().map(|s| s.to_string()))
+                    .or_else(|| {
+                        m.get("export_config")
+                            .and_then(|e| e.get("scrub_preset"))
+                            .and_then(|p| p.as_str().map(|s| s.to_string()))
+                    })
+            })
+    } else {
+        None
+    };
 
     let mut notes = Vec::new();
     if stats.has_database {
@@ -2171,6 +2178,14 @@ fn build_security_expectations(bundle_dir: &Path, stats: &BundleStats) -> Securi
         scrub_preset,
         notes,
     }
+}
+
+fn is_real_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
 }
 
 // ── Rollback guidance ──────────────────────────────────────────────────
@@ -2326,8 +2341,28 @@ fn bundle_path_relative_to_repo(repo_root: &Path, bundle_dir: &Path) -> ShareRes
 }
 
 fn write_text_file_if_absent_or_identical(path: &Path, content: &str) -> ShareResult<()> {
-    match std::fs::read_to_string(path) {
-        Ok(existing) => {
+    if let Some(parent) = path.parent() {
+        ensure_real_directory(parent)?;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(ShareError::Validation {
+                    message: format!(
+                        "refusing to write through symlinked deployment path {}",
+                        path.display()
+                    ),
+                });
+            }
+            if !metadata.file_type().is_file() {
+                return Err(ShareError::Validation {
+                    message: format!(
+                        "expected deployment file but found non-file {}",
+                        path.display()
+                    ),
+                });
+            }
+            let existing = std::fs::read_to_string(path)?;
             if existing == content {
                 return Ok(());
             }
@@ -2341,19 +2376,110 @@ fn write_text_file_if_absent_or_identical(path: &Path, content: &str) -> ShareRe
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(ShareError::Io(err)),
     }
-    std::fs::write(path, content)?;
+    write_text_file(path, content)?;
+    Ok(())
+}
+
+fn write_text_file(path: &Path, content: &str) -> ShareResult<()> {
+    if let Some(parent) = path.parent() {
+        ensure_real_directory(parent)?;
+    }
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(ShareError::Validation {
+            message: format!(
+                "refusing to write through symlinked deployment path {}",
+                path.display()
+            ),
+        });
+    }
+    std::fs::write(path, content).map_err(ShareError::Io)
+}
+
+fn read_text_file_if_regular(path: &Path) -> ShareResult<Option<String>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(ShareError::Validation {
+                    message: format!(
+                        "refusing to read symlinked deployment path {}",
+                        path.display()
+                    ),
+                });
+            }
+            if !metadata.file_type().is_file() {
+                return Err(ShareError::Validation {
+                    message: format!(
+                        "expected deployment file but found non-file {}",
+                        path.display()
+                    ),
+                });
+            }
+            std::fs::read_to_string(path)
+                .map(Some)
+                .map_err(ShareError::Io)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(ShareError::Io(err)),
+    }
+}
+
+fn ensure_real_directory(path: &Path) -> ShareResult<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        use std::path::Component;
+
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(ShareError::Validation {
+                    message: format!(
+                        "refusing to create deployment directory with parent traversal: {}",
+                        path.display()
+                    ),
+                });
+            }
+            Component::Normal(segment) => {
+                current.push(segment);
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) => {
+                        if metadata.file_type().is_symlink() {
+                            return Err(ShareError::Validation {
+                                message: format!(
+                                    "refusing to traverse symlinked deployment directory {}",
+                                    current.display()
+                                ),
+                            });
+                        }
+                        if !metadata.file_type().is_dir() {
+                            return Err(ShareError::Validation {
+                                message: format!(
+                                    "expected deployment directory but found non-directory {}",
+                                    current.display()
+                                ),
+                            });
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir(&current).map_err(ShareError::Io)?;
+                    }
+                    Err(err) => return Err(ShareError::Io(err)),
+                }
+            }
+        }
+    }
     Ok(())
 }
 
 /// Load deployment history from the bundle directory.
 pub fn load_deploy_history(bundle_dir: &Path) -> ShareResult<DeployHistory> {
     let path = bundle_dir.join(DEPLOY_HISTORY_FILE);
-    if !path.is_file() {
+    let Some(content) = read_text_file_if_regular(&path)? else {
         return Ok(DeployHistory {
             entries: Vec::new(),
         });
-    }
-    let content = std::fs::read_to_string(&path)?;
+    };
     serde_json::from_str(&content).map_err(|e| ShareError::ManifestParse {
         message: format!("deploy history parse error: {e}"),
     })
@@ -2369,7 +2495,7 @@ pub fn record_deploy(bundle_dir: &Path, entry: DeployHistoryEntry) -> ShareResul
         history.entries.drain(..drain_count);
     }
     let json = serde_json::to_string_pretty(&history).unwrap_or_else(|_| "{}".to_string());
-    std::fs::write(bundle_dir.join(DEPLOY_HISTORY_FILE), json)?;
+    write_text_file(&bundle_dir.join(DEPLOY_HISTORY_FILE), &json)?;
     Ok(())
 }
 
@@ -2450,10 +2576,12 @@ pub fn build_verify_plan(deployed_url: &str) -> VerifyResult {
 pub fn write_deploy_tooling(repo_root: &Path, bundle_dir: &Path) -> ShareResult<Vec<String>> {
     let mut written = Vec::new();
     let bundle_rel = bundle_path_relative_to_repo(repo_root, bundle_dir)?;
+    ensure_real_directory(&repo_root.join(".github").join("workflows"))?;
+    ensure_real_directory(&repo_root.join("scripts"))?;
+    ensure_real_directory(bundle_dir)?;
 
     // GitHub Actions workflow (GH Pages)
     let workflow_dir = repo_root.join(".github").join("workflows");
-    std::fs::create_dir_all(&workflow_dir)?;
     write_text_file_if_absent_or_identical(
         &workflow_dir.join("deploy-pages.yml"),
         &generate_gh_pages_workflow(&bundle_rel),
@@ -2483,7 +2611,6 @@ pub fn write_deploy_tooling(repo_root: &Path, bundle_dir: &Path) -> ShareResult<
 
     // Validation script
     let scripts_dir = repo_root.join("scripts");
-    std::fs::create_dir_all(&scripts_dir)?;
     let script_path = scripts_dir.join("validate_deploy.sh");
     write_text_file_if_absent_or_identical(&script_path, &generate_validation_script())?;
     // Make executable on Unix
@@ -2497,7 +2624,7 @@ pub fn write_deploy_tooling(repo_root: &Path, bundle_dir: &Path) -> ShareResult<
     // Deploy report
     let report = validate_bundle(bundle_dir)?;
     let report_json = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string());
-    std::fs::write(bundle_dir.join("deploy_report.json"), &report_json)?;
+    write_text_file(&bundle_dir.join("deploy_report.json"), &report_json)?;
     written.push(format!("{bundle_rel}/deploy_report.json"));
 
     Ok(written)
@@ -2709,6 +2836,21 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn validate_bundle_rejects_symlinked_bundle_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_bundle = dir.path().join("real-bundle");
+        create_minimal_bundle(&real_bundle);
+        let linked_bundle = dir.path().join("bundle-link");
+        symlink(&real_bundle, &linked_bundle).unwrap();
+
+        let err = validate_bundle(&linked_bundle).expect_err("symlinked bundle root should fail");
+        assert!(matches!(err, ShareError::BundleNotFound { .. }));
+    }
+
     fn create_test_agent_mail_sqlite_file(path: &Path) {
         let conn = SqliteConnection::open_file(path.display().to_string()).unwrap();
         conn.execute_raw(
@@ -2837,6 +2979,42 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn validate_bundle_rejects_symlinked_chunk_checksum_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        create_minimal_bundle(&bundle);
+
+        let db_path = bundle.join("mailbox.sqlite3");
+        create_test_agent_mail_sqlite_file(&db_path);
+        let db_sha = sha256_file_streaming(&db_path).unwrap();
+        let chunk_manifest = crate::maybe_chunk_database(&db_path, &bundle, 1, 128)
+            .unwrap()
+            .unwrap();
+        write_manifest_with_database(&bundle, &db_sha, Some(&chunk_manifest));
+
+        let outside = dir.path().join("outside-checksums.sha256");
+        std::fs::write(
+            &outside,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  chunks/00000.bin\n",
+        )
+        .unwrap();
+        std::fs::remove_file(bundle.join("chunks.sha256")).unwrap();
+        symlink(&outside, bundle.join("chunks.sha256")).unwrap();
+
+        let report = validate_bundle(&bundle).unwrap();
+        assert!(!report.ready);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "database_chunk_checksums_valid" && !check.passed)
+        );
+    }
+
     #[test]
     fn validate_bundle_detects_non_agent_mail_database_schema() {
         let dir = tempfile::tempdir().unwrap();
@@ -2889,6 +3067,38 @@ mod tests {
                 .checks
                 .iter()
                 .any(|check| check.name == "database_chunk_artifacts_valid" && check.passed)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_bundle_rejects_symlinked_chunk_payload() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        create_minimal_bundle(&bundle);
+
+        let db_path = bundle.join("mailbox.sqlite3");
+        create_test_agent_mail_sqlite_file(&db_path);
+        let db_sha = sha256_file_streaming(&db_path).unwrap();
+        let chunk_manifest = crate::maybe_chunk_database(&db_path, &bundle, 1, 128)
+            .unwrap()
+            .unwrap();
+        write_manifest_with_database(&bundle, &db_sha, Some(&chunk_manifest));
+
+        let outside = dir.path().join("outside-chunk.bin");
+        std::fs::write(&outside, b"outside").unwrap();
+        std::fs::remove_file(bundle.join("chunks/00000.bin")).unwrap();
+        symlink(&outside, bundle.join("chunks/00000.bin")).unwrap();
+
+        let report = validate_bundle(&bundle).unwrap();
+        assert!(!report.ready);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "database_chunk_artifacts_valid" && !check.passed)
         );
     }
 
@@ -3001,6 +3211,60 @@ mod tests {
         assert!(report.ready);
         assert!(!report.generated_at.is_empty());
         assert!(!report.rollback.steps.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_deploy_tooling_rejects_symlinked_repo_tooling_file_even_if_content_matches() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        create_minimal_bundle(&bundle);
+
+        let workflow_dir = dir.path().join(".github/workflows");
+        std::fs::create_dir_all(&workflow_dir).unwrap();
+        let outside = dir.path().join("outside-workflow.yml");
+        std::fs::write(&outside, generate_gh_pages_workflow("bundle")).unwrap();
+        symlink(&outside, workflow_dir.join("deploy-pages.yml")).unwrap();
+
+        let err = write_deploy_tooling(dir.path(), &bundle)
+            .expect_err("symlinked repo tooling target should be rejected");
+        assert!(matches!(err, ShareError::Validation { .. }));
+        assert!(
+            err.to_string().contains("symlinked deployment path"),
+            "error should explain symlink rejection: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            generate_gh_pages_workflow("bundle")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_deploy_tooling_rejects_symlinked_bundle_report_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        create_minimal_bundle(&bundle);
+
+        let outside = dir.path().join("outside-report.json");
+        std::fs::write(&outside, "{\"keep\":true}\n").unwrap();
+        symlink(&outside, bundle.join("deploy_report.json")).unwrap();
+
+        let err = write_deploy_tooling(dir.path(), &bundle)
+            .expect_err("symlinked deploy report target should be rejected");
+        assert!(matches!(err, ShareError::Validation { .. }));
+        assert!(
+            err.to_string().contains("symlinked deployment path"),
+            "error should explain symlink rejection: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "{\"keep\":true}\n"
+        );
     }
 
     // ── platform info ───────────────────────────────────────────────
@@ -3267,6 +3531,41 @@ mod tests {
         let history = load_deploy_history(&bundle).unwrap();
         assert_eq!(history.entries.len(), 2);
         assert_eq!(history.entries[1].content_hash, "def456");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn record_deploy_rejects_symlinked_history_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+
+        let outside = dir.path().join("outside-history.json");
+        std::fs::write(&outside, "{\"entries\":[]}\n").unwrap();
+        symlink(&outside, bundle.join(DEPLOY_HISTORY_FILE)).unwrap();
+
+        let err = record_deploy(
+            &bundle,
+            DeployHistoryEntry {
+                deployed_at: "2024-01-01T00:00:00Z".to_string(),
+                content_hash: "abc123".to_string(),
+                platform: "github_pages".to_string(),
+                file_count: 1,
+                total_bytes: 1,
+            },
+        )
+        .expect_err("symlinked deploy history should be rejected");
+        assert!(matches!(err, ShareError::Validation { .. }));
+        assert!(
+            err.to_string().contains("symlinked deployment path"),
+            "error should explain symlink rejection: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "{\"entries\":[]}\n"
+        );
     }
 
     // ── Verify plan ──────────────────────────────────────────────────

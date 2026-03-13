@@ -15,7 +15,7 @@
 //! no embedded timestamps unless from source data).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::Value as SqlValue;
@@ -264,7 +264,7 @@ pub fn render_static_site(
     })?;
 
     let pages_dir = output_dir.join("viewer").join("pages");
-    std::fs::create_dir_all(&pages_dir)?;
+    ensure_real_directory(&pages_dir)?;
 
     let mut generated_files = Vec::new();
     let mut sitemap: Vec<SitemapEntry> = Vec::new();
@@ -338,8 +338,9 @@ pub fn render_static_site(
 
     // ── Render per-project pages ────────────────────────────────────
     for project in &projects {
-        let proj_dir = pages_dir.join("projects").join(&project.slug);
-        std::fs::create_dir_all(&proj_dir)?;
+        let project_segment = project_route_segment(&project.slug);
+        let proj_dir = pages_dir.join("projects").join(&project_segment);
+        ensure_real_directory(&proj_dir)?;
 
         let proj_messages: Vec<&MessageInfo> = messages
             .iter()
@@ -348,9 +349,12 @@ pub fn render_static_site(
 
         let proj_html = render_project_page(project, &proj_messages, config);
         write_page(&proj_dir, "index.html", &proj_html)?;
-        generated_files.push(format!("viewer/pages/projects/{}/index.html", project.slug));
+        generated_files.push(format!(
+            "viewer/pages/{}",
+            project_index_route(&project.slug)
+        ));
         sitemap.push(SitemapEntry {
-            route: format!("projects/{}/index.html", project.slug),
+            route: project_index_route(&project.slug),
             title: format!("Project: {}", project.slug),
             parent: Some("projects.html".to_string()),
             entry_type: "project".to_string(),
@@ -359,18 +363,21 @@ pub fn render_static_site(
         // Render per-project inbox
         let inbox_html = render_inbox_page(project, &proj_messages, config);
         write_page(&proj_dir, "inbox.html", &inbox_html)?;
-        generated_files.push(format!("viewer/pages/projects/{}/inbox.html", project.slug));
+        generated_files.push(format!(
+            "viewer/pages/{}",
+            project_inbox_route(&project.slug)
+        ));
         sitemap.push(SitemapEntry {
-            route: format!("projects/{}/inbox.html", project.slug),
+            route: project_inbox_route(&project.slug),
             title: format!("Inbox: {}", project.slug),
-            parent: Some(format!("projects/{}/index.html", project.slug)),
+            parent: Some(project_index_route(&project.slug)),
             entry_type: "inbox".to_string(),
         });
     }
 
     // ── Render per-message pages ────────────────────────────────────
     let msg_pages_dir = pages_dir.join("messages");
-    std::fs::create_dir_all(&msg_pages_dir)?;
+    ensure_real_directory(&msg_pages_dir)?;
 
     for msg in &messages {
         let body_was_redacted = config.redaction.redact_bodies || is_redacted_body(&msg.body_md);
@@ -381,7 +388,7 @@ pub fn render_static_site(
         sitemap.push(SitemapEntry {
             route: format!("messages/{filename}"),
             title: msg.subject.clone(),
-            parent: Some(format!("projects/{}/inbox.html", msg.project_slug)),
+            parent: Some(project_inbox_route(&msg.project_slug)),
             entry_type: "message".to_string(),
         });
 
@@ -415,7 +422,7 @@ pub fn render_static_site(
 
     // ── Render per-thread pages ─────────────────────────────────────
     let thread_pages_dir = pages_dir.join("threads");
-    std::fs::create_dir_all(&thread_pages_dir)?;
+    ensure_real_directory(&thread_pages_dir)?;
 
     for (key, info) in &threads {
         let thread_messages: Vec<&MessageInfo> = messages
@@ -435,17 +442,17 @@ pub fn render_static_site(
         sitemap.push(SitemapEntry {
             route: format!("threads/{filename}"),
             title: format!("Thread: {}", info.subject),
-            parent: Some(format!("projects/{}/inbox.html", info.project_slug)),
+            parent: Some(project_inbox_route(&info.project_slug)),
             entry_type: "thread".to_string(),
         });
     }
 
     // ── Write sitemap.json ──────────────────────────────────────────
     let data_dir = output_dir.join("viewer").join("data");
-    std::fs::create_dir_all(&data_dir)?;
+    ensure_real_directory(&data_dir)?;
 
     let sitemap_json = serde_json::to_string_pretty(&sitemap).unwrap_or_else(|_| "[]".to_string());
-    std::fs::write(data_dir.join("sitemap.json"), &sitemap_json)?;
+    write_text_file(&data_dir.join("sitemap.json"), &sitemap_json)?;
     generated_files.push("viewer/data/sitemap.json".to_string());
 
     // ── Write search_index.json ─────────────────────────────────────
@@ -455,13 +462,13 @@ pub fn render_static_site(
 
     let search_json =
         serde_json::to_string_pretty(&sorted_index).unwrap_or_else(|_| "[]".to_string());
-    std::fs::write(data_dir.join("search_index.json"), &search_json)?;
+    write_text_file(&data_dir.join("search_index.json"), &search_json)?;
     generated_files.push("viewer/data/search_index.json".to_string());
 
     // ── Write navigation.json ───────────────────────────────────────
     let nav = build_navigation(&projects, &threads, &thread_routes);
     let nav_json = serde_json::to_string_pretty(&nav).unwrap_or_else(|_| "{}".to_string());
-    std::fs::write(data_dir.join("navigation.json"), &nav_json)?;
+    write_text_file(&data_dir.join("navigation.json"), &nav_json)?;
     generated_files.push("viewer/data/navigation.json".to_string());
 
     generated_files.sort();
@@ -469,7 +476,7 @@ pub fn render_static_site(
     // ── Write redaction audit log ──────────────────────────────────
     if audit.total() > 0 {
         let audit_json = serde_json::to_string_pretty(&audit).unwrap_or_else(|_| "{}".to_string());
-        std::fs::write(data_dir.join("redaction_audit.json"), &audit_json)?;
+        write_text_file(&data_dir.join("redaction_audit.json"), &audit_json)?;
         generated_files.push("viewer/data/redaction_audit.json".to_string());
         generated_files.sort();
     }
@@ -767,7 +774,8 @@ fn render_index_page(projects: &[ProjectInfo], config: &StaticRenderConfig) -> S
         rows = projects
             .iter()
             .map(|p| format!(
-                "<tr><td><a href=\"projects/{slug}/index.html\">{slug}</a></td><td>{msgs}</td><td>{agents}</td></tr>",
+                "<tr><td><a href=\"projects/{route_segment}/index.html\">{slug}</a></td><td>{msgs}</td><td>{agents}</td></tr>",
+                route_segment = html_escape(&project_route_segment(&p.slug)),
                 slug = html_escape(&p.slug),
                 msgs = p.message_count,
                 agents = p.agent_count,
@@ -788,7 +796,8 @@ fn render_projects_page(projects: &[ProjectInfo], config: &StaticRenderConfig) -
         rows = projects
             .iter()
             .map(|p| format!(
-                "<tr><td><a href=\"projects/{slug}/index.html\">{slug}</a></td><td class=\"meta\">{key}</td><td>{msgs}</td><td>{agents}</td></tr>",
+                "<tr><td><a href=\"projects/{route_segment}/index.html\">{slug}</a></td><td class=\"meta\">{key}</td><td>{msgs}</td><td>{agents}</td></tr>",
+                route_segment = html_escape(&project_route_segment(&p.slug)),
                 slug = html_escape(&p.slug),
                 key = html_escape(&p.human_key),
                 msgs = p.message_count,
@@ -945,7 +954,7 @@ fn render_message_page(
         r#"<div class="meta">
   <p>From: <strong>{sender}</strong></p>
   {recipients}
-  <p>Project: <a href="../projects/{project}/index.html">{project}</a></p>
+  <p>Project: <a href="../projects/{project_segment}/index.html">{project}</a></p>
   <p>Date: {ts}</p>
   <p>Importance: {badge}</p>
   {thread_link}
@@ -953,6 +962,7 @@ fn render_message_page(
 {body_html}"#,
         sender = html_escape(&msg.sender_name),
         recipients = recipients_str,
+        project_segment = html_escape(&project_route_segment(&msg.project_slug)),
         project = html_escape(&msg.project_slug),
         ts = html_escape(&msg.created_ts),
         badge = importance_badge(&msg.importance),
@@ -966,7 +976,7 @@ fn render_message_page(
             ("Home", "../index.html"),
             (
                 &msg.project_slug,
-                &format!("../projects/{}/index.html", msg.project_slug),
+                &format!("../{}", project_index_route(&msg.project_slug)),
             ),
             ("Message", ""),
         ],
@@ -983,13 +993,14 @@ fn render_thread_page(
     let participants: Vec<String> = info.participants.iter().cloned().collect();
     let body = format!(
         r#"<div class="meta">
-  <p>Project: <a href="../projects/{project}/index.html">{project}</a></p>
+  <p>Project: <a href="../projects/{project_segment}/index.html">{project}</a></p>
   <p>Messages: {count}</p>
   <p>Participants: {participants}</p>
   <p>Latest: {latest}</p>
 </div>
 <h2>Messages in Thread</h2>
 {cards}"#,
+        project_segment = html_escape(&project_route_segment(&info.project_slug)),
         project = html_escape(&info.project_slug),
         count = info.message_count,
         participants = html_escape(&participants.join(", ")),
@@ -1027,7 +1038,7 @@ fn render_thread_page(
             ("Home", "../index.html"),
             (
                 &info.project_slug,
-                &format!("../projects/{}/index.html", info.project_slug),
+                &format!("../{}", project_index_route(&info.project_slug)),
             ),
             ("Thread", ""),
         ],
@@ -1052,8 +1063,8 @@ fn build_navigation(
                 "message_count": p.message_count,
                 "agent_count": p.agent_count,
                 "routes": {
-                    "overview": format!("projects/{}/index.html", p.slug),
-                    "inbox": format!("projects/{}/inbox.html", p.slug),
+                    "overview": project_index_route(&p.slug),
+                    "inbox": project_inbox_route(&p.slug),
                 }
             })
         })
@@ -1089,7 +1100,64 @@ fn build_navigation(
 
 fn write_page(dir: &Path, filename: &str, content: &str) -> ShareResult<()> {
     let path = dir.join(filename);
-    std::fs::write(&path, content)?;
+    write_text_file(&path, content)?;
+    Ok(())
+}
+
+fn write_text_file(path: &Path, content: &str) -> ShareResult<()> {
+    if let Some(parent) = path.parent() {
+        ensure_real_directory(parent)?;
+    }
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(ShareError::Io(std::io::Error::other(format!(
+            "refusing to write through symlinked export path {}",
+            path.display()
+        ))));
+    }
+    std::fs::write(path, content)?;
+    Ok(())
+}
+
+fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        use std::path::Component;
+
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(std::io::Error::other(format!(
+                    "refusing to create directory with parent traversal: {}",
+                    path.display()
+                )));
+            }
+            Component::Normal(segment) => {
+                current.push(segment);
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) => {
+                        if metadata.file_type().is_symlink() {
+                            return Err(std::io::Error::other(format!(
+                                "refusing to traverse symlinked export directory {}",
+                                current.display()
+                            )));
+                        }
+                        if !metadata.file_type().is_dir() {
+                            return Err(std::io::Error::other(format!(
+                                "expected export directory but found non-directory {}",
+                                current.display()
+                            )));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir(&current)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1120,6 +1188,24 @@ fn scoped_thread_page_filename(project_slug: &str, thread_id: &str) -> String {
         "{}~~{}.html",
         sanitize_filename(project_slug),
         sanitize_filename(thread_id)
+    )
+}
+
+fn project_route_segment(project_slug: &str) -> String {
+    sanitize_filename(project_slug)
+}
+
+fn project_index_route(project_slug: &str) -> String {
+    format!(
+        "projects/{}/index.html",
+        project_route_segment(project_slug)
+    )
+}
+
+fn project_inbox_route(project_slug: &str) -> String {
+    format!(
+        "projects/{}/inbox.html",
+        project_route_segment(project_slug)
     )
 }
 
@@ -1685,6 +1771,116 @@ mod tests {
         assert!(msg_html.contains("Hello World"));
         assert!(msg_html.contains("RedFox"));
         assert!(msg_html.contains("test-project"));
+    }
+
+    #[test]
+    fn render_sanitizes_project_slug_route_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("slug-routes.sqlite3");
+
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, \
+             subject TEXT, body_md TEXT, importance TEXT, created_ts TEXT, thread_id TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, agent_id INTEGER, \
+             read_ts TEXT, ack_ts TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key) VALUES (1, '../escape project', '/tmp/escape')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES (1, 1, 'RedFox')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, created_ts, thread_id) \
+             VALUES (1, 1, 1, 'Hello', 'Body', 'normal', '2024-01-01T00:00:00Z', NULL)",
+            &[],
+        )
+        .unwrap();
+        drop(conn);
+
+        let output = dir.path().join("output");
+        render_static_site(&db_path, &output, &StaticRenderConfig::default()).unwrap();
+
+        let expected_segment = project_route_segment("../escape project");
+        let project_index = output
+            .join("viewer/pages/projects")
+            .join(&expected_segment)
+            .join("index.html");
+        assert!(project_index.exists());
+        assert!(!dir.path().join("escape project").exists());
+
+        let nav_json = std::fs::read_to_string(output.join("viewer/data/navigation.json")).unwrap();
+        let nav: serde_json::Value = serde_json::from_str(&nav_json).unwrap();
+        let project_entry = nav["projects"].as_array().unwrap().first().unwrap();
+        assert_eq!(
+            project_entry["routes"]["overview"].as_str().unwrap(),
+            format!("projects/{expected_segment}/index.html")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn render_rejects_symlinked_pages_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("symlink-pages.sqlite3");
+
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, \
+             subject TEXT, body_md TEXT, importance TEXT, created_ts TEXT, thread_id TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, agent_id INTEGER, \
+             read_ts TEXT, ack_ts TEXT)",
+            &[],
+        )
+        .unwrap();
+        drop(conn);
+
+        let output = dir.path().join("output");
+        std::fs::create_dir_all(output.join("viewer")).unwrap();
+        let outside = dir.path().join("outside-pages");
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, output.join("viewer/pages")).unwrap();
+
+        let err =
+            render_static_site(&db_path, &output, &StaticRenderConfig::default()).unwrap_err();
+        assert!(err.to_string().contains("symlinked export directory"));
     }
 
     #[test]

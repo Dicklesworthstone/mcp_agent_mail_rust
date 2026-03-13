@@ -220,7 +220,8 @@ pub fn bundle_attachments(
                 };
 
                 let source_file =
-                    resolve_attachment_path(storage_root, orig_path_str, allow_absolute_paths);
+                    resolve_attachment_path(storage_root, orig_path_str, allow_absolute_paths)
+                        .map_err(ShareError::Io)?;
 
                 let media_type = obj
                     .get("media_type")
@@ -229,10 +230,10 @@ pub fn bundle_attachments(
                     .to_string();
 
                 let process_result = (|| -> std::io::Result<()> {
-                    let Some(source) = source_file.as_ref().filter(|s| s.exists()) else {
+                    let Some(source) = source_file.as_ref() else {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::NotFound,
-                            "file not found or not accessible",
+                            "file not found",
                         ));
                     };
 
@@ -313,12 +314,7 @@ pub fn bundle_attachments(
                             let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("bin");
                             let subdir = &sha[..2.min(sha.len())];
                             let rel = format!("attachments/{subdir}/{sha}.{ext}");
-                            let dest = output_dir.join(&rel);
-
-                            if let Some(parent) = dest.parent() {
-                                std::fs::create_dir_all(parent)?;
-                            }
-                            std::fs::copy(source, &dest)?;
+                            copy_file_into_output(output_dir, &rel, source)?;
                             stats.bytes_copied += file_size as u64;
                             dedup_map.insert(sha.clone(), rel.clone());
                             rel
@@ -400,7 +396,7 @@ pub fn bundle_attachments(
     }
 
     // Ensure attachments dir exists even if empty
-    let _ = std::fs::create_dir_all(&attachments_dir);
+    let _ = ensure_real_directory(&attachments_dir);
 
     Ok(AttachmentManifest {
         stats,
@@ -427,7 +423,7 @@ pub fn maybe_chunk_database(
     }
 
     let chunks_dir = output_dir.join("chunks");
-    std::fs::create_dir_all(&chunks_dir)?;
+    ensure_real_directory(&chunks_dir)?;
 
     let mut sha_lines = Vec::new();
     let mut index = 0usize;
@@ -443,8 +439,7 @@ pub fn maybe_chunk_database(
         }
 
         let chunk_name = format!("{index:05}.bin");
-        let chunk_path = chunks_dir.join(&chunk_name);
-        std::fs::write(&chunk_path, &chunk)?;
+        write_output_bytes(output_dir, &format!("chunks/{chunk_name}"), &chunk)?;
 
         let hash = hex_sha256(&chunk);
         sha_lines.push(format!("{hash}  chunks/{chunk_name}\n"));
@@ -453,9 +448,8 @@ pub fn maybe_chunk_database(
     }
 
     // Write checksums
-    let sha_path = output_dir.join("chunks.sha256");
     let checksums_text: String = sha_lines.into_iter().collect();
-    std::fs::write(&sha_path, &checksums_text)?;
+    write_output_bytes(output_dir, "chunks.sha256", checksums_text.as_bytes())?;
 
     // Write chunk config (matches legacy Python format exactly)
     let config = ChunkManifest {
@@ -466,10 +460,11 @@ pub fn maybe_chunk_database(
         original_bytes: file_size,
         threshold_bytes,
     };
-    let config_path = output_dir.join("mailbox.sqlite3.config.json");
-    std::fs::write(
-        &config_path,
-        serde_json::to_string_pretty(&config).unwrap_or_default(),
+    let config_json = serde_json::to_string_pretty(&config).unwrap_or_default();
+    write_output_bytes(
+        output_dir,
+        "mailbox.sqlite3.config.json",
+        config_json.as_bytes(),
     )?;
 
     Ok(Some(config))
@@ -510,19 +505,16 @@ pub fn write_bundle_scaffolding(
         viewer_sri,
     );
     let sorted = sort_json_keys(&manifest);
-    let manifest_path = output_dir.join("manifest.json");
-    std::fs::write(
-        &manifest_path,
-        serde_json::to_string_pretty(&sorted).unwrap_or_default(),
-    )?;
+    let manifest_json = serde_json::to_string_pretty(&sorted).unwrap_or_default();
+    write_output_bytes(output_dir, "manifest.json", manifest_json.as_bytes())?;
 
     // README.md
     let readme = generate_readme(scope, scrub_summary);
-    std::fs::write(output_dir.join("README.md"), readme)?;
+    write_output_bytes(output_dir, "README.md", readme.as_bytes())?;
 
     // HOW_TO_DEPLOY.md
     let deploy = generate_deploy_guide(hosting_hints);
-    std::fs::write(output_dir.join("HOW_TO_DEPLOY.md"), deploy)?;
+    write_output_bytes(output_dir, "HOW_TO_DEPLOY.md", deploy.as_bytes())?;
 
     // index.html (redirect to viewer — matches legacy Python entry page)
     let index = r#"<!doctype html>
@@ -550,14 +542,14 @@ pub fn write_bundle_scaffolding(
   </script>
 </body>
 </html>"#;
-    std::fs::write(output_dir.join("index.html"), index)?;
+    write_output_bytes(output_dir, "index.html", index.as_bytes())?;
 
     // .nojekyll (GitHub Pages)
-    std::fs::write(output_dir.join(".nojekyll"), "")?;
+    write_output_bytes(output_dir, ".nojekyll", b"")?;
 
     // _headers (Cloudflare/Netlify COOP/COEP)
     let headers = hosting::generate_headers_file();
-    std::fs::write(output_dir.join("_headers"), headers)?;
+    write_output_bytes(output_dir, "_headers", headers.as_bytes())?;
 
     Ok(())
 }
@@ -586,7 +578,7 @@ pub fn export_bundle_from_snapshot_context(
     storage_root: &Path,
     config: &BundleExportConfig,
 ) -> ShareResult<BundleExportResult> {
-    std::fs::create_dir_all(output_dir)?;
+    ensure_output_directory(output_dir)?;
     let detach_attachment_threshold = crate::adjust_detach_threshold(
         config.inline_attachment_threshold,
         config.detach_attachment_threshold,
@@ -604,7 +596,7 @@ pub fn export_bundle_from_snapshot_context(
     let viewer_assets = copy_viewer_assets(output_dir)?;
 
     let db_dest = output_dir.join("mailbox.sqlite3");
-    std::fs::copy(&context.snapshot_path, &db_dest)?;
+    copy_file_into_output(output_dir, "mailbox.sqlite3", &context.snapshot_path)?;
     let db_bytes = std::fs::read(&db_dest)?;
     let db_sha256 = hex::encode(Sha256::digest(&db_bytes));
     let db_size_bytes = db_bytes.len() as u64;
@@ -744,29 +736,151 @@ fn resolve_attachment_path(
     storage_root: &Path,
     path: &str,
     allow_absolute_paths: bool,
-) -> Option<PathBuf> {
-    let root = storage_root
-        .canonicalize()
-        .unwrap_or_else(|_| storage_root.to_path_buf());
+) -> std::io::Result<Option<PathBuf>> {
+    let root = match storage_root.canonicalize() {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => storage_root.to_path_buf(),
+        Err(error) => return Err(error),
+    };
     let path_path = Path::new(path);
 
     // Absolute source paths are only allowed when explicitly configured.
     if path_path.is_absolute() {
         if !allow_absolute_paths {
-            return None;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "absolute attachment paths are disabled",
+            ));
         }
-        return path_path.canonicalize().ok();
+        return match path_path.canonicalize() {
+            Ok(canonical) => Ok(Some(canonical)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        };
     }
 
     let candidate = root.join(path);
-    let canonical = candidate.canonicalize().ok()?;
+    let canonical = match candidate.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
     if !canonical.starts_with(&root) {
         // Relative paths that escape root are always rejected, even when
         // allow_absolute_paths is true (that flag only governs explicitly
         // absolute input paths).
-        return None;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "attachment path escapes storage root",
+        ));
     }
-    Some(canonical)
+    Ok(Some(canonical))
+}
+
+fn ensure_output_directory(output_dir: &Path) -> std::io::Result<()> {
+    ensure_real_directory(output_dir)
+}
+
+fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        use std::path::Component;
+
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(std::io::Error::other(format!(
+                    "refusing to create directory with parent traversal: {}",
+                    path.display()
+                )));
+            }
+            Component::Normal(segment) => {
+                current.push(segment);
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) => {
+                        if metadata.file_type().is_symlink() {
+                            return Err(std::io::Error::other(format!(
+                                "refusing to traverse symlinked bundle directory {}",
+                                current.display()
+                            )));
+                        }
+                        if !metadata.file_type().is_dir() {
+                            return Err(std::io::Error::other(format!(
+                                "expected bundle directory but found non-directory {}",
+                                current.display()
+                            )));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir(&current)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_relative_output_path(path: &Path) -> std::io::Result<()> {
+    for component in path.components() {
+        use std::path::Component;
+
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
+                return Err(std::io::Error::other(format!(
+                    "refusing to write outside bundle root: {}",
+                    path.display()
+                )));
+            }
+            Component::CurDir | Component::Normal(_) => {}
+        }
+    }
+    Ok(())
+}
+
+fn write_output_bytes(output_dir: &Path, relative_path: &str, data: &[u8]) -> std::io::Result<()> {
+    ensure_output_directory(output_dir)?;
+    let relative_path = Path::new(relative_path);
+    validate_relative_output_path(relative_path)?;
+    let destination = output_dir.join(relative_path);
+    if let Some(parent) = destination.parent() {
+        ensure_real_directory(parent)?;
+    }
+    if std::fs::symlink_metadata(&destination)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(std::io::Error::other(format!(
+            "refusing to write through symlinked bundle path {}",
+            destination.display()
+        )));
+    }
+    std::fs::write(destination, data)
+}
+
+fn copy_file_into_output(
+    output_dir: &Path,
+    relative_path: &str,
+    source: &Path,
+) -> std::io::Result<()> {
+    ensure_output_directory(output_dir)?;
+    let relative_path = Path::new(relative_path);
+    validate_relative_output_path(relative_path)?;
+    let destination = output_dir.join(relative_path);
+    if let Some(parent) = destination.parent() {
+        ensure_real_directory(parent)?;
+    }
+    if std::fs::symlink_metadata(&destination)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(std::io::Error::other(format!(
+            "refusing to copy through symlinked bundle path {}",
+            destination.display()
+        )));
+    }
+    std::fs::copy(source, destination).map(|_| ())
 }
 
 fn hex_sha256(data: &[u8]) -> String {
@@ -1015,7 +1129,7 @@ fn generate_deploy_guide(hints: &[HostingHint]) -> String {
 /// Mirrors legacy behavior (package resources). Writes files in deterministic order.
 pub fn copy_viewer_assets(output_dir: &Path) -> ShareResult<Vec<String>> {
     let viewer_root = output_dir.join("viewer");
-    std::fs::create_dir_all(&viewer_root)?;
+    ensure_real_directory(&viewer_root)?;
 
     let mut rel_paths = Vec::new();
     collect_embedded_file_paths(&BUILTIN_VIEWER_ASSETS, &mut rel_paths);
@@ -1027,11 +1141,8 @@ pub fn copy_viewer_assets(output_dir: &Path) -> ShareResult<Vec<String>> {
             continue;
         };
 
-        let dest = viewer_root.join(&rel);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&dest, file.contents())?;
+        let output_rel = format!("viewer/{rel}");
+        write_output_bytes(output_dir, &output_rel, file.contents())?;
         copied.push(format!("viewer/{rel}"));
     }
 
@@ -1068,7 +1179,7 @@ pub fn copy_viewer_assets_from(
         .canonicalize()
         .map_err(|e| ShareError::Io(std::io::Error::other(e.to_string())))?;
     let viewer_root = output_dir.join("viewer");
-    std::fs::create_dir_all(&viewer_root)?;
+    ensure_real_directory(&viewer_root)?;
 
     let mut copied = Vec::new();
 
@@ -1096,11 +1207,8 @@ pub fn copy_viewer_assets_from(
             ))));
         }
 
-        let dest = viewer_root.join(relative_path);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::copy(&resolved, &dest)?;
+        let output_rel = format!("viewer/{relative_path}");
+        copy_file_into_output(output_dir, &output_rel, &resolved)?;
         copied.push(format!("viewer/{relative_path}"));
     }
 
@@ -1151,7 +1259,7 @@ pub fn export_viewer_data(
     fts_enabled: bool,
 ) -> ShareResult<ViewerDataManifest> {
     let data_dir = output_dir.join("viewer").join("data");
-    std::fs::create_dir_all(&data_dir)?;
+    ensure_real_directory(&data_dir)?;
 
     let path_str = snapshot_path.display().to_string();
     let conn = Conn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
@@ -1201,9 +1309,12 @@ pub fn export_viewer_data(
     let cached_count = messages.len();
 
     // Write messages.json
-    std::fs::write(
-        data_dir.join("messages.json"),
-        serde_json::to_string_pretty(&messages).unwrap_or_else(|_| "[]".to_string()),
+    let messages_json =
+        serde_json::to_string_pretty(&messages).unwrap_or_else(|_| "[]".to_string());
+    write_output_bytes(
+        output_dir,
+        "viewer/data/messages.json",
+        messages_json.as_bytes(),
     )?;
 
     let now = chrono::Utc::now().to_rfc3339();
@@ -1215,10 +1326,8 @@ pub fn export_viewer_data(
     });
 
     // Write meta.json
-    std::fs::write(
-        data_dir.join("meta.json"),
-        serde_json::to_string_pretty(&meta).unwrap_or_else(|_| "{}".to_string()),
-    )?;
+    let meta_json = serde_json::to_string_pretty(&meta).unwrap_or_else(|_| "{}".to_string());
+    write_output_bytes(output_dir, "viewer/data/meta.json", meta_json.as_bytes())?;
 
     Ok(ViewerDataManifest {
         messages_path: "viewer/data/messages.json".to_string(),
@@ -1727,6 +1836,95 @@ mod tests {
     }
 
     #[test]
+    fn bundle_attachment_root_escape_errors_instead_of_marking_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        std::fs::write(dir.path().join("outside.dat"), b"secret").unwrap();
+
+        let att_json =
+            r#"[{"type":"file","path":"../outside.dat","media_type":"application/octet-stream"}]"#;
+        let db = create_bundle_test_db(dir.path(), &[att_json]);
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+
+        let err = bundle_attachments(
+            &db,
+            &output,
+            &storage,
+            crate::INLINE_ATTACHMENT_THRESHOLD,
+            crate::DETACH_ATTACHMENT_THRESHOLD,
+            true,
+        )
+        .expect_err("attachment paths that escape storage_root must fail the export");
+
+        assert!(
+            matches!(err, ShareError::Io(_)),
+            "unexpected error type: {err:?}"
+        );
+
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync("SELECT attachments FROM messages WHERE id = 1", &[])
+            .unwrap();
+        let att: String = rows[0].get_named("attachments").unwrap();
+        assert!(
+            att.contains(r#""path":"../outside.dat""#),
+            "attachment JSON should be left unchanged when a path escapes storage_root"
+        );
+        assert!(
+            !att.contains(r#""type":"missing""#),
+            "root-escape policy violations must not be rewritten as missing attachments"
+        );
+    }
+
+    #[test]
+    fn bundle_disallowed_absolute_path_errors_instead_of_marking_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+
+        let absolute = dir.path().join("absolute.dat");
+        std::fs::write(&absolute, b"secret").unwrap();
+        let att_json = format!(
+            r#"[{{"type":"file","path":"{}","media_type":"application/octet-stream"}}]"#,
+            absolute.display()
+        );
+        let db = create_bundle_test_db(dir.path(), &[&att_json]);
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+
+        let err = bundle_attachments(
+            &db,
+            &output,
+            &storage,
+            crate::INLINE_ATTACHMENT_THRESHOLD,
+            crate::DETACH_ATTACHMENT_THRESHOLD,
+            false,
+        )
+        .expect_err("disallowed absolute attachment paths must fail the export");
+
+        assert!(
+            matches!(err, ShareError::Io(_)),
+            "unexpected error type: {err:?}"
+        );
+
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync("SELECT attachments FROM messages WHERE id = 1", &[])
+            .unwrap();
+        let att: String = rows[0].get_named("attachments").unwrap();
+        assert!(
+            att.contains(&format!(r#""path":"{}""#, absolute.display())),
+            "attachment JSON should be left unchanged when absolute paths are disallowed"
+        );
+        assert!(
+            !att.contains(r#""type":"missing""#),
+            "disallowed absolute paths must not be rewritten as missing attachments"
+        );
+    }
+
+    #[test]
     fn bundle_externalize_large_file() {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path().join("storage");
@@ -1981,6 +2179,22 @@ mod tests {
         assert!(output.join("viewer/vendor/sql-wasm.wasm").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn copy_viewer_assets_builtin_rejects_symlinked_viewer_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+        let outside = dir.path().join("outside-viewer");
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, output.join("viewer")).unwrap();
+
+        let err = copy_viewer_assets(&output).unwrap_err();
+        assert!(err.to_string().contains("symlinked bundle directory"));
+    }
+
     #[test]
     fn copy_viewer_assets_from_copies_directory_structure() {
         let dir = tempfile::tempdir().unwrap();
@@ -2119,6 +2333,23 @@ mod tests {
         assert_eq!(meta["message_count"], 2);
         assert_eq!(meta["messages_cached"], 2);
         assert_eq!(meta["fts_enabled"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_viewer_data_rejects_symlinked_data_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_bundle_test_db(dir.path(), &["[]"]);
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(output.join("viewer")).unwrap();
+        let outside = dir.path().join("outside-data");
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, output.join("viewer/data")).unwrap();
+
+        let err = export_viewer_data(&db, &output, true).unwrap_err();
+        assert!(err.to_string().contains("symlinked bundle directory"));
     }
 
     #[test]
