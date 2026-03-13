@@ -4003,29 +4003,31 @@ fn is_sqlite_recovery_error_message(message: &str) -> bool {
         || lower.contains("cursor must be on a leaf")
 }
 
+fn path_is_real_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+fn path_is_real_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+fn sqlite_pragma_check_rows_ok(
+    rows: &[mcp_agent_mail_db::sqlmodel_core::Row],
+    kind: mcp_agent_mail_db::CheckKind,
+) -> bool {
+    mcp_agent_mail_db::integrity::evaluate_check_rows(rows, kind, 0)
+        .map(|result| result.ok)
+        .unwrap_or(false)
+}
+
 fn sqlite_conn_quick_check_ok(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
     let rows = conn
         .query_sync("PRAGMA quick_check", &[])
         .map_err(|e| CliError::Other(format!("PRAGMA quick_check failed: {e}")))?;
-    let mut checks: Vec<String> = Vec::with_capacity(rows.len());
-    for row in &rows {
-        if let Ok(v) = row.get_named::<String>("quick_check") {
-            checks.push(v);
-            continue;
-        }
-        if let Ok(v) = row.get_named::<String>("integrity_check") {
-            checks.push(v);
-        }
-    }
-
-    if checks.is_empty() {
-        // No integrity_check values parsed; database is only OK if we got
-        // no rows at all AND expected that (unlikely — PRAGMA quick_check
-        // should always return at least one row).
-        return Ok(false);
-    }
-
-    Ok(checks.len() == 1 && checks[0] == "ok")
+    Ok(sqlite_pragma_check_rows_ok(
+        &rows,
+        mcp_agent_mail_db::CheckKind::Quick,
+    ))
 }
 
 fn sqlite_conn_is_healthy(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
@@ -4204,20 +4206,10 @@ fn sqlite_conn_quick_check_ok_canonical(
     let rows = conn
         .query_sync("PRAGMA quick_check", &[])
         .map_err(|e| CliError::Other(format!("PRAGMA quick_check failed: {e}")))?;
-    let mut checks: Vec<String> = Vec::with_capacity(rows.len());
-    for row in &rows {
-        if let Ok(v) = row.get_named::<String>("quick_check") {
-            checks.push(v);
-            continue;
-        }
-        if let Ok(v) = row.get_named::<String>("integrity_check") {
-            checks.push(v);
-        }
-    }
-    if checks.is_empty() {
-        return Ok(false);
-    }
-    Ok(checks.len() == 1 && checks[0] == "ok")
+    Ok(sqlite_pragma_check_rows_ok(
+        &rows,
+        mcp_agent_mail_db::CheckKind::Quick,
+    ))
 }
 
 fn sqlite_conn_incremental_check_ok_canonical(
@@ -4226,20 +4218,10 @@ fn sqlite_conn_incremental_check_ok_canonical(
     let rows = conn
         .query_sync("PRAGMA integrity_check(1)", &[])
         .map_err(|e| CliError::Other(format!("PRAGMA integrity_check(1) failed: {e}")))?;
-    let mut checks: Vec<String> = Vec::with_capacity(rows.len());
-    for row in &rows {
-        if let Ok(v) = row.get_named::<String>("integrity_check") {
-            checks.push(v);
-            continue;
-        }
-        if let Ok(v) = row.get_named::<String>("quick_check") {
-            checks.push(v);
-        }
-    }
-    if checks.is_empty() {
-        return Ok(false);
-    }
-    Ok(checks.len() == 1 && checks[0] == "ok")
+    Ok(sqlite_pragma_check_rows_ok(
+        &rows,
+        mcp_agent_mail_db::CheckKind::Incremental,
+    ))
 }
 
 fn sqlite_file_has_live_sidecars(path: &Path) -> bool {
@@ -4782,7 +4764,15 @@ fn attempt_sqlite_salvage_via_cli(
     }))
 }
 
+#[cfg(test)]
 fn recover_sqlite_file(path: &Path) -> CliResult<()> {
+    recover_sqlite_file_with_storage_root(path, None)
+}
+
+fn recover_sqlite_file_with_storage_root(
+    path: &Path,
+    storage_root_override: Option<&Path>,
+) -> CliResult<()> {
     if !path.exists() || sqlite_file_is_healthy(path)? {
         return Ok(());
     }
@@ -4810,9 +4800,10 @@ fn recover_sqlite_file(path: &Path) -> CliResult<()> {
         }
     } else {
         // Fall back to archive reconstruction if no backup is available
-        let config = Config::from_env();
-        let storage_root = config.storage_root;
-        if storage_root.is_dir() && storage_root.join("projects").is_dir() {
+        let storage_root = storage_root_override
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Config::from_env().storage_root);
+        if storage_root.is_dir() && path_is_real_directory(&storage_root.join("projects")) {
             ftui_runtime::ftui_println!(
                 "No backup found. Reconstructing database from archive at {}...",
                 storage_root.display()
@@ -4934,6 +4925,13 @@ fn resolve_sqlite_path_with_absolute_candidate(path: &str) -> String {
 }
 
 fn open_sqlite_with_fallback(path: &str) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
+    open_sqlite_with_fallback_and_storage_root(path, None)
+}
+
+fn open_sqlite_with_fallback_and_storage_root(
+    path: &str,
+    storage_root_override: Option<&Path>,
+) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
     retry_sync_sqlite_lock(|| match mcp_agent_mail_db::DbConn::open_file(path) {
         Ok(conn) => Ok((conn, path.to_string())),
         Err(primary_err) => {
@@ -4953,14 +4951,16 @@ fn open_sqlite_with_fallback(path: &str) -> CliResult<(mcp_agent_mail_db::DbConn
             }
             if path != ":memory:" && is_sqlite_recovery_error_message(&primary_err_text) {
                 let primary_path = Path::new(path);
-                recover_sqlite_file(primary_path).map_err(|recovery_err| {
+                recover_sqlite_file_with_storage_root(primary_path, storage_root_override).map_err(
+                    |recovery_err| {
                     sqlite_retryable_error(
                         format!(
                             "cannot open DB at {path}: {primary_err}; auto-recovery failed: {recovery_err}"
                         ),
                         &recovery_err.to_string(),
                     )
-                })?;
+                },
+                )?;
                 let recovered_conn = mcp_agent_mail_db::DbConn::open_file(path).map_err(|e| {
                     sqlite_retryable_error(
                         format!(
@@ -5047,6 +5047,13 @@ where
 pub(crate) fn open_db_sync_with_database_url(
     database_url: &str,
 ) -> CliResult<mcp_agent_mail_db::DbConn> {
+    open_db_sync_with_database_url_and_storage_root(database_url, None)
+}
+
+fn open_db_sync_with_database_url_and_storage_root(
+    database_url: &str,
+    storage_root_override: Option<&Path>,
+) -> CliResult<mcp_agent_mail_db::DbConn> {
     let cfg = mcp_agent_mail_db::DbPoolConfig {
         database_url: database_url.to_string(),
         ..Default::default()
@@ -5057,7 +5064,8 @@ pub(crate) fn open_db_sync_with_database_url(
     if path != ":memory:" {
         ensure_sqlite_parent_dir(Path::new(&path))?;
     }
-    let (mut conn, mut opened_path) = open_sqlite_with_fallback(&path)?;
+    let (mut conn, mut opened_path) =
+        open_sqlite_with_fallback_and_storage_root(&path, storage_root_override)?;
     let mut needs_canonical_init = false;
     if opened_path != ":memory:" {
         let mut conn_healthy = sqlite_conn_is_healthy(&conn)?;
@@ -5076,7 +5084,10 @@ pub(crate) fn open_db_sync_with_database_url(
 
             if !conn_healthy {
                 drop(conn);
-                recover_sqlite_file(Path::new(&opened_path))?;
+                recover_sqlite_file_with_storage_root(
+                    Path::new(&opened_path),
+                    storage_root_override,
+                )?;
                 conn = mcp_agent_mail_db::DbConn::open_file(&opened_path).map_err(|e| {
                     CliError::Other(format!("cannot reopen DB at {opened_path}: {e}"))
                 })?;
@@ -5096,7 +5107,10 @@ pub(crate) fn open_db_sync_with_database_url(
             if let Err(init_error) = init_schema_sqlite_canonical(&opened_path) {
                 let init_error_text = init_error.to_string();
                 if is_sqlite_recovery_error_message(&init_error_text) {
-                    recover_sqlite_file(Path::new(&opened_path))?;
+                    recover_sqlite_file_with_storage_root(
+                        Path::new(&opened_path),
+                        storage_root_override,
+                    )?;
                     init_schema_sqlite_canonical(&opened_path)?;
                 } else {
                     return Err(init_error);
@@ -11739,7 +11753,7 @@ fn doctor_required_tables(conn: &mcp_agent_mail_db::DbConn) -> CliResult<Vec<Str
 
 fn collect_doctor_archive_inventory(storage_root: &Path) -> CliResult<DoctorInventoryCounts> {
     let projects_root = storage_root.join("projects");
-    if !projects_root.is_dir() {
+    if !path_is_real_directory(&projects_root) {
         return Ok(DoctorInventoryCounts::default());
     }
 
@@ -11753,13 +11767,16 @@ fn collect_doctor_archive_inventory(storage_root: &Path) -> CliResult<DoctorInve
 
     for entry in entries.flatten() {
         let project_path = entry.path();
-        if !project_path.is_dir() {
+        let Ok(project_type) = entry.file_type() else {
+            continue;
+        };
+        if !project_type.is_dir() || project_type.is_symlink() {
             continue;
         }
         counts.projects += 1;
 
         let agents_dir = project_path.join("agents");
-        if agents_dir.is_dir() {
+        if path_is_real_directory(&agents_dir) {
             let agent_entries = std::fs::read_dir(&agents_dir).map_err(|e| {
                 CliError::Other(format!(
                     "failed to read archive agents dir {}: {e}",
@@ -11767,14 +11784,20 @@ fn collect_doctor_archive_inventory(storage_root: &Path) -> CliResult<DoctorInve
                 ))
             })?;
             for agent_entry in agent_entries.flatten() {
-                if agent_entry.path().join("profile.json").is_file() {
+                let Ok(agent_type) = agent_entry.file_type() else {
+                    continue;
+                };
+                if !agent_type.is_dir() || agent_type.is_symlink() {
+                    continue;
+                }
+                if path_is_real_file(&agent_entry.path().join("profile.json")) {
                     counts.agents += 1;
                 }
             }
         }
 
         let messages_dir = project_path.join("messages");
-        if messages_dir.is_dir() {
+        if path_is_real_directory(&messages_dir) {
             counts.messages += walkdir::WalkDir::new(&messages_dir)
                 .into_iter()
                 .filter_map(Result::ok)
@@ -11869,7 +11892,7 @@ fn doctor_database_fix_strategy(
     }
 
     let archive_root = storage_root.join("projects");
-    let archive_available = archive_root.is_dir();
+    let archive_available = path_is_real_directory(&archive_root);
     let resolved_path = resolve_sqlite_path_with_absolute_candidate(&configured_path);
     let resolved = Path::new(&resolved_path);
 
@@ -11966,14 +11989,26 @@ fn doctor_database_fix_strategy(
         )));
     }
 
-    let integrity_rows = opened
-        .conn
-        .query_sync("PRAGMA integrity_check", &[])
-        .map_err(|e| CliError::Other(format!("integrity check failed: {e}")))?;
-    let integrity_ok = integrity_rows
-        .first()
-        .and_then(|row| row.get_named::<String>("integrity_check").ok())
-        .is_some_and(|value| value == "ok");
+    let integrity_ok = match opened.conn.query_sync("PRAGMA integrity_check", &[]) {
+        Ok(rows) => sqlite_pragma_check_rows_ok(&rows, mcp_agent_mail_db::CheckKind::Full),
+        Err(error) => {
+            let detail = format!(
+                "PRAGMA integrity_check failed for {}: {error}",
+                opened.opened_path
+            );
+            if is_sqlite_recovery_error_message(&error.to_string()) {
+                return Ok(if archive_available {
+                    DoctorDatabaseFixStrategy::Reconstruct(format!(
+                        "{detail}; reconstruct from archive {}",
+                        archive_root.display()
+                    ))
+                } else {
+                    DoctorDatabaseFixStrategy::Repair(detail)
+                });
+            }
+            return Err(CliError::Other(detail));
+        }
+    };
     if !integrity_ok {
         return Ok(if archive_available {
             DoctorDatabaseFixStrategy::Reconstruct(format!(
@@ -12406,7 +12441,7 @@ fn handle_doctor_check_with(
             "status": "warn",
             "detail": "Skipped: storage root missing",
         }));
-    } else if !storage_root.join("projects").is_dir() {
+    } else if !path_is_real_directory(&storage_root.join("projects")) {
         checks.push(serde_json::json!({
             "check": "archive_db_parity",
             "status": "warn",
@@ -14373,7 +14408,14 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
                     skipped_count += 1;
                 } else {
                     match run_doctor_subcommand_quietly(json, || {
-                        handle_doctor_repair_with(&cfg.database_url, &backup_dir, None, false, true)
+                        handle_doctor_repair_with(
+                            &cfg.database_url,
+                            &storage_root,
+                            &backup_dir,
+                            None,
+                            false,
+                            true,
+                        )
                     }) {
                         Ok(()) => {
                             results.push(serde_json::json!({
@@ -22599,6 +22641,29 @@ startup_timeout_sec = 42
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn doctor_database_fix_strategy_ignores_symlinked_archive_projects_dir() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_projects = dir.path().join("real-projects");
+        let storage_root = dir.path().join("storage");
+        std::fs::create_dir_all(&real_projects).unwrap();
+        std::fs::create_dir_all(&storage_root).unwrap();
+        symlink(&real_projects, storage_root.join("projects")).unwrap();
+
+        let db_path = dir.path().join("missing.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let strategy =
+            doctor_database_fix_strategy(&db_url, &storage_root).expect("strategy should succeed");
+
+        assert!(
+            matches!(strategy, DoctorDatabaseFixStrategy::None(_)),
+            "symlinked archive roots should not be treated as reconstructable: {strategy:?}"
+        );
+    }
+
     #[test]
     fn doctor_database_fix_strategy_prefers_reconstruct_when_archive_is_ahead() {
         let dir = tempfile::tempdir().unwrap();
@@ -22746,6 +22811,31 @@ startup_timeout_sec = 42
         assert!(db_path.exists(), "reconstructed DB file should exist");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn scan_archive_stats_skips_symlinked_project_entries() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let real_project = tmp.path().join("outside-project");
+        let linked_project = storage_root.join("projects").join("linked-project");
+        let real_agent = real_project.join("agents").join("BlueLake");
+        let real_messages = real_project.join("messages").join("2026").join("03");
+
+        std::fs::create_dir_all(&real_agent).unwrap();
+        std::fs::create_dir_all(&real_messages).unwrap();
+        std::fs::create_dir_all(linked_project.parent().unwrap()).unwrap();
+        std::fs::write(real_agent.join("profile.json"), "{}").unwrap();
+        std::fs::write(real_messages.join("message.md"), "body").unwrap();
+        symlink(&real_project, &linked_project).unwrap();
+
+        let stats = scan_archive_stats(&storage_root);
+        assert_eq!(stats.projects, 0);
+        assert_eq!(stats.agents, 0);
+        assert_eq!(stats.message_files, 0);
+    }
+
     #[test]
     fn doctor_repair_rejects_unimplemented_project_scope() {
         let tmp = tempfile::tempdir().unwrap();
@@ -22755,6 +22845,7 @@ startup_timeout_sec = 42
 
         let result = handle_doctor_repair_with(
             &db_url,
+            tmp.path(),
             &tmp.path().join("backups"),
             Some("demo-project".to_string()),
             true,
@@ -22766,6 +22857,85 @@ startup_timeout_sec = 42
             err.to_string()
                 .contains("scoped doctor repair is not implemented")
         );
+    }
+
+    #[test]
+    fn doctor_repair_recovery_uses_explicit_storage_root_not_env_defaults() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("explicit.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let backup_dir = tmp.path().join("backups");
+        let storage_root = tmp.path().join("explicit-storage");
+        let env_storage_root = tmp.path().join("env-storage");
+        let env_db_path = tmp.path().join("env-default.sqlite3");
+        let env_db_url = format!("sqlite:///{}", env_db_path.display());
+        let env_storage_root_text = env_storage_root.display().to_string();
+        let project_root = storage_root.join("projects").join("demo");
+        let agent_dir = project_root.join("agents").join("BlueLake");
+        let message_dir = project_root.join("messages").join("2026").join("03");
+
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&message_dir).unwrap();
+        std::fs::create_dir_all(&env_storage_root).unwrap();
+        std::fs::write(
+            project_root.join("project.json"),
+            r#"{"human_key":"/tmp/demo"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"program":"codex-cli","model":"gpt-5","task_description":"doctor"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            message_dir.join("2026-03-12T00-00-00Z__1.md"),
+            "---json\n{\"id\":1,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Recovered\"}\n---\nbody\n",
+        )
+        .unwrap();
+
+        std::fs::write(&db_path, b"NOT A SQLITE DATABASE").expect("write corrupt db");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", env_db_url.as_str()),
+                ("STORAGE_ROOT", env_storage_root_text.as_str()),
+            ],
+            || handle_doctor_repair_with(&db_url, &storage_root, &backup_dir, None, false, true),
+        );
+        let output = capture.drain_to_string();
+        assert!(
+            result.is_ok(),
+            "repair should recover explicit target: {output}"
+        );
+        assert!(
+            !env_db_path.exists(),
+            "env default db should remain untouched when explicit targets are supplied"
+        );
+
+        let repaired =
+            open_db_sync_with_database_url_and_storage_root(&db_url, Some(&storage_root))
+                .expect("open repaired explicit db");
+        let project_rows = repaired
+            .query_sync("SELECT slug FROM projects", &[])
+            .expect("query reconstructed projects");
+        let project_slug: String = project_rows
+            .first()
+            .and_then(|row| row.get_named("slug").ok())
+            .expect("project slug");
+        assert_eq!(project_slug, "demo");
+
+        let message_rows = repaired
+            .query_sync("SELECT subject FROM messages", &[])
+            .expect("query reconstructed messages");
+        let subject: String = message_rows
+            .first()
+            .and_then(|row| row.get_named("subject").ok())
+            .expect("message subject");
+        assert_eq!(subject, "Recovered");
     }
 
     #[test]
@@ -28879,6 +29049,15 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn sqlite_pragma_check_rows_ok_treats_empty_rows_as_success() {
+        let rows: Vec<mcp_agent_mail_db::sqlmodel_core::Row> = Vec::new();
+        assert!(
+            sqlite_pragma_check_rows_ok(&rows, mcp_agent_mail_db::CheckKind::Quick),
+            "empty PRAGMA result sets should preserve normalized success semantics"
+        );
+    }
+
+    #[test]
     fn sqlite_quick_check_via_cli_handles_missing_binary_and_valid_db() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("sqlite3_probe_ok.sqlite3");
@@ -29461,7 +29640,7 @@ startup_timeout_sec = 42
 
         // Run doctor repair (not dry_run)
         let _capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_doctor_repair_with(&db_url, &backup_dir, None, false, true);
+        let result = handle_doctor_repair_with(&db_url, dir.path(), &backup_dir, None, false, true);
         assert!(result.is_ok(), "repair failed: {result:?}");
 
         // Verify .bak sibling exists
@@ -29529,7 +29708,8 @@ startup_timeout_sec = 42
         drop(conn);
 
         let _capture = ftui_runtime::StdioCapture::install().unwrap();
-        handle_doctor_repair_with(&db_url, &backup_dir, None, false, true).expect("repair");
+        handle_doctor_repair_with(&db_url, dir.path(), &backup_dir, None, false, true)
+            .expect("repair");
 
         // Verify the .bak is a valid DB that passes quick_check
         let bak_path = format!("{}.bak", db_path.display());
@@ -29571,7 +29751,7 @@ startup_timeout_sec = 42
         std::fs::create_dir_all(&bak_path).expect("create .bak as directory");
 
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_doctor_repair_with(&db_url, &backup_dir, None, false, true);
+        let result = handle_doctor_repair_with(&db_url, dir.path(), &backup_dir, None, false, true);
         let output = capture.drain_to_string();
 
         // Repair should still complete (non-fatal .bak failure)
@@ -29643,7 +29823,8 @@ startup_timeout_sec = 42
         drop(conn);
 
         let _capture = ftui_runtime::StdioCapture::install().unwrap();
-        handle_doctor_repair_with(&db_url, &backup_dir, None, false, true).expect("repair");
+        handle_doctor_repair_with(&db_url, dir.path(), &backup_dir, None, false, true)
+            .expect("repair");
 
         let timestamped_backup =
             find_backup_entry(&backup_dir, "pre_repair_").expect("backup path");
@@ -29719,7 +29900,8 @@ startup_timeout_sec = 42
         drop(conn);
 
         let _capture = ftui_runtime::StdioCapture::install().unwrap();
-        handle_doctor_repair_with(&db_url, &backup_dir, None, false, true).expect("repair");
+        handle_doctor_repair_with(&db_url, dir.path(), &backup_dir, None, false, true)
+            .expect("repair");
 
         let verify =
             mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("reopen db");
@@ -32225,11 +32407,19 @@ fn handle_doctor_repair(
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let database_url = &cfg.database_url;
     let bak_dir = backup_dir.unwrap_or_else(|| config.storage_root.join("backups"));
-    handle_doctor_repair_with(database_url, &bak_dir, project, dry_run, yes)
+    handle_doctor_repair_with(
+        database_url,
+        &config.storage_root,
+        &bak_dir,
+        project,
+        dry_run,
+        yes,
+    )
 }
 
 fn handle_doctor_repair_with(
     database_url: &str,
+    storage_root: &Path,
     backup_dir: &Path,
     project: Option<String>,
     dry_run: bool,
@@ -32245,6 +32435,15 @@ fn handle_doctor_repair_with(
         )));
     }
 
+    let repair_cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let reconstruct_db_path = repair_cfg
+        .sqlite_path()
+        .map(PathBuf::from)
+        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+
     let conn = open_db_sync_with_database_url(database_url)?;
 
     ftui_runtime::ftui_println!("Running database repair...");
@@ -32258,14 +32457,24 @@ fn handle_doctor_repair_with(
     }
 
     // 1. Integrity check
-    let integrity = conn
-        .query_sync("PRAGMA integrity_check", &[])
-        .map_err(|e| CliError::Other(format!("integrity check failed: {e}")))?;
-    let integrity_ok = integrity
-        .first()
-        .and_then(|r| r.get_named::<String>("integrity_check").ok())
-        .map(|s| s == "ok")
-        .unwrap_or(false);
+    let integrity_ok = match conn.query_sync("PRAGMA integrity_check", &[]) {
+        Ok(rows) => sqlite_pragma_check_rows_ok(&rows, mcp_agent_mail_db::CheckKind::Full),
+        Err(error) => {
+            if !dry_run && is_sqlite_recovery_error_message(&error.to_string()) {
+                ftui_runtime::ftui_eprintln!(
+                    "  Integrity probe failed with a recovery-class error ({error}). Automatically falling back to archive reconstruction..."
+                );
+                return handle_doctor_reconstruct_with(
+                    Some(&reconstruct_db_path),
+                    Some(storage_root),
+                    false,
+                    yes,
+                    false,
+                );
+            }
+            return Err(CliError::Other(format!("integrity check failed: {error}")));
+        }
+    };
 
     ftui_runtime::ftui_println!(
         "  Integrity: {}",
@@ -32277,7 +32486,13 @@ fn handle_doctor_repair_with(
             "  Database corruption detected. Automatically falling back to archive reconstruction..."
         );
         // Fall back to reconstruction from archive
-        return handle_doctor_reconstruct_with(None, None, false, yes, false);
+        return handle_doctor_reconstruct_with(
+            Some(&reconstruct_db_path),
+            Some(storage_root),
+            false,
+            yes,
+            false,
+        );
     }
 
     // 2. Optional backup before repair
@@ -32760,7 +32975,7 @@ fn handle_doctor_reconstruct_with(
     }
 
     let projects_dir = storage_root.join("projects");
-    if !projects_dir.is_dir() {
+    if !path_is_real_directory(&projects_dir) {
         if json {
             ftui_runtime::ftui_println!(
                 "{}",
@@ -32946,13 +33161,19 @@ fn scan_archive_stats(storage_root: &Path) -> ArchiveScanStats {
     };
 
     let projects_dir = storage_root.join("projects");
+    if !path_is_real_directory(&projects_dir) {
+        return stats;
+    }
     let entries = match std::fs::read_dir(&projects_dir) {
         Ok(e) => e,
         Err(_) => return stats,
     };
 
     for entry in entries.flatten() {
-        if !entry.path().is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
             continue;
         }
         stats.projects += 1;
@@ -32960,11 +33181,17 @@ fn scan_archive_stats(storage_root: &Path) -> ArchiveScanStats {
 
         // Count agents
         let agents_dir = project_dir.join("agents");
-        if agents_dir.is_dir()
+        if path_is_real_directory(&agents_dir)
             && let Ok(agent_entries) = std::fs::read_dir(&agents_dir)
         {
             for ae in agent_entries.flatten() {
-                if ae.path().join("profile.json").exists() {
+                let Ok(agent_type) = ae.file_type() else {
+                    continue;
+                };
+                if !agent_type.is_dir() || agent_type.is_symlink() {
+                    continue;
+                }
+                if path_is_real_file(&ae.path().join("profile.json")) {
                     stats.agents += 1;
                 }
             }
@@ -32972,7 +33199,7 @@ fn scan_archive_stats(storage_root: &Path) -> ArchiveScanStats {
 
         // Count message files
         let messages_dir = project_dir.join("messages");
-        if messages_dir.is_dir() {
+        if path_is_real_directory(&messages_dir) {
             count_md_files_recursive(&messages_dir, &mut stats.message_files);
         }
     }
@@ -32981,15 +33208,24 @@ fn scan_archive_stats(storage_root: &Path) -> ArchiveScanStats {
 }
 
 fn count_md_files_recursive(dir: &Path, count: &mut usize) {
+    if !path_is_real_directory(dir) {
+        return;
+    }
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             count_md_files_recursive(&path, count);
-        } else if path.extension().is_some_and(|e| e == "md") {
+        } else if file_type.is_file() && path.extension().is_some_and(|e| e == "md") {
             *count += 1;
         }
     }

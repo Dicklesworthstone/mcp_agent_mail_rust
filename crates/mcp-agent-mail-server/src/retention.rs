@@ -148,6 +148,10 @@ fn sleep_with_shutdown(duration: std::time::Duration) -> bool {
     false
 }
 
+fn is_real_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
 /// Summary of a retention/quota report cycle.
 struct RetentionReport {
     projects_scanned: usize,
@@ -161,7 +165,7 @@ fn run_retention_cycle(config: &Config) -> Result<RetentionReport, String> {
     // Mailbox archive layout is `{storage_root}/projects/{project_slug}/...`.
     // Retention/quota logic should operate on per-project directories under `projects/`.
     let projects_root = config.storage_root.join("projects");
-    if !projects_root.is_dir() {
+    if !is_real_directory(&projects_root) {
         return Ok(RetentionReport {
             projects_scanned: 0,
             total_attachment_bytes: 0,
@@ -309,7 +313,7 @@ fn should_ignore(name: &str, patterns: &[String]) -> bool {
 
 /// Recursively compute total size of a directory in bytes.
 fn dir_size(path: &Path) -> u64 {
-    if !path.is_dir() {
+    if !is_real_directory(path) {
         return 0;
     }
 
@@ -340,15 +344,21 @@ fn dir_size(path: &Path) -> u64 {
 
 /// Count .md files recursively under agents/*/inbox/.
 fn count_inbox_files(agents_dir: &Path) -> u64 {
-    if !agents_dir.is_dir() {
+    if !is_real_directory(agents_dir) {
         return 0;
     }
 
     let mut count = 0u64;
     if let Ok(agents) = std::fs::read_dir(agents_dir) {
         for agent in agents.flatten() {
+            let Ok(agent_type) = agent.file_type() else {
+                continue;
+            };
+            if !agent_type.is_dir() || agent_type.is_symlink() {
+                continue;
+            }
             let inbox = agent.path().join("inbox");
-            if inbox.is_dir() {
+            if is_real_directory(&inbox) {
                 count += count_md_files_recursive(&inbox);
             }
         }
@@ -358,6 +368,10 @@ fn count_inbox_files(agents_dir: &Path) -> u64 {
 
 /// Recursively count .md files in a directory.
 fn count_md_files_recursive(dir: &Path) -> u64 {
+    if !is_real_directory(dir) {
+        return 0;
+    }
+
     let mut count = 0u64;
     let mut stack = vec![dir.to_path_buf()];
 
@@ -385,7 +399,7 @@ fn count_md_files_recursive(dir: &Path) -> u64 {
 
 /// Count messages older than `max_age_days` under agents/*/inbox/.
 fn count_old_messages(agents_dir: &Path, max_age_days: u64) -> u64 {
-    if !agents_dir.is_dir() {
+    if !is_real_directory(agents_dir) {
         return 0;
     }
 
@@ -398,8 +412,14 @@ fn count_old_messages(agents_dir: &Path, max_age_days: u64) -> u64 {
     let mut count = 0u64;
     if let Ok(agents) = std::fs::read_dir(agents_dir) {
         for agent in agents.flatten() {
+            let Ok(agent_type) = agent.file_type() else {
+                continue;
+            };
+            if !agent_type.is_dir() || agent_type.is_symlink() {
+                continue;
+            }
             let inbox = agent.path().join("inbox");
-            if inbox.is_dir() {
+            if is_real_directory(&inbox) {
                 count += count_old_files_recursive(&inbox, cutoff);
             }
         }
@@ -409,6 +429,10 @@ fn count_old_messages(agents_dir: &Path, max_age_days: u64) -> u64 {
 
 /// Count files older than cutoff in a directory tree.
 fn count_old_files_recursive(dir: &Path, cutoff: std::time::SystemTime) -> u64 {
+    if !is_real_directory(dir) {
+        return 0;
+    }
+
     let mut count = 0u64;
     let mut stack = vec![dir.to_path_buf()];
 
@@ -597,6 +621,21 @@ mod tests {
         assert_eq!(dir_size(tmp.path()), 0);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn dir_size_skips_symlink_root_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("payload.bin"), vec![0u8; 64]).unwrap();
+        let linked = tmp.path().join("linked");
+        symlink(&real, &linked).unwrap();
+
+        assert_eq!(dir_size(&linked), 0);
+    }
+
     #[test]
     fn count_inbox_files_no_agents() {
         let tmp = tempfile::tempdir().unwrap();
@@ -615,6 +654,27 @@ mod tests {
         std::fs::write(agent1.join("b.md"), "msg").unwrap();
         std::fs::write(agent2.join("c.md"), "msg").unwrap();
         assert_eq!(count_inbox_files(tmp.path()), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn count_inbox_files_skips_symlinked_agent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real_agent = tmp.path().join("real-agent").join("inbox");
+        std::fs::create_dir_all(&real_agent).unwrap();
+        std::fs::write(real_agent.join("msg.md"), "msg").unwrap();
+
+        let scan_root = tmp.path().join("agents");
+        std::fs::create_dir_all(&scan_root).unwrap();
+        symlink(
+            tmp.path().join("real-agent"),
+            scan_root.join("linked-agent"),
+        )
+        .unwrap();
+
+        assert_eq!(count_inbox_files(&scan_root), 0);
     }
 
     #[test]

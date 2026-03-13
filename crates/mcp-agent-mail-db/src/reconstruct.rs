@@ -25,6 +25,14 @@ use sqlmodel_sqlite::SqliteConnection as DbConn;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+fn is_real_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+fn is_real_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
 /// Statistics returned after a reconstruction attempt.
 #[derive(Debug, Clone, Default)]
 pub struct ReconstructStats {
@@ -204,7 +212,7 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
     let mut agent_ids: HashMap<(i64, String), i64> = HashMap::new();
 
     let projects_dir = storage_root.join("projects");
-    if !projects_dir.is_dir() {
+    if !is_real_directory(&projects_dir) {
         stats.warnings.push(format!(
             "No projects directory found at {}",
             projects_dir.display()
@@ -217,7 +225,10 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
     if let Ok(entries) = std::fs::read_dir(&projects_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() || file_type.is_symlink() {
                 continue;
             }
             let Some(slug) = path.file_name().and_then(|n| n.to_str()).map(String::from) else {
@@ -247,13 +258,13 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
 
         // Phase 2: Discover agents for this project
         let agents_dir = project_path.join("agents");
-        if agents_dir.is_dir() {
+        if is_real_directory(&agents_dir) {
             discover_agents(&conn, &agents_dir, pid, &mut agent_ids, &mut stats)?;
         }
 
         // Phase 3: Discover messages for this project
         let messages_dir = project_path.join("messages");
-        if messages_dir.is_dir() {
+        if is_real_directory(&messages_dir) {
             discover_messages(&conn, &messages_dir, pid, slug, &mut agent_ids, &mut stats);
         }
     }
@@ -282,7 +293,7 @@ pub fn reconstruct_from_archive_with_salvage(
     salvage_db_path: Option<&Path>,
 ) -> DbResult<ReconstructStats> {
     let mut stats = reconstruct_from_archive(db_path, storage_root)?;
-    if let Some(salvage_db_path) = salvage_db_path.filter(|path| path.is_file()) {
+    if let Some(salvage_db_path) = salvage_db_path.filter(|path| is_real_file(path)) {
         merge_salvaged_database(db_path, salvage_db_path, &mut stats)?;
     }
     Ok(stats)
@@ -310,7 +321,10 @@ fn discover_agents(
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
             continue;
         }
         let Some(agent_name) = path.file_name().and_then(|n| n.to_str()).map(String::from) else {
@@ -318,7 +332,7 @@ fn discover_agents(
         };
 
         let profile_path = path.join("profile.json");
-        if !profile_path.is_file() {
+        if !is_real_file(&profile_path) {
             continue;
         }
 
@@ -408,7 +422,10 @@ fn discover_messages(
 
     for year_entry in years.flatten() {
         let year_path = year_entry.path();
-        if !year_path.is_dir() {
+        let Ok(year_type) = year_entry.file_type() else {
+            continue;
+        };
+        if !year_type.is_dir() || year_type.is_symlink() {
             continue;
         }
         // Walk month directories
@@ -417,7 +434,10 @@ fn discover_messages(
         };
         for month_entry in months.flatten() {
             let month_path = month_entry.path();
-            if !month_path.is_dir() {
+            let Ok(month_type) = month_entry.file_type() else {
+                continue;
+            };
+            if !month_type.is_dir() || month_type.is_symlink() {
                 continue;
             }
             // Collect .md files
@@ -426,7 +446,13 @@ fn discover_messages(
             };
             for file_entry in files.flatten() {
                 let file_path = file_entry.path();
-                if file_path.extension().is_some_and(|e| e == "md") {
+                let Ok(file_type) = file_entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_file()
+                    && !file_type.is_symlink()
+                    && file_path.extension().is_some_and(|e| e == "md")
+                {
                     message_files.push(file_path);
                 }
             }
@@ -1215,7 +1241,7 @@ fn read_project_human_key(project_path: &Path, slug: &str, stats: &mut Reconstru
     let metadata_path = project_path.join("project.json");
     let fallback = format!("/{slug}");
 
-    if !metadata_path.is_file() {
+    if !is_real_file(&metadata_path) {
         stats.warnings.push(format!(
             "Missing {}; using fallback human_key '{}'",
             metadata_path.display(),
@@ -1691,6 +1717,36 @@ mod tests {
         assert_eq!(stats.agents, 1);
         assert_eq!(stats.messages, 0);
         assert_eq!(stats.parse_errors, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconstruct_skips_symlinked_project_directories() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let storage_root = tmp.path().join("storage");
+        let real_project = tmp.path().join("outside-project");
+        let real_agent = real_project.join("agents").join("Ghost");
+        let real_messages = real_project.join("messages").join("2026").join("03");
+        let linked_project = storage_root.join("projects").join("linked-project");
+
+        std::fs::create_dir_all(&real_agent).unwrap();
+        std::fs::create_dir_all(&real_messages).unwrap();
+        std::fs::create_dir_all(linked_project.parent().unwrap()).unwrap();
+        std::fs::write(real_agent.join("profile.json"), "{}").unwrap();
+        std::fs::write(
+            real_messages.join("note.md"),
+            "---json\n{\"from\":\"Ghost\",\"to\":[],\"subject\":\"hi\"}\n---\nbody\n",
+        )
+        .unwrap();
+        symlink(&real_project, &linked_project).unwrap();
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
+        assert_eq!(stats.projects, 0);
+        assert_eq!(stats.agents, 0);
+        assert_eq!(stats.messages, 0);
     }
 
     #[test]
