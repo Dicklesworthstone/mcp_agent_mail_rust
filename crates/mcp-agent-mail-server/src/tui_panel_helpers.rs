@@ -18,14 +18,18 @@ use crate::tui_theme::TuiThemePalette;
 
 /// Standard bordered panel with rounded corners and title.
 ///
-/// Uses the current theme palette for border and background colors.
+/// Uses `panel_title_fg` for `border_style` so that both the title text
+/// (which ftui renders via `border_style`) and the border characters
+/// have readable contrast.  The frame-level contrast guard independently
+/// tunes decorative border glyphs to a subtler range without affecting
+/// the title text.
 #[must_use]
 pub fn panel_block(title: &str) -> Block<'_> {
     let tp = TuiThemePalette::current();
     Block::bordered()
         .title(title)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tp.panel_border))
+        .border_style(Style::default().fg(tp.panel_title_fg))
         .style(Style::default().fg(tp.text_primary).bg(tp.panel_bg))
 }
 

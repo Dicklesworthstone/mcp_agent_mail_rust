@@ -1436,7 +1436,9 @@ Thanks!";
 
     #[test]
     fn render_message_body_handles_large_body() {
-        let large = "x\n".repeat(5000);
+        // Use double newlines so each "x" becomes a separate markdown
+        // paragraph (single newlines are soft breaks within a paragraph).
+        let large = "x\n\n".repeat(5000);
         let result = render_message_body(&large, &theme());
         assert!(result.is_some());
         assert!(result.unwrap().height() >= 1000);

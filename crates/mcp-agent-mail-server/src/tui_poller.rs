@@ -2674,6 +2674,7 @@ mod tests {
             "CREATE TABLE file_reservations (
                 id INTEGER PRIMARY KEY,
                 project_id INTEGER,
+                agent_id INTEGER,
                 path_pattern TEXT,
                 \"exclusive\" INTEGER,
                 created_ts INTEGER,

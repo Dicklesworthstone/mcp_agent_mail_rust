@@ -4267,8 +4267,9 @@ mod tests {
         let conn = screen.db_conn.as_ref().expect("thread db connection");
         conn.execute_raw(
             "INSERT INTO messages \
-             (id, subject, body_md, importance, created_ts, sender_id, thread_id) \
-             VALUES (26, 'Subject 26', 'Body 26', 'normal', 1700000026000000, 1, 'thread-live')",
+             (id, subject, body_md, importance, created_ts, sender_id, project_id, thread_id, recipients_json) \
+             VALUES (26, 'Subject 26', 'Body 26', 'normal', 1700000026000000, 1, 1, 'thread-live', \
+             '{\"to\":[\"Receiver\"],\"cc\":[],\"bcc\":[]}')",
         )
         .expect("insert newest message");
         conn.execute_raw("INSERT INTO message_recipients (message_id, agent_id) VALUES (26, 2)")

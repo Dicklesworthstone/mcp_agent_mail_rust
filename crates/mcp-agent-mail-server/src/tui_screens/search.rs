@@ -2776,7 +2776,7 @@ impl Default for SearchCockpitScreen {
 
 impl MailScreen for SearchCockpitScreen {
     #[allow(clippy::too_many_lines)]
-    fn update(&mut self, event: &Event, state: &TuiSharedState) -> Cmd<MailScreenMsg> {
+    fn update(&mut self, event: &Event, _state: &TuiSharedState) -> Cmd<MailScreenMsg> {
         if let Event::Key(key) = event
             && key.kind == KeyEventKind::Press
         {
@@ -3144,7 +3144,17 @@ impl MailScreen for SearchCockpitScreen {
                         KeyCode::Char('c') if key.modifiers.contains(Modifiers::CTRL) => {
                             self.query_input.clear();
                             self.reset_facets();
-                            self.execute_search(state);
+                            self.results.clear();
+                            self.result_rows.clear();
+                            self.cursor = 0;
+                            self.total_sql_rows = 0;
+                            self.search_dirty = false;
+                            self.last_search_ms = None;
+                            self.highlight_terms.clear();
+                            self.guidance = None;
+                            self.query_assistance = None;
+                            self.last_error = None;
+                            self.refresh_detail_cache_generation();
                         }
                         _ => {}
                     }

@@ -1725,7 +1725,7 @@ mod tests {
                 id INTEGER PRIMARY KEY,
                 slug TEXT NOT NULL,
                 human_key TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at INTEGER NOT NULL
             )",
         )
         .expect("create projects");
@@ -1761,8 +1761,8 @@ mod tests {
         .expect("create file_reservations");
         conn.execute_raw(
             "INSERT INTO projects (id, slug, human_key, created_at) VALUES
-                (1, 'alpha', '/tmp/alpha', '2026-03-11T00:00:00Z'),
-                (2, 'beta', '/tmp/beta', '2026-03-12T00:00:00Z')",
+                (1, 'alpha', '/tmp/alpha', 1773187200000000),
+                (2, 'beta', '/tmp/beta', 1773273600000000)",
         )
         .expect("seed projects");
         conn.execute_raw(

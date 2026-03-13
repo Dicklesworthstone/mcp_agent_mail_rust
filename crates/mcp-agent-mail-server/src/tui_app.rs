@@ -1544,8 +1544,11 @@ impl MailAppModel {
         let events = self
             .state
             .events_since_limited(from_seq, SHARED_TICK_EVENT_BATCH_LIMIT);
-        let to_seq = self.state.publish_tick_event_batch(from_seq, events);
-        self.tick_event_batch_last_seq = to_seq;
+        // Skip the Arc allocation + mutex lock when no new events arrived.
+        if !events.is_empty() {
+            let to_seq = self.state.publish_tick_event_batch(from_seq, events);
+            self.tick_event_batch_last_seq = to_seq;
+        }
     }
 
     fn handle_help_overlay_mouse(&mut self, event: &Event) -> bool {
@@ -4286,8 +4289,19 @@ impl Model for MailAppModel {
         let effects_enabled = self.state.tui_effects_enabled();
         let ambient_mode = self.ambient_mode_for_frame(effects_enabled);
         let tp = crate::tui_theme::TuiThemePalette::current();
-        let ambient_health = self.ambient_health_input(now_micros());
-        let ambient_state = determine_ambient_health_state(ambient_health);
+        // Skip the mutex-locking health computation when ambient effects are
+        // off — in that case the health state is irrelevant because the
+        // renderer won't run.
+        let (ambient_health, ambient_state) = if ambient_mode.is_enabled() {
+            let h = self.ambient_health_input(now_micros());
+            let s = determine_ambient_health_state(h);
+            (h, s)
+        } else {
+            (
+                AmbientHealthInput::default(),
+                crate::tui_widgets::AmbientHealthState::Idle,
+            )
+        };
         let ambient_renderer = self.ambient_renderer.borrow();
         let can_replay_cached = ambient_renderer.can_replay_cached(
             ambient_area,
@@ -4301,7 +4315,11 @@ impl Model for MailAppModel {
             self.ambient_last_telemetry.get().mode != AmbientMode::Off
         };
         drop(ambient_renderer);
-        if !can_replay_cached {
+        // Always paint the base surface so screen content has a defined
+        // background, but skip the redundant clear when the ambient renderer
+        // is about to overwrite the same region immediately afterwards —
+        // the double-paint caused a visible flash on cache-miss frames.
+        if !should_render_ambient && !can_replay_cached {
             Paragraph::new("")
                 .style(Style::default().bg(tp.bg_deep))
                 .render(ambient_area, frame);
@@ -6264,10 +6282,10 @@ fn render_focus_hint(
 const MIN_TEXT_CONTRAST_RATIO: f64 = 4.5;
 /// Higher floor for bright surfaces to avoid white-on-white regressions.
 const MIN_TEXT_CONTRAST_RATIO_LIGHT_SURFACE: f64 = 5.6;
-/// Decorative separators should stay subtle so they do not read as random bars.
-const MIN_DECORATIVE_CONTRAST_RATIO: f64 = 1.35;
-/// Slightly higher decorative floor on bright surfaces for visibility.
-const MIN_DECORATIVE_CONTRAST_RATIO_LIGHT_SURFACE: f64 = 1.55;
+/// Decorative separators need enough contrast to remain visible as structure.
+const MIN_DECORATIVE_CONTRAST_RATIO: f64 = 2.0;
+/// Higher decorative floor on bright surfaces for visibility.
+const MIN_DECORATIVE_CONTRAST_RATIO_LIGHT_SURFACE: f64 = 2.5;
 
 #[derive(Default)]
 struct ContrastGuardCache {
@@ -6485,11 +6503,11 @@ fn best_readable_decorative_fg(
     bg: PackedRgba,
     tp: &crate::tui_theme::TuiThemePalette,
 ) -> PackedRgba {
-    let target = if perceived_luma(bg) >= 150 { 1.8 } else { 1.55 };
+    let target = if perceived_luma(bg) >= 150 { 3.0 } else { 2.5 };
     let fallback = if perceived_luma(bg) >= 128 {
-        PackedRgba::rgb(88, 88, 88)
+        PackedRgba::rgb(68, 68, 68)
     } else {
-        PackedRgba::rgb(176, 176, 176)
+        PackedRgba::rgb(190, 190, 190)
     };
     let candidates = [
         tp.panel_border_dim,
@@ -8880,7 +8898,21 @@ mod tests {
 
     #[test]
     fn dynamic_palette_adds_message_entries_from_events() {
-        let model = test_model();
+        // Serialize against other palette-cache tests and use an in-memory DB
+        // so real DB data does not saturate the message cap.
+        let _serial = PALETTE_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cache = PALETTE_DB_CACHE.get_or_init(|| Mutex::new(PaletteDbCache::default()));
+        if let Ok(mut guard) = cache.lock() {
+            *guard = PaletteDbCache::default();
+        }
+        let config = Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Config::default()
+        };
+        let state = TuiSharedState::new(&config);
+        let model = MailAppModel::new(state);
         assert!(model.state.push_event(MailEvent::message_received(
             42,
             "BlueLake",

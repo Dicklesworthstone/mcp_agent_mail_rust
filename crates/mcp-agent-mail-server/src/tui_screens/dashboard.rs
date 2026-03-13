@@ -2513,8 +2513,12 @@ fn render_summary_band(
                     MetricTrend::Down => tp.severity_warn,
                     MetricTrend::Flat => color,
                 };
+                // Use `Block::new().borders()` instead of `Block::bordered()`
+                // to avoid the default padding (Sides::all(1)) which makes the
+                // inner area too small for content at compact tile heights.
                 tile = tile.block(
-                    Block::bordered()
+                    Block::new()
+                        .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(crate::tui_theme::lerp_color(
                             tp.panel_border,
@@ -2601,7 +2605,7 @@ fn neutral_panel_block(title: &str) -> Block<'_> {
     Block::bordered()
         .title(title)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(tp.panel_border))
+        .border_style(Style::default().fg(tp.panel_title_fg))
         .style(Style::default().fg(tp.text_primary).bg(tp.panel_bg))
 }
 
@@ -7474,6 +7478,8 @@ mod tests {
         screen.view(&mut frame, Rect::new(0, 0, 200, 50), &state);
         let text = frame_text(&frame);
 
+
+
         assert!(
             text.contains("6578"),
             "summary band should show live message count"
@@ -8470,6 +8476,18 @@ mod tests {
         let config = mcp_agent_mail_core::Config::default();
         let state = TuiSharedState::new(&config);
         let mut screen = DashboardScreen::new();
+        // Seed enough events so clamp_scroll_offset allows offset > 0.
+        for i in 0..5 {
+            screen.push_event_entry(EventEntry {
+                kind: MailEventKind::HttpRequest,
+                severity: EventSeverity::Info,
+                seq: i,
+                timestamp_micros: 0,
+                timestamp: String::new(),
+                icon: '→',
+                summary: format!("req {i}"),
+            });
+        }
         assert_eq!(screen.scroll_offset, 0);
 
         let scroll_up = Event::Mouse(ftui::MouseEvent::new(

@@ -14,6 +14,17 @@ use crate::tui_events::{EventSeverity, MailEventKind};
 static ACTIVE_NAMED_THEME_INDEX: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Generation counter bumped on every theme change so the cached palette
+/// can detect staleness without comparing full palettes.
+static PALETTE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// Cached palette to avoid reconstructing + normalizing the 60+ field struct
+// on every frame.  Thread-local because `TuiThemePalette` is `Copy`.
+std::thread_local! {
+    static CACHED_PALETTE: std::cell::RefCell<(u64, Option<TuiThemePalette>)> =
+        const { std::cell::RefCell::new((u64::MAX, None)) };
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Named theme registry
 // ──────────────────────────────────────────────────────────────────────
@@ -89,6 +100,7 @@ pub fn named_theme_display_name(index: usize) -> &'static str {
 pub fn init_named_theme(config_name: &str) {
     let idx = TuiThemePalette::config_name_to_index(config_name);
     ACTIVE_NAMED_THEME_INDEX.store(idx, std::sync::atomic::Ordering::Relaxed);
+    PALETTE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Get the current active named theme index.
@@ -124,6 +136,7 @@ pub fn cycle_named_theme() -> (&'static str, &'static str, TuiThemePalette) {
     let old = ACTIVE_NAMED_THEME_INDEX.load(std::sync::atomic::Ordering::Relaxed);
     let new = (old + 1) % NAMED_THEME_COUNT;
     ACTIVE_NAMED_THEME_INDEX.store(new, std::sync::atomic::Ordering::Relaxed);
+    PALETTE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (cfg, display) = NAMED_THEMES[new];
     (cfg, display, TuiThemePalette::from_config_name(cfg))
 }
@@ -135,6 +148,7 @@ pub fn cycle_named_theme() -> (&'static str, &'static str, TuiThemePalette) {
 pub fn set_named_theme(index: usize) -> (&'static str, &'static str, TuiThemePalette) {
     let idx = index % NAMED_THEME_COUNT;
     ACTIVE_NAMED_THEME_INDEX.store(idx, std::sync::atomic::Ordering::Relaxed);
+    PALETTE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (cfg, display) = NAMED_THEMES[idx];
     (cfg, display, TuiThemePalette::from_config_name(cfg))
 }
@@ -1158,11 +1172,11 @@ impl TuiThemePalette {
         const MIN_TEXT_RATIO: f64 = 4.5;
         const MIN_ACCENT_RATIO: f64 = 3.2;
         const MIN_MUTED_RATIO: f64 = 3.0;
-        const MIN_BORDER_RATIO: f64 = 1.24;
-        const MAX_BORDER_RATIO: f64 = 2.35;
-        const MIN_BORDER_DIM_RATIO: f64 = 1.10;
-        const MAX_BORDER_DIM_RATIO: f64 = 1.70;
-        const MAX_BORDER_FOCUSED_RATIO: f64 = 3.00;
+        const MIN_BORDER_RATIO: f64 = 2.2;
+        const MAX_BORDER_RATIO: f64 = 4.5;
+        const MIN_BORDER_DIM_RATIO: f64 = 2.0;
+        const MAX_BORDER_DIM_RATIO: f64 = 3.0;
+        const MAX_BORDER_FOCUSED_RATIO: f64 = 5.5;
         const MIN_HOVER_RATIO: f64 = 1.06;
         const MAX_HOVER_RATIO: f64 = 1.34;
         const MIN_OVERLAY_RATIO: f64 = 1.03;
@@ -1574,7 +1588,7 @@ impl TuiThemePalette {
         };
         let border_ratio = contrast_ratio(self.panel_border, self.panel_bg);
         if border_ratio > MAX_BORDER_RATIO {
-            self.panel_border = lerp_color(self.panel_bg, neutral_seed, 0.14);
+            self.panel_border = lerp_color(self.panel_bg, neutral_seed, 0.28);
         } else if border_ratio < MIN_BORDER_RATIO {
             self.panel_border = ensure_min_contrast(
                 self.panel_border,
@@ -1586,7 +1600,7 @@ impl TuiThemePalette {
         }
         let border_dim_ratio = contrast_ratio(self.panel_border_dim, self.panel_bg);
         if border_dim_ratio > MAX_BORDER_DIM_RATIO {
-            self.panel_border_dim = lerp_color(self.panel_bg, neutral_seed, 0.09);
+            self.panel_border_dim = lerp_color(self.panel_bg, neutral_seed, 0.18);
         } else if border_dim_ratio < MIN_BORDER_DIM_RATIO {
             self.panel_border_dim = ensure_min_contrast(
                 self.panel_border_dim,
@@ -1642,11 +1656,24 @@ impl TuiThemePalette {
 
     /// Resolve the palette for the currently active named theme.
     ///
-    /// Uses the named theme index set by [`init_named_theme`] or
-    /// [`cycle_named_theme`].
+    /// Uses a thread-local cache keyed on a generation counter so the
+    /// expensive `normalized_for_contrast()` pass only runs once per
+    /// theme change instead of every frame.
     #[must_use]
     pub fn current() -> Self {
-        active_named_palette()
+        let generation = PALETTE_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
+        CACHED_PALETTE.with(|cell| {
+            let cached = cell.borrow();
+            if cached.0 == generation
+                && let Some(palette) = cached.1
+            {
+                return palette;
+            }
+            drop(cached);
+            let palette = active_named_palette();
+            *cell.borrow_mut() = (generation, Some(palette));
+            palette
+        })
     }
 }
 
@@ -1786,6 +1813,7 @@ pub fn current_theme_env_value() -> &'static str {
 #[must_use]
 pub fn set_theme_and_get_name(id: ThemeId) -> &'static str {
     theme::set_theme(id);
+    PALETTE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     theme::current_theme_name()
 }
 

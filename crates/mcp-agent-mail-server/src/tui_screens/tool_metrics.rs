@@ -1960,6 +1960,7 @@ mod tests {
         screen
             .tool_map
             .insert("beta".into(), ToolStats::new("beta".into()));
+        screen.table_state.selected = Some(0);
         screen.detail_scroll = 9;
 
         screen.move_selection(1);
