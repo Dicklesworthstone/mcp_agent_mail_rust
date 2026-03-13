@@ -1178,10 +1178,8 @@ fn find_project_for_cwd(conn: &DbConn) -> Result<(i64, String), CliError> {
     find_project_for_path_or_ancestors(conn, &cwd)
 }
 
-/// Resolve project from --project flag or CWD.
-fn resolve_project(conn: &DbConn, flag: Option<&str>) -> Result<(i64, String), CliError> {
-    if let Some(key) = flag
-        .map(str::trim)
+fn resolved_project_flag_or_env(flag: Option<&str>) -> Option<String> {
+    flag.map(str::trim)
         .filter(|value| !value.is_empty())
         .map(std::borrow::ToOwned::to_owned)
         .or_else(|| {
@@ -1190,7 +1188,11 @@ fn resolve_project(conn: &DbConn, flag: Option<&str>) -> Result<(i64, String), C
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         })
-    {
+}
+
+/// Resolve project from --project flag or CWD.
+fn resolve_project(conn: &DbConn, flag: Option<&str>) -> Result<(i64, String), CliError> {
+    if let Some(key) = resolved_project_flag_or_env(flag) {
         resolve_project_sync(conn, &key)
     } else {
         find_project_for_cwd(conn)
@@ -1283,14 +1285,8 @@ fn parse_resource_limit(value: Option<&String>, default_limit: usize) -> usize {
         .unwrap_or(default_limit)
 }
 
-/// Resolve agent ID from --agent flag or AGENT_MAIL_AGENT/AGENT_NAME env vars.
-fn resolve_agent_id(
-    conn: &DbConn,
-    project_id: i64,
-    flag: Option<&str>,
-) -> Result<Option<(i64, String)>, CliError> {
-    let Some(name) = flag
-        .map(str::trim)
+fn resolved_agent_flag_or_env(flag: Option<&str>) -> Option<String> {
+    flag.map(str::trim)
         .filter(|value| !value.is_empty())
         .map(std::borrow::ToOwned::to_owned)
         .or_else(|| {
@@ -1305,7 +1301,15 @@ fn resolve_agent_id(
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         })
-    else {
+}
+
+/// Resolve agent ID from --agent flag or AGENT_MAIL_AGENT/AGENT_NAME env vars.
+fn resolve_agent_id(
+    conn: &DbConn,
+    project_id: i64,
+    flag: Option<&str>,
+) -> Result<Option<(i64, String)>, CliError> {
+    let Some(name) = resolved_agent_flag_or_env(flag) else {
         return Ok(None);
     };
     let resolved = crate::context::resolve_agent(conn, project_id, &name)?;
@@ -1335,6 +1339,169 @@ fn resolve_optional_agent_id(
         explicit_flag,
         resolve_agent_id(conn, project_id, explicit_flag),
     )
+}
+
+struct RobotDbHandle {
+    conn: DbConn,
+    _snapshot_dir: Option<tempfile::TempDir>,
+}
+
+impl RobotDbHandle {
+    fn open_local() -> Result<Self, CliError> {
+        Ok(Self {
+            conn: crate::open_db_sync_robot()?,
+            _snapshot_dir: None,
+        })
+    }
+
+    fn open_archive_snapshot(storage_root: &Path) -> Result<Self, CliError> {
+        let snapshot_dir = tempfile::tempdir()
+            .map_err(|e| CliError::Other(format!("robot archive snapshot tempdir failed: {e}")))?;
+        let db_path = snapshot_dir.path().join("robot-archive-snapshot.sqlite3");
+        mcp_agent_mail_db::reconstruct_from_archive(&db_path, storage_root).map_err(|e| {
+            CliError::Other(format!("robot archive snapshot reconstruction failed: {e}"))
+        })?;
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .map_err(|e| CliError::Other(format!("robot archive snapshot open failed: {e}")))?;
+        Ok(Self {
+            conn,
+            _snapshot_dir: Some(snapshot_dir),
+        })
+    }
+
+    #[cfg(test)]
+    fn from_conn(conn: DbConn) -> Self {
+        Self {
+            conn,
+            _snapshot_dir: None,
+        }
+    }
+}
+
+struct ResolvedRobotScope {
+    db: RobotDbHandle,
+    project_id: i64,
+    project_slug: String,
+    agent: Option<(i64, String)>,
+}
+
+impl ResolvedRobotScope {
+    fn conn(&self) -> &DbConn {
+        &self.db.conn
+    }
+}
+
+fn archive_project_dir_for_key(storage_root: &Path, project_key: &str) -> Option<PathBuf> {
+    let project_key = project_key.trim();
+    if project_key.is_empty() {
+        return None;
+    }
+    let projects_dir = storage_root.join("projects");
+    if !projects_dir.is_dir() {
+        return None;
+    }
+
+    let mut candidate_slugs = vec![project_key.to_string()];
+    if Path::new(project_key).is_absolute() {
+        let derived = mcp_agent_mail_core::resolve_project_identity(project_key).slug;
+        if !candidate_slugs.iter().any(|existing| existing == &derived) {
+            candidate_slugs.push(derived);
+        }
+    }
+
+    candidate_slugs
+        .into_iter()
+        .map(|slug| projects_dir.join(slug))
+        .find(|path| path.is_dir())
+}
+
+fn archive_has_agent_profile(project_dir: &Path, agent_name: &str) -> bool {
+    let agent_name = agent_name.trim();
+    !agent_name.is_empty()
+        && project_dir
+            .join("agents")
+            .join(agent_name)
+            .join("profile.json")
+            .is_file()
+}
+
+fn should_try_archive_snapshot(
+    error: &CliError,
+    project_key: Option<&str>,
+    agent_name: Option<&str>,
+    storage_root: &Path,
+) -> bool {
+    let Some(project_key) = project_key else {
+        return false;
+    };
+    let Some(project_dir) = archive_project_dir_for_key(storage_root, project_key) else {
+        return false;
+    };
+
+    match error {
+        CliError::InvalidArgument(message) if message.starts_with("project not found: ") => true,
+        CliError::InvalidArgument(message) if message.starts_with("agent not found: ") => {
+            agent_name.is_some_and(|name| archive_has_agent_profile(&project_dir, name))
+        }
+        _ => false,
+    }
+}
+
+fn resolve_robot_scope_with_handle(
+    db: RobotDbHandle,
+    project_flag: Option<&str>,
+    agent_flag: Option<&str>,
+) -> Result<ResolvedRobotScope, CliError> {
+    let (project_id, project_slug) = resolve_project(&db.conn, project_flag)?;
+    let agent = resolve_optional_agent_id(&db.conn, project_id, agent_flag)?;
+    Ok(ResolvedRobotScope {
+        db,
+        project_id,
+        project_slug,
+        agent,
+    })
+}
+
+fn resolve_robot_scope_with_archive_fallback(
+    local: RobotDbHandle,
+    storage_root: &Path,
+    project_flag: Option<&str>,
+    agent_flag: Option<&str>,
+) -> Result<ResolvedRobotScope, CliError> {
+    match resolve_robot_scope_with_handle(local, project_flag, agent_flag) {
+        Ok(scope) => Ok(scope),
+        Err(local_error) => {
+            let project_key = resolved_project_flag_or_env(project_flag);
+            let agent_name = resolved_agent_flag_or_env(agent_flag);
+            if !should_try_archive_snapshot(
+                &local_error,
+                project_key.as_deref(),
+                agent_name.as_deref(),
+                storage_root,
+            ) {
+                return Err(local_error);
+            }
+
+            tracing::warn!(
+                project = project_key.as_deref().unwrap_or(""),
+                agent = agent_name.as_deref().unwrap_or(""),
+                error = %local_error,
+                "robot command falling back to archive snapshot because local db is missing requested scope"
+            );
+
+            let snapshot = RobotDbHandle::open_archive_snapshot(storage_root)?;
+            resolve_robot_scope_with_handle(snapshot, project_flag, agent_flag)
+        }
+    }
+}
+
+fn resolve_robot_scope(
+    project_flag: Option<&str>,
+    agent_flag: Option<&str>,
+) -> Result<ResolvedRobotScope, CliError> {
+    let local = RobotDbHandle::open_local()?;
+    let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
+    resolve_robot_scope_with_archive_fallback(local, &storage_root, project_flag, agent_flag)
 }
 
 /// Format seconds into human-readable relative time.
@@ -4642,14 +4809,14 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
 
     let out = match args.command {
         RobotSubcommand::Status => {
-            let conn = crate::open_db_sync_robot()?;
-            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
-            let agent = resolve_optional_agent_id(&conn, project_id, args.agent.as_deref())?;
+            let scope = resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
 
-            let agent_name = agent.as_ref().map(|(_, n)| n.clone());
-            let (data, actions) = build_status(&conn, project_id, &project_slug, agent)?;
+            let agent_name = scope.agent.as_ref().map(|(_, n)| n.clone());
+            let agent = scope.agent.clone();
+            let (data, actions) =
+                build_status(scope.conn(), scope.project_id, &scope.project_slug, agent)?;
             let mut env = RobotEnvelope::new(cmd_name, format, data);
-            env._meta.project = Some(project_slug);
+            env._meta.project = Some(scope.project_slug);
             env._meta.agent = agent_name.clone();
             if agent_name.is_none() {
                 env = env.with_alert(
@@ -4673,20 +4840,18 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             limit,
             include_bodies,
         } => {
-            let conn = crate::open_db_sync_robot()?;
-            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
-            let (agent_id, agent_name_str) =
-                resolve_agent_id(&conn, project_id, args.agent.as_deref())?.ok_or_else(|| {
-                    CliError::InvalidArgument(
-                        "agent required for inbox — use --agent or set AGENT_MAIL_AGENT/AGENT_NAME"
-                            .to_string(),
-                    )
-                })?;
+            let scope = resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
+            let (agent_id, agent_name_str) = scope.agent.clone().ok_or_else(|| {
+                CliError::InvalidArgument(
+                    "agent required for inbox — use --agent or set AGENT_MAIL_AGENT/AGENT_NAME"
+                        .to_string(),
+                )
+            })?;
 
             let result = build_inbox(
-                &conn,
-                project_id,
-                &project_slug,
+                scope.conn(),
+                scope.project_id,
+                &scope.project_slug,
                 agent_id,
                 &agent_name_str,
                 urgent,
@@ -4712,7 +4877,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     inbox: result.entries,
                 },
             );
-            env._meta.project = Some(project_slug);
+            env._meta.project = Some(scope.project_slug);
             env._meta.agent = Some(agent_name_str);
             for (severity, headline, action) in result.alerts {
                 env = env.with_alert(severity, headline, action);
@@ -4777,21 +4942,20 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             conflicts,
             expiring,
         } => {
-            let conn = crate::open_db_sync_robot()?;
-            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
             let agent_flag = agent_override.as_deref().or(args.agent.as_deref());
-            let agent = resolve_optional_agent_id(&conn, project_id, agent_flag)?;
+            let scope = resolve_robot_scope(args.project.as_deref(), agent_flag)?;
+            let agent = scope.agent.clone();
             let (data, actions) = build_reservations(
-                &conn,
-                project_id,
-                &project_slug,
+                scope.conn(),
+                scope.project_id,
+                &scope.project_slug,
                 agent,
                 all,
                 conflicts,
                 expiring,
             )?;
             let mut env = RobotEnvelope::new(cmd_name, format, data);
-            env._meta.project = Some(project_slug);
+            env._meta.project = Some(scope.project_slug);
             for a in actions {
                 env = env.with_action(&a);
             }
@@ -5176,9 +5340,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             format_output(&env, format)?
         }
         RobotSubcommand::Agents { active, sort } => {
-            let conn = crate::open_db_sync_robot()?;
-            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
-            let agents = build_agents(&conn, project_id, active, sort.as_deref())?;
+            let scope = resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
+            let agents = build_agents(scope.conn(), scope.project_id, active, sort.as_deref())?;
 
             #[derive(Serialize)]
             struct AgentsData {
@@ -5188,7 +5351,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
 
             let count = agents.len();
             let mut env = RobotEnvelope::new(cmd_name, format, AgentsData { count, agents });
-            env._meta.project = Some(project_slug);
+            env._meta.project = Some(scope.project_slug);
             format_output(&env, format)?
         }
         RobotSubcommand::Contacts => {
@@ -8513,6 +8676,95 @@ mod tests {
         assert!(
             err.to_string().contains("ambiguous agent name"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_robot_scope_falls_back_to_archive_snapshot_for_missing_explicit_agent() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let local_db_path = temp_dir.path().join("robot_scope_fallback.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(local_db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create projects table");
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents table");
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key)
+             VALUES (1, 'demo-project', '/tmp/demo-project')",
+            &empty,
+        )
+        .expect("insert local project");
+
+        let storage_root = tempfile::tempdir().expect("storage root");
+        let project_dir = storage_root.path().join("projects").join("demo-project");
+        let agent_dir = project_dir.join("agents").join("CoralMarsh");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"demo-project","human_key":"/tmp/demo-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{
+                "name": "CoralMarsh",
+                "program": "codex-cli",
+                "model": "gpt-5",
+                "task_description": "archive snapshot",
+                "inception_ts": "2026-03-13T21:21:02Z",
+                "last_active_ts": "2026-03-13T21:21:02Z"
+            }"#,
+        )
+        .expect("write agent profile");
+
+        let err = resolve_robot_scope_with_handle(
+            RobotDbHandle::from_conn(conn),
+            Some("/tmp/demo-project"),
+            Some("CoralMarsh"),
+        )
+        .err()
+        .expect("local db should still miss CoralMarsh");
+        assert!(
+            should_try_archive_snapshot(
+                &err,
+                Some("/tmp/demo-project"),
+                Some("CoralMarsh"),
+                storage_root.path(),
+            ),
+            "archive snapshot should be eligible when the profile exists in the archive"
+        );
+
+        let local_conn = mcp_agent_mail_db::DbConn::open_file(local_db_path.display().to_string())
+            .expect("reopen sqlite db");
+        let scope = resolve_robot_scope_with_archive_fallback(
+            RobotDbHandle::from_conn(local_conn),
+            storage_root.path(),
+            Some("/tmp/demo-project"),
+            Some("CoralMarsh"),
+        )
+        .expect("archive fallback should resolve CoralMarsh");
+
+        assert_eq!(scope.project_slug, "demo-project");
+        assert_eq!(
+            scope.agent.as_ref().map(|(_, name)| name.as_str()),
+            Some("CoralMarsh")
         );
     }
 

@@ -3512,23 +3512,15 @@ fn handle_check_inbox(
     } else {
         // Build HTTP config and fetch via JSON-RPC
         let config = Config::from_env();
-        let server_urls = check_inbox_server_urls(&host, port, &config.http_path);
-        let server_url = check_inbox_server_url(&host, port, &config.http_path);
-        let bearer_token = std::env::var("AGENT_MAIL_TOKEN")
-            .or_else(|_| std::env::var("HTTP_BEARER_TOKEN"))
-            .ok()
-            .filter(|v| !v.is_empty() && !value_looks_like_template(v));
-
-        let config = CheckInboxRpcConfig {
-            server_url,
-            server_urls: server_urls.clone(),
-            bearer_token,
-            project_key,
-            agent_name: agent_name.clone(),
-            limit: CHECK_INBOX_FETCH_LIMIT,
-            include_bodies: false,
-            timeout_seconds: CHECK_INBOX_RPC_TIMEOUT_SECS,
-        };
+        let config = resolve_check_inbox_rpc_config_reader(
+            |key| std::env::var(key).ok(),
+            &project_key,
+            &agent_name,
+            &host,
+            port,
+            &config.http_path,
+        );
+        let server_urls = config.server_urls.clone();
 
         // Use a minimal runtime for the async HTTP call
         let rt = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -14960,87 +14952,101 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
-            match try_call_server_tool(
-                &server_url,
-                bearer.as_deref(),
-                "fetch_inbox",
-                serde_json::json!({
-                    "project_key": &project_key,
-                    "agent_name": &agent_name,
-                    "urgent_only": urgent_only,
-                    "since_ts": since.as_deref(),
-                    "limit": limit.max(0),
-                    "include_bodies": include_bodies,
-                }),
-            )
-            .await
+            let mut server_args = serde_json::json!({
+                "project_key": &project_key,
+                "agent_name": &agent_name,
+                "urgent_only": urgent_only,
+                "since_ts": since.as_deref(),
+                "limit": limit.max(0),
+                "include_bodies": include_bodies,
+            });
+            if since.is_none()
+                && let Some(args) = server_args.as_object_mut()
+            {
+                args.remove("since_ts");
+            }
+            let mut server_error: Option<String> = None;
+            match try_call_server_tool(&server_url, bearer.as_deref(), "fetch_inbox", server_args)
+                .await
             {
                 ServerToolCall::Success(result) => {
-                    let payload = coerce_tool_result_json_or_error("fetch_inbox", result)?;
-                    let data = server_inbox_payload_to_cli_json(&payload, include_bodies)
-                        .ok_or_else(|| {
-                            CliError::Other("unexpected fetch_inbox response shape".to_string())
-                        })?;
-                    if data.is_empty() {
-                        output::emit_empty(fmt, "No messages.");
-                        return Ok(());
-                    }
-
-                    output::emit_output(&data, fmt, || {
-                        let mut table = output::CliTable::new(vec![
-                            "ID",
-                            "FROM",
-                            "SUBJECT",
-                            "IMPORTANCE",
-                            "TIME",
-                        ]);
-                        for row in &data {
-                            table.add_row(vec![
-                                row.get("id")
-                                    .and_then(|v| v.as_i64())
-                                    .unwrap_or(0)
-                                    .to_string(),
-                                row.get("from")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                truncate_str(
-                                    row.get("subject")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or_default(),
-                                    50,
-                                ),
-                                row.get("importance")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .to_string(),
-                                row.get("created_ts")
-                                    .and_then(|v| v.as_str())
-                                    .map(format_iso_timestamp_short)
-                                    .unwrap_or_default(),
-                            ]);
-                        }
-                        table.render();
-
-                        if include_bodies {
-                            for row in &data {
-                                ftui_runtime::ftui_println!(
-                                    "\n--- #{} {} ---",
-                                    row.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
-                                    row.get("subject")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or_default()
-                                );
-                                ftui_runtime::ftui_println!(
-                                    "{}",
-                                    row.get("body_md")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or_default()
-                                );
+                    match coerce_tool_result_json_or_error("fetch_inbox", result).and_then(
+                        |payload| {
+                            server_inbox_payload_to_cli_json(&payload, include_bodies).ok_or_else(
+                                || {
+                                    CliError::Other(
+                                        "unexpected fetch_inbox response shape".to_string(),
+                                    )
+                                },
+                            )
+                        },
+                    ) {
+                        Ok(data) => {
+                            if data.is_empty() {
+                                output::emit_empty(fmt, "No messages.");
+                                return Ok(());
                             }
+
+                            output::emit_output(&data, fmt, || {
+                                let mut table = output::CliTable::new(vec![
+                                    "ID",
+                                    "FROM",
+                                    "SUBJECT",
+                                    "IMPORTANCE",
+                                    "TIME",
+                                ]);
+                                for row in &data {
+                                    table.add_row(vec![
+                                        row.get("id")
+                                            .and_then(|v| v.as_i64())
+                                            .unwrap_or(0)
+                                            .to_string(),
+                                        row.get("from")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or_default()
+                                            .to_string(),
+                                        truncate_str(
+                                            row.get("subject")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or_default(),
+                                            50,
+                                        ),
+                                        row.get("importance")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or_default()
+                                            .to_string(),
+                                        row.get("created_ts")
+                                            .and_then(|v| v.as_str())
+                                            .map(format_iso_timestamp_short)
+                                            .unwrap_or_default(),
+                                    ]);
+                                }
+                                table.render();
+
+                                if include_bodies {
+                                    for row in &data {
+                                        ftui_runtime::ftui_println!(
+                                            "\n--- #{} {} ---",
+                                            row.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
+                                            row.get("subject")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or_default()
+                                        );
+                                        ftui_runtime::ftui_println!(
+                                            "{}",
+                                            row.get("body_md")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or_default()
+                                        );
+                                    }
+                                }
+                            });
+                            return Ok(());
                         }
-                    });
-                    return Ok(());
+                        Err(err) => {
+                            server_error = Some(err.to_string());
+                        }
+                    }
                 }
                 ServerToolCall::Unavailable(_) => {}
                 ServerToolCall::Rejected(message) => {
@@ -15077,6 +15083,9 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             )?;
 
             if rows.is_empty() {
+                if let Some(message) = server_error {
+                    tracing::debug!(message = %message, "mail inbox fell back to local database after server lookup failed");
+                }
                 output::emit_empty(fmt, "No messages.");
                 return Ok(());
             }
@@ -16465,7 +16474,18 @@ fn server_inbox_payload_to_cli_json(
     payload: &serde_json::Value,
     include_body: bool,
 ) -> Option<Vec<serde_json::Value>> {
-    let rows = payload.as_array()?;
+    let rows = if let Some(rows) = payload.as_array() {
+        rows
+    } else if let Some(rows) = payload
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+    {
+        rows
+    } else if let Some(rows) = payload.get("result").and_then(serde_json::Value::as_array) {
+        rows
+    } else {
+        return None;
+    };
     Some(
         rows.iter()
             .map(|row| {
@@ -16496,9 +16516,9 @@ fn server_inbox_payload_to_cli_json(
 #[cfg(test)]
 mod mail_server_cli_bridge_tests {
     use super::{
-        CliError, ServerToolCall, classify_server_tool_call, coerce_tool_result_json_or_error,
-        ensure_message_in_project, server_inbox_payload_to_cli_json,
-        server_message_payload_to_cli_json,
+        CliError, ServerToolCall, classify_server_tool_call, coerce_tool_result_json,
+        coerce_tool_result_json_or_error, ensure_message_in_project,
+        server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
     };
 
     #[test]
@@ -16571,6 +16591,37 @@ mod mail_server_cli_bridge_tests {
     }
 
     #[test]
+    fn server_inbox_payload_bridge_accepts_messages_wrapped_shape() {
+        let payload = serde_json::json!({
+            "messages": [
+                {
+                    "id": 8,
+                    "subject": "Wrapped inbox",
+                    "from": "LegacySender",
+                    "importance": "high",
+                    "ack_required": false,
+                    "created_ts": "2026-03-11T21:32:00Z",
+                    "kind": "to",
+                    "thread_id": "br-8",
+                    "body_md": "Wrapped body"
+                }
+            ]
+        });
+
+        let bridged =
+            server_inbox_payload_to_cli_json(&payload, true).expect("bridge wrapped inbox");
+        assert_eq!(bridged.len(), 1);
+        assert_eq!(
+            bridged[0].get("subject").and_then(|v| v.as_str()),
+            Some("Wrapped inbox")
+        );
+        assert_eq!(
+            bridged[0].get("body_md").and_then(|v| v.as_str()),
+            Some("Wrapped body")
+        );
+    }
+
+    #[test]
     fn classify_server_tool_call_treats_transport_failures_as_unavailable() {
         let result = classify_server_tool_call(
             "send_message",
@@ -16597,6 +16648,50 @@ mod mail_server_cli_bridge_tests {
             })),
         );
         assert!(matches!(result, ServerToolCall::Rejected(_)));
+    }
+
+    #[test]
+    fn classify_server_tool_call_treats_is_error_tool_results_as_rejected() {
+        let result = classify_server_tool_call(
+            "fetch_inbox",
+            Ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "1",
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "agent not found: LegacyReceiver"
+                        }
+                    ],
+                    "isError": true
+                }
+            })),
+        );
+        assert_eq!(
+            result,
+            ServerToolCall::Rejected("agent not found: LegacyReceiver".to_string())
+        );
+    }
+
+    #[test]
+    fn coerce_tool_result_json_accepts_camel_case_structured_content() {
+        let payload = serde_json::json!({
+            "structuredContent": {
+                "messages": [
+                    {
+                        "id": 9,
+                        "subject": "Camel case",
+                        "from": "BlueLake"
+                    }
+                ]
+            }
+        });
+        let coerced = coerce_tool_result_json(payload).expect("camelCase structured content");
+        assert_eq!(
+            coerced["messages"][0]["subject"].as_str(),
+            Some("Camel case")
+        );
     }
 
     #[test]
@@ -17480,6 +17575,52 @@ mod tests {
     }
 
     #[test]
+    fn check_inbox_rpc_config_uses_http_bearer_token_fallback() {
+        let env: HashMap<String, String> = HashMap::from_iter([
+            ("AGENT_MAIL_PROJECT".to_string(), "/tmp/proj".to_string()),
+            ("AGENT_MAIL_AGENT".to_string(), "BlueLake".to_string()),
+            (
+                "HTTP_BEARER_TOKEN".to_string(),
+                "token-from-http-env".to_string(),
+            ),
+        ]);
+
+        let cfg = check_inbox_rpc_config_from_env_reader(|key| env.get(key).cloned())
+            .expect("config should parse");
+        assert_eq!(cfg.bearer_token.as_deref(), Some("token-from-http-env"));
+        assert_eq!(cfg.server_url, "http://127.0.0.1:8765/mcp/");
+    }
+
+    #[test]
+    fn resolve_check_inbox_rpc_config_prefers_agent_mail_url_over_host_port() {
+        let env: HashMap<String, String> = HashMap::from_iter([
+            ("AGENT_MAIL_URL".to_string(), "10.0.0.5:8123".to_string()),
+            ("AGENT_MAIL_TOKEN".to_string(), "token-xyz".to_string()),
+            ("HTTP_PATH".to_string(), "api".to_string()),
+        ]);
+
+        let cfg = resolve_check_inbox_rpc_config_reader(
+            |key| env.get(key).cloned(),
+            "/tmp/proj",
+            "BlueLake",
+            "127.0.0.1",
+            9999,
+            "/mcp/",
+        );
+        assert_eq!(cfg.project_key, "/tmp/proj");
+        assert_eq!(cfg.agent_name, "BlueLake");
+        assert_eq!(cfg.server_url, "http://10.0.0.5:8123/api/");
+        assert_eq!(
+            cfg.server_urls,
+            vec![
+                "http://10.0.0.5:8123/api/".to_string(),
+                "http://10.0.0.5:8123/mcp/".to_string(),
+            ]
+        );
+        assert_eq!(cfg.bearer_token.as_deref(), Some("token-xyz"));
+    }
+
+    #[test]
     fn check_inbox_rpc_config_does_not_alias_explicit_url_path() {
         let env: HashMap<String, String> = HashMap::from_iter([
             ("AGENT_MAIL_PROJECT".to_string(), "/tmp/proj".to_string()),
@@ -17735,6 +17876,17 @@ command = "mcp-agent-mail"
         assert_eq!(config.project_key, "/tmp/test-project");
         assert_eq!(config.agent_name, "TestAgent");
         assert_eq!(config.limit, 10);
+    }
+
+    #[test]
+    fn check_inbox_direct_rejects_non_positive_limit() {
+        let error = check_inbox_direct(&CheckInboxDirectConfig {
+            project_key: "/tmp/test-project".to_string(),
+            agent_name: "TestAgent".to_string(),
+            limit: 0,
+        })
+        .expect_err("limit=0 should be rejected");
+        assert!(matches!(error, CliError::InvalidArgument(_)));
     }
 
     #[test]
@@ -30817,6 +30969,210 @@ fn ensure_share_zip_target_absent(bundle_dir: &Path) -> CliResult<Option<PathBuf
     Ok(Some(zip_path))
 }
 
+fn share_update_require_real_directory(path: &Path, label: &str) -> CliResult<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(CliError::Other(format!(
+            "{label} {} must not be a symlink",
+            path.display()
+        ))),
+        Ok(_) => Err(CliError::Other(format!(
+            "{label} {} exists but is not a directory",
+            path.display()
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(CliError::Other(format!(
+            "{label} {} does not exist or is not a directory",
+            path.display()
+        ))),
+        Err(err) => Err(CliError::Io(err)),
+    }
+}
+
+fn share_update_optional_real_file_exists(path: &Path, label: &str) -> CliResult<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(CliError::Other(format!(
+            "{label} {} must not be a symlink",
+            path.display()
+        ))),
+        Ok(_) => Err(CliError::Other(format!(
+            "{label} {} exists but is not a file",
+            path.display()
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(CliError::Io(err)),
+    }
+}
+
+fn share_update_ensure_real_directory(path: &Path) -> CliResult<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        use std::path::Component;
+
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(CliError::Other(format!(
+                    "refusing to create bundle directory with parent traversal: {}",
+                    path.display()
+                )));
+            }
+            Component::Normal(segment) => {
+                current.push(segment);
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) if metadata.file_type().is_dir() => {}
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(CliError::Other(format!(
+                            "refusing to traverse symlinked bundle directory {}",
+                            current.display()
+                        )));
+                    }
+                    Ok(_) => {
+                        return Err(CliError::Other(format!(
+                            "expected bundle directory but found non-directory {}",
+                            current.display()
+                        )));
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir(&current)?;
+                    }
+                    Err(err) => return Err(CliError::Io(err)),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn share_update_copy_file(src: &Path, dst: &Path) -> CliResult<()> {
+    if !path_is_real_file(src) {
+        return Err(CliError::Other(format!(
+            "bundle update source {} is not a real file",
+            src.display()
+        )));
+    }
+    if let Some(parent) = dst.parent() {
+        share_update_ensure_real_directory(parent)?;
+    }
+    match std::fs::symlink_metadata(dst) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(CliError::Other(format!(
+                "refusing to copy through symlinked bundle path {}",
+                dst.display()
+            )));
+        }
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            return Err(CliError::Other(format!(
+                "expected bundle file but found directory {}",
+                dst.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(CliError::Io(err)),
+    }
+    std::fs::copy(src, dst)?;
+    Ok(())
+}
+
+fn share_update_copy_dir_recursive(src: &Path, dst: &Path) -> CliResult<()> {
+    share_update_require_real_directory(src, "bundle update source directory")?;
+    share_update_ensure_real_directory(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let ty = entry.file_type()?;
+        if ty.is_symlink() {
+            return Err(CliError::Other(format!(
+                "unsupported symlink in bundle source: {}",
+                src_path.display()
+            )));
+        }
+        if ty.is_dir() {
+            share_update_copy_dir_recursive(&src_path, &dst_path)?;
+            continue;
+        }
+        if ty.is_file() {
+            share_update_copy_file(&src_path, &dst_path)?;
+            continue;
+        }
+        return Err(CliError::Other(format!(
+            "unsupported file type in bundle: {}",
+            src_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn share_update_remove_dir_tree_if_exists(path: &Path) -> CliResult<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(CliError::Other(format!(
+            "refusing to remove through symlinked bundle path {}",
+            path.display()
+        ))),
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?;
+                let entry_path = entry.path();
+                let ty = entry.file_type()?;
+                if ty.is_symlink() {
+                    return Err(CliError::Other(format!(
+                        "refusing to remove through symlinked bundle path {}",
+                        entry_path.display()
+                    )));
+                }
+                if ty.is_dir() {
+                    share_update_remove_dir_tree_if_exists(&entry_path)?;
+                    continue;
+                }
+                if ty.is_file() {
+                    std::fs::remove_file(&entry_path)?;
+                    continue;
+                }
+                return Err(CliError::Other(format!(
+                    "unsupported file type in bundle: {}",
+                    entry_path.display()
+                )));
+            }
+            std::fs::remove_dir(path)?;
+            Ok(())
+        }
+        Ok(_) => Err(CliError::Other(format!(
+            "expected bundle directory but found non-directory {}",
+            path.display()
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(CliError::Io(err)),
+    }
+}
+
+fn share_update_remove_file_if_exists(path: &Path) -> CliResult<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(CliError::Other(format!(
+            "refusing to remove through symlinked bundle path {}",
+            path.display()
+        ))),
+        Ok(metadata) if metadata.file_type().is_file() => {
+            std::fs::remove_file(path)?;
+            Ok(())
+        }
+        Ok(_) => Err(CliError::Other(format!(
+            "expected bundle file but found non-file {}",
+            path.display()
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(CliError::Io(err)),
+    }
+}
+
+fn share_update_replace_dir(src: &Path, dst: &Path) -> CliResult<()> {
+    share_update_remove_dir_tree_if_exists(dst)?;
+    share_update_copy_dir_recursive(src, dst)
+}
+
 struct ShareExportParams {
     output: PathBuf,
     projects: Vec<String>,
@@ -31073,58 +31429,6 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
 fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
     validate_share_archive_options(params.zip, &params.age_recipients)?;
 
-    fn copy_file(src: &Path, dst: &Path) -> CliResult<()> {
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::copy(src, dst)?;
-        Ok(())
-    }
-
-    fn copy_dir_recursive(src: &Path, dst: &Path) -> CliResult<()> {
-        std::fs::create_dir_all(dst)?;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            let src_path = entry.path();
-            let dst_path = dst.join(entry.file_name());
-            let ty = entry.file_type()?;
-            if ty.is_dir() {
-                copy_dir_recursive(&src_path, &dst_path)?;
-                continue;
-            }
-            if ty.is_file() {
-                std::fs::copy(&src_path, &dst_path)?;
-                continue;
-            }
-            return Err(CliError::Other(format!(
-                "unsupported file type in bundle: {}",
-                src_path.display()
-            )));
-        }
-        Ok(())
-    }
-
-    fn replace_dir(src: &Path, dst: &Path) -> CliResult<()> {
-        if dst.exists() {
-            std::fs::remove_dir_all(dst)?;
-        }
-        copy_dir_recursive(src, dst)
-    }
-
-    fn remove_file_if_exists(path: &Path) -> CliResult<()> {
-        if path.exists() {
-            std::fs::remove_file(path)?;
-        }
-        Ok(())
-    }
-
-    fn remove_dir_if_exists(path: &Path) -> CliResult<()> {
-        if path.exists() {
-            std::fs::remove_dir_all(path)?;
-        }
-        Ok(())
-    }
-
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let source_path = cfg
         .sqlite_path()
@@ -31136,14 +31440,11 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
         )));
     }
 
-    if !params.bundle.is_dir() {
-        return Err(CliError::Other(format!(
-            "bundle path {} does not exist or is not a directory",
-            params.bundle.display()
-        )));
-    }
-
-    let existing_signature = params.bundle.join("manifest.sig.json").exists();
+    share_update_require_real_directory(&params.bundle, "bundle path")?;
+    let existing_signature = share_update_optional_real_file_exists(
+        &params.bundle.join("manifest.sig.json"),
+        "bundle signature",
+    )?;
 
     ftui_runtime::ftui_println!("Source database: {source_path}");
     ftui_runtime::ftui_println!("Updating bundle: {}", params.bundle.display());
@@ -31244,36 +31545,36 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
         "mailbox.sqlite3",
     ];
     for name in files {
-        copy_file(&temp_bundle.join(name), &params.bundle.join(name))?;
+        share_update_copy_file(&temp_bundle.join(name), &params.bundle.join(name))?;
     }
 
     // Ensure bundle doesn't accumulate WAL/SHM files.
-    remove_file_if_exists(&params.bundle.join("mailbox.sqlite3-wal"))?;
-    remove_file_if_exists(&params.bundle.join("mailbox.sqlite3-shm"))?;
-    remove_file_if_exists(&params.bundle.join("_snapshot.sqlite3"))?;
+    share_update_remove_file_if_exists(&params.bundle.join("mailbox.sqlite3-wal"))?;
+    share_update_remove_file_if_exists(&params.bundle.join("mailbox.sqlite3-shm"))?;
+    share_update_remove_file_if_exists(&params.bundle.join("_snapshot.sqlite3"))?;
 
     // Viewer + attachments are always owned by the export; replace wholesale.
-    replace_dir(&temp_bundle.join("viewer"), &params.bundle.join("viewer"))?;
-    replace_dir(
+    share_update_replace_dir(&temp_bundle.join("viewer"), &params.bundle.join("viewer"))?;
+    share_update_replace_dir(
         &temp_bundle.join("attachments"),
         &params.bundle.join("attachments"),
     )?;
 
     // Chunk artefacts: if the refreshed snapshot no longer needs chunking, prune the old chunk files.
     if chunk.is_some() {
-        replace_dir(&temp_bundle.join("chunks"), &params.bundle.join("chunks"))?;
-        copy_file(
+        share_update_replace_dir(&temp_bundle.join("chunks"), &params.bundle.join("chunks"))?;
+        share_update_copy_file(
             &temp_bundle.join("chunks.sha256"),
             &params.bundle.join("chunks.sha256"),
         )?;
-        copy_file(
+        share_update_copy_file(
             &temp_bundle.join("mailbox.sqlite3.config.json"),
             &params.bundle.join("mailbox.sqlite3.config.json"),
         )?;
     } else {
-        remove_dir_if_exists(&params.bundle.join("chunks"))?;
-        remove_file_if_exists(&params.bundle.join("chunks.sha256"))?;
-        remove_file_if_exists(&params.bundle.join("mailbox.sqlite3.config.json"))?;
+        share_update_remove_dir_tree_if_exists(&params.bundle.join("chunks"))?;
+        share_update_remove_file_if_exists(&params.bundle.join("chunks.sha256"))?;
+        share_update_remove_file_if_exists(&params.bundle.join("mailbox.sqlite3.config.json"))?;
     }
 
     // Sign (optional).
@@ -33540,6 +33841,7 @@ where
         .cloned()
         .unwrap_or_else(|| normalize_agent_mail_url(&raw_url, &http_path));
     let bearer_token = read_env("AGENT_MAIL_TOKEN")
+        .or_else(|| read_env("HTTP_BEARER_TOKEN"))
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty() && !value_looks_like_template(v));
 
@@ -33553,6 +33855,52 @@ where
         include_bodies: false,
         timeout_seconds: CHECK_INBOX_RPC_TIMEOUT_SECS,
     })
+}
+
+fn resolve_check_inbox_rpc_config_reader<F>(
+    read_env: F,
+    project_key: &str,
+    agent_name: &str,
+    host: &str,
+    port: u16,
+    http_path: &str,
+) -> CheckInboxRpcConfig
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let raw_url = read_env("AGENT_MAIL_URL")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty() && !value_looks_like_template(v));
+    let bearer_token = read_env("AGENT_MAIL_TOKEN")
+        .or_else(|| read_env("HTTP_BEARER_TOKEN"))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty() && !value_looks_like_template(v));
+
+    let (server_url, server_urls) = if let Some(raw_url) = raw_url {
+        let env_http_path = read_env("HTTP_PATH").unwrap_or_else(|| http_path.to_string());
+        let server_urls = check_inbox_server_urls_for_agent_mail_url(&raw_url, &env_http_path);
+        let server_url = server_urls
+            .first()
+            .cloned()
+            .unwrap_or_else(|| normalize_agent_mail_url(&raw_url, &env_http_path));
+        (server_url, server_urls)
+    } else {
+        (
+            check_inbox_server_url(host, port, http_path),
+            check_inbox_server_urls(host, port, http_path),
+        )
+    };
+
+    CheckInboxRpcConfig {
+        server_url,
+        server_urls,
+        bearer_token,
+        project_key: project_key.to_string(),
+        agent_name: agent_name.to_string(),
+        limit: CHECK_INBOX_FETCH_LIMIT,
+        include_bodies: false,
+        timeout_seconds: CHECK_INBOX_RPC_TIMEOUT_SECS,
+    }
 }
 
 pub fn check_inbox_rpc_config_from_env() -> Option<CheckInboxRpcConfig> {
@@ -33819,6 +34167,12 @@ fn resolve_agent_id_for_inbox_check(
 pub fn check_inbox_direct(config: &CheckInboxDirectConfig) -> CliResult<CheckInboxRpcResult> {
     use sqlmodel_core::Value;
 
+    if config.limit < 1 {
+        return Err(CliError::InvalidArgument(
+            "check-inbox limit must be at least 1".to_string(),
+        ));
+    }
+
     let conn = open_db_sync()?;
 
     // Resolve project ID from project_key (try slug first, then human_key)
@@ -34060,6 +34414,9 @@ fn classify_server_tool_call(
             if let Some(error_text) = parse_jsonrpc_error(&payload) {
                 return ServerToolCall::Rejected(error_text);
             }
+            if let Some(error_text) = parse_tool_result_error(&payload) {
+                return ServerToolCall::Rejected(error_text);
+            }
             match payload.get("result").cloned() {
                 Some(result) => ServerToolCall::Success(result),
                 None => ServerToolCall::Rejected(format!(
@@ -34076,6 +34433,44 @@ fn classify_server_tool_call(
             }
         }
     }
+}
+
+fn parse_tool_result_error(payload: &serde_json::Value) -> Option<String> {
+    let result = payload.get("result")?;
+    if result.get("isError").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+
+    if let Some(text) = result
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("text"))
+        .and_then(serde_json::Value::as_str)
+        && !text.is_empty()
+    {
+        return Some(text.to_string());
+    }
+
+    if let Some(structured) = result
+        .get("structuredContent")
+        .or_else(|| result.get("structured_content"))
+    {
+        if let Some(message) = structured
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            && !message.is_empty()
+        {
+            return Some(message.to_string());
+        }
+        if let Some(error_text) = structured.get("error").and_then(serde_json::Value::as_str)
+            && !error_text.is_empty()
+        {
+            return Some(error_text.to_string());
+        }
+    }
+
+    Some("tool execution failed".to_string())
 }
 
 async fn try_call_server_tool(
@@ -34104,7 +34499,10 @@ fn coerce_tool_result_json(result: serde_json::Value) -> Option<serde_json::Valu
         serde_json::Value::Null => None,
         serde_json::Value::String(s) => serde_json::from_str(&s).ok(),
         serde_json::Value::Object(map) => {
-            if let Some(v) = map.get("structured_content") {
+            if let Some(v) = map
+                .get("structured_content")
+                .or_else(|| map.get("structuredContent"))
+            {
                 return Some(v.clone());
             }
             if let Some(content) = map.get("content") {
@@ -36558,6 +36956,83 @@ fn ensure_share_zip_target_absent_rejects_existing_archive() {
     let err = ensure_share_zip_target_absent(&bundle)
         .expect_err("existing zip archive should fail preflight");
     assert!(format!("{err}").contains("refusing to overwrite existing ZIP archive"));
+}
+
+#[cfg(unix)]
+#[test]
+fn share_update_require_real_directory_rejects_symlinked_bundle_root() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let real_bundle = temp.path().join("real-bundle");
+    std::fs::create_dir_all(&real_bundle).expect("create real bundle");
+    let linked_bundle = temp.path().join("bundle-link");
+    symlink(&real_bundle, &linked_bundle).expect("symlink bundle root");
+
+    let err = share_update_require_real_directory(&linked_bundle, "bundle path")
+        .expect_err("symlinked bundle root should be rejected");
+    assert!(format!("{err}").contains("must not be a symlink"));
+}
+
+#[cfg(unix)]
+#[test]
+fn share_update_optional_real_file_exists_rejects_symlinked_signature() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let outside = temp.path().join("outside.sig.json");
+    let linked = temp.path().join("manifest.sig.json");
+    std::fs::write(&outside, "{}\n").expect("write outside signature");
+    symlink(&outside, &linked).expect("symlink signature");
+
+    let err = share_update_optional_real_file_exists(&linked, "bundle signature")
+        .expect_err("symlinked signature should be rejected");
+    assert!(format!("{err}").contains("must not be a symlink"));
+}
+
+#[cfg(unix)]
+#[test]
+fn share_update_copy_file_rejects_symlinked_destination() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let src = temp.path().join("src.txt");
+    let outside = temp.path().join("outside.txt");
+    let bundle = temp.path().join("bundle");
+    let dst = bundle.join("manifest.json");
+    std::fs::write(&src, "fresh").expect("write source");
+    std::fs::write(&outside, "keep").expect("write outside file");
+    std::fs::create_dir_all(&bundle).expect("create bundle");
+    symlink(&outside, &dst).expect("symlink destination");
+
+    let err =
+        share_update_copy_file(&src, &dst).expect_err("symlinked destination should be rejected");
+    assert!(format!("{err}").contains("symlinked bundle path"));
+    assert_eq!(
+        std::fs::read_to_string(&outside).expect("read outside file"),
+        "keep"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn share_update_replace_dir_rejects_symlinked_child_in_existing_tree() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let src = temp.path().join("src-viewer");
+    let dst = temp.path().join("bundle").join("viewer");
+    let outside = temp.path().join("outside-dir");
+    std::fs::create_dir_all(&src).expect("create source viewer");
+    std::fs::write(src.join("index.html"), "<html>fresh</html>").expect("write source viewer");
+    std::fs::create_dir_all(&dst).expect("create destination viewer");
+    std::fs::create_dir_all(&outside).expect("create outside dir");
+    symlink(&outside, dst.join("leak")).expect("symlink child");
+
+    let err = share_update_replace_dir(&src, &dst)
+        .expect_err("symlinked child in existing tree should be rejected");
+    assert!(format!("{err}").contains("symlinked bundle path"));
+    assert!(outside.exists(), "outside directory must remain untouched");
 }
 
 #[cfg(test)]
