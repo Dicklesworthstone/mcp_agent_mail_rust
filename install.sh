@@ -501,6 +501,37 @@ detect_python_alias() {
     done < <(find "$HOME/.config/fish/conf.d" -maxdepth 1 -type f -name "*.fish" 2>/dev/null | sort || true)
   fi
 
+  # Follow source/. directives in primary rc files to find aliases in sourced configs
+  # This catches ACFS (~/.acfs/zsh/acfs.zshrc) and similar framework-managed configs
+  local sourced_files=()
+  for rc in "${rc_files[@]}"; do
+    [ -f "$rc" ] || continue
+    while IFS= read -r sourced; do
+      # Resolve $HOME and ~ in source paths
+      sourced="${sourced/\$HOME/$HOME}"
+      sourced="${sourced/#\~/$HOME}"
+      # Remove surrounding quotes
+      sourced="${sourced#\"}"
+      sourced="${sourced%\"}"
+      sourced="${sourced#\'}"
+      sourced="${sourced%\'}"
+      if [ -f "$sourced" ] && [[ ! " ${rc_files[*]} " =~ " ${sourced} " ]]; then
+        sourced_files+=("$sourced")
+      fi
+    done < <(grep -oE '^\s*(source|\.)\s+"?[^"#]+"?' "$rc" 2>/dev/null | sed -E 's/^\s*(source|\.)\s+//' | sed 's/#.*//' | sed 's/[[:space:]]*$//' || true)
+  done
+  rc_files+=("${sourced_files[@]}")
+
+  # Also directly check ACFS paths (common agent framework that defines am alias)
+  local acfs_zshrc="$HOME/.acfs/zsh/acfs.zshrc"
+  if [ -f "$acfs_zshrc" ] && [[ ! " ${rc_files[*]} " =~ " ${acfs_zshrc} " ]]; then
+    rc_files+=("$acfs_zshrc")
+  fi
+  local acfs_bashrc="$HOME/.acfs/bash/acfs.bashrc"
+  if [ -f "$acfs_bashrc" ] && [[ ! " ${rc_files[*]} " =~ " ${acfs_bashrc} " ]]; then
+    rc_files+=("$acfs_bashrc")
+  fi
+
   for rc in "${rc_files[@]}"; do
     [ -f "$rc" ] || continue
 
@@ -1067,30 +1098,110 @@ EOF
 
 # T1.5: Stop running Python server processes
 stop_python_server() {
-  [ -z "$PYTHON_PID" ] && return 0
-
-  info "Stopping Python mcp-agent-mail server (PID $PYTHON_PID)"
-  kill "$PYTHON_PID" 2>/dev/null || true
-
-  # Wait up to 5 seconds for graceful shutdown
-  local waited=0
-  while [ "$waited" -lt 5 ] && kill -0 "$PYTHON_PID" 2>/dev/null; do
-    sleep 1
-    waited=$((waited + 1))
+  # Stop any Python systemd user service for mcp_agent_mail first
+  # (cron-launched or systemd-managed Python servers will respawn if not disabled)
+  local py_service_names=("mcp-agent-mail-python" "mcp_agent_mail" "agent-mail-python")
+  for svc in "${py_service_names[@]}"; do
+    if systemctl --user is-active "$svc" &>/dev/null 2>&1; then
+      info "Stopping Python systemd service: $svc"
+      systemctl --user stop "$svc" 2>/dev/null || true
+      systemctl --user disable "$svc" 2>/dev/null || true
+    fi
   done
 
-  # Force-kill if still running
-  if kill -0 "$PYTHON_PID" 2>/dev/null; then
-    warn "Python server did not stop gracefully; sending SIGKILL"
-    kill -9 "$PYTHON_PID" 2>/dev/null || true
-    sleep 1
+  # Also remove any crontab entries that start the Python server
+  if command -v crontab &>/dev/null; then
+    local cron_before cron_after
+    cron_before=$(crontab -l 2>/dev/null || true)
+    if echo "$cron_before" | grep -qE "mcp_agent_mail.*serve|run_server_with_token"; then
+      cron_after=$(echo "$cron_before" | grep -vE "mcp_agent_mail.*serve|run_server_with_token")
+      echo "$cron_after" | crontab - 2>/dev/null || true
+      ok "Removed Python mcp_agent_mail crontab entries"
+    fi
   fi
 
-  if ! kill -0 "$PYTHON_PID" 2>/dev/null; then
-    ok "Python server stopped"
-  else
-    warn "Could not stop Python server (PID $PYTHON_PID)"
+  # Kill all Python mcp_agent_mail processes, not just the single detected PID
+  local all_py_pids
+  all_py_pids=$(pgrep -f "mcp_agent_mail|mcp.agent.mail" 2>/dev/null || true)
+  if [ -n "$all_py_pids" ]; then
+    local killed_any=0
+    while IFS= read -r pid; do
+      [ -z "$pid" ] && continue
+      local cmdline
+      cmdline=$(ps -p "$pid" -o command= 2>/dev/null || true)
+      if echo "$cmdline" | grep -qiE "python|uvicorn"; then
+        info "Stopping Python mcp-agent-mail process (PID $pid)"
+        kill "$pid" 2>/dev/null || true
+        killed_any=1
+      fi
+    done <<< "$all_py_pids"
+
+    if [ "$killed_any" -eq 1 ]; then
+      # Wait up to 5 seconds for graceful shutdown
+      local waited=0
+      while [ "$waited" -lt 5 ]; do
+        local still_running=0
+        while IFS= read -r pid; do
+          [ -z "$pid" ] && continue
+          local cmdline
+          cmdline=$(ps -p "$pid" -o command= 2>/dev/null || true)
+          if echo "$cmdline" | grep -qiE "python|uvicorn" && kill -0 "$pid" 2>/dev/null; then
+            still_running=1
+            break
+          fi
+        done <<< "$all_py_pids"
+        [ "$still_running" -eq 0 ] && break
+        sleep 1
+        waited=$((waited + 1))
+      done
+
+      # Force-kill any survivors
+      while IFS= read -r pid; do
+        [ -z "$pid" ] && continue
+        if kill -0 "$pid" 2>/dev/null; then
+          local cmdline
+          cmdline=$(ps -p "$pid" -o command= 2>/dev/null || true)
+          if echo "$cmdline" | grep -qiE "python|uvicorn"; then
+            warn "Force-killing Python server (PID $pid)"
+            kill -9 "$pid" 2>/dev/null || true
+          fi
+        fi
+      done <<< "$all_py_pids"
+    fi
   fi
+
+  # Also handle the single detected PID if it wasn't caught above
+  if [ -n "$PYTHON_PID" ] && kill -0 "$PYTHON_PID" 2>/dev/null; then
+    info "Stopping Python mcp-agent-mail server (PID $PYTHON_PID)"
+    kill "$PYTHON_PID" 2>/dev/null || true
+    local waited=0
+    while [ "$waited" -lt 5 ] && kill -0 "$PYTHON_PID" 2>/dev/null; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    if kill -0 "$PYTHON_PID" 2>/dev/null; then
+      warn "Python server did not stop gracefully; sending SIGKILL"
+      kill -9 "$PYTHON_PID" 2>/dev/null || true
+      sleep 1
+    fi
+  fi
+
+  # Verify port 8765 is free
+  if command -v ss &>/dev/null; then
+    local port_holder
+    port_holder=$(ss -tlnp 2>/dev/null | grep ":8765 " || true)
+    if echo "$port_holder" | grep -qiE "python|uvicorn"; then
+      local holder_pid
+      holder_pid=$(echo "$port_holder" | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
+      if [ -n "$holder_pid" ]; then
+        warn "Port 8765 still held by Python process (PID $holder_pid); force-killing"
+        kill -9 "$holder_pid" 2>/dev/null || true
+        sleep 1
+      fi
+    fi
+  fi
+
+  ok "Python server stopped"
 }
 
 # T5.2: Resolve database path differences between Python and Rust
@@ -2782,7 +2893,7 @@ find_latest_python_alias_backup() {
 }
 
 restore_python_alias_backups() {
-  local rc_files=("$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.config/fish/config.fish")
+  local rc_files=("$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.config/fish/config.fish" "$HOME/.acfs/zsh/acfs.zshrc" "$HOME/.acfs/bash/acfs.bashrc")
   local restored=0
   local rc backup pre_restore ts
 
