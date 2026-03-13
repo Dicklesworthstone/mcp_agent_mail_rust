@@ -103,13 +103,14 @@ pub fn generate_plan(
     let bundle_path = resolve_bundle_path(inputs)?;
 
     // Detect environment if not provided
-    let cwd = std::env::current_dir().map_err(|e| {
+    let shell_cwd = std::env::current_dir().map_err(|e| {
         WizardError::new(
             WizardErrorCode::InternalError,
             format!("Failed to get cwd: {e}"),
         )
     })?;
-    let env = env.unwrap_or_else(|| detect_environment(Some(&bundle_path), &cwd));
+    let detection_root = resolve_detection_root(&bundle_path, &shell_cwd);
+    let env = env.unwrap_or_else(|| detect_environment(Some(&bundle_path), &detection_root));
 
     // Determine target provider
     let provider = resolve_provider(inputs, &env)?;
@@ -195,6 +196,40 @@ fn resolve_bundle_path(inputs: &WizardInputs) -> PlanResult<PathBuf> {
         "No bundle path specified and no default bundle found",
     )
     .with_hint("Specify --bundle or run 'am share export' in the current directory"))
+}
+
+fn resolve_detection_root(bundle_path: &Path, shell_cwd: &Path) -> PathBuf {
+    let resolved_bundle_path = if bundle_path.is_absolute() {
+        bundle_path.to_path_buf()
+    } else {
+        shell_cwd.join(bundle_path)
+    };
+    let fallback_root = resolved_bundle_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(shell_cwd);
+    let mut scripts_candidate = None;
+
+    for ancestor in fallback_root.ancestors() {
+        if has_strong_project_root_marker(ancestor) {
+            return ancestor.to_path_buf();
+        }
+        if scripts_candidate.is_none() && ancestor.join("scripts").is_dir() {
+            scripts_candidate = Some(ancestor.to_path_buf());
+        }
+    }
+
+    scripts_candidate.unwrap_or_else(|| fallback_root.to_path_buf())
+}
+
+fn has_strong_project_root_marker(path: &Path) -> bool {
+    path.join(".git").exists()
+        || path.join("wrangler.toml").exists()
+        || path.join("netlify.toml").exists()
+        || path.join(".github").join("workflows").is_dir()
+        || path.join("Cargo.toml").exists()
+        || path.join("package.json").exists()
+        || path.join("pyproject.toml").exists()
 }
 
 fn resolve_provider(
@@ -1064,6 +1099,48 @@ mod tests {
         let err = generate_plan(&inputs, Some(DetectedEnvironment::default()))
             .expect_err("invalid bundle path should fail before plan generation");
         assert_eq!(err.code, WizardErrorCode::BundleNotFound);
+    }
+
+    #[test]
+    fn resolve_detection_root_prefers_bundle_project_over_shell_cwd() {
+        let shell_cwd = tempfile::tempdir().expect("shell cwd");
+        std::fs::write(shell_cwd.path().join("netlify.toml"), "[build]\npublish = \"dist\"")
+            .expect("write netlify config");
+
+        let project = tempfile::tempdir().expect("project");
+        std::fs::write(project.path().join("wrangler.toml"), "name = \"demo\"")
+            .expect("write wrangler config");
+        let bundle = project.path().join("nested/output/bundle");
+        std::fs::create_dir_all(&bundle).expect("create bundle dir");
+        std::fs::create_dir_all(project.path().join("nested/output/docs"))
+            .expect("create nested docs dir");
+        std::fs::write(bundle.join("manifest.json"), "{}").expect("write manifest");
+
+        let detection_root = resolve_detection_root(&bundle, shell_cwd.path());
+        assert_eq!(detection_root, project.path());
+
+        let env = detect_environment(Some(&bundle), &detection_root);
+        assert_eq!(
+            env.recommended_provider,
+            Some(HostingProvider::CloudflarePages)
+        );
+        assert!(
+            env.signals
+                .iter()
+                .any(|signal| signal.detail.contains("wrangler.toml")),
+            "expected project-root detection to retain bundle project signals"
+        );
+    }
+
+    #[test]
+    fn resolve_detection_root_keeps_relative_bundle_in_shell_project() {
+        let shell_cwd = tempfile::tempdir().expect("shell cwd");
+        let bundle = shell_cwd.path().join("bundle");
+        std::fs::create_dir_all(&bundle).expect("create bundle");
+        std::fs::write(bundle.join("manifest.json"), "{}").expect("write manifest");
+
+        let detection_root = resolve_detection_root(Path::new("bundle"), shell_cwd.path());
+        assert_eq!(detection_root, shell_cwd.path());
     }
 
     #[test]

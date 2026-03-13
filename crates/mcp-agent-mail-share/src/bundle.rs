@@ -1058,34 +1058,50 @@ pub fn copy_viewer_assets_from(
     viewer_source: &Path,
     output_dir: &Path,
 ) -> ShareResult<Vec<String>> {
-    let viewer_root = output_dir.join("viewer");
-    std::fs::create_dir_all(&viewer_root)?;
-
     if !viewer_source.is_dir() {
         return Err(ShareError::BundleNotFound {
             path: viewer_source.display().to_string(),
         });
     }
 
+    let viewer_source = viewer_source
+        .canonicalize()
+        .map_err(|e| ShareError::Io(std::io::Error::other(e.to_string())))?;
+    let viewer_root = output_dir.join("viewer");
+    std::fs::create_dir_all(&viewer_root)?;
+
     let mut copied = Vec::new();
 
     // Collect all files sorted for determinism
     let mut entries = Vec::new();
-    collect_entries(viewer_source, viewer_source, &mut entries)?;
+    collect_entries(&viewer_source, &viewer_source, &mut entries)?;
     entries.sort();
 
     for relative_path in &entries {
         let src = viewer_source.join(relative_path);
-        let dest = viewer_root.join(relative_path);
-        if src.is_dir() {
-            std::fs::create_dir_all(&dest)?;
-        } else {
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::copy(&src, &dest)?;
-            copied.push(format!("viewer/{relative_path}"));
+        let resolved = src.canonicalize().map_err(|e| {
+            ShareError::Io(std::io::Error::other(format!(
+                "Failed to canonicalize viewer asset {}: {e}",
+                src.display()
+            )))
+        })?;
+        if !resolved.starts_with(&viewer_source) {
+            return Err(ShareError::Io(std::io::Error::other(format!(
+                "Refusing to copy viewer asset outside viewer source: {relative_path}"
+            ))));
         }
+        if !resolved.is_file() {
+            return Err(ShareError::Io(std::io::Error::other(format!(
+                "Refusing to copy non-file viewer asset: {relative_path}"
+            ))));
+        }
+
+        let dest = viewer_root.join(relative_path);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&resolved, &dest)?;
+        copied.push(format!("viewer/{relative_path}"));
     }
 
     Ok(copied)
@@ -2002,6 +2018,29 @@ mod tests {
 
         let result = copy_viewer_assets_from(Path::new("/nonexistent/viewer"), &output);
         assert!(matches!(result, Err(ShareError::BundleNotFound { .. })));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_viewer_assets_from_refuses_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("viewer_assets");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("index.html"), b"<html>viewer</html>").unwrap();
+
+        let secret = dir.path().join("secret.js");
+        std::fs::write(&secret, b"top-secret").unwrap();
+        std::os::unix::fs::symlink(&secret, source.join("leak.js")).unwrap();
+
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+
+        let err = copy_viewer_assets_from(&source, &output).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("outside viewer source"),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[test]
