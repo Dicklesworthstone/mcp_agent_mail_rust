@@ -1532,6 +1532,10 @@ impl MailScreen for DashboardScreen {
         // redundant O(N log N) aggregation passes across render_insight_rail,
         // render_bottom_rail, and render_insight_panel_slot.
         let latency_rows = self.tool_latency_rows(&visible_entries);
+        let insight_layout = comp
+            .rect(PanelSlot::Inspector)
+            .map(classify_insight_rail_layout)
+            .unwrap_or(InsightRailLayout::Hidden);
         if let Some(trend_rect) = comp.rect(PanelSlot::Inspector) {
             render_insight_rail(
                 frame,
@@ -1556,6 +1560,7 @@ impl MailScreen for DashboardScreen {
                 &visible_entries,
                 preview,
                 &latency_rows,
+                insight_layout,
             );
         }
         if let Some(log_rect) = comp.rect(PanelSlot::Sidebar) {
@@ -1920,6 +1925,38 @@ const fn is_ultradense_bottom_area(area: Rect) -> bool {
     area.width >= ULTRADENSE_BOTTOM_MIN_WIDTH && area.height >= ULTRADENSE_BOTTOM_MIN_HEIGHT
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InsightRailLayout {
+    Hidden,
+    Compact,
+    Ultrawide,
+    Supergrid,
+    Megagrid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewFooterMode {
+    FullMetrics,
+    SignalsOnly,
+    PreviewAndQueryOnly,
+}
+
+const fn preview_footer_mode(insight_layout: InsightRailLayout) -> PreviewFooterMode {
+    match insight_layout {
+        InsightRailLayout::Megagrid => PreviewFooterMode::PreviewAndQueryOnly,
+        InsightRailLayout::Supergrid => PreviewFooterMode::SignalsOnly,
+        InsightRailLayout::Hidden | InsightRailLayout::Compact | InsightRailLayout::Ultrawide => {
+            PreviewFooterMode::FullMetrics
+        }
+    }
+}
+
+const fn should_force_preview_query_only(mode: PreviewFooterMode, area: Rect) -> bool {
+    matches!(mode, PreviewFooterMode::PreviewAndQueryOnly)
+        && area.width >= ULTRAWIDE_BOTTOM_MIN_WIDTH
+        && area.height >= ULTRAWIDE_BOTTOM_MIN_HEIGHT
+}
+
 fn split_top(area: Rect, top_h: u16) -> (Rect, Rect) {
     let top_h = top_h.min(area.height);
     let top = Rect::new(area.x, area.y, area.width, top_h);
@@ -2008,6 +2045,49 @@ fn split_rows_with_gap(area: Rect, rows: usize, gap: u16) -> Vec<Rect> {
     }
 
     out
+}
+
+fn split_insight_rail(area: Rect) -> (Rect, Rect) {
+    let ultrawide = area.width >= ULTRAWIDE_INSIGHT_MIN_WIDTH && area.height >= 20;
+    let six_k_surface =
+        area.width >= DASHBOARD_6K_MIN_WIDTH && area.height >= DASHBOARD_6K_MIN_HEIGHT;
+    if area.height >= 20 {
+        let trend_height = if six_k_surface {
+            (area
+                .height
+                .saturating_mul(DASHBOARD_6K_TREND_HEIGHT_PERCENT)
+                / 100)
+                .max(8)
+        } else if ultrawide {
+            (area.height.saturating_mul(2) / 5).max(8)
+        } else {
+            (area.height / 3).max(7)
+        };
+        split_top(area, trend_height)
+    } else {
+        (Rect::new(0, 0, 0, 0), area)
+    }
+}
+
+fn classify_insight_rail_layout(area: Rect) -> InsightRailLayout {
+    if area.width < 24 || area.height < 8 {
+        return InsightRailLayout::Hidden;
+    }
+    let (_, remaining) = split_insight_rail(area);
+    if remaining.height < 4 {
+        return InsightRailLayout::Compact;
+    }
+    if is_megagrid_insight_area(remaining) {
+        InsightRailLayout::Megagrid
+    } else if is_supergrid_insight_area(remaining) {
+        InsightRailLayout::Supergrid
+    } else if remaining.width >= ULTRAWIDE_INSIGHT_MIN_WIDTH
+        && remaining.height >= ULTRAWIDE_INSIGHT_MIN_HEIGHT
+    {
+        InsightRailLayout::Ultrawide
+    } else {
+        InsightRailLayout::Compact
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2807,25 +2887,7 @@ fn render_insight_rail(
         return;
     }
 
-    let ultrawide = area.width >= ULTRAWIDE_INSIGHT_MIN_WIDTH && area.height >= 20;
-    let six_k_surface =
-        area.width >= DASHBOARD_6K_MIN_WIDTH && area.height >= DASHBOARD_6K_MIN_HEIGHT;
-    let (trend_area, remaining) = if area.height >= 20 {
-        let trend_height = if six_k_surface {
-            (area
-                .height
-                .saturating_mul(DASHBOARD_6K_TREND_HEIGHT_PERCENT)
-                / 100)
-                .max(8)
-        } else if ultrawide {
-            (area.height.saturating_mul(2) / 5).max(8)
-        } else {
-            (area.height / 3).max(7)
-        };
-        split_top(area, trend_height)
-    } else {
-        (Rect::new(0, 0, 0, 0), area)
-    };
+    let (trend_area, remaining) = split_insight_rail(area);
 
     if trend_area.height > 0 {
         render_trend_panel(
@@ -3043,6 +3105,7 @@ fn render_bottom_rail(
     entries: &[&EventEntry],
     preview: Option<&RecentMessagePreview>,
     latency_rows: &[ToolLatencyRow],
+    insight_layout: InsightRailLayout,
 ) {
     if area.width < 24 || area.height < 4 {
         return;
@@ -3188,6 +3251,18 @@ fn render_bottom_rail(
         return;
     }
 
+    let preview_mode = preview_footer_mode(insight_layout);
+    if should_force_preview_query_only(preview_mode, area) {
+        // Megagrid inspectors already render the broad operational snapshot.
+        // Keep the footer focused on message/query context instead of repeating
+        // the same support widgets below.
+        let (preview_col, query_col) =
+            split_width_ratio_with_gap(area, if area.width >= 120 { 0.58 } else { 0.5 }, 1);
+        render_recent_message_preview_panel(frame, preview_col, preview);
+        render_query_matches_panel(frame, query_col, query_text, db_snapshot, entries);
+        return;
+    }
+
     if is_ultradense_bottom_area(area) {
         let (preview_col, rest) = split_width_ratio_with_gap(area, 0.24, 1);
         let (query_col, rest) = split_width_ratio_with_gap(rest, 0.24, 1);
@@ -3197,14 +3272,19 @@ fn render_bottom_rail(
         render_recent_message_preview_panel(frame, preview_col, preview);
         render_query_matches_panel(frame, query_col, query_text, db_snapshot, entries);
         render_recent_activity_panel(frame, activity_col, entries, query_text);
-        if metrics_col.height >= 10 {
+        if matches!(preview_mode, PreviewFooterMode::SignalsOnly) {
+            render_event_mix_panel(frame, metrics_col, entries, query_text);
+            render_message_flow_panel(frame, support_col, entries, query_text);
+        } else if metrics_col.height >= 10 {
             let (metrics_top, metrics_bottom) = split_height_ratio_with_gap(metrics_col, 0.5, 1);
             render_event_mix_panel(frame, metrics_top, entries, query_text);
             render_tool_latency_panel_cached(frame, metrics_bottom, latency_rows);
         } else {
             render_event_mix_panel(frame, metrics_col, entries, query_text);
         }
-        if support_col.height >= 10 {
+        if matches!(preview_mode, PreviewFooterMode::SignalsOnly) {
+            // handled above
+        } else if support_col.height >= 10 {
             let (support_top, support_bottom) = split_height_ratio_with_gap(support_col, 0.5, 1);
             render_message_flow_panel(frame, support_top, entries, query_text);
             render_reservation_ttl_buckets_panel(
@@ -3229,7 +3309,11 @@ fn render_bottom_rail(
         render_query_matches_panel(frame, query_col, query_text, db_snapshot, entries);
         render_recent_activity_panel(frame, activity_col, entries, query_text);
 
-        if metrics_col.height >= 10 {
+        if matches!(preview_mode, PreviewFooterMode::SignalsOnly) {
+            let (left, right) = split_width_ratio_with_gap(metrics_col, 0.5, 1);
+            render_event_mix_panel(frame, left, entries, query_text);
+            render_message_flow_panel(frame, right, entries, query_text);
+        } else if metrics_col.height >= 10 {
             let (metrics_top, metrics_bottom) = split_height_ratio_with_gap(metrics_col, 0.5, 1);
             let (top_left, top_right) = split_width_ratio_with_gap(metrics_top, 0.5, 1);
             let (bottom_left, bottom_right) = split_width_ratio_with_gap(metrics_bottom, 0.5, 1);
@@ -3259,7 +3343,15 @@ fn render_bottom_rail(
         render_query_matches_panel(frame, middle, query_text, db_snapshot, entries);
         render_recent_activity_panel(frame, right, entries, query_text);
 
-        if aux.height >= 14 {
+        if matches!(preview_mode, PreviewFooterMode::SignalsOnly) {
+            if aux.height >= 10 {
+                let (aux_top, aux_bottom) = split_height_ratio_with_gap(aux, 0.5, 1);
+                render_event_mix_panel(frame, aux_top, entries, query_text);
+                render_message_flow_panel(frame, aux_bottom, entries, query_text);
+            } else {
+                render_message_flow_panel(frame, aux, entries, query_text);
+            }
+        } else if aux.height >= 14 {
             let (aux_top, aux_bottom) = split_height_ratio_with_gap(aux, 0.5, 1);
             let (top_left, top_right) = split_width_ratio_with_gap(aux_top, 0.5, 1);
             let (bottom_left, bottom_right) = split_width_ratio_with_gap(aux_bottom, 0.5, 1);
@@ -6617,6 +6709,92 @@ mod tests {
             ULTRADENSE_BOTTOM_MIN_WIDTH,
             ULTRADENSE_BOTTOM_MIN_HEIGHT
         )));
+    }
+
+    #[test]
+    fn insight_rail_layout_classifies_dense_surfaces() {
+        assert_eq!(
+            classify_insight_rail_layout(Rect::new(0, 0, 23, 8)),
+            InsightRailLayout::Hidden
+        );
+        assert_eq!(
+            classify_insight_rail_layout(Rect::new(
+                0,
+                0,
+                ULTRAWIDE_INSIGHT_MIN_WIDTH,
+                ULTRAWIDE_INSIGHT_MIN_HEIGHT
+            )),
+            InsightRailLayout::Ultrawide
+        );
+        assert_eq!(
+            classify_insight_rail_layout(Rect::new(
+                0,
+                0,
+                SUPERGRID_INSIGHT_MIN_WIDTH,
+                SUPERGRID_INSIGHT_MIN_HEIGHT
+            )),
+            InsightRailLayout::Supergrid
+        );
+        assert_eq!(
+            classify_insight_rail_layout(Rect::new(
+                0,
+                0,
+                MEGAGRID_INSIGHT_MIN_WIDTH,
+                MEGAGRID_INSIGHT_MIN_HEIGHT
+            )),
+            InsightRailLayout::Megagrid
+        );
+    }
+
+    #[test]
+    fn preview_footer_mode_avoids_dense_insight_duplication() {
+        assert_eq!(
+            preview_footer_mode(InsightRailLayout::Hidden),
+            PreviewFooterMode::FullMetrics
+        );
+        assert_eq!(
+            preview_footer_mode(InsightRailLayout::Ultrawide),
+            PreviewFooterMode::FullMetrics
+        );
+        assert_eq!(
+            preview_footer_mode(InsightRailLayout::Supergrid),
+            PreviewFooterMode::SignalsOnly
+        );
+        assert_eq!(
+            preview_footer_mode(InsightRailLayout::Megagrid),
+            PreviewFooterMode::PreviewAndQueryOnly
+        );
+    }
+
+    #[test]
+    fn preview_query_only_mode_respects_small_footer_fallbacks() {
+        assert!(!should_force_preview_query_only(
+            PreviewFooterMode::PreviewAndQueryOnly,
+            Rect::new(
+                0,
+                0,
+                ULTRAWIDE_BOTTOM_MIN_WIDTH - 1,
+                ULTRAWIDE_BOTTOM_MIN_HEIGHT
+            )
+        ));
+        assert!(!should_force_preview_query_only(
+            PreviewFooterMode::PreviewAndQueryOnly,
+            Rect::new(
+                0,
+                0,
+                ULTRAWIDE_BOTTOM_MIN_WIDTH,
+                ULTRAWIDE_BOTTOM_MIN_HEIGHT - 1
+            )
+        ));
+        assert!(should_force_preview_query_only(
+            PreviewFooterMode::PreviewAndQueryOnly,
+            Rect::new(
+                0,
+                0,
+                ULTRAWIDE_BOTTOM_MIN_WIDTH,
+                ULTRAWIDE_BOTTOM_MIN_HEIGHT
+            )
+        ));
     }
 
     #[test]

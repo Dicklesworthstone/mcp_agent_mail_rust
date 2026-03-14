@@ -1490,7 +1490,11 @@ mod tests {
     use tempfile::tempdir;
 
     fn test_state() -> std::sync::Arc<TuiSharedState> {
-        TuiSharedState::new(&Config::default())
+        let config = Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Config::default()
+        };
+        TuiSharedState::new(&config)
     }
 
     fn set_database_url(state: &std::sync::Arc<TuiSharedState>, database_url: String) {
@@ -2764,9 +2768,11 @@ mod tests {
     fn rebuild_from_state_keeps_selection_on_same_agent_after_reorder() {
         let state = test_state();
         let mut screen = AgentsScreen::new();
+        // Use empty project strings to match what rebuild_from_state()
+        // creates from AgentSummary (AgentIdentity::new("", name)).
         screen.agents = vec![
-            test_agent_row("AliceRiver", "alpha", "codex-cli", "gpt-5", 100, 1),
-            test_agent_row("BobStone", "beta", "claude-code", "opus-4.6", 200, 2),
+            test_agent_row("AliceRiver", "", "codex-cli", "gpt-5", 100, 1),
+            test_agent_row("BobStone", "", "claude-code", "opus-4.6", 200, 2),
         ];
         screen.table_state.selected = Some(1);
 

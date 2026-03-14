@@ -16,6 +16,12 @@ pub struct WebRoot {
     root: PathBuf,
 }
 
+enum FileLookup {
+    Found((&'static str, Vec<u8>)),
+    Missing,
+    Blocked,
+}
+
 impl WebRoot {
     /// Try to serve a file from the web root.
     ///
@@ -28,27 +34,45 @@ impl WebRoot {
         // Try the exact file first.
         if !relative.is_empty()
             && let Some(relative_path) = normalized_relative_path(relative)
-            && let Some(response) = self.read_relative_file(&relative_path)
         {
-            return Some(response);
+            match self.read_relative_file(&relative_path) {
+                FileLookup::Found(response) => return Some(response),
+                FileLookup::Missing => {}
+                FileLookup::Blocked => return None,
+            }
         }
 
         // Directory index: try appending /index.html.
         if relative.is_empty() || relative.ends_with('/') {
             let base = normalized_relative_path(relative).unwrap_or_default();
             let index = base.join("index.html");
-            if let Some(response) = self.read_relative_file(&index) {
-                return Some(response);
+            match self.read_relative_file(&index) {
+                FileLookup::Found(response) => return Some(response),
+                FileLookup::Missing => {}
+                FileLookup::Blocked => return None,
             }
         }
 
-        // SPA fallback: return index.html for any path that isn't a file.
-        self.read_relative_file(Path::new("index.html"))
+        // Only route-like paths should fall back to the SPA shell.
+        if !should_spa_fallback(relative) {
+            return None;
+        }
+
+        match self.read_relative_file(Path::new("index.html")) {
+            FileLookup::Found(response) => Some(response),
+            FileLookup::Missing | FileLookup::Blocked => None,
+        }
     }
 
-    fn read_relative_file(&self, relative_path: &Path) -> Option<(&'static str, Vec<u8>)> {
-        let file = open_relative_file(&self.root, relative_path)?;
-        Self::read_file(relative_path, file)
+    fn read_relative_file(&self, relative_path: &Path) -> FileLookup {
+        match open_relative_file(&self.root, relative_path) {
+            RelativeFile::Found(file) => match Self::read_file(relative_path, file) {
+                Some(response) => FileLookup::Found(response),
+                None => FileLookup::Blocked,
+            },
+            RelativeFile::Missing => FileLookup::Missing,
+            RelativeFile::Blocked => FileLookup::Blocked,
+        }
     }
 
     fn read_file(path: &Path, mut file: std::fs::File) -> Option<(&'static str, Vec<u8>)> {
@@ -67,6 +91,16 @@ impl WebRoot {
 
         Some((content_type, body))
     }
+}
+
+fn should_spa_fallback(relative: &str) -> bool {
+    if relative.is_empty() || relative.ends_with('/') {
+        return true;
+    }
+    Path::new(relative)
+        .file_name()
+        .and_then(|segment| segment.to_str())
+        .is_some_and(|segment| !segment.contains('.'))
 }
 
 /// Resolve the web root directory, matching legacy Python behavior.
@@ -153,47 +187,68 @@ fn normalized_relative_path(relative: &str) -> Option<PathBuf> {
     Some(normalized)
 }
 
+enum RelativeFile {
+    Found(std::fs::File),
+    Missing,
+    Blocked,
+}
+
 #[cfg(unix)]
-fn open_relative_file(root: &Path, relative_path: &Path) -> Option<std::fs::File> {
+fn open_relative_file(root: &Path, relative_path: &Path) -> RelativeFile {
+    use nix::errno::Errno;
     use nix::fcntl::{OFlag, open, openat};
     use nix::sys::stat::Mode;
 
-    let mut current = open(
+    let mut current = match open(
         root,
         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
         Mode::empty(),
-    )
-    .ok()?;
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::ENOENT) => return RelativeFile::Missing,
+        Err(_) => return RelativeFile::Blocked,
+    };
 
     let mut components = relative_path.components().peekable();
     while let Some(component) = components.next() {
         let segment = match component {
             Component::CurDir => continue,
             Component::Normal(segment) => segment,
-            Component::Prefix(_) | Component::RootDir | Component::ParentDir => return None,
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
+                return RelativeFile::Blocked;
+            }
         };
         let flags = if components.peek().is_some() {
             OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC
         } else {
             OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC
         };
-        let next = openat(&current, segment, flags, Mode::empty()).ok()?;
+        let next = match openat(&current, segment, flags, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(Errno::ENOENT) => return RelativeFile::Missing,
+            Err(_) => return RelativeFile::Blocked,
+        };
         if components.peek().is_none() {
-            return Some(std::fs::File::from(next));
+            return RelativeFile::Found(std::fs::File::from(next));
         }
         current = next;
     }
 
-    None
+    RelativeFile::Missing
 }
 
 #[cfg(not(unix))]
-fn open_relative_file(root: &Path, relative_path: &Path) -> Option<std::fs::File> {
+fn open_relative_file(root: &Path, relative_path: &Path) -> RelativeFile {
     let candidate = root.join(relative_path);
-    if candidate.is_file() && is_safe_path(root, &candidate) {
-        std::fs::File::open(candidate).ok()
-    } else {
-        None
+    match std::fs::symlink_metadata(&candidate) {
+        Ok(_) if !is_safe_path(root, &candidate) => RelativeFile::Blocked,
+        Ok(_) if candidate.is_file() => match std::fs::File::open(candidate) {
+            Ok(file) => RelativeFile::Found(file),
+            Err(_) => RelativeFile::Blocked,
+        },
+        Ok(_) => RelativeFile::Missing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => RelativeFile::Missing,
+        Err(_) => RelativeFile::Blocked,
     }
 }
 
@@ -448,9 +503,7 @@ mod tests {
         symlink(&outside, vendor.join("lib.js")).unwrap();
 
         let root = WebRoot { root: web };
-        let (ct, body) = root.serve("/vendor/lib.js").unwrap();
-        assert_eq!(ct, "text/html; charset=utf-8");
-        assert_eq!(body, b"inside");
+        assert!(root.serve("/vendor/lib.js").is_none());
     }
 
     #[cfg(unix)]
@@ -469,9 +522,18 @@ mod tests {
         symlink(&outside_dir, web.join("vendor")).unwrap();
 
         let root = WebRoot { root: web };
-        let (ct, body) = root.serve("/vendor/app.js").unwrap();
-        assert_eq!(ct, "text/html; charset=utf-8");
-        assert_eq!(body, b"inside");
+        assert!(root.serve("/vendor/app.js").is_none());
+    }
+
+    #[test]
+    fn web_root_missing_asset_does_not_fall_back_to_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let web = dir.path().join("web");
+        std::fs::create_dir(&web).unwrap();
+        std::fs::write(web.join("index.html"), "inside").unwrap();
+
+        let root = WebRoot { root: web };
+        assert!(root.serve("/vendor/missing.js").is_none());
     }
 
     #[test]

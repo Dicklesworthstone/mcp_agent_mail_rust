@@ -78,7 +78,8 @@ pub struct ExportManifest {
 pub fn export_static_site(config: &ExportConfig) -> Result<ExportManifest, String> {
     ensure_export_features_supported(config)?;
     ensure_output_dir_empty(&config.output_dir)?;
-    fs::create_dir_all(&config.output_dir).map_err(|e| format!("create output dir: {e}"))?;
+    ensure_real_directory(&config.output_dir)
+        .map_err(|e| format!("create output dir {}: {e}", config.output_dir.display()))?;
 
     let pool = get_pool()?;
     let cx = Cx::for_testing();
@@ -1035,6 +1036,29 @@ mod tests {
         let err = ensure_output_dir_empty(&symlink_output)
             .expect_err("symlinked output dir should be rejected");
         assert!(err.contains("must not be a symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_static_site_rejects_symlinked_parent_for_missing_output_dir() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let linked_parent = dir.path().join("linked-parent");
+        symlink(&outside, &linked_parent).unwrap();
+
+        let config = ExportConfig {
+            output_dir: linked_parent.join("export"),
+            projects: Vec::new(),
+            include_archive: false,
+            include_search_index: true,
+        };
+
+        let err = export_static_site(&config)
+            .expect_err("symlinked parent path should be rejected before any DB work");
+        assert!(err.contains("symlinked export directory"));
     }
 
     #[test]

@@ -289,6 +289,9 @@ e2e_case_banner "Same-version reinstall repairs active Python am shadow"
 printf "\nalias am='python -m mcp_agent_mail'\n" >> "${TEST_HOME}/.zshrc"
 printf "\nalias am='python -m mcp_agent_mail'\n" >> "${TEST_HOME}/.bashrc"
 
+ZSH_ALIAS_DISABLE_COUNT_BEFORE_REPAIR="$(count_literal_in_file "${TEST_HOME}/.zshrc" "Disabled by mcp-agent-mail Rust installer: alias am='python -m mcp_agent_mail'")"
+BASH_ALIAS_DISABLE_COUNT_BEFORE_REPAIR="$(count_literal_in_file "${TEST_HOME}/.bashrc" "Disabled by mcp-agent-mail Rust installer: alias am='python -m mcp_agent_mail'")"
+
 run_installer "case_03_same_version_repairs_python_shadow" "0.1.0" "$ARTIFACT_V010"
 e2e_assert_exit_code "shadow-repair reinstall exits 0" "0" "$LAST_INSTALL_RC"
 e2e_assert_not_contains "shadow-repair reinstall does not short-circuit as healthy" "$LAST_INSTALL_STDOUT" "ok mcp-agent-mail v0.1.0 is already installed"
@@ -311,8 +314,8 @@ fi
 
 ZSH_ALIAS_DISABLE_COUNT_REPAIR="$(count_literal_in_file "${TEST_HOME}/.zshrc" "Disabled by mcp-agent-mail Rust installer: alias am='python -m mcp_agent_mail'")"
 BASH_ALIAS_DISABLE_COUNT_REPAIR="$(count_literal_in_file "${TEST_HOME}/.bashrc" "Disabled by mcp-agent-mail Rust installer: alias am='python -m mcp_agent_mail'")"
-e2e_assert_eq "shadow-repair reinstall comments zsh alias once" "1" "$ZSH_ALIAS_DISABLE_COUNT_REPAIR"
-e2e_assert_eq "shadow-repair reinstall comments bash alias once" "1" "$BASH_ALIAS_DISABLE_COUNT_REPAIR"
+e2e_assert_eq "shadow-repair reinstall adds one disabled zsh alias marker" "$((ZSH_ALIAS_DISABLE_COUNT_BEFORE_REPAIR + 1))" "$ZSH_ALIAS_DISABLE_COUNT_REPAIR"
+e2e_assert_eq "shadow-repair reinstall adds one disabled bash alias marker" "$((BASH_ALIAS_DISABLE_COUNT_BEFORE_REPAIR + 1))" "$BASH_ALIAS_DISABLE_COUNT_REPAIR"
 
 set +e
 INTERACTIVE_RESOLUTION="$(

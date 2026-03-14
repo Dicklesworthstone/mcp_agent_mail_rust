@@ -677,7 +677,13 @@ pub fn package_directory_as_zip(source_dir: &Path, destination: &Path) -> ShareR
         ))));
     }
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
+        ensure_real_directory(parent)?;
+    }
+    if std::fs::symlink_metadata(&dest).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(ShareError::Io(std::io::Error::other(format!(
+            "refusing to write through symlinked bundle path {}",
+            dest.display()
+        ))));
     }
 
     let file = std::fs::OpenOptions::new()
@@ -2162,6 +2168,24 @@ mod tests {
             msg.contains("outside ZIP source"),
             "unexpected error message: {msg}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn zip_rejects_symlinked_destination_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("a.txt"), b"alpha").unwrap();
+
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let linked_parent = dir.path().join("linked-parent");
+        std::os::unix::fs::symlink(&outside, &linked_parent).unwrap();
+
+        let zip_path = linked_parent.join("bundle.zip");
+        let err = package_directory_as_zip(&source, &zip_path).unwrap_err();
+        assert!(err.to_string().contains("symlinked bundle directory"));
     }
 
     // === Viewer asset tests ===

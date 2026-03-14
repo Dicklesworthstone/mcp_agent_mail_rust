@@ -1033,6 +1033,38 @@ pub fn validate_bundle(bundle_dir: &Path) -> ShareResult<DeployReport> {
         &mut checks,
     );
 
+    // ── Symlink descendants ────────────────────────────────────────
+    match find_symlink_descendants(bundle_dir) {
+        Ok(paths) if paths.is_empty() => checks.push(DeployCheck {
+            name: "bundle_symlink_descendants".to_string(),
+            passed: true,
+            message: "bundle contains no symlinked descendants".to_string(),
+            severity: CheckSeverity::Info,
+        }),
+        Ok(paths) => {
+            let preview = paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+            checks.push(DeployCheck {
+                name: "bundle_symlink_descendants".to_string(),
+                passed: false,
+                message: if paths.len() > 3 {
+                    format!(
+                        "bundle contains symlinked descendants: {preview}; and {} more",
+                        paths.len() - 3
+                    )
+                } else {
+                    format!("bundle contains symlinked descendants: {preview}")
+                },
+                severity: CheckSeverity::Error,
+            });
+        }
+        Err(err) => checks.push(DeployCheck {
+            name: "bundle_symlink_descendants".to_string(),
+            passed: false,
+            message: format!("failed to scan bundle for symlinked descendants: {err}"),
+            severity: CheckSeverity::Error,
+        }),
+    }
+
     // ── Manifest validation ─────────────────────────────────────────
     let manifest_path = bundle_dir.join("manifest.json");
     if is_real_file(&manifest_path) {
@@ -2077,6 +2109,44 @@ struct FileEntry {
     size: u64,
 }
 
+fn find_symlink_descendants(dir: &Path) -> Result<Vec<String>, std::io::Error> {
+    let mut symlinks = Vec::new();
+    collect_symlink_descendants(dir, dir, &mut symlinks)?;
+    symlinks.sort();
+    Ok(symlinks)
+}
+
+fn collect_symlink_descendants(
+    root: &Path,
+    current: &Path,
+    symlinks: &mut Vec<String>,
+) -> Result<(), std::io::Error> {
+    if !is_real_dir(current) {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        if metadata.file_type().is_symlink() {
+            symlinks.push(rel);
+            continue;
+        }
+        if metadata.file_type().is_dir() {
+            collect_symlink_descendants(root, &path, symlinks)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn walk_dir_recursive(dir: &Path) -> Result<Vec<FileEntry>, std::io::Error> {
     let mut entries = Vec::new();
     walk_dir_inner(dir, dir, &mut entries)?;
@@ -3099,6 +3169,29 @@ mod tests {
                 .checks
                 .iter()
                 .any(|check| check.name == "database_chunk_artifacts_valid" && !check.passed)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_bundle_rejects_arbitrary_symlink_descendants() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        create_minimal_bundle(&bundle);
+
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, bundle.join("viewer/rogue-link.txt")).unwrap();
+
+        let report = validate_bundle(&bundle).unwrap();
+        assert!(!report.ready);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "bundle_symlink_descendants" && !check.passed)
         );
     }
 
