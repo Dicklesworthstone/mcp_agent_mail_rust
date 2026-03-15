@@ -33,8 +33,14 @@ fn legacy_active_reservation_predicate_sql(
         return "1 = 1".to_string();
     }
     let table_ref = table_ref.trim().trim_end_matches('.');
+    // Validate table_ref is a safe SQL identifier (alphanumeric + underscore only)
+    // to prevent SQL injection via crafted table alias names.
+    let is_safe = !table_ref.is_empty()
+        && table_ref
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
     let predicate = mcp_agent_mail_db::queries::ACTIVE_RESERVATION_LEGACY_PREDICATE;
-    if table_ref.is_empty() || table_ref == "file_reservations" {
+    if !is_safe || table_ref == "file_reservations" {
         predicate.to_string()
     } else {
         predicate
@@ -84,6 +90,10 @@ fn reservation_released_ts_sql(
     release_alias: &str,
 ) -> String {
     let table_ref = table_ref.trim().trim_end_matches('.');
+    // Validate SQL identifier safety for both interpolated parameters.
+    let safe_ident = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let table_ref = if safe_ident(table_ref) { table_ref } else { "file_reservations" };
+    let release_alias = if safe_ident(release_alias) { release_alias } else { "frl" };
     let legacy_release_expr = has_legacy_released_ts_column.then(|| {
         format!(
             "CASE \
