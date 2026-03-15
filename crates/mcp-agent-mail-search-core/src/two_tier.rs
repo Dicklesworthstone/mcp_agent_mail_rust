@@ -786,7 +786,7 @@ impl Ord for ScoredEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         self.score
             .total_cmp(&other.score)
-            .then_with(|| self.idx.cmp(&other.idx))
+            .then_with(|| other.idx.cmp(&self.idx))
     }
 }
 

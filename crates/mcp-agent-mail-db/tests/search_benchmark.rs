@@ -1015,12 +1015,19 @@ fn explain_metadata_quality() {
     let explain = response
         .explain
         .expect("explain should be present when requested");
-    assert_eq!(explain.method, "like_fallback");
-    assert!(explain.used_like_fallback);
+    assert!(
+        explain.method.ends_with("_v3"),
+        "message search should report a V3 engine method, got {}",
+        explain.method
+    );
+    assert!(
+        !explain.used_like_fallback,
+        "V3 message search should not report LIKE fallback"
+    );
     assert!(explain.facet_count >= 2); // project_id + importance
     assert!(explain.facets_applied.contains(&"importance".to_string()));
     assert!(explain.facets_applied.contains(&"project_id".to_string()));
-    assert!(!explain.sql.is_empty());
+    assert_eq!(explain.sql, "-- v3 pipeline (non-SQL result assembly)");
 }
 
 /// Test agent search doc kind.
@@ -1227,7 +1234,9 @@ fn ranking_mode_comparison() {
     };
     let plan_rec = plan_search(&q_recency);
     assert!(
-        plan_rec.sql.contains("created_ts DESC"),
+        plan_rec
+            .sql
+            .contains("ORDER BY COALESCE(m.created_ts, 0) DESC, m.id ASC"),
         "recency/filter-only mode should sort by created_ts DESC"
     );
 }

@@ -12,8 +12,9 @@
 use crate::error::DbError;
 use crate::pool::DbPool;
 use crate::search_planner::{
-    Direction, DocKind, Importance, RankingMode, RecoverySuggestion, ScopePolicy, SearchCursor,
-    SearchQuery, SearchResponse, SearchResult, ZeroResultGuidance,
+    Direction, DocKind, Importance, PlanMethod, PlanParam, RankingMode, RecoverySuggestion,
+    ScopePolicy, SearchCursor, SearchQuery, SearchResponse, SearchResult, ZeroResultGuidance,
+    plan_search,
 };
 use crate::search_scope::{
     RedactionPolicy, ScopeAuditSummary, ScopeContext, ScopedSearchResult, apply_scope,
@@ -62,10 +63,10 @@ use half::f16;
 use mcp_agent_mail_core::DocKind as SearchDocKind;
 use mcp_agent_mail_core::SearchMode;
 use serde::{Deserialize, Serialize};
+use sqlmodel_core::{Connection, Value};
 #[cfg(feature = "hybrid")]
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
-#[cfg(feature = "hybrid")]
 use std::path::PathBuf;
 #[cfg(feature = "hybrid")]
 use std::sync::RwLock;
@@ -412,6 +413,48 @@ fn legacy_candidate_limit(query: &SearchQuery) -> usize {
     }
 }
 
+fn pagination_fetch_limit(query: &SearchQuery, base_limit: usize) -> usize {
+    if query.cursor.is_some() {
+        base_limit
+            .max(query.effective_limit().saturating_mul(16))
+            .clamp(64, 100_000)
+    } else {
+        base_limit
+    }
+}
+
+fn cursor_sort_score(result: &SearchResult, ranking: RankingMode) -> f64 {
+    match ranking {
+        RankingMode::Recency => result.created_ts.map_or_else(
+            || result.score.unwrap_or(0.0),
+            |created_ts| -micros_to_f64_for_cursor(created_ts),
+        ),
+        RankingMode::Relevance => result.score.unwrap_or(0.0),
+    }
+}
+
+fn apply_cursor_window(mut results: Vec<SearchResult>, query: &SearchQuery) -> Vec<SearchResult> {
+    let Some(cursor_str) = query.cursor.as_deref() else {
+        return results;
+    };
+    let Some(cursor) = SearchCursor::decode(cursor_str) else {
+        return results;
+    };
+
+    if let Some(index) = results.iter().position(|result| {
+        result.id == cursor.id && cursor_sort_score(result, query.ranking).to_bits() == cursor.score.to_bits()
+    }) {
+        results.drain(..=index);
+        return results;
+    }
+
+    results.retain(|result| {
+        let score = cursor_sort_score(result, query.ranking);
+        score > cursor.score || (score.to_bits() == cursor.score.to_bits() && result.id > cursor.id)
+    });
+    results
+}
+
 fn trim_search_results_to_limit(mut results: Vec<SearchResult>, limit: usize) -> Vec<SearchResult> {
     results.truncate(limit);
     results
@@ -724,6 +767,7 @@ static LEXICAL_BRIDGE_BOOTSTRAP_STATE: OnceLock<Mutex<HashMap<String, Result<(),
 static LEXICAL_BRIDGE_BACKFILL_STATE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static LEXICAL_BRIDGE_ACTIVE_DB_KEY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static LEXICAL_BRIDGE_INIT_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+static DIRECT_SURFACE_INDEX_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 fn lexical_bootstrap_state() -> &'static Mutex<HashMap<String, Result<(), String>>> {
     LEXICAL_BRIDGE_BOOTSTRAP_STATE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -739,6 +783,12 @@ fn lexical_active_db_key() -> &'static Mutex<Option<String>> {
 
 fn lexical_init_guard() -> &'static Mutex<()> {
     LEXICAL_BRIDGE_INIT_GUARD.get_or_init(|| Mutex::new(()))
+}
+
+fn direct_surface_index_dir() -> &'static PathBuf {
+    DIRECT_SURFACE_INDEX_DIR.get_or_init(|| {
+        std::env::temp_dir().join(format!("mcp-agent-mail-search-index-{}", std::process::id()))
+    })
 }
 
 fn map_bridge_bootstrap_error(err: &str) -> DbError {
@@ -857,11 +907,13 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
         return Ok(());
     }
 
-    let config = mcp_agent_mail_core::Config::get();
-    let index_dir = config.storage_root.join("search_index");
+    // Direct-search surfaces (CLI/TUI/tests) bootstrap their own process-local
+    // index so unrelated cargo test binaries and ad-hoc tools never contend on
+    // one shared Tantivy lockfile.
+    let index_dir = direct_surface_index_dir();
     let result: Result<bool, String> = (|| {
         if crate::search_v3::get_bridge().is_none() {
-            crate::search_v3::init_bridge(&index_dir)?;
+            crate::search_v3::init_bridge(index_dir)?;
         }
 
         if pool.sqlite_path() == ":memory:" {
@@ -2889,7 +2941,8 @@ fn build_v3_query_explain(
     engine: SearchEngine,
     rerank_audit: Option<&HybridRerankAudit>,
 ) -> crate::search_planner::QueryExplain {
-    let mut facets_applied = vec![format!("engine:{engine}")];
+    let mut facets_applied = collect_query_facets(query);
+    facets_applied.insert(0, format!("engine:{engine}"));
     if let Some(audit) = rerank_audit {
         facets_applied.push(format!("rerank_enabled:{}", audit.enabled));
         facets_applied.push(format!("rerank_attempted:{}", audit.attempted));
@@ -2936,6 +2989,44 @@ fn build_v3_query_explain(
         denied_count: 0,
         redacted_count: 0,
     }
+}
+
+fn collect_query_facets(query: &SearchQuery) -> Vec<String> {
+    let mut facets = Vec::new();
+    if query.project_id.is_some() {
+        facets.push("project_id".to_string());
+    }
+    if query.product_id.is_some() {
+        facets.push("product_id".to_string());
+    }
+    if !query.importance.is_empty() {
+        facets.push("importance".to_string());
+    }
+    if query.direction.is_some() {
+        facets.push("direction".to_string());
+    }
+    if query.agent_name.is_some() {
+        facets.push("agent_name".to_string());
+    }
+    if query.thread_id.is_some() {
+        facets.push("thread_id".to_string());
+    }
+    if query.ack_required.is_some() {
+        facets.push("ack_required".to_string());
+    }
+    if query.time_range.min_ts.is_some() {
+        facets.push("time_range_min".to_string());
+    }
+    if query.time_range.max_ts.is_some() {
+        facets.push("time_range_max".to_string());
+    }
+    if query.cursor.is_some() {
+        facets.push("cursor".to_string());
+    }
+    if matches!(query.scope, ScopePolicy::ProjectSet { .. }) {
+        facets.push("scope_project_set".to_string());
+    }
+    facets
 }
 
 fn decision_confidence(decision: &CandidateBudgetDecision) -> f64 {
@@ -3272,9 +3363,23 @@ pub async fn execute_search(
         .unwrap_or_else(|| mcp_agent_mail_core::Config::get().search_rollout.engine);
     let assistance = query_assistance_payload(query);
 
+    if matches!(query.doc_kind, DocKind::Agent | DocKind::Project) {
+        return execute_sql_plan_search(
+            cx,
+            pool,
+            query,
+            options,
+            cache,
+            cache_key,
+            assistance,
+            timer,
+        )
+        .await;
+    }
+
     #[allow(deprecated)]
     if matches!(engine, SearchEngine::Legacy | SearchEngine::Shadow) {
-        let limit = legacy_candidate_limit(query);
+        let limit = pagination_fetch_limit(query, legacy_candidate_limit(query));
         let raw_results = if let Some(project_id) = query.project_id {
             match crate::queries::search_messages(cx, pool, project_id, &query.text, limit).await {
                 Outcome::Ok(rows) => rows
@@ -3375,6 +3480,7 @@ pub async fn execute_search(
                 Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
                 Outcome::Panicked(payload) => return Outcome::Panicked(payload),
             };
+        let raw_results = apply_cursor_window(raw_results, query);
         let raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
         let explain = if query.explain {
             Some(build_v3_query_explain(query, engine, None))
@@ -3413,7 +3519,7 @@ pub async fn execute_search(
     if engine == SearchEngine::Lexical {
         let explicit_lexical = matches!(options.search_engine, Some(SearchEngine::Lexical));
         let mut lexical_query = query.clone();
-        lexical_query.limit = Some(lexical_candidate_limit(query));
+        lexical_query.limit = Some(pagination_fetch_limit(query, lexical_candidate_limit(query)));
 
         if let Some(mut raw_results) = try_tantivy_search(&lexical_query) {
             if raw_results.is_empty() && !explicit_lexical && pool.sqlite_path() != ":memory:" {
@@ -3447,6 +3553,7 @@ pub async fn execute_search(
                     Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
                     Outcome::Panicked(payload) => return Outcome::Panicked(payload),
                 };
+            let raw_results = apply_cursor_window(raw_results, query);
             let raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
             let explain = if query.explain {
                 Some(build_v3_query_explain(query, engine, None))
@@ -3478,7 +3585,7 @@ pub async fn execute_search(
     if engine == SearchEngine::Semantic {
         #[cfg(feature = "hybrid")]
         {
-            let candidate_limit = legacy_candidate_limit(query);
+            let candidate_limit = pagination_fetch_limit(query, legacy_candidate_limit(query));
             let mut raw_results = try_two_tier_search_with_cx(cx, query, candidate_limit)
                 .map_or_else(Vec::new, |outcome| outcome.results);
 
@@ -3494,6 +3601,7 @@ pub async fn execute_search(
                     Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
                     Outcome::Panicked(payload) => return Outcome::Panicked(payload),
                 };
+            raw_results = apply_cursor_window(raw_results, query);
             raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
 
             let explain = if query.explain {
@@ -3536,10 +3644,13 @@ pub async fn execute_search(
     // 4) optional rerank refinement with graceful fallback.
     if matches!(engine, SearchEngine::Hybrid | SearchEngine::Auto) {
         let mut candidate_query = query.clone();
-        candidate_query.limit = Some(legacy_candidate_limit(query));
+        candidate_query.limit = Some(pagination_fetch_limit(query, legacy_candidate_limit(query)));
         let plan = derive_hybrid_execution_plan(cx, &candidate_query, engine);
         let mut lexical_query = candidate_query.clone();
-        lexical_query.limit = Some(plan.derivation.budget.lexical_limit);
+        lexical_query.limit = Some(pagination_fetch_limit(
+            query,
+            plan.derivation.budget.lexical_limit,
+        ));
 
         // The old closure-style `cx.scope(|scope| ...)` API is gone in current
         // asupersync, and this crate does not enable the proc-macro helpers that
@@ -3585,6 +3696,7 @@ pub async fn execute_search(
                     Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
                     Outcome::Panicked(payload) => return Outcome::Panicked(payload),
                 };
+            raw_results = apply_cursor_window(raw_results, query);
             raw_results = trim_search_results_to_limit(raw_results, query.effective_limit());
             let explain = if query.explain {
                 Some(build_v3_query_explain(query, engine, rerank_audit.as_ref()))
@@ -3621,6 +3733,110 @@ pub async fn execute_search(
     Outcome::Err(DbError::Sqlite(format!(
         "search engine unavailable: {engine}"
     )))
+}
+
+fn plan_param_to_value(param: &PlanParam) -> Value {
+    match param {
+        PlanParam::Int(v) => Value::BigInt(*v),
+        PlanParam::Text(v) => Value::Text(v.clone()),
+        PlanParam::Float(v) => Value::Double(*v),
+    }
+}
+
+fn map_planned_rows(rows: Vec<sqlmodel_core::Row>, doc_kind: DocKind) -> Vec<SearchResult> {
+    match doc_kind {
+        DocKind::Message | DocKind::Thread => rows
+            .into_iter()
+            .map(|row| SearchResult {
+                doc_kind,
+                id: row.get_as::<i64>(0).unwrap_or(0),
+                title: row.get_as::<String>(1).unwrap_or_default(),
+                importance: Some(row.get_as::<String>(2).unwrap_or_default()),
+                ack_required: Some(row.get_as::<i64>(3).unwrap_or(0) != 0),
+                created_ts: Some(row.get_as::<i64>(4).unwrap_or(0)),
+                thread_id: row.get_as::<Option<String>>(5).unwrap_or_default(),
+                from_agent: Some(row.get_as::<String>(6).unwrap_or_default()),
+                body: row.get_as::<String>(7).unwrap_or_default(),
+                project_id: Some(row.get_as::<i64>(8).unwrap_or(0)),
+                score: Some(row.get_as::<f64>(9).unwrap_or(0.0)),
+                ..SearchResult::default()
+            })
+            .collect(),
+        DocKind::Agent => rows
+            .into_iter()
+            .map(|row| SearchResult {
+                doc_kind: DocKind::Agent,
+                id: row.get_as::<i64>(0).unwrap_or(0),
+                title: row.get_as::<String>(1).unwrap_or_default(),
+                body: row.get_as::<String>(2).unwrap_or_default(),
+                project_id: Some(row.get_as::<i64>(3).unwrap_or(0)),
+                score: Some(row.get_as::<f64>(4).unwrap_or(0.0)),
+                ..SearchResult::default()
+            })
+            .collect(),
+        DocKind::Project => rows
+            .into_iter()
+            .map(|row| SearchResult {
+                doc_kind: DocKind::Project,
+                id: row.get_as::<i64>(0).unwrap_or(0),
+                title: row.get_as::<String>(1).unwrap_or_default(),
+                body: row.get_as::<String>(2).unwrap_or_default(),
+                score: Some(row.get_as::<f64>(3).unwrap_or(0.0)),
+                ..SearchResult::default()
+            })
+            .collect(),
+    }
+}
+
+async fn execute_sql_plan_search(
+    cx: &Cx,
+    pool: &DbPool,
+    query: &SearchQuery,
+    options: &SearchOptions,
+    cache: &Arc<QueryCache<ScopedSearchResponse>>,
+    cache_key: QueryCacheKey,
+    assistance: Option<QueryAssistance>,
+    timer: std::time::Instant,
+) -> Outcome<ScopedSearchResponse, DbError> {
+    let plan = plan_search(query);
+    let raw_results = if plan.method == PlanMethod::Empty && plan.sql.is_empty() {
+        Vec::new()
+    } else {
+        let conn = match pool.acquire(cx).await {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(err) => return Outcome::Err(DbError::Sqlite(err.to_string())),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        let params = plan
+            .params
+            .iter()
+            .map(plan_param_to_value)
+            .collect::<Vec<_>>();
+        let rows = match conn.query(cx, &plan.sql, &params).await {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(err) => return Outcome::Err(DbError::Sqlite(err.to_string())),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        map_planned_rows(rows, query.doc_kind)
+    };
+
+    let explain = if query.explain {
+        Some(plan.explain())
+    } else {
+        None
+    };
+    let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
+    if options.track_telemetry {
+        record_query("search_service_sql_plan", latency_us);
+    }
+    global_metrics().search.record_legacy_query(latency_us, false);
+    let resp = finish_scoped_response(raw_results, query, options, assistance, explain);
+    if let Outcome::Ok(ref val) = resp {
+        cache.put(cache_key, val.clone());
+    }
+    resp
 }
 
 /// Apply scope enforcement and build a `ScopedSearchResponse` from raw results.

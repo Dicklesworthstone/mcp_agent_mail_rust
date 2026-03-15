@@ -1509,9 +1509,15 @@ fn search_quality_explain_metadata() {
         .explain
         .expect("explain should be populated when requested");
     assert_eq!(
-        explain.method, "like_fallback",
-        "should use LIKE fallback method for normal query"
+        explain.sql, "-- v3 pipeline (non-SQL result assembly)",
+        "runtime message search should report the V3 execution pipeline"
     );
+    assert!(
+        explain.method.ends_with("_v3"),
+        "runtime message search should report a V3 engine method, got {}",
+        explain.method
+    );
+    assert!(!explain.used_like_fallback);
 }
 
 /// Stress test: seed corpus twice (60+ messages) and verify search still works.

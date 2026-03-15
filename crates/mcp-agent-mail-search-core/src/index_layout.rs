@@ -238,8 +238,13 @@ impl IndexLayout {
             std::fs::write(&tmp_link, target.to_string_lossy().as_bytes())?;
         }
 
-        std::fs::rename(&tmp_link, &link_path)?;
-        Ok(())
+        match std::fs::rename(&tmp_link, &link_path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_link);
+                Err(SearchError::from(e))
+            }
+        }
     }
 
     /// Check which schema hash is currently active for a scope and engine.
