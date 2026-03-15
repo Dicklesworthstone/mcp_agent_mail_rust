@@ -1465,8 +1465,11 @@ impl OnsState {
 
         let lambda = self.adaptive_bet_size(alpha);
         let factor = 1.0 + lambda * centered;
-        // factor is guaranteed non-negative by the lambda bounds
-        self.e_value = (self.e_value * factor).max(1e-30);
+        // factor is guaranteed non-negative by the lambda bounds.
+        // Cap at 1e100 to prevent f64 overflow during sustained miscalibration
+        // (the e-value is evidence, not a probability — any value > threshold
+        // is equally actionable, so capping doesn't lose information).
+        self.e_value = (self.e_value * factor).clamp(1e-30, 1e100);
     }
 
     /// ONS adaptive bet sizing with CORRECT bounds for non-negative factors.

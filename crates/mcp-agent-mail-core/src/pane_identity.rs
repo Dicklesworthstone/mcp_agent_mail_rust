@@ -7,9 +7,12 @@
 //!
 //! The canonical contract:
 //!
-//! - **Path**: `~/.config/agent-mail/identity/<project_hash>/<pane_id>`
+//! - **Path**: `~/.config/agent-mail/identity/<project_hash>/<pane_key>`
+//! - **Pane key**: Composite `session_name:window_index:pane_index` via
+//!   `tmux display-message`, falling back to bare `$TMUX_PANE` (see #41).
 //! - **Content**: Plain text file containing the agent name (trimmed, single line)
-//! - **Fallback**: Reads from both legacy paths for backwards compatibility
+//! - **Fallback**: Reads from legacy bare-pane-ID files and older paths for
+//!   backwards compatibility
 //! - **Cleanup**: Stale identity files (panes that no longer exist) can be pruned
 //!
 //! All agent runtimes (Claude Code, NTM/Codex, Gemini, etc.) should converge on
@@ -34,9 +37,10 @@ const PROJECT_HASH_LEN: usize = 12;
 
 /// Compute the canonical identity file path for a given project and tmux pane.
 ///
-/// Returns `~/.config/agent-mail/identity/<project_hash>/<pane_id>`.
+/// Returns `~/.config/agent-mail/identity/<project_hash>/<sanitized_pane_id>`.
 /// The `project_key` is typically the absolute path to the project directory.
-/// The `pane_id` is the tmux pane identifier (e.g., `%0`, `%3`).
+/// The `pane_id` is either a composite key (e.g., `main:0:2`) produced by
+/// [`get_composite_tmux_pane_id`], or a bare tmux pane identifier (e.g., `%3`).
 #[must_use]
 pub fn canonical_identity_path(project_key: &str, pane_id: &str) -> PathBuf {
     let base = config_base_dir();
@@ -86,12 +90,32 @@ pub fn resolve_identity(project_key: &str, pane_id: &str) -> Option<String> {
 /// concrete file path that produced the winning match. Callers that surface the
 /// resolved path to operators should prefer this helper so diagnostics reflect
 /// reality when a legacy fallback file is read.
+///
+/// When `pane_id` is a composite key (contains `:`), also tries a legacy
+/// lookup using the bare `$TMUX_PANE` value to ensure backwards compatibility
+/// with identity files written before the composite key migration.
 #[must_use]
 pub fn resolve_identity_with_path(project_key: &str, pane_id: &str) -> Option<(String, PathBuf)> {
-    // 1. Canonical path
+    // 1. Canonical path (composite or bare)
     let canonical = canonical_identity_path(project_key, pane_id);
     if let Some(name) = read_identity_file(&canonical) {
         return Some((name, canonical));
+    }
+
+    // 1b. If pane_id is a composite key, try legacy bare $TMUX_PANE canonical path.
+    //     A composite key contains `:`, e.g., `main:0:2`. The bare pane env var
+    //     is something like `%3`. We check the env so we can find files written
+    //     before the composite key migration.
+    if pane_id.contains(':') {
+        if let Ok(bare) = std::env::var("TMUX_PANE") {
+            let bare = bare.trim().to_string();
+            if !bare.is_empty() {
+                let legacy_canonical = canonical_identity_path(project_key, &bare);
+                if let Some(name) = read_identity_file(&legacy_canonical) {
+                    return Some((name, legacy_canonical));
+                }
+            }
+        }
     }
 
     // 2. Legacy Claude Code path: ~/.claude/agent-mail/identity.$TMUX_PANE
@@ -104,6 +128,22 @@ pub fn resolve_identity_with_path(project_key: &str, pane_id: &str) -> Option<(S
         if let Some(name) = read_identity_file(&legacy_claude) {
             return Some((name, legacy_claude));
         }
+
+        // 2b. If composite key, also try bare pane ID for legacy Claude Code path
+        if pane_id.contains(':') {
+            if let Ok(bare) = std::env::var("TMUX_PANE") {
+                let bare_sanitized = sanitize_pane_id(bare.trim());
+                if bare_sanitized != sanitized {
+                    let legacy_claude_bare = home
+                        .join(".claude")
+                        .join("agent-mail")
+                        .join(format!("identity.{bare_sanitized}"));
+                    if let Some(name) = read_identity_file(&legacy_claude_bare) {
+                        return Some((name, legacy_claude_bare));
+                    }
+                }
+            }
+        }
     }
 
     // 3. Legacy NTM path: /tmp/agent-mail-name.<project_hash>.<pane_id>
@@ -114,29 +154,45 @@ pub fn resolve_identity_with_path(project_key: &str, pane_id: &str) -> Option<(S
         return Some((name, legacy_ntm));
     }
 
+    // 3b. If composite key, also try bare pane ID for legacy NTM path
+    if pane_id.contains(':') {
+        if let Ok(bare) = std::env::var("TMUX_PANE") {
+            let bare_sanitized = sanitize_pane_id(bare.trim());
+            if bare_sanitized != sanitized {
+                let legacy_ntm_bare =
+                    PathBuf::from(format!("/tmp/agent-mail-name.{hash}.{bare_sanitized}"));
+                if let Some(name) = read_identity_file(&legacy_ntm_bare) {
+                    return Some((name, legacy_ntm_bare));
+                }
+            }
+        }
+    }
+
     None
 }
 
-/// Resolve the agent name for the current tmux pane (reads `$TMUX_PANE`).
+/// Resolve the agent name for the current tmux pane.
 ///
-/// Convenience wrapper around [`resolve_identity`] that reads the pane ID
-/// from the environment. Returns `None` if `$TMUX_PANE` is not set.
+/// Uses [`get_composite_tmux_pane_id`] to obtain a session-unique composite
+/// key (e.g., `main:0:2`), falling back to bare `$TMUX_PANE` if unavailable.
+/// Returns `None` if no pane identifier can be determined.
 #[must_use]
 pub fn resolve_identity_current_pane(project_key: &str) -> Option<String> {
-    let pane_id = std::env::var("TMUX_PANE").ok();
+    let pane_id = get_composite_tmux_pane_id();
     resolve_identity_for_pane(project_key, pane_id.as_deref())
 }
 
-/// Write identity for the current tmux pane (reads `$TMUX_PANE`).
+/// Write identity for the current tmux pane.
 ///
-/// Returns `None` if `$TMUX_PANE` is not set, otherwise returns the
-/// write result.
+/// Uses [`get_composite_tmux_pane_id`] to obtain a session-unique composite
+/// key (e.g., `main:0:2`), falling back to bare `$TMUX_PANE` if unavailable.
+/// Returns `None` if no pane identifier can be determined.
 #[must_use]
 pub fn write_identity_current_pane(
     project_key: &str,
     agent_name: &str,
 ) -> Option<std::io::Result<PathBuf>> {
-    let pane_id = std::env::var("TMUX_PANE").ok();
+    let pane_id = get_composite_tmux_pane_id();
     write_identity_for_pane(project_key, pane_id.as_deref(), agent_name)
 }
 
@@ -277,14 +333,20 @@ fn project_hash(project_key: &str) -> String {
 /// Sanitize a tmux pane ID for use as a filename.
 ///
 /// Strips the leading `%` character and replaces any filesystem-unsafe
-/// characters with underscores. The `%` prefix is conventional in tmux
-/// (e.g., `%0`, `%3`) but not great for filenames.
+/// characters with hyphens (for `:` in composite keys like
+/// `session:window:pane`) or underscores (for other unsafe chars).
+///
+/// The `%` prefix is conventional in tmux (e.g., `%0`, `%3`) but not
+/// great for filenames. Composite keys use `:` as separator which becomes
+/// `-` so that `mysession:0:2` becomes `mysession-0-2`.
 fn sanitize_pane_id(pane_id: &str) -> String {
     let stripped = pane_id.strip_prefix('%').unwrap_or(pane_id);
     let mut out = String::with_capacity(stripped.len());
     for ch in stripped.chars() {
         if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
             out.push(ch);
+        } else if ch == ':' {
+            out.push('-');
         } else {
             out.push('_');
         }
@@ -340,22 +402,77 @@ fn config_base_dir() -> PathBuf {
 
 /// Query tmux for all live pane IDs (sanitized).
 ///
-/// Returns an empty vec if tmux is not running or the command fails.
+/// Returns composite keys (`session_name:window_index:pane_index`) for each
+/// live pane, plus the legacy bare pane ID (e.g., `%3` -> `3`) for backwards
+/// compatibility during cleanup. Returns an empty vec if tmux is not running
+/// or the command fails.
 fn list_live_tmux_panes() -> Vec<String> {
     let output = std::process::Command::new("tmux")
-        .args(["list-panes", "-a", "-F", "#{pane_id}"])
+        .args([
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}:#{window_index}:#{pane_index}:#{pane_id}",
+        ])
         .output();
 
     match output {
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout);
-            text.lines()
-                .filter(|l| !l.is_empty())
-                .map(|l| sanitize_pane_id(l.trim()))
-                .collect()
+            let mut ids = Vec::new();
+            for line in text.lines().filter(|l| !l.is_empty()) {
+                let line = line.trim();
+                // Parse "session:window:pane_idx:pane_id" format.
+                // The composite key is the first three fields joined by `:`.
+                // We also include the bare pane_id for backwards compat.
+                if let Some((composite, bare_id)) = line.rsplit_once(':') {
+                    ids.push(sanitize_pane_id(composite));
+                    ids.push(sanitize_pane_id(bare_id));
+                } else {
+                    // Fallback: treat the entire line as a bare pane ID
+                    ids.push(sanitize_pane_id(line));
+                }
+            }
+            ids.sort();
+            ids.dedup();
+            ids
         }
         _ => Vec::new(),
     }
+}
+
+/// Get a composite tmux pane identifier for the current pane.
+///
+/// Runs `tmux display-message -p '#{session_name}:#{window_index}:#{pane_index}'`
+/// to produce a key like `main:0:2` that is unique across tmux sessions.
+///
+/// Falls back to the bare `$TMUX_PANE` environment variable if the tmux
+/// command fails (e.g., tmux is not running, or `display-message` is
+/// unavailable).
+///
+/// Returns `None` if neither the composite key nor `$TMUX_PANE` can be
+/// determined.
+pub fn get_composite_tmux_pane_id() -> Option<String> {
+    // Try the composite key first via tmux display-message.
+    let output = std::process::Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "#{session_name}:#{window_index}:#{pane_index}",
+        ])
+        .output();
+
+    if let Ok(out) = output {
+        if out.status.success() {
+            let composite = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !composite.is_empty() && composite.contains(':') {
+                return Some(composite);
+            }
+        }
+    }
+
+    // Fallback to bare $TMUX_PANE
+    std::env::var("TMUX_PANE").ok().filter(|s| !s.trim().is_empty())
 }
 
 // ---------------------------------------------------------------------------
