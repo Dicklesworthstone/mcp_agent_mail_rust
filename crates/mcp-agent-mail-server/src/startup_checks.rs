@@ -128,6 +128,12 @@ const LISTENER_PID_HINT_DIR: &str = "mcp-agent-mail-port-pids";
 pub(crate) const HEALTH_SIGNATURE_HEADER_NAME: &str = "x-agent-mail-health";
 pub(crate) const HEALTH_SIGNATURE_HEADER_VALUE: &str = "1";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListenerPidHint {
+    pid: u32,
+    exe_path: Option<String>,
+}
+
 /// Check the status of a port: free, occupied by Agent Mail, or occupied by another process.
 ///
 /// This is a cross-platform replacement for lsof-based detection. It uses:
@@ -369,7 +375,11 @@ pub fn write_listener_pid_hint(host: &str, port: u16) -> PathBuf {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(&path, std::process::id().to_string());
+    let hint = ListenerPidHint {
+        pid: std::process::id(),
+        exe_path: current_executable_hint_path(),
+    };
+    let _ = std::fs::write(&path, format_listener_pid_hint(&hint));
     path
 }
 
@@ -424,6 +434,19 @@ fn listener_pid_hint_path(host: &str, port: u16) -> PathBuf {
         .join(format!("{}-{port}.pid", sanitize_pid_hint_component(host)))
 }
 
+fn current_executable_hint_path() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let canonical = std::fs::canonicalize(&exe).unwrap_or(exe);
+    Some(canonical.display().to_string())
+}
+
+fn format_listener_pid_hint(hint: &ListenerPidHint) -> String {
+    match hint.exe_path.as_deref() {
+        Some(exe_path) if !exe_path.trim().is_empty() => format!("{}\n{exe_path}\n", hint.pid),
+        _ => format!("{}\n", hint.pid),
+    }
+}
+
 fn sanitize_pid_hint_component(value: &str) -> String {
     let sanitized: String = value
         .chars()
@@ -436,22 +459,45 @@ fn sanitize_pid_hint_component(value: &str) -> String {
     }
 }
 
-fn read_listener_pid_hint(host: &str, port: u16) -> Option<u32> {
+fn parse_listener_pid_hint(content: &str) -> Option<ListenerPidHint> {
+    let mut lines = content.lines();
+    let pid = lines.next()?.trim().parse::<u32>().ok()?;
+    let exe_path = lines
+        .find(|line| !line.trim().is_empty())
+        .map(std::string::ToString::to_string);
+    Some(ListenerPidHint { pid, exe_path })
+}
+
+fn read_listener_pid_hint(host: &str, port: u16) -> Option<ListenerPidHint> {
     let content = std::fs::read_to_string(listener_pid_hint_path(host, port)).ok()?;
-    content.trim().parse::<u32>().ok()
+    parse_listener_pid_hint(&content)
+}
+
+fn hinted_pid_matches_listener(hint: &ListenerPidHint, listeners: &[u32]) -> bool {
+    if !listeners.contains(&hint.pid) {
+        return false;
+    }
+
+    match hint.exe_path.as_deref() {
+        Some(expected_path) => {
+            pid_executable_path_matches(hint.pid, expected_path) || pid_is_agent_mail(hint.pid)
+        }
+        None => pid_is_agent_mail(hint.pid),
+    }
 }
 
 #[cfg(target_os = "linux")]
 fn hinted_agent_mail_pid(host: &str, port: u16) -> Option<u32> {
-    let pid = read_listener_pid_hint(host, port)?;
-    (pid_is_agent_mail(pid) && listener_port_holder_pids(host, port).contains(&pid)).then_some(pid)
+    let hint = read_listener_pid_hint(host, port)?;
+    let listeners = listener_port_holder_pids(host, port);
+    hinted_pid_matches_listener(&hint, &listeners).then_some(hint.pid)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn hinted_agent_mail_pid(host: &str, port: u16) -> Option<u32> {
-    let pid = read_listener_pid_hint(host, port)?;
+    let hint = read_listener_pid_hint(host, port)?;
     let listeners = listener_port_holder_pids(host, port);
-    (pid_is_agent_mail(pid) && listeners.contains(&pid)).then_some(pid)
+    hinted_pid_matches_listener(&hint, &listeners).then_some(hint.pid)
 }
 
 #[cfg(target_os = "linux")]
@@ -724,6 +770,23 @@ fn pid_is_agent_mail(pid: u32) -> bool {
             .is_some_and(|basename| executable_name_has_agent_mail_signature(&basename))
 }
 
+fn pid_executable_path_matches(pid: u32, expected_path: &str) -> bool {
+    let Some(actual_path) = pid_executable_path(pid) else {
+        return false;
+    };
+
+    canonicalize_process_path(expected_path)
+        .zip(canonicalize_process_path(
+            actual_path.to_string_lossy().as_ref(),
+        ))
+        .is_some_and(|(expected, actual)| expected == actual)
+}
+
+fn canonicalize_process_path(path: &str) -> Option<PathBuf> {
+    let candidate = PathBuf::from(path);
+    Some(std::fs::canonicalize(&candidate).unwrap_or(candidate))
+}
+
 fn command_line_has_agent_mail_signature(command: &str) -> bool {
     let Some(argv0) = command.split_whitespace().next() else {
         return false;
@@ -774,15 +837,27 @@ fn pid_command_line(pid: u32) -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn pid_executable_basename(pid: u32) -> Option<String> {
-    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    let exe = pid_executable_path(pid)?;
     exe.file_name()
         .map(|name| name.to_string_lossy().into_owned())
 }
 
 #[cfg(not(target_os = "linux"))]
 fn pid_executable_basename(pid: u32) -> Option<String> {
+    let exe = pid_executable_path(pid)?;
+    exe.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn pid_executable_path(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_executable_path(pid: u32) -> Option<PathBuf> {
     let output = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .args(["-p", &pid.to_string(), "-o", "command="])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
@@ -790,8 +865,9 @@ fn pid_executable_basename(pid: u32) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!command.is_empty()).then_some(command)
+    let command = String::from_utf8_lossy(&output.stdout);
+    let argv0 = command.split_whitespace().next()?.trim();
+    (!argv0.is_empty()).then(|| PathBuf::from(argv0))
 }
 
 // ──────────────────────────────────────────────────────────────────────
