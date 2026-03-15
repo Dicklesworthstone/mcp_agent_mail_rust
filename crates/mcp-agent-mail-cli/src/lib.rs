@@ -2306,6 +2306,76 @@ fn resolve_socket_bind_addr(host: &str, port: u16) -> std::io::Result<std::net::
         })
 }
 
+fn wait_for_port_release(host: &str, port: u16, timeout: std::time::Duration) -> bool {
+    use std::time::Instant;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if bind_tcp_listener(host, port).is_ok() {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25).min(deadline - now));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn conflicting_systemd_service_port() -> Option<u16> {
+    let home = std::env::var("HOME").ok()?;
+    let unit_path = PathBuf::from(home)
+        .join(".config/systemd/user")
+        .join(SYSTEMD_UNIT_NAME);
+    let content = std::fs::read_to_string(unit_path).ok()?;
+    for line in content.lines() {
+        let Some(exec_start) = line.strip_prefix("ExecStart=") else {
+            continue;
+        };
+        let mut parts = exec_start.split_whitespace();
+        while let Some(part) = parts.next() {
+            if part == "--port" {
+                return parts.next().and_then(|value| value.parse::<u16>().ok());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn conflicting_systemd_service_port() -> Option<u16> {
+    None
+}
+
+fn maybe_stop_conflicting_managed_service(
+    host: &str,
+    port: u16,
+    interactive_tui: bool,
+) -> CliResult<()> {
+    if !interactive_tui {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if conflicting_systemd_service_port() == Some(port) {
+            eprintln!(
+                "[info] agent-mail.service is configured for port {port} — stopping it before launching the interactive TUI"
+            );
+            run_cmd("systemctl", &["--user", "stop", SYSTEMD_UNIT_NAME])?;
+            if wait_for_port_release(host, port, std::time::Duration::from_secs(6)) {
+                return Ok(());
+            }
+            return Err(CliError::Other(format!(
+                "Stopped agent-mail.service, but port {host}:{port} did not become free"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 /// If an Agent Mail server is already listening on `host:port`, stop it so we can start fresh.
 ///
 /// Refuses to terminate non-Agent-Mail processes.
@@ -2436,28 +2506,12 @@ fn kill_port_holder_with_pids(host: &str, port: u16, pids: Vec<u32>) -> CliResul
         PortStatus, agent_mail_pids_all_stopped, agent_mail_port_holder_pids_with_hint,
         check_port_status,
     };
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     const TERM_GRACE_TIMEOUT: Duration = Duration::from_secs(1);
     const KILL_GRACE_TIMEOUT: Duration = Duration::from_millis(300);
-    const PORT_RELEASE_POLL_INTERVAL: Duration = Duration::from_millis(25);
-
     fn port_is_free(host: &str, port: u16) -> bool {
         bind_tcp_listener(host, port).is_ok()
-    }
-
-    fn wait_for_port_release(host: &str, port: u16, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if port_is_free(host, port) {
-                return true;
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            std::thread::sleep(PORT_RELEASE_POLL_INTERVAL.min(deadline - now));
-        }
     }
 
     let mut has_kill_tool = false;
@@ -3106,6 +3160,11 @@ fn handle_serve_http(
     }
     let suppress_runtime_logs_for_tui = config.tui_enabled && crate::output::is_tty();
     apply_release_logging_defaults(suppress_runtime_logs_for_tui);
+    maybe_stop_conflicting_managed_service(
+        &config.http_host,
+        config.http_port,
+        config.tui_enabled,
+    )?;
     if let Err(e) = run_setup_self_heal_for_server(&config) {
         output::warn(&format!(
             "Agent setup self-heal encountered an issue (non-fatal): {e}"
