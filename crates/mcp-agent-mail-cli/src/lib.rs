@@ -4434,6 +4434,7 @@ where
     let mut used_absolute_fallback = false;
     let mut fallback_due_to_missing_configured_path = false;
     let mut sqlite3_probe_failed = false;
+    let mut sqlite3_probe_succeeded = false;
     let mut sqlite3_rescued_primary = false;
 
     if !selected_path.exists() {
@@ -4493,6 +4494,7 @@ where
 
     if let Some(sqlite3_ok) = sqlite_quick_check_via_cli(selected_path.as_path())? {
         if sqlite3_ok {
+            sqlite3_probe_succeeded = true;
             if !healthy {
                 healthy = true;
                 sqlite3_rescued_primary = true;
@@ -4522,6 +4524,8 @@ where
         "; sqlite3 quick_check rescued failed primary probe".to_string()
     } else if sqlite3_probe_failed {
         "; sqlite3 quick_check failed".to_string()
+    } else if sqlite3_probe_succeeded {
+        "; sqlite3 quick_check OK".to_string()
     } else {
         String::new()
     };
@@ -5058,15 +5062,75 @@ fn init_schema_sqlite_canonical(path: &str) -> CliResult<()> {
                     &e.to_string(),
                 )
             })?;
-        let init_sql = mcp_agent_mail_db::schema::init_schema_sql_base();
-        conn.execute_raw(&init_sql).map_err(|e| {
+        for stmt in mcp_agent_mail_db::schema::init_schema_sql_base().split(';') {
+            let stmt = stmt.trim();
+            if stmt.is_empty() {
+                continue;
+            }
+            conn.execute_raw(&format!("{stmt};")).map_err(|e| {
+                sqlite_retryable_error(
+                    format!("schema init failed for {path} via canonical sqlite: {e}"),
+                    &e.to_string(),
+                )
+            })?;
+        }
+
+        conn.execute_raw(&format!(
+            "CREATE TABLE IF NOT EXISTS {} (\
+                id TEXT PRIMARY KEY ON CONFLICT IGNORE,\
+                description TEXT NOT NULL,\
+                applied_at INTEGER NOT NULL\
+            )",
+            mcp_agent_mail_db::schema::MIGRATIONS_TABLE_NAME,
+        ))
+        .map_err(|e| {
             sqlite_retryable_error(
-                format!("schema init failed for {path} via canonical sqlite: {e}"),
+                format!("failed to initialize migrations table for {path}: {e}"),
                 &e.to_string(),
             )
         })?;
+
+        let migration_ts = mcp_agent_mail_db::timestamps::now_micros();
+        for migration in mcp_agent_mail_db::schema::schema_migrations_base() {
+            if let Err(e) = conn.execute_raw(&migration.up) {
+                let err_text = e.to_string();
+                if !sqlite_migration_error_is_benign(&err_text) {
+                    return Err(sqlite_retryable_error(
+                        format!(
+                            "failed to apply base migration {} for {path}: {e}",
+                            migration.id
+                        ),
+                        &err_text,
+                    ));
+                }
+            }
+            conn.execute_sync(
+                &format!(
+                    "INSERT OR IGNORE INTO {} (id, description, applied_at) VALUES (?, ?, ?)",
+                    mcp_agent_mail_db::schema::MIGRATIONS_TABLE_NAME,
+                ),
+                &[
+                    sqlmodel_core::Value::Text(migration.id),
+                    sqlmodel_core::Value::Text(migration.description),
+                    sqlmodel_core::Value::BigInt(migration_ts),
+                ],
+            )
+            .map_err(|e| {
+                sqlite_retryable_error(
+                    format!("failed to record base migration for {path}: {e}"),
+                    &e.to_string(),
+                )
+            })?;
+        }
         Ok(())
     })
+}
+
+fn sqlite_migration_error_is_benign(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("already exists")
+        || lower.contains("duplicate column name")
+        || lower.contains("duplicate trigger name")
 }
 
 fn sqlite_retryable_error(message: String, detail: &str) -> mcp_agent_mail_db::DbError {
@@ -5116,6 +5180,7 @@ fn open_db_sync_with_database_url_and_storage_root(
     let path = cfg
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+    let path = resolve_sqlite_path_with_absolute_candidate(&path);
     if path != ":memory:" {
         ensure_sqlite_parent_dir(Path::new(&path))?;
     }
@@ -5200,6 +5265,7 @@ fn open_db_sync_robot_best_effort_with_database_url(
     let path = cfg
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+    let path = resolve_sqlite_path_with_absolute_candidate(&path);
     let (conn, _opened_path) = open_sqlite_with_fallback(&path)?;
     if sqlite_conn_supports_robot_reads(&conn)? {
         return Ok(conn);
@@ -5219,6 +5285,7 @@ fn open_db_sync_robot_attachments_best_effort_with_database_url(
     let path = cfg
         .sqlite_path()
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+    let path = resolve_sqlite_path_with_absolute_candidate(&path);
     let (conn, _opened_path) = open_sqlite_with_fallback(&path)?;
     if sqlite_conn_supports_robot_attachment_reads(&conn)? {
         return Ok(conn);
@@ -5231,6 +5298,9 @@ fn open_db_sync_robot_attachments_best_effort_with_database_url(
 pub(crate) fn open_db_sync_robot_with_database_url(
     database_url: &str,
 ) -> CliResult<mcp_agent_mail_db::DbConn> {
+    if let Ok(conn) = open_db_sync_robot_best_effort_with_database_url(database_url) {
+        return Ok(conn);
+    }
     match open_db_sync_with_database_url(database_url) {
         Ok(conn) => Ok(conn),
         Err(error) if is_resource_busy_cli_error(&error) => {
@@ -7755,7 +7825,19 @@ fn handle_list_acks_with_conn(
     limit: i64,
 ) -> CliResult<()> {
     let project_id = crate::context::resolve_project(conn, project_key)?.id;
-    let agent_id = crate::context::resolve_agent(conn, project_id, agent_name)?.id;
+    let agent_id = match crate::context::resolve_agent(conn, project_id, agent_name) {
+        Ok(agent) => agent.id,
+        Err(CliError::InvalidArgument(message))
+            if message.starts_with("agent not found:") =>
+        {
+            output::empty_result(
+                false,
+                &format!("No ack-required messages for {agent_name}."),
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     let rows = conn
         .query_sync(
             "SELECT m.id, m.subject, m.importance, m.created_ts, \
@@ -25600,6 +25682,7 @@ startup_timeout_sec = 42
         let dir = tempfile::tempdir().unwrap();
         let beads_dir = dir.path().join(".beads");
         let nested = dir.path().join("crates/mcp-agent-mail-cli");
+        std::fs::create_dir_all(&beads_dir).expect("create .beads");
         std::fs::create_dir_all(&nested).expect("create nested dir");
 
         let _storage =
@@ -32994,7 +33077,9 @@ fn handle_doctor_repair_with(
             database_url: database_url.to_string(),
             ..Default::default()
         };
-        let db_path = cfg.sqlite_path().unwrap_or_default();
+        let db_path = resolve_sqlite_path_with_absolute_candidate(
+            &cfg.sqlite_path().unwrap_or_default(),
+        );
         if std::path::Path::new(&db_path).exists() {
             let bak_path = backup_dir.join(&bak_name);
             copy_sqlite_backup_consistently(Path::new(&db_path), &bak_path)?;
@@ -33002,10 +33087,11 @@ fn handle_doctor_repair_with(
 
             // Also create a .bak sibling next to the primary DB so that the
             // pool's auto-recovery (find_healthy_backup) can discover it.
-            let sibling_bak = format!("{db_path}.bak");
+            let sibling_bak = PathBuf::from(format!("{db_path}.bak"));
             if let Err(e) = std::fs::copy(&bak_path, &sibling_bak) {
                 ftui_runtime::ftui_eprintln!(
-                    "  Warning: could not create sibling backup {sibling_bak}: {e}"
+                    "  Warning: could not create sibling backup {}: {e}",
+                    sibling_bak.display()
                 );
             }
         }
