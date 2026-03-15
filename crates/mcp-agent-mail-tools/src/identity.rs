@@ -979,7 +979,7 @@ pub async fn resolve_pane_identity(
 ) -> McpResult<String> {
     let effective_pane = match pane_id {
         Some(p) if !p.trim().is_empty() => p.trim().to_string(),
-        _ => std::env::var("TMUX_PANE").unwrap_or_default(),
+        _ => mcp_agent_mail_core::get_composite_tmux_pane_id().unwrap_or_default(),
     };
 
     if effective_pane.is_empty() {

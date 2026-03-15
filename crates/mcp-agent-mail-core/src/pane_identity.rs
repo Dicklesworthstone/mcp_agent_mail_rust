@@ -529,6 +529,12 @@ mod tests {
         assert_eq!(sanitize_pane_id("%"), "unknown");
     }
 
+    #[test]
+    fn sanitize_composite_key_uses_hyphens() {
+        assert_eq!(sanitize_pane_id("main:0:2"), "main-0-2");
+        assert_eq!(sanitize_pane_id("my_session:1:0"), "my_session-1-0");
+    }
+
     // -- canonical_identity_path ---------------------------------------------
 
     #[test]
@@ -550,6 +556,31 @@ mod tests {
         let a = canonical_identity_path("/data/projects/alpha", "%0");
         let b = canonical_identity_path("/data/projects/beta", "%0");
         assert_ne!(a, b, "different projects should produce different paths");
+    }
+
+    #[test]
+    fn canonical_path_composite_key_differs_from_bare() {
+        let bare = canonical_identity_path("/data/projects/backend", "%3");
+        let composite = canonical_identity_path("/data/projects/backend", "main:0:2");
+        assert_ne!(
+            bare, composite,
+            "composite key should produce a different path than bare pane ID"
+        );
+        let composite_str = composite.to_string_lossy();
+        assert!(
+            composite_str.ends_with("/main-0-2"),
+            "expected composite key filename: {composite_str}"
+        );
+    }
+
+    #[test]
+    fn canonical_path_different_sessions_differ() {
+        let a = canonical_identity_path("/data/projects/backend", "session_a:0:2");
+        let b = canonical_identity_path("/data/projects/backend", "session_b:0:2");
+        assert_ne!(
+            a, b,
+            "different sessions with the same window/pane index should produce different paths"
+        );
     }
 
     // -- write / resolve roundtrip -------------------------------------------
@@ -585,6 +616,23 @@ mod tests {
     }
 
     // -- list_identities (with real filesystem) ------------------------------
+
+    #[test]
+    fn write_then_resolve_roundtrip_composite_key() {
+        let unique_key = format!("/tmp/test-pane-identity-composite-{}", std::process::id());
+        let composite_pane = "test_session:0:1";
+        let _ = write_identity(&unique_key, composite_pane, "GreenOwl");
+
+        let resolved = resolve_identity(&unique_key, composite_pane);
+        assert_eq!(resolved.as_deref(), Some("GreenOwl"));
+
+        // Cleanup
+        let path = canonical_identity_path(&unique_key, composite_pane);
+        let _ = std::fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
 
     #[test]
     fn list_identities_returns_entries() {
