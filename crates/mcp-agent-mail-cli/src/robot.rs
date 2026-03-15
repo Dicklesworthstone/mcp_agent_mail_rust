@@ -91,9 +91,18 @@ fn reservation_released_ts_sql(
 ) -> String {
     let table_ref = table_ref.trim().trim_end_matches('.');
     // Validate SQL identifier safety for both interpolated parameters.
-    let safe_ident = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    let table_ref = if safe_ident(table_ref) { table_ref } else { "file_reservations" };
-    let release_alias = if safe_ident(release_alias) { release_alias } else { "frl" };
+    let safe_ident =
+        |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let table_ref = if safe_ident(table_ref) {
+        table_ref
+    } else {
+        "file_reservations"
+    };
+    let release_alias = if safe_ident(release_alias) {
+        release_alias
+    } else {
+        "frl"
+    };
     let legacy_release_expr = has_legacy_released_ts_column.then(|| {
         format!(
             "CASE \
