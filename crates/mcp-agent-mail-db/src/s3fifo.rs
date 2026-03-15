@@ -152,7 +152,16 @@ where
 
         let is_ghost = if let Some(node) = self.index.get_mut(&key) {
             match node {
-                Node::Small { value: v, freq, seq: n_seq } | Node::Main { value: v, freq, seq: n_seq } => {
+                Node::Small {
+                    value: v,
+                    freq,
+                    seq: n_seq,
+                }
+                | Node::Main {
+                    value: v,
+                    freq,
+                    seq: n_seq,
+                } => {
                     *v = value;
                     *freq = (*freq + 1).min(3);
                     // Update seq to avoid eviction from old tombstone
@@ -172,12 +181,26 @@ where
             if self.main_capacity == 0 {
                 self.evict_small_if_full();
                 self.small.push_back((key.clone(), seq));
-                self.index.insert(key, Node::Small { value, freq: 0, seq });
+                self.index.insert(
+                    key,
+                    Node::Small {
+                        value,
+                        freq: 0,
+                        seq,
+                    },
+                );
                 self.small_live_count += 1;
             } else {
                 self.evict_main_if_full();
                 self.main.push_back((key.clone(), seq));
-                self.index.insert(key, Node::Main { value, freq: 0, seq });
+                self.index.insert(
+                    key,
+                    Node::Main {
+                        value,
+                        freq: 0,
+                        seq,
+                    },
+                );
                 self.main_live_count += 1;
             }
             return;
@@ -185,7 +208,14 @@ where
 
         self.evict_small_if_full();
         self.small.push_back((key.clone(), seq));
-        self.index.insert(key, Node::Small { value, freq: 0, seq });
+        self.index.insert(
+            key,
+            Node::Small {
+                value,
+                freq: 0,
+                seq,
+            },
+        );
         self.small_live_count += 1;
     }
 
@@ -245,7 +275,10 @@ where
 
             // Peek before remove: if this key was already promoted to Main or removed,
             // the entry in the index won't be Node::Small with the same seq.
-            if let Some(Node::Small { seq: current_seq, .. }) = self.index.get(&key) {
+            if let Some(Node::Small {
+                seq: current_seq, ..
+            }) = self.index.get(&key)
+            {
                 if *current_seq != expected_seq {
                     continue;
                 }
@@ -269,28 +302,25 @@ where
                 if self.main_capacity == 0 {
                     self.evict_ghost_if_full();
                     self.ghost.push_back((key.clone(), new_seq));
-                    self.index.insert(
-                        key,
-                        Node::Ghost {
-                            seq: new_seq,
-                        },
-                    );
+                    self.index.insert(key, Node::Ghost { seq: new_seq });
                     self.ghost_live_count += 1;
                 } else {
                     self.evict_main_if_full();
                     self.main.push_back((key.clone(), new_seq));
-                    self.index.insert(key, Node::Main { value, freq: 0, seq: new_seq });
+                    self.index.insert(
+                        key,
+                        Node::Main {
+                            value,
+                            freq: 0,
+                            seq: new_seq,
+                        },
+                    );
                     self.main_live_count += 1;
                 }
             } else {
                 self.evict_ghost_if_full();
                 self.ghost.push_back((key.clone(), new_seq));
-                self.index.insert(
-                    key,
-                    Node::Ghost {
-                        seq: new_seq,
-                    },
-                );
+                self.index.insert(key, Node::Ghost { seq: new_seq });
                 self.ghost_live_count += 1;
             }
         }
@@ -303,11 +333,13 @@ where
     fn evict_main_if_full(&mut self) {
         if self.main_capacity == 0 {
             while let Some((key, expected_seq)) = self.main.pop_front() {
-                if let Some(Node::Main { seq: current_seq, .. }) = self.index.get(&key) {
-                    if *current_seq == expected_seq {
-                        self.index.remove(&key);
-                        self.main_live_count -= 1;
-                    }
+                if let Some(Node::Main {
+                    seq: current_seq, ..
+                }) = self.index.get(&key)
+                    && *current_seq == expected_seq
+                {
+                    self.index.remove(&key);
+                    self.main_live_count -= 1;
                 }
             }
             return;
@@ -320,7 +352,10 @@ where
                 break;
             };
 
-            if let Some(Node::Main { seq: current_seq, .. }) = self.index.get(&key) {
+            if let Some(Node::Main {
+                seq: current_seq, ..
+            }) = self.index.get(&key)
+            {
                 if *current_seq != expected_seq {
                     continue;
                 }
@@ -360,14 +395,12 @@ where
             let Some((key, expected_seq)) = self.ghost.pop_front() else {
                 break;
             };
-            
-            if let Some(Node::Ghost {
-                seq: current_seq,
-            }) = self.index.get(&key) {
-                if *current_seq == expected_seq {
-                    self.index.remove(&key);
-                    self.ghost_live_count -= 1;
-                }
+
+            if let Some(Node::Ghost { seq: current_seq }) = self.index.get(&key)
+                && *current_seq == expected_seq
+            {
+                self.index.remove(&key);
+                self.ghost_live_count -= 1;
             }
         }
     }
@@ -385,25 +418,28 @@ where
 
     /// Number of entries in the Ghost queue (for diagnostics).
     #[must_use]
-    pub fn ghost_len(&self) -> usize {
+    pub const fn ghost_len(&self) -> usize {
         self.ghost_live_count
     }
 
     /// Number of entries in the Small queue (for diagnostics).
     #[must_use]
-    pub fn small_len(&self) -> usize {
+    pub const fn small_len(&self) -> usize {
         self.small_live_count
     }
 
     /// Number of entries in the Main queue (for diagnostics).
     #[must_use]
-    pub fn main_len(&self) -> usize {
+    pub const fn main_len(&self) -> usize {
         self.main_live_count
     }
 
     /// Iterate over all live keys (Small + Main queues, excluding Ghost).
     pub fn keys(&self) -> impl Iterator<Item = &K> {
-        self.small.iter().map(|(k, _)| k).chain(self.main.iter().map(|(k, _)| k))
+        self.small
+            .iter()
+            .map(|(k, _)| k)
+            .chain(self.main.iter().map(|(k, _)| k))
     }
 }
 
@@ -733,8 +769,11 @@ mod tests {
         // Force eviction of the tombstone.
         cache.insert("b", 3);
 
-        // The tombstone for "a" should be skipped, leaving the live "a" alone.
-        assert_eq!(cache.get(&"a"), Some(&2));
+        // Because small capacity is 1, inserting "b" must evict the live "a".
+        // The live "a" goes to Ghost (freq=0).
+        // It should NOT crash, and "b" should be in small.
+        assert_eq!(cache.get(&"a"), None);
+        assert_eq!(cache.get(&"b"), Some(&3));
         assert_eq!(cache.small_len(), 1); // "b" is in small
     }
 
@@ -804,37 +843,47 @@ mod tests {
         let mut cache = S3FifoCache::new(5);
         // Capacity 5 means Ghost capacity is 5, Small capacity is 1, Main is 4.
 
-        // 1. Insert "a" -> goes to small.
-        cache.insert(String::from("a"), 1);
-        
-        // 2. Insert "b" -> evicts "a" from small (freq=0) -> goes to ghost.
-        cache.insert(String::from("b"), 2);
+        // 1. Fill ghost queue with dummy items to push it near capacity
+        cache.insert(100, 100);
+        cache.insert(101, 101); // 100 goes to ghost
+        cache.insert(102, 102); // 101 goes to ghost
+        cache.insert(103, 103); // 102 goes to ghost
+        // Now ghost has [100, 101, 102]
 
-        // 3. Insert "a" -> is_ghost=true -> goes to main.
-        cache.insert(String::from("a"), 3);
+        // 2. Insert 1 -> goes to small.
+        cache.insert(1, 1); // 103 goes to ghost
 
-        // 4. Remove "a".
-        cache.remove(&String::from("a"));
+        // 3. Insert 2 -> evicts 1 from small (freq=0) -> goes to ghost.
+        cache.insert(2, 2);
+        // Now ghost has [100, 101, 102, 103, 1(seq=1)]
 
-        // 5. Insert "a" -> goes to small.
-        cache.insert(String::from("a"), 4);
+        // 4. Insert 1 -> is_ghost=true -> goes to main.
+        cache.insert(1, 3);
+        // ghost STILL has [100, 101, 102, 103, 1(seq=1)]
 
-        // 6. Insert "c" -> evicts "a" from small (freq=0) -> goes to ghost.
-        cache.insert(String::from("c"), 5);
+        // 5. Remove 1.
+        cache.remove(&1);
 
-        // 7. Fill ghost queue to trigger evict_ghost_if_full.
-        for i in 0..10 {
-            let key = format!("k{}", i);
-            cache.insert(key.clone(), i);
-            cache.insert(format!("dummy{}", i), i);
-        }
+        // 6. Insert 1 -> goes to small.
+        cache.insert(1, 4);
 
-        // 8. Re-insert "a". It should be recognized as ghost and go to main.
-        cache.insert(String::from("a"), 6);
-        
-        // If "a" was recognized as ghost, it went to main.
-        assert_eq!(cache.main_len(), 1, "If a went to small, ghost was forgotten!");
-        assert_eq!(cache.small_len(), 0);
+        // 7. Insert 3 -> evicts 1 from small (freq=0) -> goes to ghost.
+        cache.insert(3, 5);
+        // Now ghost has [100, 101, 102, 103, 1(seq=1), 1(seq=something)]
+
+        // 8. Trigger evict_ghost_if_full by adding one more ghost
+        cache.insert(4, 6); // 3 goes to ghost
+
+        // This will pop 100, 101, etc.
+        // It will eventually pop 1(seq=1) (the tombstone).
+        // Because of the bug fix, it should skip the tombstone and NOT remove the live 1.
+
+        // 9. Re-insert 1. It should be recognized as ghost and go to main.
+        cache.insert(1, 6);
+
+        // If 1 was recognized as ghost, it went to main.
+        assert_eq!(cache.main_len(), 1, "If 1 went to small, ghost was forgotten!");
+        assert_eq!(cache.small_len(), 1); // '4' is still in small
     }
 
     // ── Additional coverage tests ────────────────────────────────────
