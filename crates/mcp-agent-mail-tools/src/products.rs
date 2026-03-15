@@ -50,7 +50,13 @@ fn generate_product_uid(now_micros: i64) -> String {
     let pid = u64::from(std::process::id());
     let mut out = String::with_capacity(32);
     // Format directly into the output buffer
-    let _ = write!(out, "{now_micros:016x}{pid:08x}{seq:08x}");
+    let _ = write!(
+        out,
+        "{:016x}{:08x}{:08x}",
+        now_micros.cast_unsigned(),
+        pid,
+        seq
+    );
 
     if out.len() > 32 {
         // If it somehow exceeds 32 chars, we keep the rightmost 32 chars

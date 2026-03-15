@@ -1133,8 +1133,8 @@ pub mod tool_util {
 /// Returns true when two glob/literal patterns overlap under Agent Mail semantics.
 #[must_use]
 pub fn patterns_overlap(left: &str, right: &str) -> bool {
-    let left = mcp_agent_mail_core::pattern_overlap::CompiledPattern::new(left);
-    let right = mcp_agent_mail_core::pattern_overlap::CompiledPattern::new(right);
+    let left = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(left);
+    let right = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(right);
     left.overlaps(&right)
 }
 

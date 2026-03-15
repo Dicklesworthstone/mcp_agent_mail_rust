@@ -515,7 +515,8 @@ fn run_archive_harness_once() {
                         msg_id += 1;
                     }
                 }
-                ArchiveScenario::SingleInlineAttachment | ArchiveScenario::SingleFileAttachment => {
+                ArchiveScenario::SingleInlineAttachment
+                | ArchiveScenario::SingleFileAttachment => {
                     let policy = if matches!(*scenario, ArchiveScenario::SingleInlineAttachment) {
                         mcp_agent_mail_storage::EmbedPolicy::Inline
                     } else {
@@ -1485,6 +1486,39 @@ fn stable_json_file_hash(path: &Path) -> std::io::Result<String> {
     ))
 }
 
+fn stable_bundle_hash(bundle_root: &Path) -> std::io::Result<String> {
+    // Stable hash for determinism checks:
+    // - Hash each file.
+    // - For JSON files, strip volatile `generated_at` fields and sort keys before hashing.
+    // - Combine as sha256 over `relpath\0filehash\n` in sorted order.
+    let mut combined = Sha256::new();
+    let mut dbg = Vec::new();
+    let files = collect_files_sorted(bundle_root)?;
+    for file_path in files {
+        let rel = file_path
+            .strip_prefix(bundle_root)
+            .unwrap_or(&file_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let is_json = file_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+        let file_hash = if is_json {
+            stable_json_file_hash(&file_path)?
+        } else {
+            sha256_file(&file_path)?
+        };
+        dbg.push(format!("{} {}", rel, file_hash));
+        combined.update(rel.as_bytes());
+        combined.update(b"\0");
+        combined.update(file_hash.as_bytes());
+        combined.update(b"\n");
+    }
+    std::fs::write(bundle_root.join("../hash_debug.txt"), dbg.join("\n")).ok();
+    Ok(hex::encode(combined.finalize()))
+}
+
 fn dir_bytes(root: &Path) -> std::io::Result<u64> {
     let mut total = 0u64;
     let mut stack = vec![root.to_path_buf()];
@@ -1519,36 +1553,6 @@ fn collect_files_sorted(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     }
     out.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
     Ok(out)
-}
-
-fn stable_bundle_hash(bundle_root: &Path) -> std::io::Result<String> {
-    // Stable hash for determinism checks:
-    // - Hash each file.
-    // - For JSON files, strip volatile `generated_at` fields and sort keys before hashing.
-    // - Combine as sha256 over `relpath\0filehash\n` in sorted order.
-    let mut combined = Sha256::new();
-    let files = collect_files_sorted(bundle_root)?;
-    for file_path in files {
-        let rel = file_path
-            .strip_prefix(bundle_root)
-            .unwrap_or(&file_path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        let is_json = file_path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
-        let file_hash = if is_json {
-            stable_json_file_hash(&file_path)?
-        } else {
-            sha256_file(&file_path)?
-        };
-        combined.update(rel.as_bytes());
-        combined.update([0u8]);
-        combined.update(file_hash.as_bytes());
-        combined.update([b'\n']);
-    }
-    Ok(hex::encode(combined.finalize()))
 }
 
 fn write_pattern_bytes(path: &Path, size: usize, seed: u32) -> std::io::Result<()> {
@@ -1915,8 +1919,15 @@ fn run_share_harness_once() {
                             .join("bundle.zip")
                             .metadata()
                             .map_or(0, |m| m.len());
+                        std::fs::copy(out_root.join("hash_debug.txt"), run_tmp.path().join("hash_debug_first.txt")).ok();
                     } else {
                         stable_hash_second = Some(stable);
+                        std::fs::copy(out_root.join("hash_debug.txt"), run_tmp.path().join("hash_debug_second.txt")).ok();
+                        let d1 = std::fs::read_to_string(run_tmp.path().join("hash_debug_first.txt")).unwrap_or_default();
+                        let d2 = std::fs::read_to_string(run_tmp.path().join("hash_debug_second.txt")).unwrap_or_default();
+                        if d1 != d2 {
+                            println!("DIFF IN DETERMINISM:\n===1===\n{}\n===2===\n{}", d1, d2);
+                        }
                     }
                 }
             }

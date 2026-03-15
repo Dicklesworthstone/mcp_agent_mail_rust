@@ -198,7 +198,7 @@ fn resolve_bundle_path(inputs: &WizardInputs) -> PlanResult<PathBuf> {
     .with_hint("Specify --bundle or run 'am share export' in the current directory"))
 }
 
-fn resolve_detection_root(bundle_path: &Path, shell_cwd: &Path) -> PathBuf {
+pub(crate) fn resolve_detection_root(bundle_path: &Path, shell_cwd: &Path) -> PathBuf {
     let resolved_bundle_path = if bundle_path.is_absolute() {
         bundle_path.to_path_buf()
     } else {

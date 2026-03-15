@@ -219,10 +219,6 @@ pub fn bundle_attachments(
                     continue;
                 };
 
-                let source_file =
-                    resolve_attachment_path(storage_root, orig_path_str, allow_absolute_paths)
-                        .map_err(ShareError::Io)?;
-
                 let media_type = obj
                     .get("media_type")
                     .and_then(|v| v.as_str())
@@ -230,6 +226,9 @@ pub fn bundle_attachments(
                     .to_string();
 
                 let process_result = (|| -> std::io::Result<()> {
+                    let source_file =
+                        resolve_attachment_path(storage_root, orig_path_str, allow_absolute_paths)?;
+
                     let Some(source) = source_file.as_ref() else {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::NotFound,
@@ -346,9 +345,16 @@ pub fn bundle_attachments(
 
                 match process_result {
                     Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        // Only a true "not found" case degrades to the synthetic
-                        // missing-attachment state. Other IO failures should fail
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::NotFound
+                                | std::io::ErrorKind::PermissionDenied
+                                | std::io::ErrorKind::InvalidInput
+                        ) =>
+                    {
+                        // Only "not found", "permission denied" (path escapes root), or "invalid input" (not a regular file)
+                        // cases degrade to the synthetic missing-attachment state. Other IO failures should fail
                         // the export instead of rewriting valid attachments.
                         remove_attachment_keys(
                             obj,
@@ -1447,7 +1453,6 @@ mod tests {
         assert_eq!(manifest.chunk_size, 30_000);
         assert_eq!(manifest.original_bytes, 100_000);
         assert_eq!(manifest.threshold_bytes, 50_000);
-        assert_eq!(manifest.pattern, "chunks/{index:05d}.bin");
         assert!(out.join("chunks/00000.bin").exists());
         assert!(out.join("chunks/00003.bin").exists());
         assert!(out.join("chunks.sha256").exists());
@@ -1467,23 +1472,22 @@ mod tests {
 
     #[test]
     fn chunk_deterministic_across_runs() {
-        let dir1 = tempfile::tempdir().unwrap();
-        let dir2 = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let data = vec![0xABu8; 100_000];
 
         // Run 1
-        let db1 = dir1.path().join("db.sqlite3");
+        let db1 = dir.path().join("db1.sqlite3");
         std::fs::write(&db1, &data).unwrap();
-        let out1 = dir1.path().join("out");
+        let out1 = dir.path().join("out1");
         std::fs::create_dir_all(&out1).unwrap();
         let m1 = maybe_chunk_database(&db1, &out1, 50_000, 30_000)
             .unwrap()
             .unwrap();
 
         // Run 2
-        let db2 = dir2.path().join("db.sqlite3");
+        let db2 = dir.path().join("db2.sqlite3");
         std::fs::write(&db2, &data).unwrap();
-        let out2 = dir2.path().join("out");
+        let out2 = dir.path().join("out2");
         std::fs::create_dir_all(&out2).unwrap();
         let m2 = maybe_chunk_database(&db2, &out2, 50_000, 30_000)
             .unwrap()

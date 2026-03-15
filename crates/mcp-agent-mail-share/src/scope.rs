@@ -77,7 +77,7 @@ pub fn apply_project_scope(
 
     // Load all projects
     let project_rows = conn
-        .query_sync("SELECT id, slug, human_key FROM projects", &[])
+        .query_sync("SELECT id, slug, human_key FROM projects ORDER BY id ASC", &[])
         .map_err(|e| ShareError::Sqlite {
             message: format!("SELECT projects failed: {e}"),
         })?;
@@ -209,7 +209,7 @@ pub fn apply_project_scope(
 
         // 3. Collect message IDs for non-allowed projects
         let msg_sql = format!(
-            "SELECT id FROM messages WHERE project_id NOT IN ({p})",
+            "SELECT id FROM messages WHERE project_id NOT IN ({p}) ORDER BY id ASC",
             p = placeholders
         );
         let msg_rows = conn
@@ -275,8 +275,8 @@ pub fn apply_project_scope(
         exec(
             &conn,
             &format!(
-                "DELETE FROM projects WHERE id NOT IN ({p})",
-                p = placeholders
+                "DELETE FROM projects WHERE id NOT IN ({placeholders})",
+                placeholders = placeholders
             ),
             &id_values,
         )?;

@@ -24,7 +24,8 @@ use std::path::{Path, PathBuf};
 
 use crate::detection::detect_environment;
 use crate::planner::{
-    format_plan_human, generate_plan, infer_provider_from_inputs, validate_inputs,
+    format_plan_human, generate_plan, infer_provider_from_inputs, resolve_detection_root,
+    validate_inputs,
 };
 use crate::wizard::{
     DeploymentPlan, DetectedEnvironment, HostingProvider, WIZARD_VERSION, WizardError,
@@ -84,20 +85,24 @@ pub fn run_interactive_wizard(config: WizardConfig) -> Result<WizardOutcome, Wiz
     };
 
     // Detect environment
-    let cwd = std::env::current_dir().map_err(|e| {
+    let shell_cwd = std::env::current_dir().map_err(|e| {
         WizardError::new(
             WizardErrorCode::InternalError,
             format!("Failed to get current directory: {e}"),
         )
     })?;
+    let detection_root = config.inputs.bundle_path.as_deref().map_or_else(
+        || shell_cwd.clone(),
+        |bundle| resolve_detection_root(bundle, &shell_cwd),
+    );
 
     let env = if config.skip_detection {
         DetectedEnvironment {
-            cwd: cwd.clone(),
+            cwd: detection_root.clone(),
             ..Default::default()
         }
     } else {
-        detect_environment(config.inputs.bundle_path.as_deref(), &cwd)
+        detect_environment(config.inputs.bundle_path.as_deref(), &detection_root)
     };
 
     // Build inputs by merging CLI flags with prompted values

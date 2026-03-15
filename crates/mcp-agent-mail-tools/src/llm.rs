@@ -567,13 +567,18 @@ fn extract_fenced_json(text: &str) -> Option<Value> {
     // Look for ```json\n...\n``` first, then plain ```\n...\n```
     let markers = ["```json\n", "```json\r\n", "```\n", "```\r\n"];
     for marker in markers {
-        if let Some(start) = text.find(marker) {
-            let content_start = start + marker.len();
-            if let Some(end_rel) = text[content_start..].find("```") {
-                let content = text[content_start..content_start + end_rel].trim();
+        let mut cursor = text;
+        while let Some(start_idx) = cursor.find(marker) {
+            let content_start = start_idx + marker.len();
+            if let Some(end_rel) = cursor[content_start..].find("```") {
+                let content = cursor[content_start..content_start + end_rel].trim();
                 if let Ok(v) = serde_json::from_str(content) {
                     return Some(v);
                 }
+                // Move cursor past this block to find the next one
+                cursor = &cursor[content_start + end_rel + 3..];
+            } else {
+                break;
             }
         }
     }
@@ -583,13 +588,16 @@ fn extract_fenced_json(text: &str) -> Option<Value> {
 fn extract_brace_json(text: &str) -> Option<Value> {
     let mut cursor = text;
     while let Some(open) = cursor.find('{') {
-        if let Some(close) = cursor.rfind('}')
-            && close > open
-        {
-            let slice = &cursor[open..=close];
+        let mut close_search_cursor = &cursor[open..];
+        while let Some(close) = close_search_cursor.rfind('}') {
+            if close == 0 {
+                break;
+            }
+            let slice = &cursor[open..=open + close];
             if let Ok(v) = serde_json::from_str(slice) {
                 return Some(v);
             }
+            close_search_cursor = &close_search_cursor[..close];
         }
         // Try the next opening brace if this one didn't lead to valid JSON
         if cursor.len() > open + 1 {
@@ -1396,6 +1404,13 @@ mod tests {
         assert!(val["first"].as_bool().unwrap());
     }
 
+    #[test]
+    fn fenced_json_skips_invalid_first_block() {
+        let input = "```\nnot json\n```\nAnd then:\n```\n{\"second\": true}\n```";
+        let val = extract_fenced_json(input).unwrap();
+        assert!(val["second"].as_bool().unwrap());
+    }
+
     // -- extract_brace_json edge cases --
 
     #[test]
@@ -1408,6 +1423,13 @@ mod tests {
     fn brace_json_nested() {
         let val = extract_brace_json("prefix {\"a\": {\"b\": 2}} suffix").unwrap();
         assert_eq!(val["a"]["b"], 2);
+    }
+
+    #[test]
+    fn brace_json_with_trailing_garbage_brace() {
+        let val =
+            extract_brace_json("Here is JSON: {\"a\": 1} and also this trailing brace }").unwrap();
+        assert_eq!(val["a"], 1);
     }
 
     #[test]

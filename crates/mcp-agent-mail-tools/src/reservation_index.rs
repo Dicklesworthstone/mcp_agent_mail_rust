@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
+use std::sync::Arc;
 
 /// Metadata from a reservation row needed for conflict reporting.
 #[derive(Debug, Clone)]
@@ -35,27 +36,27 @@ pub(crate) struct ReservationRef {
 pub(crate) struct ReservationIndex {
     /// Exact-path reservations grouped by first path segment.
     /// Each entry is `(normalized_path, ref)`.
-    exact_by_prefix: HashMap<String, Vec<(CompiledPattern, ReservationRef)>>,
+    exact_by_prefix: HashMap<String, Vec<(Arc<CompiledPattern>, ReservationRef)>>,
 
     /// Glob reservations grouped by first literal path segment.
-    globs_by_prefix: HashMap<String, Vec<(CompiledPattern, ReservationRef)>>,
+    globs_by_prefix: HashMap<String, Vec<(Arc<CompiledPattern>, ReservationRef)>>,
 
     /// Root-level globs with no literal prefix (e.g. `*.rs`, `**`).
     /// Must be checked against every requested path.
-    root_globs: Vec<(CompiledPattern, ReservationRef)>,
+    root_globs: Vec<(Arc<CompiledPattern>, ReservationRef)>,
 }
 
 impl ReservationIndex {
     /// Build an index from an iterator of `(raw_pattern, reservation_ref)` pairs.
     pub fn build(reservations: impl Iterator<Item = (String, ReservationRef)>) -> Self {
-        let mut exact_by_prefix: HashMap<String, Vec<(CompiledPattern, ReservationRef)>> =
+        let mut exact_by_prefix: HashMap<String, Vec<(Arc<CompiledPattern>, ReservationRef)>> =
             HashMap::new();
-        let mut globs_by_prefix: HashMap<String, Vec<(CompiledPattern, ReservationRef)>> =
+        let mut globs_by_prefix: HashMap<String, Vec<(Arc<CompiledPattern>, ReservationRef)>> =
             HashMap::new();
-        let mut root_globs: Vec<(CompiledPattern, ReservationRef)> = Vec::new();
+        let mut root_globs: Vec<(Arc<CompiledPattern>, ReservationRef)> = Vec::new();
 
         for (raw_pattern, rref) in reservations {
-            let compiled = CompiledPattern::new(&raw_pattern);
+            let compiled = CompiledPattern::cached(&raw_pattern);
 
             if !compiled.is_glob() {
                 // Exact path: group by first segment for prefix-scoped scans.

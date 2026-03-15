@@ -11,7 +11,7 @@
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
 use mcp_agent_mail_core::Config;
-use mcp_agent_mail_core::pattern_overlap::{CompiledPattern, has_glob_meta};
+use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -102,40 +102,28 @@ pub struct RenewedReservation {
 
 /// Detect suspicious file reservation patterns (matching Python's `_detect_suspicious_file_reservation`).
 fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
-    let compiled = mcp_agent_mail_core::pattern_overlap::CompiledPattern::new(pattern);
-    let p = compiled.normalized();
-
-    // 1. Too-broad patterns
-    if matches!(p, "" | "*" | "**" | "**/*" | "**/**" | ".") {
-        return Some(format!(
-            "Pattern '{pattern}' (normalized to '{p}') is too broad and would reserve the entire project. \
-             Use more specific patterns like 'src/api/*.py' or 'lib/auth/**'."
-        ));
+    if pattern.trim().is_empty() {
+        return Some("Pattern is completely empty.".to_string());
     }
-    // 2. Very short patterns with wildcards
-    if p.len() <= 2 && p.contains('*') {
-        return Some(format!(
-            "Pattern '{pattern}' (normalized to '{p}') is very short and may match more files than intended. \
-             Consider using a more specific pattern."
-        ));
-    }
-    // 3. Absolute paths (check original pattern for this one, as normalize_pattern strips leading slash)
-    let trimmed = pattern.trim();
-    if !trimmed.starts_with("//") && path_looks_absolute(trimmed) {
-        return Some(format!(
-            "Pattern '{pattern}' looks like an absolute path. \
-             Reservations should use project-relative paths like 'src/module.py'."
-        ));
+    let compiled = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(pattern);
+    if compiled.normalized().is_empty() {
+        return Some(
+            "Pattern normalizes to the project root. Reserving the root overlaps with everything."
+                .to_string(),
+        );
     }
 
     None
 }
 
 fn invalid_file_reservation_pattern(pattern: &str) -> Option<String> {
-    let compiled = CompiledPattern::new(pattern);
-    if has_glob_meta(compiled.normalized()) && !compiled.is_matchable() {
+    if pattern.contains("..") {
+        return Some("Pattern contains parent directory traversal ('..'). Use simple project-relative paths.".to_string());
+    }
+    let compiled = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(pattern);
+    if compiled.is_glob() && !compiled.is_matchable() {
         return Some(format!(
-            "Pattern '{pattern}' is not a valid glob pattern. Check bracket/brace syntax or use a literal project-relative path."
+            "Invalid glob pattern syntax: '{pattern}'. Check for unescaped special characters or mismatched brackets."
         ));
     }
     None
@@ -291,22 +279,20 @@ fn renewal_filter_matches(
     paths: Option<&[String]>,
     reservation_ids: Option<&[i64]>,
 ) -> bool {
-    if row.agent_id != agent_id || row.released_ts.is_some() {
+    if row.agent_id != agent_id {
         return false;
     }
-    if let Some(ids) = reservation_ids {
-        if ids.is_empty() {
-            return false;
-        }
-        if !row.id.is_some_and(|id| ids.contains(&id)) {
-            return false;
-        }
+    if let Some(ids) = reservation_ids
+        && !ids.contains(&row.id.unwrap_or(0))
+    {
+        return false;
     }
     if let Some(path_patterns) = paths {
         if path_patterns.is_empty() {
             return false;
         }
-        let row_pattern = CompiledPattern::new(&row.path_pattern);
+        let row_pattern =
+            mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(&row.path_pattern);
         let mut matched = false;
         for pat in path_patterns {
             if row.path_pattern == *pat {
@@ -315,7 +301,9 @@ fn renewal_filter_matches(
             }
             // Match the same overlap semantics used by reservation conflict detection,
             // so narrower literals can target broader held globs and vice versa.
-            if CompiledPattern::new(pat).overlaps(&row_pattern) {
+            if mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(pat)
+                .overlaps(&row_pattern)
+            {
                 matched = true;
                 break;
             }
@@ -490,9 +478,11 @@ pub async fn file_reservation_paths(
     );
 
     // Precompile requested patterns once.
-    let requested_compiled: Vec<CompiledPattern> = normalized_paths
+    let requested_compiled: Vec<
+        std::sync::Arc<mcp_agent_mail_core::pattern_overlap::CompiledPattern>,
+    > = normalized_paths
         .iter()
-        .map(|p| CompiledPattern::new(p))
+        .map(|p| CompiledPattern::cached(p))
         .collect();
 
     let mut conflict_refs = Vec::new();
@@ -503,7 +493,7 @@ pub async fn file_reservation_paths(
         }
 
         // Check conflicts with existing reservations
-        index.find_conflicts(path_pat, &mut conflict_refs);
+        index.find_conflicts(path_pat.as_ref(), &mut conflict_refs);
 
         if conflict_refs.is_empty() {
             paths_to_grant.push(path);

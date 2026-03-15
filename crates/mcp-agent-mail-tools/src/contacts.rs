@@ -188,10 +188,7 @@ fn parse_contact_target(
     to_project: Option<String>,
     default_project: &str,
 ) -> (String, String) {
-    if let Some(tp) = to_project {
-        return (tp, to_agent.to_string());
-    }
-    if to_agent.starts_with("project:")
+    let (mut actual_project, actual_agent) = if to_agent.starts_with("project:")
         && to_agent.contains('#')
         && let Some((slug, agent)) = to_agent.split_once(':').and_then(|(_, rest)| {
             let (slug, agent) = rest.split_once('#')?;
@@ -202,11 +199,17 @@ fn parse_contact_target(
             } else {
                 Some((slug.to_string(), agent.to_string()))
             }
-        })
-    {
-        return (slug, agent);
+        }) {
+        (slug, agent)
+    } else {
+        (default_project.to_string(), to_agent.to_string())
+    };
+
+    if let Some(tp) = to_project {
+        actual_project = tp;
     }
-    (default_project.to_string(), to_agent.to_string())
+
+    (actual_project, actual_agent)
 }
 
 /// Request contact approval to message another agent.
@@ -882,7 +885,7 @@ mod tests {
             "/default",
         );
         assert_eq!(proj, "explicit-project");
-        assert_eq!(agent, "project:other#AgentX");
+        assert_eq!(agent, "AgentX");
     }
 
     // ── TTL validation ──

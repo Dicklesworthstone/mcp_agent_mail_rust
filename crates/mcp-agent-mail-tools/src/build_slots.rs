@@ -204,7 +204,13 @@ fn write_lease_json(path: &Path, lease: &BuildSlotLease) -> std::io::Result<()> 
     // Write atomically to prevent race conditions during read_active_leases
     let tmp_path = unique_tmp_lease_path(path);
     std::fs::write(&tmp_path, text)?;
-    std::fs::rename(&tmp_path, path)
+    match std::fs::rename(&tmp_path, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(e)
+        }
+    }
 }
 
 fn compute_renewed_expiry(

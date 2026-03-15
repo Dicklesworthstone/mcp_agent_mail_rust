@@ -3549,7 +3549,7 @@ pub fn ensure_archive(config: &Config, slug: &str) -> Result<ProjectArchive> {
     }
     let (repo_root, _fresh) = ensure_archive_root(config)?;
     let project_root = repo_root.join("projects").join(slug);
-    fs::create_dir_all(&project_root)?;
+    ensure_dir(&project_root)?;
 
     let canonical_root = project_root
         .canonicalize()
@@ -5172,9 +5172,6 @@ pub fn list_pending_signals(config: &Config, project_slug: Option<&str>) -> Vec<
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         let agents_dir = proj_dir.join("agents");
-        if !agents_dir.exists() {
-            continue;
-        }
         let entries = match fs::read_dir(&agents_dir) {
             Ok(iter) => iter,
             Err(_) => continue,
@@ -6331,10 +6328,6 @@ pub fn read_message_file(path: &Path) -> Result<(serde_json::Value, String)> {
 ///
 /// Returns paths sorted by modification time (newest first).
 pub fn list_message_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-
     let mut files = Vec::new();
     walk_md_files(dir, &mut files)?;
 
@@ -6386,12 +6379,13 @@ pub fn list_agent_outbox(archive: &ProjectArchive, agent_name: &str) -> Result<V
 /// List all agents with profiles in the archive.
 pub fn list_archive_agents(archive: &ProjectArchive) -> Result<Vec<String>> {
     let agents_dir = archive.root.join("agents");
-    if !agents_dir.exists() {
-        return Ok(Vec::new());
-    }
 
     let mut agents = Vec::new();
-    for entry in fs::read_dir(&agents_dir)? {
+    let iter = match fs::read_dir(&agents_dir) {
+        Ok(i) => i,
+        Err(_) => return Ok(Vec::new()),
+    };
+    for entry in iter {
         let entry = entry?;
         if entry.path().is_dir() {
             let profile = entry.path().join("profile.json");
@@ -6732,19 +6726,28 @@ fn rel_path_cached(canonical_base: &Path, target: &Path) -> Result<String> {
         return Ok(rel.to_string_lossy().replace('\\', "/"));
     }
 
-    // Slow path: canonicalize target and retry.
-    let target_canon = target
-        .canonicalize()
-        .unwrap_or_else(|_| target.to_path_buf());
+    // Slow path: avoid `canonicalize()` due to heavy `readlink` syscall overhead.
+    // Instead, normalize the path manually. Since `canonical_base` is absolute
+    // and canonical, we can normalize `target` and try stripping again.
+    let mut target_norm = PathBuf::new();
+    for component in target.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                target_norm.pop();
+            }
+            std::path::Component::CurDir => {}
+            _ => target_norm.push(component),
+        }
+    }
 
-    target_canon
+    target_norm
         .strip_prefix(canonical_base)
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .map_err(|_| {
             StorageError::InvalidPath(format!(
                 "Cannot compute relative path from {} to {}",
                 canonical_base.display(),
-                target_canon.display()
+                target_norm.display()
             ))
         })
 }
@@ -6782,30 +6785,21 @@ pub fn resolve_archive_relative_path(archive: &ProjectArchive, raw_path: &str) -
     // Use pre-canonicalized root to avoid repeated readlink syscalls.
     let root = &archive.canonical_root;
 
-    // First try canonicalize (resolves symlinks + normalizes). If the file
-    // exists, this is the most robust check.
-    let candidate = match archive.root.join(safe_rel).canonicalize() {
-        Ok(p) => p,
-        Err(_) => {
-            // File doesn't exist yet. Manually normalize the path components
-            // to prevent traversal via `foo/../../../etc/passwd` patterns.
-            // We already rejected bare ".." segments above, but be defensive
-            // by re-normalizing through component iteration.
-            let mut resolved = root.clone();
-            for component in Path::new(safe_rel).components() {
-                match component {
-                    Component::Normal(c) => resolved.push(c),
-                    Component::CurDir => { /* skip `.` */ }
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                        return Err(StorageError::InvalidPath(
-                            "directory traversal not allowed".to_string(),
-                        ));
-                    }
-                }
+    // Manually normalize the path components to prevent traversal
+    // via `foo/../../../etc/passwd` patterns, avoiding the high syscall
+    // overhead of `canonicalize()` which issues `readlink` per component.
+    let mut candidate = root.clone();
+    for component in Path::new(safe_rel).components() {
+        match component {
+            Component::Normal(c) => candidate.push(c),
+            Component::CurDir => { /* skip `.` */ }
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(StorageError::InvalidPath(
+                    "directory traversal not allowed".to_string(),
+                ));
             }
-            resolved
         }
-    };
+    }
 
     if !candidate.starts_with(root) {
         return Err(StorageError::InvalidPath(

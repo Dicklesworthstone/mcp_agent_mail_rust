@@ -1745,10 +1745,10 @@ effective_free_bytes={free}"
         let mut patterns_by_agent: HashMap<i64, Vec<CompiledPattern>> =
             HashMap::with_capacity(reservations.len());
         for res in reservations {
-            patterns_by_agent
-                .entry(res.agent_id)
-                .or_default()
-                .push(CompiledPattern::new(&res.path_pattern));
+            patterns_by_agent.entry(res.agent_id).or_default().push(
+                (*mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(&res.path_pattern))
+                    .clone(),
+            );
         }
         if let Some(sender_patterns) = patterns_by_agent.get(&sender_id) {
             for agent in recipient_map.values() {
@@ -2532,10 +2532,10 @@ effective_free_bytes={free}"
         let mut patterns_by_agent: HashMap<i64, Vec<CompiledPattern>> =
             HashMap::with_capacity(reservations.len());
         for res in reservations {
-            patterns_by_agent
-                .entry(res.agent_id)
-                .or_default()
-                .push(CompiledPattern::new(&res.path_pattern));
+            patterns_by_agent.entry(res.agent_id).or_default().push(
+                (*mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(&res.path_pattern))
+                    .clone(),
+            );
         }
         if let Some(sender_patterns) = patterns_by_agent.get(&sender_id) {
             for agent in recipient_map.values() {

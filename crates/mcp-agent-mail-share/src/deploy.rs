@@ -2762,7 +2762,9 @@ mod tests {
     impl Drop for TestHttpServer {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Relaxed);
-            let _ = TcpStream::connect(self.addr);
+            if let Ok(stream) = TcpStream::connect(self.addr) {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
             if let Some(handle) = self.handle.take() {
                 let _ = handle.join();
             }
@@ -2835,13 +2837,15 @@ mod tests {
 
         let status_text = if status == 200 { "OK" } else { "Not Found" };
         let mut response = format!("HTTP/1.1 {status} {status_text}\r\n");
+        use std::fmt::Write;
         for (k, v) in headers {
-            response.push_str(&format!("{k}: {v}\r\n"));
+            let _ = write!(response, "{k}: {v}\r\n");
         }
         response.push_str("\r\n");
         response.push_str(&body);
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.flush();
+        let _ = stream.shutdown(std::net::Shutdown::Both);
     }
 
     fn create_minimal_bundle(dir: &Path) {
