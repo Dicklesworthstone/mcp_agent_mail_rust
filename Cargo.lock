@@ -4841,6 +4841,7 @@ dependencies = [
  "chrono",
  "comrak",
  "criterion",
+ "dirs",
  "fastmcp-core",
  "fastmcp-protocol",
  "fastmcp-rust",
