@@ -148,10 +148,10 @@ fn value_to_micros(value: &sqlmodel_core::Value) -> Option<i64> {
             if let Ok(parsed) = trimmed.parse::<i64>() {
                 return Some(parsed);
             }
-            if let Ok(parsed) = trimmed.parse::<f64>() {
-                if let Some(parsed) = truncated_f64_to_i64(parsed) {
-                    return Some(parsed);
-                }
+            if let Ok(parsed) = trimmed.parse::<f64>()
+                && let Some(parsed) = truncated_f64_to_i64(parsed)
+            {
+                return Some(parsed);
             }
             mcp_agent_mail_db::iso_to_micros(trimmed)
         }

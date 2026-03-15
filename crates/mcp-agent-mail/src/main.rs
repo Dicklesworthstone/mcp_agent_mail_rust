@@ -621,9 +621,9 @@ fn main() {
             // Show configuration
             ftui_runtime::ftui_println!("{:#?}", config);
         }
-        Some(Commands::External(args)) => {
+        Some(Commands::External(external_args)) => {
             // Denial gate (ADR-001 Invariant 4, SPEC-denial-ux-contract)
-            let command = args.first().map_or("(unknown)", String::as_str);
+            let command = external_args.first().map_or("(unknown)", String::as_str);
             render_denial(command);
             std::process::exit(2);
         }
