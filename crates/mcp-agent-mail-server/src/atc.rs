@@ -1075,6 +1075,112 @@ mod tests {
             );
         }
     }
+
+    // ── EvidenceLedger + AtcDecisionRecord edge cases (br-w5phh) ───────
+
+    #[test]
+    fn ledger_all_returns_oldest_first() {
+        let mut ledger = EvidenceLedger::new(100);
+        let core = default_liveness_core();
+
+        for i in 0..5 {
+            let subject = format!("Agent{i}");
+            ledger.record(&test_decision(&core, &subject, i64::from(i) * 1_000_000));
+        }
+
+        let ids: Vec<u64> = ledger.all().map(|r| r.id).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5], "all() should return oldest first");
+    }
+
+    #[test]
+    fn ledger_latest_id_when_empty() {
+        let ledger = EvidenceLedger::new(100);
+        // next_id starts at 1, saturating_sub(1) = 0
+        assert_eq!(
+            ledger.latest_id(),
+            0,
+            "latest_id on empty ledger should return 0 (sentinel)"
+        );
+    }
+
+    #[test]
+    fn format_message_with_empty_posterior() {
+        let record = AtcDecisionRecord {
+            id: 1,
+            timestamp_micros: 1_000_000,
+            subsystem: AtcSubsystem::Liveness,
+            subject: "EmptyAgent".to_string(),
+            posterior: vec![], // empty posterior
+            action: "DeclareAlive".to_string(),
+            expected_loss: 0.5,
+            runner_up_loss: 3.0,
+            evidence_summary: "no evidence".to_string(),
+            calibration_healthy: true,
+            safe_mode_active: false,
+        };
+
+        let msg = record.format_message();
+        // Should not panic, should produce readable output
+        assert!(msg.contains("DeclareAlive"), "message should contain action");
+        assert!(msg.contains("EmptyAgent"), "message should contain subject");
+        assert!(msg.contains("Posterior: "), "message should contain Posterior label");
+        // With empty posterior, the posterior section should be empty but not crash
+        assert!(!msg.contains("NaN"), "message should not contain NaN");
+    }
+
+    #[test]
+    fn format_message_with_many_posterior_entries() {
+        let posterior: Vec<(String, f64)> = (0..10)
+            .map(|i| (format!("State{i}"), 0.1))
+            .collect();
+
+        let record = AtcDecisionRecord {
+            id: 99,
+            timestamp_micros: 5_000_000,
+            subsystem: AtcSubsystem::Conflict,
+            subject: "BigAgent".to_string(),
+            posterior,
+            action: "Ignore".to_string(),
+            expected_loss: 2.5,
+            runner_up_loss: 4.0,
+            evidence_summary: "lots of states".to_string(),
+            calibration_healthy: true,
+            safe_mode_active: false,
+        };
+
+        let msg = record.format_message();
+        // All 10 states should appear
+        for i in 0..10 {
+            assert!(
+                msg.contains(&format!("P(State{i})")),
+                "message should contain P(State{i}), got: {msg}"
+            );
+        }
+        // Probability formatting
+        assert!(msg.contains("0.10"), "probabilities should be formatted to 2 decimal places");
+    }
+
+    #[test]
+    fn ledger_capacity_one_keeps_only_last() {
+        let mut ledger = EvidenceLedger::new(1);
+        let core = default_liveness_core();
+
+        for i in 0..3 {
+            let subject = format!("Agent{i}");
+            ledger.record(&test_decision(&core, &subject, i64::from(i) * 1_000_000));
+        }
+
+        assert_eq!(ledger.len(), 1, "capacity-1 ledger should hold exactly 1 record");
+        assert!(ledger.get(1).is_none(), "first record should be evicted");
+        assert!(ledger.get(2).is_none(), "second record should be evicted");
+        let last = ledger.get(3).expect("third (last) record should survive");
+        assert_eq!(last.subject, "Agent2", "last record should be Agent2");
+        assert_eq!(
+            ledger.latest_id(),
+            3,
+            "latest_id should be 3 after 3 insertions"
+        );
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
