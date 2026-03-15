@@ -28,6 +28,7 @@ pub const COMPAT_MAIL_UI_PREFIX: &str = "/mail";
 /// Locked MCP base path aliases (interchangeable for dev convenience).
 pub const COMPAT_MCP_ALIASES: &[&str] = &["/api", "/mcp"];
 
+pub mod atc;
 mod ack_ttl;
 mod cleanup;
 pub mod console;
