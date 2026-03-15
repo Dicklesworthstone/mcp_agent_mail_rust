@@ -60,11 +60,7 @@ impl<S: AtcState, A: AtcAction> DecisionCore<S, A> {
     ///
     /// `prior` must be a valid probability distribution (non-negative, sums to ~1).
     /// `loss_entries` are `(action, state, cost)` triples.
-    pub fn new(
-        prior: &[(S, f64)],
-        loss_entries: &[(A, S, f64)],
-        alpha: f64,
-    ) -> Self {
+    pub fn new(prior: &[(S, f64)], loss_entries: &[(A, S, f64)], alpha: f64) -> Self {
         let mut loss_matrix = HashMap::new();
         let mut actions_set = Vec::new();
         for &(a, s, cost) in loss_entries {
@@ -119,7 +115,11 @@ impl<S: AtcState, A: AtcAction> DecisionCore<S, A> {
         self.posterior
             .iter()
             .map(|&(state, prob)| {
-                let cost = self.loss_matrix.get(&(action, state)).copied().unwrap_or(0.0);
+                let cost = self
+                    .loss_matrix
+                    .get(&(action, state))
+                    .copied()
+                    .unwrap_or(0.0);
                 cost * prob
             })
             .sum()
@@ -180,7 +180,10 @@ impl<S: AtcState, A: AtcAction> DecisionCore<S, A> {
     /// Look up a single loss matrix entry.
     #[must_use]
     pub fn loss_entry(&self, action: A, state: S) -> f64 {
-        self.loss_matrix.get(&(action, state)).copied().unwrap_or(0.0)
+        self.loss_matrix
+            .get(&(action, state))
+            .copied()
+            .unwrap_or(0.0)
     }
 
     /// Get the best action for a known true state (for regret computation).
@@ -281,9 +284,21 @@ pub fn default_liveness_core() -> DecisionCore<LivenessState, LivenessAction> {
             (LivenessAction::Suspect, LivenessState::Alive, 8.0),
             (LivenessAction::Suspect, LivenessState::Flaky, 2.0),
             (LivenessAction::Suspect, LivenessState::Dead, 6.0),
-            (LivenessAction::ReleaseReservations, LivenessState::Alive, 100.0),
-            (LivenessAction::ReleaseReservations, LivenessState::Flaky, 20.0),
-            (LivenessAction::ReleaseReservations, LivenessState::Dead, 1.0),
+            (
+                LivenessAction::ReleaseReservations,
+                LivenessState::Alive,
+                100.0,
+            ),
+            (
+                LivenessAction::ReleaseReservations,
+                LivenessState::Flaky,
+                20.0,
+            ),
+            (
+                LivenessAction::ReleaseReservations,
+                LivenessState::Dead,
+                1.0,
+            ),
         ],
         0.3,
     )
@@ -301,13 +316,41 @@ pub fn default_conflict_core() -> DecisionCore<ConflictState, ConflictAction> {
         &[
             (ConflictAction::Ignore, ConflictState::NoConflict, 0.0),
             (ConflictAction::Ignore, ConflictState::MildOverlap, 15.0),
-            (ConflictAction::Ignore, ConflictState::SevereCollision, 100.0),
-            (ConflictAction::AdvisoryMessage, ConflictState::NoConflict, 3.0),
-            (ConflictAction::AdvisoryMessage, ConflictState::MildOverlap, 1.0),
-            (ConflictAction::AdvisoryMessage, ConflictState::SevereCollision, 8.0),
-            (ConflictAction::ForceReservation, ConflictState::NoConflict, 12.0),
-            (ConflictAction::ForceReservation, ConflictState::MildOverlap, 4.0),
-            (ConflictAction::ForceReservation, ConflictState::SevereCollision, 2.0),
+            (
+                ConflictAction::Ignore,
+                ConflictState::SevereCollision,
+                100.0,
+            ),
+            (
+                ConflictAction::AdvisoryMessage,
+                ConflictState::NoConflict,
+                3.0,
+            ),
+            (
+                ConflictAction::AdvisoryMessage,
+                ConflictState::MildOverlap,
+                1.0,
+            ),
+            (
+                ConflictAction::AdvisoryMessage,
+                ConflictState::SevereCollision,
+                8.0,
+            ),
+            (
+                ConflictAction::ForceReservation,
+                ConflictState::NoConflict,
+                12.0,
+            ),
+            (
+                ConflictAction::ForceReservation,
+                ConflictState::MildOverlap,
+                4.0,
+            ),
+            (
+                ConflictAction::ForceReservation,
+                ConflictState::SevereCollision,
+                2.0,
+            ),
         ],
         0.3,
     )
@@ -594,10 +637,7 @@ mod tests {
     fn posterior_stays_normalized() {
         let mut core = default_liveness_core();
 
-        core.update_posterior(&[
-            (LivenessState::Alive, 0.5),
-            (LivenessState::Dead, 0.8),
-        ]);
+        core.update_posterior(&[(LivenessState::Alive, 0.5), (LivenessState::Dead, 0.8)]);
 
         let total: f64 = core.posterior().iter().map(|(_, p)| *p).sum();
         assert!(
@@ -743,14 +783,8 @@ mod tests {
         }
 
         assert_eq!(ledger.len(), 3, "should cap at capacity");
-        assert!(
-            ledger.get(1).is_none(),
-            "oldest records should be evicted"
-        );
-        assert!(
-            ledger.get(2).is_none(),
-            "second oldest should be evicted"
-        );
+        assert!(ledger.get(1).is_none(), "oldest records should be evicted");
+        assert!(ledger.get(2).is_none(), "second oldest should be evicted");
         assert!(ledger.get(3).is_some(), "third should survive");
         assert!(ledger.get(5).is_some(), "newest should survive");
     }
@@ -891,33 +925,44 @@ mod tests {
     fn partial_likelihoods_leave_unspecified_states_uninformative() {
         let mut core = default_liveness_core();
         // Initial posterior: Alive ~0.95, Flaky ~0.04, Dead ~0.01
-        let initial_posterior: Vec<(LivenessState, f64)> =
-            core.posterior().to_vec();
+        let initial_posterior: Vec<(LivenessState, f64)> = core.posterior().to_vec();
 
         // Update with likelihoods for only Alive and Dead — Flaky is absent
         // and should get likelihood 1.0 (uninformative).
         core.update_posterior(&[
-            (LivenessState::Alive, 0.1),  // strong evidence against Alive
-            (LivenessState::Dead, 5.0),   // strong evidence for Dead
+            (LivenessState::Alive, 0.1), // strong evidence against Alive
+            (LivenessState::Dead, 5.0),  // strong evidence for Dead
         ]);
 
         let posterior: Vec<(LivenessState, f64)> = core.posterior().to_vec();
 
         // Alive probability should have decreased
-        let alive_before = initial_posterior.iter()
-            .find(|(s, _)| *s == LivenessState::Alive).unwrap().1;
-        let alive_after = posterior.iter()
-            .find(|(s, _)| *s == LivenessState::Alive).unwrap().1;
+        let alive_before = initial_posterior
+            .iter()
+            .find(|(s, _)| *s == LivenessState::Alive)
+            .unwrap()
+            .1;
+        let alive_after = posterior
+            .iter()
+            .find(|(s, _)| *s == LivenessState::Alive)
+            .unwrap()
+            .1;
         assert!(
             alive_after < alive_before,
             "Alive should decrease with low likelihood, posterior: {posterior:?}"
         );
 
         // Dead probability should have increased
-        let dead_before = initial_posterior.iter()
-            .find(|(s, _)| *s == LivenessState::Dead).unwrap().1;
-        let dead_after = posterior.iter()
-            .find(|(s, _)| *s == LivenessState::Dead).unwrap().1;
+        let dead_before = initial_posterior
+            .iter()
+            .find(|(s, _)| *s == LivenessState::Dead)
+            .unwrap()
+            .1;
+        let dead_after = posterior
+            .iter()
+            .find(|(s, _)| *s == LivenessState::Dead)
+            .unwrap()
+            .1;
         assert!(
             dead_after > dead_before,
             "Dead should increase with high likelihood, posterior: {posterior:?}"
@@ -936,10 +981,16 @@ mod tests {
         // A core with exactly 2 actions — runner_up should be the loss
         // of the other action, not INFINITY.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-        enum TwoState { Good, Bad }
+        enum TwoState {
+            Good,
+            Bad,
+        }
         impl AtcState for TwoState {}
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-        enum TwoAction { Act, Wait }
+        enum TwoAction {
+            Act,
+            Wait,
+        }
         impl AtcAction for TwoAction {}
 
         let core = DecisionCore::new(
@@ -994,9 +1045,21 @@ mod tests {
                 (LivenessAction::Suspect, LivenessState::Alive, 5.0),
                 (LivenessAction::Suspect, LivenessState::Flaky, 2.0),
                 (LivenessAction::Suspect, LivenessState::Dead, 10.0),
-                (LivenessAction::ReleaseReservations, LivenessState::Alive, 100.0),
-                (LivenessAction::ReleaseReservations, LivenessState::Flaky, 20.0),
-                (LivenessAction::ReleaseReservations, LivenessState::Dead, 1.0),
+                (
+                    LivenessAction::ReleaseReservations,
+                    LivenessState::Alive,
+                    100.0,
+                ),
+                (
+                    LivenessAction::ReleaseReservations,
+                    LivenessState::Flaky,
+                    20.0,
+                ),
+                (
+                    LivenessAction::ReleaseReservations,
+                    LivenessState::Dead,
+                    1.0,
+                ),
             ],
             0.3,
         );
@@ -1026,8 +1089,16 @@ mod tests {
             &[
                 (LivenessAction::DeclareAlive, LivenessState::Alive, 0.0),
                 (LivenessAction::DeclareAlive, LivenessState::Dead, 50.0),
-                (LivenessAction::ReleaseReservations, LivenessState::Alive, 100.0),
-                (LivenessAction::ReleaseReservations, LivenessState::Dead, 1.0),
+                (
+                    LivenessAction::ReleaseReservations,
+                    LivenessState::Alive,
+                    100.0,
+                ),
+                (
+                    LivenessAction::ReleaseReservations,
+                    LivenessState::Dead,
+                    1.0,
+                ),
             ],
             -1.0,
         );
@@ -1037,16 +1108,15 @@ mod tests {
         let mut slow_core = core;
         let before: Vec<f64> = slow_core.posterior().iter().map(|(_, p)| *p).collect();
 
-        slow_core.update_posterior(&[
-            (LivenessState::Alive, 0.01),
-            (LivenessState::Dead, 10.0),
-        ]);
+        slow_core.update_posterior(&[(LivenessState::Alive, 0.01), (LivenessState::Dead, 10.0)]);
 
         let after: Vec<f64> = slow_core.posterior().iter().map(|(_, p)| *p).collect();
         let posterior = slow_core.posterior();
 
         // With alpha clamped to 0.01, the change should be tiny (< 0.05)
-        let delta: f64 = before.iter().zip(after.iter())
+        let delta: f64 = before
+            .iter()
+            .zip(after.iter())
             .map(|(b, a)| (b - a).abs())
             .sum();
         assert!(
@@ -1121,18 +1191,22 @@ mod tests {
 
         let msg = record.format_message();
         // Should not panic, should produce readable output
-        assert!(msg.contains("DeclareAlive"), "message should contain action");
+        assert!(
+            msg.contains("DeclareAlive"),
+            "message should contain action"
+        );
         assert!(msg.contains("EmptyAgent"), "message should contain subject");
-        assert!(msg.contains("Posterior: "), "message should contain Posterior label");
+        assert!(
+            msg.contains("Posterior: "),
+            "message should contain Posterior label"
+        );
         // With empty posterior, the posterior section should be empty but not crash
         assert!(!msg.contains("NaN"), "message should not contain NaN");
     }
 
     #[test]
     fn format_message_with_many_posterior_entries() {
-        let posterior: Vec<(String, f64)> = (0..10)
-            .map(|i| (format!("State{i}"), 0.1))
-            .collect();
+        let posterior: Vec<(String, f64)> = (0..10).map(|i| (format!("State{i}"), 0.1)).collect();
 
         let record = AtcDecisionRecord {
             id: 99,
@@ -1157,7 +1231,10 @@ mod tests {
             );
         }
         // Probability formatting
-        assert!(msg.contains("0.10"), "probabilities should be formatted to 2 decimal places");
+        assert!(
+            msg.contains("0.10"),
+            "probabilities should be formatted to 2 decimal places"
+        );
     }
 
     #[test]
@@ -1170,7 +1247,11 @@ mod tests {
             ledger.record(&test_decision(&core, &subject, i64::from(i) * 1_000_000));
         }
 
-        assert_eq!(ledger.len(), 1, "capacity-1 ledger should hold exactly 1 record");
+        assert_eq!(
+            ledger.len(),
+            1,
+            "capacity-1 ledger should hold exactly 1 record"
+        );
         assert!(ledger.get(1).is_none(), "first record should be evicted");
         assert!(ledger.get(2).is_none(), "second record should be evicted");
         let last = ledger.get(3).expect("third (last) record should survive");
@@ -1482,7 +1563,10 @@ mod liveness_tests {
         let mut rhythm = AgentRhythm::new(60.0);
         // First observation sets the anchor
         rhythm.observe(1_000_000);
-        assert_eq!(rhythm.observation_count, 0, "first observe just sets anchor");
+        assert_eq!(
+            rhythm.observation_count, 0,
+            "first observe just sets anchor"
+        );
 
         // Second observation at +30s → delta = 30s
         rhythm.observe(31_000_000);
@@ -1565,7 +1649,7 @@ mod liveness_tests {
     fn observe_with_out_of_order_timestamps() {
         let mut rhythm = AgentRhythm::new(60.0);
         rhythm.observe(100_000_000); // anchor at 100s
-        rhythm.observe(50_000_000);  // earlier timestamp (clock skew)
+        rhythm.observe(50_000_000); // earlier timestamp (clock skew)
 
         // Delta should be clamped to 0 via .max(0)
         assert!(
@@ -1578,8 +1662,14 @@ mod liveness_tests {
             "var_interval should not go negative, got {}",
             rhythm.var_interval
         );
-        assert!(rhythm.avg_interval.is_finite(), "avg_interval should be finite");
-        assert!(rhythm.var_interval.is_finite(), "var_interval should be finite");
+        assert!(
+            rhythm.avg_interval.is_finite(),
+            "avg_interval should be finite"
+        );
+        assert!(
+            rhythm.var_interval.is_finite(),
+            "var_interval should be finite"
+        );
     }
 
     #[test]
@@ -1589,8 +1679,14 @@ mod liveness_tests {
         rhythm.observe(100_000_000); // delta = 0
 
         // No division by zero or NaN
-        assert!(rhythm.avg_interval.is_finite(), "avg should be finite with zero delta");
-        assert!(rhythm.var_interval.is_finite(), "var should be finite with zero delta");
+        assert!(
+            rhythm.avg_interval.is_finite(),
+            "avg should be finite with zero delta"
+        );
+        assert!(
+            rhythm.var_interval.is_finite(),
+            "var should be finite with zero delta"
+        );
         assert!(rhythm.std_dev().is_finite(), "std_dev should be finite");
         assert_eq!(rhythm.observation_count, 1, "should count 1 observation");
     }
@@ -1793,7 +1889,10 @@ mod conflict_tests {
 
         let cycles = find_deadlock_cycles(&graph);
         // A self-loop creates an SCC of size 1, which we filter out
-        assert!(cycles.is_empty(), "self-loop should not be reported as deadlock");
+        assert!(
+            cycles.is_empty(),
+            "self-loop should not be reported as deadlock"
+        );
     }
 }
 
@@ -1892,12 +1991,7 @@ impl EProcessMonitor {
     /// Each e-process (global, per-subsystem, per-agent) maintains its own
     /// independent ONS state and bet sizing.  This prevents a drifting
     /// subsystem from contaminating the bet size for well-calibrated ones.
-    pub fn update(
-        &mut self,
-        correct: bool,
-        subsystem: AtcSubsystem,
-        agent: Option<&str>,
-    ) {
+    pub fn update(&mut self, correct: bool, subsystem: AtcSubsystem, agent: Option<&str>) {
         let z = if correct { 0.0 } else { 1.0 };
         let alpha = 1.0 - self.target_coverage;
         let centered = z - alpha;
@@ -2266,8 +2360,16 @@ mod martingale_tests {
         let sources = monitor.drift_sources();
         assert!(!sources.is_empty(), "should identify drift source");
         // Liveness should have higher e-value than conflict
-        let liveness_e = monitor.per_subsystem.get(&AtcSubsystem::Liveness).map(|o| o.e_value).unwrap_or(0.0);
-        let conflict_e = monitor.per_subsystem.get(&AtcSubsystem::Conflict).map(|o| o.e_value).unwrap_or(0.0);
+        let liveness_e = monitor
+            .per_subsystem
+            .get(&AtcSubsystem::Liveness)
+            .map(|o| o.e_value)
+            .unwrap_or(0.0);
+        let conflict_e = monitor
+            .per_subsystem
+            .get(&AtcSubsystem::Conflict)
+            .map(|o| o.e_value)
+            .unwrap_or(0.0);
         assert!(
             liveness_e > conflict_e,
             "liveness (all wrong) should have higher e-value than conflict (mostly right)"
@@ -2283,8 +2385,16 @@ mod martingale_tests {
             monitor.update(true, AtcSubsystem::Liveness, Some("AgentB"));
         }
 
-        let agent_a_e = monitor.per_agent.get("AgentA").map(|o| o.e_value).unwrap_or(0.0);
-        let agent_b_e = monitor.per_agent.get("AgentB").map(|o| o.e_value).unwrap_or(0.0);
+        let agent_a_e = monitor
+            .per_agent
+            .get("AgentA")
+            .map(|o| o.e_value)
+            .unwrap_or(0.0);
+        let agent_b_e = monitor
+            .per_agent
+            .get("AgentB")
+            .map(|o| o.e_value)
+            .unwrap_or(0.0);
         assert!(
             agent_a_e > agent_b_e,
             "AgentA (all wrong) should have higher e-value than AgentB (all right)"
@@ -2421,14 +2531,7 @@ mod martingale_tests {
     fn regret_tracker_recent_window() {
         let mut tracker = RegretTracker::new(3);
         for i in 0_u64..5 {
-            tracker.record_outcome(
-                i,
-                "A",
-                i as f64 * 2.0,
-                "B",
-                0.0,
-                i as i64,
-            );
+            tracker.record_outcome(i, "A", i as f64 * 2.0, "B", 0.0, i as i64);
         }
         assert_eq!(tracker.recent.len(), 3, "should cap at max_recent");
         // Recent window should contain the last 3 entries (ids 2,3,4)
@@ -2503,9 +2606,7 @@ impl CalibrationGuard {
         // Enter safe mode if ANY of these signals fire:
         // 1. E-process exceeds threshold (sustained miscalibration)
         // 2. CUSUM detected a degradation regime change
-        if !self.safe_mode
-            && (eprocess.miscalibrated() || cusum.degradation_detected())
-        {
+        if !self.safe_mode && (eprocess.miscalibrated() || cusum.degradation_detected()) {
             self.safe_mode = true;
             self.safe_mode_since = timestamp_micros;
             self.consecutive_correct = 0;
@@ -2957,7 +3058,10 @@ mod calibration_tests {
         for i in 0..20 {
             guard.update(&eprocess, &cusum, true, (i + 2) * 1_000_000);
         }
-        assert!(guard.is_safe_mode(), "should NOT exit while eprocess is miscalibrated");
+        assert!(
+            guard.is_safe_mode(),
+            "should NOT exit while eprocess is miscalibrated"
+        );
     }
 
     #[test]
@@ -3070,7 +3174,10 @@ mod engine_tests {
         }
         let now = 9 * 60_000_000 + 30_000_000; // only 30s since last activity
         let actions = engine.evaluate_liveness(now);
-        assert!(actions.is_empty(), "active agent should not trigger any action");
+        assert!(
+            actions.is_empty(),
+            "active agent should not trigger any action"
+        );
     }
 
     #[test]
@@ -3134,7 +3241,9 @@ mod engine_tests {
                 since: 2,
             }],
         );
-        engine.conflict_graphs.insert("test-project".to_string(), graph);
+        engine
+            .conflict_graphs
+            .insert("test-project".to_string(), graph);
 
         let deadlocks = engine.detect_deadlocks();
         assert_eq!(deadlocks.len(), 1);
@@ -3146,7 +3255,10 @@ mod engine_tests {
     #[test]
     fn is_self_event_filters_correctly() {
         assert!(AtcEngine::is_self_event(ATC_AGENT_NAME, &[]));
-        assert!(AtcEngine::is_self_event("other", &[ATC_AGENT_NAME.to_string()]));
+        assert!(AtcEngine::is_self_event(
+            "other",
+            &[ATC_AGENT_NAME.to_string()]
+        ));
         assert!(!AtcEngine::is_self_event("other", &["another".to_string()]));
     }
 
@@ -3225,7 +3337,8 @@ mod engine_tests {
         let actions = engine.evaluate_liveness(now);
 
         // No actions should be generated for Dead agents
-        let zombie_actions: Vec<_> = actions.iter()
+        let zombie_actions: Vec<_> = actions
+            .iter()
             .filter(|(name, _)| name == "Zombie")
             .collect();
         assert!(
@@ -3335,10 +3448,18 @@ impl SynthesisEvent {
     #[must_use]
     pub const fn timestamp_micros(&self) -> i64 {
         match self {
-            Self::MessageSent { timestamp_micros, .. }
-            | Self::MessageReceived { timestamp_micros, .. }
-            | Self::ReservationGranted { timestamp_micros, .. }
-            | Self::ReservationReleased { timestamp_micros, .. }
+            Self::MessageSent {
+                timestamp_micros, ..
+            }
+            | Self::MessageReceived {
+                timestamp_micros, ..
+            }
+            | Self::ReservationGranted {
+                timestamp_micros, ..
+            }
+            | Self::ReservationReleased {
+                timestamp_micros, ..
+            }
             | Self::ConflictDetected { timestamp_micros }
             | Self::ConflictResolved { timestamp_micros }
             | Self::AtcIntervention { timestamp_micros } => *timestamp_micros,
@@ -3357,7 +3478,12 @@ impl SessionSummary {
         self.input_generation += 1;
 
         match event {
-            SynthesisEvent::MessageSent { from, to, thread_id, .. } => {
+            SynthesisEvent::MessageSent {
+                from,
+                to,
+                thread_id,
+                ..
+            } => {
                 self.messages_sent += 1;
                 self.active_agents.insert(from.clone());
                 for recipient in to {
@@ -3566,8 +3692,12 @@ mod synthesis_tests {
     #[test]
     fn absorb_conflict_events() {
         let mut summary = SessionSummary::default();
-        summary.absorb(&SynthesisEvent::ConflictDetected { timestamp_micros: 1 });
-        summary.absorb(&SynthesisEvent::ConflictResolved { timestamp_micros: 2 });
+        summary.absorb(&SynthesisEvent::ConflictDetected {
+            timestamp_micros: 1,
+        });
+        summary.absorb(&SynthesisEvent::ConflictResolved {
+            timestamp_micros: 2,
+        });
 
         assert_eq!(summary.conflicts_detected, 1);
         assert_eq!(summary.conflicts_resolved, 1);
@@ -3612,15 +3742,22 @@ mod synthesis_tests {
         for i in 0..10 {
             summary.absorb(&msg_sent("BlueFox", &["RedHawk"], Some("feat-1"), i));
         }
-        summary.absorb(&SynthesisEvent::ConflictDetected { timestamp_micros: 100 });
-        summary.absorb(&SynthesisEvent::AtcIntervention { timestamp_micros: 101 });
+        summary.absorb(&SynthesisEvent::ConflictDetected {
+            timestamp_micros: 100,
+        });
+        summary.absorb(&SynthesisEvent::AtcIntervention {
+            timestamp_micros: 101,
+        });
 
         let output = summary.formatted().to_string();
         assert!(output.contains("10 sent"), "should show message count");
         assert!(output.contains("BlueFox"), "should show agent name");
         assert!(output.contains("feat-1"), "should show thread");
         assert!(output.contains("Conflicts: 1"), "should show conflicts");
-        assert!(output.contains("ATC interventions: 1"), "should show interventions");
+        assert!(
+            output.contains("ATC interventions: 1"),
+            "should show interventions"
+        );
     }
 
     #[test]
@@ -3628,7 +3765,10 @@ mod synthesis_tests {
         let events = vec![
             msg_sent("A", &["B"], Some("t1"), 1),
             msg_sent("B", &["C"], Some("t2"), 2),
-            SynthesisEvent::ReservationGranted { agent: "A".to_string(), timestamp_micros: 3 },
+            SynthesisEvent::ReservationGranted {
+                agent: "A".to_string(),
+                timestamp_micros: 3,
+            },
         ];
 
         let mut s1 = SessionSummary::default();
@@ -3673,7 +3813,7 @@ impl AgentLoadModel {
             throughput_ewma: 0.0,
             active_reservations: 0,
             pending_inbox: 0,
-            predicted_capacity: 1.0, // assume idle initially
+            predicted_capacity: 1.0,  // assume idle initially
             prediction_accuracy: 0.5, // neutral accuracy
             observation_count: 0,
         }
@@ -3704,7 +3844,9 @@ impl AgentLoadModel {
 
     /// Record whether a routing prediction was accurate.
     pub fn record_accuracy(&mut self, actual_response_secs: f64, expected_response_secs: f64) {
-        let error = ((actual_response_secs - expected_response_secs) / expected_response_secs.max(1.0)).abs();
+        let error = ((actual_response_secs - expected_response_secs)
+            / expected_response_secs.max(1.0))
+        .abs();
         let correct = if error < 0.5 { 1.0 } else { 0.0 };
         self.prediction_accuracy = 0.9 * self.prediction_accuracy + 0.1 * correct;
         self.observation_count += 1;
@@ -3773,7 +3915,10 @@ mod load_routing_tests {
     fn reservations_reduce_capacity() {
         let mut model = AgentLoadModel::new();
         model.update_counts(5, 0);
-        assert!(model.predicted_capacity < 0.5, "5 reservations should reduce capacity");
+        assert!(
+            model.predicted_capacity < 0.5,
+            "5 reservations should reduce capacity"
+        );
         assert!(model.routing_score() < 0.5);
     }
 
@@ -3781,7 +3926,10 @@ mod load_routing_tests {
     fn pending_inbox_reduces_capacity() {
         let mut model = AgentLoadModel::new();
         model.update_counts(0, 10);
-        assert!(model.predicted_capacity < 0.8, "10 pending messages should reduce capacity");
+        assert!(
+            model.predicted_capacity < 0.8,
+            "10 pending messages should reduce capacity"
+        );
     }
 
     #[test]
@@ -3850,7 +3998,10 @@ mod load_routing_tests {
         agents.insert("SaturatedAgent".to_string(), saturated);
 
         let target = select_route_target(&agents, "Requester", 0.5);
-        assert!(target.is_none(), "should return None when all below threshold");
+        assert!(
+            target.is_none(),
+            "should return None when all below threshold"
+        );
     }
 
     #[test]
@@ -3918,11 +4069,7 @@ impl ThreadParticipationGraph {
             for j in (i + 1)..agents.len() {
                 let count = self.shared_thread_count(agents[i], agents[j]);
                 if count >= min_shared {
-                    pairs.push((
-                        agents[i].to_string(),
-                        agents[j].to_string(),
-                        count,
-                    ));
+                    pairs.push((agents[i].to_string(), agents[j].to_string(), count));
                 }
             }
         }
@@ -4036,7 +4183,11 @@ mod predictive_tests {
 
         let all_pairs = graph.high_risk_pairs(1);
         // A-B share 3, A-C share 1, B-C share 1 (both in t1) = 3 pairs
-        assert_eq!(all_pairs.len(), 3, "all three pairs should exceed threshold 1");
+        assert_eq!(
+            all_pairs.len(),
+            3,
+            "all three pairs should exceed threshold 1"
+        );
     }
 
     #[test]
@@ -4067,7 +4218,10 @@ mod predictive_tests {
         let gain_certain = probe_information_gain(&certain);
 
         assert!(gain_uniform > gain_certain);
-        assert!(gain_certain < 0.01, "certain posterior should have ~0 entropy");
+        assert!(
+            gain_certain < 0.01,
+            "certain posterior should have ~0 entropy"
+        );
         assert!(gain_uniform > 1.0, "uniform should have high entropy");
     }
 
@@ -4110,7 +4264,10 @@ mod predictive_tests {
 
         let ranked = rank_probe_targets(&agents, 0.0);
         assert!(!ranked.is_empty());
-        assert_eq!(ranked[0].0, "Uncertain", "most uncertain should be probed first");
+        assert_eq!(
+            ranked[0].0, "Uncertain",
+            "most uncertain should be probed first"
+        );
     }
 
     #[test]
@@ -4130,7 +4287,10 @@ mod predictive_tests {
         );
 
         let ranked = rank_probe_targets(&agents, 0.0);
-        assert!(ranked.is_empty(), "ATC should be excluded from probe targets");
+        assert!(
+            ranked.is_empty(),
+            "ATC should be excluded from probe targets"
+        );
     }
 }
 
@@ -4166,8 +4326,7 @@ pub fn vcg_priority(participants: &[ConflictParticipant]) -> Vec<(String, f64)> 
                 .enumerate()
                 .filter(|(j, _)| *j != i)
                 .map(|(_, other)| {
-                    other.remaining_tasks as f64
-                        * other.estimated_completion_mins.max(1) as f64
+                    other.remaining_tasks as f64 * other.estimated_completion_mins.max(1) as f64
                         / 60.0
                 })
                 .sum();
@@ -4351,7 +4510,10 @@ mod advanced_tests {
         }];
         let priorities = vcg_priority(&participants);
         assert_eq!(priorities.len(), 1);
-        assert!((priorities[0].1 - 0.0).abs() < f64::EPSILON, "single agent has 0 externality");
+        assert!(
+            (priorities[0].1 - 0.0).abs() < f64::EPSILON,
+            "single agent has 0 externality"
+        );
     }
 
     // ── Queueing Theory (Track 14) ───────────────────────────────────
@@ -4395,7 +4557,10 @@ mod advanced_tests {
         for _ in 0..100 {
             pid.update(1.0, 1.0);
         }
-        assert!(pid.current_value > 10.0, "positive error should increase value");
+        assert!(
+            pid.current_value > 10.0,
+            "positive error should increase value"
+        );
     }
 
     #[test]
@@ -4406,7 +4571,10 @@ mod advanced_tests {
             pid.update(100.0, 1.0);
         }
         assert!(pid.current_value <= 100.0, "should not exceed 10× original");
-        assert!(pid.current_value >= 1.0, "should not go below 0.1× original");
+        assert!(
+            pid.current_value >= 1.0,
+            "should not go below 0.1× original"
+        );
     }
 
     #[test]
@@ -4437,7 +4605,10 @@ mod advanced_tests {
         let mut pid = PidState::new(10.0);
         assert!((pid.deviation() - 0.0).abs() < f64::EPSILON);
         pid.update(1.0, 1.0);
-        assert!(pid.deviation() > 0.0, "positive error should increase deviation");
+        assert!(
+            pid.deviation() > 0.0,
+            "positive error should increase deviation"
+        );
     }
 }
 
@@ -4459,15 +4630,26 @@ mod edge_case_tests {
         core.update_posterior(&[(LivenessState::Alive, 0.01)]);
         let after = core.posterior().to_vec();
         // Alive probability should decrease (low likelihood)
-        let alive_before = before.iter().find(|(s, _)| *s == LivenessState::Alive).unwrap().1;
-        let alive_after = after.iter().find(|(s, _)| *s == LivenessState::Alive).unwrap().1;
+        let alive_before = before
+            .iter()
+            .find(|(s, _)| *s == LivenessState::Alive)
+            .unwrap()
+            .1;
+        let alive_after = after
+            .iter()
+            .find(|(s, _)| *s == LivenessState::Alive)
+            .unwrap()
+            .1;
         assert!(
             alive_after < alive_before,
             "alive should decrease: before={alive_before:.4}, after={alive_after:.4}"
         );
         // Posterior should still be normalized
         let total: f64 = after.iter().map(|(_, p)| *p).sum();
-        assert!((total - 1.0).abs() < 1e-10, "should stay normalized: {total}");
+        assert!(
+            (total - 1.0).abs() < 1e-10,
+            "should stay normalized: {total}"
+        );
     }
 
     #[test]
@@ -4478,13 +4660,24 @@ mod edge_case_tests {
             &[
                 (LivenessAction::DeclareAlive, LivenessState::Alive, 0.0),
                 (LivenessAction::DeclareAlive, LivenessState::Dead, 50.0),
-                (LivenessAction::ReleaseReservations, LivenessState::Alive, 100.0),
-                (LivenessAction::ReleaseReservations, LivenessState::Dead, 1.0),
+                (
+                    LivenessAction::ReleaseReservations,
+                    LivenessState::Alive,
+                    100.0,
+                ),
+                (
+                    LivenessAction::ReleaseReservations,
+                    LivenessState::Dead,
+                    1.0,
+                ),
             ],
             0.3,
         );
         let (_best, best_loss, runner_up) = core.choose_action();
-        assert!(runner_up.is_finite(), "runner_up should not be INFINITY with 2 actions");
+        assert!(
+            runner_up.is_finite(),
+            "runner_up should not be INFINITY with 2 actions"
+        );
         assert!(runner_up > best_loss);
     }
 
@@ -4499,19 +4692,51 @@ mod edge_case_tests {
             &[
                 (ConflictAction::Ignore, ConflictState::NoConflict, 0.0),
                 (ConflictAction::Ignore, ConflictState::MildOverlap, 15.0),
-                (ConflictAction::Ignore, ConflictState::SevereCollision, 100.0),
-                (ConflictAction::AdvisoryMessage, ConflictState::NoConflict, 3.0),
-                (ConflictAction::AdvisoryMessage, ConflictState::MildOverlap, 1.0),
-                (ConflictAction::AdvisoryMessage, ConflictState::SevereCollision, 8.0),
-                (ConflictAction::ForceReservation, ConflictState::NoConflict, 12.0),
-                (ConflictAction::ForceReservation, ConflictState::MildOverlap, 4.0),
-                (ConflictAction::ForceReservation, ConflictState::SevereCollision, 2.0),
+                (
+                    ConflictAction::Ignore,
+                    ConflictState::SevereCollision,
+                    100.0,
+                ),
+                (
+                    ConflictAction::AdvisoryMessage,
+                    ConflictState::NoConflict,
+                    3.0,
+                ),
+                (
+                    ConflictAction::AdvisoryMessage,
+                    ConflictState::MildOverlap,
+                    1.0,
+                ),
+                (
+                    ConflictAction::AdvisoryMessage,
+                    ConflictState::SevereCollision,
+                    8.0,
+                ),
+                (
+                    ConflictAction::ForceReservation,
+                    ConflictState::NoConflict,
+                    12.0,
+                ),
+                (
+                    ConflictAction::ForceReservation,
+                    ConflictState::MildOverlap,
+                    4.0,
+                ),
+                (
+                    ConflictAction::ForceReservation,
+                    ConflictState::SevereCollision,
+                    2.0,
+                ),
             ],
             0.3,
         );
         let (action, _, _) = core.choose_action();
         // Under uniform: Advisory=(3+1+8)/3=4, Ignore=(0+15+100)/3=38.3, Force=(12+4+2)/3=6
-        assert_eq!(action, ConflictAction::AdvisoryMessage, "advisory has lowest expected loss under uniform");
+        assert_eq!(
+            action,
+            ConflictAction::AdvisoryMessage,
+            "advisory has lowest expected loss under uniform"
+        );
     }
 
     #[test]
@@ -4521,7 +4746,10 @@ mod edge_case_tests {
             &[(LivenessAction::DeclareAlive, LivenessState::Alive, 0.0)],
             -5.0, // negative alpha
         );
-        assert!((core.alpha - 0.01).abs() < f64::EPSILON, "alpha should be clamped to 0.01");
+        assert!(
+            (core.alpha - 0.01).abs() < f64::EPSILON,
+            "alpha should be clamped to 0.01"
+        );
     }
 
     #[test]
@@ -4536,7 +4764,9 @@ mod edge_case_tests {
             assert!(
                 (before[i].1 - after[i].1).abs() < 1e-10,
                 "state {:?} should be unchanged: {:.6} vs {:.6}",
-                before[i].0, before[i].1, after[i].1,
+                before[i].0,
+                before[i].1,
+                after[i].1,
             );
         }
     }
@@ -4588,7 +4818,10 @@ mod edge_case_tests {
             safe_mode_active: false,
         };
         let msg = record.format_message();
-        assert!(msg.contains("Decision #1"), "should not panic with empty posterior");
+        assert!(
+            msg.contains("Decision #1"),
+            "should not panic with empty posterior"
+        );
     }
 
     #[test]
@@ -4610,7 +4843,11 @@ mod edge_case_tests {
                 timestamp_micros: i as i64,
             });
         }
-        assert_eq!(ledger.len(), 1, "capacity-1 ledger should hold only 1 record");
+        assert_eq!(
+            ledger.len(),
+            1,
+            "capacity-1 ledger should hold only 1 record"
+        );
         assert!(ledger.get(3).is_some(), "should hold the last record");
         assert!(ledger.get(1).is_none(), "first record should be evicted");
     }
@@ -4621,10 +4858,13 @@ mod edge_case_tests {
     fn observe_out_of_order_timestamps() {
         let mut rhythm = AgentRhythm::new(60.0);
         rhythm.observe(100_000_000); // 100s
-        rhythm.observe(50_000_000);  // 50s (before previous!)
+        rhythm.observe(50_000_000); // 50s (before previous!)
         // Delta should be clamped to 0 via .max(0)
         assert!(rhythm.avg_interval >= 0.0, "avg should not go negative");
-        assert!(rhythm.var_interval >= 0.0, "variance should not go negative");
+        assert!(
+            rhythm.var_interval >= 0.0,
+            "variance should not go negative"
+        );
     }
 
     #[test]
@@ -4650,7 +4890,10 @@ mod edge_case_tests {
 
         let now = 9 * 60_000_000 + 600_000_000;
         let actions = engine.evaluate_liveness(now);
-        let dead_actions: Vec<_> = actions.iter().filter(|(name, _)| name == "DeadAgent").collect();
+        let dead_actions: Vec<_> = actions
+            .iter()
+            .filter(|(name, _)| name == "DeadAgent")
+            .collect();
         assert!(dead_actions.is_empty(), "should skip Dead agents");
     }
 
@@ -4710,7 +4953,10 @@ mod edge_case_tests {
         assert!(cusum.degradation_detected());
 
         guard.update(&eprocess, &cusum, false, 1_000_000);
-        assert!(guard.is_safe_mode(), "both signals should trigger safe mode");
+        assert!(
+            guard.is_safe_mode(),
+            "both signals should trigger safe mode"
+        );
 
         // Recovery requires BOTH to clear
         let healthy_ep = EProcessMonitor::new(0.85, 20.0);
@@ -4718,7 +4964,10 @@ mod edge_case_tests {
         for i in 0..25 {
             guard.update(&healthy_ep, &cusum, true, (i + 2) * 1_000_000);
         }
-        assert!(guard.is_safe_mode(), "should stay in safe mode while cusum degraded");
+        assert!(
+            guard.is_safe_mode(),
+            "should stay in safe mode while cusum degraded"
+        );
     }
 
     #[test]
@@ -4727,7 +4976,10 @@ mod edge_case_tests {
         let mut monitor = EProcessMonitor::new(1.0, 20.0);
         monitor.update(true, AtcSubsystem::Liveness, None);
         monitor.update(false, AtcSubsystem::Liveness, None);
-        assert!(monitor.e_value().is_finite(), "should handle alpha=0 without panic");
+        assert!(
+            monitor.e_value().is_finite(),
+            "should handle alpha=0 without panic"
+        );
     }
 
     #[test]
@@ -4736,7 +4988,10 @@ mod edge_case_tests {
         let mut monitor = EProcessMonitor::new(0.0, 20.0);
         monitor.update(true, AtcSubsystem::Liveness, None);
         monitor.update(false, AtcSubsystem::Liveness, None);
-        assert!(monitor.e_value().is_finite(), "should handle alpha=1 without panic");
+        assert!(
+            monitor.e_value().is_finite(),
+            "should handle alpha=1 without panic"
+        );
     }
 
     #[test]
@@ -4795,7 +5050,10 @@ mod edge_case_tests {
         for _ in 0..50 {
             pid.update(-1.0, 1.0);
         }
-        assert!(pid.current_value < 10.0, "negative error should decrease value");
+        assert!(
+            pid.current_value < 10.0,
+            "negative error should decrease value"
+        );
     }
 
     #[test]
@@ -4833,18 +5091,21 @@ mod edge_case_tests {
         // B's externality = A_cost + C_cost = (1*10/60) + (10*60/60) = 0.167 + 10 = 10.167
         // C's externality = A_cost + B_cost = (1*10/60) + (5*30/60) = 0.167 + 2.5 = 2.667
         // A has highest externality → should yield first
-        assert_eq!(priorities[0].0, "A", "A should yield first (highest externality)");
+        assert_eq!(
+            priorities[0].0, "A",
+            "A should yield first (highest externality)"
+        );
     }
 
     #[test]
     fn probe_gain_binary_posterior() {
-        let binary = vec![
-            (LivenessState::Alive, 0.5),
-            (LivenessState::Dead, 0.5),
-        ];
+        let binary = vec![(LivenessState::Alive, 0.5), (LivenessState::Dead, 0.5)];
         let gain = probe_information_gain(&binary);
         // Binary entropy at p=0.5 = ln(2) ≈ 0.693
-        assert!((gain - 2.0_f64.ln()).abs() < 0.01, "should be ln(2) for binary uniform");
+        assert!(
+            (gain - 2.0_f64.ln()).abs() < 0.01,
+            "should be ln(2) for binary uniform"
+        );
     }
 
     #[test]
@@ -4858,7 +5119,7 @@ mod edge_case_tests {
     #[test]
     fn kingman_lower_cv_means_shorter_wait() {
         let det = kingman_wait_time(0.5, 1.0, 0.0, 0.0); // deterministic
-        let var = kingman_wait_time(0.5, 1.0, 1.0, 1.0);  // variable
+        let var = kingman_wait_time(0.5, 1.0, 1.0, 1.0); // variable
         assert!(
             det < var,
             "deterministic service should have shorter wait: {det} vs {var}"

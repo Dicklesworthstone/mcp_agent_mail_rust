@@ -472,7 +472,9 @@ pub fn get_composite_tmux_pane_id() -> Option<String> {
     }
 
     // Fallback to bare $TMUX_PANE
-    std::env::var("TMUX_PANE").ok().filter(|s| !s.trim().is_empty())
+    std::env::var("TMUX_PANE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
 }
 
 // ---------------------------------------------------------------------------
