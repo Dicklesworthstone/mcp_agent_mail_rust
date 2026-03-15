@@ -1558,6 +1558,81 @@ mod liveness_tests {
     fn atc_agent_name_is_consistent() {
         assert_eq!(ATC_AGENT_NAME, "AirTrafficControl");
     }
+
+    // ── AgentRhythm boundary condition tests (br-oco5x) ───────────────
+
+    #[test]
+    fn observe_with_out_of_order_timestamps() {
+        let mut rhythm = AgentRhythm::new(60.0);
+        rhythm.observe(100_000_000); // anchor at 100s
+        rhythm.observe(50_000_000);  // earlier timestamp (clock skew)
+
+        // Delta should be clamped to 0 via .max(0)
+        assert!(
+            rhythm.avg_interval >= 0.0,
+            "avg_interval should not go negative after out-of-order timestamps, got {}",
+            rhythm.avg_interval
+        );
+        assert!(
+            rhythm.var_interval >= 0.0,
+            "var_interval should not go negative, got {}",
+            rhythm.var_interval
+        );
+        assert!(rhythm.avg_interval.is_finite(), "avg_interval should be finite");
+        assert!(rhythm.var_interval.is_finite(), "var_interval should be finite");
+    }
+
+    #[test]
+    fn observe_with_same_timestamp_twice() {
+        let mut rhythm = AgentRhythm::new(60.0);
+        rhythm.observe(100_000_000);
+        rhythm.observe(100_000_000); // delta = 0
+
+        // No division by zero or NaN
+        assert!(rhythm.avg_interval.is_finite(), "avg should be finite with zero delta");
+        assert!(rhythm.var_interval.is_finite(), "var should be finite with zero delta");
+        assert!(rhythm.std_dev().is_finite(), "std_dev should be finite");
+        assert_eq!(rhythm.observation_count, 1, "should count 1 observation");
+    }
+
+    #[test]
+    fn is_suspicious_before_any_observation() {
+        let rhythm = AgentRhythm::new(60.0);
+        // last_activity_ts = 0 (sentinel), so is_suspicious should return false
+        assert!(
+            !rhythm.is_suspicious(1_000_000_000, 3.0),
+            "should not be suspicious before any observation (last_activity_ts = 0)"
+        );
+    }
+
+    #[test]
+    fn suspicion_threshold_with_zero_variance() {
+        let mut rhythm = AgentRhythm::new(60.0);
+        // Many observations at exactly the same interval → variance → 0
+        for i in 0..100 {
+            rhythm.observe(i * 60_000_000); // exactly 60s apart
+        }
+
+        let std = rhythm.std_dev();
+        // After many identical intervals, variance should be very small
+        // (not exactly zero due to EWMA blending with initial variance)
+        let threshold = rhythm.suspicion_threshold(3.0);
+        let avg = rhythm.effective_avg();
+
+        // With near-zero variance, threshold ≈ avg
+        assert!(
+            (threshold - avg).abs() < avg * 0.1,
+            "with near-zero variance, threshold ({threshold}) should be close to avg ({avg}), std={std}"
+        );
+
+        // Silence just above avg should trigger suspicion
+        let last_ts = rhythm.last_activity_ts;
+        let barely_above = last_ts + (threshold as i64) + 1;
+        assert!(
+            rhythm.is_suspicious(barely_above, 3.0),
+            "silence just above threshold should be suspicious"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3093,6 +3168,91 @@ mod engine_tests {
             assert_eq!(record.subsystem, AtcSubsystem::Liveness);
             assert_eq!(record.subject, "BlueFox");
         }
+    }
+
+    // ── Engine boundary condition tests (br-oco5x) ────────────────────
+
+    #[test]
+    fn dead_agent_resurrection_via_observe_activity() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("Phoenix", "claude-code");
+
+        // Manually set to Dead
+        if let Some(entry) = engine.agents.get_mut("Phoenix") {
+            entry.state = LivenessState::Dead;
+            entry.suspect_since = 1_000_000;
+            entry.sprt_log_lr = 5.0;
+        }
+        assert_eq!(
+            engine.agent_liveness("Phoenix"),
+            Some(LivenessState::Dead),
+            "agent should be Dead before resurrection"
+        );
+
+        // observe_activity should resurrect from Dead → Alive
+        engine.observe_activity("Phoenix", 2_000_000);
+
+        assert_eq!(
+            engine.agent_liveness("Phoenix"),
+            Some(LivenessState::Alive),
+            "agent should be Alive after observe_activity resurrection"
+        );
+        // SPRT and suspect fields should be cleared
+        let entry = engine.agents.get("Phoenix").unwrap();
+        assert_eq!(entry.suspect_since, 0, "suspect_since should be cleared");
+        assert!(
+            entry.sprt_log_lr.abs() < f64::EPSILON,
+            "sprt_log_lr should be cleared, got {}",
+            entry.sprt_log_lr
+        );
+    }
+
+    #[test]
+    fn evaluate_liveness_skips_dead_agents() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.register_agent("Zombie", "claude-code");
+
+        // Establish rhythm then set to Dead
+        for i in 0..10 {
+            engine.observe_activity("Zombie", i * 60_000_000);
+        }
+        if let Some(entry) = engine.agents.get_mut("Zombie") {
+            entry.state = LivenessState::Dead;
+        }
+
+        // Long silence — but Dead agents should be skipped
+        let now = 9 * 60_000_000 + 600_000_000; // 10 min silence
+        let actions = engine.evaluate_liveness(now);
+
+        // No actions should be generated for Dead agents
+        let zombie_actions: Vec<_> = actions.iter()
+            .filter(|(name, _)| name == "Zombie")
+            .collect();
+        assert!(
+            zombie_actions.is_empty(),
+            "evaluate_liveness should skip Dead agents, got {zombie_actions:?}"
+        );
+    }
+
+    #[test]
+    fn observe_activity_for_unregistered_agent() {
+        let mut engine = AtcEngine::new_for_testing();
+        let agents_before = engine.tracked_agents().len();
+
+        // Call observe_activity for an agent that was never registered
+        engine.observe_activity("GhostAgent", 1_000_000);
+
+        // Should not panic, should not create a new entry
+        assert_eq!(
+            engine.tracked_agents().len(),
+            agents_before,
+            "unregistered agent should not be auto-created"
+        );
+        assert_eq!(
+            engine.agent_liveness("GhostAgent"),
+            None,
+            "unregistered agent should return None"
+        );
     }
 }
 
