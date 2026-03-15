@@ -1429,15 +1429,6 @@ mod conflict_tests {
 // Conformal Martingale Regret Engine (Track 11)
 // ──────────────────────────────────────────────────────────────────────
 
-/// E-process martingale monitor for anytime-valid miscalibration detection.
-///
-/// Maintains a non-negative supermartingale E_t starting at 1.0 under H₀
-/// ("predictions are well-calibrated").  If E_t >= threshold at ANY time,
-/// we have statistically valid evidence of miscalibration — no multiple-
-/// testing correction needed.
-///
-/// Also maintains per-subsystem and per-agent e-processes to PINPOINT
-/// which component is drifting.
 /// Independent ONS (Online Newton Step) state for one e-process instance.
 #[derive(Debug, Clone)]
 struct OnsState {
@@ -1488,6 +1479,15 @@ impl OnsState {
     }
 }
 
+/// E-process martingale monitor for anytime-valid miscalibration detection.
+///
+/// Maintains a non-negative supermartingale E_t starting at 1.0 under H₀
+/// ("predictions are well-calibrated").  If E_t >= threshold at ANY time,
+/// we have statistically valid evidence of miscalibration — no multiple-
+/// testing correction needed.
+///
+/// Also maintains per-subsystem and per-agent e-processes to PINPOINT
+/// which component is drifting.
 #[derive(Debug, Clone)]
 pub struct EProcessMonitor {
     /// Global e-process (with its own ONS state).
