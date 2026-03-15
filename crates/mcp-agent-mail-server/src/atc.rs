@@ -884,6 +884,197 @@ mod tests {
             "posterior should recover toward Alive after evidence shift, got {alive_prob:.6}"
         );
     }
+
+    // ── DecisionCore edge case tests (br-1u8gy) ────────────────────────
+
+    #[test]
+    fn partial_likelihoods_leave_unspecified_states_uninformative() {
+        let mut core = default_liveness_core();
+        // Initial posterior: Alive ~0.95, Flaky ~0.04, Dead ~0.01
+        let initial_posterior: Vec<(LivenessState, f64)> =
+            core.posterior().to_vec();
+
+        // Update with likelihoods for only Alive and Dead — Flaky is absent
+        // and should get likelihood 1.0 (uninformative).
+        core.update_posterior(&[
+            (LivenessState::Alive, 0.1),  // strong evidence against Alive
+            (LivenessState::Dead, 5.0),   // strong evidence for Dead
+        ]);
+
+        let posterior: Vec<(LivenessState, f64)> = core.posterior().to_vec();
+
+        // Alive probability should have decreased
+        let alive_before = initial_posterior.iter()
+            .find(|(s, _)| *s == LivenessState::Alive).unwrap().1;
+        let alive_after = posterior.iter()
+            .find(|(s, _)| *s == LivenessState::Alive).unwrap().1;
+        assert!(
+            alive_after < alive_before,
+            "Alive should decrease with low likelihood, posterior: {posterior:?}"
+        );
+
+        // Dead probability should have increased
+        let dead_before = initial_posterior.iter()
+            .find(|(s, _)| *s == LivenessState::Dead).unwrap().1;
+        let dead_after = posterior.iter()
+            .find(|(s, _)| *s == LivenessState::Dead).unwrap().1;
+        assert!(
+            dead_after > dead_before,
+            "Dead should increase with high likelihood, posterior: {posterior:?}"
+        );
+
+        // Posterior should still be normalized
+        let total: f64 = posterior.iter().map(|(_, p)| *p).sum();
+        assert!(
+            (total - 1.0).abs() < 1e-10,
+            "posterior should be normalized, got total={total}, posterior: {posterior:?}"
+        );
+    }
+
+    #[test]
+    fn two_action_core_runner_up_is_other_action() {
+        // A core with exactly 2 actions — runner_up should be the loss
+        // of the other action, not INFINITY.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        enum TwoState { Good, Bad }
+        impl AtcState for TwoState {}
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        enum TwoAction { Act, Wait }
+        impl AtcAction for TwoAction {}
+
+        let core = DecisionCore::new(
+            &[(TwoState::Good, 0.7), (TwoState::Bad, 0.3)],
+            &[
+                (TwoAction::Act, TwoState::Good, 0.0),
+                (TwoAction::Act, TwoState::Bad, 10.0),
+                (TwoAction::Wait, TwoState::Good, 3.0),
+                (TwoAction::Wait, TwoState::Bad, 1.0),
+            ],
+            0.3,
+        );
+
+        let (best, best_loss, runner_up_loss) = core.choose_action();
+        let posterior = core.posterior();
+
+        // runner_up should be finite (the loss of the other action)
+        assert!(
+            runner_up_loss.is_finite(),
+            "runner_up should be finite with 2 actions, got {runner_up_loss}, posterior: {posterior:?}"
+        );
+        assert!(
+            runner_up_loss >= best_loss,
+            "runner_up ({runner_up_loss}) should be >= best ({best_loss}), posterior: {posterior:?}"
+        );
+        // Verify it's the loss of the other action
+        let other_loss = if best == TwoAction::Act {
+            core.expected_loss_for(TwoAction::Wait)
+        } else {
+            core.expected_loss_for(TwoAction::Act)
+        };
+        assert!(
+            (runner_up_loss - other_loss).abs() < f64::EPSILON,
+            "runner_up ({runner_up_loss}) should equal other action loss ({other_loss}), posterior: {posterior:?}"
+        );
+    }
+
+    #[test]
+    fn uniform_posterior_picks_lowest_loss_action() {
+        // With P(s) = 1/3 for all states, choose_action should pick
+        // the action with lowest average loss across all states.
+        let core = DecisionCore::new(
+            &[
+                (LivenessState::Alive, 1.0 / 3.0),
+                (LivenessState::Flaky, 1.0 / 3.0),
+                (LivenessState::Dead, 1.0 / 3.0),
+            ],
+            &[
+                (LivenessAction::DeclareAlive, LivenessState::Alive, 0.0),
+                (LivenessAction::DeclareAlive, LivenessState::Flaky, 15.0),
+                (LivenessAction::DeclareAlive, LivenessState::Dead, 50.0),
+                (LivenessAction::Suspect, LivenessState::Alive, 5.0),
+                (LivenessAction::Suspect, LivenessState::Flaky, 2.0),
+                (LivenessAction::Suspect, LivenessState::Dead, 10.0),
+                (LivenessAction::ReleaseReservations, LivenessState::Alive, 100.0),
+                (LivenessAction::ReleaseReservations, LivenessState::Flaky, 20.0),
+                (LivenessAction::ReleaseReservations, LivenessState::Dead, 1.0),
+            ],
+            0.3,
+        );
+
+        let (best, best_loss, _) = core.choose_action();
+        let posterior = core.posterior();
+
+        // Under uniform prior, Suspect has average loss (5+2+10)/3 ≈ 5.67
+        // which should be lowest. DeclareAlive = (0+15+50)/3 ≈ 21.67,
+        // ReleaseReservations = (100+20+1)/3 ≈ 40.33.
+        assert_eq!(
+            best,
+            LivenessAction::Suspect,
+            "uniform prior should pick Suspect (lowest avg loss), got {best:?}, loss={best_loss}, posterior: {posterior:?}"
+        );
+    }
+
+    #[test]
+    fn negative_alpha_clamped_to_minimum() {
+        // Alpha = -1.0 should be clamped to 0.01
+        let core = DecisionCore::new(
+            &[
+                (LivenessState::Alive, 0.95),
+                (LivenessState::Flaky, 0.04),
+                (LivenessState::Dead, 0.01),
+            ],
+            &[
+                (LivenessAction::DeclareAlive, LivenessState::Alive, 0.0),
+                (LivenessAction::DeclareAlive, LivenessState::Dead, 50.0),
+                (LivenessAction::ReleaseReservations, LivenessState::Alive, 100.0),
+                (LivenessAction::ReleaseReservations, LivenessState::Dead, 1.0),
+            ],
+            -1.0,
+        );
+
+        // Verify alpha was clamped by checking posterior behavior:
+        // with alpha=0.01, updates should be very slow (nearly no change).
+        let mut slow_core = core;
+        let before: Vec<f64> = slow_core.posterior().iter().map(|(_, p)| *p).collect();
+
+        slow_core.update_posterior(&[
+            (LivenessState::Alive, 0.01),
+            (LivenessState::Dead, 10.0),
+        ]);
+
+        let after: Vec<f64> = slow_core.posterior().iter().map(|(_, p)| *p).collect();
+        let posterior = slow_core.posterior();
+
+        // With alpha clamped to 0.01, the change should be tiny (< 0.05)
+        let delta: f64 = before.iter().zip(after.iter())
+            .map(|(b, a)| (b - a).abs())
+            .sum();
+        assert!(
+            delta < 0.05,
+            "alpha=-1.0 should clamp to 0.01, making updates very slow; \
+             delta={delta:.6}, posterior: {posterior:?}"
+        );
+    }
+
+    #[test]
+    fn empty_likelihoods_leave_posterior_unchanged() {
+        let mut core = default_liveness_core();
+        let before: Vec<(LivenessState, f64)> = core.posterior().to_vec();
+
+        // Empty likelihoods: all states get default likelihood 1.0.
+        // P(s) × 1.0^alpha = P(s), so posterior should not change.
+        core.update_posterior(&[]);
+
+        let after = core.posterior();
+        for ((s_b, p_b), (s_a, p_a)) in before.iter().zip(after.iter()) {
+            assert_eq!(s_b, s_a);
+            assert!(
+                (p_b - p_a).abs() < 1e-12,
+                "empty likelihoods should leave posterior unchanged; \
+                 state {s_b:?}: {p_b} → {p_a}, posterior: {after:?}"
+            );
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
