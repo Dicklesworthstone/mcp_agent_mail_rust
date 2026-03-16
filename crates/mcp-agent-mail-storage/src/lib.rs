@@ -375,6 +375,15 @@ pub fn wbq_enqueue(op: WriteOp) -> WbqEnqueueResult {
     wbq_enqueue_with_sender_and_pressure(&sender, wbq.op_depth.as_ref(), op, disk_pressure)
 }
 
+/// Execute a write op synchronously on the caller thread.
+///
+/// This is intended as a durability fallback when the write-behind queue is
+/// unavailable. The operation still uses the normal storage write path,
+/// including retries and async git commit enqueueing where applicable.
+pub fn write_op_sync(op: &WriteOp) -> Result<()> {
+    wbq_execute_op(op)
+}
+
 /// Block until all pending write ops have been drained.
 ///
 /// Uses a blocking `send` so the Flush message is guaranteed to enter the
