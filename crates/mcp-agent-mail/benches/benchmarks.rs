@@ -1508,7 +1508,7 @@ fn stable_bundle_hash(bundle_root: &Path) -> std::io::Result<String> {
         } else {
             sha256_file(&file_path)?
         };
-        dbg.push(format!("{} {}", rel, file_hash));
+        dbg.push(format!("{rel} {file_hash}"));
         combined.update(rel.as_bytes());
         combined.update(b"\0");
         combined.update(file_hash.as_bytes());
