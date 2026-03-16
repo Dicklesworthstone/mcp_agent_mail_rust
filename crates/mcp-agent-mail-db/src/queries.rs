@@ -2992,10 +2992,17 @@ async fn create_message_with_recipients_tx(
 ///
 /// Used for hydrating search results (e.g. from vector search) where
 /// the index does not store full content.
+/// Fetch full message details for a list of message IDs.
+///
+/// `project_id` is an optional project boundary filter.  When `Some`,
+/// only messages belonging to that project are returned — preventing
+/// cross-project data leakage.  When `None` (e.g., internal index
+/// rebuilds), all matching messages are returned regardless of project.
 pub async fn get_messages_details_by_ids(
     cx: &Cx,
     pool: &DbPool,
     message_ids: &[i64],
+    project_id: Option<i64>,
 ) -> Outcome<Vec<ThreadMessageRow>, DbError> {
     if message_ids.is_empty() {
         return Outcome::Ok(Vec::new());
@@ -3014,16 +3021,24 @@ pub async fn get_messages_details_by_ids(
 
     for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
         let placeholders = placeholders(chunk.len());
+        let project_clause = if project_id.is_some() {
+            " AND m.project_id = ?"
+        } else {
+            ""
+        };
         let sql = format!(
             "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
                     m.importance, m.ack_required, m.created_ts, m.recipients_json, \
                     m.attachments, a.name as from_name \
              FROM messages m \
              JOIN agents a ON a.id = m.sender_id \
-             WHERE m.id IN ({placeholders})"
+             WHERE m.id IN ({placeholders}){project_clause}"
         );
 
-        let params: Vec<Value> = chunk.iter().map(|&id| Value::BigInt(id)).collect();
+        let mut params: Vec<Value> = chunk.iter().map(|&id| Value::BigInt(id)).collect();
+        if let Some(pid) = project_id {
+            params.push(Value::BigInt(pid));
+        }
 
         match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
             Outcome::Ok(rows) => {

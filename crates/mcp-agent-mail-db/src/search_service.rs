@@ -655,7 +655,7 @@ async fn canonicalize_message_results(
     }
 
     let ids: Vec<i64> = deduped.iter().map(|r| r.id).collect();
-    let details = match crate::queries::get_messages_details_by_ids(cx, pool, &ids).await {
+    let details = match crate::queries::get_messages_details_by_ids(cx, pool, &ids, query.project_id).await {
         Outcome::Ok(rows) => rows,
         Outcome::Err(err) => return Outcome::Err(err),
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
