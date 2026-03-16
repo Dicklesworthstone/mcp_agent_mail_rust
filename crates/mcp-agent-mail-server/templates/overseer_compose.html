@@ -541,7 +541,7 @@ function overseerComposer() {
         this.showToast = true;
 
         setTimeout(() => {
-          window.location.href = `/mail/${projectSlug}`;
+          window.agentMailNavigate(`/mail/${projectSlug}`);
         }, 2000);
 
       } catch (error) {

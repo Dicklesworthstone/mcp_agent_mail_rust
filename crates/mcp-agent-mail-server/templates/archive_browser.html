@@ -103,7 +103,7 @@ function browserManager() {
 
       if (entry.type === 'dir') {
         const projectQuery = encodeURIComponent(this.project);
-        window.location.href = `/mail/archive/browser?project=${projectQuery}&path=${encodeURIComponent(entry.path)}`;
+        window.agentMailNavigate(`/mail/archive/browser?project=${projectQuery}&path=${encodeURIComponent(entry.path)}`);
         return;
       }
 
