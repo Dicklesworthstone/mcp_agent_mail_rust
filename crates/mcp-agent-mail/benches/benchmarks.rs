@@ -515,8 +515,7 @@ fn run_archive_harness_once() {
                         msg_id += 1;
                     }
                 }
-                ArchiveScenario::SingleInlineAttachment
-                | ArchiveScenario::SingleFileAttachment => {
+                ArchiveScenario::SingleInlineAttachment | ArchiveScenario::SingleFileAttachment => {
                     let policy = if matches!(*scenario, ArchiveScenario::SingleInlineAttachment) {
                         mcp_agent_mail_storage::EmbedPolicy::Inline
                     } else {
@@ -1884,6 +1883,7 @@ fn run_share_harness_once() {
 
             let mut stable_hash_first: Option<String> = None;
             let mut stable_hash_second: Option<String> = None;
+            let mut stable_debug_first: Option<String> = None;
             let mut output_dir_bytes: u64 = 0;
             let mut output_zip_bytes: u64 = 0;
 
@@ -1912,32 +1912,34 @@ fn run_share_harness_once() {
                 if op_idx < 2 {
                     let bundle_dir = out_root.join("bundle");
                     let stable = stable_bundle_hash(&bundle_dir).expect("stable bundle hash");
+                    let debug = std::fs::read_to_string(out_root.join("hash_debug.txt"))
+                        .unwrap_or_default();
                     if op_idx == 0 {
                         stable_hash_first = Some(stable);
+                        stable_debug_first = Some(debug);
                         output_dir_bytes = dir_bytes(&bundle_dir).unwrap_or(0);
                         output_zip_bytes = out_root
                             .join("bundle.zip")
                             .metadata()
                             .map_or(0, |m| m.len());
-                        std::fs::copy(out_root.join("hash_debug.txt"), "/tmp/hash_debug_first.txt").ok();
                     } else {
                         stable_hash_second = Some(stable);
-                        std::fs::copy(out_root.join("hash_debug.txt"), "/tmp/hash_debug_second.txt").ok();
-                        let d1 = std::fs::read_to_string("/tmp/hash_debug_first.txt").unwrap_or_default();
-                        let d2 = std::fs::read_to_string("/tmp/hash_debug_second.txt").unwrap_or_default();
-                        if d1 != d2 {
-                            println!("DIFF IN DETERMINISM:\n===1===\n{}\n===2===\n{}", d1, d2);
+                        if stable_debug_first.as_deref() != Some(debug.as_str()) {
+                            println!(
+                                "DIFF IN DETERMINISM:\n===1===\n{}\n===2===\n{}",
+                                stable_debug_first.as_deref().unwrap_or_default(),
+                                debug
+                            );
                         }
                     }
                 }
             }
 
             if let (Some(a), Some(b)) = (&stable_hash_first, &stable_hash_second) {
-                // Ignore determinism assertion so benchmark can finish
-                // assert_eq!(
-                //     a, b,
-                //     "share bundle output should be deterministic (normalized)"
-                // );
+                assert_eq!(
+                    a, b,
+                    "share bundle output should be deterministic (normalized)"
+                );
             }
             let stable_bundle_hash = stable_hash_first.unwrap_or_else(|| "unknown".to_string());
             let chunk_count = chunk_counts.into_iter().max().unwrap_or_default();
