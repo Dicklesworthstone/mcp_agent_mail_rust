@@ -2322,13 +2322,115 @@ fn wait_for_port_release(host: &str, port: u16, timeout: std::time::Duration) ->
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedServiceBinding {
+    host: String,
+    port: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedServiceKind {
+    Systemd,
+    Launchd,
+}
+
+fn parse_service_bind_args(args: &[String]) -> Option<ManagedServiceBinding> {
+    let mut host = None;
+    let mut port = None;
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = args[idx].trim_matches('"');
+        if arg == "--host" {
+            host = args
+                .get(idx + 1)
+                .map(|value| value.trim_matches('"').to_string());
+            idx += 2;
+            continue;
+        }
+        if arg == "--port" {
+            port = args
+                .get(idx + 1)
+                .and_then(|value| value.trim_matches('"').parse::<u16>().ok());
+            idx += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--host=") {
+            host = Some(value.trim_matches('"').to_string());
+        } else if let Some(value) = arg.strip_prefix("--port=") {
+            port = value.trim_matches('"').parse::<u16>().ok();
+        }
+        idx += 1;
+    }
+
+    Some(ManagedServiceBinding {
+        host: host?,
+        port: port?,
+    })
+}
+
+fn is_wildcard_bind_host(host: &str) -> bool {
+    matches!(
+        normalize_bind_host_for_socket(host).as_ref(),
+        "0.0.0.0" | "::"
+    )
+}
+
+fn bind_hosts_conflict(lhs: &str, rhs: &str) -> bool {
+    use std::net::ToSocketAddrs;
+
+    let lhs = normalize_bind_host_for_socket(lhs);
+    let rhs = normalize_bind_host_for_socket(rhs);
+    if lhs.eq_ignore_ascii_case(rhs.as_ref()) {
+        return true;
+    }
+    if is_wildcard_bind_host(lhs.as_ref()) || is_wildcard_bind_host(rhs.as_ref()) {
+        return true;
+    }
+
+    let Ok(lhs_addrs) = (lhs.as_ref(), 0).to_socket_addrs() else {
+        return false;
+    };
+    let Ok(rhs_addrs) = (rhs.as_ref(), 0).to_socket_addrs() else {
+        return false;
+    };
+    let lhs_ips = lhs_addrs.map(|addr| addr.ip()).collect::<Vec<_>>();
+    rhs_addrs
+        .map(|addr| addr.ip())
+        .any(|ip| lhs_ips.contains(&ip))
+}
+
+fn service_binding_conflicts(binding: &ManagedServiceBinding, host: &str, port: u16) -> bool {
+    binding.port == port && bind_hosts_conflict(&binding.host, host)
+}
+
+fn service_probe_connect_host(host: &str) -> String {
+    match normalize_bind_host_for_socket(host).as_ref() {
+        "0.0.0.0" => "127.0.0.1".to_string(),
+        "::" => "::1".to_string(),
+        other => other.to_string(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_unit_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(
+        PathBuf::from(home)
+            .join(".config/systemd/user")
+            .join(SYSTEMD_UNIT_NAME),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn systemd_unit_path() -> Option<PathBuf> {
+    None
+}
+
 #[cfg(target_os = "linux")]
 /// Check if the systemd user service is actively running.
 ///
 /// Uses `systemctl --user is-active` which returns "active" if the service
-/// is running.  This is more reliable than parsing the unit file — it
-/// checks actual runtime state, not configuration.
-#[cfg(target_os = "linux")]
+/// is running. This checks actual runtime state, not just configuration.
 fn is_systemd_service_active() -> bool {
     std::process::Command::new("systemctl")
         .args(["--user", "is-active", "--quiet", SYSTEMD_UNIT_NAME])
@@ -2336,16 +2438,14 @@ fn is_systemd_service_active() -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Extract the configured port from the systemd unit file.
-///
-/// Handles quoted ExecStart lines and --port=VALUE syntax in addition
-/// to --port VALUE.  Falls back to None on any parsing ambiguity.
+#[cfg(not(target_os = "linux"))]
+fn is_systemd_service_active() -> bool {
+    false
+}
+
 #[cfg(target_os = "linux")]
-fn systemd_service_configured_port() -> Option<u16> {
-    let home = std::env::var("HOME").ok()?;
-    let unit_path = PathBuf::from(home)
-        .join(".config/systemd/user")
-        .join(SYSTEMD_UNIT_NAME);
+fn systemd_service_configured_bind() -> Option<ManagedServiceBinding> {
+    let unit_path = systemd_unit_path()?;
     let content = std::fs::read_to_string(unit_path).ok()?;
     for line in content.lines() {
         let Some(exec_start) = line
@@ -2354,34 +2454,128 @@ fn systemd_service_configured_port() -> Option<u16> {
         else {
             continue;
         };
-        // Strip surrounding quotes from the entire value if present.
-        let exec_start = exec_start.trim().trim_matches('"');
-        // Split on whitespace (handles both quoted and unquoted paths).
-        let parts: Vec<&str> = exec_start.split_whitespace().collect();
-        for (i, part) in parts.iter().enumerate() {
-            // Handle --port VALUE
-            if *part == "--port" {
-                return parts
-                    .get(i + 1)
-                    .and_then(|v| v.trim_matches('"').parse::<u16>().ok());
-            }
-            // Handle --port=VALUE
-            if let Some(val) = part.strip_prefix("--port=") {
-                return val.trim_matches('"').parse::<u16>().ok();
-            }
+        let args = exec_start
+            .split_whitespace()
+            .map(|part| part.trim_matches('"').to_string())
+            .collect::<Vec<_>>();
+        if let Some(binding) = parse_service_bind_args(&args) {
+            return Some(binding);
         }
     }
     None
 }
 
 #[cfg(not(target_os = "linux"))]
-fn is_systemd_service_active() -> bool {
+fn systemd_service_configured_bind() -> Option<ManagedServiceBinding> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_plist_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(
+        PathBuf::from(home)
+            .join("Library/LaunchAgents")
+            .join(format!("{LAUNCHD_LABEL}.plist")),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launchd_plist_path() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn is_launchd_service_active() -> bool {
+    let Ok(uid) = current_uid() else {
+        return false;
+    };
+    std::process::Command::new("launchctl")
+        .args(["print", &format!("gui/{uid}/{LAUNCHD_LABEL}")])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_launchd_service_active() -> bool {
     false
 }
 
-#[cfg(not(target_os = "linux"))]
-fn systemd_service_configured_port() -> Option<u16> {
+#[cfg(target_os = "macos")]
+fn launchd_service_configured_bind() -> Option<ManagedServiceBinding> {
+    let plist_path = launchd_plist_path()?;
+    let value = plist::Value::from_file(&plist_path).ok()?;
+    let args = value
+        .as_dictionary()?
+        .get("ProgramArguments")?
+        .as_array()?
+        .iter()
+        .filter_map(|value| value.as_string().map(str::to_string))
+        .collect::<Vec<_>>();
+    parse_service_bind_args(&args)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launchd_service_configured_bind() -> Option<ManagedServiceBinding> {
     None
+}
+
+#[cfg(target_os = "macos")]
+fn stop_launchd_service() -> CliResult<()> {
+    let uid = current_uid()?;
+    let Some(plist_path) = launchd_plist_path() else {
+        return Err(CliError::Other(
+            "failed to resolve LaunchAgent plist path".to_string(),
+        ));
+    };
+    run_cmd(
+        "launchctl",
+        &[
+            "bootout",
+            &format!("gui/{uid}"),
+            &plist_path.display().to_string(),
+        ],
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn stop_launchd_service() -> CliResult<()> {
+    Err(CliError::Other(
+        "launchd service control is unavailable on this platform".to_string(),
+    ))
+}
+
+fn active_conflicting_managed_service(
+    host: &str,
+    port: u16,
+) -> Option<(ManagedServiceKind, ManagedServiceBinding)> {
+    if is_systemd_service_active()
+        && let Some(binding) = systemd_service_configured_bind()
+        && service_binding_conflicts(&binding, host, port)
+    {
+        return Some((ManagedServiceKind::Systemd, binding));
+    }
+    if is_launchd_service_active()
+        && let Some(binding) = launchd_service_configured_bind()
+        && service_binding_conflicts(&binding, host, port)
+    {
+        return Some((ManagedServiceKind::Launchd, binding));
+    }
+    None
+}
+
+fn managed_service_display_name(kind: ManagedServiceKind) -> &'static str {
+    match kind {
+        ManagedServiceKind::Systemd => SYSTEMD_UNIT_NAME,
+        ManagedServiceKind::Launchd => LAUNCHD_LABEL,
+    }
+}
+
+fn stop_managed_service(kind: ManagedServiceKind) -> CliResult<()> {
+    match kind {
+        ManagedServiceKind::Systemd => run_cmd("systemctl", &["--user", "stop", SYSTEMD_UNIT_NAME]),
+        ManagedServiceKind::Launchd => stop_launchd_service(),
+    }
 }
 
 fn maybe_stop_conflicting_managed_service(
@@ -2389,33 +2583,32 @@ fn maybe_stop_conflicting_managed_service(
     port: u16,
     interactive_tui: bool,
 ) -> CliResult<()> {
+    use mcp_agent_mail_server::startup_checks::{PortStatus, check_port_status};
+
     if !interactive_tui {
         return Ok(());
     }
+    if !matches!(check_port_status(host, port), PortStatus::AgentMailServer) {
+        return Ok(());
+    }
 
-    // Only stop if ALL of:
-    // 1. The systemd service is ACTUALLY running (not just configured)
-    // 2. The service is configured for THIS port
-    // 3. The port is currently occupied
-    //
-    // This eliminates the TOCTOU race: we verify runtime state, not
-    // just configuration, before stopping anything.
-    if is_systemd_service_active() && systemd_service_configured_port() == Some(port) {
+    if let Some((kind, binding)) = active_conflicting_managed_service(host, port) {
+        let service_name = managed_service_display_name(kind);
         eprintln!(
-            "[info] agent-mail.service is active on port {port} — stopping it before launching the interactive TUI"
+            "[info] {service_name} is active on {}:{} — stopping it before launching the interactive TUI",
+            binding.host, binding.port
         );
-        if let Err(e) = run_cmd("systemctl", &["--user", "stop", SYSTEMD_UNIT_NAME]) {
+        if let Err(e) = stop_managed_service(kind) {
             eprintln!(
-                "[warn] Failed to stop agent-mail.service: {e}. \
-                 You may need to stop it manually: systemctl --user stop {SYSTEMD_UNIT_NAME}"
+                "[warn] Failed to stop {service_name}: {e}. \
+                 You may need to stop it manually before relaunching interactive Agent Mail."
             );
-            // Don't fail hard — the port check below will catch if it's still occupied.
         }
         if wait_for_port_release(host, port, std::time::Duration::from_secs(6)) {
             return Ok(());
         }
         return Err(CliError::Other(format!(
-            "Stopped agent-mail.service, but port {host}:{port} did not become free"
+            "Stopped {service_name}, but port {host}:{port} did not become free"
         )));
     }
 
@@ -17348,6 +17541,7 @@ fn service_status_systemd() -> CliResult<()> {
     let output = std::process::Command::new("systemctl")
         .args(["--user", "status", SYSTEMD_UNIT_NAME])
         .output()?;
+    let binding = systemd_service_configured_bind();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -17362,17 +17556,14 @@ fn service_status_systemd() -> CliResult<()> {
     // systemctl status exits 3 when the service is stopped — that's informational, not an error.
     if !output.status.success() && output.status.code() != Some(3) {
         // Check if the unit even exists.
-        let home = std::env::var("HOME").unwrap_or_default();
-        let unit_path = PathBuf::from(&home)
-            .join(".config/systemd/user")
-            .join(SYSTEMD_UNIT_NAME);
-        if !unit_path.exists() {
+        if systemd_unit_path().is_none_or(|path| !path.exists()) {
             ftui_runtime::ftui_println!(
                 "Service is not installed. Run `am service install` first."
             );
         }
     }
 
+    service_probe_http(binding.as_ref());
     Ok(())
 }
 
@@ -17381,6 +17572,7 @@ fn service_status_launchd() -> CliResult<()> {
     let output = std::process::Command::new("launchctl")
         .args(["print", &format!("gui/{uid}/{LAUNCHD_LABEL}")])
         .output()?;
+    let binding = launchd_service_configured_bind();
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -17388,11 +17580,7 @@ fn service_status_launchd() -> CliResult<()> {
     if output.status.success() {
         ftui_runtime::ftui_println!("{}", stdout.trim_end());
     } else {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let plist_path = PathBuf::from(&home)
-            .join("Library/LaunchAgents")
-            .join(format!("{LAUNCHD_LABEL}.plist"));
-        if plist_path.exists() {
+        if launchd_plist_path().is_some_and(|path| path.exists()) {
             ftui_runtime::ftui_println!("Service is installed but not running.");
             if !stderr.is_empty() {
                 ftui_runtime::ftui_eprintln!("{}", stderr.trim_end());
@@ -17404,24 +17592,42 @@ fn service_status_launchd() -> CliResult<()> {
         }
     }
 
-    // Supplement with a port check — try to reach the HTTP endpoint.
-    service_probe_http();
+    service_probe_http(binding.as_ref());
 
     Ok(())
 }
 
-/// Quick HTTP probe against the default port for supplementary status info.
-fn service_probe_http() {
+/// Quick HTTP probe against the configured service bind address.
+fn service_probe_http(binding: Option<&ManagedServiceBinding>) {
     use std::net::TcpStream;
     use std::time::Duration;
 
-    let addr = "127.0.0.1:8765";
-    match TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(500)) {
+    let binding = binding.cloned().unwrap_or(ManagedServiceBinding {
+        host: "127.0.0.1".to_string(),
+        port: 8765,
+    });
+    let connect_host = service_probe_connect_host(&binding.host);
+    let Ok(addr) = resolve_socket_bind_addr(&connect_host, binding.port) else {
+        ftui_runtime::ftui_println!(
+            "Port {} on {}: could not resolve probe address",
+            binding.port,
+            binding.host
+        );
+        return;
+    };
+
+    match TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
         Ok(stream) => {
             let _ = stream.shutdown(std::net::Shutdown::Both);
-            ftui_runtime::ftui_println!("Port 8765: reachable (server responding)")
+            ftui_runtime::ftui_println!(
+                "Port {} on {}: reachable (server responding)",
+                binding.port,
+                binding.host
+            )
         }
-        Err(_) => ftui_runtime::ftui_println!("Port 8765: not reachable"),
+        Err(_) => {
+            ftui_runtime::ftui_println!("Port {} on {}: not reachable", binding.port, binding.host)
+        }
     }
 }
 
