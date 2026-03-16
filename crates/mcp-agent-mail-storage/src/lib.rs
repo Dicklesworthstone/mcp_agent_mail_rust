@@ -4785,7 +4785,7 @@ pub fn process_markdown_images(
     embed_policy: EmbedPolicy,
 ) -> Result<(String, Vec<AttachmentMeta>, Vec<String>)> {
     let re = image_pattern_re();
-    
+
     let canonical_base = match base_dir.canonicalize() {
         Ok(b) => b,
         Err(_) => return Ok((body_md.to_string(), Vec::new(), Vec::new())),

@@ -77,7 +77,10 @@ pub fn apply_project_scope(
 
     // Load all projects
     let project_rows = conn
-        .query_sync("SELECT id, slug, human_key FROM projects ORDER BY id ASC", &[])
+        .query_sync(
+            "SELECT id, slug, human_key FROM projects ORDER BY id ASC",
+            &[],
+        )
         .map_err(|e| ShareError::Sqlite {
             message: format!("SELECT projects failed: {e}"),
         })?;

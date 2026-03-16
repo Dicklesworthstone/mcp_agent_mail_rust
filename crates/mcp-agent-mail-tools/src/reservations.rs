@@ -478,7 +478,9 @@ pub async fn file_reservation_paths(
     );
 
     // Precompile requested patterns once.
-    let requested_compiled: Vec<std::sync::Arc<mcp_agent_mail_core::pattern_overlap::CompiledPattern>> = normalized_paths
+    let requested_compiled: Vec<
+        std::sync::Arc<mcp_agent_mail_core::pattern_overlap::CompiledPattern>,
+    > = normalized_paths
         .iter()
         .map(|p| CompiledPattern::cached(p))
         .collect();
