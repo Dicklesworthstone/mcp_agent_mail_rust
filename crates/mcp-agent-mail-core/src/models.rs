@@ -547,21 +547,16 @@ pub const VALID_NOUNS: &[&str] = &[
     "fortress",
 ];
 
-static VALID_ADJECTIVE_LOOKUP: LazyLock<HashMap<&'static str, &'static str>> =
-    LazyLock::new(|| {
-        VALID_ADJECTIVES
-            .iter()
-            .copied()
-            .map(|word| (word, word))
-            .collect()
-    });
+static VALID_ADJECTIVE_LOOKUP: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    let mut v = VALID_ADJECTIVES.to_vec();
+    v.sort_unstable();
+    v
+});
 
-static VALID_NOUN_LOOKUP: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
-    VALID_NOUNS
-        .iter()
-        .copied()
-        .map(|word| (word, word))
-        .collect()
+static VALID_NOUN_LOOKUP: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    let mut v = VALID_NOUNS.to_vec();
+    v.sort_unstable();
+    v
 });
 
 static VALID_ADJECTIVE_LENGTHS_DESC: LazyLock<Vec<usize>> = LazyLock::new(|| {
@@ -785,7 +780,7 @@ pub fn looks_like_unix_username(value: &str) -> bool {
         return false;
     }
 
-    !VALID_ADJECTIVE_LOOKUP.contains_key(value) && !VALID_NOUN_LOOKUP.contains_key(value)
+    !VALID_ADJECTIVE_LOOKUP.contains(&value) && !VALID_NOUN_LOOKUP.contains(&value)
 }
 
 /// Detect common mistakes when agents provide invalid agent names.
@@ -875,12 +870,17 @@ fn split_valid_agent_name(name: &str) -> Option<(&'static str, &'static str)> {
         }
 
         let (adjective_candidate, noun_candidate) = lower_name.split_at(adjective_len);
-        let Some(adjective) = VALID_ADJECTIVE_LOOKUP.get(adjective_candidate).copied() else {
+        
+        let Ok(adj_idx) = VALID_ADJECTIVE_LOOKUP.binary_search(&adjective_candidate) else {
             continue;
         };
-        let Some(noun) = VALID_NOUN_LOOKUP.get(noun_candidate).copied() else {
+        let adjective = VALID_ADJECTIVE_LOOKUP[adj_idx];
+        
+        let Ok(noun_idx) = VALID_NOUN_LOOKUP.binary_search(&noun_candidate) else {
             continue;
         };
+        let noun = VALID_NOUN_LOOKUP[noun_idx];
+
         return Some((adjective, noun));
     }
 

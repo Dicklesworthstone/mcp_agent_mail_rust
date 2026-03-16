@@ -161,7 +161,7 @@ pub fn is_sqlite_memory_database_url(database_url: &str) -> bool {
 pub fn sqlite_file_path_from_database_url(database_url: &str) -> Option<PathBuf> {
     let stripped = sqlite_path_component(database_url)?;
 
-    if stripped.is_empty() {
+    if stripped.is_empty() || stripped == "/" {
         return None;
     }
 

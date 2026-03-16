@@ -407,10 +407,24 @@ pub fn compute_project_slug(human_key: &str) -> String {
     }
 }
 
+static IDENTITY_CACHE: std::sync::OnceLock<Mutex<std::collections::HashMap<String, (ProjectIdentity, Instant)>>> = std::sync::OnceLock::new();
+
 /// Resolve identity details for a given `human_key` path.
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {
+    let target_path = resolve_path(human_key);
+    let target_str = target_path.to_string_lossy().to_string();
+
+    let cache = IDENTITY_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some((ident, ts)) = guard.get(&target_str) {
+            if ts.elapsed() < Duration::from_secs(5) {
+                return ident.clone();
+            }
+        }
+    }
+
     let config = &Config::get();
     let mode_config = config.project_identity_mode;
     let mode_used = if config.worktrees_enabled {
@@ -419,17 +433,14 @@ pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {
         "dir".to_string()
     };
 
-    let target_path = resolve_path(human_key);
-    let target_str = target_path.to_string_lossy().to_string();
-
     if !config.worktrees_enabled {
         let slug_value = slugify(human_key);
         let project_uid = short_sha1(&target_str, 20);
         let resolved_human_key = target_str.clone();
-        return ProjectIdentity {
+        let ident = ProjectIdentity {
             slug: slug_value,
             identity_mode_used: "dir".to_string(),
-            canonical_path: target_str,
+            canonical_path: target_str.clone(),
             human_key: resolved_human_key,
             repo_root: None,
             git_common_dir: None,
@@ -440,6 +451,10 @@ pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {
             project_uid,
             discovery: None,
         };
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(target_str, (ident.clone(), Instant::now()));
+        }
+        return ident;
     }
 
     let repo_root = git_cmd(&target_path, &["rev-parse", "--show-toplevel"]);
@@ -594,7 +609,7 @@ pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {
 
     let slug_value = compute_project_slug(&target_str);
 
-    ProjectIdentity {
+    let ident = ProjectIdentity {
         slug: slug_value,
         identity_mode_used: mode_used,
         canonical_path,
@@ -607,7 +622,12 @@ pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {
         normalized_remote,
         project_uid: project_uid.unwrap_or_else(|| short_sha1(&target_str, 20)),
         discovery,
+    };
+
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(target_str, (ident.clone(), Instant::now()));
     }
+    ident
 }
 
 #[cfg(test)]
