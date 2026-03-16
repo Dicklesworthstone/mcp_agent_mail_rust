@@ -419,12 +419,11 @@ pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {
     let target_str = target_path.to_string_lossy().to_string();
 
     let cache = IDENTITY_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    if let Ok(guard) = cache.lock() {
-        if let Some((ident, ts)) = guard.get(&target_str) {
-            if ts.elapsed() < Duration::from_secs(5) {
-                return ident.clone();
-            }
-        }
+    if let Ok(guard) = cache.lock()
+        && let Some((ident, ts)) = guard.get(&target_str)
+        && ts.elapsed() < Duration::from_secs(5)
+    {
+        return ident.clone();
     }
 
     let config = &Config::get();
