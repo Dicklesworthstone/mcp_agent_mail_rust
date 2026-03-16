@@ -131,23 +131,23 @@ pub fn bridge_provider_env() {
 
 /// Priority-ordered provider → model mapping.
 const MODEL_PRIORITY: &[(&str, &str)] = &[
-    ("OPENAI_API_KEY", "gpt-4o-mini"),
-    ("GOOGLE_API_KEY", "gemini-1.5-flash"),
-    ("ANTHROPIC_API_KEY", "claude-3-haiku-20240307"),
-    ("GROQ_API_KEY", "groq/llama-3.1-8b-instant"),
-    ("DEEPSEEK_API_KEY", "deepseek/deepseek-chat"),
-    ("XAI_API_KEY", "xai/grok-2-mini"),
+    ("OPENAI_API_KEY", "gpt-5.4"),
+    ("ANTHROPIC_API_KEY", "claude-4.6-sonnet"),
+    ("GOOGLE_API_KEY", "gemini-3.1-pro"),
+    ("DEEPSEEK_API_KEY", "deepseek-chat"),
+    ("XAI_API_KEY", "xai/grok-3"),
+    ("GROQ_API_KEY", "groq/openai/gpt-oss-120b"),
     (
         "OPENROUTER_API_KEY",
-        "openrouter/meta-llama/llama-3.1-8b-instruct",
+        "openrouter/meta-llama/llama-4-scout-17b",
     ),
 ];
 
 /// Default fallback model when no API keys are found.
-const DEFAULT_MODEL: &str = "gpt-4o-mini";
+const DEFAULT_MODEL: &str = "gpt-5.4";
 
 /// Aliases that trigger dynamic model selection.
-const AUTO_ALIASES: &[&str] = &["best", "auto", "gpt-5-mini", "gpt5-mini", "gpt-5m"];
+const AUTO_ALIASES: &[&str] = &["best", "auto", "gpt-5.4", "gpt5.4", "gpt-5-mini", "gpt-5m", "gpt-4o", "gpt4o"];
 
 /// Choose the best available model based on set API keys.
 ///
@@ -366,11 +366,13 @@ fn resolve_api_endpoint(model: &str) -> Result<(String, String, String), LlmErro
 }
 
 fn strip_provider_prefix<'a>(model: &'a str, providers: &[&str]) -> &'a str {
+    let lower_model = model.to_ascii_lowercase();
     for provider in providers {
-        if let Some(stripped) = model.strip_prefix(provider)
-            && let Some(stripped) = stripped.strip_prefix(['/', ':'])
-        {
-            return stripped;
+        if lower_model.starts_with(provider) {
+            let rest = &model[provider.len()..];
+            if let Some(stripped) = rest.strip_prefix(['/', ':']) {
+                return stripped;
+            }
         }
     }
     model
@@ -616,6 +618,37 @@ fn extract_brace_json(text: &str) -> Option<Value> {
 /// Action keywords used to identify heuristic `key_points` worth preserving.
 const ACTION_KEYWORDS: &[&str] = &["TODO", "ACTION", "FIXME", "NEXT", "BLOCKED"];
 
+fn contains_action_keyword(text: &str) -> bool {
+    let upper = text.to_ascii_uppercase();
+    ACTION_KEYWORDS.iter().any(|keyword| upper.contains(keyword))
+}
+
+fn normalize_action_point(text: &str) -> Option<String> {
+    const CHECKBOX_PREFIXES: &[&str] = &[
+        "- [ ]", "* [ ]", "+ [ ]", "- [x]", "- [X]", "* [x]", "* [X]", "+ [x]", "+ [X]",
+    ];
+
+    let trimmed = text.trim();
+    let mut cleaned = CHECKBOX_PREFIXES
+        .iter()
+        .find_map(|prefix| trimmed.strip_prefix(prefix))
+        .unwrap_or(trimmed)
+        .trim();
+
+    cleaned = cleaned.trim_start_matches(&['-', '+', '*', ' '][..]);
+    if let Some(dot_pos) = cleaned.find('.')
+        && cleaned[..dot_pos].chars().all(|ch| ch.is_ascii_digit())
+    {
+        cleaned = cleaned[dot_pos + 1..].trim_start();
+    }
+
+    if cleaned.is_empty() || !contains_action_keyword(cleaned) {
+        return None;
+    }
+
+    Some(cleaned.to_string())
+}
+
 /// Maximum `key_points` after merge.
 const KEY_POINTS_CAP: usize = 10;
 
@@ -639,19 +672,24 @@ pub fn merge_single_thread_summary(heuristic: &ThreadSummary, llm_json: &Value) 
         // Legacy Python semantics: only override key_points if non-empty, then append heuristic
         // keyword key_points (TODO/ACTION/etc) after LLM's items.
         if !llm_points.is_empty() {
-            // Keep heuristic items with action keywords
-            let action_points: Vec<String> = heuristic
+            // Keep heuristic keyword key_points and keyword action items. Checkbox action
+            // items are normalized so "- [ ] TODO: ..." contributes "TODO: ..." here.
+            let key_point_actions = heuristic
                 .key_points
                 .iter()
-                .filter(|kp| {
-                    let upper = kp.to_ascii_uppercase();
-                    ACTION_KEYWORDS.iter().any(|k| upper.contains(k))
-                })
-                .cloned()
-                .collect();
+                .filter(|kp| contains_action_keyword(kp))
+                .cloned();
+            let action_item_points = heuristic
+                .action_items
+                .iter()
+                .filter_map(|item| normalize_action_point(item));
 
             let mut merged: Vec<String> = Vec::new();
-            for p in llm_points.into_iter().chain(action_points.into_iter()) {
+            for p in llm_points
+                .into_iter()
+                .chain(key_point_actions)
+                .chain(action_item_points)
+            {
                 if !merged.contains(&p) {
                     merged.push(p);
                 }
@@ -957,7 +995,7 @@ fn stubbed_completion_content(system: &str, user: &str) -> String {
     }
 
     // Intentionally include fenced JSON so parsing exercises code-fence extraction fallback.
-    "Here is the summary:\n```json\n{\n  \"participants\": [\"Alice\"]}\n```\nLet me know."
+    "Here is the summary:\n```json\n{\n  \"participants\": [\"BlueLake\", \"GreenCastle\"],\n  \"key_points\": [\n    \"API migration planned for next sprint\",\n    \"Staging deployment needed before review\"\n  ],\n  \"action_items\": [\"Deploy to staging\", \"Update API docs\"],\n  \"mentions\": [{\"name\": \"Carol\", \"count\": 2}],\n  \"code_references\": [\"api/v2/users\"],\n  \"total_messages\": 2,\n  \"open_actions\": 1,\n  \"done_actions\": 0\n}\n```\nLet me know."
         .to_string()
 }
 
@@ -1088,7 +1126,7 @@ mod tests {
 
     #[test]
     fn resolve_alias_passthrough() {
-        assert_eq!(resolve_model_alias("gpt-4o"), "gpt-4o");
+        assert_eq!(resolve_model_alias("some-custom-model-id"), "some-custom-model-id");
         assert_eq!(
             resolve_model_alias("claude-3-opus-20240229"),
             "claude-3-opus-20240229"
@@ -1110,8 +1148,12 @@ mod tests {
     #[test]
     fn strip_provider_prefix_handles_slash_and_colon_variants() {
         assert_eq!(
-            strip_provider_prefix("openai/gpt-4o-mini", &["openai", "gpt"]),
-            "gpt-4o-mini"
+            strip_provider_prefix("openai/gpt-4o", &["openai", "gpt"]),
+            "gpt-4o"
+        );
+        assert_eq!(
+            strip_provider_prefix("OpenAI/gpt-4o", &["openai", "gpt"]),
+            "gpt-4o"
         );
         assert_eq!(
             strip_provider_prefix(
@@ -1125,8 +1167,8 @@ mod tests {
             "gemini-1.5-flash"
         );
         assert_eq!(
-            strip_provider_prefix("gpt-4o-mini", &["openai", "gpt"]),
-            "gpt-4o-mini"
+            strip_provider_prefix("gpt-4o", &["openai", "gpt"]),
+            "gpt-4o"
         );
     }
 
@@ -1142,8 +1184,8 @@ mod tests {
         drop(env);
 
         let (_, _, openai_model) =
-            resolve_api_endpoint("openai/gpt-4o-mini").expect("openai endpoint");
-        assert_eq!(openai_model, "gpt-4o-mini");
+            resolve_api_endpoint("openai/gpt-4o").expect("openai endpoint");
+        assert_eq!(openai_model, "gpt-4o");
 
         let (_, _, anthropic_model) =
             resolve_api_endpoint("anthropic/claude-3-haiku-20240307").expect("anthropic endpoint");
@@ -1252,6 +1294,38 @@ mod tests {
         // participants unchanged (not in LLM response)
         assert_eq!(merged.participants, vec!["Alice"]);
         assert_eq!(merged.total_messages, 3);
+    }
+
+    #[test]
+    fn merge_single_includes_checkbox_action_items_in_key_points() {
+        let heuristic = ThreadSummary {
+            participants: vec!["BlueLake".into(), "GreenCastle".into()],
+            key_points: vec!["TODO: deploy to staging".into()],
+            action_items: vec!["- [ ] TODO: update docs".into()],
+            total_messages: 2,
+            open_actions: 1,
+            done_actions: 0,
+            mentions: vec![],
+            code_references: None,
+        };
+
+        let llm_json: Value = serde_json::from_str(
+            r#"{"participants": ["BlueLake", "GreenCastle"], "key_points": ["API v2 schema finalized"], "action_items": ["Update OpenAPI spec", "Run migration script"], "total_messages": 2, "open_actions": 1, "done_actions": 0}"#,
+        )
+        .unwrap();
+
+        let merged = merge_single_thread_summary(&heuristic, &llm_json);
+
+        assert!(
+            merged
+                .key_points
+                .contains(&"TODO: deploy to staging".to_string())
+        );
+        assert!(
+            merged
+                .key_points
+                .contains(&"TODO: update docs".to_string())
+        );
     }
 
     #[test]

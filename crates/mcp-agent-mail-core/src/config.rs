@@ -788,8 +788,8 @@ impl Default for Config {
             search_rollout: SearchRolloutConfig::default(),
 
             // LLM
-            llm_enabled: true,
-            llm_default_model: "gpt-4o-mini".to_string(),
+            llm_enabled: false,
+            llm_default_model: "gpt-5.4".to_string(),
             llm_temperature: 0.2,
             llm_max_tokens: 512,
             llm_cost_logging_enabled: true,
@@ -881,8 +881,7 @@ impl Default for Config {
             tui_debug: false,
             export_dir: resolve_data_path(
                 &dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join(".mcp_agent_mail"),
+                    .unwrap_or_else(|| PathBuf::from(".")),
                 "exports",
             ),
             tui_tree_style: "rounded".to_string(),

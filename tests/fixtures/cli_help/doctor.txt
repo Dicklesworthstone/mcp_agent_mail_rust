@@ -6,6 +6,7 @@ Commands:
   backups
   restore
   reconstruct  Reconstruct the database from the Git archive
+  fix          Attempt automatic remediation for detected issues
   help         Print this message or the help of the given subcommand(s)
 
 Options:

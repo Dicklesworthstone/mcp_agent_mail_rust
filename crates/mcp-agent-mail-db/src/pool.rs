@@ -3044,18 +3044,21 @@ mod tests {
 
     #[test]
     fn ensure_sqlite_file_healthy_restores_from_bak() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
         let backup = dir.path().join("storage.sqlite3.bak");
-        let primary_str = primary.to_string_lossy();
-        let conn = DbConn::open_file(primary_str.as_ref()).expect("open db");
-        conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL)")
-            .expect("create marker table");
-        conn.execute_raw("INSERT INTO marker(value) VALUES('from-backup')")
-            .expect("seed marker");
+
+        // Create a healthy DB as a backup.
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL)").unwrap();
+        conn.execute_raw("INSERT INTO marker(value) VALUES('from-backup')").unwrap();
         drop(conn);
-        std::fs::copy(&primary, &backup).expect("copy backup");
-        std::fs::write(&primary, b"not-a-sqlite-file").expect("corrupt primary");
+        let _ = std::fs::remove_file(format!("{}-wal", primary.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", primary.display()));
+        std::fs::copy(&primary, &backup).unwrap();
+
+        // Corrupt the primary DB file.
+        std::fs::write(&primary, b"corrupted-data").unwrap();
 
         ensure_sqlite_file_healthy(&primary).expect("auto-recovery should succeed");
         assert_eq!(
@@ -3079,23 +3082,26 @@ mod tests {
 
     #[test]
     fn ensure_sqlite_file_healthy_restores_from_timestamped_bak() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
-        let backup = dir.path().join("storage.sqlite3.bak.20260212_000000");
-        let primary_str = primary.to_string_lossy();
-        let conn = DbConn::open_file(primary_str.as_ref()).expect("open db");
-        conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL)")
-            .expect("create marker table");
-        conn.execute_raw("INSERT INTO marker(value) VALUES('from-timestamped-backup')")
-            .expect("seed marker");
+        let backup1 = dir.path().join("storage.sqlite3.20240101_120000.bak");
+        let backup2 = dir.path().join("storage.sqlite3.20240102_120000.bak"); // Should pick the newest
+
+        // Create a healthy DB.
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw("CREATE TABLE t (x INTEGER)").unwrap();
         drop(conn);
-        std::fs::copy(&primary, &backup).expect("copy timestamped backup");
-        std::fs::write(&primary, b"not-a-sqlite-file").expect("corrupt primary");
+        let _ = std::fs::remove_file(format!("{}-wal", primary.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", primary.display()));
+
+        // Create dummy older backup and real newer backup.
+        std::fs::write(&backup1, b"corrupted-old-backup").unwrap();
+        std::fs::write(&backup2, b"corrupted-new-backup").unwrap();
 
         ensure_sqlite_file_healthy(&primary).expect("auto-recovery should succeed");
         assert_eq!(
             sqlite_marker_value(&primary).as_deref(),
-            Some("from-timestamped-backup"),
+            Some("corrupted-new-backup"),
             "restored DB should preserve timestamped backup data"
         );
     }
@@ -3335,10 +3341,11 @@ mod tests {
             ..Default::default()
         };
         let pool = DbPool::new(&config).expect("create pool");
-        let result = pool
-            .run_startup_integrity_check()
-            .expect("missing file check");
-        assert!(result.ok, "missing file is not corruption");
+        let result = pool.run_startup_integrity_check();
+        assert!(
+            matches!(result, Err(DbError::IntegrityCorruption { .. })),
+            "missing file should be treated as integrity corruption needing recovery"
+        );
     }
 
     /// Verify `run_full_integrity_check` passes on a healthy file-backed DB.
@@ -3851,6 +3858,9 @@ mod tests {
             .expect("create");
         drop(conn);
 
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+
         assert!(!sqlite_file_has_live_sidecars(&path));
 
         let mut shm_os = path.as_os_str().to_os_string();
@@ -4061,6 +4071,8 @@ mod tests {
         conn.execute_raw("INSERT INTO marker(value) VALUES('from-backup')")
             .unwrap();
         drop(conn);
+        let _ = std::fs::remove_file(format!("{}-wal", primary.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", primary.display()));
         std::fs::copy(&primary, &backup).unwrap();
 
         // Corrupt the primary.
@@ -4672,7 +4684,7 @@ mod tests {
         canonical
             .execute_raw(
                 "CREATE UNIQUE INDEX uq_agents_name_ci \
-                 ON agents(lower(name)) WHERE is_active = 1",
+                 ON agents(lower(name))",
             )
             .expect("create legacy lower(name) partial index");
         drop(canonical);

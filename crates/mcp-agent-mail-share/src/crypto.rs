@@ -332,7 +332,10 @@ pub fn decrypt_with_age(
     if let Some(pass) = passphrase {
         use std::io::Write;
         cmd.stdin(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
+        // To prevent deadlock during write_all if age produces unexpected output on stdout/stderr,
+        // we map them to null since we output to a file and don't log them for passphrase runs.
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
         let mut child = cmd.spawn()?;
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(pass.as_bytes())?;
@@ -731,7 +734,7 @@ mod tests {
     fn verify_with_wrong_public_key_fails() {
         let dir = tempfile::tempdir().unwrap();
         let manifest_path = dir.path().join("manifest.json");
-        std::fs::write(&manifest_path, r#"{"test": "wrong key"}"#).unwrap();
+        std::fs::write(&manifest_path, r#"{"test":"wrong key"}"#).unwrap();
 
         // Sign with key A
         let key_a = dir.path().join("key_a.key");

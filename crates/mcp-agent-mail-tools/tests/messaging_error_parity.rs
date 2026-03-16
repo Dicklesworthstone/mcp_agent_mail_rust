@@ -64,6 +64,15 @@ async fn setup_project_and_agent(ctx: &McpContext, project_key: &str, agent: &st
     )
     .await
     .expect("register_agent");
+
+    mcp_agent_mail_tools::contacts::set_contact_policy(
+        ctx,
+        project_key.to_string(),
+        agent.to_string(),
+        "open".to_string(),
+    )
+    .await
+    .expect("set_contact_policy");
 }
 
 // -----------------------------------------------------------------------

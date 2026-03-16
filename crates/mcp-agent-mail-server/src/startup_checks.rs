@@ -11,7 +11,7 @@ use mcp_agent_mail_core::{
 use mcp_agent_mail_db::DbPoolConfig;
 use std::collections::BTreeSet;
 use std::fmt;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -285,8 +285,9 @@ fn probe_agent_mail_health_addr(connect_host: &str, port: u16, addr: std::net::S
             return false;
         }
 
-        // Read response
-        let mut reader = BufReader::new(&stream);
+        // Read response, bounded by MAX_HEALTH_BODY_BYTES to prevent memory exhaustion DoS
+        // from malicious or misbehaving services listening on this port.
+        let mut reader = BufReader::new((&stream).take((MAX_HEALTH_BODY_BYTES + 4096) as u64));
         let mut status_line = String::new();
         if reader.read_line(&mut status_line).is_err() {
             return false;
@@ -1923,7 +1924,7 @@ mod tests {
         // Use port 0 to get a random available port, then check a nearby high port
         // that's almost certainly free
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind to random port");
-        let port = listener.local_addr().expect("get local addr").port();
+        let port = listener.local_addr().expect("listener addr").port();
         drop(listener);
 
         // The port we just released should be free
@@ -1938,7 +1939,7 @@ mod tests {
     fn check_port_status_in_use_by_other_process() {
         // Bind to a random port and keep it held
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind to random port");
-        let port = listener.local_addr().expect("get local addr").port();
+        let port = listener.local_addr().expect("listener addr").port();
 
         // The port should be detected as in use
         let status = check_port_status("127.0.0.1", port);
@@ -2231,7 +2232,7 @@ mod tests {
         let output = concat!(
             "LISTEN 0 4096 127.0.0.1:8765 0.0.0.0:* users:((\"am\",pid=1234,fd=7))\n",
             "LISTEN 0 4096 127.0.0.2:8765 0.0.0.0:* users:((\"am\",pid=5678,fd=8))\n",
-            "LISTEN 0 4096 *:8765 0.0.0.0:* users:((\"am\",pid=9999,fd=9))\n"
+            "LISTEN 0 4096 [::1]:8765 [::]:* users:((\"am\",pid=9999,fd=9))\n"
         );
         assert_eq!(
             parse_ss_port_holder_pids_for_host(output, "127.0.0.1"),

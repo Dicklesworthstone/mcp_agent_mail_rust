@@ -111,6 +111,24 @@ static HTML_SANITIZER: LazyLock<Builder<'static>> = LazyLock::new(|| {
             .collect::<HashSet<_>>(),
     );
 
+    // Prevent XSS via data:text/html URIs while allowing inline images
+    b.attribute_filter(|_element, attribute, value| {
+        if attribute == "href" || attribute == "src" {
+            let value_lower = value.trim().to_ascii_lowercase();
+            if value_lower.starts_with("data:") {
+                if value_lower.starts_with("data:image/") {
+                    Some(value.into())
+                } else {
+                    None
+                }
+            } else {
+                Some(value.into())
+            }
+        } else {
+            Some(value.into())
+        }
+    });
+
     // Only allow a small set of style properties (legacy python uses bleach CSSSanitizer).
     b.filter_style_properties(
         [

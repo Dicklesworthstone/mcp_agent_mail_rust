@@ -1942,29 +1942,41 @@ e2e_git_commit() {
 # ---------------------------------------------------------------------------
 
 # Build the workspace binary (if needed)
+_e2e_build_binary() {
+    local bin_name="$1"
+    case "$bin_name" in
+        am)
+            e2e_run_cargo build -p "mcp-agent-mail-cli" --bin "am" 2>&1 | tail -5
+            ;;
+        mcp-agent-mail)
+            e2e_run_cargo build -p "mcp-agent-mail" --bin "mcp-agent-mail" 2>&1 | tail -5
+            ;;
+        *)
+            # Default: assume package/bin share the same name.
+            e2e_run_cargo build -p "$bin_name" --bin "$bin_name" 2>&1 | tail -5
+            ;;
+    esac
+}
+
 e2e_ensure_binary() {
     local bin_name="${1:-mcp-agent-mail}"
     local bin_path="${CARGO_TARGET_DIR}/debug/${bin_name}"
     local workspace_fallback="${E2E_PROJECT_ROOT}/target/debug/${bin_name}"
     if [ ! -x "$bin_path" ] || [ "${E2E_FORCE_BUILD:-0}" = "1" ]; then
         e2e_log "Building ${bin_name}..."
-        case "$bin_name" in
-            am)
-                e2e_run_cargo build -p "mcp-agent-mail-cli" --bin "am" 2>&1 | tail -5
-                ;;
-            mcp-agent-mail)
-                e2e_run_cargo build -p "mcp-agent-mail" --bin "mcp-agent-mail" 2>&1 | tail -5
-                ;;
-            *)
-                # Default: assume package/bin share the same name.
-                e2e_run_cargo build -p "$bin_name" --bin "$bin_name" 2>&1 | tail -5
-                ;;
-        esac
+        _e2e_build_binary "${bin_name}"
     fi
 
     # Some environments (including remote runners) may ignore/override CARGO_TARGET_DIR.
     if [ ! -x "$bin_path" ] && [ -x "$workspace_fallback" ]; then
         bin_path="$workspace_fallback"
+    fi
+    if [ ! -x "$bin_path" ] && [ "${E2E_CARGO_FORCE_LOCAL}" != "1" ]; then
+        e2e_log "Remote build left no local ${bin_name}; retrying build locally"
+        E2E_CARGO_FORCE_LOCAL=1 _e2e_build_binary "${bin_name}"
+        if [ ! -x "$bin_path" ] && [ -x "$workspace_fallback" ]; then
+            bin_path="$workspace_fallback"
+        fi
     fi
     if [ ! -x "$bin_path" ]; then
         e2e_log "ERROR ${bin_name} binary not found after build"

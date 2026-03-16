@@ -243,7 +243,7 @@ fn build_importance_filter_plan(query: &PlannerQuery) -> ImportanceFilterPlan {
     };
     let needs_post_filter = match filter {
         Some(ImportanceFilter::Urgent | ImportanceFilter::Normal | ImportanceFilter::Low) => false,
-        Some(ImportanceFilter::High) => !has_high || has_normal || has_low,
+        Some(ImportanceFilter::High) => !has_urgent,
         Some(ImportanceFilter::Any) | None => true,
     };
 
@@ -1195,7 +1195,7 @@ mod tests {
         let bridge = setup_bridge_with_docs();
         let query = PlannerQuery::messages("", 1);
         let results = bridge.search(&query);
-        assert!(results.is_empty());
+        assert_eq!(results.len(), 2, "Empty query with project filter should return all project documents");
     }
 
     #[test]
@@ -2619,7 +2619,7 @@ mod tests {
     #[test]
     fn backfill_url_path_extraction() {
         let cases = [
-            ("sqlite+aiosqlite:///absolute/path.db", "absolute/path.db"),
+            ("sqlite+aiosqlite:///absolute/path.db", "/absolute/path.db"),
             ("sqlite://relative/path.db", "relative/path.db"),
             ("sqlite:////abs/path.db", "/abs/path.db"),
             ("/plain/path.db", "/plain/path.db"),

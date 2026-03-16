@@ -207,7 +207,10 @@ pub fn capture_command_with_stdin(
             .stderr(Stdio::piped())
             .spawn()?;
         if let Some(mut child_stdin) = child.stdin.take() {
-            child_stdin.write_all(stdin_payload.as_bytes())?;
+            let payload = stdin_payload.to_string();
+            std::thread::spawn(move || {
+                let _ = child_stdin.write_all(payload.as_bytes());
+            });
         }
         child.wait_with_output()?
     } else {

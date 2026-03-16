@@ -144,6 +144,7 @@ fn cli_help_snapshots() {
         ("guard_check", &["guard", "check", "--help"]),
         ("doctor", &["doctor", "--help"]),
         ("doctor_repair", &["doctor", "repair", "--help"]),
+        ("service", &["service", "--help"]),
         ("archive", &["archive", "--help"]),
         ("products", &["products", "--help"]),
         ("docs", &["docs", "--help"]),

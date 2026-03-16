@@ -11,6 +11,8 @@ use std::sync::{Mutex, OnceLock};
 
 /// Auto-increment ID field names that are non-deterministic across test runs.
 const AUTO_INCREMENT_ID_KEYS: &[&str] = &["id", "message_id", "reply_to"];
+const TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS: &str = "3600";
+const TEST_SEARCH_ENGINE: &str = "legacy";
 
 /// Tests in this file mutate process-wide environment variables (Rust has no per-test env isolation).
 /// The Rust test harness runs tests in parallel by default, so serialize any env mutations and
@@ -255,13 +257,31 @@ impl ToolFilterEnvGuard {
             "TOOLS_FILTER_MODE",
             "TOOLS_FILTER_CLUSTERS",
             "TOOLS_FILTER_TOOLS",
+            "AM_STARTUP_SEARCH_BACKFILL_DELAY_SECS",
+            "AM_SEARCH_ENGINE",
         ];
 
         let mut previous = Vec::new();
         for key in keys {
             let old = std::env::var(key).ok();
             previous.push((key.to_string(), old));
-            if let Some(value) = case_env.get(key) {
+            if key == "AM_STARTUP_SEARCH_BACKFILL_DELAY_SECS" {
+                let value = case_env
+                    .get(key)
+                    .map(String::as_str)
+                    .unwrap_or(TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS);
+                unsafe {
+                    std::env::set_var(key, value);
+                }
+            } else if key == "AM_SEARCH_ENGINE" {
+                let value = case_env
+                    .get(key)
+                    .map(String::as_str)
+                    .unwrap_or(TEST_SEARCH_ENGINE);
+                unsafe {
+                    std::env::set_var(key, value);
+                }
+            } else if let Some(value) = case_env.get(key) {
                 unsafe {
                     std::env::set_var(key, value);
                 }
@@ -307,6 +327,25 @@ impl EnvVarGuard {
             previous.push(((*key).to_string(), old));
             unsafe {
                 std::env::set_var(key, value);
+            }
+        }
+        if !vars
+            .iter()
+            .any(|(key, _)| *key == "AM_STARTUP_SEARCH_BACKFILL_DELAY_SECS")
+        {
+            let key = "AM_STARTUP_SEARCH_BACKFILL_DELAY_SECS";
+            let old = std::env::var(key).ok();
+            previous.push((key.to_string(), old));
+            unsafe {
+                std::env::set_var(key, TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS);
+            }
+        }
+        if !vars.iter().any(|(key, _)| *key == "AM_SEARCH_ENGINE") {
+            let key = "AM_SEARCH_ENGINE";
+            let old = std::env::var(key).ok();
+            previous.push((key.to_string(), old));
+            unsafe {
+                std::env::set_var(key, TEST_SEARCH_ENGINE);
             }
         }
         mcp_agent_mail_core::Config::reset_cached();
@@ -398,6 +437,7 @@ fn setup_fixture_env() -> FixtureEnv {
         // Deterministic LLM paths for llm_mode=true conformance fixtures.
         ("LLM_ENABLED", "1"),
         ("MCP_AGENT_MAIL_LLM_STUB", "1"),
+        ("SEARCH_ROLLOUT_ENGINE", "legacy"),
         ("TOOLS_FILTER_PROFILE", "full"),
         ("TOOLS_FILTER_MODE", "include"),
         ("TOOLS_FILTER_CLUSTERS", ""),
@@ -479,6 +519,12 @@ fn run_fixtures_against_rust_server_router() {
     let mut req_id: u64 = 1;
 
     for (tool_name, tool_fixture) in &fixtures.tools {
+        if tool_name.starts_with("search_") || tool_name == "products_search" {
+            // Search indexing is async. Give the background updater a moment to catch up
+            // with the messages created by earlier fixture cases.
+            std::thread::sleep(std::time::Duration::from_millis(600));
+        }
+
         for case in &tool_fixture.cases {
             let params = CallToolParams {
                 name: tool_name.clone(),
@@ -781,11 +827,8 @@ fn run_fixtures_against_rust_server_router() {
             content.trim_start().starts_with("---json"),
             "message {msg_rel} must start with ---json frontmatter marker"
         );
-        let fm = parse_frontmatter(&content)
-            .unwrap_or_else(|| panic!("message {msg_rel} has no valid ---json frontmatter"));
-        let fm_obj = fm
-            .as_object()
-            .unwrap_or_else(|| panic!("{msg_rel} frontmatter is not a JSON object"));
+        let fm = parse_frontmatter(&content).expect("message {msg_rel} has no valid ---json frontmatter");
+        let fm_obj = fm.as_object().unwrap_or_else(|| panic!("{msg_rel} frontmatter is not a JSON object"));
 
         for field in &required_fm_fields {
             assert!(
@@ -1131,7 +1174,7 @@ fn run_fixtures_against_rust_server_router() {
             name: "register_agent".to_string(),
             arguments: Some(serde_json::json!({
                 "project_key": project_key.clone(),
-                "program": "codex-cli",
+                "program": "test",
                 "model": "gpt-5",
                 "name": name,
             })),
@@ -1919,7 +1962,7 @@ fn resource_query_router_projects_limit_and_contains_are_honored() {
     let zero_result = router
         .handle_resources_read(
             &cx,
-            req_id,
+            1,
             &zero_params,
             &budget,
             SessionState::new(),
@@ -2119,7 +2162,6 @@ fn toon_format_resolution_json_fallback() {
         ("TOON_BIN", ""),
         ("TOON_TRU_BIN", ""),
         ("MCP_AGENT_MAIL_OUTPUT_FORMAT", ""),
-        ("TOON_DEFAULT_FORMAT", ""),
         ("AGENT_NAME_ENFORCEMENT_MODE", "coerce"),
     ]);
 

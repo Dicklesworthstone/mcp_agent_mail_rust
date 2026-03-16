@@ -35,6 +35,25 @@ fn write_fixture(path: &Path, contents: &str) {
     std::fs::write(path, contents).expect("write fixture");
 }
 
+#[cfg(unix)]
+fn set_executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut perms = std::fs::metadata(path)
+        .expect("stat executable")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).expect("chmod executable");
+}
+
+fn write_login_profile(path: &Path, local_bin: &Path) {
+    let contents = format!(
+        "export PATH=\"{}:/usr/local/bin:/usr/bin:/bin\"\n",
+        local_bin.display()
+    );
+    std::fs::write(path, contents).expect("write shell profile");
+}
+
 fn read_fixture(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
@@ -99,6 +118,31 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
                                 Value::String("<BEADS_ISSUE_AWARENESS_SUMMARY>".to_string()),
                             );
                         }
+                        // Runtime diagnostics depend on the local listener/process state.
+                        "server_port" => {
+                            out.insert(
+                                "detail".to_string(),
+                                Value::String("<SERVER_PORT_SUMMARY>".to_string()),
+                            );
+                        }
+                        "server_http_health" => {
+                            out.insert(
+                                "detail".to_string(),
+                                Value::String("<SERVER_HTTP_HEALTH_SUMMARY>".to_string()),
+                            );
+                        }
+                        "server_jsonrpc_health" => {
+                            out.insert(
+                                "detail".to_string(),
+                                Value::String("<SERVER_JSONRPC_HEALTH_SUMMARY>".to_string()),
+                            );
+                        }
+                        "server_process_cpu" => {
+                            out.insert(
+                                "detail".to_string(),
+                                Value::String("<SERVER_PROCESS_CPU_SUMMARY>".to_string()),
+                            );
+                        }
                         _ => {}
                     }
                 }
@@ -115,13 +159,53 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
 struct TestEnv {
     tmp: tempfile::TempDir,
     db_path: PathBuf,
+    home_dir: PathBuf,
+    doctor_repo: PathBuf,
 }
 
 impl TestEnv {
     fn new() -> Self {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("mailbox.sqlite3");
-        Self { tmp, db_path }
+        let home_dir = tmp.path().join("home");
+        let doctor_repo = tmp.path().join("doctor_repo");
+
+        let local_bin = home_dir.join(".local/bin");
+        std::fs::create_dir_all(&local_bin).expect("create local bin");
+        std::fs::create_dir_all(home_dir.join(".config")).expect("create config dir");
+        std::fs::create_dir_all(home_dir.join(".cache")).expect("create cache dir");
+        std::fs::create_dir_all(home_dir.join(".local/share")).expect("create data dir");
+
+        let installed_am = local_bin.join("am");
+        std::fs::copy(am_bin(), &installed_am).expect("copy am into hermetic home");
+        #[cfg(unix)]
+        set_executable(&installed_am);
+
+        write_login_profile(&home_dir.join(".bash_profile"), &local_bin);
+        write_login_profile(&home_dir.join(".profile"), &local_bin);
+        write_login_profile(&home_dir.join(".zprofile"), &local_bin);
+
+        std::fs::create_dir_all(&doctor_repo).expect("create doctor repo");
+        let git_init = Command::new("git")
+            .arg("init")
+            .arg("-b")
+            .arg("main")
+            .current_dir(&doctor_repo)
+            .output()
+            .expect("git init doctor repo");
+        assert!(
+            git_init.status.success(),
+            "git init failed: {}{}",
+            String::from_utf8_lossy(&git_init.stdout),
+            String::from_utf8_lossy(&git_init.stderr)
+        );
+
+        Self {
+            tmp,
+            db_path,
+            home_dir,
+            doctor_repo,
+        }
     }
 
     fn database_url(&self) -> String {
@@ -132,6 +216,14 @@ impl TestEnv {
         self.tmp.path().join("storage_root")
     }
 
+    fn local_bin(&self) -> PathBuf {
+        self.home_dir.join(".local/bin")
+    }
+
+    fn doctor_cwd(&self) -> &Path {
+        &self.doctor_repo
+    }
+
     fn base_env(&self) -> Vec<(String, String)> {
         vec![
             ("DATABASE_URL".to_string(), self.database_url()),
@@ -139,6 +231,28 @@ impl TestEnv {
                 "STORAGE_ROOT".to_string(),
                 self.storage_root().display().to_string(),
             ),
+            ("HOME".to_string(), self.home_dir.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".to_string(),
+                self.home_dir.join(".config").display().to_string(),
+            ),
+            (
+                "XDG_CACHE_HOME".to_string(),
+                self.home_dir.join(".cache").display().to_string(),
+            ),
+            (
+                "XDG_DATA_HOME".to_string(),
+                self.home_dir.join(".local/share").display().to_string(),
+            ),
+            (
+                "PATH".to_string(),
+                format!(
+                    "{}:/usr/local/bin:/usr/bin:/bin",
+                    self.local_bin().display()
+                ),
+            ),
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+            ("LC_ALL".to_string(), "C.UTF-8".to_string()),
             // Force server tool calls (products) to fail fast so we exercise local fallbacks.
             ("HTTP_HOST".to_string(), "127.0.0.1".to_string()),
             ("HTTP_PORT".to_string(), "1".to_string()),
@@ -510,9 +624,8 @@ fn run_json_cmd(
 ) -> (std::process::ExitStatus, String, String) {
     let mut cmd = Command::new(am_bin());
     cmd.args(args);
-    if let Some(cwd) = cwd {
-        cmd.current_dir(cwd);
-    }
+    cmd.env_clear();
+    cmd.current_dir(cwd.unwrap_or(env.tmp.path()));
     for (k, v) in env.base_env() {
         cmd.env(k, v);
     }
@@ -608,7 +721,7 @@ fn cli_json_snapshots() {
     assert_json_snapshot(
         &env_seeded,
         "doctor_check",
-        None,
+        Some(env_seeded.doctor_cwd()),
         &["doctor", "check", "--json"],
     );
     assert_json_snapshot(

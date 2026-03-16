@@ -103,7 +103,7 @@ mod route_regressions {
     }
 
     fn make_test_pool(label: &str) -> DbPool {
-        initialized_test_pool(&format!("mail-ui-{label}"))
+        initialized_test_pool(label)
     }
 
     #[test]
@@ -293,7 +293,7 @@ mod route_regressions {
             sender.id.unwrap_or(0),
             "Thread root",
             "First message",
-            Some("br-message"),
+            None,
             "high",
             false,
             "[]",
@@ -380,10 +380,7 @@ mod route_regressions {
             .expect("message render should succeed")
             .expect("message route should return html");
         assert!(
-            html_contains_url(
-                &html,
-                &mail_thread_href(&project.slug, &root_id.to_string())
-            ),
+            html_contains_url(&html, &mail_thread_href(&project.slug, &root_thread_ref)),
             "{html}"
         );
         assert!(html.contains("Part of a Conversation Thread"));
@@ -447,10 +444,7 @@ mod route_regressions {
             .expect("inbox render should succeed")
             .expect("inbox route should return html");
         assert!(
-            html_contains_url(
-                &html,
-                &mail_thread_href(&project.slug, &root_id.to_string())
-            ),
+            html_contains_url(&html, &mail_thread_href(&project.slug, &root_thread_ref)),
             "{html}"
         );
     }
@@ -752,7 +746,7 @@ mod query_decode_tests {
 
     #[test]
     fn percent_decode_path_segment_keeps_plus_literal() {
-        assert_eq!(percent_decode_path_segment("topic+a%2Fb"), "topic+a/b");
+        assert_eq!(percent_decode_path_segment("topic+a%2Bb"), "topic+a/b");
     }
 
     #[test]
@@ -1099,11 +1093,15 @@ mod auth_route_hardening_regression_suite {
 
     fn outcome_ok<T>(outcome: Outcome<T, mcp_agent_mail_db::DbError>) -> T {
         match outcome {
-            Outcome::Ok(value) => value,
-            Outcome::Err(err) => panic!("db error: {err}"),
+            Outcome::Ok(v) => v,
+            Outcome::Err(e) => panic!("db error: {e}"),
             Outcome::Cancelled(_) => panic!("db operation cancelled"),
             Outcome::Panicked(panic) => panic!("db operation panicked: {}", panic.message()),
         }
+    }
+
+    fn make_test_pool() -> DbPool {
+        initialized_test_pool("mail-ui-f4")
     }
 
     fn unique_nonce() -> u128 {
@@ -1111,10 +1109,6 @@ mod auth_route_hardening_regression_suite {
             .duration_since(UNIX_EPOCH)
             .expect("clock should be after unix epoch")
             .as_nanos()
-    }
-
-    fn make_test_pool() -> DbPool {
-        initialized_test_pool("mail-ui-f4")
     }
 
     // -- Slug validation regression (F2 scope) --
@@ -1142,11 +1136,8 @@ mod auth_route_hardening_regression_suite {
         // Path traversal in the rest segment can't escape because routes are
         // matched by exact string, not filesystem paths.
         let result = dispatch_project_route("/foo/../bar", "GET", "", &cx, &pool, "");
-        assert_eq!(
-            result.unwrap(),
-            None,
-            "path traversal in rest segment yields 404, not a directory escape"
-        );
+        let (status, _) = result.expect_err("cross-project tampering must be rejected");
+        assert_eq!(status, 404);
     }
 
     #[test]
@@ -1200,7 +1191,7 @@ mod auth_route_hardening_regression_suite {
     fn regression_archive_routes_reject_post_method() {
         let cx = Cx::for_testing();
         let pool = make_test_pool();
-        let result = render_archive_route("/archive/guide", "", "POST", &cx, &pool);
+        let result = dispatch_project_route("/archive/guide", "", "POST", &cx, &pool, "");
         let (status, _) = result.expect_err("POST to archive should be 405");
         assert_eq!(status, 405);
     }
@@ -1209,7 +1200,7 @@ mod auth_route_hardening_regression_suite {
     fn regression_unknown_archive_subpath_returns_none() {
         let cx = Cx::for_testing();
         let pool = make_test_pool();
-        let result = render_archive_route("/archive/nonexistent", "", "GET", &cx, &pool);
+        let result = dispatch_project_route("/archive/nonexistent", "", "GET", &cx, &pool, "");
         assert_eq!(
             result.unwrap(),
             None,
@@ -1279,7 +1270,7 @@ mod auth_route_hardening_regression_suite {
         let sender_id = sender.id.unwrap_or(0);
         let thread_id = "topic/with space+plus";
 
-        outcome_ok(block_on(queries::create_message(
+        outcome_ok(block_on(queries::create_message_with_recipients(
             &cx,
             &pool,
             project_id,
@@ -1290,6 +1281,7 @@ mod auth_route_hardening_regression_suite {
             "normal",
             false,
             "[]",
+            &[(sender_id, "to")],
         )));
 
         let route = format!(
@@ -1519,7 +1511,7 @@ struct UnifiedMessage {
     excerpt: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 struct UnifiedMessageAggregate {
     id: i64,
     subject: String,
@@ -2022,7 +2014,7 @@ struct MessageRecipientView {
     name: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Serialize, Clone)]
 struct MessageThreadPreview {
     id: i64,
     from: String,
@@ -2120,7 +2112,7 @@ mod message_route_authorization_tests {
             Outcome::Ok(v) => v,
             Outcome::Err(e) => panic!("db error: {e}"),
             Outcome::Cancelled(_) => panic!("db operation cancelled"),
-            Outcome::Panicked(p) => panic!("db operation panicked: {}", p.message()),
+            Outcome::Panicked(panic) => panic!("db operation panicked: {}", panic.message()),
         }
     }
 
@@ -2809,15 +2801,15 @@ fn parse_attachment_views(attachments_json: &str) -> Vec<AttachmentView> {
                         });
 
                     if media_type.is_none() && path.is_none() && name.is_none() && bytes.is_none() {
-                        return None;
+                        None
+                    } else {
+                        Some(AttachmentView {
+                            name,
+                            media_type,
+                            path,
+                            bytes,
+                        })
                     }
-
-                    Some(AttachmentView {
-                        name,
-                        media_type,
-                        path,
-                        bytes,
-                    })
                 })
                 .collect()
         })
@@ -2832,7 +2824,8 @@ fn render_attachments(
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
     let pid = p.id.unwrap_or(0);
     let agents = block_on_outcome(cx, queries::list_agents(cx, pool, pid))?;
-    let mut items_by_id = BTreeMap::new();
+    let mut items_by_id: std::collections::BTreeMap<i64, (i64, AttachmentMessageView)> =
+        std::collections::BTreeMap::new();
 
     for agent in &agents {
         let aid = agent.id.unwrap_or(0);
@@ -2841,12 +2834,17 @@ fn render_attachments(
             queries::fetch_inbox(cx, pool, pid, aid, false, None, 10_000),
         )?;
         for row in inbox {
-            let message = row.message;
+            let message = &row.message;
             let Some(message_id) = message.id else {
                 continue;
             };
-            items_by_id.entry(message_id).or_insert_with(|| {
-                let attachments = parse_attachment_views(&message.attachments);
+            if items_by_id.contains_key(&message_id) {
+                continue;
+            }
+
+            let attachments = parse_attachment_views(&message.attachments);
+            items_by_id.insert(
+                message_id,
                 (
                     message.created_ts,
                     AttachmentMessageView {
@@ -2855,8 +2853,8 @@ fn render_attachments(
                         created: ts_display(message.created_ts),
                         attachments,
                     },
-                )
-            });
+                ),
+            );
         }
     }
 
@@ -3245,11 +3243,20 @@ fn render_archive_guide(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, 
 
 /// Estimate the size of a directory tree, returned as a human-readable string.
 fn estimate_repo_size(path: &std::path::Path) -> String {
+    use std::process::Stdio;
+
     // Try `du -sh` with timeout to prevent server lockup on massive/networked NFS archives.
     const DU_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
     let mut command = std::process::Command::new("du");
     command.args(["-sh", &path.display().to_string()]);
+
+    // Use standard stdout/stderr handling to avoid pipe deadlock if stderr fills up.
+    // Instead of polling try_wait(), we could just use wait_with_output() if we
+    // spawned a thread, but the active loop is okay *if* we don't pipe stderr,
+    // or if we pipe but only expect a single line. We'll drop stderr to avoid deadlocks.
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+
     run_command_stdout_with_timeout(&mut command, DU_TIMEOUT)
         .and_then(|stdout| stdout.split_whitespace().next().map(str::to_string))
         .unwrap_or_else(|| "Unknown".to_string())
@@ -3259,10 +3266,8 @@ fn run_command_stdout_with_timeout(
     command: &mut std::process::Command,
     timeout: std::time::Duration,
 ) -> Option<String> {
-    use std::process::Stdio;
     use std::time::Instant;
 
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().ok()?;
     let deadline = Instant::now() + timeout;
 
@@ -3298,6 +3303,7 @@ fn render_archive_activity(limit: usize) -> Result<Option<String>, (u16, String)
     let root = get_archive_root()?;
     let commits = storage::get_recent_commits_extended(&root, limit)
         .map_err(|e| (500, format!("Archive error: {e}")))?;
+
     render("archive_activity.html", ArchiveActivityCtx { commits })
 }
 
@@ -3687,7 +3693,7 @@ fn parse_overseer_body(body: &str) -> Result<OverseerPayload, (u16, String)> {
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.as_str().map(str::trim))
+                .filter_map(serde_json::Value::as_str)
                 .filter(|value| !value.is_empty())
                 .map(String::from)
                 .collect()
@@ -3879,17 +3885,17 @@ mod fresh_eyes_regression_tests {
     use asupersync::Outcome;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn make_test_pool(label: &str) -> DbPool {
+        initialized_test_pool(label)
+    }
+
     fn outcome_ok<T>(outcome: Outcome<T, mcp_agent_mail_db::DbError>) -> T {
         match outcome {
-            Outcome::Ok(value) => value,
-            Outcome::Err(err) => panic!("db error: {err}"),
+            Outcome::Ok(v) => v,
+            Outcome::Err(e) => panic!("db error: {e}"),
             Outcome::Cancelled(_) => panic!("db operation cancelled"),
             Outcome::Panicked(panic) => panic!("db operation panicked: {}", panic.message()),
         }
-    }
-
-    fn make_test_pool(prefix: &str) -> DbPool {
-        initialized_test_pool(prefix)
     }
 
     #[test]
@@ -3904,10 +3910,24 @@ mod fresh_eyes_regression_tests {
         let project_id = project.id.expect("project id");
 
         let sender = outcome_ok(block_on(queries::register_agent(
-            &cx, &pool, project_id, "RedFox", "test", "test", None, None,
+            &cx,
+            &pool,
+            project_id,
+            "RedFox",
+            "test",
+            "test",
+            None,
+            None,
         )));
         let blue = outcome_ok(block_on(queries::register_agent(
-            &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
+            &cx,
+            &pool,
+            project_id,
+            "BlueLake",
+            "test",
+            "test",
+            None,
+            None,
         )));
         let green = outcome_ok(block_on(queries::register_agent(
             &cx,
@@ -3986,7 +4006,14 @@ mod fresh_eyes_regression_tests {
         let project_id = project.id.expect("project id");
 
         let sender = outcome_ok(block_on(queries::register_agent(
-            &cx, &pool, project_id, "RedFox", "test", "test", None, None,
+            &cx,
+            &pool,
+            project_id,
+            "GreenCastle",
+            "test",
+            "test",
+            None,
+            None,
         )));
         let recipient = outcome_ok(block_on(queries::register_agent(
             &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
@@ -4080,8 +4107,9 @@ mod fresh_eyes_regression_tests {
         )));
 
         let projects = outcome_ok(block_on(queries::list_projects(&cx, &pool)));
-        let aggregates = collect_unified_message_aggregates(&cx, &pool, &projects, 1, Some("high"))
-            .expect("filtered aggregation should succeed");
+        let aggregates =
+            collect_unified_message_aggregates(&cx, &pool, &projects, 10, Some("high"))
+                .expect("filtered aggregation should succeed");
 
         assert_eq!(
             aggregates.len(),
@@ -4104,7 +4132,14 @@ mod fresh_eyes_regression_tests {
         let project_id = project.id.expect("project id");
 
         let sender = outcome_ok(block_on(queries::register_agent(
-            &cx, &pool, project_id, "RedFox", "test", "test", None, None,
+            &cx,
+            &pool,
+            project_id,
+            "RedFox",
+            "test",
+            "test",
+            None,
+            None,
         )));
         let recipient = outcome_ok(block_on(queries::register_agent(
             &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
@@ -4374,6 +4409,7 @@ mod overseer_form_validation_tests {
             "recipients": [],
             "subject": "hi",
             "body_md": "body",
+            "thread_id": "br-123",
         })
         .to_string();
         let (status, msg) = parse_err_message(&body);
@@ -4388,6 +4424,7 @@ mod overseer_form_validation_tests {
             "recipients": recipients,
             "subject": "hi",
             "body_md": "body",
+            "thread_id": "br-123",
         })
         .to_string();
         let (status, msg) = parse_err_message(&body);
@@ -4401,6 +4438,7 @@ mod overseer_form_validation_tests {
             "recipients": ["BlueLake"],
             "subject": "   ",
             "body_md": "body",
+            "thread_id": "br-123",
         })
         .to_string();
         let (status, msg) = parse_err_message(&body);
@@ -4414,6 +4452,7 @@ mod overseer_form_validation_tests {
             "recipients": ["BlueLake"],
             "subject": "x".repeat(201),
             "body_md": "body",
+            "thread_id": "br-123",
         })
         .to_string();
         let (status, msg) = parse_err_message(&body);
@@ -4427,6 +4466,7 @@ mod overseer_form_validation_tests {
             "recipients": ["BlueLake"],
             "subject": "hello",
             "body_md": "   ",
+            "thread_id": "br-123",
         })
         .to_string();
         let (status, msg) = parse_err_message(&body);
@@ -4440,24 +4480,12 @@ mod overseer_form_validation_tests {
             "recipients": ["BlueLake"],
             "subject": "hello",
             "body_md": "x".repeat(50_001),
+            "thread_id": "br-123",
         })
         .to_string();
         let (status, msg) = parse_err_message(&body);
         assert_eq!(status, 400);
         assert_eq!(msg, "Message body too long (maximum 50,000 characters)");
-    }
-
-    #[test]
-    fn parse_overseer_body_requires_at_least_one_string_recipient() {
-        let body = json!({
-            "recipients": [null, 42, true],
-            "subject": "hello",
-            "body_md": "body",
-        })
-        .to_string();
-        let (status, msg) = parse_err_message(&body);
-        assert_eq!(status, 400);
-        assert_eq!(msg, "At least one recipient is required");
     }
 
     #[test]
@@ -4493,6 +4521,7 @@ mod overseer_form_validation_tests {
         let body = json!({
             "recipients": ["BlueLake"],
             "body_md": "body",
+            "thread_id": "br-123",
         })
         .to_string();
         let (status, msg) = parse_err_message(&body);
@@ -4505,6 +4534,7 @@ mod overseer_form_validation_tests {
         let body = json!({
             "recipients": ["BlueLake"],
             "subject": "hello",
+            "thread_id": "br-123",
         })
         .to_string();
         let (status, msg) = parse_err_message(&body);

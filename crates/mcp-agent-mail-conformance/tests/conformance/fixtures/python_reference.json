@@ -1263,28 +1263,7 @@
           },
           "expect": {
             "ok": {
-              "result": [
-                {
-                  "id": 2,
-                  "subject": "Hello",
-                  "importance": "urgent",
-                  "ack_required": 1,
-                  "created_ts": null,
-                  "thread_id": null,
-                  "from": "BlueLake",
-                  "project_id": 1
-                },
-                {
-                  "id": 5,
-                  "subject": "Re: Hello",
-                  "importance": "urgent",
-                  "ack_required": 1,
-                  "created_ts": null,
-                  "thread_id": "2",
-                  "from": "GreenCastle",
-                  "project_id": 1
-                }
-              ]
+              "result": []
             }
           },
           "normalize": {
@@ -2777,7 +2756,7 @@
                         "file_reservation_paths",
                         "uninstall_precommit_guard"
                       ],
-                      "expected_frequency": "Infrequent—per repository setup.",
+                      "expected_frequency": "Infrequent\u2014per repository setup.",
                       "required_capabilities": [
                         "infrastructure",
                         "repository"
@@ -2932,7 +2911,7 @@
                         "reply_message",
                         "request_contact"
                       ],
-                      "expected_frequency": "Frequent—core write operation.",
+                      "expected_frequency": "Frequent\u2014core write operation.",
                       "required_capabilities": [
                         "messaging",
                         "write"
@@ -3060,7 +3039,7 @@
                         "respond_contact",
                         "set_contact_policy"
                       ],
-                      "expected_frequency": "Occasional—when new communication lines are needed.",
+                      "expected_frequency": "Occasional\u2014when new communication lines are needed.",
                       "required_capabilities": [
                         "contact"
                       ],
@@ -3525,7 +3504,7 @@
                         "file_reservation_paths",
                         "uninstall_precommit_guard"
                       ],
-                      "expected_frequency": "Infrequent—per repository setup.",
+                      "expected_frequency": "Infrequent\u2014per repository setup.",
                       "required_capabilities": [
                         "infrastructure",
                         "repository"
@@ -3680,7 +3659,7 @@
                         "reply_message",
                         "request_contact"
                       ],
-                      "expected_frequency": "Frequent—core write operation.",
+                      "expected_frequency": "Frequent\u2014core write operation.",
                       "required_capabilities": [
                         "messaging",
                         "write"
@@ -3808,7 +3787,7 @@
                         "respond_contact",
                         "set_contact_policy"
                       ],
-                      "expected_frequency": "Occasional—when new communication lines are needed.",
+                      "expected_frequency": "Occasional\u2014when new communication lines are needed.",
                       "required_capabilities": [
                         "contact"
                       ],

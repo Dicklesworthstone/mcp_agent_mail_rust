@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -81,15 +81,34 @@ fn tool_call(id: i64, name: &str, arguments: Value) -> Value {
 }
 
 fn run_stdio_session(db_path: &Path, requests: &[Value]) -> SessionRun {
+    let storage_root = db_path
+        .parent()
+        .expect("db path should have parent")
+        .join("storage_root");
+    fs::create_dir_all(&storage_root).expect("create storage root");
+
     let mut cmd = Command::new(am_bin());
     cmd.arg("serve-stdio")
         .env("DATABASE_URL", format!("sqlite:///{}", db_path.display()))
+        .env("STORAGE_ROOT", storage_root.display().to_string())
         .env("RUST_LOG", "error")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
     let mut child = cmd.spawn().expect("spawn `am serve-stdio`");
+    let mut stdout = child.stdout.take().expect("child stdout");
+    let mut stderr = child.stderr.take().expect("child stderr");
+    let stdout_thread = thread::spawn(move || {
+        let mut buf = String::new();
+        stdout.read_to_string(&mut buf).expect("read child stdout");
+        buf
+    });
+    let stderr_thread = thread::spawn(move || {
+        let mut buf = String::new();
+        stderr.read_to_string(&mut buf).expect("read child stderr");
+        buf
+    });
     {
         let mut stdin = child.stdin.take().expect("child stdin");
         let mut send = Vec::with_capacity(requests.len() + 1);
@@ -102,7 +121,7 @@ fn run_stdio_session(db_path: &Path, requests: &[Value]) -> SessionRun {
         stdin.flush().expect("flush child stdin");
     }
 
-    let timeout = Duration::from_secs(15);
+    let timeout = Duration::from_secs(30);
     let started = Instant::now();
     let mut timed_out = false;
     loop {
@@ -120,15 +139,15 @@ fn run_stdio_session(db_path: &Path, requests: &[Value]) -> SessionRun {
         }
     }
 
-    let output = child.wait_with_output().expect("wait_with_output");
-    let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = child.wait().expect("wait child").code();
+    let stdout = stdout_thread.join().expect("join stdout thread");
+    let mut stderr = stderr_thread.join().expect("join stderr thread");
     if timed_out {
         if !stderr.is_empty() {
             stderr.push('\n');
         }
-        stderr.push_str("session timed out after 15s");
+        stderr.push_str("session timed out after 30s");
     }
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let responses = stdout
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
@@ -138,7 +157,7 @@ fn run_stdio_session(db_path: &Path, requests: &[Value]) -> SessionRun {
         responses,
         stdout,
         stderr,
-        exit_code: output.status.code(),
+        exit_code,
     }
 }
 

@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS messages (
     importance TEXT NOT NULL DEFAULT 'normal',
     ack_required INTEGER NOT NULL DEFAULT 0,
     created_ts INTEGER NOT NULL,
+    recipients_json TEXT NOT NULL DEFAULT '{}',
     attachments TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS idx_messages_project_created ON messages(project_id, created_ts);
@@ -1896,6 +1897,98 @@ mod tests {
         .expect("insert message recipient");
     }
 
+    fn create_identity_fts_objects(conn: &DbConn) {
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS projects (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                slug TEXT NOT NULL UNIQUE,\
+                human_key TEXT NOT NULL,\
+                created_at INTEGER NOT NULL\
+            )",
+            &[],
+        )
+        .expect("create projects table");
+        conn.execute_sync(
+            "CREATE TABLE IF NOT EXISTS agents (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                project_id INTEGER NOT NULL,\
+                name TEXT NOT NULL,\
+                program TEXT NOT NULL,\
+                model TEXT NOT NULL,\
+                task_description TEXT NOT NULL DEFAULT '',\
+                inception_ts INTEGER NOT NULL,\
+                last_active_ts INTEGER NOT NULL,\
+                attachments_policy TEXT NOT NULL DEFAULT 'auto',\
+                contact_policy TEXT NOT NULL DEFAULT 'auto',\
+                UNIQUE(project_id, name)\
+            )",
+            &[],
+        )
+        .expect("create agents table");
+        conn.execute_sync(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS fts_agents USING fts5(\
+                agent_id UNINDEXED, project_id UNINDEXED, name, task_description, program, model\
+            )",
+            &[],
+        )
+        .expect("create fts_agents table");
+        conn.execute_sync(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS fts_projects USING fts5(\
+                project_id UNINDEXED, slug, human_key\
+            )",
+            &[],
+        )
+        .expect("create fts_projects table");
+        conn.execute_sync(
+            "CREATE TRIGGER IF NOT EXISTS agents_ai AFTER INSERT ON agents BEGIN \
+                 INSERT INTO fts_agents(rowid, agent_id, project_id, name, task_description, program, model) \
+                 VALUES (NEW.id, NEW.id, NEW.project_id, NEW.name, NEW.task_description, NEW.program, NEW.model); \
+             END",
+            &[],
+        )
+        .expect("create agents_ai trigger");
+        conn.execute_sync(
+            "CREATE TRIGGER IF NOT EXISTS agents_ad AFTER DELETE ON agents BEGIN \
+                 DELETE FROM fts_agents WHERE rowid = OLD.id; \
+             END",
+            &[],
+        )
+        .expect("create agents_ad trigger");
+        conn.execute_sync(
+            "CREATE TRIGGER IF NOT EXISTS agents_au AFTER UPDATE ON agents BEGIN \
+                 DELETE FROM fts_agents WHERE rowid = OLD.id; \
+                 INSERT INTO fts_agents(rowid, agent_id, project_id, name, task_description, program, model) \
+                 VALUES (NEW.id, NEW.id, NEW.project_id, NEW.name, NEW.task_description, NEW.program, NEW.model); \
+             END",
+            &[],
+        )
+        .expect("create agents_au trigger");
+        conn.execute_sync(
+            "CREATE TRIGGER IF NOT EXISTS projects_ai AFTER INSERT ON projects BEGIN \
+                 INSERT INTO fts_projects(rowid, project_id, slug, human_key) \
+                 VALUES (NEW.id, NEW.id, NEW.slug, NEW.human_key); \
+             END",
+            &[],
+        )
+        .expect("create projects_ai trigger");
+        conn.execute_sync(
+            "CREATE TRIGGER IF NOT EXISTS projects_ad AFTER DELETE ON projects BEGIN \
+                 DELETE FROM fts_projects WHERE rowid = OLD.id; \
+             END",
+            &[],
+        )
+        .expect("create projects_ad trigger");
+        conn.execute_sync(
+            "CREATE TRIGGER IF NOT EXISTS projects_au AFTER UPDATE ON projects BEGIN \
+                 DELETE FROM fts_projects WHERE rowid = OLD.id; \
+                 INSERT INTO fts_projects(rowid, project_id, slug, human_key) \
+                 VALUES (NEW.id, NEW.id, NEW.slug, NEW.human_key); \
+             END",
+            &[],
+        )
+        .expect("create projects_au trigger");
+    }
+
     #[test]
     fn migrations_apply_and_are_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2180,7 +2273,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
     fn enforce_base_mode_cleanup_drops_identity_fts_objects() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("base_cleanup_identity_fts.db");
@@ -2189,96 +2281,7 @@ mod tests {
 
         conn.execute_raw(PRAGMA_SETTINGS_SQL)
             .expect("apply PRAGMAs");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS projects (\
-                id INTEGER PRIMARY KEY AUTOINCREMENT,\
-                slug TEXT NOT NULL UNIQUE,\
-                human_key TEXT NOT NULL,\
-                created_at INTEGER NOT NULL\
-            )",
-            &[],
-        )
-        .expect("create projects table");
-        conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS agents (\
-                id INTEGER PRIMARY KEY AUTOINCREMENT,\
-                project_id INTEGER NOT NULL,\
-                name TEXT NOT NULL,\
-                program TEXT NOT NULL,\
-                model TEXT NOT NULL,\
-                task_description TEXT NOT NULL DEFAULT '',\
-                inception_ts INTEGER NOT NULL,\
-                last_active_ts INTEGER NOT NULL,\
-                attachments_policy TEXT NOT NULL DEFAULT 'auto',\
-                contact_policy TEXT NOT NULL DEFAULT 'auto',\
-                UNIQUE(project_id, name)\
-            )",
-            &[],
-        )
-        .expect("create agents table");
-        conn.execute_sync(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS fts_agents USING fts5(\
-                agent_id UNINDEXED, project_id UNINDEXED, name, task_description, program, model\
-            )",
-            &[],
-        )
-        .expect("create fts_agents table");
-        conn.execute_sync(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS fts_projects USING fts5(\
-                project_id UNINDEXED, slug, human_key\
-            )",
-            &[],
-        )
-        .expect("create fts_projects table");
-
-        conn.execute_sync(
-            "CREATE TRIGGER IF NOT EXISTS agents_ai AFTER INSERT ON agents BEGIN \
-                 INSERT INTO fts_agents(rowid, agent_id, project_id, name, task_description, program, model) \
-                 VALUES (NEW.id, NEW.id, NEW.project_id, NEW.name, NEW.task_description, NEW.program, NEW.model); \
-             END",
-            &[],
-        )
-        .expect("create agents_ai trigger");
-        conn.execute_sync(
-            "CREATE TRIGGER IF NOT EXISTS agents_ad AFTER DELETE ON agents BEGIN \
-                 DELETE FROM fts_agents WHERE rowid = OLD.id; \
-             END",
-            &[],
-        )
-        .expect("create agents_ad trigger");
-        conn.execute_sync(
-            "CREATE TRIGGER IF NOT EXISTS agents_au AFTER UPDATE ON agents BEGIN \
-                 DELETE FROM fts_agents WHERE rowid = OLD.id; \
-                 INSERT INTO fts_agents(rowid, agent_id, project_id, name, task_description, program, model) \
-                 VALUES (NEW.id, NEW.id, NEW.project_id, NEW.name, NEW.task_description, NEW.program, NEW.model); \
-             END",
-            &[],
-        )
-        .expect("create agents_au trigger");
-        conn.execute_sync(
-            "CREATE TRIGGER IF NOT EXISTS projects_ai AFTER INSERT ON projects BEGIN \
-                 INSERT INTO fts_projects(rowid, project_id, slug, human_key) \
-                 VALUES (NEW.id, NEW.id, NEW.slug, NEW.human_key); \
-             END",
-            &[],
-        )
-        .expect("create projects_ai trigger");
-        conn.execute_sync(
-            "CREATE TRIGGER IF NOT EXISTS projects_ad AFTER DELETE ON projects BEGIN \
-                 DELETE FROM fts_projects WHERE rowid = OLD.id; \
-             END",
-            &[],
-        )
-        .expect("create projects_ad trigger");
-        conn.execute_sync(
-            "CREATE TRIGGER IF NOT EXISTS projects_au AFTER UPDATE ON projects BEGIN \
-                 DELETE FROM fts_projects WHERE rowid = OLD.id; \
-                 INSERT INTO fts_projects(rowid, project_id, slug, human_key) \
-                 VALUES (NEW.id, NEW.id, NEW.slug, NEW.human_key); \
-             END",
-            &[],
-        )
-        .expect("create projects_au trigger");
+        create_identity_fts_objects(&conn);
 
         enforce_base_mode_cleanup(&conn).expect("base cleanup");
 
@@ -2753,8 +2756,16 @@ VALUES (1, 1, 1, 'src/legacy/**', 1, 'legacy reservation', '2026-02-24 15:33:00'
         ).expect("create agents table");
         conn.execute_sync(
             "INSERT INTO agents (project_id, name, program, model, inception_ts, last_active_ts) VALUES (?, ?, ?, ?, ?, ?)",
-            &[Value::BigInt(1), Value::Text("BlueLake".to_string()), Value::Text("cc".to_string()), Value::Text("opus".to_string()), Value::BigInt(100), Value::BigInt(100)],
-        ).expect("insert agent");
+            &[
+                Value::BigInt(1),
+                Value::Text("BlueLake".to_string()),
+                Value::Text("cc".to_string()),
+                Value::Text("opus".to_string()),
+                Value::BigInt(100),
+                Value::BigInt(100),
+            ],
+        )
+        .expect("insert agent");
 
         conn.execute_sync(
             "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL DEFAULT 'normal', ack_required INTEGER NOT NULL DEFAULT 0, created_ts INTEGER NOT NULL, attachments TEXT NOT NULL DEFAULT '[]')",
@@ -2885,7 +2896,7 @@ VALUES (1, 1, 1, 'src/legacy/**', 1, 'legacy reservation', '2026-02-24 15:33:00'
     #[test]
     fn extract_ident_create_trigger() {
         let result = extract_ident_after_keyword(
-            "CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN ... END",
+            "CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN ... END;",
             "create trigger if not exists ",
         );
         assert_eq!(result, Some("messages_ai".to_string()));

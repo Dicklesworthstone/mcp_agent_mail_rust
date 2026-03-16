@@ -670,6 +670,28 @@ fn build_tool_directory() -> ToolDirectory {
                     complexity: "medium".to_string(),
                 },
                 ToolDirectoryEntry {
+                    name: "resolve_pane_identity".to_string(),
+                    summary: "Resolve the agent name for a tmux pane from the canonical per-pane identity file.".to_string(),
+                    use_when: "When a script needs to figure out its own identity without explicitly being passed arguments.".to_string(),
+                    related: vec!["register_agent".to_string()],
+                    expected_frequency: "Once on script startup.".to_string(),
+                    required_capabilities: vec!["identity".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Self discovery".to_string(), sample: "resolve_pane_identity(project_key='backend')".to_string() }],
+                    capabilities: vec!["identity".to_string()],
+                    complexity: "low".to_string(),
+                },
+                ToolDirectoryEntry {
+                    name: "cleanup_pane_identities".to_string(),
+                    summary: "Remove stale per-pane identity files for tmux panes that no longer exist.".to_string(),
+                    use_when: "During system housekeeping or when pane files have accumulated.".to_string(),
+                    related: vec!["resolve_pane_identity".to_string()],
+                    expected_frequency: "During cleanup cycles.".to_string(),
+                    required_capabilities: vec!["identity".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Garbage collection".to_string(), sample: "cleanup_pane_identities(project_key='backend')".to_string() }],
+                    capabilities: vec!["identity".to_string()],
+                    complexity: "low".to_string(),
+                },
+                ToolDirectoryEntry {
                     name: "set_contact_policy".to_string(),
                     summary: "Set inbound contact policy (open, auto, contacts_only, block_all).".to_string(),
                     use_when: "Adjusting how permissive an agent is about unsolicited messages.".to_string(),
@@ -4435,7 +4457,7 @@ mod resource_shape_tests {
                 let project_id = project.id.unwrap_or(0);
                 let sender = register_agent(&cx, &pool, project_id, "BlueLake").await;
                 let recipient = register_agent(&cx, &pool, project_id, "RedPeak").await;
-                let hidden = register_agent(&cx, &pool, project_id, "GreyOwl").await;
+                let hidden = register_agent(&cx, &pool, project_id, "RedFox").await;
                 let thread_id = format!("thread-bcc-{}", unique_suffix());
                 let message = create_message_with_bcc(
                     &cx,
@@ -4785,7 +4807,7 @@ mod resource_shape_tests {
                 let project_key = format!("/tmp/resources-invalid-since-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
-                let agent = register_agent(&cx, &pool, project_id, "QuartzSeal").await;
+                let agent = register_agent(&cx, &pool, project_id, "BlueLake").await;
                 let ctx = McpContext::new(cx.clone(), 1);
                 let project_ref = project.human_key.clone();
 
@@ -5446,6 +5468,7 @@ mod resource_shape_tests {
                     ],
                 )
                 .expect("insert legacy duplicate agent row");
+                drop(conn);
 
                 let ctx = McpContext::new(cx.clone(), 1);
                 let err = resolve_resource_agent(&ctx, &pool, project_id, "BlueLake")

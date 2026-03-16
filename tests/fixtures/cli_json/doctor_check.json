@@ -2,17 +2,22 @@
   "checks": [
     {
       "check": "database",
-      "detail": "SQLite database accessible",
+      "detail": "SQLite database accessible at <TMP_ROOT>/mailbox.sqlite3",
       "status": "ok"
     },
     {
       "check": "db_file_sanity",
-      "detail": "quick_check OK (221184 bytes)",
+      "detail": "quick_check OK (221184 bytes); sqlite3 quick_check OK",
       "status": "ok"
     },
     {
       "check": "pool_init",
       "detail": "Database reopen probe OK (doctor check kept non-mutating)",
+      "status": "ok"
+    },
+    {
+      "check": "foreign_key_integrity",
+      "detail": "No foreign key violations detected",
       "status": "ok"
     },
     {
@@ -22,6 +27,11 @@
     },
     {
       "check": "storage_root_writable",
+      "detail": "Skipped: storage root missing",
+      "status": "warn"
+    },
+    {
+      "check": "archive_db_parity",
       "detail": "Skipped: storage root missing",
       "status": "warn"
     },
@@ -42,7 +52,7 @@
     },
     {
       "check": "guard_hooks",
-      "detail": "Missing hooks (pre-commit=false, pre-push=false) in /data/projects/mcp_agent_mail_rust/.git/hooks",
+      "detail": "Missing hooks (pre-commit=false, pre-push=false) in <TMP_ROOT>/doctor_repo/.git/hooks",
       "status": "warn"
     },
     {
@@ -52,7 +62,7 @@
     },
     {
       "check": "binary_resolution",
-      "detail": "'am' resolves to /home/ubuntu/.local/bin/am (bash)",
+      "detail": "'am' resolves to <TMP_ROOT>/home/.local/bin/am (zsh)",
       "status": "ok"
     },
     {
@@ -67,22 +77,42 @@
     },
     {
       "check": "path_order",
-      "detail": "/home/ubuntu/.local/bin in PATH at position 5 of 6 (shadowed by /home/ubuntu/.cargo/bin/am at PATH position 1). Fix: move /home/ubuntu/.local/bin earlier in PATH",
-      "status": "warn"
+      "detail": "<TMP_ROOT>/home/.local/bin in PATH at position 1 of 4",
+      "status": "ok"
     },
     {
       "check": "binary_version",
-      "detail": "am 0.1.0 (expected v0.2.0)",
-      "status": "warn"
+      "detail": "am 0.2.7 (expected v0.2.7)",
+      "status": "ok"
     },
     {
       "check": "mcp_config",
-      "detail": "11 config(s) found: 0 HTTP URL, 3 stdio command, 0 legacy Python, 7 no entry, 1 unreadable. Fix: run `am setup` or `am doctor fix` to convert to HTTP URL mode: codex (/home/ubuntu/.codex/config.toml) → stdio command mode, codex (/home/ubuntu/.config/codex/mcp.toml) → stdio command mode, codex (/home/ubuntu/.cache/codex/config.toml) → stdio command mode",
+      "detail": "No MCP config files found. Run `am setup` to configure agent tools",
       "status": "warn"
     },
     {
       "check": "update_available",
       "detail": "No recent update-check cache. Run `am self-update --check`",
+      "status": "warn"
+    },
+    {
+      "check": "server_port",
+      "detail": "<SERVER_PORT_SUMMARY>",
+      "status": "warn"
+    },
+    {
+      "check": "server_http_health",
+      "detail": "<SERVER_HTTP_HEALTH_SUMMARY>",
+      "status": "warn"
+    },
+    {
+      "check": "server_jsonrpc_health",
+      "detail": "<SERVER_JSONRPC_HEALTH_SUMMARY>",
+      "status": "warn"
+    },
+    {
+      "check": "server_process_cpu",
+      "detail": "<SERVER_PROCESS_CPU_SUMMARY>",
       "status": "warn"
     },
     {

@@ -107,6 +107,30 @@ fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
     if pattern.trim().is_empty() {
         return Some("Pattern is completely empty.".to_string());
     }
+
+    if path_looks_absolute(pattern) {
+        return Some(format!(
+            "Pattern appears to be an absolute path: '{pattern}'. Use project-relative paths instead."
+        ));
+    }
+
+    if pattern == "*"
+        || pattern == "**"
+        || pattern == "**/*"
+        || pattern == "**/**"
+        || pattern == "."
+    {
+        return Some(format!(
+            "Pattern '{pattern}' is too broad. It will block all other agents from editing any files."
+        ));
+    }
+
+    if pattern.len() <= 2 && pattern.contains('*') {
+        return Some(format!(
+            "Pattern '{pattern}' is very short and likely too broad."
+        ));
+    }
+
     let compiled = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(pattern);
     if compiled.normalized().is_empty() {
         return Some(
@@ -125,13 +149,16 @@ fn invalid_file_reservation_pattern(pattern: &str) -> Option<String> {
     let compiled = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(pattern);
     if compiled.is_glob() && !compiled.is_matchable() {
         return Some(format!(
-            "Invalid glob pattern syntax: '{pattern}'. Check for unescaped special characters or mismatched brackets."
+            "Pattern '{pattern}' is not a valid glob pattern. Check for unescaped special characters or mismatched brackets."
         ));
     }
     None
 }
 
 fn path_looks_absolute(input: &str) -> bool {
+    if input.starts_with("//") {
+        return false;
+    }
     if std::path::Path::new(input).is_absolute() || input.starts_with("~/") || input == "~" {
         return true;
     }
@@ -281,6 +308,9 @@ fn renewal_filter_matches(
     paths: Option<&[String]>,
     reservation_ids: Option<&[i64]>,
 ) -> bool {
+    if row.released_ts.is_some() {
+        return false;
+    }
     if row.agent_id != agent_id {
         return false;
     }
@@ -1092,7 +1122,7 @@ pub async fn force_release_file_reservation(
         let res_json = serde_json::json!({
             "id": reservation.id.unwrap_or(0),
             "project": &project.human_key,
-            "agent": &holder_agent.name,
+            "agent": holder_agent.name,
             "path_pattern": &reservation.path_pattern,
             "exclusive": reservation.exclusive != 0,
             "reason": &reservation.reason,

@@ -1,70 +1,70 @@
 {
   "_doc": "Model selection based on available API keys. Keys checked in priority order. First matching key determines the model.",
   "priority_order": [
-    {"env_var": "OPENAI_API_KEY", "model": "gpt-4o-mini"},
-    {"env_var": "GOOGLE_API_KEY", "model": "gemini-1.5-flash"},
-    {"env_var": "ANTHROPIC_API_KEY", "model": "claude-3-haiku-20240307"},
-    {"env_var": "GROQ_API_KEY", "model": "groq/llama-3.1-8b-instant"},
-    {"env_var": "DEEPSEEK_API_KEY", "model": "deepseek/deepseek-chat"},
-    {"env_var": "XAI_API_KEY", "model": "xai/grok-2-mini"},
-    {"env_var": "OPENROUTER_API_KEY", "model": "openrouter/meta-llama/llama-3.1-8b-instruct"}
+    {"env_var": "OPENAI_API_KEY", "model": "gpt-5.4"},
+    {"env_var": "ANTHROPIC_API_KEY", "model": "claude-4.6-sonnet"},
+    {"env_var": "GOOGLE_API_KEY", "model": "gemini-3.1-pro"},
+    {"env_var": "DEEPSEEK_API_KEY", "model": "deepseek-chat"},
+    {"env_var": "XAI_API_KEY", "model": "xai/grok-3"},
+    {"env_var": "GROQ_API_KEY", "model": "groq/openai/gpt-oss-120b"},
+    {"env_var": "OPENROUTER_API_KEY", "model": "openrouter/meta-llama/llama-4-scout-17b"}
   ],
   "alias_resolution": [
     {"alias": "best", "behavior": "calls _choose_best_available_model()"},
     {"alias": "auto", "behavior": "calls _choose_best_available_model()"},
-    {"alias": "gpt-4o", "behavior": "used as-is"},
+    {"alias": "gpt-5.4", "behavior": "used as-is"},
     {"alias": "claude-3-opus-20240229", "behavior": "used as-is"}
   ],
   "vectors": [
     {
-      "desc": "OpenAI key available: selects gpt-4o-mini",
+      "desc": "OpenAI key available: selects gpt-5.4",
       "env_keys_set": ["OPENAI_API_KEY"],
-      "expected_model": "gpt-4o-mini"
+      "expected_model": "gpt-5.4"
     },
     {
       "desc": "Only Google key: selects gemini",
       "env_keys_set": ["GOOGLE_API_KEY"],
-      "expected_model": "gemini-1.5-flash"
+      "expected_model": "gemini-3.1-pro"
     },
     {
-      "desc": "Only Anthropic key: selects haiku",
+      "desc": "Only Anthropic key: selects sonnet",
       "env_keys_set": ["ANTHROPIC_API_KEY"],
-      "expected_model": "claude-3-haiku-20240307"
+      "expected_model": "claude-4.6-sonnet"
     },
     {
-      "desc": "Google + Anthropic (no OpenAI): Google wins (higher priority)",
+      "desc": "Google + Anthropic (no OpenAI): Anthropic wins (higher priority)",
       "env_keys_set": ["GOOGLE_API_KEY", "ANTHROPIC_API_KEY"],
-      "expected_model": "gemini-1.5-flash"
+      "expected_model": "claude-4.6-sonnet"
     },
     {
       "desc": "All keys set: OpenAI wins (highest priority)",
       "env_keys_set": ["OPENAI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY", "GROQ_API_KEY"],
-      "expected_model": "gpt-4o-mini"
+      "expected_model": "gpt-5.4"
     },
     {
-      "desc": "No keys set: falls back to gpt-4o-mini",
+      "desc": "No keys set: falls back to gpt-5.4",
       "env_keys_set": [],
-      "expected_model": "gpt-4o-mini"
+      "expected_model": "gpt-5.4"
     },
     {
       "desc": "Only Groq key: selects groq model",
       "env_keys_set": ["GROQ_API_KEY"],
-      "expected_model": "groq/llama-3.1-8b-instant"
+      "expected_model": "groq/openai/gpt-oss-120b"
     },
     {
       "desc": "Only DeepSeek key: selects deepseek model",
       "env_keys_set": ["DEEPSEEK_API_KEY"],
-      "expected_model": "deepseek/deepseek-chat"
+      "expected_model": "deepseek-chat"
     },
     {
       "desc": "Only XAI key: selects grok model",
       "env_keys_set": ["XAI_API_KEY"],
-      "expected_model": "xai/grok-2-mini"
+      "expected_model": "xai/grok-3"
     },
     {
       "desc": "Only OpenRouter key: selects llama model",
       "env_keys_set": ["OPENROUTER_API_KEY"],
-      "expected_model": "openrouter/meta-llama/llama-3.1-8b-instruct"
+      "expected_model": "openrouter/meta-llama/llama-4-scout-17b"
     }
   ]
 }

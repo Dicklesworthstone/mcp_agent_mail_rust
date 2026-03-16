@@ -268,6 +268,23 @@ where
     ///
     /// Items with `freq >= 1` promote to Main; others go to Ghost.
     fn evict_small_if_full(&mut self) {
+        // Compact tombstones once queue growth meaningfully exceeds live capacity.
+        // Keeping the threshold proportional prevents tiny caches from retaining
+        // dozens of dead entries before cleanup kicks in.
+        if self.small.len() > self.small_capacity.saturating_mul(4).max(4) {
+            let index = &self.index;
+            self.small.retain(|(k, expected_seq)| {
+                if let Some(Node::Small {
+                    seq: current_seq, ..
+                }) = index.get(k)
+                {
+                    current_seq == expected_seq
+                } else {
+                    false
+                }
+            });
+        }
+
         while self.small_live_count >= self.small_capacity {
             let Some((key, expected_seq)) = self.small.pop_front() else {
                 break;
@@ -331,6 +348,21 @@ where
     /// Items with `freq >= 1` get reinserted at tail with freq reset.
     /// Others are permanently evicted.
     fn evict_main_if_full(&mut self) {
+        // Compact tombstones once queue growth meaningfully exceeds live capacity.
+        if self.main.len() > self.main_capacity.saturating_mul(4).max(4) {
+            let index = &self.index;
+            self.main.retain(|(k, expected_seq)| {
+                if let Some(Node::Main {
+                    seq: current_seq, ..
+                }) = index.get(k)
+                {
+                    current_seq == expected_seq
+                } else {
+                    false
+                }
+            });
+        }
+
         if self.main_capacity == 0 {
             while let Some((key, expected_seq)) = self.main.pop_front() {
                 if let Some(Node::Main {
@@ -391,6 +423,18 @@ where
 
     /// Evict from Ghost until it is below capacity.
     fn evict_ghost_if_full(&mut self) {
+        // Compact tombstones once queue growth meaningfully exceeds live capacity.
+        if self.ghost.len() > self.ghost_capacity.saturating_mul(4).max(4) {
+            let index = &self.index;
+            self.ghost.retain(|(k, expected_seq)| {
+                if let Some(Node::Ghost { seq: current_seq }) = index.get(k) {
+                    current_seq == expected_seq
+                } else {
+                    false
+                }
+            });
+        }
+
         while self.ghost_live_count >= self.ghost_capacity {
             let Some((key, expected_seq)) = self.ghost.pop_front() else {
                 break;
@@ -1082,6 +1126,29 @@ mod tests {
         assert!(
             hot_count >= 3,
             "at least 3 of 5 hot items should survive eviction, got {hot_count}"
+        );
+    }
+
+    #[test]
+    fn s3fifo_tombstone_memory_leak() {
+        let mut cache = S3FifoCache::new(5);
+        // small_capacity = 1, main_capacity = 4
+
+        // 1. Insert a live item that will sit at the front of small
+        cache.insert("front_blocker".to_string(), 1);
+
+        // 2. Insert and remove items repeatedly to create tombstones
+        for i in 0..10_000 {
+            let key = format!("k{i}");
+            cache.insert(key.clone(), i);
+            cache.remove(&key);
+        }
+
+        // 3. The small queue should not have grown to 10,000 elements!
+        assert!(
+            cache.small.len() <= 10,
+            "Small queue leaked tombstones! length is {}",
+            cache.small.len()
         );
     }
 }

@@ -2,51 +2,51 @@
   "cases": [
     {
       "name": "openai_default_when_key_present",
-      "preferred": "gpt-5-mini",
+      "preferred": "gpt-6-mini",
       "env": {"OPENAI_API_KEY": "x"},
-      "expected_model": "gpt-4o-mini"
+      "expected_model": "gpt-5.4"
     },
     {
       "name": "google_fallback_when_openai_missing",
-      "preferred": "gpt-5-mini",
+      "preferred": "gpt-6-mini",
       "env": {"GOOGLE_API_KEY": "x"},
-      "expected_model": "gemini-1.5-flash"
+      "expected_model": "gemini-3.1-pro"
     },
     {
       "name": "anthropic_fallback",
-      "preferred": "gpt-5-mini",
+      "preferred": "gpt-6-mini",
       "env": {"ANTHROPIC_API_KEY": "x"},
-      "expected_model": "claude-3-haiku-20240307"
+      "expected_model": "claude-4.6-sonnet"
     },
     {
       "name": "groq_fallback",
-      "preferred": "gpt-5-mini",
+      "preferred": "gpt-6-mini",
       "env": {"GROQ_API_KEY": "x"},
-      "expected_model": "groq/llama-3.1-70b-versatile"
+      "expected_model": "groq/openai/gpt-oss-120b"
     },
     {
       "name": "deepseek_fallback",
-      "preferred": "gpt-5-mini",
+      "preferred": "gpt-6-mini",
       "env": {"DEEPSEEK_API_KEY": "x"},
-      "expected_model": "deepseek/deepseek-chat"
+      "expected_model": "deepseek-chat"
     },
     {
       "name": "xai_fallback",
-      "preferred": "gpt-5-mini",
+      "preferred": "gpt-6-mini",
       "env": {"XAI_API_KEY": "x"},
-      "expected_model": "xai/grok-2-mini"
+      "expected_model": "xai/grok-3"
     },
     {
       "name": "openrouter_fallback",
-      "preferred": "gpt-5-mini",
+      "preferred": "gpt-6-mini",
       "env": {"OPENROUTER_API_KEY": "x"},
-      "expected_model": "openrouter/openai/gpt-4o-mini"
+      "expected_model": "openrouter/openai/gpt-5.4"
     },
     {
       "name": "provider_qualified_preserved",
-      "preferred": "openrouter/openai/gpt-4o-mini",
+      "preferred": "openrouter/openai/gpt-5.4",
       "env": {"OPENAI_API_KEY": "x"},
-      "expected_model": "openrouter/openai/gpt-4o-mini"
+      "expected_model": "openrouter/openai/gpt-5.4"
     }
   ]
 }

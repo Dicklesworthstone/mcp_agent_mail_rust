@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+use glob::Pattern;
 use mcp_agent_mail_core::Config;
 use std::path::Path;
 use std::sync::Mutex;
@@ -280,32 +281,15 @@ fn should_ignore(name: &str, patterns: &[String]) -> bool {
             continue;
         }
 
-        let starts_with_star = pat.starts_with('*');
-        let ends_with_star = pat.ends_with('*');
-        let core = pat.trim_matches('*');
-
-        if core.is_empty() {
-            // Pattern was just "*" or "**" — matches everything
-            if starts_with_star || ends_with_star {
+        if let Ok(compiled) = Pattern::new(pat) {
+            if compiled.matches(name) {
                 return true;
             }
-            continue;
-        }
-
-        if starts_with_star && ends_with_star {
-            if name.contains(core) {
+        } else {
+            // Fallback for invalid glob patterns (though should be rare for simple * globs)
+            if name == pat {
                 return true;
             }
-        } else if starts_with_star {
-            if name.ends_with(core) {
-                return true;
-            }
-        } else if ends_with_star {
-            if name.starts_with(core) {
-                return true;
-            }
-        } else if name == pat {
-            return true;
         }
     }
     false

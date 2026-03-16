@@ -256,46 +256,28 @@ impl CandidateBudget {
             QueryClass::Empty => (100_u32, 0_u32),
         };
 
-        let lexical_limit =
-            scaled_ceil_limit(requested_limit, base_lexical_bps, class_lexical_bps, SCALE)
-                .clamp(config.min_lexical, config.max_lexical.max(requested_limit));
+        let lexical_limit = {
+            let lim = scaled_ceil_limit(requested_limit, base_lexical_bps, class_lexical_bps, SCALE);
+            if lim == 0 { 0 } else { lim.clamp(config.min_lexical, config.max_lexical) }
+        };
 
-        let semantic_limit = scaled_ceil_limit(
-            requested_limit,
-            base_semantic_bps,
-            class_semantic_bps,
-            SCALE,
-        )
-        .clamp(
-            config.min_semantic,
-            config.max_semantic.max(requested_limit),
-        );
+        let semantic_limit = {
+            let lim = scaled_ceil_limit(requested_limit, base_semantic_bps, class_semantic_bps, SCALE);
+            if lim == 0 { 0 } else { lim.clamp(config.min_semantic, config.max_semantic) }
+        };
 
         let final_lexical = if semantic_limit == 0 {
             // Re-allocate full budget to lexical if semantic is effectively bypassed
-            scaled_ceil_limit(
-                requested_limit,
-                config.lexical_fallback_bps,
-                class_lexical_bps,
-                SCALE,
-            )
-            .clamp(config.min_lexical, config.max_lexical.max(requested_limit))
+            let lim = scaled_ceil_limit(requested_limit, config.lexical_fallback_bps, class_lexical_bps, SCALE);
+            if lim == 0 { 0 } else { lim.clamp(config.min_lexical, config.max_lexical) }
         } else {
             lexical_limit
         };
 
         let final_semantic = if final_lexical == 0 {
             // Re-allocate full budget to semantic if lexical is effectively bypassed
-            scaled_ceil_limit(
-                requested_limit,
-                config.hybrid_semantic_bps,
-                class_semantic_bps,
-                SCALE,
-            )
-            .clamp(
-                config.min_semantic,
-                config.max_semantic.max(requested_limit),
-            )
+            let lim = scaled_ceil_limit(requested_limit, config.hybrid_semantic_bps, class_semantic_bps, SCALE);
+            if lim == 0 { 0 } else { lim.clamp(config.min_semantic, config.max_semantic) }
         } else {
             semantic_limit
         };
@@ -304,7 +286,7 @@ impl CandidateBudget {
             lexical_limit: final_lexical,
             semantic_limit: final_semantic,
             combined_limit: (final_lexical.saturating_add(final_semantic))
-                .min(config.max_combined.max(requested_limit.saturating_mul(2))),
+                .min(config.max_combined),
         };
 
         CandidateBudgetDerivation { budget, decision }

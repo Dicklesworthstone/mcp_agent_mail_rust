@@ -437,14 +437,14 @@ def is_real_file(path):
 
 def slugify(value):
     out = []
-    prev_dash = false
+    prev_dash = False
     for ch in value.strip().lower():
         if ch.isalnum():
             out.append(ch)
-            prev_dash = false
+            prev_dash = False
         elif not prev_dash:
             out.append("-")
-            prev_dash = true
+            prev_dash = True
     slug = "".join(out).strip("-")
     return slug or "project"
 
@@ -1880,6 +1880,23 @@ mod tests {
         assert_eq!(restored, orig_body);
     }
 
+    #[test]
+    fn render_guard_plugin_script_uses_valid_python_booleans_in_slugify() {
+        let script = render_guard_plugin_script("/abs/path/backend", "pre-commit");
+        assert!(
+            script.contains("prev_dash = False"),
+            "slugify helper should emit valid Python booleans"
+        );
+        assert!(
+            script.contains("prev_dash = True"),
+            "slugify helper should emit valid Python booleans"
+        );
+        assert!(
+            !script.contains("prev_dash = false"),
+            "slugify helper must not emit Rust-style lowercase booleans"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Path normalization tests
     // -----------------------------------------------------------------------
@@ -2091,7 +2108,7 @@ mod tests {
         let td = tempfile::TempDir::new().expect("tempdir");
         let archive = td.path().join("archive");
         let dir = archive.join("file_reservations");
-        std::fs::create_dir_all(&dir).expect("create file_reservations");
+        std::fs::create_dir_all(&dir).expect("mkdir file_reservations");
 
         let released_values = [
             serde_json::json!(0),
@@ -2586,7 +2603,7 @@ mod tests {
         run_git(&repo_dir, &["add", "a.txt"]);
         run_git(&repo_dir, &["commit", "-qm", "touch"]);
 
-        // Commit 2 reverts it so net diff(remote..local) would be empty.
+        // Commit 2 reverts it so the net diff is empty even though the push touched the file.
         std::fs::write(&file, "base\n").expect("write revert");
         run_git(&repo_dir, &["add", "a.txt"]);
         run_git(&repo_dir, &["commit", "-qm", "revert"]);
@@ -2853,7 +2870,7 @@ mod tests {
         let records = read_active_reservations_from_archive(&archive, false).expect("read");
         assert!(
             records.is_empty(),
-            "missing agent metadata should be ignored"
+            "empty reservation patterns should be ignored"
         );
     }
 
@@ -2867,7 +2884,6 @@ mod tests {
         let future = chrono::Utc::now() + chrono::Duration::hours(1);
         let payload = serde_json::json!({
             "path_pattern": "src/**",
-            "agent_name": "Agent",
             "exclusive": true,
             "expires_ts": future.to_rfc3339(),
             "released_ts": null

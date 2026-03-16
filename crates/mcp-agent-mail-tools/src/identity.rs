@@ -553,7 +553,7 @@ pub async fn register_agent(
                     (
                         "INVALID_AGENT_NAME",
                         format!(
-                            "Invalid agent name '{n}'. MUST be an adjective+noun combination (e.g. GreenLake)."
+                            "Invalid agent name format: '{n}'. Agent names MUST be randomly generated adjective+noun combinations (e.g., 'GreenLake', 'BlueDog'), NOT descriptive names. Omit the 'name' parameter to auto-generate a valid name."
                         ),
                     )
                 });
@@ -724,7 +724,7 @@ pub async fn create_agent_identity(
                     (
                         "INVALID_AGENT_NAME",
                         format!(
-                            "Invalid agent name hint '{hint}'. MUST be an adjective+noun combination (e.g. GreenLake)."
+                            "Invalid agent name format: '{hint}'. Agent names MUST be randomly generated adjective+noun combinations (e.g., 'GreenLake', 'BlueDog'), NOT descriptive names. Omit the 'name' parameter to auto-generate a valid name."
                         ),
                     )
                 });

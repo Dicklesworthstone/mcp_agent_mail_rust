@@ -165,6 +165,7 @@ const CLI_ALLOW_COMMANDS: &[&[&str]] = &[
     &["robot", "--help"],
     &["legacy", "--help"],
     &["upgrade", "--help"],
+    &["service", "--help"],
     &["self-update", "--help"],
 ];
 
@@ -198,6 +199,7 @@ const MCP_DENY_COMMANDS: &[&[&str]] = &[
     &["robot"],
     &["legacy"],
     &["upgrade"],
+    &["service"],
     &["self-update"],
 ];
 
@@ -540,6 +542,7 @@ fn golden_cli_help_snapshot_stability() {
         (&["doctor", "--help"], "cli_help_doctor.txt"),
         (&["contacts", "--help"], "cli_help_contacts.txt"),
         (&["macros", "--help"], "cli_help_macros.txt"),
+        (&["service", "--help"], "cli_help_service.txt"),
     ];
 
     for (args, snapshot_name) in help_cases {

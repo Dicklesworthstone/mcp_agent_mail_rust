@@ -512,7 +512,7 @@ async fn validate_explicit_thread_id_for_send(
     if !has_exact_thread {
         return Err(invalid_thread_id_error(
             thread_id,
-            "Bare numeric IDs are only valid when they refer to an existing reply-seeded thread in this project.",
+            "Bare numeric IDs are reserved for reply-seeded threads. If you are starting a new thread, use an alphanumeric identifier (e.g. 'TKT-123', 'bd-42', 'feature-xyz').",
         ));
     }
 
@@ -1485,7 +1485,19 @@ effective_free_bytes={free}"
     .await?;
     let sender_id = sender.id.unwrap_or(0);
 
+    let explicitly_targeted = !to.is_empty()
+        || cc.as_ref().is_some_and(|v| !v.is_empty())
+        || bcc.as_ref().is_some_and(|v| !v.is_empty());
+
     let broadcast = broadcast.unwrap_or(false);
+    if broadcast && explicitly_targeted {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "broadcast=true and explicit 'to' recipients are mutually exclusive. Set broadcast=true with an empty 'to' list, or provide explicit recipients without broadcast.",
+            true,
+            serde_json::json!({ "argument": "broadcast" }),
+        ));
+    }
     if broadcast {
         return Err(legacy_tool_error(
             "BROADCAST_DISABLED",

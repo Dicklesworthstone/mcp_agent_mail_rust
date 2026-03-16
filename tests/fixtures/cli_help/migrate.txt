@@ -2,6 +2,7 @@ Usage: am migrate [OPTIONS]
 
 Options:
       --check                    Only check the database format without modifying anything
+      --rollback                 Restore the database from the latest available backup and exit
       --force                    Force migration even if the format is unclear or mixed
       --backup-dir <BACKUP_DIR>  Custom backup directory (default: same directory as the database)
   -h, --help                     Print help

@@ -3080,16 +3080,16 @@ pub async fn get_messages_details_by_ids(
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let recipients: String = match row.get_as(9) {
-                        Ok(v) => v,
+                    let recipients: String = match row.get_as::<Option<String>>(9) {
+                        Ok(v) => v.unwrap_or_else(|| "{}".to_string()),
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let attachments: String = match row.get_as(10) {
-                        Ok(v) => v,
+                    let attachments: String = match row.get_as::<Option<String>>(10) {
+                        Ok(v) => v.unwrap_or_else(|| "[]".to_string()),
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let from: String = match row.get_as(11) {
-                        Ok(v) => v,
+                    let from: String = match row.get_as::<Option<String>>(11) {
+                        Ok(v) => v.unwrap_or_default(),
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
                     out.push(ThreadMessageRow {
