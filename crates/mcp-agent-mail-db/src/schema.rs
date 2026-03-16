@@ -1190,6 +1190,12 @@ fn is_fts_migration(id: &str) -> bool {
 /// Includes FTS5 virtual tables, queries with aggregate functions over JOINs,
 /// CREATE INDEX with expressions (COLLATE NOCASE), and message triggers that
 /// depend on `fts_messages`.
+///
+/// `v15_add_recipients_json_to_messages` is also excluded from base mode.
+/// The base-mode startup path and compatibility probes do not require the
+/// column, and legacy Python-shaped `messages` tables can fail canonical
+/// `ALTER TABLE ... ADD COLUMN` reparsing under the base engine even though the
+/// rest of the schema is readable and migratable.
 fn is_unsupported_by_franken(id: &str) -> bool {
     is_fts_migration(id)
         || matches!(
@@ -1203,6 +1209,7 @@ fn is_unsupported_by_franken(id: &str) -> bool {
                 | "v6_trg_inbox_stats_ack"
                 | "v10a_dedup_agents_case_insensitive"
                 | "v10b_idx_agents_project_name_nocase"
+                | "v15_add_recipients_json_to_messages"
         )
 }
 
