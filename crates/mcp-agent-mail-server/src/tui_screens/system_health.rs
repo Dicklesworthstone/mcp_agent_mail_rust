@@ -481,8 +481,7 @@ impl SystemHealthScreen {
             Span::styled(
                 format!(
                     "  policy={}  fallback={}",
-                    snap.atc.policy.incumbent_policy_id,
-                    snap.atc.policy.fallback_active
+                    snap.atc.policy.incumbent_policy_id, snap.atc.policy.fallback_active
                 ),
                 hint_style,
             ),

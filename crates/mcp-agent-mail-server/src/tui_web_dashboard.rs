@@ -22,9 +22,9 @@
 //! Target: < 500µs capture for 200×50 grids, < 1µs serve.
 
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ftui::render::buffer::Buffer;
 use mcp_agent_mail_core::now_micros;
@@ -636,9 +636,11 @@ mod tests {
         assert!(!encoded.is_empty());
         assert!(encoded.len() <= (input.len() + 2) / 3 * 4);
         // Verify all chars are valid base64.
-        assert!(encoded
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/'));
+        assert!(
+            encoded
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/')
+        );
     }
 
     #[test]
