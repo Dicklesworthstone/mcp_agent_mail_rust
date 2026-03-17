@@ -1,0 +1,14 @@
+Cross-platform service management (systemd on Linux, launchd on macOS)
+
+Usage: am service <COMMAND>
+
+Commands:
+  install    Generate and register a platform-native service configuration
+  uninstall  Remove the service configuration and stop the running service
+  status     Check if the service is running, show PID, uptime, and port
+  logs       Tail service logs (journalctl --user on Linux, log show on macOS)
+  restart    Graceful restart: SIGTERM with force-kill fallback
+  help       Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
