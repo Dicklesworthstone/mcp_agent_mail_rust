@@ -2005,6 +2005,7 @@ fn self_process_repo(
 
     // Phase 3: Drain queue + spill for this repo
     let mut batch: Vec<CoalescerCommitFields> = Vec::new();
+    let mut queue_is_empty = false;
     {
         let mut q = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
         while batch.len() < COALESCER_MAX_BATCH_SIZE {
@@ -2024,10 +2025,16 @@ fn self_process_repo(
         if !batch.is_empty() {
             coalescer_depth_decrement(&rq.depth, batch.len() as u64);
         }
+        queue_is_empty = q.is_empty();
     }
 
-    // Drain spill if we have room
-    let spilled_work = coalescer_drain_repo_spill(rq, repo_root);
+    // Drain spill ONLY if the main queue is completely empty to preserve FIFO order.
+    // If the queue still has items, we'll get to the spill on a future iteration.
+    let spilled_work = if queue_is_empty {
+        coalescer_drain_repo_spill(rq, repo_root)
+    } else {
+        None
+    };
 
     let drained_count =
         batch.len() as u64 + spilled_work.as_ref().map_or(0, |w| w.pending_requests);
@@ -2812,8 +2819,34 @@ pub fn flush_async_commits() {
 // ---------------------------------------------------------------------------
 
 /// Determine the commit lock path based on project-scoped rel_paths.
-pub fn commit_lock_path(repo_root: &Path, _rel_paths: &[&str]) -> PathBuf {
-    repo_root.join(".commit.lock")
+pub fn commit_lock_path(repo_root: &Path, rel_paths: &[&str]) -> PathBuf {
+    if rel_paths.is_empty() {
+        return repo_root.join(".commit.lock");
+    }
+
+    let mut common_project: Option<String> = None;
+
+    for path in rel_paths {
+        let parts: Vec<&str> = path.split('/').collect();
+        if parts.len() >= 2 && parts[0] == "projects" {
+            let project_slug = parts[1];
+            if let Some(ref current) = common_project {
+                if current != project_slug {
+                    return repo_root.join(".commit.lock");
+                }
+            } else {
+                common_project = Some(project_slug.to_string());
+            }
+        } else {
+            return repo_root.join(".commit.lock");
+        }
+    }
+
+    if let Some(slug) = common_project {
+        repo_root.join("projects").join(slug).join(".commit.lock")
+    } else {
+        repo_root.join(".commit.lock")
+    }
 }
 
 /// Check if an error is a git index.lock contention error.
@@ -3426,7 +3459,9 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
             continue;
         };
         let name = path.file_name().unwrap_or_default().to_string_lossy();
-        let lock_name = &name[..name.len() - ".owner.json".len()];
+        let Some(lock_name) = name.strip_suffix(".owner.json") else {
+            continue;
+        };
         let lock_candidate = parent.join(lock_name);
         if !lock_candidate.exists() && fs::remove_file(&path).is_ok() {
             result.metadata_removed.push(path.display().to_string());
@@ -5059,8 +5094,11 @@ pub fn emit_notification_signal(
         return false;
     }
 
-    // Reject path-traversal characters to prevent writing outside the signals dir.
-    if project_slug.contains('/')
+    // Reject empty, whitespace-only, or path-traversal values to prevent writing
+    // outside the signals directory.
+    if project_slug.trim().is_empty()
+        || agent_name.trim().is_empty()
+        || project_slug.contains('/')
         || project_slug.contains('\\')
         || project_slug.contains("..")
         || agent_name.contains('/')
