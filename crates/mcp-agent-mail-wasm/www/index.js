@@ -414,14 +414,22 @@ async function beginHttpPolling(reason) {
     }
 
     setConnectionStatus('connected', 'Connected (HTTP poll fallback)');
-    await pollHttpStateOnce();
+    try {
+        await pollHttpStateOnce();
+    } catch (err) {
+        console.error('Initial HTTP poll failed:', err);
+    }
 }
 
 async function waitForWebSocketConnection(timeoutMs) {
     const started = performance.now();
     while (performance.now() - started < timeoutMs) {
         if (app?.is_connected) return true;
-        await sleep(50);
+        try {
+            await sleep(50);
+        } catch (err) {
+            // Ignore sleep errors
+        }
     }
     return app?.is_connected === true;
 }
@@ -729,7 +737,11 @@ async function main() {
     console.log('MCP Agent Mail Dashboard starting...');
     setupEventListeners();
     updateUI();
-    await initWasm();
+    try {
+        await initWasm();
+    } catch (err) {
+        console.error('WASM init failed:', err);
+    }
 }
 
 main().catch((error) => {
