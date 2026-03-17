@@ -2016,7 +2016,10 @@ fn self_process_repo(
                 {
                     break;
                 }
-                batch.push(q.pop_front().unwrap_or_else(|| unreachable!()));
+                batch.push(
+                    q.pop_front()
+                        .expect("pop_front must succeed after front() returned Some"),
+                );
             } else {
                 break;
             }
@@ -6441,6 +6444,15 @@ pub fn get_timeline_commits(
 ///
 /// Returns `(frontmatter_json, body_markdown)`.
 pub fn read_message_file(path: &Path) -> Result<(serde_json::Value, String)> {
+    if let Ok(meta) = fs::metadata(path) {
+        if meta.len() > 50 * 1024 * 1024 { // 50MB safety limit
+            return Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("message file {} exceeds maximum size of 50MB", path.display()),
+            )));
+        }
+    }
+
     let content = fs::read_to_string(path)?;
 
     // Parse ---json frontmatter
