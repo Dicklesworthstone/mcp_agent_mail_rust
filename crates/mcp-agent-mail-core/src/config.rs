@@ -902,7 +902,9 @@ impl Default for Config {
             tui_ambient: "subtle".to_string(),
             tui_debug: false,
             export_dir: resolve_data_path(
-                &dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")),
+                &dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".mcp_agent_mail"),
                 "exports",
             ),
             tui_tree_style: "rounded".to_string(),
