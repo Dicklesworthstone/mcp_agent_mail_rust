@@ -22,6 +22,8 @@
 //! Frequently accessed entries get their TTL extended up to 2x the base:
 //! - 0-4 accesses: base TTL (300s for agents, 300s for projects)
 //! - 5+ accesses: 2x base TTL (600s)
+//! - Hot-read maintenance is sampled, so TTL/frequency metadata is refreshed
+//!   approximately rather than on every single hit
 //!
 //! ## Metrics
 //!
@@ -46,6 +48,9 @@ const MAX_ENTRIES_PER_CATEGORY: usize = 16_384;
 const TOUCH_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 /// Minimum accesses before adaptive TTL kicks in (2x base TTL).
 const ADAPTIVE_TTL_THRESHOLD: u32 = 5;
+/// Run write-side cache maintenance only on every Nth hit so hot reads stay
+/// on a shared read lock most of the time.
+const HIT_WRITE_MAINTENANCE_INTERVAL: u64 = 4;
 /// Number of lock-independent shards for the deferred touch queue.
 /// Shard key: `agent_id % NUM_TOUCH_SHARDS`. Reduces contention 16×
 /// compared to a single mutex at 100+ concurrent tool calls/sec.
@@ -154,12 +159,22 @@ impl CacheMetrics {
         self.project_hits.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_project_hit_sampled(&self) -> bool {
+        let hits = self.project_hits.fetch_add(1, Ordering::Relaxed) + 1;
+        hits % HIT_WRITE_MAINTENANCE_INTERVAL == 0
+    }
+
     fn record_project_miss(&self) {
         self.project_misses.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_agent_hit(&self) {
         self.agent_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_agent_hit_sampled(&self) -> bool {
+        let hits = self.agent_hits.fetch_add(1, Ordering::Relaxed) + 1;
+        hits % HIT_WRITE_MAINTENANCE_INTERVAL == 0
     }
 
     fn record_agent_miss(&self) {
@@ -260,12 +275,63 @@ impl ReadCache {
     #[allow(clippy::significant_drop_tightening)]
     pub fn get_project_scoped(&self, scope: &str, slug: &str) -> Option<ProjectRow> {
         let key = (scope_fingerprint(scope), InternedStr::new(slug));
+        {
+            let cache = self.projects_by_slug.read();
+            let Some(entry) = cache.peek(&key) else {
+                CACHE_METRICS.record_project_miss();
+                return None;
+            };
+            if !entry.is_expired(PROJECT_TTL) {
+                let value = entry.value.as_ref().clone();
+                let should_maintain = CACHE_METRICS.record_project_hit_sampled();
+                drop(cache);
+
+                if should_maintain {
+                    let mut cache = self.projects_by_slug.write();
+                    let expired = match cache.get_mut(&key) {
+                        Some(entry) => {
+                            if entry.is_expired(PROJECT_TTL) {
+                                true
+                            } else {
+                                entry.touch();
+                                false
+                            }
+                        }
+                        None => false,
+                    };
+                    if expired {
+                        let slug_owned = slug.to_owned();
+                        mcp_agent_mail_core::evidence_ledger().record(
+                            "cache.eviction",
+                            serde_json::json!({ "key": slug_owned, "reason": "ttl_expired", "category": "project" }),
+                            "evict",
+                            Some("hit_rate >= 0.85".into()),
+                            0.9,
+                            "s3fifo_v1",
+                        );
+                        cache.remove(&key);
+                    }
+                }
+                return Some(value);
+            }
+        }
+
         let mut cache = self.projects_by_slug.write();
-        let Some(entry) = cache.get_mut(&key) else {
-            CACHE_METRICS.record_project_miss();
-            return None;
+        let expired = match cache.get_mut(&key) {
+            Some(entry) => {
+                if entry.is_expired(PROJECT_TTL) {
+                    true
+                } else {
+                    entry.touch();
+                    false
+                }
+            }
+            None => {
+                CACHE_METRICS.record_project_miss();
+                return None;
+            }
         };
-        if entry.is_expired(PROJECT_TTL) {
+        if expired {
             let slug_owned = slug.to_owned();
             mcp_agent_mail_core::evidence_ledger().record(
                 "cache.eviction",
@@ -279,8 +345,12 @@ impl ReadCache {
             CACHE_METRICS.record_project_miss();
             return None;
         }
-        entry.touch();
-        let value = entry.value.as_ref().clone();
+        let value = cache
+            .peek(&key)
+            .expect("cache entry must exist after non-expired get_mut")
+            .value
+            .as_ref()
+            .clone();
         CACHE_METRICS.record_project_hit();
         Some(value)
     }
@@ -299,18 +369,64 @@ impl ReadCache {
         human_key: &str,
     ) -> Option<ProjectRow> {
         let key = (scope_fingerprint(scope), InternedStr::new(human_key));
+        {
+            let cache = self.projects_by_human_key.read();
+            let Some(entry) = cache.peek(&key) else {
+                CACHE_METRICS.record_project_miss();
+                return None;
+            };
+            if !entry.is_expired(PROJECT_TTL) {
+                let value = entry.value.as_ref().clone();
+                let should_maintain = CACHE_METRICS.record_project_hit_sampled();
+                drop(cache);
+
+                if should_maintain {
+                    let mut cache = self.projects_by_human_key.write();
+                    let expired = match cache.get_mut(&key) {
+                        Some(entry) => {
+                            if entry.is_expired(PROJECT_TTL) {
+                                true
+                            } else {
+                                entry.touch();
+                                false
+                            }
+                        }
+                        None => false,
+                    };
+                    if expired {
+                        cache.remove(&key);
+                    }
+                }
+                return Some(value);
+            }
+        }
+
         let mut cache = self.projects_by_human_key.write();
-        let Some(entry) = cache.get_mut(&key) else {
-            CACHE_METRICS.record_project_miss();
-            return None;
+        let expired = match cache.get_mut(&key) {
+            Some(entry) => {
+                if entry.is_expired(PROJECT_TTL) {
+                    true
+                } else {
+                    entry.touch();
+                    false
+                }
+            }
+            None => {
+                CACHE_METRICS.record_project_miss();
+                return None;
+            }
         };
-        if entry.is_expired(PROJECT_TTL) {
+        if expired {
             cache.remove(&key);
             CACHE_METRICS.record_project_miss();
             return None;
         }
-        entry.touch();
-        let value = entry.value.as_ref().clone();
+        let value = cache
+            .peek(&key)
+            .expect("cache entry must exist after non-expired get_mut")
+            .value
+            .as_ref()
+            .clone();
         CACHE_METRICS.record_project_hit();
         Some(value)
     }
@@ -355,18 +471,64 @@ impl ReadCache {
     #[allow(clippy::significant_drop_tightening)]
     pub fn get_agent_scoped(&self, scope: &str, project_id: i64, name: &str) -> Option<AgentRow> {
         let key = (scope_fingerprint(scope), project_id, InternedStr::new(name));
+        {
+            let cache = self.agents_by_key.read();
+            let Some(entry) = cache.peek(&key) else {
+                CACHE_METRICS.record_agent_miss();
+                return None;
+            };
+            if !entry.is_expired(AGENT_TTL) {
+                let value = entry.value.as_ref().clone();
+                let should_maintain = CACHE_METRICS.record_agent_hit_sampled();
+                drop(cache);
+
+                if should_maintain {
+                    let mut cache = self.agents_by_key.write();
+                    let expired = match cache.get_mut(&key) {
+                        Some(entry) => {
+                            if entry.is_expired(AGENT_TTL) {
+                                true
+                            } else {
+                                entry.touch();
+                                false
+                            }
+                        }
+                        None => false,
+                    };
+                    if expired {
+                        cache.remove(&key);
+                    }
+                }
+                return Some(value);
+            }
+        }
+
         let mut cache = self.agents_by_key.write();
-        let Some(entry) = cache.get_mut(&key) else {
-            CACHE_METRICS.record_agent_miss();
-            return None;
+        let expired = match cache.get_mut(&key) {
+            Some(entry) => {
+                if entry.is_expired(AGENT_TTL) {
+                    true
+                } else {
+                    entry.touch();
+                    false
+                }
+            }
+            None => {
+                CACHE_METRICS.record_agent_miss();
+                return None;
+            }
         };
-        if entry.is_expired(AGENT_TTL) {
+        if expired {
             cache.remove(&key);
             CACHE_METRICS.record_agent_miss();
             return None;
         }
-        entry.touch();
-        let value = entry.value.as_ref().clone();
+        let value = cache
+            .peek(&key)
+            .expect("cache entry must exist after non-expired get_mut")
+            .value
+            .as_ref()
+            .clone();
         CACHE_METRICS.record_agent_hit();
         Some(value)
     }
@@ -381,18 +543,64 @@ impl ReadCache {
     #[allow(clippy::significant_drop_tightening)]
     pub fn get_agent_by_id_scoped(&self, scope: &str, agent_id: i64) -> Option<AgentRow> {
         let key = (scope_fingerprint(scope), agent_id);
+        {
+            let cache = self.agents_by_id.read();
+            let Some(entry) = cache.peek(&key) else {
+                CACHE_METRICS.record_agent_miss();
+                return None;
+            };
+            if !entry.is_expired(AGENT_TTL) {
+                let value = entry.value.as_ref().clone();
+                let should_maintain = CACHE_METRICS.record_agent_hit_sampled();
+                drop(cache);
+
+                if should_maintain {
+                    let mut cache = self.agents_by_id.write();
+                    let expired = match cache.get_mut(&key) {
+                        Some(entry) => {
+                            if entry.is_expired(AGENT_TTL) {
+                                true
+                            } else {
+                                entry.touch();
+                                false
+                            }
+                        }
+                        None => false,
+                    };
+                    if expired {
+                        cache.remove(&key);
+                    }
+                }
+                return Some(value);
+            }
+        }
+
         let mut cache = self.agents_by_id.write();
-        let Some(entry) = cache.get_mut(&key) else {
-            CACHE_METRICS.record_agent_miss();
-            return None;
+        let expired = match cache.get_mut(&key) {
+            Some(entry) => {
+                if entry.is_expired(AGENT_TTL) {
+                    true
+                } else {
+                    entry.touch();
+                    false
+                }
+            }
+            None => {
+                CACHE_METRICS.record_agent_miss();
+                return None;
+            }
         };
-        if entry.is_expired(AGENT_TTL) {
+        if expired {
             cache.remove(&key);
             CACHE_METRICS.record_agent_miss();
             return None;
         }
-        entry.touch();
-        let value = entry.value.as_ref().clone();
+        let value = cache
+            .peek(&key)
+            .expect("cache entry must exist after non-expired get_mut")
+            .value
+            .as_ref()
+            .clone();
         CACHE_METRICS.record_agent_hit();
         Some(value)
     }
@@ -538,6 +746,16 @@ impl ReadCache {
     #[allow(clippy::significant_drop_tightening)]
     pub fn get_inbox_stats_scoped(&self, scope: &str, agent_id: i64) -> Option<InboxStatsRow> {
         let key = (scope_fingerprint(scope), agent_id);
+        {
+            let cache = self.inbox_stats.read();
+            let Some(entry) = cache.peek(&key) else {
+                return None;
+            };
+            if !entry.is_expired(INBOX_STATS_TTL) {
+                return Some(entry.value.clone());
+            }
+        }
+
         let mut cache = self.inbox_stats.write();
         let expired = match cache.get_mut(&key) {
             Some(entry) => {
@@ -545,15 +763,23 @@ impl ReadCache {
                     true
                 } else {
                     entry.touch();
-                    return Some(entry.value.clone());
+                    false
                 }
             }
             None => return None,
         };
         if expired {
             cache.remove(&key);
+            None
+        } else {
+            Some(
+                cache
+                    .peek(&key)
+                    .expect("cache entry must exist after non-expired get_mut")
+                    .value
+                    .clone(),
+            )
         }
-        None
     }
 
     /// Insert or update cached inbox stats for an agent.
@@ -1671,8 +1897,10 @@ mod tests {
         let project = make_project("hot-proj");
         cache.put_project(&project);
 
-        // Access ADAPTIVE_TTL_THRESHOLD times to trigger 2x TTL
-        for _ in 0..ADAPTIVE_TTL_THRESHOLD {
+        // Hot reads refresh metadata on a sampled cadence rather than every hit.
+        let sampled_hit_count =
+            ADAPTIVE_TTL_THRESHOLD * u32::try_from(HIT_WRITE_MAINTENANCE_INTERVAL).unwrap();
+        for _ in 0..sampled_hit_count {
             let _ = cache.get_project("hot-proj");
         }
 

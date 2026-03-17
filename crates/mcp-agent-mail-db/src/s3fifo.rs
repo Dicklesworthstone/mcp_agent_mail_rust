@@ -110,6 +110,22 @@ where
         }
     }
 
+    /// Look up a key without updating frequency metadata.
+    ///
+    /// This is used by read-mostly callers that want to avoid taking an
+    /// exclusive outer lock on every hit, and can amortize frequency updates
+    /// separately.
+    pub fn peek<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        match self.index.get(key) {
+            Some(Node::Small { value, .. } | Node::Main { value, .. }) => Some(value),
+            _ => None,
+        }
+    }
+
     /// Look up a key, returning a mutable reference to the value.
     ///
     /// Increments the frequency counter on hit. Returns `None` if the key
