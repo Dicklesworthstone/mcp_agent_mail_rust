@@ -5165,3 +5165,1037 @@ mod edge_case_tests {
         );
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// ALIEN-ARTIFACT ENHANCEMENTS — Tracks 16–21
+// ══════════════════════════════════════════════════════════════════════
+
+// ── Track 16: Regret → PID → Loss Matrix Feedback Loop ──────────────
+
+/// Maintains a PID controller per (action, state) pair in a loss matrix.
+#[derive(Debug)]
+pub struct LossMatrixTuner<A: AtcAction, S: AtcState> {
+    pids: HashMap<(A, S), PidState>,
+    regret_accum: HashMap<(A, S), (f64, u64)>,
+    update_interval: u64,
+    decisions_since_update: u64,
+}
+
+impl<A: AtcAction, S: AtcState> LossMatrixTuner<A, S> {
+    #[must_use]
+    pub fn from_core(core: &DecisionCore<S, A>, update_interval: u64) -> Self {
+        let mut pids = HashMap::new();
+        for &action in &core.actions {
+            for &(state, _) in core.posterior() {
+                let loss = core.loss_entry(action, state);
+                pids.insert((action, state), PidState::new(loss));
+            }
+        }
+        Self {
+            pids,
+            regret_accum: HashMap::new(),
+            update_interval: update_interval.max(1),
+            decisions_since_update: 0,
+        }
+    }
+
+    pub fn record_outcome(&mut self, action: A, true_state: S, regret: f64) {
+        let entry = self
+            .regret_accum
+            .entry((action, true_state))
+            .or_insert((0.0, 0));
+        entry.0 += regret;
+        entry.1 += 1;
+        self.decisions_since_update += 1;
+    }
+
+    pub fn maybe_update(&mut self, core: &mut DecisionCore<S, A>) -> bool {
+        if self.decisions_since_update < self.update_interval {
+            return false;
+        }
+        self.decisions_since_update = 0;
+        let dt = 1.0;
+        let loss_matrix = core.loss_matrix_mut();
+        let mut any_changed = false;
+        for ((action, state), pid) in &mut self.pids {
+            let (total_regret, count) = self
+                .regret_accum
+                .get(&(*action, *state))
+                .copied()
+                .unwrap_or((0.0, 0));
+            if count == 0 {
+                continue;
+            }
+            let avg_regret = total_regret / u64_to_f64(count);
+            let new_loss = pid.update(avg_regret, dt);
+            loss_matrix.insert((*action, *state), new_loss);
+            any_changed = true;
+        }
+        self.regret_accum.clear();
+        any_changed
+    }
+}
+
+// ── Track 17: Conformal Prediction Sets for ATC Decisions ───────────
+
+#[derive(Debug, Clone)]
+pub struct AtcConformalSet {
+    pub sets: HashMap<AtcSubsystem, SubsystemConformal>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubsystemConformal {
+    scores: VecDeque<f64>,
+    capacity: usize,
+    coverage: f64,
+}
+
+impl SubsystemConformal {
+    fn new(capacity: usize, coverage: f64) -> Self {
+        Self {
+            scores: VecDeque::with_capacity(capacity),
+            capacity,
+            coverage,
+        }
+    }
+
+    pub fn observe(&mut self, predicted_loss: f64, actual_loss: f64) {
+        let score = (predicted_loss - actual_loss).abs();
+        if self.scores.len() >= self.capacity {
+            self.scores.pop_front();
+        }
+        self.scores.push_back(score);
+    }
+
+    #[must_use]
+    pub fn interval_width(&self) -> Option<f64> {
+        if self.scores.len() < 5 {
+            return None;
+        }
+        let mut sorted: Vec<f64> = self.scores.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // Quantile index at configured coverage level
+        let raw_idx = (self.coverage * usize_to_f64(sorted.len())).ceil();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let idx = (raw_idx as usize).min(sorted.len().saturating_sub(1));
+        Some(sorted[idx])
+    }
+
+    #[must_use]
+    pub fn is_uncertain(&self) -> bool {
+        self.interval_width().is_some_and(|w| w > 10.0)
+    }
+}
+
+impl AtcConformalSet {
+    #[must_use]
+    pub fn new(capacity: usize, coverage: f64) -> Self {
+        let mut sets = HashMap::new();
+        for sub in [
+            AtcSubsystem::Liveness,
+            AtcSubsystem::Conflict,
+            AtcSubsystem::LoadRouting,
+            AtcSubsystem::Synthesis,
+            AtcSubsystem::Calibration,
+        ] {
+            sets.insert(sub, SubsystemConformal::new(capacity, coverage));
+        }
+        Self { sets }
+    }
+
+    pub fn observe(&mut self, subsystem: AtcSubsystem, predicted_loss: f64, actual_loss: f64) {
+        if let Some(sc) = self.sets.get_mut(&subsystem) {
+            sc.observe(predicted_loss, actual_loss);
+        }
+    }
+
+    #[must_use]
+    pub fn is_uncertain(&self, subsystem: AtcSubsystem) -> bool {
+        self.sets
+            .get(&subsystem)
+            .is_some_and(SubsystemConformal::is_uncertain)
+    }
+}
+
+// ── Track 18: Hierarchical Bayesian Agent Population Model ──────────
+
+#[derive(Debug, Clone)]
+pub struct HierarchicalAgentModel {
+    populations: HashMap<String, PopulationStats>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PopulationStats {
+    pub mean: f64,
+    pub variance: f64,
+    pub n: f64,
+    pub agent_count: u64,
+}
+
+impl PopulationStats {
+    fn new(prior_mean_secs: f64) -> Self {
+        let prior_mean = prior_mean_secs * 1_000_000.0;
+        Self {
+            mean: prior_mean,
+            variance: (prior_mean * 0.5).powi(2),
+            n: 3.0,
+            agent_count: 0,
+        }
+    }
+
+    fn absorb_agent(&mut self, agent_avg: f64, agent_var: f64, agent_n: u64) {
+        if agent_n == 0 {
+            return;
+        }
+        let n_agent = u64_to_f64(agent_n);
+        let total_n = self.n + n_agent;
+        let delta = agent_avg - self.mean;
+        self.mean += delta * n_agent / total_n;
+        self.variance = (self.variance.mul_add(self.n, agent_var * n_agent)
+            + (delta * delta * self.n * n_agent / total_n))
+            / total_n;
+        self.n = total_n;
+        self.agent_count += 1;
+    }
+
+    #[must_use]
+    const fn derive_prior(&self) -> (f64, f64) {
+        // Use manual max instead of f64::max() for const context.
+        let v = if self.variance > 1.0 {
+            self.variance
+        } else {
+            1.0
+        };
+        (self.mean, v)
+    }
+}
+
+impl HierarchicalAgentModel {
+    #[must_use]
+    pub fn new() -> Self {
+        let mut populations = HashMap::new();
+        for (program, secs) in [
+            ("claude-code", 60.0),
+            ("codex-cli", 120.0),
+            ("gemini-cli", 120.0),
+            ("copilot-cli", 120.0),
+            ("unknown", 300.0),
+        ] {
+            populations.insert(program.to_string(), PopulationStats::new(secs));
+        }
+        Self { populations }
+    }
+
+    fn canonical_program(program: &str) -> &'static str {
+        match program.to_ascii_lowercase().as_str() {
+            "claude-code" | "claude_code" => "claude-code",
+            "codex-cli" | "codex_cli" | "codex" => "codex-cli",
+            "gemini-cli" | "gemini_cli" | "gemini" => "gemini-cli",
+            "copilot-cli" | "copilot_cli" | "copilot" => "copilot-cli",
+            _ => "unknown",
+        }
+    }
+
+    #[must_use]
+    pub fn prior_for(&self, program: &str) -> (f64, f64) {
+        let key = Self::canonical_program(program);
+        self.populations.get(key).map_or_else(
+            || {
+                let default_mean = 300.0 * 1_000_000.0;
+                (default_mean, (default_mean * 0.5).powi(2))
+            },
+            PopulationStats::derive_prior,
+        )
+    }
+
+    pub fn absorb_agent(&mut self, program: &str, rhythm: &AgentRhythm) {
+        let key = Self::canonical_program(program).to_string();
+        let stats = self
+            .populations
+            .entry(key)
+            .or_insert_with(|| PopulationStats::new(300.0));
+        stats.absorb_agent(
+            rhythm.avg_interval,
+            rhythm.var_interval,
+            rhythm.observation_count,
+        );
+    }
+
+    #[must_use]
+    pub fn create_rhythm(&self, program: &str) -> AgentRhythm {
+        let (mean, var) = self.prior_for(program);
+        let mut rhythm = AgentRhythm::new(mean / 1_000_000.0);
+        rhythm.var_interval = var;
+        rhythm
+    }
+}
+
+impl Default for HierarchicalAgentModel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Track 19: Contextual Bandits for Adaptive Thresholds ────────────
+
+/// Thompson-sampling-inspired adaptive suspicion threshold per agent.
+/// Maintains a Beta(α, β) posterior for the true-positive rate.
+#[derive(Debug, Clone)]
+pub struct AdaptiveThreshold {
+    alpha: f64,
+    beta_param: f64,
+    base_k: f64,
+    min_k: f64,
+    max_k: f64,
+}
+
+impl AdaptiveThreshold {
+    #[must_use]
+    pub const fn new(base_k: f64) -> Self {
+        Self {
+            alpha: 2.0,
+            beta_param: 2.0,
+            base_k,
+            min_k: 1.5,
+            max_k: 5.0,
+        }
+    }
+
+    pub fn record_outcome(&mut self, true_positive: bool) {
+        if true_positive {
+            self.alpha += 1.0;
+        } else {
+            self.beta_param += 1.0;
+        }
+    }
+
+    #[must_use]
+    pub fn effective_k(&self) -> f64 {
+        let precision = self.alpha / (self.alpha + self.beta_param);
+        (0.5 - precision)
+            .mul_add(self.max_k - self.min_k, self.base_k)
+            .clamp(self.min_k, self.max_k)
+    }
+
+    #[must_use]
+    pub fn precision_estimate(&self) -> f64 {
+        self.alpha / (self.alpha + self.beta_param)
+    }
+
+    #[must_use]
+    pub fn observation_count(&self) -> u64 {
+        // Subtract the 4 pseudo-counts from the prior
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        {
+            (self.alpha + self.beta_param - 4.0).max(0.0) as u64
+        }
+    }
+}
+
+// ── Track 20: Submodular Probe Scheduling ───────────────────────────
+
+#[must_use]
+pub fn submodular_probe_schedule<S: BuildHasher>(
+    agents: &HashMap<String, AgentLivenessEntry, S>,
+    max_probes: usize,
+    recency_decay: f64,
+    now_micros: i64,
+) -> Vec<(String, f64)> {
+    if agents.is_empty() || max_probes == 0 {
+        return Vec::new();
+    }
+
+    let mut candidates: Vec<(String, f64)> = agents
+        .iter()
+        .filter(|(name, _)| name.as_str() != ATC_AGENT_NAME)
+        .map(|(name, entry)| {
+            let base_gain = probe_information_gain(entry.core.posterior());
+            let time_since_probe = if entry.probe_sent_at > 0 {
+                nonnegative_i64_to_f64((now_micros - entry.probe_sent_at).max(0))
+            } else {
+                1_000_000_000.0
+            };
+            let recency = 1.0 - (-time_since_probe / (recency_decay * 1_000_000.0)).exp();
+            (name.clone(), base_gain * recency.max(0.01))
+        })
+        .filter(|(_, gain)| *gain > 0.001)
+        .collect();
+
+    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut selected = Vec::new();
+    let mut total_gain = 0.0;
+    for (name, gain) in candidates {
+        if selected.len() >= max_probes {
+            break;
+        }
+        let marginal = gain * (1.0 - total_gain / (total_gain + gain + 1.0));
+        if marginal < 0.001 {
+            break;
+        }
+        total_gain += marginal;
+        selected.push((name, marginal));
+    }
+    selected
+}
+
+// ── Track 21: Survival Analysis for Agent Liveness ──────────────────
+
+/// Kaplan-Meier survival estimator for agent silence durations.
+#[derive(Debug, Clone)]
+pub struct KaplanMeierEstimator {
+    observations: Vec<(i64, bool)>,
+    capacity: usize,
+}
+
+impl KaplanMeierEstimator {
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            observations: Vec::with_capacity(capacity.min(4096)),
+            capacity,
+        }
+    }
+
+    pub fn observe(&mut self, duration_micros: i64, is_death: bool) {
+        if self.observations.len() >= self.capacity {
+            self.observations.remove(0);
+        }
+        self.observations.push((duration_micros, is_death));
+    }
+
+    #[must_use]
+    pub fn survival_probability(&self, t_micros: i64) -> f64 {
+        if self.observations.is_empty() {
+            return 1.0;
+        }
+        let mut sorted: Vec<(i64, bool)> = self.observations.clone();
+        sorted.sort_by_key(|(d, _)| *d);
+
+        let mut s = 1.0;
+        let mut at_risk = usize_to_f64(sorted.len());
+
+        for &(duration, is_death) in &sorted {
+            if duration > t_micros {
+                break;
+            }
+            if is_death && at_risk > 0.0 {
+                s *= 1.0 - (1.0 / at_risk);
+            }
+            at_risk -= 1.0;
+        }
+        s.max(0.0)
+    }
+
+    #[must_use]
+    pub fn hazard_rate(&self, t_micros: i64, window_micros: i64) -> f64 {
+        let s_t = self.survival_probability(t_micros);
+        let s_t_plus = self.survival_probability(t_micros + window_micros);
+        if s_t <= 0.0 {
+            return 1.0;
+        }
+        let window_secs = nonnegative_i64_to_f64(window_micros) / 1_000_000.0;
+        if window_secs <= 0.0 {
+            return 0.0;
+        }
+        (s_t - s_t_plus) / (s_t * window_secs)
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.observations.len()
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.observations.is_empty()
+    }
+}
+
+// ── Global ATC Engine Singleton ─────────────────────────────────────
+
+use std::sync::{Mutex, OnceLock};
+
+static ATC_ENGINE: OnceLock<Mutex<AtcEngine>> = OnceLock::new();
+static ATC_POPULATION: OnceLock<Mutex<HierarchicalAgentModel>> = OnceLock::new();
+static ATC_CONFORMAL: OnceLock<Mutex<AtcConformalSet>> = OnceLock::new();
+static ATC_THRESHOLDS: OnceLock<Mutex<HashMap<String, AdaptiveThreshold>>> = OnceLock::new();
+static ATC_SURVIVAL: OnceLock<Mutex<HashMap<String, KaplanMeierEstimator>>> = OnceLock::new();
+static ATC_LIVENESS_TUNER: OnceLock<Mutex<LossMatrixTuner<LivenessAction, LivenessState>>> =
+    OnceLock::new();
+
+impl AtcEngine {
+    /// Build an `AtcConfig` from the core `Config` env vars.
+    #[must_use]
+    pub fn config_from_env(config: &mcp_agent_mail_core::Config) -> AtcConfig {
+        AtcConfig {
+            enabled: config.atc_enabled,
+            probe_interval_micros: i64::try_from(config.atc_probe_interval_secs)
+                .unwrap_or(120)
+                .saturating_mul(1_000_000),
+            advisory_cooldown_micros: i64::try_from(config.atc_advisory_cooldown_secs)
+                .unwrap_or(300)
+                .saturating_mul(1_000_000),
+            summary_interval_micros: i64::try_from(config.atc_summary_interval_secs)
+                .unwrap_or(300)
+                .saturating_mul(1_000_000),
+            safe_mode_recovery_count: config.atc_safe_mode_recovery_count,
+            eprocess_alert_threshold: config.atc_eprocess_threshold,
+            cusum_threshold: config.atc_cusum_threshold,
+            cusum_delta: config.atc_cusum_delta,
+            ledger_capacity: config.atc_ledger_capacity,
+            tick_budget_micros: 5_000,
+            suspicion_k: config.atc_suspicion_k,
+        }
+    }
+}
+
+/// Initialize the global ATC engine. Call once at server startup.
+pub fn init_global_atc(config: &mcp_agent_mail_core::Config) {
+    let atc_config = AtcEngine::config_from_env(config);
+    ATC_ENGINE.get_or_init(|| Mutex::new(AtcEngine::new(atc_config)));
+    ATC_POPULATION.get_or_init(|| Mutex::new(HierarchicalAgentModel::new()));
+    ATC_CONFORMAL.get_or_init(|| Mutex::new(AtcConformalSet::new(200, 0.90)));
+    ATC_THRESHOLDS.get_or_init(|| Mutex::new(HashMap::new()));
+    ATC_SURVIVAL.get_or_init(|| Mutex::new(HashMap::new()));
+    ATC_LIVENESS_TUNER
+        .get_or_init(|| Mutex::new(LossMatrixTuner::from_core(&default_liveness_core(), 50)));
+}
+
+/// Whether the global ATC is initialized and enabled.
+#[must_use]
+pub fn atc_enabled() -> bool {
+    ATC_ENGINE
+        .get()
+        .and_then(|m| m.lock().ok())
+        .is_some_and(|e| e.enabled())
+}
+
+/// Record an agent registration in the ATC.
+pub fn atc_register_agent(name: &str, program: &str) {
+    if let Some(engine) = ATC_ENGINE.get()
+        && let Ok(mut e) = engine.lock()
+    {
+        e.register_agent(name, program);
+    }
+    if let Some(thresholds) = ATC_THRESHOLDS.get()
+        && let Ok(mut t) = thresholds.lock()
+    {
+        let base_k = ATC_ENGINE
+            .get()
+            .and_then(|m| m.lock().ok())
+            .map_or(3.0, |e| e.config.suspicion_k);
+        t.entry(name.to_string())
+            .or_insert_with(|| AdaptiveThreshold::new(base_k));
+    }
+}
+
+/// Record agent activity (tool call, message, etc.) in the ATC.
+pub fn atc_observe_activity(agent: &str, timestamp_micros: i64) {
+    if let Some(engine) = ATC_ENGINE.get()
+        && let Ok(mut e) = engine.lock()
+    {
+        e.observe_activity(agent, timestamp_micros);
+    }
+}
+
+/// Actionable outputs from an ATC tick.
+#[derive(Debug, Clone)]
+pub enum AtcTickAction {
+    SendAdvisory { agent: String, message: String },
+    ReleaseReservations { agent: String },
+    ProbeAgent { agent: String },
+}
+
+/// Run one ATC tick: evaluate liveness, detect deadlocks, update calibration.
+#[must_use]
+pub fn atc_tick(now_micros: i64) -> Vec<AtcTickAction> {
+    let mut actions = Vec::new();
+
+    let Some(engine_lock) = ATC_ENGINE.get() else {
+        return actions;
+    };
+    let Ok(mut engine) = engine_lock.lock() else {
+        return actions;
+    };
+
+    if !engine.enabled() {
+        return actions;
+    }
+
+    engine.tick_count += 1;
+
+    // 1. Evaluate liveness
+    let liveness_actions = engine.evaluate_liveness(now_micros);
+
+    for (agent_name, action) in &liveness_actions {
+        match action {
+            LivenessAction::Suspect => {
+                actions.push(AtcTickAction::SendAdvisory {
+                    agent: agent_name.clone(),
+                    message: format!("[ATC] Agent {agent_name} appears unresponsive. Monitoring."),
+                });
+            }
+            LivenessAction::ReleaseReservations => {
+                actions.push(AtcTickAction::ReleaseReservations {
+                    agent: agent_name.clone(),
+                });
+                actions.push(AtcTickAction::SendAdvisory {
+                    agent: agent_name.clone(),
+                    message: format!(
+                        "[ATC] Agent {agent_name} declared dead. Reservations released."
+                    ),
+                });
+            }
+            LivenessAction::DeclareAlive => {}
+        }
+    }
+
+    // 2. Detect deadlocks
+    let deadlocks = engine.detect_deadlocks();
+    for (project, cycles) in &deadlocks {
+        for cycle in cycles {
+            let agents_str = cycle.join(" → ");
+            actions.push(AtcTickAction::SendAdvisory {
+                agent: cycle[0].clone(),
+                message: format!(
+                    "[ATC] Deadlock detected in {project}: {agents_str}. \
+                     Consider releasing reservations.",
+                ),
+            });
+        }
+    }
+
+    // 3. Submodular probe scheduling
+    let probe_targets = submodular_probe_schedule(&engine.agents, 3, 60.0, now_micros);
+    for (agent_name, _gain) in &probe_targets {
+        if let Some(entry) = engine.agents.get_mut(agent_name) {
+            entry.probe_sent_at = now_micros;
+        }
+        actions.push(AtcTickAction::ProbeAgent {
+            agent: agent_name.clone(),
+        });
+    }
+
+    // 4. Conformal uncertainty gating — suppress aggressive actions under high uncertainty
+    if let Some(conformal_lock) = ATC_CONFORMAL.get()
+        && let Ok(conformal) = conformal_lock.lock()
+        && conformal.is_uncertain(AtcSubsystem::Liveness)
+    {
+        actions.retain(|a| !matches!(a, AtcTickAction::ReleaseReservations { .. }));
+    }
+
+    // 5. Periodically update population model
+    if engine.tick_count % 50 == 0
+        && let Some(pop_lock) = ATC_POPULATION.get()
+        && let Ok(mut pop) = pop_lock.lock()
+    {
+        for entry in engine.agents.values() {
+            pop.absorb_agent("unknown", &entry.rhythm);
+        }
+    }
+
+    actions
+}
+
+/// Record the outcome of an ATC decision for calibration feedback.
+pub fn atc_record_outcome(
+    subsystem: AtcSubsystem,
+    agent: Option<&str>,
+    predicted_loss: f64,
+    actual_loss: f64,
+    correct: bool,
+) {
+    // Feed e-process, CUSUM, and calibration guard
+    if let Some(engine_lock) = ATC_ENGINE.get()
+        && let Ok(mut engine) = engine_lock.lock()
+    {
+        engine.eprocess.update(correct, subsystem, agent);
+        let now = mcp_agent_mail_core::timestamps::now_micros();
+        engine.cusum.update(!correct, now);
+
+        // Clone to satisfy borrow checker (calibration borrows eprocess/cusum)
+        let ep_snapshot = engine.eprocess.clone();
+        let cusum_snapshot = engine.cusum.clone();
+        engine
+            .calibration
+            .update(&ep_snapshot, &cusum_snapshot, correct, now);
+    }
+
+    // Feed conformal predictor
+    if let Some(conformal_lock) = ATC_CONFORMAL.get()
+        && let Ok(mut conformal) = conformal_lock.lock()
+    {
+        conformal.observe(subsystem, predicted_loss, actual_loss);
+    }
+
+    // Feed adaptive threshold (liveness only)
+    if subsystem == AtcSubsystem::Liveness
+        && let Some(agent_name) = agent
+        && let Some(thresholds_lock) = ATC_THRESHOLDS.get()
+        && let Ok(mut thresholds) = thresholds_lock.lock()
+        && let Some(adaptive) = thresholds.get_mut(agent_name)
+    {
+        adaptive.record_outcome(correct);
+    }
+
+    // Feed liveness tuner (regret → PID → loss matrix feedback loop)
+    if subsystem == AtcSubsystem::Liveness
+        && let Some(tuner_lock) = ATC_LIVENESS_TUNER.get()
+        && let Ok(mut tuner) = tuner_lock.lock()
+    {
+        let regret = (predicted_loss - actual_loss).abs();
+        let action = if correct {
+            LivenessAction::DeclareAlive
+        } else {
+            LivenessAction::Suspect
+        };
+        let state = if correct {
+            LivenessState::Alive
+        } else {
+            LivenessState::Dead
+        };
+        tuner.record_outcome(action, state, regret);
+
+        if let Some(engine_lock) = ATC_ENGINE.get()
+            && let Ok(mut engine) = engine_lock.lock()
+        {
+            tuner.maybe_update(&mut engine.liveness_core);
+        }
+    }
+
+    // Feed survival estimator.
+    // Extract silence duration from engine first, then lock survival separately
+    // to avoid holding two locks (SURVIVAL + ENGINE) simultaneously.
+    if subsystem == AtcSubsystem::Liveness
+        && let Some(agent_name) = agent
+    {
+        let silence = ATC_ENGINE
+            .get()
+            .and_then(|l| l.lock().ok())
+            .and_then(|engine| {
+                engine.agents.get(agent_name).map(|entry| {
+                    entry
+                        .rhythm
+                        .silence_duration(mcp_agent_mail_core::timestamps::now_micros())
+                })
+            });
+        if let Some(silence) = silence
+            && let Some(survival_lock) = ATC_SURVIVAL.get()
+            && let Ok(mut survival) = survival_lock.lock()
+        {
+            let estimator = survival
+                .entry("all".to_string())
+                .or_insert_with(|| KaplanMeierEstimator::new(1000));
+            estimator.observe(silence, !correct);
+        }
+    }
+}
+
+/// Get ATC summary for robot mode / TUI display.
+#[must_use]
+pub fn atc_summary() -> Option<AtcSummarySnapshot> {
+    let engine_lock = ATC_ENGINE.get()?;
+    let engine = engine_lock.lock().ok()?;
+
+    let mut agent_states = Vec::new();
+    let now = mcp_agent_mail_core::timestamps::now_micros();
+    for (name, entry) in &engine.agents {
+        agent_states.push(AgentStateSnapshot {
+            name: name.clone(),
+            state: entry.state,
+            silence_secs: entry.rhythm.silence_duration(now) / 1_000_000,
+            posterior_alive: entry
+                .core
+                .posterior()
+                .iter()
+                .find(|(s, _)| *s == LivenessState::Alive)
+                .map_or(0.0, |(_, p)| *p),
+        });
+    }
+
+    let deadlock_count: usize = engine
+        .conflict_graphs
+        .values()
+        .map(|g| find_deadlock_cycles(g).len())
+        .sum();
+
+    Some(AtcSummarySnapshot {
+        enabled: engine.enabled(),
+        safe_mode: engine.is_safe_mode(),
+        tick_count: engine.tick_count(),
+        tracked_agents: agent_states,
+        deadlock_cycles: deadlock_count,
+        eprocess_value: engine.eprocess().e_value(),
+        regret_avg: engine.regret().average_regret(),
+        decisions_total: engine.ledger().latest_id(),
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct AtcSummarySnapshot {
+    pub enabled: bool,
+    pub safe_mode: bool,
+    pub tick_count: u64,
+    pub tracked_agents: Vec<AgentStateSnapshot>,
+    pub deadlock_cycles: usize,
+    pub eprocess_value: f64,
+    pub regret_avg: f64,
+    pub decisions_total: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentStateSnapshot {
+    pub name: String,
+    pub state: LivenessState,
+    pub silence_secs: i64,
+    pub posterior_alive: f64,
+}
+
+// ── Tests for alien-artifact enhancements ───────────────────────────
+
+#[cfg(test)]
+mod alien_enhancement_tests {
+    use super::*;
+
+    #[test]
+    fn tuner_from_core_creates_pids() {
+        let core = default_liveness_core();
+        let tuner = LossMatrixTuner::from_core(&core, 10);
+        assert_eq!(tuner.pids.len(), 9);
+    }
+
+    #[test]
+    fn tuner_update_interval_respected() {
+        let core = default_liveness_core();
+        let mut tuner = LossMatrixTuner::from_core(&core, 5);
+        let mut core_clone = core.clone();
+        for _ in 0..4 {
+            tuner.record_outcome(LivenessAction::DeclareAlive, LivenessState::Alive, 1.0);
+        }
+        assert!(!tuner.maybe_update(&mut core_clone));
+        tuner.record_outcome(LivenessAction::DeclareAlive, LivenessState::Alive, 1.0);
+        assert!(tuner.maybe_update(&mut core_clone));
+    }
+
+    #[test]
+    fn tuner_adjusts_loss_values() {
+        let core = default_liveness_core();
+        let original_loss = core.loss_entry(LivenessAction::Suspect, LivenessState::Alive);
+        let mut tuner = LossMatrixTuner::from_core(&core, 3);
+        let mut core_clone = core.clone();
+        for _ in 0..3 {
+            tuner.record_outcome(LivenessAction::Suspect, LivenessState::Alive, 20.0);
+        }
+        tuner.maybe_update(&mut core_clone);
+        let new_loss = core_clone.loss_entry(LivenessAction::Suspect, LivenessState::Alive);
+        assert!(
+            (new_loss - original_loss).abs() > 0.001,
+            "PID should adjust loss: original={original_loss}, new={new_loss}"
+        );
+    }
+
+    #[test]
+    fn conformal_set_has_all_subsystems() {
+        let cs = AtcConformalSet::new(100, 0.90);
+        assert!(cs.sets.contains_key(&AtcSubsystem::Liveness));
+        assert!(cs.sets.contains_key(&AtcSubsystem::Conflict));
+    }
+
+    #[test]
+    fn conformal_interval_widens_with_variance() {
+        let mut sc = SubsystemConformal::new(100, 0.90);
+        for _ in 0..20 {
+            sc.observe(5.0, 5.1);
+        }
+        let tight = sc.interval_width().unwrap();
+
+        let mut sc2 = SubsystemConformal::new(100, 0.90);
+        for i in 0..20 {
+            sc2.observe(5.0, f64::from(i) * 2.0);
+        }
+        let wide = sc2.interval_width().unwrap();
+        assert!(wide > tight, "tight={tight}, wide={wide}");
+    }
+
+    #[test]
+    fn conformal_needs_minimum_data() {
+        let sc = SubsystemConformal::new(100, 0.90);
+        assert!(sc.interval_width().is_none());
+    }
+
+    #[test]
+    fn hierarchical_model_default_priors() {
+        let model = HierarchicalAgentModel::new();
+        let (mean, _) = model.prior_for("claude-code");
+        assert!((mean - 60_000_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn hierarchical_model_absorbs_agents() {
+        let mut model = HierarchicalAgentModel::new();
+        let mut rhythm = AgentRhythm::new(60.0);
+        for i in 1..=10 {
+            rhythm.observe(i * 30_000_000);
+        }
+        model.absorb_agent("claude-code", &rhythm);
+        let (mean, _) = model.prior_for("claude-code");
+        assert!(mean < 60_000_000.0, "mean should shift: {mean}");
+    }
+
+    #[test]
+    fn hierarchical_unknown_uses_default() {
+        let model = HierarchicalAgentModel::new();
+        let (mean, _) = model.prior_for("totally-new");
+        assert!((mean - 300_000_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn adaptive_threshold_starts_near_base() {
+        let at = AdaptiveThreshold::new(3.0);
+        assert!((at.effective_k() - 3.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn adaptive_threshold_decreases_with_tp() {
+        let mut at = AdaptiveThreshold::new(3.0);
+        let before = at.effective_k();
+        for _ in 0..20 {
+            at.record_outcome(true);
+        }
+        assert!(at.effective_k() < before);
+    }
+
+    #[test]
+    fn adaptive_threshold_increases_with_fp() {
+        let mut at = AdaptiveThreshold::new(3.0);
+        let before = at.effective_k();
+        for _ in 0..20 {
+            at.record_outcome(false);
+        }
+        assert!(at.effective_k() > before);
+    }
+
+    #[test]
+    fn adaptive_threshold_k_bounded() {
+        let mut at = AdaptiveThreshold::new(3.0);
+        for _ in 0..1000 {
+            at.record_outcome(true);
+        }
+        assert!(at.effective_k() >= at.min_k);
+        let mut at2 = AdaptiveThreshold::new(3.0);
+        for _ in 0..1000 {
+            at2.record_outcome(false);
+        }
+        assert!(at2.effective_k() <= at2.max_k);
+    }
+
+    #[test]
+    fn submodular_schedule_empty() {
+        let agents: HashMap<String, AgentLivenessEntry> = HashMap::new();
+        assert!(submodular_probe_schedule(&agents, 5, 60.0, 1_000_000).is_empty());
+    }
+
+    #[test]
+    fn submodular_schedule_respects_max() {
+        let mut agents = HashMap::new();
+        for i in 0..10 {
+            let name = format!("Agent{i}");
+            agents.insert(
+                name.clone(),
+                AgentLivenessEntry {
+                    name,
+                    state: LivenessState::Alive,
+                    rhythm: AgentRhythm::new(60.0),
+                    suspect_since: 0,
+                    probe_sent_at: 0,
+                    sprt_log_lr: 0.0,
+                    core: default_liveness_core(),
+                },
+            );
+        }
+        let schedule = submodular_probe_schedule(&agents, 3, 60.0, 1_000_000);
+        assert!(schedule.len() <= 3);
+    }
+
+    #[test]
+    fn kaplan_meier_no_data() {
+        let km = KaplanMeierEstimator::new(100);
+        assert!((km.survival_probability(1_000_000) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn kaplan_meier_survival_decreases() {
+        let mut km = KaplanMeierEstimator::new(100);
+        for i in 1..=10 {
+            km.observe(i * 60_000_000, true);
+        }
+        let s_early = km.survival_probability(60_000_000);
+        let s_late = km.survival_probability(600_000_000);
+        assert!(s_early > s_late, "S(1m)={s_early}, S(10m)={s_late}");
+    }
+
+    #[test]
+    fn kaplan_meier_censored() {
+        let mut km = KaplanMeierEstimator::new(100);
+        for i in 1..=5 {
+            km.observe(i * 60_000_000, true);
+            km.observe(i * 60_000_000, false);
+        }
+        let s = km.survival_probability(300_000_000);
+        assert!(s > 0.0 && s < 1.0, "s={s}");
+    }
+
+    #[test]
+    fn kaplan_meier_hazard_nonneg() {
+        let mut km = KaplanMeierEstimator::new(100);
+        for i in 1..=10 {
+            km.observe(i * 60_000_000, true);
+        }
+        assert!(km.hazard_rate(300_000_000, 60_000_000) >= 0.0);
+    }
+
+    #[test]
+    fn hazard_rate_zero_window() {
+        let mut km = KaplanMeierEstimator::new(100);
+        km.observe(120_000_000, true);
+        // Zero window at a point where survival > 0 should return 0.0
+        // (no time passes, so no additional risk).
+        let h = km.hazard_rate(30_000_000, 0);
+        assert!(
+            h.abs() < f64::EPSILON,
+            "zero window should yield zero hazard, got {h}"
+        );
+    }
+
+    #[test]
+    fn atc_config_from_env_defaults() {
+        let config = mcp_agent_mail_core::Config::default();
+        let atc_config = AtcEngine::config_from_env(&config);
+        assert!(atc_config.enabled);
+        assert_eq!(atc_config.probe_interval_micros, 120_000_000);
+    }
+
+    #[test]
+    fn global_atc_init_and_query() {
+        let config = mcp_agent_mail_core::Config::default();
+        init_global_atc(&config);
+        assert!(atc_enabled());
+        atc_register_agent("TestAlpha", "claude-code");
+        atc_observe_activity("TestAlpha", 1_000_000);
+        assert!(atc_summary().is_some());
+    }
+
+    #[test]
+    fn atc_tick_no_actions_for_active_agent() {
+        let config = mcp_agent_mail_core::Config::default();
+        init_global_atc(&config);
+        let now = mcp_agent_mail_core::timestamps::now_micros();
+        atc_register_agent("TickTest", "claude-code");
+        atc_observe_activity("TickTest", now);
+        let actions = atc_tick(now + 1_000_000);
+        assert!(!actions.iter().any(
+            |a| matches!(a, AtcTickAction::ReleaseReservations { agent } if agent == "TickTest")
+        ));
+    }
+}

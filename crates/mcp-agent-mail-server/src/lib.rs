@@ -1017,6 +1017,9 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
     disk_monitor::start(config);
     mcp_agent_mail_storage::wbq_start();
 
+    // Initialize the Air Traffic Controller engine for proactive agent coordination.
+    atc::init_global_atc(config);
+
     // Start background backfill for Search V3 if enabled.
     spawn_startup_search_backfill(config);
 
@@ -1822,6 +1825,10 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     heal_storage_lock_artifacts(config);
     init_search_bridge(config);
     mcp_agent_mail_storage::wbq_start();
+
+    // Initialize the Air Traffic Controller engine for proactive agent coordination.
+    atc::init_global_atc(config);
+
     cleanup::start(config);
     ack_ttl::start(config);
     tool_metrics::start(config);
@@ -6387,6 +6394,20 @@ to skip auth for local requests.</p>
                     agent_hint.as_deref(),
                 ) {
                     emit_tui_event(event);
+                }
+
+                // Record agent activity in the ATC engine for liveness tracking.
+                if let Some(ref agent) = agent_hint {
+                    atc::atc_observe_activity(agent, mcp_agent_mail_core::timestamps::now_micros());
+                }
+
+                // Register agent in ATC on successful register_agent / macro_start_session.
+                if matches!(tool_name.as_str(), "register_agent" | "macro_start_session")
+                    && let Some(ref agent) = agent_hint
+                {
+                    let program =
+                        extract_arg_str(call_arguments.as_ref(), &["program"]).unwrap_or_default();
+                    atc::atc_register_agent(agent, &program);
                 }
 
                 // Emit tool-call-end panel
