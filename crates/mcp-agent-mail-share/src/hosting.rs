@@ -43,10 +43,15 @@ fn detect_github_pages(output_dir: &Path, hints: &mut Vec<HostingHint>) {
         && dir.is_dir()
         && let Ok(entries) = std::fs::read_dir(&dir)
     {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
+        let mut entry_names: Vec<_> = entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        entry_names.sort();
+
+        for name in entry_names {
             if (name.ends_with(".yml") || name.ends_with(".yaml"))
-                && let Ok(content) = std::fs::read_to_string(entry.path())
+                && let Ok(content) = std::fs::read_to_string(dir.join(&name))
                 && (content.contains("pages") || content.contains("deploy"))
             {
                 signals.push(format!("Workflow {name} references Pages"));
@@ -151,29 +156,24 @@ fn detect_netlify(output_dir: &Path, hints: &mut Vec<HostingHint>) {
 fn detect_s3(output_dir: &Path, hints: &mut Vec<HostingHint>) {
     let mut signals = Vec::new();
 
-    if let Some(remote) = git_remote_url(output_dir)
-        && (remote.contains("amazonaws") || remote.contains("s3"))
-    {
-        signals.push(format!("Git remote: {remote}"));
-    }
-
-    if std::env::var("AWS_ACCESS_KEY_ID").is_ok() || std::env::var("AWS_PROFILE").is_ok() {
-        signals.push("AWS env vars set".to_string());
-    }
-
     // Check for deploy scripts referencing S3
     let scripts_dir = find_ancestor_path(output_dir, "scripts");
     if let Some(dir) = scripts_dir
         && dir.is_dir()
         && let Ok(entries) = std::fs::read_dir(&dir)
     {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
+        let mut entry_names: Vec<_> = entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        entry_names.sort();
+
+        for name in entry_names {
             if (name.contains("deploy") || name.contains("s3"))
-                && let Ok(content) = std::fs::read_to_string(entry.path())
-                && (content.contains("s3") || content.contains("aws"))
+                && let Ok(content) = std::fs::read_to_string(dir.join(&name))
+                && content.contains("aws s3")
             {
-                signals.push(format!("Deploy script {name} references S3/AWS"));
+                signals.push(format!("Found S3 deployment script: {name}"));
             }
         }
     }
