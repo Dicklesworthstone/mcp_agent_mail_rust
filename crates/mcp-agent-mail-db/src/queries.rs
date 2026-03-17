@@ -4833,7 +4833,7 @@ pub async fn mark_message_read(
 /// This is the high-performance counterpart of [`mark_message_read`] for use
 /// in `fetch_inbox` where 20+ messages need to be marked read at once.
 /// Reduces N separate transactions to a single transaction with N UPDATE
-/// statements, cutting fetch_inbox latency by ~80%.
+/// statements, cutting `fetch_inbox` latency by ~80%.
 pub async fn mark_messages_read_batch(
     cx: &Cx,
     pool: &DbPool,
@@ -5475,6 +5475,13 @@ struct ReleasedReservationMarker {
     released_ts: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseReservationExpiryConstraint {
+    Any,
+    OnOrBefore(i64),
+    Exact(i64),
+}
+
 fn release_reservation_chunk_plan(
     path_count: usize,
     reservation_id_count: usize,
@@ -5732,11 +5739,28 @@ pub fn release_reservations<'a>(
     }) // Box::pin(async move {
 }
 
+/// Release reservations by id, optionally requiring `expires_ts` to be on or
+/// before the provided cutoff.
 async fn release_reservations_by_ids_matching_expiry(
     cx: &Cx,
     pool: &DbPool,
     ids: &[i64],
     expires_at_or_before: Option<i64>,
+) -> Outcome<Vec<ReleasedReservationMarker>, DbError> {
+    let expiry_constraint = expires_at_or_before
+        .map_or(ReleaseReservationExpiryConstraint::Any, |cutoff| {
+            ReleaseReservationExpiryConstraint::OnOrBefore(cutoff)
+        });
+    release_reservations_by_ids_with_expiry_constraint(cx, pool, ids, expiry_constraint).await
+}
+
+/// Internal release primitive that supports exact-match and cutoff-based
+/// expiry guards without changing the public DB API.
+async fn release_reservations_by_ids_with_expiry_constraint(
+    cx: &Cx,
+    pool: &DbPool,
+    ids: &[i64],
+    expiry_constraint: ReleaseReservationExpiryConstraint,
 ) -> Outcome<Vec<ReleasedReservationMarker>, DbError> {
     if ids.is_empty() {
         return Outcome::Ok(Vec::new());
@@ -5776,20 +5800,33 @@ async fn release_reservations_by_ids_matching_expiry(
              SELECT 1 FROM file_reservations \
              WHERE id = ? AND ({ACTIVE_RESERVATION_PREDICATE})"
     );
-    if expires_at_or_before.is_some() {
-        release_sql.push_str(" AND expires_ts <= ?");
+    match expiry_constraint {
+        ReleaseReservationExpiryConstraint::Any => {}
+        ReleaseReservationExpiryConstraint::OnOrBefore(_) => {
+            release_sql.push_str(" AND expires_ts <= ?");
+        }
+        ReleaseReservationExpiryConstraint::Exact(_) => {
+            release_sql.push_str(" AND expires_ts = ?");
+        }
     }
     release_sql.push_str(" LIMIT 1) RETURNING reservation_id");
 
     for id in ids {
         let released_ts = release_marker;
-        let mut release_params =
-            Vec::with_capacity(if expires_at_or_before.is_some() { 4 } else { 3 });
+        let mut release_params = Vec::with_capacity(match expiry_constraint {
+            ReleaseReservationExpiryConstraint::Any => 3,
+            ReleaseReservationExpiryConstraint::OnOrBefore(_)
+            | ReleaseReservationExpiryConstraint::Exact(_) => 4,
+        });
         release_params.push(Value::BigInt(*id));
         release_params.push(Value::BigInt(released_ts));
         release_params.push(Value::BigInt(*id));
-        if let Some(expiry_cutoff) = expires_at_or_before {
-            release_params.push(Value::BigInt(expiry_cutoff));
+        match expiry_constraint {
+            ReleaseReservationExpiryConstraint::Any => {}
+            ReleaseReservationExpiryConstraint::OnOrBefore(expiry_cutoff)
+            | ReleaseReservationExpiryConstraint::Exact(expiry_cutoff) => {
+                release_params.push(Value::BigInt(expiry_cutoff));
+            }
         }
         let rows = try_in_tx!(
             cx,
@@ -6867,11 +6904,10 @@ pub async fn get_product_by_uid(
     }
 }
 
-/// List projects linked to a product.
 /// Force-release a single file reservation by ID regardless of owner.
 ///
 /// If `expected_expires_ts` is provided, the release is only performed if the
-/// current `expires_ts` matches exactly (prevents concurrent renewal races).
+/// current `expires_ts` matches exactly (prevents concurrent update races).
 ///
 /// Returns the number of rows affected (0 if already released, not found, or mismatch).
 pub async fn force_release_reservation(
@@ -6880,11 +6916,15 @@ pub async fn force_release_reservation(
     reservation_id: i64,
     expected_expires_ts: Option<i64>,
 ) -> Outcome<usize, DbError> {
-    match release_reservations_by_ids_matching_expiry(
+    let expiry_constraint = expected_expires_ts
+        .map_or(ReleaseReservationExpiryConstraint::Any, |expires_ts| {
+            ReleaseReservationExpiryConstraint::Exact(expires_ts)
+        });
+    match release_reservations_by_ids_with_expiry_constraint(
         cx,
         pool,
         &[reservation_id],
-        expected_expires_ts,
+        expiry_constraint,
     )
     .await
     {
@@ -9208,6 +9248,101 @@ mod tests {
             assert_eq!(active.len(), 1);
             assert_eq!(active[0].id, Some(reservation_id));
             assert!(active[0].released_ts.is_none());
+        });
+    }
+
+    #[test]
+    fn force_release_reservation_requires_exact_expiry_match() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("force_release_exact_expiry.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-force-release-exact-expiry-{base}"),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let agent = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("holder"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("register agent");
+            let agent_id = agent.id.expect("agent id");
+
+            let created = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                agent_id,
+                &["src/main.rs"],
+                3600,
+                true,
+                "test",
+            )
+            .await
+            .into_result()
+            .expect("create reservation");
+            let reservation_id = created[0].id.expect("reservation id");
+            let original_expires = created[0].expires_ts;
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire connection");
+            let tracked = tracked(&*conn);
+            let changed_params = [
+                Value::BigInt(original_expires.saturating_sub(1)),
+                Value::BigInt(reservation_id),
+            ];
+            map_sql_outcome(
+                traw_execute(
+                    &cx,
+                    &tracked,
+                    "UPDATE file_reservations SET expires_ts = ? WHERE id = ?",
+                    &changed_params,
+                )
+                .await,
+            )
+            .into_result()
+            .expect("change reservation expiry");
+            drop(conn);
+
+            let released =
+                force_release_reservation(&cx, &pool, reservation_id, Some(original_expires))
+                    .await
+                    .into_result()
+                    .expect("force release with exact expiry guard");
+            assert_eq!(
+                released, 0,
+                "force release must fail when expires_ts changed, even if it stayed earlier"
+            );
+
+            let active = list_file_reservations(&cx, &pool, project_id, true)
+                .await
+                .into_result()
+                .expect("list active reservations");
+            assert_eq!(active.len(), 1);
+            assert_eq!(active[0].id, Some(reservation_id));
+            assert!(active[0].released_ts.is_none());
+            assert_eq!(active[0].expires_ts, original_expires.saturating_sub(1));
         });
     }
 

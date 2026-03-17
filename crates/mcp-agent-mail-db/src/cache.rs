@@ -1268,13 +1268,16 @@ mod tests {
             )
         };
         let mut by_human_key = cache.projects_by_human_key.write();
-        let shared_from_human_key = &by_human_key
-            .get(&human_key)
-            .expect("project cached by human key")
-            .value;
+        let shared_from_human_key = Arc::clone(
+            &by_human_key
+                .get(&human_key)
+                .expect("project cached by human key")
+                .value,
+        );
+        drop(by_human_key);
 
         assert!(
-            Arc::ptr_eq(&shared_from_slug, shared_from_human_key),
+            Arc::ptr_eq(&shared_from_slug, &shared_from_human_key),
             "project dual indexes should share the same backing allocation"
         );
     }
@@ -1294,10 +1297,11 @@ mod tests {
             Arc::clone(&by_key.get(&key).expect("agent cached by key").value)
         };
         let mut by_id = cache.agents_by_id.write();
-        let shared_from_id = &by_id.get(&id_key).expect("agent cached by id").value;
+        let shared_from_id = Arc::clone(&by_id.get(&id_key).expect("agent cached by id").value);
+        drop(by_id);
 
         assert!(
-            Arc::ptr_eq(&shared_from_key, shared_from_id),
+            Arc::ptr_eq(&shared_from_key, &shared_from_id),
             "agent dual indexes should share the same backing allocation"
         );
     }

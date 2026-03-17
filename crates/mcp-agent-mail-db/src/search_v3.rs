@@ -487,6 +487,8 @@ fn upsert_indexable_message(
 }
 
 fn refresh_index_health_metrics(bridge: &TantivyBridge) {
+    static LAST_MEASURED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
     let doc_count = bridge
         .index()
         .reader()
@@ -494,7 +496,6 @@ fn refresh_index_health_metrics(bridge: &TantivyBridge) {
 
     // Only perform the expensive recursive filesystem scan occasionally
     // to avoid blocking the synchronous message send path.
-    static LAST_MEASURED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
     let now = current_unix_micros();
     let last = LAST_MEASURED.load(std::sync::atomic::Ordering::Relaxed);
 
