@@ -253,6 +253,28 @@ pub struct Config {
     pub tui_toast_error_dismiss_secs: u64,
     /// Enable one-shot contextual coach hints on first screen visit.
     pub tui_coach_hints_enabled: bool,
+
+    // ATC (Air Traffic Controller) — proactive agent coordination
+    /// Master switch for the ATC engine.
+    pub atc_enabled: bool,
+    /// Health probe interval in seconds.
+    pub atc_probe_interval_secs: u64,
+    /// Minimum interval between advisories to the same agent (seconds).
+    pub atc_advisory_cooldown_secs: u64,
+    /// Session summary posting interval (seconds).
+    pub atc_summary_interval_secs: u64,
+    /// Consecutive correct predictions required to exit safe mode.
+    pub atc_safe_mode_recovery_count: u64,
+    /// E-process martingale alert threshold (default 20.0 ≈ 5% significance).
+    pub atc_eprocess_threshold: f64,
+    /// CUSUM detection threshold.
+    pub atc_cusum_threshold: f64,
+    /// CUSUM minimum shift magnitude to detect.
+    pub atc_cusum_delta: f64,
+    /// Evidence ledger ring buffer capacity.
+    pub atc_ledger_capacity: usize,
+    /// Suspicion k-factor for rhythm-based liveness detection.
+    pub atc_suspicion_k: f64,
 }
 
 /// Application environment
@@ -880,8 +902,7 @@ impl Default for Config {
             tui_ambient: "subtle".to_string(),
             tui_debug: false,
             export_dir: resolve_data_path(
-                &dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from(".")),
+                &dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")),
                 "exports",
             ),
             tui_tree_style: "rounded".to_string(),
@@ -894,6 +915,16 @@ impl Default for Config {
             tui_toast_warn_dismiss_secs: 8,
             tui_toast_error_dismiss_secs: 15,
             tui_coach_hints_enabled: true,
+            atc_enabled: true,
+            atc_probe_interval_secs: 120,
+            atc_advisory_cooldown_secs: 300,
+            atc_summary_interval_secs: 300,
+            atc_safe_mode_recovery_count: 20,
+            atc_eprocess_threshold: 20.0,
+            atc_cusum_threshold: 5.0,
+            atc_cusum_delta: 0.1,
+            atc_ledger_capacity: 1000,
+            atc_suspicion_k: 3.0,
         }
     }
 }
@@ -1569,6 +1600,56 @@ impl Config {
         .max(1);
         config.tui_coach_hints_enabled =
             console_bool("AM_TUI_COACH_HINTS_ENABLED", config.tui_coach_hints_enabled);
+
+        // ATC (Air Traffic Controller) configuration
+        config.atc_enabled = console_bool("AM_ATC_ENABLED", config.atc_enabled);
+        config.atc_probe_interval_secs =
+            console_u64("AM_ATC_PROBE_INTERVAL_SECS", config.atc_probe_interval_secs).max(5);
+        config.atc_advisory_cooldown_secs = console_u64(
+            "AM_ATC_ADVISORY_COOLDOWN_SECS",
+            config.atc_advisory_cooldown_secs,
+        )
+        .max(10);
+        config.atc_summary_interval_secs = console_u64(
+            "AM_ATC_SUMMARY_INTERVAL_SECS",
+            config.atc_summary_interval_secs,
+        )
+        .max(10);
+        config.atc_safe_mode_recovery_count = console_u64(
+            "AM_ATC_SAFE_MODE_RECOVERY_COUNT",
+            config.atc_safe_mode_recovery_count,
+        )
+        .max(1);
+        if let Some(v) = console_value("AM_ATC_EPROCESS_THRESHOLD")
+            && let Ok(f) = v.trim().parse::<f64>()
+            && f > 0.0
+        {
+            config.atc_eprocess_threshold = f;
+        }
+        if let Some(v) = console_value("AM_ATC_CUSUM_THRESHOLD")
+            && let Ok(f) = v.trim().parse::<f64>()
+            && f > 0.0
+        {
+            config.atc_cusum_threshold = f;
+        }
+        if let Some(v) = console_value("AM_ATC_CUSUM_DELTA")
+            && let Ok(f) = v.trim().parse::<f64>()
+            && f > 0.0
+        {
+            config.atc_cusum_delta = f;
+        }
+        config.atc_ledger_capacity = usize::try_from(console_u64(
+            "AM_ATC_LEDGER_CAPACITY",
+            config.atc_ledger_capacity as u64,
+        ))
+        .unwrap_or(config.atc_ledger_capacity)
+        .max(10);
+        if let Some(v) = console_value("AM_ATC_SUSPICION_K")
+            && let Ok(f) = v.trim().parse::<f64>()
+            && f > 0.0
+        {
+            config.atc_suspicion_k = f;
+        }
 
         config
     }
