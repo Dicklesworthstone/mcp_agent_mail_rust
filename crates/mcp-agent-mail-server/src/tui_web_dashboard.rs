@@ -22,9 +22,9 @@
 //! Target: < 500µs capture for 200×50 grids, < 1µs serve.
 
 use std::fmt::Write as _;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use ftui::render::buffer::Buffer;
 use mcp_agent_mail_core::now_micros;
@@ -65,7 +65,9 @@ struct FrameState {
 
 impl Default for FrameState {
     fn default() -> Self {
-        let empty: Arc<str> = Arc::from(r#"{"mode":"snapshot","seq":0,"cols":0,"rows":0,"screen_id":0,"timestamp_us":0,"cells":""}"#);
+        let empty: Arc<str> = Arc::from(
+            r#"{"mode":"snapshot","seq":0,"cols":0,"rows":0,"screen_id":0,"timestamp_us":0,"cells":""}"#,
+        );
         Self {
             prev_bytes: Vec::new(),
             curr_bytes: Vec::new(),
@@ -139,28 +141,27 @@ impl WebDashboardFrameStore {
         // We extract fields individually because the Cell's alignment padding
         // makes a raw memcpy incorrect (padding bytes are undefined).
         for cell in cells {
-            guard.curr_bytes.extend_from_slice(&cell.content.raw().to_le_bytes());
-            guard.curr_bytes.extend_from_slice(&cell.fg.0.to_le_bytes());
-            guard.curr_bytes.extend_from_slice(&cell.bg.0.to_le_bytes());
-            guard.curr_bytes.extend_from_slice(&cell_attrs_raw(&cell.attrs).to_le_bytes());
+            new_curr.extend_from_slice(&cell.content.raw().to_le_bytes());
+            new_curr.extend_from_slice(&cell.fg.0.to_le_bytes());
+            new_curr.extend_from_slice(&cell.bg.0.to_le_bytes());
+            new_curr.extend_from_slice(&cell_attrs_raw(&cell.attrs).to_le_bytes());
         }
 
         // ── Build snapshot response (base64-encoded raw bytes) ──────
-        let b64_len = (guard.curr_bytes.len() + 2) / 3 * 4;
+        let b64_len = (new_curr.len() + 2) / 3 * 4;
         // Pre-size: ~130 chars header + b64 + ~2 chars footer
         let mut snap = String::with_capacity(140 + b64_len);
         write!(
             snap,
             r#"{{"mode":"snapshot","seq":{new_seq},"cols":{cols},"rows":{rows},"screen_id":{screen_id},"timestamp_us":{ts},"cells":""#
         ).unwrap();
-        base64_encode_into(&guard.curr_bytes, &mut snap);
+        base64_encode_into(&new_curr, &mut snap);
         snap.push_str("\"}");
         guard.cached_snapshot = Arc::from(snap.as_str());
 
         // ── Build delta response (only changed cell indices) ────────
-        let same_dims = guard.prev_bytes.len() == guard.curr_bytes.len()
-            && guard.cols == cols
-            && guard.rows == rows;
+        let same_dims =
+            guard.prev_bytes.len() == new_curr.len() && guard.cols == cols && guard.rows == rows;
 
         if same_dims {
             // Compare 16-byte chunks, collect indices of changed cells.
@@ -171,19 +172,38 @@ impl WebDashboardFrameStore {
             ).unwrap();
             let mut first = true;
             let prev = &guard.prev_bytes;
-            let curr = &guard.curr_bytes;
             for i in 0..n_cells {
                 let off = i * 16;
-                if prev[off..off + 16] != curr[off..off + 16] {
+                if prev[off..off + 16] != new_curr[off..off + 16] {
                     if !first {
                         delta.push(',');
                     }
                     first = false;
                     // Emit: [idx, content, fg, bg, attrs]
-                    let c = u32::from_le_bytes([curr[off], curr[off+1], curr[off+2], curr[off+3]]);
-                    let f = u32::from_le_bytes([curr[off+4], curr[off+5], curr[off+6], curr[off+7]]);
-                    let b = u32::from_le_bytes([curr[off+8], curr[off+9], curr[off+10], curr[off+11]]);
-                    let a = u32::from_le_bytes([curr[off+12], curr[off+13], curr[off+14], curr[off+15]]);
+                    let c = u32::from_le_bytes([
+                        new_curr[off],
+                        new_curr[off + 1],
+                        new_curr[off + 2],
+                        new_curr[off + 3],
+                    ]);
+                    let f = u32::from_le_bytes([
+                        new_curr[off + 4],
+                        new_curr[off + 5],
+                        new_curr[off + 6],
+                        new_curr[off + 7],
+                    ]);
+                    let b = u32::from_le_bytes([
+                        new_curr[off + 8],
+                        new_curr[off + 9],
+                        new_curr[off + 10],
+                        new_curr[off + 11],
+                    ]);
+                    let a = u32::from_le_bytes([
+                        new_curr[off + 12],
+                        new_curr[off + 13],
+                        new_curr[off + 14],
+                        new_curr[off + 15],
+                    ]);
                     write!(delta, "[{i},{c},{f},{b},{a}]").unwrap();
                 }
             }
@@ -194,6 +214,7 @@ impl WebDashboardFrameStore {
             guard.cached_delta = Arc::clone(&guard.cached_snapshot);
         }
 
+        guard.curr_bytes = new_curr;
         guard.cols = cols;
         guard.rows = rows;
         guard.screen_id = screen_id;
@@ -208,7 +229,8 @@ impl WebDashboardFrameStore {
     /// Get the pre-serialized snapshot response (zero-copy Arc<str>).
     pub fn cached_snapshot(&self) -> Arc<str> {
         Arc::clone(
-            &self.state
+            &self
+                .state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .cached_snapshot,
@@ -218,7 +240,8 @@ impl WebDashboardFrameStore {
     /// Get the pre-serialized delta response (zero-copy Arc<str>).
     pub fn cached_delta(&self) -> Arc<str> {
         Arc::clone(
-            &self.state
+            &self
+                .state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .cached_delta,
@@ -297,12 +320,16 @@ pub fn handle_state(state: &TuiSharedState, query: Option<&str>) -> String {
         if since >= current_seq {
             return unchanged_response(current_seq);
         }
-        // Client has an older frame — send delta (changed cells only).
-        // The delta was pre-computed at capture time.
-        return store.cached_delta().to_string();
+        // Delta is only valid for exactly the previous frame (seq - 1).
+        // If the client missed more than one frame, send a full snapshot
+        // so it doesn't render stale cells from the missed intermediate frames.
+        if since + 1 >= current_seq {
+            return store.cached_delta().to_string();
+        }
+        // Client is too far behind — fall through to full snapshot.
     }
 
-    // No since param — send full snapshot.
+    // No since param or client too far behind — send full snapshot.
     store.cached_snapshot().to_string()
 }
 
@@ -488,8 +515,10 @@ function renderSnapshot(data) {
 
 function applyDelta(data) {
   if (!cellBuf || data.cols !== lastCols || data.rows !== lastRows) {
-    // Dimensions mismatch or no previous frame — need full snapshot.
-    renderSnapshot(data);
+    // Dimensions mismatch or no previous frame — request full snapshot
+    // on the next poll by resetting lastSeq.  (Cannot call renderSnapshot
+    // here because delta payloads don't carry the base64 cells field.)
+    lastSeq = 0;
     return;
   }
   const changed = data.changed; // array of [idx, content, fg, bg, attrs]
@@ -607,7 +636,9 @@ mod tests {
         assert!(!encoded.is_empty());
         assert!(encoded.len() <= (input.len() + 2) / 3 * 4);
         // Verify all chars are valid base64.
-        assert!(encoded.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/'));
+        assert!(encoded
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/'));
     }
 
     #[test]

@@ -16,10 +16,10 @@
 //! are built on top of these two primitives.
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TWO_POW_32_F64: f64 = 4_294_967_296.0;
 const MICROS_PER_SECOND_F64: f64 = 1_000_000.0;
@@ -46,6 +46,10 @@ fn micros_f64_to_i64(value: f64) -> i64 {
     let seconds = value / MICROS_PER_SECOND_F64;
     let micros = Duration::from_secs_f64(seconds).as_micros();
     i64::try_from(micros).unwrap_or(i64::MAX)
+}
+
+fn elapsed_micros(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_micros().min(u128::from(u64::MAX))).unwrap_or(u64::MAX)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -141,7 +145,7 @@ impl<S: AtcState, A: AtcAction> DecisionCore<S, A> {
     }
 
     #[inline]
-    fn state_count(&self) -> usize {
+    const fn state_count(&self) -> usize {
         self.posterior.len()
     }
 
@@ -1493,6 +1497,17 @@ pub struct AgentLivenessEntry {
     /// Per-agent decision core (shares loss matrix structure but
     /// maintains its own posterior).
     pub core: DecisionCore<LivenessState, LivenessAction>,
+    /// Monotonic schedule version for stale-heap suppression.
+    pub schedule_version: u64,
+    /// When this agent should next be reevaluated.
+    pub next_review_micros: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ScheduledAgentReview {
+    review_at_micros: i64,
+    schedule_version: u64,
+    agent: String,
 }
 
 /// Infer a reasonable inter-activity prior from program name.
@@ -2804,6 +2819,398 @@ impl Default for AtcConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub enum AtcBudgetMode {
+    #[default]
+    Nominal,
+    Pressure,
+    Conservative,
+}
+
+impl AtcBudgetMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Nominal => "nominal",
+            Self::Pressure => "pressure",
+            Self::Conservative => "conservative",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct AtcStageTimings {
+    pub liveness_micros: u64,
+    pub deadlock_micros: u64,
+    pub probe_micros: u64,
+    pub gating_micros: u64,
+    pub slow_control_micros: u64,
+    pub summary_micros: u64,
+    pub total_micros: u64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct AtcKernelTelemetry {
+    pub due_agents: usize,
+    pub scheduled_agents: usize,
+    pub dirty_agents: usize,
+    pub dirty_projects: usize,
+    pub deadlock_cache_hits: u64,
+    pub deadlock_cache_misses: u64,
+    pub deadlock_cache_hit_rate: f64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct AtcBudgetTelemetry {
+    pub mode: String,
+    pub tick_budget_micros: u64,
+    pub probe_budget_micros: u64,
+    pub estimated_probe_cost_micros: u64,
+    pub max_probes_this_tick: usize,
+    pub utilization_ratio: f64,
+    pub slow_window_utilization: f64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct AtcPolicyTelemetry {
+    pub incumbent_policy_id: String,
+    pub candidate_policy_id: Option<String>,
+    pub shadow_enabled: bool,
+    pub shadow_disagreements: u64,
+    pub shadow_regret_avg: f64,
+    pub fallback_active: bool,
+    pub fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AtcLivenessPolicyArtifact {
+    policy_id: String,
+    decision_alpha: f64,
+    suspicion_k: f64,
+    max_probes_per_tick: usize,
+    probe_recency_decay_secs: f64,
+    probe_gain_floor: f64,
+    probe_budget_fraction: f64,
+    conservative_probe_budget_fraction: f64,
+    release_guard_enabled: bool,
+    losses: [[f64; 3]; 3],
+}
+
+impl AtcLivenessPolicyArtifact {
+    #[must_use]
+    fn from_core(policy_id: String, core: &DecisionCore<LivenessState, LivenessAction>, base_k: f64) -> Self {
+        let mut losses = [[0.0; 3]; 3];
+        for (action_idx, action) in [
+            LivenessAction::DeclareAlive,
+            LivenessAction::Suspect,
+            LivenessAction::ReleaseReservations,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (state_idx, state) in [
+                LivenessState::Alive,
+                LivenessState::Flaky,
+                LivenessState::Dead,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                losses[action_idx][state_idx] = core.loss_entry(action, state);
+            }
+        }
+        Self {
+            policy_id,
+            decision_alpha: core.alpha,
+            suspicion_k: base_k,
+            max_probes_per_tick: 3,
+            probe_recency_decay_secs: 60.0,
+            probe_gain_floor: 0.01,
+            probe_budget_fraction: 0.55,
+            conservative_probe_budget_fraction: 0.25,
+            release_guard_enabled: true,
+            losses,
+        }
+    }
+
+    #[must_use]
+    fn candidate_from_incumbent(incumbent: &Self) -> Self {
+        let mut candidate = incumbent.clone();
+        candidate.policy_id = "liveness-shadow-cautious-v1".to_string();
+        candidate.suspicion_k += 0.35;
+        candidate.max_probes_per_tick = candidate.max_probes_per_tick.saturating_sub(1).max(1);
+        candidate.probe_recency_decay_secs = 45.0;
+        candidate.probe_gain_floor = 0.02;
+        candidate.probe_budget_fraction = 0.35;
+        candidate.conservative_probe_budget_fraction = 0.18;
+        candidate.losses[2][0] *= 1.15;
+        candidate.losses[2][1] *= 1.35;
+        candidate.losses[1][2] *= 0.9;
+        candidate
+    }
+
+    #[must_use]
+    fn max_probes(&self, mode: AtcBudgetMode) -> usize {
+        match mode {
+            AtcBudgetMode::Nominal => self.max_probes_per_tick,
+            AtcBudgetMode::Pressure => self.max_probes_per_tick.min(2),
+            AtcBudgetMode::Conservative => self.max_probes_per_tick.min(1),
+        }
+    }
+
+    #[must_use]
+    fn probe_budget_fraction(&self, mode: AtcBudgetMode) -> f64 {
+        match mode {
+            AtcBudgetMode::Nominal => self.probe_budget_fraction,
+            AtcBudgetMode::Pressure => (self.probe_budget_fraction * 0.75).clamp(0.05, 1.0),
+            AtcBudgetMode::Conservative => self.conservative_probe_budget_fraction,
+        }
+    }
+
+    #[must_use]
+    fn expected_loss(&self, action: LivenessAction, posterior: &[(LivenessState, f64)]) -> f64 {
+        let action_idx = match action {
+            LivenessAction::DeclareAlive => 0,
+            LivenessAction::Suspect => 1,
+            LivenessAction::ReleaseReservations => 2,
+        };
+        posterior.iter().fold(0.0, |acc, (state, probability)| {
+            let state_idx = match state {
+                LivenessState::Alive => 0,
+                LivenessState::Flaky => 1,
+                LivenessState::Dead => 2,
+            };
+            acc + (*probability * self.losses[action_idx][state_idx])
+        })
+    }
+
+    #[must_use]
+    fn choose_action(
+        &self,
+        posterior: &[(LivenessState, f64)],
+        release_guard_active: bool,
+    ) -> (LivenessAction, f64, f64) {
+        let mut best_action = LivenessAction::DeclareAlive;
+        let mut best_loss = f64::INFINITY;
+        let mut runner_up = f64::INFINITY;
+        for action in [
+            LivenessAction::DeclareAlive,
+            LivenessAction::Suspect,
+            LivenessAction::ReleaseReservations,
+        ] {
+            if release_guard_active
+                && self.release_guard_enabled
+                && action == LivenessAction::ReleaseReservations
+            {
+                continue;
+            }
+            let expected_loss = self.expected_loss(action, posterior);
+            if expected_loss < best_loss {
+                runner_up = best_loss;
+                best_loss = expected_loss;
+                best_action = action;
+            } else if expected_loss < runner_up {
+                runner_up = expected_loss;
+            }
+        }
+        (best_action, best_loss, runner_up)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct DeadlockCacheEntry {
+    generation: u64,
+    cycles: Vec<Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+struct AtcCostModel {
+    liveness_avg_micros: f64,
+    deadlock_avg_micros: f64,
+    gating_avg_micros: f64,
+    summary_avg_micros: f64,
+    per_probe_avg_micros: f64,
+    alpha: f64,
+}
+
+impl Default for AtcCostModel {
+    fn default() -> Self {
+        Self {
+            liveness_avg_micros: 300.0,
+            deadlock_avg_micros: 200.0,
+            gating_avg_micros: 80.0,
+            summary_avg_micros: 120.0,
+            per_probe_avg_micros: 120.0,
+            alpha: 0.2,
+        }
+    }
+}
+
+impl AtcCostModel {
+    fn update(&mut self, timings: &AtcStageTimings, probes_selected: usize) {
+        self.liveness_avg_micros = self
+            .alpha
+            .mul_add(u64_to_f64(timings.liveness_micros), (1.0 - self.alpha) * self.liveness_avg_micros);
+        self.deadlock_avg_micros = self
+            .alpha
+            .mul_add(u64_to_f64(timings.deadlock_micros), (1.0 - self.alpha) * self.deadlock_avg_micros);
+        self.gating_avg_micros = self
+            .alpha
+            .mul_add(u64_to_f64(timings.gating_micros), (1.0 - self.alpha) * self.gating_avg_micros);
+        self.summary_avg_micros = self
+            .alpha
+            .mul_add(u64_to_f64(timings.summary_micros), (1.0 - self.alpha) * self.summary_avg_micros);
+        if probes_selected > 0 {
+            let per_probe = u64_to_f64(timings.probe_micros) / usize_to_f64(probes_selected);
+            self.per_probe_avg_micros =
+                self.alpha.mul_add(per_probe.max(1.0), (1.0 - self.alpha) * self.per_probe_avg_micros);
+        }
+    }
+
+    #[must_use]
+    fn estimated_non_probe_micros(&self) -> u64 {
+        micros_f64_to_i64(
+            self.liveness_avg_micros + self.deadlock_avg_micros + self.gating_avg_micros,
+        )
+        .max(0)
+        .try_into()
+        .unwrap_or(u64::MAX)
+    }
+
+    #[must_use]
+    fn estimated_probe_cost_micros(&self) -> u64 {
+        micros_f64_to_i64(self.per_probe_avg_micros.max(1.0))
+            .max(1)
+            .try_into()
+            .unwrap_or(1)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AtcSlowControllerState {
+    mode: AtcBudgetMode,
+    probe_limit: usize,
+    window_tick_count: u64,
+    window_total_utilization: f64,
+    window_budget_exceeded: u64,
+    adaptation_interval_ticks: u64,
+}
+
+impl Default for AtcSlowControllerState {
+    fn default() -> Self {
+        Self {
+            mode: AtcBudgetMode::Nominal,
+            probe_limit: 3,
+            window_tick_count: 0,
+            window_total_utilization: 0.0,
+            window_budget_exceeded: 0,
+            adaptation_interval_ticks: 16,
+        }
+    }
+}
+
+impl AtcSlowControllerState {
+    fn note_tick(&mut self, utilization_ratio: f64, budget_exceeded: bool, baseline_probe_limit: usize) {
+        self.window_tick_count = self.window_tick_count.saturating_add(1);
+        self.window_total_utilization += utilization_ratio;
+        if budget_exceeded {
+            self.window_budget_exceeded = self.window_budget_exceeded.saturating_add(1);
+        }
+        if self.window_tick_count < self.adaptation_interval_ticks {
+            return;
+        }
+
+        let average_utilization = self.window_total_utilization / u64_to_f64(self.window_tick_count);
+        if self.window_budget_exceeded > 0 || average_utilization > 0.9 {
+            self.mode = AtcBudgetMode::Conservative;
+            self.probe_limit = self.probe_limit.saturating_sub(1).max(1);
+        } else if average_utilization > 0.75 {
+            self.mode = AtcBudgetMode::Pressure;
+            self.probe_limit = self.probe_limit.min(baseline_probe_limit.max(1));
+        } else {
+            self.mode = AtcBudgetMode::Nominal;
+            self.probe_limit = (self.probe_limit + 1).min(baseline_probe_limit.max(1));
+        }
+
+        self.window_tick_count = 0;
+        self.window_total_utilization = 0.0;
+        self.window_budget_exceeded = 0;
+    }
+
+    #[must_use]
+    fn average_window_utilization(&self) -> f64 {
+        if self.window_tick_count == 0 {
+            0.0
+        } else {
+            self.window_total_utilization / u64_to_f64(self.window_tick_count)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AtcShadowPolicyState {
+    candidate: Option<AtcLivenessPolicyArtifact>,
+    disagreements: u64,
+    evaluations: u64,
+    total_estimated_regret: f64,
+    recent_estimated_regret: VecDeque<f64>,
+}
+
+impl Default for AtcShadowPolicyState {
+    fn default() -> Self {
+        Self {
+            candidate: None,
+            disagreements: 0,
+            evaluations: 0,
+            total_estimated_regret: 0.0,
+            recent_estimated_regret: VecDeque::with_capacity(64),
+        }
+    }
+}
+
+impl AtcShadowPolicyState {
+    fn record_decision_pair(
+        &mut self,
+        incumbent_action: LivenessAction,
+        candidate_action: LivenessAction,
+        incumbent_loss: f64,
+        candidate_loss: f64,
+    ) {
+        self.evaluations = self.evaluations.saturating_add(1);
+        if incumbent_action != candidate_action {
+            self.disagreements = self.disagreements.saturating_add(1);
+        }
+        let estimated_regret = (incumbent_loss - candidate_loss).max(0.0);
+        self.total_estimated_regret += estimated_regret;
+        if self.recent_estimated_regret.len() >= 64 {
+            self.recent_estimated_regret.pop_front();
+        }
+        self.recent_estimated_regret.push_back(estimated_regret);
+    }
+
+    fn record_probe_disagreement(&mut self, incumbent_agents: &[String], candidate_agents: &[String]) {
+        self.evaluations = self.evaluations.saturating_add(1);
+        if incumbent_agents != candidate_agents {
+            self.disagreements = self.disagreements.saturating_add(1);
+        }
+    }
+
+    #[must_use]
+    fn average_regret(&self) -> f64 {
+        if self.evaluations == 0 {
+            0.0
+        } else {
+            self.total_estimated_regret / u64_to_f64(self.evaluations)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AtcTickReport {
+    pub actions: Vec<AtcTickAction>,
+    pub summary: AtcSummarySnapshot,
+}
+
 /// Top-level ATC engine that orchestrates all subsystems.
 #[derive(Debug)]
 pub struct AtcEngine {
@@ -2819,8 +3226,22 @@ pub struct AtcEngine {
     conflict_core: DecisionCore<ConflictState, ConflictAction>,
     /// Per-agent liveness tracking.
     agents: HashMap<String, AgentLivenessEntry>,
+    /// Incremental liveness review schedule.
+    liveness_schedule: BinaryHeap<Reverse<ScheduledAgentReview>>,
+    /// Agents that must be reevaluated immediately due to policy changes.
+    dirty_agents: HashSet<String>,
     /// Per-project conflict graphs.
     conflict_graphs: HashMap<String, ProjectConflictGraph>,
+    /// Projects whose conflict state has changed since the last cached render.
+    dirty_projects: HashSet<String>,
+    /// Cached deadlock SCCs by project.
+    deadlock_cache: HashMap<String, DeadlockCacheEntry>,
+    /// Total number of currently cached deadlock cycles across all projects.
+    deadlock_cycle_total: usize,
+    /// Cumulative cache hits for deadlock reuse.
+    deadlock_cache_hits: u64,
+    /// Cumulative cache misses for deadlock reuse.
+    deadlock_cache_misses: u64,
     /// Calibration guard (safe mode policy).
     calibration: CalibrationGuard,
     /// E-process martingale monitor.
@@ -2831,11 +3252,35 @@ pub struct AtcEngine {
     regret: RegretTracker,
     /// Evidence ledger.
     ledger: EvidenceLedger,
+    /// Incremental stage cost model for budget-aware probe selection.
+    cost_model: AtcCostModel,
+    /// Slow controller that adapts probe pressure on a coarser timescale.
+    slow_controller: AtcSlowControllerState,
+    /// Policy-as-data artifact for live liveness decisions.
+    incumbent_policy: AtcLivenessPolicyArtifact,
+    /// Shadow-mode candidate policy.
+    shadow_policy: AtcShadowPolicyState,
+    /// Monotonic policy revision for operator visibility.
+    policy_revision: u64,
+    /// Most recent stage timings emitted by the kernel.
+    last_stage_timings: AtcStageTimings,
+    /// Most recent kernel telemetry snapshot.
+    last_kernel_telemetry: AtcKernelTelemetry,
+    /// Most recent budget telemetry snapshot.
+    last_budget_telemetry: AtcBudgetTelemetry,
+    /// Most recent policy telemetry snapshot.
+    last_policy_telemetry: AtcPolicyTelemetry,
     /// Last processed event sequence number (incremental computation).
     #[allow(dead_code)]
     last_event_seq: u64,
     /// Engine tick count.
     tick_count: u64,
+}
+
+#[derive(Debug, Default)]
+struct LivenessEvaluation {
+    due_agents: usize,
+    actions: Vec<(String, LivenessAction)>,
 }
 
 impl AtcEngine {
@@ -2857,19 +3302,50 @@ impl AtcEngine {
         let cusum = CusumDetector::new(0.15, config.cusum_threshold, config.cusum_delta);
         let regret = RegretTracker::new(100);
         let ledger = EvidenceLedger::new(config.ledger_capacity);
+        let liveness_core = default_liveness_core();
+        let incumbent_policy = AtcLivenessPolicyArtifact::from_core(
+            "liveness-incumbent-r1".to_string(),
+            &liveness_core,
+            config.suspicion_k,
+        );
+        let shadow_policy = AtcShadowPolicyState {
+            candidate: Some(AtcLivenessPolicyArtifact::candidate_from_incumbent(
+                &incumbent_policy,
+            )),
+            ..AtcShadowPolicyState::default()
+        };
 
         Self {
             config,
             registered: false,
-            liveness_core: default_liveness_core(),
+            liveness_core,
             conflict_core: default_conflict_core(),
             agents: HashMap::new(),
+            liveness_schedule: BinaryHeap::new(),
+            dirty_agents: HashSet::new(),
             conflict_graphs: HashMap::new(),
+            dirty_projects: HashSet::new(),
+            deadlock_cache: HashMap::new(),
+            deadlock_cycle_total: 0,
+            deadlock_cache_hits: 0,
+            deadlock_cache_misses: 0,
             calibration,
             eprocess,
             cusum,
             regret,
             ledger,
+            cost_model: AtcCostModel::default(),
+            slow_controller: AtcSlowControllerState {
+                probe_limit: incumbent_policy.max_probes_per_tick,
+                ..AtcSlowControllerState::default()
+            },
+            incumbent_policy,
+            shadow_policy,
+            policy_revision: 1,
+            last_stage_timings: AtcStageTimings::default(),
+            last_kernel_telemetry: AtcKernelTelemetry::default(),
+            last_budget_telemetry: AtcBudgetTelemetry::default(),
+            last_policy_telemetry: AtcPolicyTelemetry::default(),
             last_event_seq: 0,
             tick_count: 0,
         }
@@ -2945,9 +3421,199 @@ impl AtcEngine {
         self.agents.keys().map(String::as_str).collect()
     }
 
+    fn current_release_guard_reason(&self) -> Option<String> {
+        if self.calibration.is_safe_mode() {
+            Some("calibration_safe_mode".to_string())
+        } else if self.slow_controller.mode == AtcBudgetMode::Conservative {
+            Some("budget_pressure".to_string())
+        } else {
+            None
+        }
+    }
+
+    fn mark_agents_dirty(&mut self) {
+        self.dirty_agents.extend(self.agents.keys().cloned());
+    }
+
+    fn refresh_incumbent_policy_from_core(&mut self) {
+        self.policy_revision = self.policy_revision.saturating_add(1);
+        self.incumbent_policy = AtcLivenessPolicyArtifact::from_core(
+            format!("liveness-incumbent-r{}", self.policy_revision),
+            &self.liveness_core,
+            self.config.suspicion_k,
+        );
+        self.shadow_policy.candidate = Some(AtcLivenessPolicyArtifact::candidate_from_incumbent(
+            &self.incumbent_policy,
+        ));
+        self.slow_controller.probe_limit = self
+            .slow_controller
+            .probe_limit
+            .min(self.incumbent_policy.max_probes_per_tick.max(1));
+        self.mark_agents_dirty();
+    }
+
+    fn schedule_entry_for_push(
+        &mut self,
+        agent: &str,
+        review_at_micros: i64,
+    ) {
+        let Some(entry) = self.agents.get_mut(agent) else {
+            return;
+        };
+        entry.schedule_version = entry.schedule_version.saturating_add(1);
+        entry.next_review_micros = review_at_micros;
+        if review_at_micros < i64::MAX {
+            self.liveness_schedule.push(Reverse(ScheduledAgentReview {
+                review_at_micros,
+                schedule_version: entry.schedule_version,
+                agent: agent.to_string(),
+            }));
+        }
+    }
+
+    fn effective_threshold_for_agent(
+        &self,
+        agent_name: &str,
+        base_k: f64,
+        thresholds: Option<&HashMap<String, AdaptiveThreshold>>,
+        fallback_active: bool,
+    ) -> f64 {
+        let adaptive_k = thresholds
+            .and_then(|items| items.get(agent_name))
+            .map_or(base_k, AdaptiveThreshold::effective_k);
+        if fallback_active {
+            adaptive_k.max(base_k + 0.5)
+        } else {
+            adaptive_k
+        }
+    }
+
+    fn next_review_time_for_policy(
+        &self,
+        entry: &AgentLivenessEntry,
+        threshold_k: f64,
+        now_micros: i64,
+    ) -> i64 {
+        if entry.state == LivenessState::Dead || entry.rhythm.last_activity_ts <= 0 {
+            return i64::MAX;
+        }
+        let threshold = micros_f64_to_i64(entry.rhythm.suspicion_threshold(threshold_k).max(1.0))
+            .max(1);
+        let mut next_review = entry.rhythm.last_activity_ts.saturating_add(threshold);
+        if entry.state == LivenessState::Flaky {
+            next_review = next_review.min(
+                now_micros.saturating_add((self.config.probe_interval_micros / 2).max(250_000)),
+            );
+        }
+        if entry.probe_sent_at > 0 {
+            next_review = next_review.min(
+                entry
+                    .probe_sent_at
+                    .saturating_add((self.config.probe_interval_micros / 2).max(250_000)),
+            );
+        }
+        next_review
+    }
+
+    fn reschedule_agent(
+        &mut self,
+        agent: &str,
+        now_micros: i64,
+        thresholds: Option<&HashMap<String, AdaptiveThreshold>>,
+        fallback_active: bool,
+    ) {
+        let Some(entry) = self.agents.get(agent) else {
+            return;
+        };
+        let incumbent_k = self.effective_threshold_for_agent(
+            agent,
+            self.incumbent_policy.suspicion_k,
+            thresholds,
+            fallback_active,
+        );
+        let incumbent_review = self.next_review_time_for_policy(entry, incumbent_k, now_micros);
+        let candidate_review = self
+            .shadow_policy
+            .candidate
+            .as_ref()
+            .map_or(i64::MAX, |candidate| {
+                self.next_review_time_for_policy(entry, candidate.suspicion_k, now_micros)
+            });
+        self.schedule_entry_for_push(agent, incumbent_review.min(candidate_review));
+    }
+
+    fn pop_due_agents(&mut self, now_micros: i64) -> Vec<String> {
+        let mut due = Vec::new();
+        let mut seen = HashSet::new();
+        while let Some(Reverse(next)) = self.liveness_schedule.peek().cloned() {
+            if next.review_at_micros > now_micros {
+                break;
+            }
+            self.liveness_schedule.pop();
+            let Some(entry) = self.agents.get(&next.agent) else {
+                continue;
+            };
+            if entry.schedule_version != next.schedule_version
+                || entry.next_review_micros != next.review_at_micros
+            {
+                continue;
+            }
+            if seen.insert(next.agent.clone()) {
+                due.push(next.agent);
+            }
+        }
+        for agent in self.dirty_agents.drain() {
+            if seen.insert(agent.clone()) {
+                due.push(agent);
+            }
+        }
+        due
+    }
+
+    fn update_deadlock_cache_for_project(&mut self, project: &str) {
+        let Some(graph) = self.conflict_graphs.get(project) else {
+            self.deadlock_cache.remove(project);
+            return;
+        };
+        let should_recompute = self
+            .deadlock_cache
+            .get(project)
+            .is_none_or(|cached| cached.generation != graph.generation);
+        if should_recompute {
+            self.deadlock_cache_misses = self.deadlock_cache_misses.saturating_add(1);
+            let cycles = find_deadlock_cycles(graph);
+            self.deadlock_cache.insert(
+                project.to_string(),
+                DeadlockCacheEntry {
+                    generation: graph.generation,
+                    cycles,
+                },
+            );
+        } else {
+            self.deadlock_cache_hits = self.deadlock_cache_hits.saturating_add(1);
+        }
+    }
+
+    fn recompute_deadlock_totals(&mut self) {
+        self.deadlock_cycle_total = self
+            .deadlock_cache
+            .values()
+            .map(|entry| entry.cycles.len())
+            .sum();
+    }
+
+    fn budget_mode(&self) -> AtcBudgetMode {
+        if self.calibration.is_safe_mode() {
+            AtcBudgetMode::Conservative
+        } else {
+            self.slow_controller.mode
+        }
+    }
+
     /// Force safe mode on/off (operator override).
-    pub const fn set_safe_mode(&mut self, active: bool, timestamp_micros: i64) {
+    pub fn set_safe_mode(&mut self, active: bool, timestamp_micros: i64) {
         self.calibration.set_safe_mode(active, timestamp_micros);
+        self.mark_agents_dirty();
     }
 
     /// Check whether an event is from/to the ATC itself (self-exclusion).
@@ -2986,9 +3652,16 @@ impl AtcEngine {
                     probe_sent_at: 0,
                     sprt_log_lr: 0.0,
                     core: self.liveness_core.clone(),
+                    schedule_version: 0,
+                    next_review_micros: i64::MAX,
                 });
             }
         }
+        let thresholds_snapshot = ATC_THRESHOLDS
+            .get()
+            .and_then(|lock| lock.lock().ok().map(|guard| guard.clone()));
+        let fallback_active = self.current_release_guard_reason().is_some();
+        self.reschedule_agent(name, mcp_agent_mail_core::timestamps::now_micros(), thresholds_snapshot.as_ref(), fallback_active);
     }
 
     /// Process an agent activity signal (message, reservation, commit).
@@ -2996,6 +3669,7 @@ impl AtcEngine {
         if agent == ATC_AGENT_NAME {
             return;
         }
+        let mut resurrected = false;
         if let Some(entry) = self.agents.get_mut(agent) {
             entry.rhythm.observe(timestamp_micros);
             // Any activity resets to Alive (resurrection)
@@ -3004,7 +3678,21 @@ impl AtcEngine {
                 entry.suspect_since = 0;
                 entry.probe_sent_at = 0;
                 entry.sprt_log_lr = 0.0;
+                resurrected = true;
             }
+        }
+        let thresholds_snapshot = ATC_THRESHOLDS
+            .get()
+            .and_then(|lock| lock.lock().ok().map(|guard| guard.clone()));
+        let fallback_active = self.current_release_guard_reason().is_some();
+        self.reschedule_agent(
+            agent,
+            timestamp_micros,
+            thresholds_snapshot.as_ref(),
+            fallback_active,
+        );
+        if resurrected {
+            self.dirty_agents.insert(agent.to_string());
         }
     }
 
@@ -3013,93 +3701,192 @@ impl AtcEngine {
     /// Returns a list of `(agent_name, recommended_action)` tuples for agents
     /// that need intervention.
     #[must_use]
-    pub fn evaluate_liveness(&mut self, now_micros: i64) -> Vec<(String, LivenessAction)> {
-        let k = self.config.suspicion_k;
-        let mut actions = Vec::new();
-        let safe_mode = self.calibration.is_safe_mode();
-        let ledger = &mut self.ledger;
-        for entry in self.agents.values_mut() {
-            // Skip agents already declared dead
-            if entry.state == LivenessState::Dead {
-                continue;
-            }
+    pub fn evaluate_liveness(&mut self, now_micros: i64) -> LivenessEvaluation {
+        let thresholds_snapshot = ATC_THRESHOLDS
+            .get()
+            .and_then(|lock| lock.lock().ok().map(|guard| guard.clone()));
+        let fallback_active = self.current_release_guard_reason().is_some();
+        let incumbent_policy = self.incumbent_policy.clone();
+        let candidate_policy = self.shadow_policy.candidate.clone();
+        let due_agents = self.pop_due_agents(now_micros);
+        let mut evaluation = LivenessEvaluation {
+            due_agents: due_agents.len(),
+            ..LivenessEvaluation::default()
+        };
 
-            // Check if the agent is suspicious
-            if entry.rhythm.is_suspicious(now_micros, k) {
-                // Update posterior toward flaky/dead
-                let silence_ratio =
-                    nonnegative_i64_to_f64(entry.rhythm.silence_duration(now_micros))
+        for agent_name in due_agents {
+            let incumbent_k = self.effective_threshold_for_agent(
+                &agent_name,
+                incumbent_policy.suspicion_k,
+                thresholds_snapshot.as_ref(),
+                fallback_active,
+            );
+            let candidate_k = candidate_policy
+                .as_ref()
+                .map_or(incumbent_policy.suspicion_k, |candidate| candidate.suspicion_k);
+
+            let mut shadow_pair: Option<(LivenessAction, LivenessAction, f64, f64)> = None;
+            let mut decision_log: Option<(String, LivenessAction, f64, f64, String)> = None;
+            let mut action_to_emit: Option<(String, LivenessAction)> = None;
+
+            if let Some(entry) = self.agents.get_mut(&agent_name) {
+                if entry.state == LivenessState::Dead {
+                    entry.next_review_micros = i64::MAX;
+                    continue;
+                }
+
+                let incumbent_suspicious = entry.rhythm.is_suspicious(now_micros, incumbent_k);
+                let candidate_suspicious = entry.rhythm.is_suspicious(now_micros, candidate_k);
+                if incumbent_suspicious || candidate_suspicious {
+                    let silence_ratio = nonnegative_i64_to_f64(entry.rhythm.silence_duration(now_micros))
                         / entry.rhythm.effective_avg().max(1.0);
+                    let alive_lk = (-silence_ratio * 0.5).exp().max(0.01);
+                    let flaky_lk = (-silence_ratio * 0.1).exp().max(0.05);
+                    let dead_lk = 1.0 - alive_lk;
 
-                let alive_lk = (-silence_ratio * 0.5).exp().max(0.01);
-                let flaky_lk = (-silence_ratio * 0.1).exp().max(0.05);
-                let dead_lk = 1.0 - alive_lk;
+                    entry.core.update_posterior(&[
+                        (LivenessState::Alive, alive_lk),
+                        (LivenessState::Flaky, flaky_lk),
+                        (LivenessState::Dead, dead_lk),
+                    ]);
 
-                entry.core.update_posterior(&[
-                    (LivenessState::Alive, alive_lk),
-                    (LivenessState::Flaky, flaky_lk),
-                    (LivenessState::Dead, dead_lk),
-                ]);
-
-                let (chosen_action, expected_loss, runner_up) = entry.core.choose_action();
-                let action = if chosen_action == LivenessAction::ReleaseReservations && safe_mode {
-                    LivenessAction::Suspect
-                } else {
-                    chosen_action
-                };
-
-                // Only act if the action is different from DeclareAlive
-                if action != LivenessAction::DeclareAlive {
-                    // Log to evidence ledger
-                    let evidence_summary = format!(
-                        "silence {}s (avg {}s, {:.1}σ)",
-                        entry.rhythm.silence_duration(now_micros) / 1_000_000,
-                        micros_f64_to_i64(entry.rhythm.effective_avg()) / 1_000_000,
-                        silence_ratio,
-                    );
-                    ledger.record(&DecisionBuilder {
-                        subsystem: AtcSubsystem::Liveness,
-                        subject: &entry.name,
-                        core: &entry.core,
-                        action,
-                        expected_loss,
-                        runner_up_loss: runner_up,
-                        evidence_summary: &evidence_summary,
-                        calibration_healthy: !safe_mode,
-                        safe_mode_active: safe_mode,
-                        timestamp_micros: now_micros,
-                    });
-
-                    // Apply state transition
-                    match action {
-                        LivenessAction::Suspect => {
-                            if entry.state != LivenessState::Flaky {
-                                entry.state = LivenessState::Flaky;
-                                entry.suspect_since = now_micros;
+                    let (incumbent_action, incumbent_loss, runner_up_loss) = if incumbent_suspicious
+                    {
+                        incumbent_policy.choose_action(entry.core.posterior(), fallback_active)
+                    } else {
+                        (
+                            LivenessAction::DeclareAlive,
+                            incumbent_policy
+                                .expected_loss(LivenessAction::DeclareAlive, entry.core.posterior()),
+                            incumbent_policy
+                                .expected_loss(LivenessAction::Suspect, entry.core.posterior()),
+                        )
+                    };
+                    let (candidate_action, candidate_loss) = candidate_policy
+                        .as_ref()
+                        .map_or((LivenessAction::DeclareAlive, incumbent_loss), |candidate| {
+                            if candidate_suspicious {
+                                let (action, loss, _) =
+                                    candidate.choose_action(entry.core.posterior(), fallback_active);
+                                (action, loss)
+                            } else {
+                                (
+                                    LivenessAction::DeclareAlive,
+                                    candidate.expected_loss(
+                                        LivenessAction::DeclareAlive,
+                                        entry.core.posterior(),
+                                    ),
+                                )
                             }
-                        }
-                        LivenessAction::ReleaseReservations => {
-                            entry.state = LivenessState::Dead;
-                        }
-                        LivenessAction::DeclareAlive => {}
-                    }
+                        });
+                    shadow_pair = Some((
+                        incumbent_action,
+                        candidate_action,
+                        incumbent_loss,
+                        candidate_loss,
+                    ));
 
-                    actions.push((entry.name.clone(), action));
+                    if incumbent_suspicious && incumbent_action != LivenessAction::DeclareAlive {
+                        let evidence_summary = format!(
+                            "silence {}s (avg {}s, {:.1}σ)",
+                            entry.rhythm.silence_duration(now_micros) / 1_000_000,
+                            micros_f64_to_i64(entry.rhythm.effective_avg()) / 1_000_000,
+                            silence_ratio,
+                        );
+                        match incumbent_action {
+                            LivenessAction::Suspect => {
+                                if entry.state != LivenessState::Flaky {
+                                    entry.state = LivenessState::Flaky;
+                                    entry.suspect_since = now_micros;
+                                }
+                            }
+                            LivenessAction::ReleaseReservations => {
+                                entry.state = LivenessState::Dead;
+                            }
+                            LivenessAction::DeclareAlive => {}
+                        }
+                        decision_log = Some((
+                            entry.name.clone(),
+                            incumbent_action,
+                            incumbent_loss,
+                            runner_up_loss,
+                            evidence_summary,
+                        ));
+                        action_to_emit = Some((entry.name.clone(), incumbent_action));
+                    }
                 }
             }
+
+            if let Some((incumbent_action, candidate_action, incumbent_loss, candidate_loss)) =
+                shadow_pair
+            {
+                self.shadow_policy.record_decision_pair(
+                    incumbent_action,
+                    candidate_action,
+                    incumbent_loss,
+                    candidate_loss,
+                );
+                self.regret.record_outcome(
+                    self.ledger.latest_id(),
+                    &format!("{incumbent_action:?}"),
+                    incumbent_loss,
+                    &format!("{candidate_action:?}"),
+                    candidate_loss.min(incumbent_loss),
+                    now_micros,
+                );
+            }
+
+            if let Some((subject, action, incumbent_loss, runner_up_loss, evidence_summary)) =
+                decision_log
+            {
+                let Some(entry) = self.agents.get(&agent_name) else {
+                    continue;
+                };
+                self.ledger.record(&DecisionBuilder {
+                    subsystem: AtcSubsystem::Liveness,
+                    subject: &subject,
+                    core: &entry.core,
+                    action,
+                    expected_loss: incumbent_loss,
+                    runner_up_loss,
+                    evidence_summary: &evidence_summary,
+                    calibration_healthy: !fallback_active,
+                    safe_mode_active: fallback_active,
+                    timestamp_micros: now_micros,
+                });
+            }
+
+            if let Some(action) = action_to_emit {
+                evaluation.actions.push(action);
+            }
+
+            self.reschedule_agent(
+                &agent_name,
+                now_micros,
+                thresholds_snapshot.as_ref(),
+                fallback_active,
+            );
         }
 
-        actions
+        evaluation
     }
 
     /// Check for deadlock cycles in all project conflict graphs.
     #[must_use]
-    pub fn detect_deadlocks(&self) -> Vec<(String, Vec<Vec<String>>)> {
+    pub fn detect_deadlocks(&mut self) -> Vec<(String, Vec<Vec<String>>)> {
+        if self.deadlock_cache.is_empty() {
+            self.dirty_projects.extend(self.conflict_graphs.keys().cloned());
+        }
+        let dirty_projects: Vec<String> = self.dirty_projects.drain().collect();
+        for project in dirty_projects {
+            self.update_deadlock_cache_for_project(&project);
+        }
+        self.recompute_deadlock_totals();
+
         let mut results = Vec::new();
-        for (project, graph) in &self.conflict_graphs {
-            let cycles = find_deadlock_cycles(graph);
-            if !cycles.is_empty() {
-                results.push((project.clone(), cycles));
+        for (project, cached) in &self.deadlock_cache {
+            if !cached.cycles.is_empty() {
+                results.push((project.clone(), cached.cycles.clone()));
             }
         }
         results
@@ -3109,12 +3896,294 @@ impl AtcEngine {
         for entry in self.agents.values_mut() {
             entry.core.sync_policy_from(&self.liveness_core);
         }
+        self.refresh_incumbent_policy_from_core();
     }
 
     fn absorb_population_snapshot(&self, population: &mut HierarchicalAgentModel) {
         for entry in self.agents.values() {
             population.absorb_agent(&entry.program, &entry.rhythm);
         }
+    }
+
+    fn build_summary_snapshot_with(
+        &self,
+        now_micros: i64,
+        stage_timings: &AtcStageTimings,
+        kernel: &AtcKernelTelemetry,
+        budget: &AtcBudgetTelemetry,
+        policy: &AtcPolicyTelemetry,
+    ) -> AtcSummarySnapshot {
+        let mut agent_states = Vec::with_capacity(self.agents.len());
+        for (name, entry) in &self.agents {
+            agent_states.push(AgentStateSnapshot {
+                name: name.clone(),
+                state: entry.state,
+                silence_secs: entry.rhythm.silence_duration(now_micros) / 1_000_000,
+                posterior_alive: entry.core.posterior_probability(LivenessState::Alive),
+            });
+        }
+        agent_states.sort_by(|left, right| left.name.cmp(&right.name));
+
+        AtcSummarySnapshot {
+            enabled: self.enabled(),
+            safe_mode: self.is_safe_mode(),
+            tick_count: self.tick_count(),
+            tracked_agents: agent_states,
+            deadlock_cycles: self.deadlock_cycle_total,
+            eprocess_value: self.eprocess().e_value(),
+            regret_avg: self.regret().average_regret(),
+            decisions_total: self.ledger().latest_id(),
+            stage_timings: stage_timings.clone(),
+            kernel: kernel.clone(),
+            budget: budget.clone(),
+            policy: policy.clone(),
+        }
+    }
+
+    fn run_tick(&mut self, now_micros: i64) -> AtcTickReport {
+        let total_started = Instant::now();
+        self.tick_count = self.tick_count.saturating_add(1);
+
+        let fallback_reason = self.current_release_guard_reason();
+        let mode = self.budget_mode();
+        let candidate_policy = self.shadow_policy.candidate.clone();
+        let thresholds_snapshot = ATC_THRESHOLDS
+            .get()
+            .and_then(|lock| lock.lock().ok().map(|guard| guard.clone()));
+
+        let mut actions = Vec::new();
+        let mut timings = AtcStageTimings::default();
+
+        let liveness_started = Instant::now();
+        let liveness = self.evaluate_liveness(now_micros);
+        timings.liveness_micros = elapsed_micros(liveness_started);
+        for (agent_name, action) in &liveness.actions {
+            match action {
+                LivenessAction::Suspect => actions.push(AtcTickAction::SendAdvisory {
+                    agent: agent_name.clone(),
+                    message: format!("[ATC] Agent {agent_name} appears unresponsive. Monitoring."),
+                }),
+                LivenessAction::ReleaseReservations => {
+                    actions.push(AtcTickAction::ReleaseReservations {
+                        agent: agent_name.clone(),
+                    });
+                }
+                LivenessAction::DeclareAlive => {}
+            }
+        }
+
+        let deadlock_started = Instant::now();
+        let deadlocks = self.detect_deadlocks();
+        timings.deadlock_micros = elapsed_micros(deadlock_started);
+        for (project, cycles) in &deadlocks {
+            for cycle in cycles {
+                actions.push(AtcTickAction::SendAdvisory {
+                    agent: cycle[0].clone(),
+                    message: format!(
+                        "[ATC] Deadlock detected in {project}: {}. Consider releasing reservations.",
+                        cycle.join(" → ")
+                    ),
+                });
+            }
+        }
+
+        let excluded_agents: HashSet<String> = liveness
+            .actions
+            .iter()
+            .filter_map(|(agent, action)| {
+                (*action == LivenessAction::ReleaseReservations).then_some(agent.clone())
+            })
+            .collect();
+        let estimated_probe_cost_micros = self.cost_model.estimated_probe_cost_micros().max(1);
+        let projected_non_probe_micros = self
+            .cost_model
+            .estimated_non_probe_micros()
+            .saturating_add(estimated_probe_cost_micros);
+        let available_budget_micros = self
+            .config
+            .tick_budget_micros
+            .saturating_sub(projected_non_probe_micros);
+        let probe_budget_micros = ((u64_to_f64(available_budget_micros)
+            * self.incumbent_policy.probe_budget_fraction(mode))
+            .floor() as u64)
+            .min(self.config.tick_budget_micros);
+
+        let probe_started = Instant::now();
+        let incumbent_probe_candidates = budgeted_probe_schedule(
+            &self.agents,
+            &excluded_agents,
+            &self.incumbent_policy,
+            mode,
+            probe_budget_micros,
+            estimated_probe_cost_micros,
+            now_micros,
+        );
+        let incumbent_probe_agents: Vec<String> = incumbent_probe_candidates
+            .iter()
+            .map(|candidate| candidate.agent.clone())
+            .collect();
+        if let Some(candidate) = candidate_policy.as_ref() {
+            let candidate_probe_budget_micros = ((u64_to_f64(available_budget_micros)
+                * candidate.probe_budget_fraction(mode))
+                .floor() as u64)
+                .min(self.config.tick_budget_micros);
+            let candidate_probe_agents: Vec<String> = budgeted_probe_schedule(
+                &self.agents,
+                &excluded_agents,
+                candidate,
+                mode,
+                candidate_probe_budget_micros,
+                estimated_probe_cost_micros,
+                now_micros,
+            )
+            .into_iter()
+            .map(|candidate| candidate.agent)
+            .collect();
+            self.shadow_policy
+                .record_probe_disagreement(&incumbent_probe_agents, &candidate_probe_agents);
+        }
+        timings.probe_micros = elapsed_micros(probe_started);
+
+        for candidate in incumbent_probe_candidates {
+            if let Some(entry) = self.agents.get_mut(&candidate.agent) {
+                entry.probe_sent_at = now_micros;
+            }
+            self.reschedule_agent(
+                &candidate.agent,
+                now_micros,
+                thresholds_snapshot.as_ref(),
+                fallback_reason.is_some(),
+            );
+            actions.push(AtcTickAction::ProbeAgent {
+                agent: candidate.agent,
+            });
+        }
+
+        let gating_started = Instant::now();
+        let mut withheld_releases = Vec::new();
+        if let Some(conformal_lock) = ATC_CONFORMAL.get()
+            && let Ok(conformal) = conformal_lock.lock()
+            && conformal.is_uncertain(AtcSubsystem::Liveness)
+        {
+            actions.retain(|action| match action {
+                AtcTickAction::ReleaseReservations { agent } => {
+                    withheld_releases.push(agent.clone());
+                    false
+                }
+                _ => true,
+            });
+        }
+
+        for agent_name in withheld_releases {
+            if let Some(entry) = self.agents.get_mut(&agent_name)
+                && entry.state == LivenessState::Dead
+            {
+                entry.state = LivenessState::Flaky;
+                if entry.suspect_since == 0 {
+                    entry.suspect_since = now_micros;
+                }
+            }
+            self.reschedule_agent(
+                &agent_name,
+                now_micros,
+                thresholds_snapshot.as_ref(),
+                true,
+            );
+            actions.push(AtcTickAction::SendAdvisory {
+                agent: agent_name.clone(),
+                message: format!(
+                    "[ATC] Agent {agent_name} appears unresponsive. Automated reservation release withheld under high uncertainty."
+                ),
+            });
+        }
+
+        let release_targets: Vec<String> = actions
+            .iter()
+            .filter_map(|action| match action {
+                AtcTickAction::ReleaseReservations { agent } => Some(agent.clone()),
+                _ => None,
+            })
+            .collect();
+        for agent_name in release_targets {
+            actions.push(AtcTickAction::SendAdvisory {
+                agent: agent_name.clone(),
+                message: format!(
+                    "[ATC] Agent {agent_name} declared dead. Automated reservation release requested."
+                ),
+            });
+        }
+        timings.gating_micros = elapsed_micros(gating_started);
+
+        let slow_started = Instant::now();
+        if self.tick_count % 50 == 0
+            && let Some(pop_lock) = ATC_POPULATION.get()
+            && let Ok(mut pop) = pop_lock.lock()
+        {
+            self.absorb_population_snapshot(&mut pop);
+        }
+        let pre_summary_total_micros = elapsed_micros(total_started);
+        let budget_exceeded = pre_summary_total_micros > self.config.tick_budget_micros;
+        let utilization_ratio =
+            u64_to_f64(pre_summary_total_micros) / u64_to_f64(self.config.tick_budget_micros.max(1));
+        self.slow_controller.note_tick(
+            utilization_ratio,
+            budget_exceeded,
+            self.incumbent_policy.max_probes_per_tick,
+        );
+        timings.slow_control_micros = elapsed_micros(slow_started);
+
+        let kernel = AtcKernelTelemetry {
+            due_agents: liveness.due_agents,
+            scheduled_agents: self.liveness_schedule.len(),
+            dirty_agents: self.dirty_agents.len(),
+            dirty_projects: self.dirty_projects.len(),
+            deadlock_cache_hits: self.deadlock_cache_hits,
+            deadlock_cache_misses: self.deadlock_cache_misses,
+            deadlock_cache_hit_rate: if self.deadlock_cache_hits + self.deadlock_cache_misses == 0 {
+                1.0
+            } else {
+                u64_to_f64(self.deadlock_cache_hits)
+                    / u64_to_f64(self.deadlock_cache_hits + self.deadlock_cache_misses)
+            },
+        };
+        let budget = AtcBudgetTelemetry {
+            mode: mode.as_str().to_string(),
+            tick_budget_micros: self.config.tick_budget_micros,
+            probe_budget_micros,
+            estimated_probe_cost_micros,
+            max_probes_this_tick: self
+                .slow_controller
+                .probe_limit
+                .min(self.incumbent_policy.max_probes(mode)),
+            utilization_ratio,
+            slow_window_utilization: self.slow_controller.average_window_utilization(),
+        };
+        let policy = AtcPolicyTelemetry {
+            incumbent_policy_id: self.incumbent_policy.policy_id.clone(),
+            candidate_policy_id: candidate_policy.as_ref().map(|candidate| candidate.policy_id.clone()),
+            shadow_enabled: candidate_policy.is_some(),
+            shadow_disagreements: self.shadow_policy.disagreements,
+            shadow_regret_avg: self.shadow_policy.average_regret(),
+            fallback_active: fallback_reason.is_some(),
+            fallback_reason,
+        };
+
+        let summary_started = Instant::now();
+        timings.total_micros = elapsed_micros(total_started);
+        let mut summary = self.build_summary_snapshot_with(now_micros, &timings, &kernel, &budget, &policy);
+        timings.summary_micros = elapsed_micros(summary_started);
+        timings.total_micros = elapsed_micros(total_started);
+        summary.stage_timings = timings.clone();
+
+        self.last_stage_timings = timings;
+        self.last_kernel_telemetry = kernel;
+        self.last_budget_telemetry = budget;
+        self.last_policy_telemetry = policy;
+
+        self.cost_model
+            .update(&self.last_stage_timings, incumbent_probe_agents.len());
+
+        AtcTickReport { actions, summary }
     }
 }
 
@@ -5671,12 +6740,79 @@ pub fn submodular_probe_schedule<S: BuildHasher>(
     selected
 }
 
+#[derive(Debug, Clone)]
+struct AtcProbeCandidate {
+    pub agent: String,
+    pub estimated_gain: f64,
+    pub gain_per_micro: f64,
+    pub estimated_cost_micros: u64,
+}
+
+#[must_use]
+fn budgeted_probe_schedule<S: BuildHasher>(
+    agents: &HashMap<String, AgentLivenessEntry, S>,
+    excluded_agents: &HashSet<String>,
+    policy: &AtcLivenessPolicyArtifact,
+    mode: AtcBudgetMode,
+    max_budget_micros: u64,
+    estimated_probe_cost_micros: u64,
+    now_micros: i64,
+) -> Vec<AtcProbeCandidate> {
+    if agents.is_empty() || max_budget_micros == 0 {
+        return Vec::new();
+    }
+
+    let max_probes = policy.max_probes(mode);
+    if max_probes == 0 {
+        return Vec::new();
+    }
+
+    let schedule = submodular_probe_schedule(
+        agents,
+        max_probes,
+        policy.probe_recency_decay_secs,
+        now_micros,
+    );
+    let probe_cost = estimated_probe_cost_micros.max(1);
+    let budgeted_probe_count = usize::try_from((max_budget_micros / probe_cost).max(1)).unwrap_or(max_probes);
+    let mut candidates = Vec::new();
+    let mut spent_budget = 0_u64;
+
+    for (agent, estimated_gain) in schedule {
+        if excluded_agents.contains(&agent) || estimated_gain < policy.probe_gain_floor {
+            continue;
+        }
+        if candidates.len() >= max_probes || candidates.len() >= budgeted_probe_count {
+            break;
+        }
+        if spent_budget.saturating_add(probe_cost) > max_budget_micros {
+            break;
+        }
+        spent_budget = spent_budget.saturating_add(probe_cost);
+        candidates.push(AtcProbeCandidate {
+            agent,
+            estimated_gain,
+            gain_per_micro: estimated_gain / u64_to_f64(probe_cost),
+            estimated_cost_micros: probe_cost,
+        });
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .gain_per_micro
+            .partial_cmp(&left.gain_per_micro)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.agent.cmp(&right.agent))
+    });
+    candidates
+}
+
 // ── Track 21: Survival Analysis for Agent Liveness ──────────────────
 
 /// Kaplan-Meier survival estimator for agent silence durations.
 #[derive(Debug, Clone)]
 pub struct KaplanMeierEstimator {
-    observations: Vec<(i64, bool)>,
+    observations: VecDeque<(i64, bool)>,
     capacity: usize,
 }
 
@@ -5684,16 +6820,16 @@ impl KaplanMeierEstimator {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
-            observations: Vec::with_capacity(capacity.min(4096)),
+            observations: VecDeque::with_capacity(capacity.min(4096)),
             capacity,
         }
     }
 
     pub fn observe(&mut self, duration_micros: i64, is_death: bool) {
         if self.observations.len() >= self.capacity {
-            self.observations.remove(0);
+            self.observations.pop_front();
         }
-        self.observations.push((duration_micros, is_death));
+        self.observations.push_back((duration_micros, is_death));
     }
 
     #[must_use]
@@ -5701,7 +6837,7 @@ impl KaplanMeierEstimator {
         if self.observations.is_empty() {
             return 1.0;
         }
-        let mut sorted: Vec<(i64, bool)> = self.observations.clone();
+        let mut sorted: Vec<(i64, bool)> = self.observations.iter().copied().collect();
         sorted.sort_by_key(|(d, _)| *d);
 
         let mut s = 1.0;
@@ -5734,12 +6870,12 @@ impl KaplanMeierEstimator {
     }
 
     #[must_use]
-    pub const fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.observations.len()
     }
 
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.observations.is_empty()
     }
 }
@@ -5873,6 +7009,7 @@ pub enum AtcTickAction {
 
 /// Run one ATC tick: evaluate liveness, detect deadlocks, update calibration.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn atc_tick(now_micros: i64) -> Vec<AtcTickAction> {
     let mut actions = Vec::new();
 

@@ -893,7 +893,9 @@ impl TuiSharedState {
 
     /// Access the web dashboard frame store for frame capture / serving.
     #[must_use]
-    pub fn web_dashboard_frame_store(&self) -> &crate::tui_web_dashboard::WebDashboardFrameStore {
+    pub const fn web_dashboard_frame_store(
+        &self,
+    ) -> &crate::tui_web_dashboard::WebDashboardFrameStore {
         &self.web_dashboard_frame
     }
 

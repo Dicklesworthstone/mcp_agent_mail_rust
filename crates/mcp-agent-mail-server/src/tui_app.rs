@@ -4644,10 +4644,13 @@ impl Model for MailAppModel {
         // Capture the rendered frame for the web dashboard mirror.
         // This iterates cells and packs them into u32s — no buffer clone needed.
         {
-            let screen_idx = crate::tui_screens::ALL_SCREEN_IDS
-                .iter()
-                .position(|&id| id == self.screen_manager.active_screen())
-                .unwrap_or(0) as u8;
+            let screen_idx = u8::try_from(
+                crate::tui_screens::ALL_SCREEN_IDS
+                    .iter()
+                    .position(|&id| id == self.screen_manager.active_screen())
+                    .unwrap_or(0),
+            )
+            .unwrap_or(0);
             self.state
                 .web_dashboard_frame_store()
                 .capture(&frame.buffer, screen_idx);
