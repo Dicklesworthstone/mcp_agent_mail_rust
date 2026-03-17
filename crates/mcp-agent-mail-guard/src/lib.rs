@@ -437,14 +437,14 @@ def is_real_file(path):
 
 def slugify(value):
     out = []
-    prev_dash = False
+    prev_dash = false
     for ch in value.strip().lower():
         if ch.isalnum():
             out.append(ch)
-            prev_dash = False
+            prev_dash = false
         elif not prev_dash:
             out.append("-")
-            prev_dash = True
+            prev_dash = true
     slug = "".join(out).strip("-")
     return slug or "project"
 
@@ -1330,6 +1330,14 @@ fn read_active_reservations_from_archive(
             || file_type.is_symlink()
             || path.extension().and_then(|e| e.to_str()) != Some("json")
         {
+            continue;
+        }
+
+        // Defend against arbitrary large files in the archive causing OOM in the pre-commit hook.
+        if let Ok(meta) = entry.metadata()
+            && meta.len() > 1024 * 1024
+        {
+            // 1MB limit for reservation JSON
             continue;
         }
 
@@ -2943,7 +2951,7 @@ mod tests {
             "expires_ts": future.to_rfc3339(),
             "released_ts": null
         });
-        std::fs::write(outside_res_dir.join("escaped.json"), payload.to_string())
+        std::fs::write(&outside_res_dir.join("escaped.json"), payload.to_string())
             .expect("write escaped reservation");
         symlink(&outside_res_dir, archive.join("file_reservations"))
             .expect("symlink reservations dir");
