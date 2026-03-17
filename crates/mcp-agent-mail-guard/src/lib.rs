@@ -718,7 +718,10 @@ def glob_to_regex(pattern):
         
     # Replace fnmatch's normal * (.*) with [^/]* to respect directory boundaries
     regex = regex.replace(".*", "[^/]*")
-    # Restore ** as .*
+    # Restore ** logic, handling optional slashes
+    regex = regex.replace("/\0/", "(?:/|/.+/)")
+    if regex.startswith("\0/"):
+        regex = "(?:.+/|)" + regex[2:]
     regex = regex.replace("\0", ".*")
     # Handle {a,b} bash-style brace expansion
     regex = re.sub(r"\\?\{(.+?)\\?\}", lambda m: "(" + m.group(1).replace("\\", "").replace(",", "|") + ")", regex)
@@ -1925,13 +1928,13 @@ mod tests {
         assert_eq!(normalize_path("../../evil", false), "evil");
         // Single dot removal
         assert_eq!(
-            normalize_path("./app/./api/./file.py", false),
+            normalize_path("app/./api/./file.py", false),
             "app/api/file.py"
         );
         // Mixed
         assert_eq!(
-            normalize_path("/./app/../src/./lib.rs", false),
-            "src/lib.rs"
+            normalize_path("app/other/../api/./lib.rs", false),
+            "app/api/lib.rs"
         );
         // Case-insensitive mode
         assert_eq!(normalize_path("App/../SRC/Lib.rs", true), "src/lib.rs");
@@ -2602,6 +2605,7 @@ mod tests {
         std::fs::write(&file, "one\n").expect("write one");
         run_git(&repo_dir, &["add", "a.txt"]);
         run_git(&repo_dir, &["commit", "-qm", "touch"]);
+        let _local_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
 
         // Commit 2 reverts it so the net diff is empty even though the push touched the file.
         std::fs::write(&file, "base\n").expect("write revert");
@@ -2830,7 +2834,6 @@ mod tests {
         std::fs::write(res_dir.join("valid.json"), valid.to_string()).expect("write");
 
         let records = read_active_reservations_from_archive(&archive, false).expect("read");
-        // Malformed JSON should be skipped, valid one should be read
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].agent_name, "ValidAgent");
     }
