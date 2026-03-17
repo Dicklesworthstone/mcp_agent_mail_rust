@@ -539,6 +539,7 @@ fn sanitize_thread_id(raw: &str, fallback: &str) -> String {
 ///
 /// Enforces `max_subject_bytes`, `max_message_body_bytes`, `max_attachment_bytes`,
 /// and `max_total_message_bytes` from config. A limit of 0 means unlimited.
+#[allow(clippy::too_many_lines)]
 fn validate_message_size_limits(
     config: &Config,
     subject: &str,
@@ -585,7 +586,9 @@ fn validate_message_size_limits(
 
     // Per-attachment size (check file paths if provided)
     let mut total_size = subject.len().saturating_add(body_md.len());
-    if let Some(paths) = attachment_paths {
+    if let Some(paths) = attachment_paths
+        && !paths.is_empty()
+    {
         let canonical_attachment_base =
             attachment_base_dir.map(|base_dir| base_dir.canonicalize().ok());
         for path in paths {
@@ -1106,22 +1109,22 @@ fn process_message_attachments(
             Ok(archive) => {
                 let canonical_base = base_dir.canonicalize().ok();
                 for path in paths {
-                    let resolved = match canonical_base.as_ref() {
-                        Some(base_dir) => {
-                            mcp_agent_mail_storage::resolve_attachment_source_path_from_canonical_base(
-                                base_dir,
-                                config,
-                                path,
-                            )
-                        }
-                        None => {
+                    let resolved = canonical_base.as_ref().map_or_else(
+                        || {
                             mcp_agent_mail_storage::resolve_attachment_source_path(
                                 base_dir,
                                 config,
                                 path,
                             )
-                        }
-                    }
+                        },
+                        |base_dir| {
+                            mcp_agent_mail_storage::resolve_attachment_source_path_from_canonical_base(
+                                base_dir,
+                                config,
+                                path,
+                            )
+                        },
+                    )
                     .map_err(|e| {
                         legacy_tool_error(
                             "INVALID_ARGUMENT",

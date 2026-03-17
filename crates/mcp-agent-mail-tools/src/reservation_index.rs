@@ -16,8 +16,9 @@
 //! 2. **Prefixed globs** (e.g. `src/**/*.rs`): grouped by first literal segment.
 //! 3. **Root globs** (e.g. `*.rs`, `**`): must be checked against every request.
 //!
-//! For each requested path, only the relevant prefix group + root globs are
-//! examined, skipping all reservations under unrelated directory subtrees.
+//! For each requested path, exact-path checks stay local to the exact key,
+//! its segment ancestors, and its descendant subtree, while glob checks stay
+//! scoped to the relevant literal-prefix group plus root globs.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -170,7 +171,7 @@ impl ReservationIndex {
     /// Scan for conflicts when the request is a glob pattern.
     ///
     /// A glob request like `src/**` can match exact reservations like `src/main.rs`,
-    /// so we must scan exact entries in the same prefix group.
+    /// so we must scan the exact anchor (`src`) and exact descendants (`src/...`).
     fn scan_glob_request<'a>(
         &'a self,
         request_pat: &CompiledPattern,
@@ -420,6 +421,16 @@ mod tests {
             vec![("src/main/generated.rs".to_string(), make_ref(1))].into_iter(),
         );
         let req = CompiledPattern::new("src/main");
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].agent_id, 1);
+    }
+
+    #[test]
+    fn glob_request_conflicts_with_exact_directory_anchor() {
+        let idx = ReservationIndex::build(vec![("src".to_string(), make_ref(1))].into_iter());
+        let req = CompiledPattern::new("src/**/*.rs");
         let mut conflicts = Vec::new();
         idx.find_conflicts(&req, &mut conflicts);
         assert_eq!(conflicts.len(), 1);

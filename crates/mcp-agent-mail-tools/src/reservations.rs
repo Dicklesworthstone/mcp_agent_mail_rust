@@ -477,10 +477,9 @@ pub async fn file_reservation_paths(
 
     let mut pending_conflicts: Vec<PendingReservationConflict> = Vec::new();
 
-    // Build prefix-partitioned index from exclusive reservations held by other
-    // agents. This replaces the O(M×N) brute-force loop with prefix-scoped
-    // lookups: only reservations sharing a first path segment (or root globs)
-    // are examined per request.
+    // Build the reservation index from exclusive reservations held by other
+    // agents. Exact paths now use exact/ancestor/descendant lookups, while
+    // glob reservations remain prefix-scoped with a small root-glob fallback.
     let index = ReservationIndex::build(
         active
             .iter()
