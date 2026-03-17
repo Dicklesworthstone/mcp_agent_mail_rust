@@ -31516,6 +31516,15 @@ fn zip_archive_path_for_dir(dir: &Path) -> PathBuf {
     parent.join(format!("{name}.zip"))
 }
 
+fn age_archive_path_for_input(input: &Path) -> PathBuf {
+    input.with_extension(
+        input
+            .extension()
+            .map(|ext| format!("{}.age", ext.to_string_lossy()))
+            .unwrap_or_else(|| "age".to_string()),
+    )
+}
+
 fn validate_share_archive_options(zip_enabled: bool, age_recipients: &[String]) -> CliResult<()> {
     if !age_recipients.is_empty() && !zip_enabled {
         return Err(CliError::Other(
@@ -31525,13 +31534,25 @@ fn validate_share_archive_options(zip_enabled: bool, age_recipients: &[String]) 
     Ok(())
 }
 
-fn ensure_share_zip_target_absent(bundle_dir: &Path) -> CliResult<Option<PathBuf>> {
+fn ensure_share_zip_target_absent(
+    bundle_dir: &Path,
+    age_encryption_enabled: bool,
+) -> CliResult<Option<PathBuf>> {
     let zip_path = zip_archive_path_for_dir(bundle_dir);
     if zip_path.exists() {
         return Err(CliError::Other(format!(
             "refusing to overwrite existing ZIP archive {}; remove it first or choose a different bundle path",
             zip_path.display()
         )));
+    }
+    if age_encryption_enabled {
+        let encrypted_path = age_archive_path_for_input(&zip_path);
+        if encrypted_path.exists() {
+            return Err(CliError::Other(format!(
+                "refusing to overwrite existing encrypted archive {}; remove it first or choose a different bundle path",
+                encrypted_path.display()
+            )));
+        }
     }
     Ok(Some(zip_path))
 }
@@ -31962,14 +31983,14 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
     snapshot_cleanup.try_cleanup()?;
 
     let zip_path = if params.zip {
-        ensure_share_zip_target_absent(output)?
+        ensure_share_zip_target_absent(output, !params.age_recipients.is_empty())?
     } else {
         None
     };
 
     // 12. ZIP
     let mut archive_path: Option<PathBuf> = None;
-    let final_path = if params.zip {
+    let mut final_path = if params.zip {
         ftui_runtime::ftui_println!("Packaging as ZIP...");
         let zip_path = zip_path.expect("zip path preflighted");
         share::package_directory_as_zip(output, &zip_path)?;
@@ -31987,6 +32008,7 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
         ftui_runtime::ftui_println!("Encrypting with age...");
         let encrypted = share::encrypt_with_age(archive, &params.age_recipients)?;
         ftui_runtime::ftui_println!("  Encrypted: {}", encrypted.display());
+        final_path = encrypted;
     }
 
     ftui_runtime::ftui_println!("Export complete: {}", final_path.display());
@@ -32018,7 +32040,7 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
     ftui_runtime::ftui_println!("Scrub preset:   {}", params.scrub_preset);
 
     let zip_path = if params.zip {
-        ensure_share_zip_target_absent(&params.bundle)?
+        ensure_share_zip_target_absent(&params.bundle, !params.age_recipients.is_empty())?
     } else {
         None
     };
@@ -37525,9 +37547,24 @@ fn ensure_share_zip_target_absent_rejects_existing_archive() {
     let zip_path = zip_archive_path_for_dir(&bundle);
     std::fs::write(&zip_path, b"existing archive").expect("seed existing archive");
 
-    let err = ensure_share_zip_target_absent(&bundle)
+    let err = ensure_share_zip_target_absent(&bundle, false)
         .expect_err("existing zip archive should fail preflight");
     assert!(format!("{err}").contains("refusing to overwrite existing ZIP archive"));
+}
+
+#[test]
+fn ensure_share_zip_target_absent_rejects_existing_encrypted_archive() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let bundle = temp.path().join("bundle");
+    std::fs::create_dir_all(&bundle).expect("create bundle dir");
+    let zip_path = zip_archive_path_for_dir(&bundle);
+    let encrypted_path = age_archive_path_for_input(&zip_path);
+    std::fs::write(&encrypted_path, b"existing encrypted archive")
+        .expect("seed existing encrypted archive");
+
+    let err = ensure_share_zip_target_absent(&bundle, true)
+        .expect_err("existing encrypted archive should fail preflight");
+    assert!(format!("{err}").contains("refusing to overwrite existing encrypted archive"));
 }
 
 #[cfg(unix)]
@@ -37611,20 +37648,16 @@ fn share_update_replace_dir_rejects_symlinked_child_in_existing_tree() {
 static SHARE_EXPORT_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
-#[test]
-fn run_share_export_removes_snapshot_when_signing_fails() {
-    let _lock = SHARE_EXPORT_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
+#[cfg(test)]
+fn stdio_capture_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
 
-    let temp = tempfile::tempdir().expect("tempdir");
-    let source_db = temp.path().join("share-export-source.sqlite3");
-    let storage_root = temp.path().join("storage");
-    let output = temp.path().join("bundle");
-    std::fs::create_dir_all(&storage_root).expect("create storage root");
-
-    let conn = mcp_agent_mail_db::DbConn::open_file(source_db.display().to_string())
-        .expect("open source db");
+#[cfg(test)]
+fn seed_share_export_source_db(path: &Path) {
+    let conn =
+        mcp_agent_mail_db::DbConn::open_file(path.display().to_string()).expect("open source db");
     conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
         .expect("init source schema");
     conn.query_sync(
@@ -37637,7 +37670,44 @@ fn run_share_export_removes_snapshot_when_signing_fails() {
         ],
     )
     .expect("insert project");
-    drop(conn);
+}
+
+#[cfg(test)]
+fn try_generate_age_recipient(dir: &Path) -> Option<String> {
+    let identity_path = dir.join("age_identity.txt");
+    let output = std::process::Command::new("age-keygen")
+        .arg("-o")
+        .arg(&identity_path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    combined
+        .lines()
+        .find(|line| line.contains("public key:"))
+        .and_then(|line| line.split_whitespace().last())
+        .map(str::to_string)
+}
+
+#[test]
+fn run_share_export_removes_snapshot_when_signing_fails() {
+    let _lock = SHARE_EXPORT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source_db = temp.path().join("share-export-source.sqlite3");
+    let storage_root = temp.path().join("storage");
+    let output = temp.path().join("bundle");
+    std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+    seed_share_export_source_db(&source_db);
 
     let database_url = format!("sqlite:///{}", source_db.display());
     let storage_root_text = storage_root.to_string_lossy().to_string();
@@ -37668,6 +37738,79 @@ fn run_share_export_removes_snapshot_when_signing_fails() {
     assert!(
         !output.join("_snapshot.sqlite3").exists(),
         "snapshot should be removed after export failure"
+    );
+}
+
+#[test]
+fn run_share_export_reports_encrypted_archive_as_final_output() {
+    let _share_lock = SHARE_EXPORT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let _stdio_lock = stdio_capture_lock()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    if std::process::Command::new("age")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("Skipping: age CLI not available");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let Some(recipient) = try_generate_age_recipient(temp.path()) else {
+        eprintln!("Skipping: age-keygen not available");
+        return;
+    };
+
+    let source_db = temp.path().join("share-export-source.sqlite3");
+    let storage_root = temp.path().join("storage");
+    let output = temp.path().join("bundle");
+    std::fs::create_dir_all(&storage_root).expect("create storage root");
+    seed_share_export_source_db(&source_db);
+
+    let database_url = format!("sqlite:///{}", source_db.display());
+    let storage_root_text = storage_root.to_string_lossy().to_string();
+    let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+    let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        &[
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root_text.as_str()),
+        ],
+        || {
+            run_share_export(ShareExportParams {
+                output: output.clone(),
+                projects: vec![],
+                inline_threshold: share::INLINE_ATTACHMENT_THRESHOLD,
+                detach_threshold: share::DETACH_ATTACHMENT_THRESHOLD,
+                scrub_preset: share::ScrubPreset::Standard,
+                chunk_threshold: share::DEFAULT_CHUNK_THRESHOLD,
+                chunk_size: share::DEFAULT_CHUNK_SIZE,
+                dry_run: false,
+                zip: true,
+                signing_key: None,
+                signing_public_out: None,
+                age_recipients: vec![recipient.clone()],
+            })
+        },
+    );
+    let stdout = capture.drain_to_string();
+
+    assert!(
+        result.is_ok(),
+        "share export with age should succeed: {result:?}"
+    );
+    let encrypted_path = age_archive_path_for_input(&zip_archive_path_for_dir(&output));
+    assert!(
+        stdout.contains(&format!("Export complete: {}", encrypted_path.display())),
+        "export should report encrypted archive as final artifact:\n{stdout}"
+    );
+    assert!(
+        encrypted_path.exists(),
+        "encrypted archive should exist at {}",
+        encrypted_path.display()
     );
 }
 

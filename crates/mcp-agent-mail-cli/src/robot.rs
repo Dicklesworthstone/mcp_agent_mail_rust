@@ -987,10 +987,18 @@ struct AtcRobotSnapshot {
     decisions_total: u64,
     #[serde(default)]
     recent_actions: Vec<AtcRobotAction>,
+    #[serde(default)]
+    recent_decisions: Vec<AtcRobotDecision>,
+    #[serde(default)]
+    recent_executions: Vec<AtcRobotExecution>,
     last_tick_micros: i64,
     last_tick_duration_micros: u64,
     last_tick_budget_micros: u64,
     last_tick_budget_exceeded: bool,
+    outer_loop_overhead_micros: u64,
+    #[serde(default)]
+    executor_mode: String,
+    executor_pending_effects: usize,
     #[serde(default)]
     stage_timings: AtcRobotStageTimings,
     #[serde(default)]
@@ -1018,8 +1026,12 @@ struct AtcRobotStageTimings {
 struct AtcRobotKernel {
     due_agents: usize,
     scheduled_agents: usize,
+    #[serde(default)]
+    next_due_micros: Option<i64>,
     dirty_agents: usize,
     dirty_projects: usize,
+    pending_effects: usize,
+    lock_wait_micros: u64,
     deadlock_cache_hits: u64,
     deadlock_cache_misses: u64,
     deadlock_cache_hit_rate: f64,
@@ -1032,18 +1044,30 @@ struct AtcRobotBudget {
     probe_budget_micros: u64,
     estimated_probe_cost_micros: u64,
     max_probes_this_tick: usize,
+    budget_debt_micros: u64,
     utilization_ratio: f64,
     slow_window_utilization: f64,
+    kernel_total_micros: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct AtcRobotPolicy {
+    #[serde(default)]
+    bundle_id: String,
+    #[serde(default)]
+    bundle_hash: String,
     incumbent_policy_id: String,
     #[serde(default)]
+    incumbent_artifact_hash: String,
+    #[serde(default)]
     candidate_policy_id: Option<String>,
+    #[serde(default)]
+    candidate_artifact_hash: Option<String>,
     shadow_enabled: bool,
     shadow_disagreements: u64,
     shadow_regret_avg: f64,
+    #[serde(default)]
+    decision_mode: String,
     fallback_active: bool,
     #[serde(default)]
     fallback_reason: Option<String>,
@@ -1067,6 +1091,68 @@ struct AtcRobotAction {
     message: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AtcRobotLossTableEntry {
+    action: String,
+    expected_loss: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AtcRobotDecision {
+    id: u64,
+    #[serde(default)]
+    claim_id: String,
+    #[serde(default)]
+    evidence_id: String,
+    #[serde(default)]
+    trace_id: String,
+    timestamp_micros: i64,
+    subsystem: String,
+    #[serde(default)]
+    decision_class: String,
+    subject: String,
+    #[serde(default)]
+    policy_id: Option<String>,
+    #[serde(default)]
+    posterior: Vec<(String, f64)>,
+    action: String,
+    expected_loss: f64,
+    runner_up_loss: f64,
+    #[serde(default)]
+    loss_table: Vec<AtcRobotLossTableEntry>,
+    evidence_summary: String,
+    calibration_healthy: bool,
+    safe_mode_active: bool,
+    #[serde(default)]
+    fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AtcRobotExecution {
+    timestamp_micros: i64,
+    #[serde(default)]
+    effect_id: String,
+    #[serde(default)]
+    claim_id: String,
+    #[serde(default)]
+    evidence_id: String,
+    #[serde(default)]
+    trace_id: String,
+    kind: String,
+    category: String,
+    agent: String,
+    #[serde(default)]
+    project_key: Option<String>,
+    #[serde(default)]
+    policy_id: Option<String>,
+    #[serde(default)]
+    execution_mode: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    message: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct AtcSummaryData {
     enabled: bool,
@@ -1083,23 +1169,38 @@ struct AtcSummaryData {
     last_tick_duration_micros: u64,
     last_tick_budget_micros: u64,
     last_tick_budget_exceeded: bool,
+    outer_loop_overhead_micros: u64,
+    executor_mode: String,
+    executor_pending_effects: usize,
     budget_mode: String,
     probe_budget_micros: u64,
     estimated_probe_cost_micros: u64,
     max_probes_this_tick: usize,
+    budget_debt_micros: u64,
     tick_utilization_ratio: f64,
     slow_window_utilization: f64,
+    kernel_total_micros: u64,
+    bundle_id: String,
+    bundle_hash: String,
     incumbent_policy_id: String,
+    incumbent_artifact_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     candidate_policy_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_artifact_hash: Option<String>,
     shadow_enabled: bool,
     shadow_disagreements: u64,
     shadow_regret_avg: f64,
+    decision_mode: String,
     fallback_active: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     fallback_reason: Option<String>,
     due_agents: usize,
     scheduled_agents: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_due: Option<String>,
+    pending_effects: usize,
+    lock_wait_micros: u64,
     deadlock_cache_hits: u64,
     deadlock_cache_misses: u64,
     deadlock_cache_hit_rate: f64,
@@ -1122,9 +1223,42 @@ struct AtcLivenessData {
 #[derive(Debug, Clone, Serialize)]
 struct AtcDecisionData {
     timestamp: String,
+    subsystem: String,
+    decision_class: String,
+    agent: String,
+    action: String,
+    claim_id: String,
+    evidence_id: String,
+    trace_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_id: Option<String>,
+    expected_loss: f64,
+    runner_up_loss: f64,
+    evidence_summary: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    posterior: Vec<(String, f64)>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    loss_table: Vec<AtcRobotLossTableEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AtcExecutionData {
+    timestamp: String,
+    effect_id: String,
+    claim_id: String,
+    evidence_id: String,
+    trace_id: String,
+    agent: String,
     kind: String,
     category: String,
-    agent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_id: Option<String>,
+    execution_mode: String,
+    status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
 }
@@ -1148,6 +1282,8 @@ struct AtcData {
     summary: Option<AtcSummaryData>,
     #[serde(skip_serializing_if = "Option::is_none")]
     decisions: Option<Vec<AtcDecisionData>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executions: Option<Vec<AtcExecutionData>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     liveness: Option<Vec<AtcLivenessData>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4910,17 +5046,37 @@ fn build_unavailable_atc_snapshot(live_error: &str) -> AtcRobotSnapshot {
     }
 }
 
-fn atc_decision_data(action: &AtcRobotAction) -> AtcDecisionData {
+fn atc_decision_category(decision: &AtcRobotDecision) -> &'static str {
+    match decision.subsystem.as_str() {
+        "Conflict" => "conflict",
+        "Calibration" => "calibration",
+        "Synthesis" if decision.decision_class.contains("probe") => "probe",
+        "Liveness" => "liveness",
+        _ => "liveness",
+    }
+}
+
+fn atc_decision_data(decision: &AtcRobotDecision) -> AtcDecisionData {
     AtcDecisionData {
-        timestamp: if action.timestamp_micros > 0 {
-            mcp_agent_mail_db::micros_to_iso(action.timestamp_micros)
+        timestamp: if decision.timestamp_micros > 0 {
+            mcp_agent_mail_db::micros_to_iso(decision.timestamp_micros)
         } else {
             "--".to_string()
         },
-        kind: action.kind.clone(),
-        category: action.category.clone(),
-        agent: action.agent.clone(),
-        message: action.message.clone(),
+        subsystem: decision.subsystem.clone(),
+        decision_class: decision.decision_class.clone(),
+        agent: decision.subject.clone(),
+        action: decision.action.clone(),
+        claim_id: decision.claim_id.clone(),
+        evidence_id: decision.evidence_id.clone(),
+        trace_id: decision.trace_id.clone(),
+        policy_id: decision.policy_id.clone(),
+        expected_loss: decision.expected_loss,
+        runner_up_loss: decision.runner_up_loss,
+        evidence_summary: decision.evidence_summary.clone(),
+        posterior: decision.posterior.clone(),
+        loss_table: decision.loss_table.clone(),
+        fallback_reason: decision.fallback_reason.clone(),
     }
 }
 
@@ -4930,33 +5086,132 @@ fn atc_filtered_decisions(
     category: Option<&str>,
     limit: usize,
 ) -> Vec<AtcDecisionData> {
-    let mut actions: Vec<AtcRobotAction> = snapshot
-        .recent_actions
+    if snapshot.recent_decisions.is_empty() {
+        let mut fallback_actions: Vec<AtcRobotAction> = snapshot
+            .recent_actions
+            .iter()
+            .filter(|action| category.is_none_or(|value| action.category == value))
+            .cloned()
+            .collect();
+        let has_focus_match = focus_agent.is_some_and(|focus| {
+            fallback_actions
+                .iter()
+                .any(|action| action.agent.eq_ignore_ascii_case(focus))
+        });
+        if has_focus_match {
+            fallback_actions.retain(|action| {
+                focus_agent.is_some_and(|focus| action.agent.eq_ignore_ascii_case(focus))
+            });
+        }
+        fallback_actions.sort_by(|left, right| {
+            right
+                .timestamp_micros
+                .cmp(&left.timestamp_micros)
+                .then_with(|| left.agent.cmp(&right.agent))
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
+        return fallback_actions
+            .into_iter()
+            .take(limit)
+            .map(|action| AtcDecisionData {
+                timestamp: if action.timestamp_micros > 0 {
+                    mcp_agent_mail_db::micros_to_iso(action.timestamp_micros)
+                } else {
+                    "--".to_string()
+                },
+                subsystem: action.category.clone(),
+                decision_class: action.kind.clone(),
+                agent: action.agent,
+                action: action.kind,
+                claim_id: String::new(),
+                evidence_id: String::new(),
+                trace_id: String::new(),
+                policy_id: None,
+                expected_loss: 0.0,
+                runner_up_loss: 0.0,
+                evidence_summary: action.message.unwrap_or_default(),
+                posterior: Vec::new(),
+                loss_table: Vec::new(),
+                fallback_reason: None,
+            })
+            .collect();
+    }
+
+    let mut decisions: Vec<AtcRobotDecision> = snapshot
+        .recent_decisions
         .iter()
-        .filter(|action| category.is_none_or(|value| action.category == value))
+        .filter(|decision| category.is_none_or(|value| atc_decision_category(decision) == value))
         .cloned()
         .collect();
     let has_focus_match = focus_agent.is_some_and(|focus| {
-        actions
+        decisions
             .iter()
-            .any(|action| action.agent.eq_ignore_ascii_case(focus))
+            .any(|decision| decision.subject.eq_ignore_ascii_case(focus))
     });
     if has_focus_match {
-        actions.retain(|action| {
-            focus_agent.is_some_and(|focus| action.agent.eq_ignore_ascii_case(focus))
+        decisions.retain(|decision| {
+            focus_agent.is_some_and(|focus| decision.subject.eq_ignore_ascii_case(focus))
         });
     }
-    actions.sort_by(|left, right| {
+    decisions.sort_by(|left, right| {
+        right
+            .timestamp_micros
+            .cmp(&left.timestamp_micros)
+            .then_with(|| left.subject.cmp(&right.subject))
+            .then_with(|| left.action.cmp(&right.action))
+    });
+    decisions
+        .into_iter()
+        .take(limit)
+        .map(|decision| atc_decision_data(&decision))
+        .collect()
+}
+
+fn atc_execution_data(
+    snapshot: &AtcRobotSnapshot,
+    focus_agent: Option<&str>,
+    limit: usize,
+) -> Vec<AtcExecutionData> {
+    let mut executions = snapshot.recent_executions.clone();
+    let has_focus_match = focus_agent.is_some_and(|focus| {
+        executions
+            .iter()
+            .any(|execution| execution.agent.eq_ignore_ascii_case(focus))
+    });
+    if has_focus_match {
+        executions.retain(|execution| {
+            focus_agent.is_some_and(|focus| execution.agent.eq_ignore_ascii_case(focus))
+        });
+    }
+    executions.sort_by(|left, right| {
         right
             .timestamp_micros
             .cmp(&left.timestamp_micros)
             .then_with(|| left.agent.cmp(&right.agent))
-            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.effect_id.cmp(&right.effect_id))
     });
-    actions
+    executions
         .into_iter()
         .take(limit)
-        .map(|action| atc_decision_data(&action))
+        .map(|execution| AtcExecutionData {
+            timestamp: if execution.timestamp_micros > 0 {
+                mcp_agent_mail_db::micros_to_iso(execution.timestamp_micros)
+            } else {
+                "--".to_string()
+            },
+            effect_id: execution.effect_id,
+            claim_id: execution.claim_id,
+            evidence_id: execution.evidence_id,
+            trace_id: execution.trace_id,
+            agent: execution.agent,
+            kind: execution.kind,
+            category: execution.category,
+            project_key: execution.project_key,
+            policy_id: execution.policy_id,
+            execution_mode: execution.execution_mode,
+            status: execution.status,
+            message: execution.message,
+        })
         .collect()
 }
 
@@ -5033,21 +5288,37 @@ fn atc_summary_data(snapshot: &AtcRobotSnapshot) -> AtcSummaryData {
         last_tick_duration_micros: snapshot.last_tick_duration_micros,
         last_tick_budget_micros: snapshot.last_tick_budget_micros,
         last_tick_budget_exceeded: snapshot.last_tick_budget_exceeded,
+        outer_loop_overhead_micros: snapshot.outer_loop_overhead_micros,
+        executor_mode: snapshot.executor_mode.clone(),
+        executor_pending_effects: snapshot.executor_pending_effects,
         budget_mode: snapshot.budget.mode.clone(),
         probe_budget_micros: snapshot.budget.probe_budget_micros,
         estimated_probe_cost_micros: snapshot.budget.estimated_probe_cost_micros,
         max_probes_this_tick: snapshot.budget.max_probes_this_tick,
+        budget_debt_micros: snapshot.budget.budget_debt_micros,
         tick_utilization_ratio: snapshot.budget.utilization_ratio,
         slow_window_utilization: snapshot.budget.slow_window_utilization,
+        kernel_total_micros: snapshot.budget.kernel_total_micros,
+        bundle_id: snapshot.policy.bundle_id.clone(),
+        bundle_hash: snapshot.policy.bundle_hash.clone(),
         incumbent_policy_id: snapshot.policy.incumbent_policy_id.clone(),
+        incumbent_artifact_hash: snapshot.policy.incumbent_artifact_hash.clone(),
         candidate_policy_id: snapshot.policy.candidate_policy_id.clone(),
+        candidate_artifact_hash: snapshot.policy.candidate_artifact_hash.clone(),
         shadow_enabled: snapshot.policy.shadow_enabled,
         shadow_disagreements: snapshot.policy.shadow_disagreements,
         shadow_regret_avg: snapshot.policy.shadow_regret_avg,
+        decision_mode: snapshot.policy.decision_mode.clone(),
         fallback_active: snapshot.policy.fallback_active,
         fallback_reason: snapshot.policy.fallback_reason.clone(),
         due_agents: snapshot.kernel.due_agents,
         scheduled_agents: snapshot.kernel.scheduled_agents,
+        next_due: snapshot
+            .kernel
+            .next_due_micros
+            .map(mcp_agent_mail_db::micros_to_iso),
+        pending_effects: snapshot.kernel.pending_effects,
+        lock_wait_micros: snapshot.kernel.lock_wait_micros,
         deadlock_cache_hits: snapshot.kernel.deadlock_cache_hits,
         deadlock_cache_misses: snapshot.kernel.deadlock_cache_misses,
         deadlock_cache_hit_rate: snapshot.kernel.deadlock_cache_hit_rate,
@@ -5108,6 +5379,7 @@ fn build_atc_data(
     let default_sections = !(decisions_flag || liveness_flag || conflicts_flag || summary_flag);
     let show_summary = summary_flag || default_sections;
     let show_decisions = decisions_flag || default_sections;
+    let show_executions = default_sections && !snapshot.recent_executions.is_empty();
     let show_liveness = liveness_flag
         || (default_sections
             && snapshot
@@ -5129,6 +5401,7 @@ fn build_atc_data(
         summary: show_summary.then(|| atc_summary_data(&snapshot)),
         decisions: show_decisions
             .then(|| atc_filtered_decisions(&snapshot, focus_agent, None, limit)),
+        executions: show_executions.then(|| atc_execution_data(&snapshot, focus_agent, limit)),
         liveness: show_liveness
             .then(|| atc_liveness_data(&snapshot, focus_agent, limit, default_sections)),
         conflicts: show_conflicts
@@ -6703,6 +6976,81 @@ mod tests {
             eprocess_value: 3.5,
             regret_avg: 0.25,
             decisions_total: 12,
+            recent_decisions: vec![
+                AtcRobotDecision {
+                    id: 12,
+                    claim_id: "atc-claim-12".to_string(),
+                    evidence_id: "atc-evidence-12".to_string(),
+                    trace_id: "atc-trace-12".to_string(),
+                    timestamp_micros: 2_200_000,
+                    subsystem: "Conflict".to_string(),
+                    decision_class: "deadlock_cycle".to_string(),
+                    subject: "BetaAgent".to_string(),
+                    policy_id: Some("liveness-incumbent-r7".to_string()),
+                    posterior: vec![("Dead".to_string(), 0.92)],
+                    action: "AdvisoryMessage".to_string(),
+                    expected_loss: 0.2,
+                    runner_up_loss: 1.1,
+                    loss_table: vec![
+                        AtcRobotLossTableEntry {
+                            action: "AdvisoryMessage".to_string(),
+                            expected_loss: 0.2,
+                        },
+                        AtcRobotLossTableEntry {
+                            action: "Ignore".to_string(),
+                            expected_loss: 1.1,
+                        },
+                    ],
+                    evidence_summary: "deterministic deadlock cycle in /tmp/project".to_string(),
+                    calibration_healthy: false,
+                    safe_mode_active: true,
+                    fallback_reason: Some("budget_pressure".to_string()),
+                },
+                AtcRobotDecision {
+                    id: 11,
+                    claim_id: "atc-claim-11".to_string(),
+                    evidence_id: "atc-evidence-11".to_string(),
+                    trace_id: "atc-trace-11".to_string(),
+                    timestamp_micros: 1_800_000,
+                    subsystem: "Synthesis".to_string(),
+                    decision_class: "probe_schedule".to_string(),
+                    subject: "AlphaAgent".to_string(),
+                    policy_id: Some("liveness-incumbent-r7".to_string()),
+                    posterior: vec![("Alive".to_string(), 0.63), ("Flaky".to_string(), 0.28)],
+                    action: "ProbeAgent".to_string(),
+                    expected_loss: 0.5,
+                    runner_up_loss: 1.4,
+                    loss_table: vec![
+                        AtcRobotLossTableEntry {
+                            action: "ProbeAgent".to_string(),
+                            expected_loss: 0.5,
+                        },
+                        AtcRobotLossTableEntry {
+                            action: "DeferProbe".to_string(),
+                            expected_loss: 1.4,
+                        },
+                    ],
+                    evidence_summary: "selected for probing with gain_per_micro 2.0000".to_string(),
+                    calibration_healthy: false,
+                    safe_mode_active: true,
+                    fallback_reason: Some("budget_pressure".to_string()),
+                },
+            ],
+            recent_executions: vec![AtcRobotExecution {
+                timestamp_micros: 2_250_000,
+                effect_id: "atc-effect-12".to_string(),
+                claim_id: "atc-claim-12".to_string(),
+                evidence_id: "atc-evidence-12".to_string(),
+                trace_id: "atc-trace-12".to_string(),
+                kind: "send_advisory".to_string(),
+                category: "conflict".to_string(),
+                agent: "BetaAgent".to_string(),
+                project_key: Some("/tmp/project".to_string()),
+                policy_id: Some("liveness-incumbent-r7".to_string()),
+                execution_mode: "shadow".to_string(),
+                status: "shadowed".to_string(),
+                message: Some("Deadlock detected".to_string()),
+            }],
             recent_actions: vec![
                 AtcRobotAction {
                     timestamp_micros: 2_000_000,
@@ -6723,6 +7071,9 @@ mod tests {
             last_tick_duration_micros: 80,
             last_tick_budget_micros: 60,
             last_tick_budget_exceeded: true,
+            outer_loop_overhead_micros: 21,
+            executor_mode: "shadow".to_string(),
+            executor_pending_effects: 1,
             stage_timings: AtcRobotStageTimings {
                 liveness_micros: 10,
                 deadlock_micros: 12,
@@ -6735,8 +7086,11 @@ mod tests {
             kernel: AtcRobotKernel {
                 due_agents: 1,
                 scheduled_agents: 2,
+                next_due_micros: Some(3_000_000),
                 dirty_agents: 0,
                 dirty_projects: 0,
+                pending_effects: 1,
+                lock_wait_micros: 4,
                 deadlock_cache_hits: 9,
                 deadlock_cache_misses: 1,
                 deadlock_cache_hit_rate: 0.9,
@@ -6747,15 +7101,22 @@ mod tests {
                 probe_budget_micros: 20,
                 estimated_probe_cost_micros: 10,
                 max_probes_this_tick: 2,
+                budget_debt_micros: 33,
                 utilization_ratio: 1.33,
                 slow_window_utilization: 0.82,
+                kernel_total_micros: 59,
             },
             policy: AtcRobotPolicy {
+                bundle_id: "atc-liveness-bundle-r7".to_string(),
+                bundle_hash: "bundle-hash-7".to_string(),
                 incumbent_policy_id: "liveness-incumbent-r7".to_string(),
+                incumbent_artifact_hash: "incumbent-hash-7".to_string(),
                 candidate_policy_id: Some("liveness-shadow-cautious-v1".to_string()),
+                candidate_artifact_hash: Some("candidate-hash-7".to_string()),
                 shadow_enabled: true,
                 shadow_disagreements: 3,
                 shadow_regret_avg: 0.4,
+                decision_mode: "pressure".to_string(),
                 fallback_active: true,
                 fallback_reason: Some("budget_pressure".to_string()),
             },
@@ -6869,6 +7230,10 @@ mod tests {
             "default ATC output should include decisions"
         );
         assert!(
+            data.executions.is_some(),
+            "default ATC output should include recent effect executions"
+        );
+        assert!(
             data.liveness.is_some(),
             "degraded agents should surface in default output"
         );
@@ -6893,6 +7258,20 @@ mod tests {
                 .as_ref()
                 .map_or(0, |item| item.deadlock_cycles),
             1
+        );
+        assert_eq!(
+            data.executions
+                .as_ref()
+                .and_then(|executions| executions.first())
+                .map(|execution| execution.status.as_str()),
+            Some("shadowed")
+        );
+        assert_eq!(
+            data.executions
+                .as_ref()
+                .and_then(|executions| executions.first())
+                .map(|execution| execution.trace_id.as_str()),
+            Some("atc-trace-12")
         );
     }
 
