@@ -232,7 +232,8 @@ fn build_importance_filter_plan(query: &PlannerQuery) -> ImportanceFilterPlan {
 
     let filter = if has_urgent && !has_high && !has_normal && !has_low {
         Some(ImportanceFilter::Urgent)
-    } else if has_high && !has_normal && !has_urgent && !has_low {
+    } else if has_high && !has_normal && !has_low {
+        // High alone or High + Urgent both map to High (adjacent upper levels).
         Some(ImportanceFilter::High)
     } else if has_normal && !has_high && !has_urgent && !has_low {
         Some(ImportanceFilter::Normal)

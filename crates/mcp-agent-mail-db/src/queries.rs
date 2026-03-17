@@ -5961,61 +5961,56 @@ async fn release_reservations_by_ids_with_expiry_constraint(
 
     let mut release_marker = now_micros();
     let mut released = Vec::with_capacity(ids.len());
-    let mut release_sql = format!(
-        "INSERT OR REPLACE INTO file_reservation_releases (reservation_id, released_ts) \
-         SELECT ?, ? \
-         WHERE EXISTS( \
-             SELECT 1 FROM file_reservations \
-             WHERE id = ? AND ({ACTIVE_RESERVATION_PREDICATE})"
+
+    // Build the eligibility check: active reservation not already released.
+    let mut check_sql = format!(
+        "SELECT 1 FROM file_reservations \
+         WHERE id = ? AND ({ACTIVE_RESERVATION_PREDICATE}) \
+         AND id NOT IN (SELECT reservation_id FROM file_reservation_releases)"
     );
     match expiry_constraint {
         ReleaseReservationExpiryConstraint::Any => {}
         ReleaseReservationExpiryConstraint::OnOrBefore(_) => {
-            release_sql.push_str(" AND expires_ts <= ?");
+            check_sql.push_str(" AND expires_ts <= ?");
         }
         ReleaseReservationExpiryConstraint::Exact(_) => {
-            release_sql.push_str(" AND expires_ts = ?");
+            check_sql.push_str(" AND expires_ts = ?");
         }
     }
-    release_sql.push_str(" LIMIT 1) RETURNING reservation_id");
+    check_sql.push_str(" LIMIT 1");
+
+    // Insert into the release ledger (no RETURNING — frankensqlite compat).
+    let insert_sql = "INSERT OR IGNORE INTO file_reservation_releases (reservation_id, released_ts) \
+         VALUES (?, ?)";
 
     for id in ids {
         let released_ts = release_marker;
-        let mut release_params = Vec::with_capacity(match expiry_constraint {
-            ReleaseReservationExpiryConstraint::Any => 3,
-            ReleaseReservationExpiryConstraint::OnOrBefore(_)
-            | ReleaseReservationExpiryConstraint::Exact(_) => 4,
-        });
-        release_params.push(Value::BigInt(*id));
-        release_params.push(Value::BigInt(released_ts));
-        release_params.push(Value::BigInt(*id));
+
+        // Step 1: Check eligibility.
+        let mut check_params: Vec<Value> = vec![Value::BigInt(*id)];
         match expiry_constraint {
             ReleaseReservationExpiryConstraint::Any => {}
             ReleaseReservationExpiryConstraint::OnOrBefore(expiry_cutoff)
             | ReleaseReservationExpiryConstraint::Exact(expiry_cutoff) => {
-                release_params.push(Value::BigInt(expiry_cutoff));
+                check_params.push(Value::BigInt(expiry_cutoff));
             }
         }
-        let rows = try_in_tx!(
+        let eligible_rows = try_in_tx!(
             cx,
             &tracked,
-            map_sql_outcome(traw_query(cx, &tracked, &release_sql, &release_params).await)
+            map_sql_outcome(traw_query(cx, &tracked, &check_sql, &check_params).await)
         );
-        let Some(row) = rows.first() else {
+        if eligible_rows.is_empty() {
             continue;
-        };
-        let Some(returned_id) = row_first_i64(row) else {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(DbError::Internal(
-                "release reservation RETURNING id yielded non-integer id".to_string(),
-            ));
-        };
-        if returned_id != *id {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(DbError::Internal(format!(
-                "release reservation RETURNING id mismatch: expected {id}, got {returned_id}"
-            )));
         }
+
+        // Step 2: Record the release.
+        let insert_params = [Value::BigInt(*id), Value::BigInt(released_ts)];
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
+        );
 
         release_marker = release_marker.saturating_add(1);
         released.push(ReleasedReservationMarker {
@@ -10182,6 +10177,11 @@ mod tests {
         let (cx, pool, _dir) = setup_test_pool("create_message_rebuild_inbox_stats_chunks.db");
 
         rt.block_on(async {
+            let conn = crate::open_sqlite_file_with_recovery(pool.sqlite_path())
+                .expect("open sqlite connection for inbox_stats setup");
+            create_inbox_stats_table_for_test(&conn);
+            drop(conn);
+
             let base = now_micros();
             let project = ensure_project(&cx, &pool, &format!("/tmp/am-inbox-chunks-{base}"))
                 .await

@@ -161,7 +161,7 @@ impl CacheMetrics {
 
     fn record_project_hit_sampled(&self) -> bool {
         let hits = self.project_hits.fetch_add(1, Ordering::Relaxed) + 1;
-        hits % HIT_WRITE_MAINTENANCE_INTERVAL == 0
+        hits.is_multiple_of(HIT_WRITE_MAINTENANCE_INTERVAL)
     }
 
     fn record_project_miss(&self) {
@@ -174,7 +174,7 @@ impl CacheMetrics {
 
     fn record_agent_hit_sampled(&self) -> bool {
         let hits = self.agent_hits.fetch_add(1, Ordering::Relaxed) + 1;
-        hits % HIT_WRITE_MAINTENANCE_INTERVAL == 0
+        hits.is_multiple_of(HIT_WRITE_MAINTENANCE_INTERVAL)
     }
 
     fn record_agent_miss(&self) {
@@ -288,17 +288,14 @@ impl ReadCache {
 
                 if should_maintain {
                     let mut cache = self.projects_by_slug.write();
-                    let expired = match cache.get_mut(&key) {
-                        Some(entry) => {
-                            if entry.is_expired(PROJECT_TTL) {
-                                true
-                            } else {
-                                entry.touch();
-                                false
-                            }
+                    let expired = cache.get_mut(&key).is_some_and(|entry| {
+                        if entry.is_expired(PROJECT_TTL) {
+                            true
+                        } else {
+                            entry.touch();
+                            false
                         }
-                        None => false,
-                    };
+                    });
                     if expired {
                         let slug_owned = slug.to_owned();
                         mcp_agent_mail_core::evidence_ledger().record(
@@ -317,19 +314,16 @@ impl ReadCache {
         }
 
         let mut cache = self.projects_by_slug.write();
-        let expired = match cache.get_mut(&key) {
-            Some(entry) => {
-                if entry.is_expired(PROJECT_TTL) {
-                    true
-                } else {
-                    entry.touch();
-                    false
-                }
+        let expired = if let Some(entry) = cache.get_mut(&key) {
+            if entry.is_expired(PROJECT_TTL) {
+                true
+            } else {
+                entry.touch();
+                false
             }
-            None => {
-                CACHE_METRICS.record_project_miss();
-                return None;
-            }
+        } else {
+            CACHE_METRICS.record_project_miss();
+            return None;
         };
         if expired {
             let slug_owned = slug.to_owned();
@@ -382,17 +376,14 @@ impl ReadCache {
 
                 if should_maintain {
                     let mut cache = self.projects_by_human_key.write();
-                    let expired = match cache.get_mut(&key) {
-                        Some(entry) => {
-                            if entry.is_expired(PROJECT_TTL) {
-                                true
-                            } else {
-                                entry.touch();
-                                false
-                            }
+                    let expired = cache.get_mut(&key).is_some_and(|entry| {
+                        if entry.is_expired(PROJECT_TTL) {
+                            true
+                        } else {
+                            entry.touch();
+                            false
                         }
-                        None => false,
-                    };
+                    });
                     if expired {
                         cache.remove(&key);
                     }
@@ -402,19 +393,16 @@ impl ReadCache {
         }
 
         let mut cache = self.projects_by_human_key.write();
-        let expired = match cache.get_mut(&key) {
-            Some(entry) => {
-                if entry.is_expired(PROJECT_TTL) {
-                    true
-                } else {
-                    entry.touch();
-                    false
-                }
+        let expired = if let Some(entry) = cache.get_mut(&key) {
+            if entry.is_expired(PROJECT_TTL) {
+                true
+            } else {
+                entry.touch();
+                false
             }
-            None => {
-                CACHE_METRICS.record_project_miss();
-                return None;
-            }
+        } else {
+            CACHE_METRICS.record_project_miss();
+            return None;
         };
         if expired {
             cache.remove(&key);
@@ -484,17 +472,14 @@ impl ReadCache {
 
                 if should_maintain {
                     let mut cache = self.agents_by_key.write();
-                    let expired = match cache.get_mut(&key) {
-                        Some(entry) => {
-                            if entry.is_expired(AGENT_TTL) {
-                                true
-                            } else {
-                                entry.touch();
-                                false
-                            }
+                    let expired = cache.get_mut(&key).is_some_and(|entry| {
+                        if entry.is_expired(AGENT_TTL) {
+                            true
+                        } else {
+                            entry.touch();
+                            false
                         }
-                        None => false,
-                    };
+                    });
                     if expired {
                         cache.remove(&key);
                     }
@@ -504,19 +489,16 @@ impl ReadCache {
         }
 
         let mut cache = self.agents_by_key.write();
-        let expired = match cache.get_mut(&key) {
-            Some(entry) => {
-                if entry.is_expired(AGENT_TTL) {
-                    true
-                } else {
-                    entry.touch();
-                    false
-                }
+        let expired = if let Some(entry) = cache.get_mut(&key) {
+            if entry.is_expired(AGENT_TTL) {
+                true
+            } else {
+                entry.touch();
+                false
             }
-            None => {
-                CACHE_METRICS.record_agent_miss();
-                return None;
-            }
+        } else {
+            CACHE_METRICS.record_agent_miss();
+            return None;
         };
         if expired {
             cache.remove(&key);
@@ -556,17 +538,14 @@ impl ReadCache {
 
                 if should_maintain {
                     let mut cache = self.agents_by_id.write();
-                    let expired = match cache.get_mut(&key) {
-                        Some(entry) => {
-                            if entry.is_expired(AGENT_TTL) {
-                                true
-                            } else {
-                                entry.touch();
-                                false
-                            }
+                    let expired = cache.get_mut(&key).is_some_and(|entry| {
+                        if entry.is_expired(AGENT_TTL) {
+                            true
+                        } else {
+                            entry.touch();
+                            false
                         }
-                        None => false,
-                    };
+                    });
                     if expired {
                         cache.remove(&key);
                     }
@@ -576,19 +555,16 @@ impl ReadCache {
         }
 
         let mut cache = self.agents_by_id.write();
-        let expired = match cache.get_mut(&key) {
-            Some(entry) => {
-                if entry.is_expired(AGENT_TTL) {
-                    true
-                } else {
-                    entry.touch();
-                    false
-                }
+        let expired = if let Some(entry) = cache.get_mut(&key) {
+            if entry.is_expired(AGENT_TTL) {
+                true
+            } else {
+                entry.touch();
+                false
             }
-            None => {
-                CACHE_METRICS.record_agent_miss();
-                return None;
-            }
+        } else {
+            CACHE_METRICS.record_agent_miss();
+            return None;
         };
         if expired {
             cache.remove(&key);
@@ -725,9 +701,32 @@ impl ReadCache {
         let removed_id = cache.remove(&key).and_then(|a| a.value.id);
         drop(cache); // release key map lock first
 
+        let mut agent_ids_to_remove = Vec::new();
         if let Some(agent_id) = id.or(removed_id) {
+            agent_ids_to_remove.push(agent_id);
+        }
+
+        if id.is_none() {
+            let id_cache = self.agents_by_id.read();
+            agent_ids_to_remove.extend(id_cache.keys().filter_map(|(entry_scope, agent_id)| {
+                if *entry_scope != scope_fp {
+                    return None;
+                }
+                let lookup_key = (*entry_scope, *agent_id);
+                let entry = id_cache.peek(&lookup_key)?;
+                (entry.value.project_id == project_id && entry.value.name == name)
+                    .then_some(*agent_id)
+            }));
+        }
+
+        agent_ids_to_remove.sort_unstable();
+        agent_ids_to_remove.dedup();
+
+        if !agent_ids_to_remove.is_empty() {
             let mut id_cache = self.agents_by_id.write();
-            id_cache.remove(&(scope_fp, agent_id));
+            for agent_id in agent_ids_to_remove {
+                id_cache.remove(&(scope_fp, agent_id));
+            }
         }
     }
 
@@ -748,25 +747,22 @@ impl ReadCache {
         let key = (scope_fingerprint(scope), agent_id);
         {
             let cache = self.inbox_stats.read();
-            let Some(entry) = cache.peek(&key) else {
-                return None;
-            };
+            let entry = cache.peek(&key)?;
             if !entry.is_expired(INBOX_STATS_TTL) {
                 return Some(entry.value.clone());
             }
         }
 
         let mut cache = self.inbox_stats.write();
-        let expired = match cache.get_mut(&key) {
-            Some(entry) => {
-                if entry.is_expired(INBOX_STATS_TTL) {
-                    true
-                } else {
-                    entry.touch();
-                    false
-                }
+        let expired = if let Some(entry) = cache.get_mut(&key) {
+            if entry.is_expired(INBOX_STATS_TTL) {
+                true
+            } else {
+                entry.touch();
+                false
             }
-            None => return None,
+        } else {
+            return None;
         };
         if expired {
             cache.remove(&key);
@@ -1090,6 +1086,42 @@ mod tests {
         cache.invalidate_agent(2, "RedCat", None);
         assert!(cache.get_agent(2, "RedCat").is_none());
         assert!(cache.get_agent_by_id(55).is_none());
+    }
+
+    #[test]
+    fn agent_invalidate_clears_id_index_when_key_index_already_missing() {
+        let cache = ReadCache::new();
+
+        let agent = make_agent_with_id("RedCat", 2, 55);
+        cache.put_agent(&agent);
+
+        let key = (scope_fingerprint(""), 2, InternedStr::new("RedCat"));
+        let mut by_key = cache.agents_by_key.write();
+        by_key.remove(&key);
+        drop(by_key);
+
+        assert!(cache.get_agent(2, "RedCat").is_none());
+        assert!(cache.get_agent_by_id(55).is_some());
+
+        cache.invalidate_agent(2, "RedCat", None);
+        assert!(cache.get_agent_by_id(55).is_none());
+    }
+
+    #[test]
+    fn agent_invalidate_clears_all_matching_stale_id_entries() {
+        let cache = ReadCache::new();
+
+        cache.put_agent(&make_agent_with_id("RedCat", 2, 55));
+        cache.put_agent(&make_agent_with_id("RedCat", 2, 56));
+
+        assert_eq!(cache.get_agent(2, "RedCat").unwrap().id, Some(56));
+        assert!(cache.get_agent_by_id(55).is_some());
+        assert!(cache.get_agent_by_id(56).is_some());
+
+        cache.invalidate_agent(2, "RedCat", None);
+        assert!(cache.get_agent(2, "RedCat").is_none());
+        assert!(cache.get_agent_by_id(55).is_none());
+        assert!(cache.get_agent_by_id(56).is_none());
     }
 
     #[test]

@@ -2388,6 +2388,7 @@ fn env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
         .clamp(min, max)
 }
 
+#[cfg(feature = "hybrid")]
 fn hybrid_budget_governor_config_from_env() -> HybridBudgetGovernorConfig {
     let defaults = HybridBudgetGovernorConfig::default();
     let tight_ms = env_u64(
@@ -3159,6 +3160,8 @@ fn cache_scope_discriminator(query: &SearchQuery) -> u64 {
         RankingMode::Recency => "recency".hash(&mut hasher),
     }
 
+    query.explain.hash(&mut hasher);
+
     let mut importance_levels: Vec<&'static str> = query
         .importance
         .iter()
@@ -3290,6 +3293,7 @@ fn build_search_cache_key(
     let mut discriminator_hasher = DefaultHasher::new();
     cache_scope_discriminator(query).hash(&mut discriminator_hasher);
     cache_authorization_discriminator(options).hash(&mut discriminator_hasher);
+    cache_engine_discriminator(engine_mode).hash(&mut discriminator_hasher);
     sqlite_key_for_pool(pool).hash(&mut discriminator_hasher);
     let scope_discriminator = discriminator_hasher.finish();
     // Cursor-based pagination: hash cursor token into offset proxy.
@@ -3323,6 +3327,18 @@ fn build_search_cache_key(
         offset_proxy,
         query.effective_limit(),
     )
+}
+
+#[allow(deprecated)]
+const fn cache_engine_discriminator(engine: SearchEngine) -> &'static str {
+    match engine {
+        SearchEngine::Legacy => "legacy",
+        SearchEngine::Lexical => "lexical",
+        SearchEngine::Semantic => "semantic",
+        SearchEngine::Hybrid => "hybrid",
+        SearchEngine::Auto => "auto",
+        SearchEngine::Shadow => "shadow",
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -4626,6 +4642,57 @@ mod tests {
             build_search_cache_key(&pool, &query, &default_redaction, 9),
             build_search_cache_key(&pool, &query, &strict_redaction, 9),
             "differently redacted search responses must not share cache entries"
+        );
+    }
+
+    #[test]
+    fn build_search_cache_key_distinguishes_explain_mode() {
+        let config = crate::pool::DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..crate::pool::DbPoolConfig::default()
+        };
+        let pool = DbPool::new(&config).expect("pool");
+        let base_query = SearchQuery {
+            text: "shared".to_string(),
+            ..Default::default()
+        };
+        let explain_query = SearchQuery {
+            explain: true,
+            ..base_query.clone()
+        };
+
+        assert_ne!(
+            build_search_cache_key(&pool, &base_query, &SearchOptions::default(), 9),
+            build_search_cache_key(&pool, &explain_query, &SearchOptions::default(), 9),
+            "queries with different explain modes must not share cache entries"
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn build_search_cache_key_distinguishes_legacy_and_lexical_engines() {
+        let config = crate::pool::DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..crate::pool::DbPoolConfig::default()
+        };
+        let pool = DbPool::new(&config).expect("pool");
+        let query = SearchQuery {
+            text: "shared".to_string(),
+            ..Default::default()
+        };
+        let legacy = SearchOptions {
+            search_engine: Some(SearchEngine::Legacy),
+            ..SearchOptions::default()
+        };
+        let lexical = SearchOptions {
+            search_engine: Some(SearchEngine::Lexical),
+            ..SearchOptions::default()
+        };
+
+        assert_ne!(
+            build_search_cache_key(&pool, &query, &legacy, 9),
+            build_search_cache_key(&pool, &query, &lexical, 9),
+            "engine-specific search results must not share cache entries"
         );
     }
 
