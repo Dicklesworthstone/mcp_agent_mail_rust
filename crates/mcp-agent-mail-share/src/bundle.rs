@@ -944,13 +944,9 @@ fn collect_entries_ctx(
             }
 
             if file_type.is_symlink() {
-                // Symlinks are always rejected during collection.
-                // Symlinked files that resolve outside the source tree are a
-                // path-escape vector; symlinked directories must not be
-                // traversed at all to prevent escape from the source tree.
-                //
-                // Resolve the link and check containment.  If the target
-                // escapes the source root, fail the export immediately.
+                // Resolve the link target and verify containment.
+                // Symlinks escaping the source root are a path-traversal
+                // vector and must fail the export immediately.
                 let canonical = path.canonicalize()?;
                 if !canonical.starts_with(base) {
                     return Err(std::io::Error::other(format!(
@@ -961,13 +957,18 @@ fn collect_entries_ctx(
                             .replace('\\', "/"),
                     )));
                 }
-                // Symlink target is inside the source tree — include it.
-                let relative = path
-                    .strip_prefix(base)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                entries.push(relative);
+                // Target is inside the source tree.  If it resolves to a
+                // directory, recurse into it; if a file, include it.
+                if canonical.is_dir() {
+                    stack.push(path);
+                } else if canonical.is_file() {
+                    let relative = path
+                        .strip_prefix(base)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    entries.push(relative);
+                }
                 continue;
             }
 
