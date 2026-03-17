@@ -399,11 +399,12 @@ pub async fn file_reservation_paths(
     }
 
     let ttl = ttl_seconds.map_or(3600, |t| t.clamp(60, 31_536_000));
-    if ttl_seconds.is_some_and(|t| t < 60) {
-        tracing::warn!(
-            "ttl_seconds={} clamped to minimum 60s",
-            ttl_seconds.unwrap_or(0)
-        );
+    if let Some(t) = ttl_seconds {
+        if t < 60 {
+            tracing::warn!("ttl_seconds={t} clamped to minimum 60s");
+        } else if t > 31_536_000 {
+            tracing::warn!("ttl_seconds={t} clamped to maximum 31536000s (1 year)");
+        }
     }
 
     let is_exclusive = exclusive.unwrap_or(true);

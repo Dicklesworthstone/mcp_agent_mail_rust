@@ -129,11 +129,14 @@ pub async fn macro_start_session(
             }
         } else {
             let ttl = file_reservation_ttl_seconds.map_or(3600, |t| t.clamp(60, 31_536_000));
-            if file_reservation_ttl_seconds.is_some_and(|t| t < 60) {
-                tracing::warn!(
-                    "file_reservation_ttl_seconds={} clamped to minimum 60s",
-                    file_reservation_ttl_seconds.unwrap_or(0)
-                );
+            if let Some(t) = file_reservation_ttl_seconds {
+                if t < 60 {
+                    tracing::warn!("file_reservation_ttl_seconds={t} clamped to minimum 60s");
+                } else if t > 31_536_000 {
+                    tracing::warn!(
+                        "file_reservation_ttl_seconds={t} clamped to maximum 31536000s (1 year)"
+                    );
+                }
             }
             let reason = file_reservation_reason.unwrap_or_else(|| "macro-session".to_string());
             let reservation_json = crate::reservations::file_reservation_paths(

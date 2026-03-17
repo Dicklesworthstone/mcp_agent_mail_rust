@@ -1997,8 +1997,12 @@ effective_free_bytes={free}"
     )?;
 
     // Serialize processed attachment metadata as JSON array
-    let attachments_json =
-        serde_json::to_string(&all_attachment_meta).unwrap_or_else(|_| "[]".to_string());
+    let attachments_json = serde_json::to_string(&all_attachment_meta).unwrap_or_else(|e| {
+        tracing::warn!(
+            "attachment metadata serialization failed, falling back to empty array: {e}"
+        );
+        "[]".to_string()
+    });
 
     // Create message + recipients in a single DB transaction (1 fsync)
     let recipient_refs: SmallVec<[(i64, &str); 8]> = all_recipients
