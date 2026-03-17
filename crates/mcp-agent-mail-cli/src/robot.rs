@@ -6877,6 +6877,18 @@ mod tests {
             "conflict evidence should surface by default"
         );
         assert_eq!(
+            data.summary
+                .as_ref()
+                .map(|summary| summary.budget_mode.as_str()),
+            Some("pressure")
+        );
+        assert_eq!(
+            data.summary
+                .as_ref()
+                .and_then(|summary| summary.fallback_reason.as_deref()),
+            Some("budget_pressure")
+        );
+        assert_eq!(
             data.conflicts
                 .as_ref()
                 .map_or(0, |item| item.deadlock_cycles),
