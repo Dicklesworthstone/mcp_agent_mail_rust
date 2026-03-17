@@ -134,9 +134,6 @@ CREATE TABLE IF NOT EXISTS agent_links (
     expires_ts INTEGER,
     UNIQUE(a_project_id, a_agent_id, b_project_id, b_agent_id)
 );
--- Note: the UNIQUE table constraint above already creates an implicit unique
--- index on (a_project_id, a_agent_id, b_project_id, b_agent_id); no separate
--- CREATE UNIQUE INDEX is needed.
 CREATE INDEX IF NOT EXISTS idx_agent_links_a_project ON agent_links(a_project_id);
 CREATE INDEX IF NOT EXISTS idx_agent_links_b_project ON agent_links(b_project_id);
 CREATE INDEX IF NOT EXISTS idx_agent_links_status ON agent_links(status);

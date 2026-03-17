@@ -3939,13 +3939,7 @@ fn compute_next_cursor(
     }
     // Use the last result's (score, id) as cursor
     results.last().map(|r| {
-        let score = match ranking {
-            RankingMode::Recency => r.created_ts.map_or_else(
-                || r.score.unwrap_or(0.0),
-                |created_ts| -micros_to_f64_for_cursor(created_ts),
-            ),
-            RankingMode::Relevance => r.score.unwrap_or(0.0),
-        };
+        let score = cursor_sort_score(r, ranking);
         let cursor = SearchCursor { score, id: r.id };
         cursor.encode()
     })
@@ -4240,6 +4234,92 @@ mod tests {
         assert_eq!(
             decoded.score.to_bits(),
             (-1_700_000_000_000_123.0f64).to_bits()
+        );
+    }
+
+    #[test]
+    fn recency_cursor_round_trips_through_apply_cursor_window() {
+        let page = vec![
+            SearchResult {
+                doc_kind: DocKind::Message,
+                id: 3,
+                project_id: Some(1),
+                title: "newest".to_string(),
+                body: String::new(),
+                score: Some(0.0),
+                importance: None,
+                ack_required: None,
+                created_ts: Some(300),
+                thread_id: None,
+                from_agent: None,
+                from_agent_id: None,
+                to: None,
+                cc: None,
+                bcc: None,
+                reason_codes: Vec::new(),
+                score_factors: Vec::new(),
+                redacted: false,
+                redaction_reason: None,
+            },
+            SearchResult {
+                doc_kind: DocKind::Message,
+                id: 2,
+                project_id: Some(1),
+                title: "boundary".to_string(),
+                body: String::new(),
+                score: Some(0.0),
+                importance: None,
+                ack_required: None,
+                created_ts: Some(200),
+                thread_id: None,
+                from_agent: None,
+                from_agent_id: None,
+                to: None,
+                cc: None,
+                bcc: None,
+                reason_codes: Vec::new(),
+                score_factors: Vec::new(),
+                redacted: false,
+                redaction_reason: None,
+            },
+        ];
+        let cursor = compute_next_cursor(&page, page.len(), RankingMode::Recency).unwrap();
+        let query = SearchQuery {
+            ranking: RankingMode::Recency,
+            cursor: Some(cursor),
+            ..SearchQuery::default()
+        };
+        let remaining = apply_cursor_window(
+            vec![
+                page[0].clone(),
+                page[1].clone(),
+                SearchResult {
+                    doc_kind: DocKind::Message,
+                    id: 1,
+                    project_id: Some(1),
+                    title: "older".to_string(),
+                    body: String::new(),
+                    score: Some(0.0),
+                    importance: None,
+                    ack_required: None,
+                    created_ts: Some(100),
+                    thread_id: None,
+                    from_agent: None,
+                    from_agent_id: None,
+                    to: None,
+                    cc: None,
+                    bcc: None,
+                    reason_codes: Vec::new(),
+                    score_factors: Vec::new(),
+                    redacted: false,
+                    redaction_reason: None,
+                },
+            ],
+            &query,
+        );
+        assert_eq!(
+            remaining.iter().map(|result| result.id).collect::<Vec<_>>(),
+            vec![1]
         );
     }
 

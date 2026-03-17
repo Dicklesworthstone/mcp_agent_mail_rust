@@ -373,14 +373,21 @@ fn escalate(
                     config: config.clone(),
                     reservations: res_jsons,
                 };
-                match mcp_agent_mail_storage::wbq_enqueue(op) {
+                match mcp_agent_mail_storage::wbq_enqueue(op.clone()) {
                     mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
                     | mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {}
                     mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
                         warn!(
-                            "WBQ enqueue failed; skipping reservation artifacts archive write project={}",
-                            project.slug
+                            project = %project.slug,
+                            "WBQ unavailable during ACK escalation archive write; falling back to synchronous storage write"
                         );
+                        if let Err(error) = mcp_agent_mail_storage::write_op_sync(&op) {
+                            warn!(
+                                error = %error,
+                                project = %project.slug,
+                                "ACK escalation archive fallback write failed"
+                            );
+                        }
                     }
                 }
             }

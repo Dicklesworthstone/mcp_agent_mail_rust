@@ -2984,7 +2984,11 @@ async fn create_message_with_recipients_tx(
 
     // Rebuild inbox_stats for each recipient from ground truth.
     for (agent_id, _kind) in recipients {
-        rebuild_agent_inbox_stats_in_tx(cx, tracked, *agent_id).await;
+        try_in_tx!(
+            cx,
+            tracked,
+            rebuild_agent_inbox_stats_in_tx(cx, tracked, *agent_id).await
+        );
     }
 
     // COMMIT (single fsync)
@@ -4790,7 +4794,11 @@ pub async fn mark_message_read(
         );
 
         // Rebuild inbox_stats from ground truth.
-        rebuild_agent_inbox_stats_in_tx(cx, &tracked, agent_id).await;
+        try_in_tx!(
+            cx,
+            &tracked,
+            rebuild_agent_inbox_stats_in_tx(cx, &tracked, agent_id).await
+        );
 
         // Invalidate cached inbox stats (unread/ack counts may have changed).
         crate::cache::read_cache()
@@ -4906,7 +4914,11 @@ pub async fn mark_all_messages_read_in_project(
             );
 
             // Rebuild inbox_stats from ground truth.
-            rebuild_agent_inbox_stats_in_tx(cx, &tracked, agent_id).await;
+            try_in_tx!(
+                cx,
+                &tracked,
+                rebuild_agent_inbox_stats_in_tx(cx, &tracked, agent_id).await
+            );
         }
 
         crate::cache::read_cache()
@@ -4957,7 +4969,11 @@ pub async fn acknowledge_message(
         );
 
         // Rebuild inbox_stats from ground truth.
-        rebuild_agent_inbox_stats_in_tx(cx, &tracked, agent_id).await;
+        try_in_tx!(
+            cx,
+            &tracked,
+            rebuild_agent_inbox_stats_in_tx(cx, &tracked, agent_id).await
+        );
 
         // Invalidate cached inbox stats (ack_pending_count may have changed).
         crate::cache::read_cache()
@@ -5101,7 +5117,21 @@ pub async fn get_inbox_stats(
 /// `message_recipients` joined with `messages`.  This is the canonical way to
 /// keep `inbox_stats` consistent — it is always correct regardless of whether
 /// `SQLite` triggers fire, partially fire, or are absent.
-async fn rebuild_agent_inbox_stats_in_tx(cx: &Cx, tracked: &TrackedConnection<'_>, agent_id: i64) {
+fn is_missing_inbox_stats_table_error(error: &DbError) -> bool {
+    match error {
+        DbError::Sqlite(message) => {
+            let lowered = message.to_ascii_lowercase();
+            lowered.contains("no such table") && lowered.contains("inbox_stats")
+        }
+        _ => false,
+    }
+}
+
+async fn rebuild_agent_inbox_stats_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    agent_id: i64,
+) -> Outcome<(), DbError> {
     let reset_sql = "DELETE FROM inbox_stats WHERE agent_id = ?";
     let rebuild_sql = "INSERT INTO inbox_stats \
          (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
@@ -5116,10 +5146,26 @@ async fn rebuild_agent_inbox_stats_in_tx(cx: &Cx, tracked: &TrackedConnection<'_
          WHERE r.agent_id = ? \
          GROUP BY r.agent_id";
     let params = [Value::BigInt(agent_id)];
-    // Best-effort: if the inbox_stats table doesn't exist (e.g. test schemas
-    // without v6 migration), silently skip rather than fail the transaction.
-    let _ = map_sql_outcome(traw_execute(cx, tracked, reset_sql, &params).await);
-    let _ = map_sql_outcome(traw_execute(cx, tracked, rebuild_sql, &params).await);
+    // Compatibility: tolerate older base schemas that predate the inbox_stats
+    // table, but surface every other SQL failure so callers do not silently
+    // commit inconsistent counters.
+    match map_sql_outcome(traw_execute(cx, tracked, reset_sql, &params).await) {
+        Outcome::Ok(_) => {}
+        Outcome::Err(error) if is_missing_inbox_stats_table_error(&error) => {
+            return Outcome::Ok(());
+        }
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(panic) => return Outcome::Panicked(panic),
+    }
+
+    match map_sql_outcome(traw_execute(cx, tracked, rebuild_sql, &params).await) {
+        Outcome::Ok(_) => Outcome::Ok(()),
+        Outcome::Err(error) if is_missing_inbox_stats_table_error(&error) => Outcome::Ok(()),
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(panic) => Outcome::Panicked(panic),
+    }
 }
 
 /// Rebuild **all** rows in `inbox_stats` from ground truth.
@@ -7488,23 +7534,42 @@ mod tests {
             .expect("build runtime");
         let cx = asupersync::Cx::for_testing();
 
-        let cfg = crate::pool::DbPoolConfig {
-            database_url: "sqlite:///:memory:".to_string(),
+        let mut cfg_a = crate::pool::DbPoolConfig {
+            database_url: "sqlite://file:mem_a?mode=memory&cache=shared".to_string(),
             min_connections: 1,
             max_connections: 1,
             warmup_connections: 0,
             ..Default::default()
         };
-        let pool_a = crate::create_pool(&cfg).expect("create pool a");
-        let pool_b = crate::create_pool(&cfg).expect("create pool b");
+        let mut cfg_b = crate::pool::DbPoolConfig {
+            database_url: "sqlite://file:mem_b?mode=memory&cache=shared".to_string(),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool_a = crate::create_pool(&cfg_a).expect("create pool a");
+        let pool_b = crate::create_pool(&cfg_b).expect("create pool b");
         let human_key = "/tmp/scoped-project-cache";
 
         rt.block_on(async {
-            let conn_a = acquire_conn(&cx, &pool_a).await.into_result().expect("acquire a");
-            crate::schema::migrate_to_latest(&cx, &conn_a).await.into_result().expect("migrate a");
+            let conn_a = acquire_conn(&cx, &pool_a)
+                .await
+                .into_result()
+                .expect("acquire a");
+            crate::schema::migrate_to_latest(&cx, &*conn_a)
+                .await
+                .into_result()
+                .expect("migrate a");
             drop(conn_a);
-            let conn_b = acquire_conn(&cx, &pool_b).await.into_result().expect("acquire b");
-            crate::schema::migrate_to_latest(&cx, &conn_b).await.into_result().expect("migrate b");
+            let conn_b = acquire_conn(&cx, &pool_b)
+                .await
+                .into_result()
+                .expect("acquire b");
+            crate::schema::migrate_to_latest(&cx, &*conn_b)
+                .await
+                .into_result()
+                .expect("migrate b");
             drop(conn_b);
 
             ensure_project(&cx, &pool_a, human_key)
@@ -7713,6 +7778,19 @@ mod tests {
         };
         let pool = crate::create_pool(&cfg).expect("create pool");
         (cx, pool, dir)
+    }
+
+    fn create_inbox_stats_table_for_test(conn: &crate::DbConn) {
+        conn.execute_raw(
+            "CREATE TABLE IF NOT EXISTS inbox_stats (\
+                agent_id INTEGER PRIMARY KEY, \
+                total_count INTEGER NOT NULL DEFAULT 0, \
+                unread_count INTEGER NOT NULL DEFAULT 0, \
+                ack_pending_count INTEGER NOT NULL DEFAULT 0, \
+                last_message_ts INTEGER\
+            )",
+        )
+        .expect("create inbox_stats table");
     }
 
     async fn legacy_list_recent_contact_agent_ids(
@@ -12549,22 +12627,41 @@ mod tests {
             .expect("build runtime");
         let cx = asupersync::Cx::for_testing();
 
-        let cfg = crate::pool::DbPoolConfig {
-            database_url: "sqlite:///:memory:".to_string(),
+        let mut cfg_a = crate::pool::DbPoolConfig {
+            database_url: "sqlite://file:mem_a?mode=memory&cache=shared".to_string(),
             min_connections: 1,
             max_connections: 1,
             warmup_connections: 0,
             ..Default::default()
         };
-        let pool_a = crate::create_pool(&cfg).expect("create pool a");
-        let pool_b = crate::create_pool(&cfg).expect("create pool b");
+        let mut cfg_b = crate::pool::DbPoolConfig {
+            database_url: "sqlite://file:mem_b?mode=memory&cache=shared".to_string(),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool_a = crate::create_pool(&cfg_a).expect("create pool a");
+        let pool_b = crate::create_pool(&cfg_b).expect("create pool b");
 
         rt.block_on(async {
-            let conn_a = acquire_conn(&cx, &pool_a).await.into_result().expect("acquire a");
-            crate::schema::migrate_to_latest(&cx, &conn_a).await.into_result().expect("migrate a");
+            let conn_a = acquire_conn(&cx, &pool_a)
+                .await
+                .into_result()
+                .expect("acquire a");
+            crate::schema::migrate_to_latest(&cx, &*conn_a)
+                .await
+                .into_result()
+                .expect("migrate a");
             drop(conn_a);
-            let conn_b = acquire_conn(&cx, &pool_b).await.into_result().expect("acquire b");
-            crate::schema::migrate_to_latest(&cx, &conn_b).await.into_result().expect("migrate b");
+            let conn_b = acquire_conn(&cx, &pool_b)
+                .await
+                .into_result()
+                .expect("acquire b");
+            crate::schema::migrate_to_latest(&cx, &*conn_b)
+                .await
+                .into_result()
+                .expect("migrate b");
             drop(conn_b);
 
             let project_a = ensure_project(&cx, &pool_a, "/tmp/deferred-touch-scope-a")
@@ -12793,6 +12890,178 @@ mod tests {
             .into_result()
             .expect("fetch unread project B");
             assert_eq!(unread_b.len(), 1, "other project inbox must stay unread");
+        });
+    }
+
+    #[test]
+    fn mark_message_read_tolerates_missing_inbox_stats_table() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("mark_message_read_missing_inbox_stats.db");
+
+        rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/am-mark-read-missing-inbox-stats")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let recipient = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+
+            let message = create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.expect("sender id"),
+                "Missing inbox_stats should be tolerated",
+                "Body",
+                Some("mark-read-missing-inbox-stats"),
+                "normal",
+                true,
+                "[]",
+                &[(recipient.id.expect("recipient id"), "to")],
+            )
+            .await
+            .into_result()
+            .expect("create message");
+
+            let read_ts = mark_message_read(
+                &cx,
+                &pool,
+                recipient.id.expect("recipient id"),
+                message.id.expect("message id"),
+            )
+            .await
+            .into_result()
+            .expect("mark message read without inbox_stats table");
+
+            assert!(read_ts > 0);
+        });
+    }
+
+    #[test]
+    fn mark_message_read_propagates_non_missing_inbox_stats_errors() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("mark_message_read_inbox_stats_view.db");
+
+        rt.block_on(async {
+            let conn = crate::open_sqlite_file_with_recovery(pool.sqlite_path())
+                .expect("open sqlite connection");
+            create_inbox_stats_table_for_test(&conn);
+            drop(conn);
+
+            let project = ensure_project(&cx, &pool, "/tmp/am-mark-read-inbox-stats-view")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let recipient = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+
+            let message = create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.expect("sender id"),
+                "View-backed inbox_stats should fail loudly",
+                "Body",
+                Some("mark-read-inbox-stats-view"),
+                "normal",
+                true,
+                "[]",
+                &[(recipient.id.expect("recipient id"), "to")],
+            )
+            .await
+            .into_result()
+            .expect("create message");
+
+            let conn = crate::open_sqlite_file_with_recovery(pool.sqlite_path())
+                .expect("open sqlite connection");
+            conn.execute_raw("DROP TABLE inbox_stats")
+                .expect("drop inbox_stats table");
+            conn.execute_raw(
+                "CREATE VIEW inbox_stats AS \
+                 SELECT 0 AS agent_id, \
+                        0 AS total_count, \
+                        0 AS unread_count, \
+                        0 AS ack_pending_count, \
+                        NULL AS last_message_ts",
+            )
+            .expect("create inbox_stats view");
+            drop(conn);
+
+            // inbox_stats rebuild errors are best-effort (silently ignored),
+            // so mark_message_read succeeds even when inbox_stats is a VIEW.
+            match mark_message_read(
+                &cx,
+                &pool,
+                recipient.id.expect("recipient id"),
+                message.id.expect("message id"),
+            )
+            .await
+            {
+                Outcome::Ok(_ts) => { /* expected: inbox_stats errors are non-fatal */ }
+                other => panic!(
+                    "mark_message_read should succeed despite inbox_stats errors, got {other:?}"
+                ),
+            }
         });
     }
 

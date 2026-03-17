@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::Path;
 
+use crate::messaging::try_dispatch_archive_write;
 use crate::tool_util::{
     db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, legacy_tool_error,
     resolve_project,
@@ -37,24 +38,17 @@ const fn us_to_ms_ceil(us: u64) -> u64 {
 /// but do not fail the tool call – the DB is the source of truth.
 ///
 /// Uses the write-behind queue when available. If the queue is unavailable,
-/// logs a warning and skips the archive write.
+/// falls back to the direct storage path before giving up.
 fn try_write_agent_profile(config: &Config, project_slug: &str, agent_json: &serde_json::Value) {
     let op = mcp_agent_mail_storage::WriteOp::AgentProfile {
         project_slug: project_slug.to_string(),
         config: config.clone(),
         agent_json: agent_json.clone(),
     };
-    match mcp_agent_mail_storage::wbq_enqueue(op) {
-        mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
-        | mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {
-            // Disk pressure guard: archive writes may be disabled; DB remains authoritative.
-        }
-        mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
-            tracing::warn!(
-                "WBQ enqueue failed; skipping agent profile archive write project={project_slug}"
-            );
-        }
-    }
+    try_dispatch_archive_write(
+        op,
+        &format!("agent profile archive write project={project_slug}"),
+    );
 }
 
 fn enqueue_project_semantic_index(project: &mcp_agent_mail_db::ProjectRow) {

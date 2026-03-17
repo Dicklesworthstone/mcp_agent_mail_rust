@@ -3975,16 +3975,13 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
                 config: config.clone(),
                 reservations: release_payloads,
             };
-            match mcp_agent_mail_storage::wbq_enqueue(op) {
-                mcp_agent_mail_storage::WbqEnqueueResult::Enqueued
-                | mcp_agent_mail_storage::WbqEnqueueResult::SkippedDiskCritical => {}
-                mcp_agent_mail_storage::WbqEnqueueResult::QueueUnavailable => {
-                    tracing::warn!(
-                        "WBQ enqueue failed; skipping reservation release artifacts archive write project={}",
-                        project.slug
-                    );
-                }
-            }
+            crate::messaging::try_dispatch_archive_write(
+                op,
+                &format!(
+                    "reservation release artifacts archive write project={}",
+                    project.slug
+                ),
+            );
         }
     }
 

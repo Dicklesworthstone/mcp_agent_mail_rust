@@ -523,16 +523,23 @@ fn path_modified_within_grace(path: &Path, now_us: i64, grace_us: i64) -> bool {
         })
 }
 
+enum ActivityProbeResult {
+    Active,
+    Inactive,
+    Truncated,
+    Unsupported,
+}
+
 fn check_git_listed_activity(
     workspace: &Path,
     pathspec: &str,
     now_us: i64,
     grace_us: i64,
-) -> Option<bool> {
+) -> ActivityProbeResult {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
 
-    let mut child = Command::new("git")
+    let Ok(mut child) = Command::new("git")
         .args([
             "-C",
             &workspace.to_string_lossy(),
@@ -546,48 +553,33 @@ fn check_git_listed_activity(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .ok()?;
+    else {
+        return ActivityProbeResult::Unsupported;
+    };
 
-    let mut found_activity = false;
-    let mut count = 0;
-    let mut found_probe_limit = false;
+    let Some(stdout) = child.stdout.take() else {
+        return ActivityProbeResult::Inactive;
+    };
 
-    if let Some(stdout) = child.stdout.take() {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            if path_modified_within_grace(&workspace.join(line), now_us, grace_us) {
-                found_activity = true;
-                break;
-            }
-            count += 1;
-            if count >= ACTIVITY_PROBE_PATH_LIMIT {
-                found_probe_limit = true;
-                break;
-            }
+    let reader = BufReader::new(stdout);
+    for line in reader.lines().map_while(Result::ok) {
+        if path_modified_within_grace(&workspace.join(line), now_us, grace_us) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return ActivityProbeResult::Active;
         }
     }
 
-    if found_activity {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Some(true);
-    }
-
-    if found_probe_limit {
-        let _ = child.kill();
-        let _ = child.wait();
-        return None;
-    }
-
-    let status = child.wait().ok()?;
-    if status.success() {
-        Some(found_activity)
-    } else {
-        None
-    }
+    let _ = child.kill();
+    let _ = child.wait();
+    ActivityProbeResult::Inactive
 }
 
-fn check_directory_activity_fallback(dir: &Path, now_us: i64, grace_us: i64) -> Option<bool> {
+fn check_directory_activity_fallback(
+    dir: &Path,
+    now_us: i64,
+    grace_us: i64,
+) -> ActivityProbeResult {
     for (scanned, entry) in walkdir::WalkDir::new(dir)
         .follow_links(false)
         .into_iter()
@@ -596,13 +588,13 @@ fn check_directory_activity_fallback(dir: &Path, now_us: i64, grace_us: i64) -> 
         .enumerate()
     {
         if scanned >= ACTIVITY_PROBE_PATH_LIMIT {
-            return None;
+            return ActivityProbeResult::Truncated;
         }
         if path_modified_within_grace(entry.path(), now_us, grace_us) {
-            return Some(true);
+            return ActivityProbeResult::Active;
         }
     }
-    Some(false)
+    ActivityProbeResult::Inactive
 }
 
 fn check_glob_activity_fallback(
@@ -610,7 +602,7 @@ fn check_glob_activity_fallback(
     pattern: &str,
     now_us: i64,
     grace_us: i64,
-) -> Option<bool> {
+) -> ActivityProbeResult {
     let base_str = workspace.to_string_lossy().replace('\\', "/");
     let base_escaped = glob::Pattern::escape(&base_str);
     // We use format! instead of Path::join because base_escaped is a string
@@ -622,18 +614,18 @@ fn check_glob_activity_fallback(
     };
 
     let Ok(paths) = glob::glob(&full_pattern) else {
-        return Some(false);
+        return ActivityProbeResult::Unsupported;
     };
 
     for (scanned, entry) in paths.flatten().enumerate() {
         if scanned >= ACTIVITY_PROBE_PATH_LIMIT {
-            return None;
+            return ActivityProbeResult::Truncated;
         }
         if path_modified_within_grace(&entry, now_us, grace_us) {
-            return Some(true);
+            return ActivityProbeResult::Active;
         }
     }
-    Some(false)
+    ActivityProbeResult::Inactive
 }
 
 /// Check if any matched files have recent filesystem activity.
@@ -661,21 +653,31 @@ fn check_filesystem_activity(
         let pathspec = format!(":(glob){pattern}");
         // Fast path: let git enumerate matching files so ignored trees such as
         // `target/` do not explode synchronous traversal cost.
-        if let Some(recent) = check_git_listed_activity(workspace, &pathspec, now_us, grace_us) {
-            return recent;
+        match check_git_listed_activity(workspace, &pathspec, now_us, grace_us) {
+            ActivityProbeResult::Inactive => return false,
+            ActivityProbeResult::Active | ActivityProbeResult::Truncated => return true, // Fail closed to preserve reservation
+            ActivityProbeResult::Unsupported => {} // Fall through to glob
         }
 
         // Fallback: glob traversal for non-git workspaces or truncated git scans.
         // If the fallback also truncates, fail closed and keep the reservation.
-        return check_glob_activity_fallback(workspace, &pattern, now_us, grace_us).unwrap_or(true);
+        return matches!(
+            check_glob_activity_fallback(workspace, &pattern, now_us, grace_us),
+            ActivityProbeResult::Active | ActivityProbeResult::Truncated
+        );
     }
 
     let candidate = workspace.join(&pattern);
     if candidate.is_dir() {
-        if let Some(recent) = check_git_listed_activity(workspace, &pattern, now_us, grace_us) {
-            return recent;
+        match check_git_listed_activity(workspace, &pattern, now_us, grace_us) {
+            ActivityProbeResult::Inactive => return false,
+            ActivityProbeResult::Active | ActivityProbeResult::Truncated => return true, // Fail closed
+            ActivityProbeResult::Unsupported => {}
         }
-        return check_directory_activity_fallback(&candidate, now_us, grace_us).unwrap_or(true);
+        return matches!(
+            check_directory_activity_fallback(&candidate, now_us, grace_us),
+            ActivityProbeResult::Active | ActivityProbeResult::Truncated
+        );
     }
     if candidate.exists() && path_modified_within_grace(&candidate, now_us, grace_us) {
         return true;

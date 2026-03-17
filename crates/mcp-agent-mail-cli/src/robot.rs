@@ -998,7 +998,7 @@ fn parse_output_format(s: &str) -> Result<OutputFormat, String> {
     s.parse()
 }
 
-/// All `am robot` subcommands (16 commands across 4 tracks).
+/// All `am robot` subcommands (17 commands across 5 tracks).
 #[derive(Debug, Subcommand)]
 pub enum RobotSubcommand {
     // ── Track 2: Situational Awareness ──────────────────────────────────

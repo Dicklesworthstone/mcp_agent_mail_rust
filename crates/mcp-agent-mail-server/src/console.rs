@@ -331,9 +331,9 @@ pub fn render_tool_call_start(
 ) -> Vec<String> {
     // Sanitize user-supplied values to prevent terminal escape injection.
     let tool_name = &strip_ansi_content(tool_name);
-    let project = project.map(|p| strip_ansi_content(p));
+    let project = project.map(strip_ansi_content);
     let project = project.as_deref();
-    let agent = agent.map(|a| strip_ansi_content(a));
+    let agent = agent.map(strip_ansi_content);
     let agent = agent.as_deref();
 
     let mut lines = Vec::with_capacity(20);
@@ -365,7 +365,7 @@ pub fn render_tool_call_start(
 
     // Info rows
     let info_rows: Vec<(&str, String)> = vec![
-        ("Tool", tool_name.to_string()),
+        ("Tool", tool_name.clone()),
         ("Time", timestamp),
         ("Project", project.unwrap_or("-").to_string()),
         ("Agent", agent.unwrap_or("-").to_string()),

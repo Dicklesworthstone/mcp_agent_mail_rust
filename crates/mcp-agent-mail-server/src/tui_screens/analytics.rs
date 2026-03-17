@@ -22,7 +22,7 @@ use mcp_agent_mail_core::{
 };
 
 use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
-use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenMsg};
+use crate::tui_screens::{DeepLinkTarget, HelpEntry, MailScreen, MailScreenId, MailScreenMsg};
 use crate::tui_widgets::fancy::SummaryFooter;
 
 /// Refresh the insight feed every N ticks (~100ms each → ~5s).
@@ -2358,7 +2358,7 @@ impl MailScreen for AnalyticsScreen {
                     self.sort_mode,
                     active_cards.len(),
                     self.feed.cards.len(),
-                    false,
+                    true,
                     false,
                 );
             }
@@ -2589,7 +2589,8 @@ impl MailScreen for AnalyticsScreen {
             let max_list_h = content
                 .height
                 .saturating_sub(ANALYTICS_STACKED_DETAIL_MIN_HEIGHT)
-                .saturating_sub(stack_gap);
+                .saturating_sub(stack_gap)
+                .max(1);
             list_h = list_h.min(max_list_h);
 
             let list_area = Rect::new(content.x, content.y, content.width, list_h);
@@ -3739,12 +3740,8 @@ mod tests {
             cards_produced: 1,
         };
         screen.focus = AnalyticsFocus::Detail;
-        screen.detail_scroll = 0;
-        // Render once so detail_focus_available is set from the layout.
-        let mut pool = ftui::GraphemePool::new();
-        let mut frame = Frame::new(140, 30, &mut pool);
-        screen.view(&mut frame, Rect::new(0, 0, 140, 30), &state);
-        // Override the layout-derived max so the fast-scroll range is
+        screen.detail_focus_available.set(true);
+        // Set a high max so the fast-scroll range is
         // not clamped by the compact test viewport.
         screen.last_detail_max_scroll.set(100);
 
