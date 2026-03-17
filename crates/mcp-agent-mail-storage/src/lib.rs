@@ -4772,10 +4772,21 @@ pub fn process_attachments(
     attachment_paths: &[String],
     embed_policy: EmbedPolicy,
 ) -> Result<(Vec<AttachmentMeta>, Vec<String>)> {
+    if attachment_paths.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let canonical_base = base_dir.canonicalize().map_err(|e| {
+        StorageError::InvalidPath(format!(
+            "Attachment base directory does not exist or is not accessible: {} ({e})",
+            base_dir.display()
+        ))
+    })?;
+
     // Phase 1: resolve all paths (fast, no image I/O)
     let resolved: Vec<PathBuf> = attachment_paths
         .iter()
-        .map(|p| resolve_attachment_source_path(base_dir, config, p))
+        .map(|p| resolve_attachment_source_path_from_canonical_base(&canonical_base, config, p))
         .collect::<Result<Vec<_>>>()?;
 
     // Phase 2: convert in parallel chunks
@@ -4970,14 +4981,6 @@ pub fn resolve_attachment_source_path(
     config: &Config,
     raw_path: &str,
 ) -> Result<PathBuf> {
-    let raw = raw_path.trim();
-    if raw.is_empty() {
-        return Err(StorageError::InvalidPath(
-            "Attachment path cannot be empty".to_string(),
-        ));
-    }
-
-    // Canonicalize base dir so prefix checks cannot be bypassed via symlinks.
     let base = base_dir.canonicalize().map_err(|e| {
         StorageError::InvalidPath(format!(
             "Attachment base directory does not exist or is not accessible: {} ({e})",
@@ -4985,37 +4988,61 @@ pub fn resolve_attachment_source_path(
         ))
     })?;
 
+    resolve_attachment_source_path_from_canonical_base(&base, config, raw_path)
+}
+
+/// Resolve an attachment source path using a base directory that is already
+/// canonicalized.
+///
+/// This additive helper exists for hot paths that need to resolve many
+/// attachment candidates against the same project root without paying the
+/// base-directory `canonicalize()` cost on every path.
+#[doc(hidden)]
+pub fn resolve_attachment_source_path_from_canonical_base(
+    canonical_base: &Path,
+    config: &Config,
+    raw_path: &str,
+) -> Result<PathBuf> {
+    let raw = raw_path.trim();
+    if raw.is_empty() {
+        return Err(StorageError::InvalidPath(
+            "Attachment path cannot be empty".to_string(),
+        ));
+    }
+
     let input = PathBuf::from(raw);
     let input_is_absolute = input.is_absolute();
     let candidate = if input_is_absolute {
         input
     } else {
-        base.join(input)
+        canonical_base.join(input)
     };
 
-    if !candidate.exists() {
-        return Err(StorageError::InvalidPath(format!(
-            "Attachment not found: {}",
-            candidate.display()
-        )));
-    }
-
-    let resolved = candidate.canonicalize().map_err(|e| {
-        StorageError::InvalidPath(format!(
-            "Invalid attachment path: {} ({e})",
-            candidate.display()
-        ))
-    })?;
+    let resolved = match candidate.canonicalize() {
+        Ok(resolved) => resolved,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(StorageError::InvalidPath(format!(
+                "Attachment not found: {}",
+                candidate.display()
+            )));
+        }
+        Err(e) => {
+            return Err(StorageError::InvalidPath(format!(
+                "Invalid attachment path: {} ({e})",
+                candidate.display()
+            )));
+        }
+    };
 
     // Relative paths must never escape the project directory.
-    if !input_is_absolute && !resolved.starts_with(&base) {
+    if !input_is_absolute && !resolved.starts_with(canonical_base) {
         return Err(StorageError::InvalidPath(format!(
             "Attachment path escapes the project directory: {}",
             resolved.display()
         )));
     }
 
-    if resolved.starts_with(&base) {
+    if resolved.starts_with(canonical_base) {
         return Ok(resolved);
     }
 
@@ -5048,9 +5075,6 @@ fn resolve_source_attachment_path_opt(
     } else {
         canonical_base.join(input)
     };
-    if !candidate.exists() {
-        return None;
-    }
     let resolved = candidate.canonicalize().ok()?;
 
     // Relative paths must never escape the project directory.
@@ -8764,6 +8788,20 @@ mod tests {
 
         assert_eq!(meta.len(), 2);
         assert!(!rel_paths.is_empty());
+    }
+
+    #[test]
+    fn test_process_attachments_empty_list_does_not_require_existing_base_dir() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proc-empty-proj").unwrap();
+        let missing_base = tmp.path().join("missing-base");
+
+        let (meta, rel_paths) =
+            process_attachments(&archive, &config, &missing_base, &[], EmbedPolicy::File).unwrap();
+
+        assert!(meta.is_empty());
+        assert!(rel_paths.is_empty());
     }
 
     #[test]
