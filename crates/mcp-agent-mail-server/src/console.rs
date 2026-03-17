@@ -586,28 +586,23 @@ fn truncate_with_suffix(input: &str, max_chars: usize, suffix: &str) -> String {
 // Sparkline ring buffer (br-1m6a.3)
 // ──────────────────────────────────────────────────────────────────────
 
+use std::collections::VecDeque;
+
 /// Ring buffer of request-rate data points for the sparkline.
 pub struct SparklineBuffer {
-    data: Mutex<Vec<f64>>,
-    counter: AtomicU64,
-}
-
-impl Default for SparklineBuffer {
-    fn default() -> Self {
-        Self::new()
-    }
+    data: Mutex<VecDeque<f64>>,
+    counter: std::sync::atomic::AtomicU64,
 }
 
 impl SparklineBuffer {
-    #[must_use]
     pub fn new() -> Self {
         Self {
-            data: Mutex::new(vec![0.0; SPARKLINE_CAPACITY]),
-            counter: AtomicU64::new(0),
+            data: Mutex::new(VecDeque::with_capacity(SPARKLINE_CAPACITY)),
+            counter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// Increment the request counter (called per-request).
+    /// Record a single request. Call this on every HTTP request.
     pub fn tick(&self) {
         self.counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -621,26 +616,19 @@ impl SparklineBuffer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if data.len() >= SPARKLINE_CAPACITY {
-            data.remove(0);
+            data.pop_front();
         }
-        let count_u32 = u32::try_from(count).unwrap_or(u32::MAX);
-        data.push(f64::from(count_u32));
+        data.push_back(count as f64);
     }
 
-    /// Get a snapshot of the ring buffer data.
-    pub fn snapshot(&self) -> Vec<f64> {
+    /// Get the current sparkline data array (cloned).
+    pub fn get_data(&self) -> Vec<f64> {
         self.data
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-
-    /// Render a sparkline string using frankentui.
-    pub fn render_sparkline(&self) -> String {
-        let data = self.snapshot();
-        Sparkline::new(&data)
-            .gradient(theme::sparkline_lo(), theme::sparkline_hi())
-            .render_to_string()
+            .iter()
+            .copied()
+            .collect()
     }
 }
 
@@ -3113,7 +3101,7 @@ mod tests {
         buf.tick();
         buf.tick();
         buf.sample();
-        let data = buf.snapshot();
+        let data = buf.get_data();
         let last = data.last().copied().unwrap();
         assert!(
             (last - 3.0).abs() < 0.0001,
@@ -3128,7 +3116,7 @@ mod tests {
             buf.tick();
             buf.sample();
         }
-        let rendered = buf.render_sparkline();
+        let rendered = buf.get_data();
         assert!(!rendered.is_empty());
     }
 

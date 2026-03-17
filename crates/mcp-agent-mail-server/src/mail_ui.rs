@@ -424,8 +424,6 @@ mod route_regressions {
             "[]",
             &[(recipient.id.unwrap_or(0), "to")],
         )));
-        let root_id = root.id.unwrap_or(0);
-        let root_thread_ref = root_id.to_string();
         outcome_ok(block_on(queries::create_message_with_recipients(
             &cx,
             &pool,
@@ -433,7 +431,7 @@ mod route_regressions {
             recipient.id.unwrap_or(0),
             "Inbox numeric thread reply",
             "Reply",
-            Some(&root_thread_ref),
+            Some(&root_id.to_string()),
             "normal",
             false,
             "[]",
@@ -1291,7 +1289,7 @@ mod auth_route_hardening_regression_suite {
         );
         let html = dispatch_project_route(&route, "GET", "", &cx, &pool, "")
             .expect("thread route should succeed")
-            .expect("thread route should render html");
+            .expect("thread route should return html");
 
         assert!(html.contains("Encoded thread subject"));
         assert!(
@@ -3849,13 +3847,12 @@ fn handle_sibling_update(
     let payload: serde_json::Value =
         serde_json::from_str(body).map_err(|e| (400, format!("Invalid JSON: {e}")))?;
 
-    let action = payload
-        .get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_lowercase();
+    let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
-    if !matches!(action.as_str(), "confirm" | "dismiss" | "reset") {
+    if !action.eq_ignore_ascii_case("confirm")
+        && !action.eq_ignore_ascii_case("dismiss")
+        && !action.eq_ignore_ascii_case("reset")
+    {
         return json_err(400, "Invalid action");
     }
 

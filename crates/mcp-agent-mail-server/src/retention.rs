@@ -209,17 +209,19 @@ fn run_retention_cycle(config: &Config) -> Result<RetentionReport, String> {
             continue;
         }
 
-        report.projects_scanned += 1;
+        report.projects_scanned = report.projects_scanned.saturating_add(1);
 
         // Scan attachments.
         let attachments_dir = path.join("attachments");
         let attachment_bytes = dir_size(&attachments_dir);
-        report.total_attachment_bytes += attachment_bytes;
+        report.total_attachment_bytes = report
+            .total_attachment_bytes
+            .saturating_add(attachment_bytes);
 
         // Scan inbox (count .md files under agents/*/inbox/).
         let agents_dir = path.join("agents");
         let inbox_count = count_inbox_files(&agents_dir);
-        report.total_inbox_count += inbox_count;
+        report.total_inbox_count = report.total_inbox_count.saturating_add(inbox_count);
 
         // Quota checks.
         if config.quota_enabled {
@@ -235,7 +237,7 @@ fn run_retention_cycle(config: &Config) -> Result<RetentionReport, String> {
                     limit_bytes = config.quota_attachments_limit_bytes,
                     "attachment quota exceeded"
                 );
-                report.warnings += 1;
+                report.warnings = report.warnings.saturating_add(1);
             }
 
             if config.quota_inbox_limit_count > 0 && inbox_count > config.quota_inbox_limit_count {
@@ -248,7 +250,7 @@ fn run_retention_cycle(config: &Config) -> Result<RetentionReport, String> {
                     limit_count = config.quota_inbox_limit_count,
                     "inbox quota exceeded"
                 );
-                report.warnings += 1;
+                report.warnings = report.warnings.saturating_add(1);
             }
         }
 
@@ -281,18 +283,57 @@ fn should_ignore(name: &str, patterns: &[String]) -> bool {
             continue;
         }
 
-        if let Ok(compiled) = Pattern::new(pat) {
-            if compiled.matches(name) {
-                return true;
-            }
-        } else {
-            // Fallback for invalid glob patterns (though should be rare for simple * globs)
-            if name == pat {
-                return true;
-            }
+        if wildcard_match(pat, name) {
+            return true;
         }
     }
     false
+}
+
+fn wildcard_match(pattern: &str, name: &str) -> bool {
+    let mut p_chars = pattern.chars().peekable();
+    let mut n_chars = name.chars().peekable();
+
+    // Fast path: no wildcards
+    if !pattern.contains('*') {
+        return pattern == name;
+    }
+
+    // Split pattern by '*' and ensure all segments match in order
+    let segments: Vec<&str> = pattern.split('*').collect();
+
+    // If it's just "*"
+    if segments.len() == 2 && segments[0].is_empty() && segments[1].is_empty() {
+        return true;
+    }
+
+    let mut current_name = name;
+
+    for (i, segment) in segments.iter().enumerate() {
+        if i == 0 {
+            // First segment must match prefix
+            if !current_name.starts_with(segment) {
+                return false;
+            }
+            current_name = &current_name[segment.len()..];
+        } else if i == segments.len() - 1 {
+            // Last segment must match suffix
+            if !current_name.ends_with(segment) {
+                return false;
+            }
+        } else {
+            // Middle segments must be found in order
+            if segment.is_empty() {
+                continue;
+            }
+            if let Some(pos) = current_name.find(segment) {
+                current_name = &current_name[pos + segment.len()..];
+            } else {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Recursively compute total size of a directory in bytes.
@@ -316,7 +357,7 @@ fn dir_size(path: &Path) -> u64 {
 
                 let p = entry.path();
                 if ft.is_file() {
-                    total += entry.metadata().map_or(0, |m| m.len());
+                    total = total.saturating_add(entry.metadata().map_or(0, |m| m.len()));
                 } else if ft.is_dir() {
                     stack.push(p);
                 }
@@ -343,7 +384,7 @@ fn count_inbox_files(agents_dir: &Path) -> u64 {
             }
             let inbox = agent.path().join("inbox");
             if is_real_directory(&inbox) {
-                count += count_md_files_recursive(&inbox);
+                count = count.saturating_add(count_md_files_recursive(&inbox));
             }
         }
     }
@@ -370,8 +411,10 @@ fn count_md_files_recursive(dir: &Path) -> u64 {
                 }
 
                 let p = entry.path();
-                if ft.is_file() && p.extension().is_some_and(|e| e == "md") {
-                    count += 1;
+                if ft.is_file() {
+                    if p.extension().is_some_and(|e| e == "md") {
+                        count = count.saturating_add(1);
+                    }
                 } else if ft.is_dir() {
                     stack.push(p);
                 }
@@ -382,29 +425,40 @@ fn count_md_files_recursive(dir: &Path) -> u64 {
 }
 
 /// Count messages older than `max_age_days` under agents/*/inbox/.
-fn count_old_messages(agents_dir: &Path, max_age_days: u64) -> u64 {
+fn count_old_messages(agents_dir: &Path, max_age_days: i64) -> usize {
     if !is_real_directory(agents_dir) {
         return 0;
     }
 
-    let cutoff = std::time::SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs(
-            max_age_days.saturating_mul(86400),
-        ))
-        .unwrap_or(std::time::UNIX_EPOCH);
+    let mut count = 0usize;
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(max_age_days);
+    let mut stack = vec![agents_dir.to_path_buf()];
 
-    let mut count = 0u64;
-    if let Ok(agents) = std::fs::read_dir(agents_dir) {
-        for agent in agents.flatten() {
-            let Ok(agent_type) = agent.file_type() else {
-                continue;
-            };
-            if !agent_type.is_dir() || agent_type.is_symlink() {
-                continue;
-            }
-            let inbox = agent.path().join("inbox");
-            if is_real_directory(&inbox) {
-                count += count_old_files_recursive(&inbox, cutoff);
+    while let Some(current) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(current) {
+            for entry in entries.flatten() {
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_symlink() {
+                    continue;
+                }
+
+                let p = entry.path();
+                if ft.is_file() {
+                    if p.extension().is_some_and(|e| e == "md") {
+                        if let Ok(meta) = entry.metadata() {
+                            if let Ok(modified) = meta.modified() {
+                                let dt: chrono::DateTime<chrono::Utc> = modified.into();
+                                if dt < cutoff {
+                                    count = count.saturating_add(1);
+                                }
+                            }
+                        }
+                    }
+                } else if ft.is_dir() {
+                    stack.push(p);
+                }
             }
         }
     }

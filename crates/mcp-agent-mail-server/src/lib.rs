@@ -5936,20 +5936,21 @@ impl HttpState {
         {
             dashboard.record_request(method.as_str(), path, resp.status, dur_ms, client_ip);
         }
-        // Emit TUI HttpRequest event (skip healthz / high-frequency polling)
-        if let Some(tui) = tui.as_ref()
-            && let (Some(method), Some(path), Some(client_ip)) =
-                (method.as_ref(), path.as_ref(), client_ip.as_ref())
+        // Feed the live TUI when present, otherwise feed the passive fallback
+        // state used by `/mail/ws-state` and `/web-dashboard/state`.
+        if let (Some(method), Some(path), Some(client_ip)) =
+            (method.as_ref(), path.as_ref(), client_ip.as_ref())
             && !should_suppress_tui_http_event(path)
         {
-            let _ = tui.push_event(tui_events::MailEvent::http_request(
+            let observability_state = tui.as_deref().unwrap_or(self.ws_state_fallback.as_ref());
+            let _ = observability_state.push_event(tui_events::MailEvent::http_request(
                 method.as_str(),
                 path.as_str(),
                 resp.status,
                 dur_ms,
                 client_ip.as_str(),
             ));
-            tui.record_request(resp.status, dur_ms);
+            observability_state.record_request(resp.status, dur_ms);
         }
         if self.config.http_request_log_enabled
             && let (Some(method), Some(path), Some(client_ip)) =
@@ -6269,22 +6270,26 @@ impl HttpState {
             if !matches!(req.method, Http1Method::Get) {
                 return Some(self.error_response(req, 405, "Method Not Allowed"));
             }
-            let Some(state) = tui_state_handle() else {
-                return Some(self.error_response(req, 503, "TUI state is not active"));
-            };
             let (_path_part, query_part) = split_path_query(&req.uri);
-            let payload = tui_web_dashboard::handle_state(&state, query_part.as_deref());
-            return Some(self.raw_response(req, 200, "application/json", payload.into_bytes()));
+            let live_state = tui_state_handle();
+            let (status, payload) = tui_web_dashboard::handle_state_response(
+                live_state.as_deref(),
+                &self.ws_state_fallback,
+                query_part.as_deref(),
+            );
+            return Some(self.raw_response(req, status, "application/json", payload.into_bytes()));
         }
 
         if path == "/web-dashboard/input" {
             if !matches!(req.method, Http1Method::Post) {
                 return Some(self.error_response(req, 405, "Method Not Allowed"));
             }
-            let Some(state) = tui_state_handle() else {
-                return Some(self.error_response(req, 503, "TUI state is not active"));
-            };
-            let (status, payload) = tui_web_dashboard::handle_input(&state, &req.body);
+            let live_state = tui_state_handle();
+            let (status, payload) = live_state
+                .as_deref()
+                .map_or_else(tui_web_dashboard::handle_inactive_input, |state| {
+                    tui_web_dashboard::handle_input(state, &req.body)
+                });
             return Some(self.raw_response(req, status, "application/json", payload.into_bytes()));
         }
 
@@ -6427,6 +6432,11 @@ impl HttpState {
 
         let (path, _query) = split_path_query(&req.uri);
         let is_mail_route = path == "/mail" || path.starts_with("/mail/");
+        let is_web_dashboard_route = path == "/web-dashboard"
+            || path == "/web-dashboard/"
+            || path == "/web-dashboard/state"
+            || path == "/web-dashboard/input";
+        let is_browser_route = is_mail_route || is_web_dashboard_route;
 
         if self.allow_local_unauthenticated(req) {
             return None;
@@ -6438,10 +6448,10 @@ impl HttpState {
             return None;
         }
 
-        // D3: Accept bearer token from `?token=` query parameter only on /mail routes.
-        // Browser-opened URLs (e.g. health link) cannot set Authorization headers,
-        // so build_web_ui_url() embeds the token as a query param instead.
-        if is_mail_route && self.has_expected_query_token(req) {
+        // D3: Accept bearer token from `?token=` query parameter on browser
+        // routes. Browser-opened surfaces cannot set Authorization headers, so
+        // shareable URLs embed the token as a query parameter instead.
+        if is_browser_route && self.has_expected_query_token(req) {
             return None;
         }
 
@@ -6451,18 +6461,21 @@ impl HttpState {
             return None;
         }
 
-        // D4: For browser /mail routes, return actionable HTML; for machine /mail/api routes,
-        // preserve JSON 401 responses.
-        if is_mail_route {
+        // D4: For browser HTML routes, return actionable HTML; for
+        // machine/browser JSON routes, preserve JSON 401 responses.
+        if is_browser_route {
             let method_str = if matches!(req.method, Http1Method::Post) {
                 "POST"
             } else {
                 "GET"
             };
-            if Self::is_mail_json_route(&path, method_str) {
+            let is_browser_json_route = Self::is_mail_json_route(&path, method_str)
+                || path == "/web-dashboard/state"
+                || path == "/web-dashboard/input";
+            if is_browser_json_route {
                 return Some(self.error_response(req, 401, "Unauthorized"));
             }
-            return Some(self.mail_unauthorized_html_response(req));
+            return Some(self.browser_unauthorized_html_response(req));
         }
 
         Some(self.error_response(req, 401, "Unauthorized"))
@@ -6497,10 +6510,10 @@ impl HttpState {
         false
     }
 
-    /// Return a user-friendly HTML 401 page for `/mail` routes explaining how to
-    /// authenticate. Operators opening the health link in a browser need actionable
-    /// guidance rather than an opaque `{"detail":"Unauthorized"}` JSON blob.
-    fn mail_unauthorized_html_response(&self, req: &Http1Request) -> Http1Response {
+    /// Return a user-friendly HTML 401 page for browser routes explaining how to
+    /// authenticate. Operators opening browser surfaces need actionable guidance
+    /// rather than an opaque `{"detail":"Unauthorized"}` JSON blob.
+    fn browser_unauthorized_html_response(&self, req: &Http1Request) -> Http1Response {
         let html = r#"<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><title>401 — Unauthorized</title>
@@ -6511,7 +6524,7 @@ h1{color:#c0392b}code{background:#f4f4f4;padding:2px 6px;border-radius:3px}
 </style></head>
 <body>
 <h1>401 — Unauthorized</h1>
-<p>This Agent Mail web interface requires a valid bearer token.</p>
+<p>This Agent Mail browser surface requires a valid bearer token.</p>
 <div class="steps">
 <h3>How to fix this</h3>
 <ol>
@@ -6519,6 +6532,9 @@ h1{color:#c0392b}code{background:#f4f4f4;padding:2px 6px;border-radius:3px}
 (or environment) to match the server's configured token.</li>
 <li>Use the generated health link from the TUI — it embeds the token
 as <code>?token=…</code> in the URL automatically.</li>
+<li>If you are opening <code>/web-dashboard</code> in a browser, keep the
+<code>?token=…</code> query parameter on the page URL so the dashboard can
+reuse it for background polling and input requests.</li>
 <li>If using <code>curl</code> or an API client, pass the token via header:<br>
 <code>Authorization: Bearer &lt;your-token&gt;</code></li>
 </ol>
@@ -8971,7 +8987,11 @@ fn is_websocket_upgrade_request(req: &Http1Request) -> bool {
 }
 
 fn should_suppress_tui_http_event(path: &str) -> bool {
-    path.ends_with("/healthz") || path == "/mail/ws-state" || path == "/mail/ws-input"
+    path.ends_with("/healthz")
+        || path == "/mail/ws-state"
+        || path == "/mail/ws-input"
+        || path == "/web-dashboard/state"
+        || path == "/web-dashboard/input"
 }
 
 fn has_forwarded_headers(req: &Http1Request) -> bool {
@@ -10336,6 +10356,103 @@ mod tests {
         assert_eq!(resp.status, 405);
         let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("error json");
         assert_eq!(body["detail"], "Method Not Allowed");
+    }
+
+    #[test]
+    fn web_dashboard_route_returns_html_shell() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let req = make_request(Http1Method::Get, "/web-dashboard", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            response_header(&resp, "content-type"),
+            Some("text/html; charset=utf-8")
+        );
+        let body = String::from_utf8(resp.body).expect("utf8 body");
+        assert!(body.contains("Browser TUI Mirror"));
+        assert!(body.contains("/web-dashboard/state"));
+    }
+
+    #[test]
+    fn web_dashboard_state_without_tui_returns_inactive_json() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let req = make_request(Http1Method::Get, "/web-dashboard/state", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            response_header(&resp, "content-type"),
+            Some("application/json")
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.body).expect("inactive state json");
+        assert_eq!(body["mode"], "inactive");
+        assert_eq!(body["reason"], "tui_inactive");
+        assert_eq!(body["poll_state"]["mode"], "snapshot");
+    }
+
+    #[test]
+    fn web_dashboard_state_without_tui_uses_fallback_request_counters() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+
+        let req = make_request(Http1Method::Get, "/mail/api/locks", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+
+        let req = make_request(Http1Method::Get, "/web-dashboard/state", &[]);
+        let resp = block_on(state.handle(req));
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.body).expect("inactive state json");
+        assert_eq!(body["mode"], "inactive");
+        assert_eq!(body["poll_state"]["request_counters"]["total"], 1);
+        assert!(
+            body["poll_state"]["events"]
+                .as_array()
+                .is_some_and(|events| !events.is_empty()),
+            "fallback state should retain recent headless events"
+        );
+    }
+
+    #[test]
+    fn web_dashboard_state_with_live_tui_but_no_frame_returns_warming_json() {
+        let _guard = TUI_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config.clone());
+        let shared = tui_bridge::TuiSharedState::new(&config);
+        set_tui_state_handle(None);
+        set_tui_state_handle(Some(Arc::clone(&shared)));
+
+        let req = make_request(Http1Method::Get, "/web-dashboard/state", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.body).expect("warming state json");
+        assert_eq!(body["mode"], "warming");
+        assert_eq!(body["reason"], "tui_warming");
+
+        set_tui_state_handle(None);
+    }
+
+    #[test]
+    fn web_dashboard_input_without_tui_returns_inactive_json() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let mut req = make_request(Http1Method::Post, "/web-dashboard/input", &[]);
+        req.body = br#"{"type":"Input","data":{"kind":"Key","key":"j","modifiers":0}}"#.to_vec();
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 503);
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.body).expect("inactive input json");
+        assert_eq!(body["status"], "inactive");
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("Live TUI state is not active"),
+            "unexpected inactive input detail: {detail}"
+        );
     }
 
     #[test]
@@ -18849,6 +18966,44 @@ mod tests {
     }
 
     #[test]
+    fn web_dashboard_route_accepts_query_token() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("dash-secret".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let req = make_request(Http1Method::Get, "/web-dashboard?token=dash-secret", &[]);
+        let resp = block_on(state.handle(req));
+        assert_ne!(
+            resp.status, 401,
+            "/web-dashboard query token must authenticate"
+        );
+    }
+
+    #[test]
+    fn web_dashboard_state_route_accepts_query_token() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("dash-secret".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let req = make_request(
+            Http1Method::Get,
+            "/web-dashboard/state?token=dash-secret",
+            &[],
+        );
+        let resp = block_on(state.handle(req));
+        assert_ne!(
+            resp.status, 401,
+            "/web-dashboard/state query token must authenticate"
+        );
+    }
+
+    #[test]
     fn build_web_ui_url_percent_encodes_token() {
         let url = build_web_ui_url("100.64.0.1", 8765, Some("a+b/c?d=e&f"));
         assert_eq!(
@@ -18898,7 +19053,7 @@ mod tests {
         );
     }
 
-    // ── D4: actionable HTML for unauthorized /mail ───────────────
+    // ── D4: actionable HTML for unauthorized browser routes ──────
 
     #[test]
     fn mail_unauthorized_returns_html_not_json() {
@@ -18928,6 +19083,57 @@ mod tests {
         assert!(
             body.contains("How to fix"),
             "HTML must include remediation steps"
+        );
+    }
+
+    #[test]
+    fn web_dashboard_unauthorized_returns_html_not_json() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let req = make_request(Http1Method::Get, "/web-dashboard", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 401);
+        let content_type = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k == "content-type")
+            .map_or("", |(_, v)| v.as_str());
+        assert!(
+            content_type.contains("text/html"),
+            "unauthorized /web-dashboard must return HTML, got: {content_type}"
+        );
+        let body = String::from_utf8_lossy(&resp.body);
+        assert!(
+            body.contains("/web-dashboard"),
+            "HTML must explain dashboard query-token usage"
+        );
+    }
+
+    #[test]
+    fn web_dashboard_json_route_unauthorized_returns_json() {
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret".to_string()),
+            http_allow_localhost_unauthenticated: false,
+            ..Default::default()
+        };
+        let state = build_state(config);
+
+        let req = make_request(Http1Method::Get, "/web-dashboard/state", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 401);
+        let content_type = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k == "content-type")
+            .map_or("", |(_, v)| v.as_str());
+        assert!(
+            content_type.contains("application/json"),
+            "unauthorized /web-dashboard/state must return JSON, got: {content_type}"
         );
     }
 
@@ -18967,7 +19173,7 @@ mod tests {
         let resp = block_on(state.handle(req));
         assert_eq!(
             resp.status, 401,
-            "query token auth must be limited to /mail routes only"
+            "query token auth must be limited to browser routes only"
         );
     }
 
@@ -19120,6 +19326,15 @@ mod tests {
         let req = make_request(Http1Method::Get, "/mail?token=dual-test-token", &[]);
         let resp = block_on(state.handle(req));
         assert_ne!(resp.status, 401, "query token must authenticate");
+
+        // Dashboard query token auth.
+        let req = make_request(
+            Http1Method::Get,
+            "/web-dashboard?token=dual-test-token",
+            &[],
+        );
+        let resp = block_on(state.handle(req));
+        assert_ne!(resp.status, 401, "dashboard query token must authenticate");
     }
 
     #[test]

@@ -1223,7 +1223,7 @@ pub struct MailAppModel {
     /// Coach hint manager for one-shot contextual tips.
     coach_hints: CoachHintManager,
     /// Recent action outcomes for feedback surfaces.
-    action_outcomes: Vec<ActionOutcome>,
+    action_outcomes: std::collections::VecDeque<ActionOutcome>,
     /// Clipboard helper for OSC 52 / system clipboard copy operations.
     clipboard: Clipboard,
     /// Internal clipboard fallback when terminal clipboard is unavailable.
@@ -1345,7 +1345,7 @@ impl MailAppModel {
             screen_panics: RefCell::new(HashMap::new()),
             mouse_dispatcher: crate::tui_hit_regions::MouseDispatcher::new(),
             coach_hints: CoachHintManager::new(),
-            action_outcomes: Vec::new(),
+            action_outcomes: std::collections::VecDeque::new(),
             clipboard: Clipboard::auto(ftui::TerminalCapabilities::detect()),
             internal_clipboard: None,
             system_health_url_hint_shown: false,
@@ -1603,7 +1603,7 @@ impl MailAppModel {
         if to == MailScreenId::SystemHealth && !self.system_health_url_hint_shown {
             self.system_health_url_hint_shown = true;
             self.notifications.notify(
-                Toast::new("System Health URL shortcuts: o=open, y=copy")
+                Toast::new("System Health Mail UI shortcuts: o=open, y=copy")
                     .icon(ToastIcon::Info)
                     .duration(Duration::from_secs(4)),
             );
@@ -1869,9 +1869,9 @@ impl MailAppModel {
                     .set(&url, ClipboardSelection::Clipboard, &mut std::io::stdout());
             self.internal_clipboard = Some(url);
             let (message, icon, duration) = if result == Ok(()) {
-                ("System Health URL copied", ToastIcon::Info, 2)
+                ("Mail UI URL copied", ToastIcon::Info, 2)
             } else {
-                ("System Health URL copied (internal)", ToastIcon::Warning, 3)
+                ("Mail UI URL copied (internal)", ToastIcon::Warning, 3)
             };
             self.notifications.notify(
                 Toast::new(message)
@@ -1882,7 +1882,7 @@ impl MailAppModel {
         }
 
         self.notifications.notify(
-            Toast::new("System Health URL unavailable or invalid")
+            Toast::new("Mail UI URL unavailable or invalid")
                 .icon(ToastIcon::Warning)
                 .duration(Duration::from_secs(2)),
         );
@@ -1891,7 +1891,7 @@ impl MailAppModel {
     fn open_system_health_web_ui_url(&mut self) {
         let Ok(url) = self.system_health_web_ui_url() else {
             self.notifications.notify(
-                Toast::new("System Health URL unavailable or invalid")
+                Toast::new("Mail UI URL unavailable or invalid")
                     .icon(ToastIcon::Warning)
                     .duration(Duration::from_secs(2)),
             );
@@ -1901,7 +1901,7 @@ impl MailAppModel {
         match spawn_browser_for_url(&url) {
             Ok(()) => {
                 self.notifications.notify(
-                    Toast::new("Opening System Health URL")
+                    Toast::new("Opening Mail UI")
                         .icon(ToastIcon::Info)
                         .duration(Duration::from_secs(3)),
                 );
@@ -2089,7 +2089,7 @@ impl MailAppModel {
             | "batch_mark_read" | "batch_mark_unread" => {
                 let op = operation.to_string();
                 let ctx = context.to_string();
-                self.action_outcomes.push(ActionOutcome::InFlight {
+                self.action_outcomes.push_back(ActionOutcome::InFlight {
                     operation: cmd.to_string(),
                 });
                 self.notifications.notify(
@@ -2172,9 +2172,9 @@ impl MailAppModel {
         }
         // Cap outcome history to 20 entries.
         if self.action_outcomes.len() >= 20 {
-            self.action_outcomes.remove(0);
+            self.action_outcomes.pop_front();
         }
-        self.action_outcomes.push(outcome);
+        self.action_outcomes.push_back(outcome);
     }
 
     /// Current accessibility settings.
@@ -4644,16 +4644,20 @@ impl Model for MailAppModel {
         // Capture the rendered frame for the web dashboard mirror.
         // This iterates cells and packs them into u32s — no buffer clone needed.
         {
+            let active_screen = self.screen_manager.active_screen();
             let screen_idx = u8::try_from(
                 crate::tui_screens::ALL_SCREEN_IDS
                     .iter()
-                    .position(|&id| id == self.screen_manager.active_screen())
+                    .position(|&id| id == active_screen)
                     .unwrap_or(0),
             )
             .unwrap_or(0);
-            self.state
-                .web_dashboard_frame_store()
-                .capture(&frame.buffer, screen_idx);
+            self.state.web_dashboard_frame_store().capture(
+                &frame.buffer,
+                screen_idx,
+                screen_tick_key(active_screen),
+                crate::tui_screens::screen_meta(active_screen).title,
+            );
         }
 
         // Signal first paint only after the full frame has rendered successfully.
@@ -12510,8 +12514,7 @@ mod tests {
         // In test mode clipboard.set() returns Err (no clipboard), so the
         // internal-only fallback message is produced.
         assert!(
-            message == "System Health URL copied"
-                || message == "System Health URL copied (internal)",
+            message == "Mail UI URL copied" || message == "Mail UI URL copied (internal)",
             "unexpected toast: {message}"
         );
         assert!(!message.contains("token="));
@@ -12541,7 +12544,7 @@ mod tests {
             .content
             .message
             .clone();
-        assert_eq!(message, "Opening System Health URL");
+        assert_eq!(message, "Opening Mail UI");
         assert!(!message.contains("token="));
     }
 
