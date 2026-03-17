@@ -939,14 +939,16 @@ fn collect_entries(base: &Path, current: &Path, entries: &mut Vec<String>) -> st
             }
 
             if file_type.is_symlink() {
-                // Avoid traversing symlinked directories during ZIP packaging; for symlinked files,
-                // we rely on canonicalization guards in `package_directory_as_zip`.
-                if std::fs::metadata(&path).is_ok_and(|m| m.is_dir()) {
-                    continue;
-                }
+                // Skip all symlinks during collection.  Symlinked files are
+                // caught by the canonicalization + starts_with guard in
+                // `package_directory_as_zip`; symlinked directories must not
+                // be traversed at all to prevent escape from the source tree.
+                // Using `symlink_metadata` (not `metadata`) avoids following
+                // the link, which would defeat the protection.
+                continue;
             }
 
-            if !(file_type.is_file() || file_type.is_symlink()) {
+            if !file_type.is_file() {
                 continue;
             }
 
