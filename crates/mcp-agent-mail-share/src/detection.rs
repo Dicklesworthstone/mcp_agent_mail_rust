@@ -73,10 +73,15 @@ pub fn detect_environment(bundle_path: Option<&Path>, cwd: &Path) -> DetectedEnv
 /// - `GITHUB_REPOSITORY` environment variable
 /// - docs/ directory location
 pub fn detect_github_pages(cwd: &Path) -> Vec<DetectedSignal> {
+    let git_remote = git_remote_url(cwd);
+    detect_github_pages_with_remote(cwd, git_remote.as_deref())
+}
+
+fn detect_github_pages_with_remote(cwd: &Path, git_remote: Option<&str>) -> Vec<DetectedSignal> {
     let mut signals = Vec::new();
 
     // Check git remote
-    if let Some(url) = git_remote_url(cwd)
+    if let Some(url) = git_remote
         && (url.contains("github.com") || url.contains("github:"))
     {
         signals.push(DetectedSignal {
@@ -125,8 +130,7 @@ pub fn detect_github_pages(cwd: &Path) -> Vec<DetectedSignal> {
     }
 
     // Check for docs/ directory (common GitHub Pages pattern)
-    let docs_dir = cwd.join("docs");
-    if docs_dir.is_dir() {
+    if find_ancestor_path(cwd, "docs").is_some_and(|docs_dir| docs_dir.is_dir()) {
         signals.push(DetectedSignal {
             source: "filesystem".to_string(),
             detail: "docs/ directory exists (common Pages pattern)".to_string(),
@@ -242,8 +246,8 @@ pub fn detect_s3(cwd: &Path) -> Vec<DetectedSignal> {
     }
 
     // Check for S3-related scripts
-    let scripts_dir = cwd.join("scripts");
-    if scripts_dir.is_dir()
+    if let Some(scripts_dir) = find_ancestor_path(cwd, "scripts")
+        && scripts_dir.is_dir()
         && let Ok(entries) = std::fs::read_dir(&scripts_dir)
     {
         for entry in entries.flatten() {
@@ -267,23 +271,25 @@ pub fn detect_s3(cwd: &Path) -> Vec<DetectedSignal> {
 /// Extract GitHub owner/repo from a remote URL.
 ///
 /// Handles HTTPS, SSH, and git:// URLs.
+///
+/// For web-style URLs, only the canonical `owner/repo` portion is returned.
+/// Trailing segments like `/tree/main` or `/issues` are ignored because the
+/// rest of the share flow expects a repository identifier, not an arbitrary URL
+/// path.
 pub fn extract_github_repo(url: &str) -> Option<String> {
     // HTTPS: https://github.com/owner/repo.git
     if let Some(rest) = url.strip_prefix("https://github.com/") {
-        let repo = rest.strip_suffix(".git").unwrap_or(rest);
-        return Some(repo.to_string());
+        return normalize_github_repo_path(rest);
     }
 
     // SSH: git@github.com:owner/repo.git
     if let Some(rest) = url.strip_prefix("git@github.com:") {
-        let repo = rest.strip_suffix(".git").unwrap_or(rest);
-        return Some(repo.to_string());
+        return normalize_github_repo_path(rest);
     }
 
     // git:// protocol
     if let Some(rest) = url.strip_prefix("git://github.com/") {
-        let repo = rest.strip_suffix(".git").unwrap_or(rest);
-        return Some(repo.to_string());
+        return normalize_github_repo_path(rest);
     }
 
     None
@@ -328,11 +334,27 @@ fn detect_git_context(cwd: &Path, env: &mut DetectedEnvironment) {
     }
 }
 
+fn normalize_github_repo_path(path: &str) -> Option<String> {
+    let mut segments = path.trim_matches('/').split('/').filter(|s| !s.is_empty());
+    let owner = segments.next()?;
+    let repo = segments
+        .next()?
+        .split(['?', '#'])
+        .next()
+        .map(|segment| segment.strip_suffix(".git").unwrap_or(segment))?;
+
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+
+    Some(format!("{owner}/{repo}"))
+}
+
 fn detect_env_vars(env: &mut DetectedEnvironment) {
     // GitHub
-    if std::env::var("GITHUB_REPOSITORY").is_ok() || std::env::var("GITHUB_ACTIONS").is_ok() {
-        env.github_env = true;
-    }
+    let github_repository = std::env::var("GITHUB_REPOSITORY").ok();
+    let github_actions_present = std::env::var("GITHUB_ACTIONS").is_ok();
+    apply_github_env_vars(env, github_repository.as_deref(), github_actions_present);
 
     // Cloudflare
     if std::env::var("CF_PAGES").is_ok() || std::env::var("CF_PAGES_BRANCH").is_ok() {
@@ -355,7 +377,7 @@ fn detect_env_vars(env: &mut DetectedEnvironment) {
 
 fn detect_filesystem_signals(cwd: &Path, env: &mut DetectedEnvironment) {
     // Collect provider-specific signals
-    let github_signals = detect_github_pages(cwd);
+    let github_signals = detect_github_pages_with_remote(cwd, env.git_remote_url.as_deref());
     let cloudflare_signals = detect_cloudflare_pages(cwd);
     let netlify_signals = detect_netlify(cwd);
     let s3_signals = detect_s3(cwd);
@@ -380,6 +402,23 @@ fn detect_filesystem_signals(cwd: &Path, env: &mut DetectedEnvironment) {
         if !env.signals.iter().any(|s| s.detail == signal.detail) {
             env.signals.push(signal);
         }
+    }
+}
+
+fn apply_github_env_vars(
+    env: &mut DetectedEnvironment,
+    github_repository: Option<&str>,
+    github_actions_present: bool,
+) {
+    if let Some(repo) = github_repository {
+        env.github_env = true;
+        if let Some(normalized_repo) = normalize_github_repo_path(repo) {
+            env.github_repo = Some(normalized_repo);
+        }
+    }
+
+    if github_actions_present {
+        env.github_env = true;
     }
 }
 
@@ -761,6 +800,16 @@ mod tests {
     }
 
     #[test]
+    fn detect_github_pages_finds_ancestor_docs_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        let nested = dir.path().join("nested/output");
+        std::fs::create_dir_all(&nested).unwrap();
+        let signals = detect_github_pages(&nested);
+        assert!(signals.iter().any(|s| s.detail.contains("docs/")));
+    }
+
+    #[test]
     fn detect_github_pages_workflow_dir_without_pages_workflow() {
         let dir = tempfile::tempdir().unwrap();
         let wf = dir.path().join(".github").join("workflows");
@@ -825,6 +874,24 @@ mod tests {
     }
 
     #[test]
+    fn detect_s3_finds_ancestor_scripts_from_nested_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let scripts = dir.path().join("scripts");
+        std::fs::create_dir(&scripts).unwrap();
+        std::fs::write(scripts.join("deploy-s3.sh"), "aws s3 sync . s3://bucket").unwrap();
+        let nested = dir.path().join("nested/output/bundle");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let signals = detect_s3(&nested);
+        assert!(
+            signals
+                .iter()
+                .any(|s| s.detail.contains("S3/AWS deploy script")),
+            "expected ancestor scripts/ directory to be detected from nested path"
+        );
+    }
+
+    #[test]
     fn detect_s3_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
         let signals = detect_s3(dir.path());
@@ -842,8 +909,38 @@ mod tests {
     fn extract_github_repo_nested_path() {
         assert_eq!(
             extract_github_repo("https://github.com/org/repo/tree/main"),
-            Some("org/repo/tree/main".to_string())
+            Some("org/repo".to_string())
         );
+    }
+
+    #[test]
+    fn extract_github_repo_trailing_segments_and_query() {
+        assert_eq!(
+            extract_github_repo("https://github.com/org/repo/issues/123"),
+            Some("org/repo".to_string())
+        );
+        assert_eq!(
+            extract_github_repo("https://github.com/org/repo/?tab=readme"),
+            Some("org/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn apply_github_env_vars_populates_repo_from_github_repository() {
+        let mut env = DetectedEnvironment::default();
+        apply_github_env_vars(&mut env, Some("actions/example-repo"), false);
+        assert_eq!(env.github_repo.as_deref(), Some("actions/example-repo"));
+        assert!(env.github_env);
+    }
+
+    #[test]
+    fn apply_github_env_vars_overrides_remote_derived_repo() {
+        let mut env = DetectedEnvironment {
+            github_repo: Some("remote/origin".to_string()),
+            ..Default::default()
+        };
+        apply_github_env_vars(&mut env, Some("actions/example-repo"), false);
+        assert_eq!(env.github_repo.as_deref(), Some("actions/example-repo"));
     }
 
     #[test]

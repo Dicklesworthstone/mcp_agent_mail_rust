@@ -260,14 +260,21 @@ pub fn encrypt_with_age(input: &Path, recipients: &[String]) -> ShareResult<std:
         )));
     }
 
-    check_age_available()?;
-
     let output = input.with_extension(
         input
             .extension()
             .map(|e| format!("{}.age", e.to_string_lossy()))
             .unwrap_or_else(|| "age".to_string()),
     );
+
+    if output.exists() {
+        return Err(ShareError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("encrypted file already exists: {}", output.display()),
+        )));
+    }
+
+    check_age_available()?;
 
     let mut cmd = std::process::Command::new("age");
     for r in recipients {
@@ -1362,6 +1369,19 @@ mod tests {
 
         let result = encrypt_with_age(&input, &[]);
         assert!(result.is_err(), "encryption with no recipients should fail");
+    }
+
+    #[test]
+    fn age_encrypt_refuses_existing_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("bundle.zip");
+        let encrypted = dir.path().join("bundle.zip.age");
+        std::fs::write(&input, b"data").unwrap();
+        std::fs::write(&encrypted, b"existing ciphertext").unwrap();
+
+        let err = encrypt_with_age(&input, &["age1example".to_string()])
+            .expect_err("existing encrypted output should be rejected before encryption");
+        assert!(format!("{err}").contains("already exists"));
     }
 
     #[test]

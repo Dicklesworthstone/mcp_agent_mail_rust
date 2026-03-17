@@ -345,17 +345,11 @@ pub fn bundle_attachments(
 
                 match process_result {
                     Ok(()) => {}
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::NotFound
-                                | std::io::ErrorKind::PermissionDenied
-                                | std::io::ErrorKind::InvalidInput
-                        ) =>
-                    {
-                        // Only "not found", "permission denied" (path escapes root), or "invalid input" (not a regular file)
-                        // cases degrade to the synthetic missing-attachment state. Other IO failures should fail
-                        // the export instead of rewriting valid attachments.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        // Only genuinely missing files degrade to the synthetic
+                        // missing-attachment state.  Policy violations (root escape,
+                        // disallowed absolute paths) and invalid sources (directories)
+                        // must fail the export instead of silently rewriting.
                         remove_attachment_keys(
                             obj,
                             &["path", "data_uri", "sha256", "bytes", "note"],
@@ -706,7 +700,7 @@ pub fn package_directory_as_zip(source_dir: &Path, destination: &Path) -> ShareR
 
     // Collect and sort entries for reproducibility
     let mut entries = Vec::new();
-    collect_entries(&source, &source, &mut entries)?;
+    collect_entries_ctx(&source, &source, &mut entries, "ZIP")?;
     entries.sort();
 
     for relative_path in &entries {
@@ -759,8 +753,7 @@ fn resolve_attachment_path(
     // Absolute source paths are only allowed when explicitly configured.
     if path_path.is_absolute() {
         if !allow_absolute_paths {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
+            return Err(std::io::Error::other(
                 "absolute attachment paths are disabled",
             ));
         }
@@ -781,8 +774,11 @@ fn resolve_attachment_path(
         // Relative paths that escape root are always rejected, even when
         // allow_absolute_paths is true (that flag only governs explicitly
         // absolute input paths).
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
+        //
+        // Use `Other` (not `PermissionDenied`) so the bundle error handler
+        // propagates this as a hard export failure rather than silently
+        // degrading to a "missing" attachment.
+        return Err(std::io::Error::other(
             "attachment path escapes storage root",
         ));
     }
@@ -919,6 +915,15 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
 }
 
 fn collect_entries(base: &Path, current: &Path, entries: &mut Vec<String>) -> std::io::Result<()> {
+    collect_entries_ctx(base, current, entries, "source")
+}
+
+fn collect_entries_ctx(
+    base: &Path,
+    current: &Path,
+    entries: &mut Vec<String>,
+    context: &str,
+) -> std::io::Result<()> {
     if !current.is_dir() {
         return Ok(());
     }
@@ -939,12 +944,30 @@ fn collect_entries(base: &Path, current: &Path, entries: &mut Vec<String>) -> st
             }
 
             if file_type.is_symlink() {
-                // Skip all symlinks during collection.  Symlinked files are
-                // caught by the canonicalization + starts_with guard in
-                // `package_directory_as_zip`; symlinked directories must not
-                // be traversed at all to prevent escape from the source tree.
-                // Using `symlink_metadata` (not `metadata`) avoids following
-                // the link, which would defeat the protection.
+                // Symlinks are always rejected during collection.
+                // Symlinked files that resolve outside the source tree are a
+                // path-escape vector; symlinked directories must not be
+                // traversed at all to prevent escape from the source tree.
+                //
+                // Resolve the link and check containment.  If the target
+                // escapes the source root, fail the export immediately.
+                let canonical = path.canonicalize()?;
+                if !canonical.starts_with(base) {
+                    return Err(std::io::Error::other(format!(
+                        "Refusing to include path outside {context} source: {}",
+                        path.strip_prefix(base)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    )));
+                }
+                // Symlink target is inside the source tree — include it.
+                let relative = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                entries.push(relative);
                 continue;
             }
 
@@ -1199,7 +1222,7 @@ pub fn copy_viewer_assets_from(
 
     // Collect all files sorted for determinism
     let mut entries = Vec::new();
-    collect_entries(&viewer_source, &viewer_source, &mut entries)?;
+    collect_entries_ctx(&viewer_source, &viewer_source, &mut entries, "viewer")?;
     entries.sort();
 
     for relative_path in &entries {

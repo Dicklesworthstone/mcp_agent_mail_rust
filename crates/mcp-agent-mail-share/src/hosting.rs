@@ -23,10 +23,11 @@ pub struct HostingHint {
 #[must_use]
 pub fn detect_hosting_hints(output_dir: &Path) -> Vec<HostingHint> {
     let mut hints: Vec<HostingHint> = Vec::new();
+    let git_remote = git_remote_url(output_dir);
 
-    detect_github_pages(output_dir, &mut hints);
-    detect_cloudflare_pages(output_dir, &mut hints);
-    detect_netlify(output_dir, &mut hints);
+    detect_github_pages(output_dir, git_remote.as_deref(), &mut hints);
+    detect_cloudflare_pages(output_dir, git_remote.as_deref(), &mut hints);
+    detect_netlify(output_dir, git_remote.as_deref(), &mut hints);
     detect_s3(output_dir, &mut hints);
 
     // Sort by number of signals (most confident first)
@@ -34,7 +35,7 @@ pub fn detect_hosting_hints(output_dir: &Path) -> Vec<HostingHint> {
     hints
 }
 
-fn detect_github_pages(output_dir: &Path, hints: &mut Vec<HostingHint>) {
+fn detect_github_pages(output_dir: &Path, git_remote: Option<&str>, hints: &mut Vec<HostingHint>) {
     let mut signals = Vec::new();
 
     // Check for GitHub Actions workflows
@@ -60,7 +61,7 @@ fn detect_github_pages(output_dir: &Path, hints: &mut Vec<HostingHint>) {
     }
 
     // Check git remote
-    if let Some(remote) = git_remote_url(output_dir)
+    if let Some(remote) = git_remote
         && remote.contains("github")
     {
         signals.push(format!("Git remote: {remote}"));
@@ -91,14 +92,18 @@ fn detect_github_pages(output_dir: &Path, hints: &mut Vec<HostingHint>) {
     }
 }
 
-fn detect_cloudflare_pages(output_dir: &Path, hints: &mut Vec<HostingHint>) {
+fn detect_cloudflare_pages(
+    output_dir: &Path,
+    git_remote: Option<&str>,
+    hints: &mut Vec<HostingHint>,
+) {
     let mut signals = Vec::new();
 
     if find_ancestor_path(output_dir, "wrangler.toml").is_some() {
         signals.push("wrangler.toml found".to_string());
     }
 
-    if let Some(remote) = git_remote_url(output_dir)
+    if let Some(remote) = git_remote
         && remote.contains("cloudflare")
     {
         signals.push(format!("Git remote: {remote}"));
@@ -122,14 +127,14 @@ fn detect_cloudflare_pages(output_dir: &Path, hints: &mut Vec<HostingHint>) {
     }
 }
 
-fn detect_netlify(output_dir: &Path, hints: &mut Vec<HostingHint>) {
+fn detect_netlify(output_dir: &Path, git_remote: Option<&str>, hints: &mut Vec<HostingHint>) {
     let mut signals = Vec::new();
 
     if find_ancestor_path(output_dir, "netlify.toml").is_some() {
         signals.push("netlify.toml found".to_string());
     }
 
-    if let Some(remote) = git_remote_url(output_dir)
+    if let Some(remote) = git_remote
         && remote.contains("netlify")
     {
         signals.push(format!("Git remote: {remote}"));
