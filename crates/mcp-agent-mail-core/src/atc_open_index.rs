@@ -284,7 +284,7 @@ impl OpenExperienceIndex {
     /// Get resolution candidates that have exceeded the resolution window.
     #[must_use]
     pub fn expired_candidates(&self, now_micros: i64) -> Vec<ResolutionCandidate> {
-        let cutoff = now_micros - self.resolution_window_micros;
+        let cutoff = now_micros.saturating_sub(self.resolution_window_micros);
         let mut candidates = Vec::new();
 
         for (&ts, ids) in &self.by_creation {
@@ -298,7 +298,7 @@ impl OpenExperienceIndex {
                         decision_id: entry.decision_id,
                         created_ts_micros: entry.created_ts_micros,
                         effect_kind: entry.effect_kind.clone(),
-                        age_micros: now_micros - entry.created_ts_micros,
+                        age_micros: now_micros.saturating_sub(entry.created_ts_micros),
                     });
                 }
             }

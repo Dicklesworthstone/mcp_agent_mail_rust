@@ -263,12 +263,15 @@ pub fn compute_cohort_stats(estimates: &[StratumEstimate]) -> CohortStats {
             .filter_map(|e| e.local_variance)
             .collect();
         if vars.is_empty() {
-            // Fallback: use the between-strata variance as a proxy for
-            // within-variance. This is conservative (over-estimates within
-            // relative to between, which biases toward more shrinkage).
-            // We avoid the Bernoulli p*(1-p) formula because loss values
-            // can exceed 1.0.
-            (between_variance / strata_count as f64).max(0.01)
+            // Fallback: use between-strata variance directly as a proxy
+            // for within-variance. This is conservative: when within ≈
+            // between, the shrinkage weight B = within/(within + n*between)
+            // ≈ 1/(1+n), giving moderate pooling that trusts local estimates
+            // proportionally to their sample size. We do NOT divide by
+            // strata_count here because that would make within << between,
+            // biasing toward LESS shrinkage (more trust in sparse locals),
+            // which is the opposite of conservative behavior.
+            between_variance.max(0.01)
         } else {
             vars.iter().sum::<f64>() / vars.len() as f64
         }

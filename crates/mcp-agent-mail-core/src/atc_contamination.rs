@@ -164,8 +164,8 @@ impl AgentContaminationTracker {
     ) -> Vec<ContaminationSignal> {
         let mut signals = Vec::new();
 
-        // Check for burst.
-        if ts_micros - self.window_start_micros > window_duration_micros {
+        // Check for burst. Use saturating_sub to handle clock skew safely.
+        if ts_micros.saturating_sub(self.window_start_micros) > window_duration_micros {
             // Reset window.
             self.event_count_in_window = 0;
             self.window_start_micros = ts_micros;
@@ -184,7 +184,7 @@ impl AgentContaminationTracker {
         let events_per_minute = if self.event_count_in_window >= MIN_BURST_EVENT_COUNT
             && window_duration_micros > 0
         {
-            let actual_elapsed = ts_micros - self.window_start_micros;
+            let actual_elapsed = ts_micros.saturating_sub(self.window_start_micros);
             let elapsed_micros = actual_elapsed.max(MIN_BURST_OBSERVATION_MICROS);
             #[allow(
                 clippy::cast_precision_loss,
