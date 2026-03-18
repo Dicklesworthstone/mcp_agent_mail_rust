@@ -15305,7 +15305,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             }
 
             // Prefix subject
-            let subject = if orig.subject.to_ascii_lowercase().starts_with("re:") {
+            let subject = if orig.subject.len() >= 3 && orig.subject.as_bytes()[..3].eq_ignore_ascii_case(b"re:") {
                 orig.subject.clone()
             } else {
                 format!("Re: {}", orig.subject)

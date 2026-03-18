@@ -344,7 +344,7 @@ impl ComposeState {
         self.recipients
             .iter()
             .enumerate()
-            .filter(|(_, r)| r.name.to_ascii_lowercase().contains(&filter_lower))
+            .filter(|(_, r)| crate::tui_screens::contains_ci(&r.name, &filter_lower))
             .map(|(i, _)| i)
             .collect()
     }

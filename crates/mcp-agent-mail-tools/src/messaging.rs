@@ -4114,9 +4114,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn apply_prefix(original_subject: &str, prefix: &str) -> String {
-        if original_subject
-            .to_ascii_lowercase()
-            .starts_with(&prefix.to_ascii_lowercase())
+        if original_subject.len() >= prefix.len()
+            && original_subject.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
         {
             original_subject.to_string()
         } else {

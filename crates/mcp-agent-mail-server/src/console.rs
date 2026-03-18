@@ -2101,7 +2101,7 @@ impl TimelinePane {
 
         if !self.query.is_empty() {
             let q = self.query.to_ascii_lowercase();
-            if !event.summary.to_ascii_lowercase().contains(&q) {
+            if !crate::tui_screens::contains_ci(&event.summary, &q) {
                 return false;
             }
         }

@@ -306,8 +306,6 @@ pub mod tool_util {
     /// Mimics Python's `difflib.SequenceMatcher.ratio()` which returns
     /// `2.0 * matching_chars / total_chars`.
     fn similarity_score(a: &str, b: &str) -> f64 {
-        let a = a.to_ascii_lowercase();
-        let b = b.to_ascii_lowercase();
         let a_bytes = a.as_bytes();
         let b_bytes = b.as_bytes();
         let total = a_bytes.len() + b_bytes.len();
@@ -322,7 +320,7 @@ pub mod tool_util {
         let mut curr = vec![0usize; n + 1];
         for i in 1..=m {
             for j in 1..=n {
-                curr[j] = if a_bytes[i - 1] == b_bytes[j - 1] {
+                curr[j] = if a_bytes[i - 1].to_ascii_lowercase() == b_bytes[j - 1].to_ascii_lowercase() {
                     prev[j - 1] + 1
                 } else {
                     prev[j].max(curr[j - 1])
