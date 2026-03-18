@@ -8,9 +8,8 @@
 
 #![forbid(unsafe_code)]
 
-use serde::Serialize;
-use std::collections::BTreeMap;
-use std::io::{IsTerminal, Write};
+use serde::{Deserialize, Serialize};
+use std::io::IsTerminal;
 use unicode_width::UnicodeWidthStr;
 
 // ── Output format enum ────────────────────────────────────────────────────
