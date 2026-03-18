@@ -499,11 +499,12 @@ pub fn compute_doubly_robust(
 
     let n = n_contributing as f64;
     let candidate_dr_loss = sum_dr / n;
-    // Computational variance formula: Var(X) = (E[X²] - E[X]²) / (n-1)
-    // clippy flags `- x * x` as suspicious, but this is correct math.
+    // Computational variance formula: Var(X) = (E[X²] - (E[X])²) / (n-1).
+    // Clamp to 0.0 because the one-pass formula can produce small negative
+    // values due to floating-point cancellation when DR terms are similar.
     #[allow(clippy::suspicious_operation_groupings)]
     let dr_variance = if n > 1.0 {
-        (sum_dr_sq / n - candidate_dr_loss * candidate_dr_loss) / (n - 1.0)
+        ((sum_dr_sq / n - candidate_dr_loss * candidate_dr_loss) / (n - 1.0)).max(0.0)
     } else {
         f64::INFINITY
     };
@@ -586,6 +587,14 @@ impl ConfidenceSequence {
     ///
     /// Positive advantage means the candidate is better.
     pub fn update(&mut self, advantage: f64) {
+        // IMPORTANT: Update e-value BEFORE adapting lambda. The e-process
+        // validity guarantee (type-I error ≤ α under optional stopping)
+        // requires λ_i to be F_{i-1}-measurable — it must only depend on
+        // past data, not the current observation. So we apply the current
+        // lambda first, then adapt it for the NEXT observation.
+        let factor = (1.0 + self.lambda * advantage).max(1e-6);
+        self.log_e_value += factor.ln();
+
         self.n_observations += 1;
 
         // Welford's online mean and variance.
@@ -594,7 +603,7 @@ impl ConfidenceSequence {
         let delta2 = advantage - self.running_mean;
         self.running_m2 += delta * delta2;
 
-        // Adaptively set lambda based on running variance.
+        // Adaptively set lambda for the NEXT observation.
         if self.n_observations >= 10 {
             let variance = self.running_m2 / (self.n_observations - 1) as f64;
             let std_dev = variance.max(1e-10).sqrt();
@@ -603,13 +612,6 @@ impl ConfidenceSequence {
             self.lambda = (self.running_mean / (2.0 * std_dev * std_dev))
                 .clamp(0.01, 2.0);
         }
-
-        // Update e-value in log-space: log(E_t) += log(1 + λ × Z_i).
-        // When factor ≤ 0 (catastrophically bad observation), the e-value
-        // should crash toward zero. Clamping to a small positive value
-        // produces a large negative log update, which is correct.
-        let factor = (1.0 + self.lambda * advantage).max(1e-6);
-        self.log_e_value += factor.ln();
     }
 
     /// Current e-value (exponentiated from log-space).
