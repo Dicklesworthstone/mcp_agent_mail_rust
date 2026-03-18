@@ -455,10 +455,10 @@ pub fn compute_doubly_robust(
         return None;
     }
 
-    let n = observations.len() as f64;
     let mut sum_dr = 0.0;
     let mut sum_dr_sq = 0.0;
     let mut sum_iw_sq = 0.0;
+    let mut n_contributing = 0u64;
     let mut n_selected = 0u64;
     let mut n_clipped = 0u64;
 
@@ -467,6 +467,7 @@ pub fn compute_doubly_robust(
         if combined_weight <= 0.0 {
             continue;
         }
+        n_contributing += 1;
 
         let dr_term = if obs.candidate_selected {
             n_selected += 1;
@@ -492,6 +493,11 @@ pub fn compute_doubly_robust(
         sum_dr_sq += dr_term * dr_term;
     }
 
+    if n_contributing == 0 {
+        return None;
+    }
+
+    let n = n_contributing as f64;
     let candidate_dr_loss = sum_dr / n;
     // Computational variance formula: Var(X) = (E[X²] - E[X]²) / (n-1)
     // clippy flags `- x * x` as suspicious, but this is correct math.
@@ -516,7 +522,7 @@ pub fn compute_doubly_robust(
         candidate_dr_loss,
         incumbent_mean_loss,
         dr_advantage: incumbent_mean_loss - candidate_dr_loss,
-        n_observations: observations.len() as u64,
+        n_observations: n_contributing,
         n_selected,
         n_clipped,
         effective_sample_size: ess,
@@ -1580,6 +1586,50 @@ mod tests {
         }).collect();
         let result = compute_doubly_robust(&obs, 0.5).unwrap();
         assert!(result.n_clipped > 0, "Expected clipped weights with low propensity");
+    }
+
+    #[test]
+    fn test_doubly_robust_zero_weight_observations_excluded() {
+        // 3 contributing observations + 7 zero-weight ones.
+        // The zero-weight ones should NOT dilute the estimate.
+        let mut obs = Vec::new();
+        for _ in 0..3 {
+            obs.push(DRObservation {
+                candidate_selected: true,
+                propensity: 0.5,
+                realized_loss: 0.4,
+                predicted_loss: 0.5,
+                evidence_weight: 1.0,
+                attribution_weight: 1.0,
+            });
+        }
+        for _ in 0..7 {
+            obs.push(DRObservation {
+                candidate_selected: true,
+                propensity: 0.5,
+                realized_loss: 0.4,
+                predicted_loss: 0.5,
+                evidence_weight: 0.0, // zero weight → excluded
+                attribution_weight: 1.0,
+            });
+        }
+        let result = compute_doubly_robust(&obs, 0.5).unwrap();
+        assert_eq!(result.n_observations, 3, "Only contributing observations should be counted");
+        assert_eq!(result.n_selected, 3);
+    }
+
+    #[test]
+    fn test_doubly_robust_all_zero_weight_returns_none() {
+        let obs: Vec<DRObservation> = (0..10).map(|_| DRObservation {
+            candidate_selected: true,
+            propensity: 0.5,
+            realized_loss: 0.4,
+            predicted_loss: 0.5,
+            evidence_weight: 0.0, // all zero weight
+            attribution_weight: 1.0,
+        }).collect();
+        let result = compute_doubly_robust(&obs, 0.5);
+        assert!(result.is_none(), "All-zero-weight observations should return None");
     }
 
     #[test]

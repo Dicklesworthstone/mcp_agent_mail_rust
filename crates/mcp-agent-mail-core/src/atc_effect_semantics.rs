@@ -439,6 +439,17 @@ impl CooldownTracker {
         let active_cooldown_micros = cooldown_micros.max(0);
 
         if let Some(entry) = self.entries.get(cooldown_key) {
+            // For effects with max_reps == 0 (e.g., HighRiskIntervention),
+            // ANY prior emission means suppression, regardless of window.
+            if max_reps == 0 && entry.emissions_in_window > 0 {
+                return CooldownVerdict::Suppressed {
+                    remaining_micros: active_cooldown_micros
+                        .saturating_sub(now_micros.saturating_sub(entry.last_ts_micros)),
+                    emissions_in_window: entry.emissions_in_window,
+                    max_in_window: 0,
+                };
+            }
+
             let elapsed = now_micros.saturating_sub(entry.last_ts_micros);
             if elapsed < active_cooldown_micros {
                 // Still within cooldown window.
@@ -1073,6 +1084,20 @@ mod tests {
         // High risk: max 0 repetitions in window.
         let verdict = tracker.check(key, 2_000_000, 60_000_000, "reservation_release");
         assert!(matches!(verdict, CooldownVerdict::Suppressed { .. }));
+    }
+
+    #[test]
+    fn test_cooldown_high_risk_suppresses_even_with_zero_cooldown() {
+        let mut tracker = CooldownTracker::new();
+        let key = "reservation_release:proj:Agent";
+        // Record emission with zero cooldown window.
+        tracker.record_emission(key, 1_000_000, 0, "reservation_release");
+        // High risk with zero cooldown should STILL suppress repeats.
+        let verdict = tracker.check(key, 2_000_000, 0, "reservation_release");
+        assert!(
+            matches!(verdict, CooldownVerdict::Suppressed { .. }),
+            "High-risk effects must be suppressed even with zero cooldown window"
+        );
     }
 
     #[test]
