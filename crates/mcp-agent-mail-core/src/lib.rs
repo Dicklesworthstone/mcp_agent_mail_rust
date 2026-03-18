@@ -27,6 +27,7 @@ pub mod atc_retention;
 pub mod atc_risk_budgets;
 pub mod atc_shrinkage;
 pub mod atc_transparency;
+pub mod atc_user_surfaces;
 pub mod atc_voi_control;
 pub mod backpressure;
 pub mod bocpd;
