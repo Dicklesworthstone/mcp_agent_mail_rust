@@ -3464,18 +3464,24 @@ pub async fn list_message_recipients_by_message(
                 out.push(MessageRecipientDetailRow { name, kind });
             }
             out.sort_by(|left, right| {
-                let kind_rank = |kind: &str| match kind.to_ascii_lowercase().as_str() {
-                    "to" => 0,
-                    "cc" => 1,
-                    "bcc" => 2,
-                    _ => 3,
+                let kind_rank = |kind: &str| {
+                    if kind.eq_ignore_ascii_case("to") {
+                        0
+                    } else if kind.eq_ignore_ascii_case("cc") {
+                        1
+                    } else if kind.eq_ignore_ascii_case("bcc") {
+                        2
+                    } else {
+                        3
+                    }
                 };
                 kind_rank(&left.kind)
                     .cmp(&kind_rank(&right.kind))
                     .then_with(|| {
                         left.name
-                            .to_ascii_lowercase()
-                            .cmp(&right.name.to_ascii_lowercase())
+                            .bytes()
+                            .map(|b| b.to_ascii_lowercase())
+                            .cmp(right.name.bytes().map(|b| b.to_ascii_lowercase()))
                     })
                     .then_with(|| left.name.cmp(&right.name))
             });
@@ -3540,7 +3546,11 @@ pub async fn list_message_recipient_names_by_message(
     }
 
     for names in out.values_mut() {
-        names.sort_by_key(|name| name.to_ascii_lowercase());
+        names.sort_by(|left, right| {
+            left.bytes()
+                .map(|b| b.to_ascii_lowercase())
+                .cmp(right.bytes().map(|b| b.to_ascii_lowercase()))
+        });
         names.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
     }
 
