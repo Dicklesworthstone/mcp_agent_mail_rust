@@ -3938,7 +3938,7 @@ mod tests {
                 let err = validate_explicit_thread_id_for_send(&ctx, &pool, project_id, "424242")
                     .await
                     .expect_err("unknown numeric thread id should be rejected");
-                assert!(err.message.contains("existing reply-seeded thread"));
+                assert!(err.message.contains("reserved for reply-seeded thread"));
             },
         );
     }
@@ -3978,7 +3978,7 @@ mod tests {
             )
             .await
             .expect_err("root message id without replies should be rejected");
-            assert!(err.message.contains("existing reply-seeded thread"));
+            assert!(err.message.contains("reserved for reply-seeded thread"));
         });
     }
 
@@ -4038,7 +4038,7 @@ mod tests {
             )
             .await
             .expect_err("leading-zero numeric variant should be rejected");
-            assert!(err.message.contains("existing reply-seeded thread"));
+            assert!(err.message.contains("reserved for reply-seeded thread"));
         });
     }
 
