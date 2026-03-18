@@ -5949,9 +5949,12 @@ pub fn get_archive_tree(archive: &ProjectArchive, path: &str) -> Result<Vec<Tree
     entries.sort_by(|a, b| {
         let a_dir = a.entry_type == "dir";
         let b_dir = b.entry_type == "dir";
-        b_dir
-            .cmp(&a_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        b_dir.cmp(&a_dir).then_with(|| {
+            a.name
+                .bytes()
+                .map(|b| b.to_ascii_lowercase())
+                .cmp(b.name.bytes().map(|b| b.to_ascii_lowercase()))
+        })
     });
 
     Ok(entries)
@@ -6445,10 +6448,14 @@ pub fn get_timeline_commits(
 /// Returns `(frontmatter_json, body_markdown)`.
 pub fn read_message_file(path: &Path) -> Result<(serde_json::Value, String)> {
     if let Ok(meta) = fs::metadata(path) {
-        if meta.len() > 50 * 1024 * 1024 { // 50MB safety limit
+        if meta.len() > 50 * 1024 * 1024 {
+            // 50MB safety limit
             return Err(StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("message file {} exceeds maximum size of 50MB", path.display()),
+                format!(
+                    "message file {} exceeds maximum size of 50MB",
+                    path.display()
+                ),
             )));
         }
     }
