@@ -85,7 +85,7 @@ impl FastEmbedEmbedder {
         let mut model = self
             .model
             .lock()
-            .map_err(|_| SearchError::Internal("fastembed lock poisoned".to_string()))?;
+            .map_err(|e| SearchError::Internal(format!("fastembed lock poisoned: {e}")))?;
 
         let embeddings = model
             .embed(vec![text], None)

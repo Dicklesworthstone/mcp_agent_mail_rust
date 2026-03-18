@@ -831,14 +831,14 @@ fn has_run_lexical_backfill(sqlite_key: &str) -> Result<bool, DbError> {
     let backfill_state = lexical_backfill_state();
     let state = backfill_state
         .lock()
-        .map_err(|_| DbError::Sqlite("search backfill state lock poisoned".to_string()))?;
+        .map_err(|e| DbError::Sqlite(format!("search backfill state lock poisoned: {e}")))?;
     Ok(state.contains(sqlite_key))
 }
 
 fn mark_lexical_backfill_ran(sqlite_key: &str) -> Result<(), DbError> {
     lexical_backfill_state()
         .lock()
-        .map_err(|_| DbError::Sqlite("search backfill state lock poisoned".to_string()))?
+        .map_err(|e| DbError::Sqlite(format!("search backfill state lock poisoned: {e}")))?
         .insert(sqlite_key.to_string());
     Ok(())
 }
@@ -846,7 +846,7 @@ fn mark_lexical_backfill_ran(sqlite_key: &str) -> Result<(), DbError> {
 fn set_lexical_active_db_key(sqlite_key: &str) -> Result<(), DbError> {
     *lexical_active_db_key()
         .lock()
-        .map_err(|_| DbError::Sqlite("search active DB key lock poisoned".to_string()))? =
+        .map_err(|e| DbError::Sqlite(format!("search active DB key lock poisoned: {e}")))? =
         Some(sqlite_key.to_string());
     Ok(())
 }
@@ -854,7 +854,7 @@ fn set_lexical_active_db_key(sqlite_key: &str) -> Result<(), DbError> {
 fn record_lexical_bootstrap_success(sqlite_key: &str) -> Result<(), DbError> {
     lexical_bootstrap_state()
         .lock()
-        .map_err(|_| DbError::Sqlite("search bootstrap state lock poisoned".to_string()))?
+        .map_err(|e| DbError::Sqlite(format!("search bootstrap state lock poisoned: {e}")))?
         .insert(sqlite_key.to_string(), Ok(()));
     set_lexical_active_db_key(sqlite_key)?;
     mark_lexical_backfill_ran(sqlite_key)?;
@@ -870,7 +870,7 @@ pub fn note_startup_lexical_backfill_completed(database_url: &str) -> Result<(),
     }
     let _guard = lexical_init_guard()
         .lock()
-        .map_err(|_| DbError::Sqlite("search bootstrap init guard lock poisoned".to_string()))?;
+        .map_err(|e| DbError::Sqlite(format!("search bootstrap init guard lock poisoned: {e}")))?;
     record_lexical_bootstrap_success(&sqlite_key)
 }
 
@@ -889,17 +889,17 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
     let sqlite_key = sqlite_key_for_pool(pool);
     let _guard = lexical_init_guard()
         .lock()
-        .map_err(|_| DbError::Sqlite("search bootstrap init guard lock poisoned".to_string()))?;
+        .map_err(|e| DbError::Sqlite(format!("search bootstrap init guard lock poisoned: {e}")))?;
 
     let state_lock = lexical_bootstrap_state();
     let cached_state = state_lock
         .lock()
-        .map_err(|_| DbError::Sqlite("search bootstrap state lock poisoned".to_string()))?
+        .map_err(|e| DbError::Sqlite(format!("search bootstrap state lock poisoned: {e}")))?
         .get(&sqlite_key)
         .cloned();
     let active_key = lexical_active_db_key()
         .lock()
-        .map_err(|_| DbError::Sqlite("search active DB key lock poisoned".to_string()))?
+        .map_err(|e| DbError::Sqlite(format!("search active DB key lock poisoned: {e}")))?
         .clone();
 
     // Fast path: the current DB is already the active bridge source and the
@@ -958,7 +958,7 @@ fn ensure_lexical_bridge_initialized(pool: &DbPool) -> Result<(), DbError> {
             // Do not permanently cache failures; allow retry on next query.
             state_lock
                 .lock()
-                .map_err(|_| DbError::Sqlite("search bootstrap state lock poisoned".to_string()))?
+                .map_err(|e| DbError::Sqlite(format!("search bootstrap state lock poisoned: {e}")))?
                 .remove(&sqlite_key);
             Err(map_bridge_bootstrap_error(&err))
         }
