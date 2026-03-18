@@ -463,7 +463,7 @@ pub fn agent_mail_pids_all_stopped(_pids: &[u32]) -> bool {
 fn listener_pid_hint_path(host: &str, port: u16) -> PathBuf {
     std::env::temp_dir()
         .join(LISTENER_PID_HINT_DIR)
-        .join(format!("{}-{port}.pid", sanitize_pid_hint_component(host)))
+        .join(format!("{}-{port}.pid", encode_pid_hint_component(host)))
 }
 
 fn current_executable_hint_path() -> Option<String> {
@@ -486,16 +486,20 @@ fn format_listener_pid_hint(hint: &ListenerPidHint) -> String {
     }
 }
 
-fn sanitize_pid_hint_component(value: &str) -> String {
-    let sanitized: String = value
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-        .collect();
-    if sanitized.is_empty() {
-        "host".to_string()
+fn encode_pid_hint_component(value: &str) -> String {
+    use std::fmt::Write as _;
+
+    let trimmed = value.trim();
+    let raw = if trimmed.is_empty() {
+        b"host".as_slice()
     } else {
-        sanitized
+        trimmed.as_bytes()
+    };
+    let mut encoded = String::with_capacity(raw.len().saturating_mul(2));
+    for byte in raw {
+        let _ = write!(encoded, "{byte:02x}");
     }
+    encoded
 }
 
 fn parse_listener_pid_hint(content: &str) -> Option<ListenerPidHint> {
@@ -2283,7 +2287,14 @@ mod tests {
     fn listener_pid_hint_path_sanitizes_host() {
         let path = listener_pid_hint_path("::1", 8765);
         let file_name = path.file_name().expect("file name");
-        assert_eq!(file_name.to_string_lossy(), "__1-8765.pid");
+        assert_eq!(file_name.to_string_lossy(), "3a3a31-8765.pid");
+    }
+
+    #[test]
+    fn listener_pid_hint_path_distinguishes_hosts_that_old_sanitizer_collided() {
+        let dotted = listener_pid_hint_path("127.0.0.1", 8765);
+        let underscored = listener_pid_hint_path("127_0_0_1", 8765);
+        assert_ne!(dotted, underscored);
     }
 
     #[test]

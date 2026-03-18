@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
-use asupersync::Cx;
+use asupersync::{Budget, Cx};
 use fastmcp_core::block_on;
 use mcp_agent_mail_core::config::Config;
 use mcp_agent_mail_db::models::{AgentRow, ProjectRow};
@@ -34,7 +34,10 @@ pub fn dispatch(
     method: &str,
     body: &str,
 ) -> Result<Option<String>, (u16, String)> {
-    let cx = Cx::for_testing();
+    // Use a real 30-second budget for production mail UI requests.
+    // Cx::for_testing() was previously used here, which provides no
+    // timeout enforcement and could let slow queries block indefinitely.
+    let cx = Cx::for_request_with_budget(Budget::seconds(30));
     let pool = get_pool()?;
 
     // Strip leading "/mail" prefix.

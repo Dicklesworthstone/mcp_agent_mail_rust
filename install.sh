@@ -4599,13 +4599,11 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
     if printf "%s\n" "$migration_output" | grep -qiE "schema migration hit sqlite engine instability|schema migration path was skipped due to backend instability"; then
       migration_requires_fallback=1
     fi
+    info "Database migration command completed; verifying results"
     if [ "$migration_has_unresolved_warnings" -eq 1 ]; then
-      ok "Database schema migrated"
       warn "Database migration completed with unresolved warnings."
       warn "Review migration output with --verbose and retry if needed:"
       warn "  AM_INTERFACE_MODE=cli DATABASE_URL=sqlite:///$PYTHON_DB_MIGRATED_PATH am migrate --force"
-    else
-      ok "Database schema migrated"
     fi
     migration_succeeded=1
   elif migration_output_fallback=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite+aiosqlite:///$PYTHON_DB_MIGRATED_PATH" "$DEST/$BIN_CLI" migrate --force 2>&1); then
@@ -4627,13 +4625,11 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
     if printf "%s\n%s\n" "$migration_output" "$migration_output_fallback" | grep -qiE "schema migration hit sqlite engine instability|schema migration path was skipped due to backend instability"; then
       migration_requires_fallback=1
     fi
+    info "Database migration command completed; verifying results"
     if [ "$migration_has_unresolved_warnings" -eq 1 ]; then
-      ok "Database schema migrated"
       warn "Database migration completed with unresolved warnings."
       warn "Review migration output with --verbose and retry if needed:"
       warn "  AM_INTERFACE_MODE=cli DATABASE_URL=sqlite:///$PYTHON_DB_MIGRATED_PATH am migrate --force"
-    else
-      ok "Database schema migrated"
     fi
     migration_succeeded=1
   else
@@ -4741,6 +4737,9 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
     if ! migration_core_counts_preserved "$migration_before_counts" "$migration_after_counts"; then
       migration_succeeded=0
       warn "Final migration verification detected reduced core legacy row counts."
+    fi
+    if [ "$migration_succeeded" -eq 1 ]; then
+      ok "Database schema migrated"
     fi
   fi
 

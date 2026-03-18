@@ -85,7 +85,6 @@ use asupersync::http::h1::types::{
 };
 use asupersync::messaging::RedisClient;
 #[cfg(not(target_os = "linux"))]
-#[cfg(not(target_os = "linux"))]
 use asupersync::runtime::reactor::create_reactor;
 #[cfg(target_os = "linux")]
 use asupersync::runtime::reactor::{EpollReactor, IoUringReactor, Reactor};
@@ -3219,10 +3218,20 @@ fn record_atc_operator_execution(
     visible_actions: &mut Vec<AtcOperatorActionSnapshot>,
     execution: AtcOperatorExecutionSnapshot,
 ) {
-    push_bounded(recent_executions, ATC_OPERATOR_EXECUTION_CAPACITY, execution.clone());
+    push_bounded(
+        recent_executions,
+        ATC_OPERATOR_EXECUTION_CAPACITY,
+        execution.clone(),
+    );
     let action_snapshot = atc_action_snapshot_from_execution(&execution);
-    visible_actions.push(action_snapshot.clone());
-    push_bounded(recent_actions, ATC_OPERATOR_ACTION_CAPACITY, action_snapshot);
+    if visible_actions.len() < ATC_OPERATOR_ACTION_CAPACITY {
+        visible_actions.push(action_snapshot.clone());
+    }
+    push_bounded(
+        recent_actions,
+        ATC_OPERATOR_ACTION_CAPACITY,
+        action_snapshot,
+    );
 }
 
 fn atc_status_consumes_cooldown(status: &str) -> bool {
@@ -4442,6 +4451,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                 summary.budget.tick_budget_micros
             });
 
+        let mut visible_actions = Vec::new();
         for mut effect in new_effects {
             if let Some(pool) = atc_db_pool.as_ref() {
                 match append_atc_experience_for_effect(pool, &effect) {
@@ -4482,10 +4492,12 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                             executor_mode.as_str(),
                             ATC_QUEUE_BACKPRESSURE_STATUS,
                         );
-                        if recent_executions.len() >= ATC_OPERATOR_EXECUTION_CAPACITY {
-                            let _ = recent_executions.pop_front();
-                        }
-                        recent_executions.push_back(execution);
+                        record_atc_operator_execution(
+                            &mut recent_executions,
+                            &mut recent_actions,
+                            &mut visible_actions,
+                            execution,
+                        );
                         tracing::warn!(
                             decision_id = dropped.decision_id,
                             effect_id = %dropped.effect_id,
@@ -4498,7 +4510,6 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
             }
         }
 
-        let mut visible_actions = Vec::new();
         let mut processed_this_tick = 0_usize;
         while processed_this_tick < ATC_OPERATOR_ACTION_CAPACITY {
             let Some(effect) = pending_effects.front() else {
@@ -7181,8 +7192,9 @@ impl HttpState {
                         &serde_json::json!({"status":"warming_up"}),
                     ));
                 }
-                if let Err(err) = readiness_check_quick(&self.config) {
-                    return Some(self.error_response(req, 503, &err));
+                if let Err(_err) = readiness_check_quick(&self.config) {
+                    tracing::warn!(error = %_err, "readiness check failed");
+                    return Some(self.error_response(req, 503, "service unavailable"));
                 }
                 return Some(self.health_json_response(
                     req,
@@ -11810,6 +11822,70 @@ mod tests {
                 .console_line()
                 .contains("[suppressed:executor_mode_dry_run]")
         );
+    }
+
+    #[test]
+    fn record_atc_operator_execution_keeps_nonexecuted_outcomes_visible() {
+        let effect = sample_probe_effect();
+        let execution = atc_execution_snapshot(
+            1_700_000_000_000_111,
+            &effect,
+            "live",
+            ATC_QUEUE_BACKPRESSURE_STATUS,
+        );
+        let mut recent_executions = VecDeque::new();
+        let mut recent_actions = VecDeque::new();
+        let mut visible_actions = Vec::new();
+
+        record_atc_operator_execution(
+            &mut recent_executions,
+            &mut recent_actions,
+            &mut visible_actions,
+            execution,
+        );
+
+        assert_eq!(recent_executions.len(), 1);
+        assert_eq!(recent_actions.len(), 1);
+        assert_eq!(visible_actions.len(), 1);
+        assert_eq!(
+            recent_actions
+                .front()
+                .and_then(|action| action.message.as_deref()),
+            Some(
+                "[throttled:pending_queue_capacity] ATC needs an acknowledgment from AlphaAgent to distinguish a stale session from active work."
+            )
+        );
+        assert!(
+            visible_actions[0]
+                .console_line()
+                .contains("[throttled:pending_queue_capacity]")
+        );
+    }
+
+    #[test]
+    fn record_atc_operator_execution_caps_per_tick_visible_actions() {
+        let effect = sample_probe_effect();
+        let execution = atc_execution_snapshot(
+            1_700_000_000_000_000,
+            &effect,
+            "live",
+            ATC_QUEUE_BACKPRESSURE_STATUS,
+        );
+        let mut recent_executions = VecDeque::new();
+        let mut recent_actions = VecDeque::new();
+        let mut visible_actions =
+            vec![AtcOperatorActionSnapshot::default(); ATC_OPERATOR_ACTION_CAPACITY];
+
+        record_atc_operator_execution(
+            &mut recent_executions,
+            &mut recent_actions,
+            &mut visible_actions,
+            execution,
+        );
+
+        assert_eq!(recent_executions.len(), 1);
+        assert_eq!(recent_actions.len(), 1);
+        assert_eq!(visible_actions.len(), ATC_OPERATOR_ACTION_CAPACITY);
     }
 
     #[test]

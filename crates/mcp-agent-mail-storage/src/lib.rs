@@ -3615,7 +3615,13 @@ pub fn ensure_archive_root(config: &Config) -> Result<(PathBuf, bool)> {
 
 /// Open an existing per-project archive directory without creating it.
 pub fn open_archive(config: &Config, slug: &str) -> Result<Option<ProjectArchive>> {
-    if slug.contains('/') || slug.contains('\\') || slug.contains("..") || slug.is_empty() {
+    if slug.contains('/')
+        || slug.contains('\\')
+        || slug.contains("..")
+        || slug.is_empty()
+        || slug == "."
+        || slug.starts_with('.')
+    {
         return Err(StorageError::InvalidPath(
             "invalid project slug: must not contain path separators or '..' components".to_string(),
         ));
@@ -3649,7 +3655,13 @@ pub fn open_archive(config: &Config, slug: &str) -> Result<Option<ProjectArchive
 /// Ensure a per-project archive directory exists under the archive root.
 pub fn ensure_archive(config: &Config, slug: &str) -> Result<ProjectArchive> {
     // Reject slugs with path separators or traversal components.
-    if slug.contains('/') || slug.contains('\\') || slug.contains("..") || slug.is_empty() {
+    if slug.contains('/')
+        || slug.contains('\\')
+        || slug.contains("..")
+        || slug.is_empty()
+        || slug == "."
+        || slug.starts_with('.')
+    {
         return Err(StorageError::InvalidPath(
             "invalid project slug: must not contain path separators or '..' components".to_string(),
         ));
@@ -5186,9 +5198,13 @@ pub fn emit_notification_signal(
         || project_slug.contains('/')
         || project_slug.contains('\\')
         || project_slug.contains("..")
+        || project_slug == "."
+        || project_slug.starts_with('.')
         || agent_name.contains('/')
         || agent_name.contains('\\')
         || agent_name.contains("..")
+        || agent_name == "."
+        || agent_name.starts_with('.')
     {
         return false;
     }
@@ -5248,13 +5264,17 @@ pub fn clear_notification_signal(config: &Config, project_slug: &str, agent_name
         return false;
     }
 
-    // Reject path-traversal characters.
+    // Reject path-traversal characters and dot-prefix names.
     if project_slug.contains('/')
         || project_slug.contains('\\')
         || project_slug.contains("..")
+        || project_slug == "."
+        || project_slug.starts_with('.')
         || agent_name.contains('/')
         || agent_name.contains('\\')
         || agent_name.contains("..")
+        || agent_name == "."
+        || agent_name.starts_with('.')
     {
         return false;
     }
@@ -5291,7 +5311,12 @@ pub fn list_pending_signals(config: &Config, project_slug: Option<&str>) -> Vec<
     let mut results = Vec::new();
     let dirs: Vec<PathBuf> = if let Some(slug) = project_slug {
         // Reject path-traversal characters.
-        if slug.contains('/') || slug.contains('\\') || slug.contains("..") {
+        if slug.contains('/')
+            || slug.contains('\\')
+            || slug.contains("..")
+            || slug == "."
+            || slug.starts_with('.')
+        {
             return Vec::new();
         }
         let d = projects_root.join(slug);

@@ -118,10 +118,47 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("project_sibling_suggestions", "dismissed_ts", true),
 ];
 
+#[derive(Debug, Default)]
+struct ColumnTypeScan {
+    has_non_null: bool,
+    has_text: bool,
+    has_integer_like: bool,
+    other_types: BTreeSet<String>,
+}
+
+fn scan_column_types(
+    conn: &DbConn,
+    table: &str,
+    column: &str,
+) -> Result<ColumnTypeScan, sqlmodel_core::Error> {
+    let sql =
+        format!("SELECT DISTINCT typeof({column}) AS t FROM {table} WHERE {column} IS NOT NULL");
+    let rows = conn.query_sync(&sql, &[])?;
+    let mut scan = ColumnTypeScan::default();
+
+    for row in rows {
+        let type_str: String = row.get_named("t").unwrap_or_default();
+        if type_str.is_empty() || type_str == "null" {
+            continue;
+        }
+        scan.has_non_null = true;
+        match type_str.as_str() {
+            "text" => scan.has_text = true,
+            "integer" | "real" => scan.has_integer_like = true,
+            other => {
+                scan.other_types.insert(other.to_string());
+            }
+        }
+    }
+
+    Ok(scan)
+}
+
 /// Detect the timestamp format used in a database.
 ///
-/// Probes each table's primary timestamp column using `typeof()` to determine
-/// whether the database stores TEXT (Python) or INTEGER (Rust) timestamps.
+/// Scans each timestamp column using `typeof()` to determine whether any rows
+/// still store TEXT (Python) timestamps or whether the column is fully INTEGER
+/// backed (Rust native format).
 ///
 /// # Errors
 ///
@@ -134,7 +171,7 @@ pub fn detect_timestamp_format(conn: &DbConn) -> Result<TimestampFormat, Migrati
     let mut text_tables = BTreeSet::new();
     let mut table_has_rows_cache: HashMap<&'static str, Option<bool>> = HashMap::new();
 
-    for &(table, column, _nullable) in TIMESTAMP_COLUMNS {
+    for &(table, column, nullable) in TIMESTAMP_COLUMNS {
         let table_has_rows = table_has_rows_cache.entry(table).or_insert_with(|| {
             let row_probe_sql = format!("SELECT 1 AS present FROM {table} LIMIT 1");
             conn.query_sync(&row_probe_sql, &[])
@@ -148,34 +185,29 @@ pub fn detect_timestamp_format(conn: &DbConn) -> Result<TimestampFormat, Migrati
         }
         saw_nonempty_table = true;
 
-        // Query the typeof() of the first non-NULL value in the column.
-        let sql =
-            format!("SELECT typeof({column}) AS t FROM {table} WHERE {column} IS NOT NULL LIMIT 1");
-        let Ok(rows) = conn.query_sync(&sql, &[]) else {
+        let Ok(scan) = scan_column_types(conn, table, column) else {
             saw_incompatible_timestamp_schema = true;
             continue; // Column might be renamed or missing
         };
 
-        if rows.is_empty() {
-            saw_incompatible_timestamp_schema = true;
-            continue; // Column exists but all values are NULL, or frankensqlite bug
+        if !scan.other_types.is_empty() {
+            return Ok(TimestampFormat::Unknown(format!(
+                "unsupported storage classes in {table}.{column}: {}",
+                scan.other_types.into_iter().collect::<Vec<_>>().join(", ")
+            )));
         }
-
-        let type_str: String = rows[0].get_named("t").unwrap_or_default();
-        match type_str.as_str() {
-            "integer" => saw_integer = true,
-            "text" => {
-                saw_text = true;
-                text_tables.insert(table.to_string());
+        if !scan.has_non_null {
+            if !nullable {
+                saw_incompatible_timestamp_schema = true;
             }
-            "real" => {
-                // REAL timestamps are unusual but could appear — treat like integer
-                saw_integer = true;
-            }
-            "null" => {} // All values NULL, skip
-            other => {
-                return Ok(TimestampFormat::Unknown(other.to_string()));
-            }
+            continue;
+        }
+        if scan.has_integer_like {
+            saw_integer = true;
+        }
+        if scan.has_text {
+            saw_text = true;
+            text_tables.insert(table.to_string());
         }
     }
 
@@ -201,21 +233,20 @@ pub fn detect_timestamp_format(conn: &DbConn) -> Result<TimestampFormat, Migrati
 
 /// Detect format for a specific table and column.
 ///
-/// Returns `Some("integer")`, `Some("text")`, `Some("null")`, or `None` if
-/// the table is empty or does not exist.
+/// Returns `Some("text")` if any row in the column still stores a TEXT
+/// timestamp, even when other rows are already INTEGER. Returns `Some("integer")`
+/// once the column is fully integer-like, or `None` if the table is empty,
+/// unreadable, or the column has no non-NULL values.
 pub fn detect_column_format(
     conn: &DbConn,
     table: &str,
     column: &str,
 ) -> Result<Option<String>, MigrationError> {
-    let sql =
-        format!("SELECT typeof({column}) AS t FROM {table} WHERE {column} IS NOT NULL LIMIT 1");
-    match conn.query_sync(&sql, &[]) {
-        Ok(rows) if rows.is_empty() => Ok(None),
-        Ok(rows) => {
-            let t: String = rows[0].get_named("t").unwrap_or_default();
-            Ok(Some(t))
-        }
+    match scan_column_types(conn, table, column) {
+        Ok(scan) if !scan.other_types.is_empty() => Ok(scan.other_types.into_iter().next()),
+        Ok(scan) if scan.has_text => Ok(Some("text".to_string())),
+        Ok(scan) if scan.has_integer_like => Ok(Some("integer".to_string())),
+        Ok(_) => Ok(None),
         Err(_) => Ok(None),
     }
 }
@@ -1255,6 +1286,136 @@ mod tests {
             )
             .expect("read migration_state");
         assert_eq!(rows.len(), 1, "projects should remain tracked as migrated");
+    }
+
+    #[test]
+    fn detect_column_format_prefers_text_when_column_is_mixed() {
+        let conn = DbConn::open_memory().expect("open in-memory DB");
+        conn.execute_raw(crate::schema::CREATE_TABLES_SQL)
+            .expect("create tables");
+
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'test', '/tmp', 1740000000000000)",
+            &[],
+        )
+        .expect("insert project");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES (1, 1, 'Sender', 'p', 'm', 1740000000000000, 1740000000000000)",
+            &[],
+        )
+        .expect("insert sender");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES (2, 1, 'ReaderA', 'p', 'm', 1740000000000001, 1740000000000001)",
+            &[],
+        )
+        .expect("insert reader a");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES (3, 1, 'ReaderB', 'p', 'm', 1740000000000002, 1740000000000002)",
+            &[],
+        )
+        .expect("insert reader b");
+        conn.query_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) VALUES (1, 1, 1, 'test', 'body', 1740000000000003)",
+            &[],
+        )
+        .expect("insert message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (1, 2, 'to', 1740000000000100, NULL)",
+            &[],
+        )
+        .expect("insert integer recipient row");
+        conn.query_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (1, 3, 'to', '2026-02-24 15:30:00.123456', NULL)",
+            &[],
+        )
+        .expect("insert text recipient row");
+
+        let column = detect_column_format(&conn, "message_recipients", "read_ts")
+            .expect("detect column format")
+            .expect("mixed column should not be empty");
+        assert_eq!(
+            column, "text",
+            "mixed columns must keep reporting text until every legacy row is converted"
+        );
+
+        let format = detect_timestamp_format(&conn).expect("detect timestamp format");
+        assert_eq!(
+            format,
+            TimestampFormat::Mixed {
+                text_tables: vec!["message_recipients".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn convert_all_timestamps_converts_mixed_message_recipient_columns() {
+        let conn = DbConn::open_memory().expect("open in-memory DB");
+        conn.execute_raw(crate::schema::CREATE_TABLES_SQL)
+            .expect("create tables");
+
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'test', '/tmp', 1740000000000000)",
+            &[],
+        )
+        .expect("insert project");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES (1, 1, 'Sender', 'p', 'm', 1740000000000000, 1740000000000000)",
+            &[],
+        )
+        .expect("insert sender");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES (2, 1, 'ReaderA', 'p', 'm', 1740000000000001, 1740000000000001)",
+            &[],
+        )
+        .expect("insert reader a");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, inception_ts, last_active_ts) VALUES (3, 1, 'ReaderB', 'p', 'm', 1740000000000002, 1740000000000002)",
+            &[],
+        )
+        .expect("insert reader b");
+        conn.query_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts) VALUES (1, 1, 1, 'test', 'body', 1740000000000003)",
+            &[],
+        )
+        .expect("insert message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (1, 2, 'to', 1740000000000100, NULL)",
+            &[],
+        )
+        .expect("insert integer recipient row");
+        conn.query_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (1, 3, 'to', '2026-02-24 15:30:00.123456', NULL)",
+            &[],
+        )
+        .expect("insert text recipient row");
+
+        let summary = convert_all_timestamps(&conn).expect("migrate");
+        assert!(
+            summary.success,
+            "mixed timestamp columns should migrate cleanly"
+        );
+        assert_eq!(
+            summary.total_converted, 1,
+            "only the lingering TEXT recipient timestamp should require conversion"
+        );
+
+        let remaining = conn
+            .query_sync(
+                "SELECT COUNT(*) AS count FROM message_recipients WHERE typeof(read_ts) = 'text'",
+                &[],
+            )
+            .expect("count remaining text recipient timestamps");
+        let remaining_count: i64 = remaining
+            .first()
+            .and_then(|row| row.get_named("count").ok())
+            .unwrap_or(-1);
+        assert_eq!(
+            remaining_count, 0,
+            "migration must clear every TEXT recipient timestamp"
+        );
+
+        let after = detect_timestamp_format(&conn).expect("detect post-migration format");
+        assert_eq!(after, TimestampFormat::RustMicros);
     }
 
     #[test]

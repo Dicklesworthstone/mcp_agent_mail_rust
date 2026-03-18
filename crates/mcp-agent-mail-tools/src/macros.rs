@@ -555,7 +555,7 @@ pub async fn macro_contact_handshake(
 
     let should_auto_accept = auto_accept.unwrap_or(false);
     let ttl = match ttl_seconds {
-        Some(t) if t > 0 => t,
+        Some(t) if t > 0 => t.clamp(60, 31_536_000), // consistent with other macros
         _ => 604_800, // 7 days
     };
     let target_project_key = to_project.clone().unwrap_or_else(|| project_key.clone());
@@ -626,6 +626,11 @@ pub async fn macro_contact_handshake(
             .await?;
             Some(parse_json(welcome_json, "welcome_message")?)
         } else {
+            tracing::debug!(
+                from = %from_agent,
+                to = %target_agent,
+                "welcome message skipped for cross-project handshake (messaging across projects not yet supported)"
+            );
             None
         }
     } else {
@@ -638,13 +643,14 @@ pub async fn macro_contact_handshake(
         welcome_message: welcome_val,
     };
 
+    let welcome_sent = welcome_val.is_some();
     tracing::debug!(
-        "Contact handshake from {} to {} in project {} (auto_accept: {}, welcome: {})",
+        "Contact handshake from {} to {} in project {} (auto_accept: {}, welcome_sent: {})",
         from_agent,
         target_agent,
         project_key,
         should_auto_accept,
-        has_welcome
+        welcome_sent
     );
 
     // Log registration params

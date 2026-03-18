@@ -4118,19 +4118,76 @@ fn path_is_real_directory(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
 }
 
+fn archive_project_matches_repo_path(
+    candidate: &Path,
+    repo_identity: &mcp_agent_mail_core::ProjectIdentity,
+) -> bool {
+    let metadata_path = candidate.join("project.json");
+    if !path_is_real_file(&metadata_path) {
+        return false;
+    }
+
+    let Ok(content) = std::fs::read_to_string(&metadata_path) else {
+        return false;
+    };
+    let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    let Some(human_key) = metadata
+        .get("human_key")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+
+    if human_key.eq_ignore_ascii_case(&repo_identity.human_key) {
+        return true;
+    }
+
+    let archive_identity = resolve_project_identity(human_key);
+    archive_identity
+        .human_key
+        .eq_ignore_ascii_case(&repo_identity.human_key)
+        || archive_identity
+            .canonical_path
+            .eq_ignore_ascii_case(&repo_identity.canonical_path)
+}
+
 fn resolve_guard_archive_root_for_check(repo_path: &Path, config: &Config) -> PathBuf {
     if path_is_real_directory(&repo_path.join("file_reservations")) {
         return repo_path.to_path_buf();
     }
 
+    let projects_dir = config.storage_root.join("projects");
+    if !path_is_real_directory(&projects_dir) {
+        return repo_path.to_path_buf();
+    }
+
     let human_key = repo_path.to_string_lossy().to_string();
     let identity = resolve_project_identity(&human_key);
-    let candidate = config.storage_root.join("projects").join(&identity.slug);
-    if path_is_real_directory(&candidate.join("file_reservations")) {
-        candidate
-    } else {
-        repo_path.to_path_buf()
+    let candidate = projects_dir.join(&identity.slug);
+    if path_is_real_directory(&candidate.join("file_reservations"))
+        && archive_project_matches_repo_path(&candidate, &identity)
+    {
+        return candidate;
     }
+
+    let Ok(entries) = std::fs::read_dir(&projects_dir) else {
+        return repo_path.to_path_buf();
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == candidate || !path_is_real_directory(&path.join("file_reservations")) {
+            continue;
+        }
+        if archive_project_matches_repo_path(&path, &identity) {
+            return path;
+        }
+    }
+
+    repo_path.to_path_buf()
 }
 
 fn handle_list_projects(
@@ -15033,7 +15090,7 @@ fn handle_mail_status_sync(conn: &mcp_agent_mail_db::DbConn, action: MailCommand
         unreachable!()
     };
     let identity = resolve_project_identity(project_path.to_string_lossy().as_ref());
-    let slug = &identity.project_uid;
+    let slug = &identity.slug;
 
     let rows = conn
         .query_sync(
@@ -24313,6 +24370,15 @@ startup_timeout_sec = 42
         let identity = resolve_project_identity(&repo_path.to_string_lossy());
         let candidate = config.storage_root.join("projects").join(&identity.slug);
         std::fs::create_dir_all(candidate.join("file_reservations")).expect("mkdir archive");
+        std::fs::write(
+            candidate.join("project.json"),
+            serde_json::json!({
+                "slug": identity.slug,
+                "human_key": repo_path.to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .expect("write project metadata");
 
         let resolved = resolve_guard_archive_root_for_check(&repo_path, &config);
         assert_eq!(resolved, candidate);
@@ -24342,9 +24408,54 @@ startup_timeout_sec = 42
         let identity = resolve_project_identity(&repo_path.to_string_lossy());
         let candidate = config.storage_root.join("projects").join(&identity.slug);
         std::fs::create_dir_all(candidate.join("file_reservations")).expect("mkdir archive");
+        std::fs::write(
+            candidate.join("project.json"),
+            serde_json::json!({
+                "slug": identity.slug,
+                "human_key": repo_path.to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .expect("write project metadata");
 
         let resolved = resolve_guard_archive_root_for_check(&repo_path, &config);
         assert_eq!(resolved, candidate);
+    }
+
+    #[test]
+    fn resolve_guard_archive_root_rejects_slug_collision_without_matching_metadata() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_path = td.path().join("repo").join("a").join("b");
+        let colliding_project = td.path().join("repo").join("a-b");
+        std::fs::create_dir_all(&repo_path).expect("mkdir repo");
+        std::fs::create_dir_all(&colliding_project).expect("mkdir colliding project");
+
+        let config = Config {
+            storage_root: td.path().join("storage"),
+            ..Config::default()
+        };
+
+        let identity = resolve_project_identity(&repo_path.to_string_lossy());
+        let colliding_identity = resolve_project_identity(&colliding_project.to_string_lossy());
+        assert_eq!(
+            identity.slug, colliding_identity.slug,
+            "test setup needs slug collision"
+        );
+
+        let candidate = config.storage_root.join("projects").join(&identity.slug);
+        std::fs::create_dir_all(candidate.join("file_reservations")).expect("mkdir archive");
+        std::fs::write(
+            candidate.join("project.json"),
+            serde_json::json!({
+                "slug": colliding_identity.slug,
+                "human_key": colliding_project.to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .expect("write colliding metadata");
+
+        let resolved = resolve_guard_archive_root_for_check(&repo_path, &config);
+        assert_eq!(resolved, repo_path);
     }
 
     #[test]
@@ -27148,7 +27259,7 @@ startup_timeout_sec = 42
 
         let now_us = mcp_agent_mail_db::timestamps::now_micros();
         let identity = resolve_project_identity(project_path);
-        let slug = &identity.project_uid;
+        let slug = &identity.slug;
 
         conn.execute_sync(
             "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
@@ -27257,6 +27368,13 @@ startup_timeout_sec = 42
         assert!(
             output.contains("Agents") && output.contains("2"),
             "expected agent count 2 in output, got: {output}"
+        );
+        assert!(
+            output.contains(&format!(
+                "Project: {}",
+                resolve_project_identity(project_path).slug
+            )),
+            "expected project slug in output, got: {output}"
         );
     }
 
@@ -29187,6 +29305,45 @@ startup_timeout_sec = 42
             err_msg.contains("project not found"),
             "error should say 'project not found', got: {err_msg}"
         );
+    }
+
+    #[test]
+    fn get_project_record_rejects_slug_collision_for_absolute_path() {
+        let (pool, dir) = make_test_pool();
+
+        let project_a = dir.path().join("repo").join("a-b");
+        let project_b = dir.path().join("repo").join("a").join("b");
+        std::fs::create_dir_all(&project_a).expect("mkdir project_a");
+        std::fs::create_dir_all(&project_b).expect("mkdir project_b");
+
+        let project_a = project_a.canonicalize().expect("canonicalize project_a");
+        let project_b = project_b.canonicalize().expect("canonicalize project_b");
+        let project_a_key = project_a.display().to_string();
+        let project_b_key = project_b.display().to_string();
+
+        let identity_a = resolve_project_identity(&project_a_key);
+        let identity_b = resolve_project_identity(&project_b_key);
+        assert_eq!(
+            identity_a.slug, identity_b.slug,
+            "test setup requires a slug collision"
+        );
+
+        block_on_async(|cx| async move {
+            let existing = mcp_agent_mail_db::queries::ensure_project(&cx, &pool, &project_a_key)
+                .await
+                .into_result()
+                .expect("ensure project A");
+            assert_eq!(existing.human_key, project_a_key);
+
+            let err = get_project_record(&cx, &pool, &project_b_key)
+                .await
+                .expect_err("colliding absolute path should not resolve to project A");
+            let err_msg = format!("{err}");
+            assert!(
+                err_msg.contains("not found"),
+                "expected not-found error for colliding path lookup, got: {err_msg}"
+            );
+        });
     }
 
     #[test]
@@ -35449,32 +35606,12 @@ async fn get_project_record(
     }
     let slug = mcp_agent_mail_core::compute_project_slug(&canonical);
 
-    let out = mcp_agent_mail_db::queries::get_project_by_slug(cx, pool, &slug).await;
-    match out {
-        asupersync::Outcome::Ok(row) => return Ok(row),
-        asupersync::Outcome::Err(_) => {}
-        asupersync::Outcome::Cancelled(_) => {
-            return Err(CliError::Other("request cancelled".to_string()));
-        }
-        asupersync::Outcome::Panicked(p) => {
-            return Err(CliError::Other(format!("internal panic: {}", p.message())));
-        }
-    }
+    let try_human_key = |key: &str| async move {
+        mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, key).await
+    };
 
-    let out = mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, &canonical).await;
-    match out {
-        asupersync::Outcome::Ok(row) => return Ok(row),
-        asupersync::Outcome::Err(_) => {}
-        asupersync::Outcome::Cancelled(_) => {
-            return Err(CliError::Other("request cancelled".to_string()));
-        }
-        asupersync::Outcome::Panicked(p) => {
-            return Err(CliError::Other(format!("internal panic: {}", p.message())));
-        }
-    }
-
-    if canonical != raw {
-        let out = mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, raw).await;
+    if path.is_absolute() {
+        let out = try_human_key(&canonical).await;
         match out {
             asupersync::Outcome::Ok(row) => return Ok(row),
             asupersync::Outcome::Err(_) => {}
@@ -35483,6 +35620,76 @@ async fn get_project_record(
             }
             asupersync::Outcome::Panicked(p) => {
                 return Err(CliError::Other(format!("internal panic: {}", p.message())));
+            }
+        }
+
+        if canonical != raw {
+            let out = try_human_key(raw).await;
+            match out {
+                asupersync::Outcome::Ok(row) => return Ok(row),
+                asupersync::Outcome::Err(_) => {}
+                asupersync::Outcome::Cancelled(_) => {
+                    return Err(CliError::Other("request cancelled".to_string()));
+                }
+                asupersync::Outcome::Panicked(p) => {
+                    return Err(CliError::Other(format!("internal panic: {}", p.message())));
+                }
+            }
+        }
+    }
+
+    let out = mcp_agent_mail_db::queries::get_project_by_slug(cx, pool, &slug).await;
+    match out {
+        asupersync::Outcome::Ok(row) => {
+            if !path.is_absolute() {
+                return Ok(row);
+            }
+
+            let row_identity = resolve_project_identity(&row.human_key);
+            let requested_identity = resolve_project_identity(&canonical);
+            if row_identity
+                .human_key
+                .eq_ignore_ascii_case(&requested_identity.human_key)
+                || row_identity
+                    .canonical_path
+                    .eq_ignore_ascii_case(&requested_identity.canonical_path)
+            {
+                return Ok(row);
+            }
+        }
+        asupersync::Outcome::Err(_) => {}
+        asupersync::Outcome::Cancelled(_) => {
+            return Err(CliError::Other("request cancelled".to_string()));
+        }
+        asupersync::Outcome::Panicked(p) => {
+            return Err(CliError::Other(format!("internal panic: {}", p.message())));
+        }
+    }
+
+    if !path.is_absolute() {
+        let out = try_human_key(&canonical).await;
+        match out {
+            asupersync::Outcome::Ok(row) => return Ok(row),
+            asupersync::Outcome::Err(_) => {}
+            asupersync::Outcome::Cancelled(_) => {
+                return Err(CliError::Other("request cancelled".to_string()));
+            }
+            asupersync::Outcome::Panicked(p) => {
+                return Err(CliError::Other(format!("internal panic: {}", p.message())));
+            }
+        }
+
+        if canonical != raw {
+            let out = try_human_key(raw).await;
+            match out {
+                asupersync::Outcome::Ok(row) => return Ok(row),
+                asupersync::Outcome::Err(_) => {}
+                asupersync::Outcome::Cancelled(_) => {
+                    return Err(CliError::Other("request cancelled".to_string()));
+                }
+                asupersync::Outcome::Panicked(p) => {
+                    return Err(CliError::Other(format!("internal panic: {}", p.message())));
+                }
             }
         }
     }

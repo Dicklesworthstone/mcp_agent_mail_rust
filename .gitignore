@@ -104,6 +104,17 @@ ci-artifacts/
 proptest-regressions/
 test_meminfo
 
+# Compiled test binaries (accidentally committed, should never be tracked)
+migrate_bug_test
+parser_bug_test
+s3fifo_test
+s3fifo_leak_test
+test_glob
+test_panic
+ammonia_bug_test
+test_output.txt
+tmp.json
+
 # Remote compilation helper artifacts
 rch-artifacts/
 target-rch-release/

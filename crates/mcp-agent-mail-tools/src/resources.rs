@@ -2602,7 +2602,7 @@ fn outbox_message_from_row(
         },
         to,
         cc,
-        bcc,
+        bcc: redacted_bcc_recipients(), // Never expose BCC recipients in outbox view
         commit: unavailable_full_commit_metadata(summary),
     }
 }

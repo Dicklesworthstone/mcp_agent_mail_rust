@@ -476,6 +476,10 @@ def canonical_text(value):
     except OSError:
         return os.path.abspath(value)
 
+def looks_like_project_slug(value):
+    value = (value or "").strip()
+    return bool(value) and not os.path.isabs(value) and "/" not in value and "\\" not in value
+
 def project_metadata_matches(
     metadata,
     project_value,
@@ -489,8 +493,13 @@ def project_metadata_matches(
         return False
 
     slug = str(metadata.get("slug", "")).strip()
-    if slug and slug in {project_value, project_slug, repo_slug}:
-        return True
+    project_value_is_slug = looks_like_project_slug(project_value)
+    repo_root_is_slug = looks_like_project_slug(repo_root)
+    if slug:
+        if project_value_is_slug and slug in {project_value, project_slug}:
+            return True
+        if repo_root_is_slug and slug in {repo_root, repo_slug}:
+            return True
 
     human_key = str(metadata.get("human_key", "")).strip()
     if human_key and human_key in {project_value, repo_root}:
@@ -512,8 +521,15 @@ def resolve_archive_root():
     project_value = PROJECT.strip()
     project_slug = slugify(project_value) if project_value else ""
     repo_slug = slugify(repo_root) if repo_root else ""
+    project_value_is_slug = looks_like_project_slug(project_value)
+    repo_root_is_slug = looks_like_project_slug(repo_root)
     explicit_names = []
-    for name in (project_value, project_slug, repo_slug):
+    for name in (
+        project_value if project_value_is_slug else "",
+        project_slug if project_value_is_slug else "",
+        repo_root if repo_root_is_slug else "",
+        repo_slug if repo_root_is_slug else "",
+    ):
         if (
             name
             and not os.path.isabs(name)
@@ -830,7 +846,10 @@ if __name__ == "__main__":
 
     template
         .replace("__HOOK_NAME_TEXT__", hook_name)
-        .replace("__PROJECT_TEXT__", project)
+        .replace(
+            "__PROJECT_TEXT__",
+            &project.replace('\n', " ").replace('\r', " "),
+        )
         .replace("__PROJECT_JSON__", &project_json)
         .replace("__HOOK_NAME_JSON__", &hook_name_json)
 }
@@ -3156,11 +3175,99 @@ mod tests {
         assert!(script.contains("has_glob = any(c in pattern for c in \"*?[{\")"));
         assert!(script.contains("record.get(\"path_pattern\") or record.get(\"path\")"));
         assert!(script.contains("def resolve_archive_root"));
+        assert!(script.contains("def looks_like_project_slug"));
         assert!(script.contains("project.json"));
         assert!(script.contains("STORAGE_ROOT"));
-        assert!(script.contains("not os.path.isabs(name)"));
+        assert!(script.contains("project_value_is_slug = looks_like_project_slug(project_value)"));
         assert!(script.contains("\"/\" not in name"));
         assert!(script.contains("AGENT_NAME environment variable is required"));
         assert!(script.contains("sys.exit(2)"));
+    }
+
+    #[test]
+    fn guard_plugin_slug_collision_fails_closed_instead_of_loading_wrong_archive() {
+        let python = if Command::new("python3").arg("--version").output().is_ok() {
+            "python3"
+        } else if Command::new("python").arg("--version").output().is_ok() {
+            "python"
+        } else {
+            return;
+        };
+
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo").join("a").join("b");
+        let colliding_project = td.path().join("repo").join("a-b");
+        let storage_root = td.path().join("storage");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        std::fs::create_dir_all(&colliding_project).expect("mkdir colliding project");
+        run_git(&repo_dir, &["init", "-q"]);
+
+        let staged = repo_dir.join("src").join("main.rs");
+        std::fs::create_dir_all(staged.parent().expect("src dir")).expect("mkdir src");
+        std::fs::write(&staged, "fn main() {}\n").expect("write staged file");
+        run_git(&repo_dir, &["add", "src/main.rs"]);
+
+        let repo_identity =
+            mcp_agent_mail_core::resolve_project_identity(&repo_dir.to_string_lossy());
+        let colliding_identity =
+            mcp_agent_mail_core::resolve_project_identity(&colliding_project.to_string_lossy());
+        assert_eq!(
+            repo_identity.slug, colliding_identity.slug,
+            "test setup needs slug collision"
+        );
+
+        let archive_root = storage_root.join("projects").join(&repo_identity.slug);
+        let reservations_dir = archive_root.join("file_reservations");
+        std::fs::create_dir_all(&reservations_dir).expect("mkdir reservations");
+        std::fs::write(
+            archive_root.join("project.json"),
+            serde_json::json!({
+                "slug": colliding_identity.slug,
+                "human_key": colliding_project.to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .expect("write colliding metadata");
+        std::fs::write(
+            reservations_dir.join("conflict.json"),
+            serde_json::json!({
+                "path_pattern": "src/main.rs",
+                "agent_name": "OtherAgent",
+                "exclusive": true,
+                "expires_ts": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                "released_ts": serde_json::Value::Null,
+            })
+            .to_string(),
+        )
+        .expect("write reservation");
+
+        let script_path = td.path().join("guard.py");
+        std::fs::write(
+            &script_path,
+            render_guard_plugin_script(&repo_dir.to_string_lossy(), "pre-commit"),
+        )
+        .expect("write guard script");
+
+        let output = Command::new(python)
+            .current_dir(&repo_dir)
+            .env("AGENT_NAME", "PinkStone")
+            .env("STORAGE_ROOT", &storage_root)
+            .arg(&script_path)
+            .output()
+            .expect("run guard script");
+
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "guard should fail closed when only a colliding archive exists: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("could not locate archive"),
+            "expected archive lookup failure, got stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 }

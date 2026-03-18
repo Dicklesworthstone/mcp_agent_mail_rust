@@ -350,22 +350,36 @@ fn probe_single_get(
         sanitized_header_value(&config.user_agent),
     );
 
-    let stream = TcpStream::connect_timeout(
-        &addr.parse().or_else(|_| {
-            // DNS resolution via std::net
-            use std::net::ToSocketAddrs;
-            addr.to_socket_addrs()
-                .map_err(|e| ProbeError::DnsError {
-                    detail: e.to_string(),
-                })?
-                .next()
-                .ok_or_else(|| ProbeError::DnsError {
-                    detail: "No addresses found".to_string(),
-                })
-        })?,
-        config.timeout,
-    )
-    .map_err(|e| categorize_connect_error(e, config.timeout))?;
+    let resolved: std::net::SocketAddr = addr.parse().or_else(|_| {
+        // DNS resolution via std::net
+        use std::net::ToSocketAddrs;
+        addr.to_socket_addrs()
+            .map_err(|e| ProbeError::DnsError {
+                detail: e.to_string(),
+            })?
+            .next()
+            .ok_or_else(|| ProbeError::DnsError {
+                detail: "No addresses found".to_string(),
+            })
+    })?;
+
+    // Reject probes to private/loopback/link-local addresses (SSRF protection).
+    let ip = resolved.ip();
+    if ip.is_loopback()
+        || ip.is_unspecified()
+        || matches!(ip, std::net::IpAddr::V4(v4) if v4.is_private() || v4.is_link_local())
+        || matches!(ip, std::net::IpAddr::V6(v6) if v6.segments()[0] & 0xfe00 == 0xfc00)
+    {
+        return Err(ProbeError::ConnectionError {
+            detail: format!(
+                "probing private/internal address {} is not allowed",
+                resolved.ip()
+            ),
+        });
+    }
+
+    let stream = TcpStream::connect_timeout(&resolved, config.timeout)
+        .map_err(|e| categorize_connect_error(e, config.timeout))?;
 
     let _ = stream.set_read_timeout(Some(config.timeout));
     let _ = stream.set_write_timeout(Some(config.timeout));
