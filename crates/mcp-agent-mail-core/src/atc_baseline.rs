@@ -108,9 +108,9 @@ pub const BASELINE_CONFLICT_PRIOR: [f64; 3] = [0.90, 0.08, 0.02];
 /// ```
 pub const BASELINE_LOAD_LOSSES: [[f64; 3]; 3] = [
     // [Underloaded, Balanced, Overloaded]
-    [1.0, 3.0, 25.0],  // RouteHere
-    [8.0, 2.0, 3.0],   // SuggestAlternative
-    [15.0, 8.0, 1.0],  // Defer
+    [1.0, 3.0, 25.0], // RouteHere
+    [8.0, 2.0, 3.0],  // SuggestAlternative
+    [15.0, 8.0, 1.0], // Defer
 ];
 
 /// Pre-learning load prior probabilities.
@@ -142,10 +142,10 @@ pub struct BaselineTimingBudgets {
 
 /// Frozen pre-learning timing budgets.
 pub const BASELINE_TIMING: BaselineTimingBudgets = BaselineTimingBudgets {
-    tick_budget_micros: 5_000,        // 5ms
-    probe_interval_micros: 120_000_000, // 120s
+    tick_budget_micros: 5_000,             // 5ms
+    probe_interval_micros: 120_000_000,    // 120s
     advisory_cooldown_micros: 300_000_000, // 300s
-    summary_interval_micros: 300_000_000, // 300s
+    summary_interval_micros: 300_000_000,  // 300s
     estimated_probe_cost_micros: 120,
     estimated_non_probe_cost_micros: 700, // ~300 + 200 + 80 + 120
 };
@@ -243,16 +243,15 @@ pub struct BaselineAdaptiveController {
 }
 
 /// Frozen pre-learning adaptive controller thresholds.
-pub const BASELINE_ADAPTIVE_CONTROLLER: BaselineAdaptiveController =
-    BaselineAdaptiveController {
-        pressure_utilization: 0.75,
-        conservative_utilization: 0.90,
-        pressure_debt_ratio: 0.5,
-        conservative_debt_ratio: 1.5,
-        window_size: 16,
-        initial_probe_limit: 3,
-        nominal_probe_budget_fraction: 0.55,
-    };
+pub const BASELINE_ADAPTIVE_CONTROLLER: BaselineAdaptiveController = BaselineAdaptiveController {
+    pressure_utilization: 0.75,
+    conservative_utilization: 0.90,
+    pressure_debt_ratio: 0.5,
+    conservative_debt_ratio: 1.5,
+    window_size: 16,
+    initial_probe_limit: 3,
+    nominal_probe_budget_fraction: 0.55,
+};
 
 // ──────────────────────────────────────────────────────────────────────
 // Program-based priors (agent silence expectations)
@@ -326,9 +325,9 @@ pub const BASELINE_COST_ASYMMETRIES: &[EffectCostAsymmetry] = &[
     // Probe is budget-constrained, not loss-matrix-driven
     EffectCostAsymmetry {
         effect: "Probe",
-        false_positive_cost: 0.0,  // probes are always safe
-        false_negative_cost: 0.0,  // missing a probe delays detection
-        asymmetry_ratio: 1.0,      // neutral
+        false_positive_cost: 0.0, // probes are always safe
+        false_negative_cost: 0.0, // missing a probe delays detection
+        asymmetry_ratio: 1.0,     // neutral
     },
 ];
 
@@ -486,10 +485,7 @@ mod tests {
     #[test]
     fn program_priors_reasonable() {
         for &(program, prior_secs) in BASELINE_PROGRAM_PRIORS {
-            assert!(
-                prior_secs > 0,
-                "program {program} has zero prior"
-            );
+            assert!(prior_secs > 0, "program {program} has zero prior");
             assert!(
                 prior_secs <= BASELINE_UNKNOWN_PROGRAM_PRIOR_SECS,
                 "known program {program} ({prior_secs}s) should not exceed unknown default ({BASELINE_UNKNOWN_PROGRAM_PRIOR_SECS}s)"
@@ -501,7 +497,10 @@ mod tests {
     fn timing_budgets_reasonable() {
         let t = &BASELINE_TIMING;
         assert!(t.tick_budget_micros > 0);
-        assert!(t.tick_budget_micros <= 50_000, "tick budget should be <50ms");
+        assert!(
+            t.tick_budget_micros <= 50_000,
+            "tick budget should be <50ms"
+        );
         assert!(t.probe_interval_micros > t.tick_budget_micros as i64);
         assert!(t.estimated_probe_cost_micros < t.tick_budget_micros);
     }

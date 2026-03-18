@@ -9,7 +9,21 @@
 #![forbid(unsafe_code)]
 
 pub mod agent_detect;
+pub mod atc_adaptation;
+pub mod atc_admissibility;
+pub mod atc_assumptions;
+pub mod atc_attribution;
 pub mod atc_baseline;
+pub mod atc_contamination;
+pub mod atc_invariants;
+pub mod atc_labeling;
+pub mod atc_open_index;
+pub mod atc_participation;
+pub mod atc_regime;
+pub mod atc_retention;
+pub mod atc_shrinkage;
+pub mod atc_risk_budgets;
+pub mod atc_transparency;
 pub mod backpressure;
 pub mod bocpd;
 pub mod config;
@@ -45,6 +59,17 @@ pub use agent_detect::{
     AgentDetectError, AgentDetectOptions, AgentDetectRootOverride, InstalledAgentDetectionEntry,
     InstalledAgentDetectionReport, InstalledAgentDetectionSummary, detect_installed_agents,
 };
+pub use atc_retention::{
+    ARCHIVE_DISCOVERABILITY_MIN_DAYS, ATC_RETENTION_RULES, ArchiveRetention, ArchiveTrigger,
+    ArtifactRetentionRule, CompactionStrategy, ComparabilityAnchor,
+    EVIDENCE_LEDGER_DROP_AFTER_DAYS, EVIDENCE_LEDGER_HOT_DAYS, FORENSIC_TRACE_DISCOVERABILITY_DAYS,
+    GIT_ARCHIVE_DEFAULT_ARTIFACTS, GIT_ARCHIVE_DENYLIST, GIT_ARCHIVE_EXPLICIT_EXCLUSIONS,
+    GIT_ARCHIVE_PROMOTION_ONLY_ARTIFACTS, LearningArtifactKind, OPEN_EXPERIENCE_STALE_AFTER_DAYS,
+    OPEN_EXPERIENCE_TERMINALIZE_AFTER_DAYS, OPERATOR_LIFECYCLE_RULES, PERIODIC_AUDIT_CADENCE_DAYS,
+    POLICY_SNAPSHOT_HOT_DAYS, REPLAY_DISCOVERABILITY_REQUIREMENTS,
+    RESOLVED_EXPERIENCE_DROP_AFTER_DAYS, RESOLVED_EXPERIENCE_FULL_FIDELITY_DAYS, ROLLUP_LIVE_DAYS,
+    STALE_REGIME_AFTER_DAYS, StoragePlane, retention_rule,
+};
 pub use backpressure::{
     HealthLevel, HealthSignals, cached_health_level, compute_health_level,
     compute_health_level_with_signals, is_shedable_tool, level_transitions, refresh_health_level,
@@ -60,9 +85,9 @@ pub use evidence_ledger::{
     append_evidence_entry_if_configured, append_evidence_entry_to_path, evidence_ledger,
 };
 pub use experience::{
-    FEATURE_VERSION, EffectKind, ExperienceBuilder, ExperienceOutcome, ExperienceRow,
-    ExperienceState, ExperienceSubsystem, FeatureExtension, FeatureVector, NonExecutionReason,
-    loss_to_bp, prob_to_bp, saturating_u16, saturating_u8, validate_transition,
+    EffectKind, ExperienceBuilder, ExperienceOutcome, ExperienceRow, ExperienceState,
+    ExperienceSubsystem, FEATURE_VERSION, FeatureExtension, FeatureVector, NonExecutionReason,
+    loss_to_bp, prob_to_bp, saturating_u8, saturating_u16, validate_transition,
 };
 pub use identity::{ProjectIdentity, compute_project_slug, resolve_project_identity, slugify};
 pub use intern::{InternedStr, intern, intern_count, pre_intern, pre_intern_policies};

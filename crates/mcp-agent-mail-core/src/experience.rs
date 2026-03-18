@@ -218,10 +218,7 @@ impl std::fmt::Display for ExperienceState {
 
 /// Validate a state transition. Returns `Ok(())` if the transition is valid,
 /// `Err(reason)` if it is not.
-pub fn validate_transition(
-    from: ExperienceState,
-    to: ExperienceState,
-) -> Result<(), &'static str> {
+pub fn validate_transition(from: ExperienceState, to: ExperienceState) -> Result<(), &'static str> {
     match (from, to) {
         // Same-state transitions are always idempotent no-ops.
         (a, b) if a == b => Ok(()),
@@ -239,9 +236,7 @@ pub fn validate_transition(
         | (ExperienceState::Executed, ExperienceState::Open)
         | (
             ExperienceState::Open,
-            ExperienceState::Resolved
-            | ExperienceState::Censored
-            | ExperienceState::Expired,
+            ExperienceState::Resolved | ExperienceState::Censored | ExperienceState::Expired,
         ) => Ok(()),
 
         // All other transitions are invalid.
@@ -446,7 +441,6 @@ pub struct ExperienceOutcome {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExperienceRow {
     // ── Identifiers ──────────────────────────────────────────────────
-
     /// Unique experience row ID. Monotonically increasing.
     pub experience_id: ExperienceId,
     /// Decision that originated this experience.
@@ -461,12 +455,10 @@ pub struct ExperienceRow {
     pub evidence_id: EvidenceIdStr,
 
     // ── Lifecycle ────────────────────────────────────────────────────
-
     /// Current lifecycle state.
     pub state: ExperienceState,
 
     // ── Decision context ─────────────────────────────────────────────
-
     /// Which ATC subsystem made the decision.
     pub subsystem: ExperienceSubsystem,
     /// Fine-grained decision class within the subsystem.
@@ -481,14 +473,12 @@ pub struct ExperienceRow {
     pub policy_id: Option<String>,
 
     // ── Effect ───────────────────────────────────────────────────────
-
     /// Kind of effect planned or executed.
     pub effect_kind: EffectKind,
     /// Action label (e.g., "DeclareAlive", "AdvisoryMessage").
     pub action: String,
 
     // ── Decision quality ─────────────────────────────────────────────
-
     /// Posterior belief at decision time: `[(state_label, probability)]`.
     pub posterior: Vec<(String, f64)>,
     /// Expected loss of the chosen action.
@@ -507,19 +497,16 @@ pub struct ExperienceRow {
     pub safe_mode_active: bool,
 
     // ── Non-execution ────────────────────────────────────────────────
-
     /// Why the effect was not executed (for Throttled/Suppressed/Skipped).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub non_execution_reason: Option<NonExecutionReason>,
 
     // ── Outcome (populated during resolution) ────────────────────────
-
     /// Observed outcome (populated when state → Resolved).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<ExperienceOutcome>,
 
     // ── Timestamps ───────────────────────────────────────────────────
-
     /// When the experience row was created (microseconds since epoch).
     pub created_ts_micros: i64,
     /// When the effect was dispatched.
@@ -533,7 +520,6 @@ pub struct ExperienceRow {
     pub resolved_ts_micros: Option<i64>,
 
     // ── Feature vector (br-0qt6e.1.2) ──────────────────────────────
-
     /// Compact feature vector for learning (fixed-width, cheap to scan).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub features: Option<FeatureVector>,
@@ -543,7 +529,6 @@ pub struct ExperienceRow {
     pub feature_ext: Option<FeatureExtension>,
 
     // ── Extensible metadata ──────────────────────────────────────────
-
     /// Arbitrary structured metadata for audit and debugging.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<Value>,
@@ -610,8 +595,7 @@ impl ExperienceRow {
     /// How long between creation and resolution (if resolved).
     #[must_use]
     pub fn resolution_latency_micros(&self) -> Option<i64> {
-        self.resolved_ts_micros
-            .map(|r| r - self.created_ts_micros)
+        self.resolved_ts_micros.map(|r| r - self.created_ts_micros)
     }
 }
 
@@ -653,7 +637,6 @@ pub struct FeatureVector {
     pub version: u16,
 
     // ── Liveness context (quantized) ─────────────────────────────────
-
     /// Posterior probability of Alive state, in basis points (0..10000).
     pub posterior_alive_bp: u16,
     /// Posterior probability of Flaky state, in basis points (0..10000).
@@ -664,7 +647,6 @@ pub struct FeatureVector {
     pub observation_count: u16,
 
     // ── Conflict context (quantized) ─────────────────────────────────
-
     /// Number of active exclusive reservations for this agent (capped at 255).
     pub reservation_count: u8,
     /// Number of overlapping reservation conflicts (capped at 255).
@@ -673,14 +655,12 @@ pub struct FeatureVector {
     pub in_deadlock_cycle: bool,
 
     // ── Load context (quantized) ─────────────────────────────────────
-
     /// Agent message throughput (messages/min, capped at 255).
     pub throughput_per_min: u8,
     /// Inbox depth (capped at 255).
     pub inbox_depth: u8,
 
     // ── Decision quality context ─────────────────────────────────────
-
     /// Expected loss of chosen action, in basis points (0..10000).
     pub expected_loss_bp: u16,
     /// Loss gap: (runner_up_loss - chosen_loss), in basis points.
@@ -692,14 +672,12 @@ pub struct FeatureVector {
     pub safe_mode_active: bool,
 
     // ── Budget context ───────────────────────────────────────────────
-
     /// Tick budget utilization in basis points (0..10000).
     pub tick_utilization_bp: u16,
     /// Adaptive controller mode: 0=Nominal, 1=Pressure, 2=Conservative.
     pub controller_mode: u8,
 
     // ── Risk tier (for stratification) ───────────────────────────────
-
     /// Risk tier for this experience: 0=low, 1=medium, 2=high.
     /// Determined by effect kind: Advisory/Probe/NoAction=0,
     /// RoutingSuggestion/Backpressure=1, Release/ForceReservation=2.
@@ -802,11 +780,7 @@ pub const fn saturating_u16(v: u64) -> u16 {
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
 pub const fn saturating_u8(v: u64) -> u8 {
-    if v > u8::MAX as u64 {
-        u8::MAX
-    } else {
-        v as u8
-    }
+    if v > u8::MAX as u64 { u8::MAX } else { v as u8 }
 }
 
 /// Versioned extension payload for rare or future-facing context.
@@ -1025,8 +999,8 @@ mod tests {
 
     fn sample_builder() -> ExperienceBuilder {
         ExperienceBuilder::new(
-            1,   // decision_id
-            1,   // effect_id
+            1, // decision_id
+            1, // effect_id
             "trc-abc123".to_string(),
             "clm-1".to_string(),
             "evi-1".to_string(),
@@ -1386,15 +1360,24 @@ mod tests {
         assert_eq!(FeatureVector::risk_tier_for(EffectKind::Advisory), 0);
         assert_eq!(FeatureVector::risk_tier_for(EffectKind::Probe), 0);
         assert_eq!(FeatureVector::risk_tier_for(EffectKind::NoAction), 0);
-        assert_eq!(FeatureVector::risk_tier_for(EffectKind::RoutingSuggestion), 1);
+        assert_eq!(
+            FeatureVector::risk_tier_for(EffectKind::RoutingSuggestion),
+            1
+        );
         assert_eq!(FeatureVector::risk_tier_for(EffectKind::Backpressure), 1);
         assert_eq!(FeatureVector::risk_tier_for(EffectKind::Release), 2);
-        assert_eq!(FeatureVector::risk_tier_for(EffectKind::ForceReservation), 2);
+        assert_eq!(
+            FeatureVector::risk_tier_for(EffectKind::ForceReservation),
+            2
+        );
     }
 
     #[test]
     fn stratum_key_format() {
-        let fv = FeatureVector { risk_tier: 2, ..FeatureVector::zeroed() };
+        let fv = FeatureVector {
+            risk_tier: 2,
+            ..FeatureVector::zeroed()
+        };
         let key = fv.stratum_key(&ExperienceSubsystem::Liveness, &EffectKind::Release);
         assert_eq!(key, "liveness:release:2");
     }
@@ -1425,10 +1408,7 @@ mod tests {
     fn feature_vector_size_budget() {
         // FeatureVector should be <= 64 bytes
         let size = std::mem::size_of::<FeatureVector>();
-        assert!(
-            size <= 64,
-            "FeatureVector is {size} bytes, budget is 64"
-        );
+        assert!(size <= 64, "FeatureVector is {size} bytes, budget is 64");
     }
 
     #[test]
