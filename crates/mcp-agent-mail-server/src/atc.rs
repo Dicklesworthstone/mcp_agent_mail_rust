@@ -1665,7 +1665,7 @@ impl AgentRhythm {
     #[must_use]
     pub fn silence_duration(&self, now_micros: i64) -> i64 {
         if self.last_activity_ts > 0 {
-            (now_micros - self.last_activity_ts).max(0)
+            now_micros.saturating_sub(self.last_activity_ts).max(0)
         } else {
             0
         }
@@ -8221,7 +8221,7 @@ pub fn submodular_probe_schedule<S: BuildHasher>(
         let gain = {
             let base_gain = probe_information_gain(entry.core.posterior());
             let time_since_probe = if entry.probe_sent_at > 0 {
-                nonnegative_i64_to_f64((now_micros - entry.probe_sent_at).max(0))
+                nonnegative_i64_to_f64(now_micros.saturating_sub(entry.probe_sent_at).max(0))
             } else {
                 1_000_000_000.0
             };
