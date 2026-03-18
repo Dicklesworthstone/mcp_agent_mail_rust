@@ -4,10 +4,9 @@
 //! `TerminalWriter::write_log()` or `dashboard_write_log()`.
 
 use ftui::PackedRgba;
-use ftui::widgets::sparkline::Sparkline;
 use serde_json::Value;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use crate::theme;
 
@@ -629,6 +628,11 @@ impl SparklineBuffer {
             .iter()
             .copied()
             .collect()
+    }
+
+    /// Snapshot the current sparkline data array.
+    pub fn snapshot(&self) -> Vec<f64> {
+        self.get_data()
     }
 }
 
@@ -1831,8 +1835,6 @@ pub fn render_split_frame(
 // ──────────────────────────────────────────────────────────────────────
 // Event Timeline (br-1m6a.22): structured event stream viewer (AltScreen)
 // ──────────────────────────────────────────────────────────────────────
-
-use std::collections::VecDeque;
 
 use chrono::SecondsFormat;
 use ftui::widgets::paragraph::Paragraph;

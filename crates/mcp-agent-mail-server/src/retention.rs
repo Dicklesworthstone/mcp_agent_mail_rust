@@ -11,7 +11,6 @@
 
 #![forbid(unsafe_code)]
 
-use glob::Pattern;
 use mcp_agent_mail_core::Config;
 use std::path::Path;
 use std::sync::Mutex;
@@ -291,9 +290,6 @@ fn should_ignore(name: &str, patterns: &[String]) -> bool {
 }
 
 fn wildcard_match(pattern: &str, name: &str) -> bool {
-    let mut p_chars = pattern.chars().peekable();
-    let mut n_chars = name.chars().peekable();
-
     // Fast path: no wildcards
     if !pattern.contains('*') {
         return pattern == name;
@@ -425,13 +421,20 @@ fn count_md_files_recursive(dir: &Path) -> u64 {
 }
 
 /// Count messages older than `max_age_days` under agents/*/inbox/.
-fn count_old_messages(agents_dir: &Path, max_age_days: i64) -> usize {
+fn count_old_messages(agents_dir: &Path, max_age_days: u64) -> usize {
     if !is_real_directory(agents_dir) {
         return 0;
     }
 
+    let Ok(max_age_days) = i64::try_from(max_age_days) else {
+        return 0;
+    };
+    let Some(max_age) = chrono::TimeDelta::try_days(max_age_days) else {
+        return 0;
+    };
+
     let mut count = 0usize;
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(max_age_days);
+    let cutoff = chrono::Utc::now() - max_age;
     let mut stack = vec![agents_dir.to_path_buf()];
 
     while let Some(current) = stack.pop() {
@@ -737,6 +740,16 @@ mod tests {
     #[test]
     fn count_old_messages_nonexistent_dir() {
         assert_eq!(count_old_messages(Path::new("/nonexistent"), 30), 0);
+    }
+
+    #[test]
+    fn count_old_messages_extreme_age_is_safe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("Agent").join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::write(inbox.join("fresh.md"), "new").unwrap();
+
+        assert_eq!(count_old_messages(tmp.path(), u64::MAX), 0);
     }
 
     #[test]

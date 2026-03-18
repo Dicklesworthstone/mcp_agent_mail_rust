@@ -13,6 +13,7 @@
 //! The `OrderedMutex` is only acquired for slow-query logging (rare cold path).
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
@@ -467,9 +468,7 @@ impl QueryTracker {
         for (idx, count) in self.per_table.iter().enumerate() {
             let c = count.load(Ordering::Relaxed);
             if c > 0 {
-                let name = TableId::from_index(idx)
-                    .unwrap_or(TableId::Unknown)
-                    .as_str();
+                let name = TableId::from_index(idx).as_str();
                 per_table.insert(name.to_string(), c);
             }
         }

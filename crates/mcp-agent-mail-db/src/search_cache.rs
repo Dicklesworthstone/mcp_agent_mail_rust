@@ -6,7 +6,7 @@
 //! - [`WarmWorker`] - background worker for pre-warming search resources
 //! - [`CacheInvalidator`] - epoch-aware cache invalidation on index/model changes
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
