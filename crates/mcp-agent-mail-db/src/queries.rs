@@ -8367,7 +8367,7 @@ pub async fn fetch_open_atc_experiences(
         (
             format!(
                 "{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} \
-                 WHERE state IN ('executed', 'open') AND subject = ? \
+                 WHERE state IN ('executed', 'open') AND subject = ? COLLATE NOCASE \
                  ORDER BY created_ts ASC LIMIT ?"
             ),
             vec![
@@ -9338,6 +9338,112 @@ mod tests {
                     ..
                 }))
             ));
+        });
+    }
+
+    #[test]
+    fn fetch_open_atc_experiences_filters_subject_case_insensitively() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("fetch_open_atc_experiences_subject_case.db");
+
+        rt.block_on(async {
+            let blue = ExperienceRow {
+                experience_id: 0,
+                decision_id: 88,
+                effect_id: 201,
+                trace_id: "trc-fetch-open-blue".to_string(),
+                claim_id: "clm-fetch-open-blue".to_string(),
+                evidence_id: "evi-fetch-open-blue".to_string(),
+                state: ExperienceState::Open,
+                subsystem: ExperienceSubsystem::Conflict,
+                decision_class: "reservation_conflict".to_string(),
+                subject: "BlueLake".to_string(),
+                project_key: Some("/tmp/fetch-open-atc".to_string()),
+                policy_id: Some("conflict-r1".to_string()),
+                effect_kind: EffectKind::Advisory,
+                action: "RecommendReservation".to_string(),
+                posterior: vec![("Clear".to_string(), 0.20), ("Conflict".to_string(), 0.80)],
+                expected_loss: 1.4,
+                runner_up_action: Some("Wait".to_string()),
+                runner_up_loss: Some(1.8),
+                evidence_summary: "conflict signal".to_string(),
+                calibration_healthy: true,
+                safe_mode_active: false,
+                non_execution_reason: None,
+                outcome: None,
+                created_ts_micros: 1_700_000_000_001_000,
+                dispatched_ts_micros: Some(1_700_000_000_001_050),
+                executed_ts_micros: Some(1_700_000_000_001_100),
+                resolved_ts_micros: None,
+                features: Some(FeatureVector::zeroed()),
+                feature_ext: None,
+                context: None,
+            };
+            let red = ExperienceRow {
+                experience_id: 0,
+                decision_id: 89,
+                effect_id: 202,
+                trace_id: "trc-fetch-open-red".to_string(),
+                claim_id: "clm-fetch-open-red".to_string(),
+                evidence_id: "evi-fetch-open-red".to_string(),
+                state: ExperienceState::Open,
+                subsystem: ExperienceSubsystem::Conflict,
+                decision_class: "reservation_conflict".to_string(),
+                subject: "RedPeak".to_string(),
+                project_key: Some("/tmp/fetch-open-atc".to_string()),
+                policy_id: Some("conflict-r1".to_string()),
+                effect_kind: EffectKind::Advisory,
+                action: "RecommendReservation".to_string(),
+                posterior: vec![("Clear".to_string(), 0.40), ("Conflict".to_string(), 0.60)],
+                expected_loss: 1.2,
+                runner_up_action: Some("Wait".to_string()),
+                runner_up_loss: Some(1.6),
+                evidence_summary: "other conflict signal".to_string(),
+                calibration_healthy: true,
+                safe_mode_active: false,
+                non_execution_reason: None,
+                outcome: None,
+                created_ts_micros: 1_700_000_000_002_000,
+                dispatched_ts_micros: Some(1_700_000_000_002_050),
+                executed_ts_micros: Some(1_700_000_000_002_100),
+                resolved_ts_micros: None,
+                features: Some(FeatureVector::zeroed()),
+                feature_ext: None,
+                context: None,
+            };
+
+            append_atc_experience(&cx, &pool, &blue)
+                .await
+                .into_result()
+                .expect("append BlueLake experience");
+            append_atc_experience(&cx, &pool, &red)
+                .await
+                .into_result()
+                .expect("append RedPeak experience");
+
+            let lower = fetch_open_atc_experiences(&cx, &pool, Some("bluelake"), 10)
+                .await
+                .into_result()
+                .expect("fetch lowercase subject");
+            assert_eq!(lower.len(), 1);
+            assert_eq!(lower[0].subject, "BlueLake");
+
+            let upper = fetch_open_atc_experiences(&cx, &pool, Some("BLUELAKE"), 10)
+                .await
+                .into_result()
+                .expect("fetch uppercase subject");
+            assert_eq!(upper.len(), 1);
+            assert_eq!(upper[0].subject, "BlueLake");
+
+            let unmatched = fetch_open_atc_experiences(&cx, &pool, Some("greenowl"), 10)
+                .await
+                .into_result()
+                .expect("fetch unmatched subject");
+            assert!(unmatched.is_empty());
         });
     }
 

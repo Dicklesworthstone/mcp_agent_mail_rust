@@ -1166,7 +1166,13 @@ fn check_path_conflicts(
                     builder.add(glob);
                     active_indices.push(res);
                 }
-                Err(_err) => continue,
+                Err(err) => {
+                    eprintln!(
+                        "[agent-mail guard] warning: invalid glob pattern '{}' in reservation by {}: {err}",
+                        res.normalized_pattern, res.agent_name
+                    );
+                    continue;
+                }
             }
         }
     }
@@ -1491,7 +1497,17 @@ pub fn get_staged_paths(repo_root: &Path) -> GuardResult<Vec<String>> {
         .output()?;
 
     if !output.status.success() {
-        return Ok(Vec::new());
+        // Fail-closed: if git diff fails, return an error so the guard blocks
+        // the commit rather than silently allowing it through with no checks.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(GuardError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "git diff --cached failed (exit {}): {}",
+                output.status.code().unwrap_or(-1),
+                stderr.trim(),
+            ),
+        )));
     }
 
     parse_name_status_z(&output.stdout)

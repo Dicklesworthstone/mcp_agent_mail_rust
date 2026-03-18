@@ -3206,6 +3206,25 @@ fn atc_action_snapshot_message(execution: &AtcOperatorExecutionSnapshot) -> Opti
     })
 }
 
+fn push_bounded<T>(items: &mut VecDeque<T>, capacity: usize, item: T) {
+    if items.len() >= capacity {
+        let _ = items.pop_front();
+    }
+    items.push_back(item);
+}
+
+fn record_atc_operator_execution(
+    recent_executions: &mut VecDeque<AtcOperatorExecutionSnapshot>,
+    recent_actions: &mut VecDeque<AtcOperatorActionSnapshot>,
+    visible_actions: &mut Vec<AtcOperatorActionSnapshot>,
+    execution: AtcOperatorExecutionSnapshot,
+) {
+    push_bounded(recent_executions, ATC_OPERATOR_EXECUTION_CAPACITY, execution.clone());
+    let action_snapshot = atc_action_snapshot_from_execution(&execution);
+    visible_actions.push(action_snapshot.clone());
+    push_bounded(recent_actions, ATC_OPERATOR_ACTION_CAPACITY, action_snapshot);
+}
+
 fn atc_status_consumes_cooldown(status: &str) -> bool {
     !status.starts_with("failed:") && status != "suppressed:missing_project_precondition"
 }
@@ -3778,6 +3797,57 @@ fn atc_resolution_outcome_from_activity(
     })
 }
 
+fn promote_executed_experience_to_open_for_resolution(
+    pool: &mcp_agent_mail_db::DbPool,
+    experience_id: u64,
+    state: ExperienceState,
+    now_micros: i64,
+    failure_message: &'static str,
+) -> bool {
+    if state != ExperienceState::Executed {
+        return true;
+    }
+
+    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    match block_on(mcp_agent_mail_db::queries::transition_atc_experience(
+        &cx,
+        pool,
+        experience_id,
+        ExperienceState::Open,
+        now_micros,
+        None,
+        None,
+    )) {
+        asupersync::Outcome::Ok(()) => true,
+        asupersync::Outcome::Err(error) => {
+            tracing::debug!(
+                experience_id,
+                %error,
+                reason = failure_message,
+                "failed to promote executed ATC experience to open"
+            );
+            false
+        }
+        asupersync::Outcome::Cancelled(_) => {
+            tracing::debug!(
+                experience_id,
+                reason = failure_message,
+                "promotion of executed ATC experience to open was cancelled"
+            );
+            false
+        }
+        asupersync::Outcome::Panicked(_) => {
+            tracing::warn!(
+                experience_id,
+                reason = failure_message,
+                "promotion of executed ATC experience to open panicked"
+            );
+            false
+        }
+        _ => false,
+    }
+}
+
 /// Sweep open ATC experiences for resolution signals (br-0qt6e.2.3).
 ///
 /// Checks experiences in `executed` or `open` state and resolves them based on
@@ -3815,26 +3885,14 @@ fn sweep_open_experiences_for_resolution(
     for experience in &open_experiences {
         // Ensure executed experiences transition to open before resolution.
         // The state machine requires Executed → Open → Resolved.
-        if experience.state == ExperienceState::Executed {
-            let cx = Cx::for_request_with_budget(Budget::INFINITE);
-            if let asupersync::Outcome::Err(error) =
-                block_on(mcp_agent_mail_db::queries::transition_atc_experience(
-                    &cx,
-                    pool,
-                    experience.experience_id,
-                    ExperienceState::Open,
-                    now_micros,
-                    None,
-                    None,
-                ))
-            {
-                tracing::debug!(
-                    experience_id = experience.experience_id,
-                    %error,
-                    "failed to transition experience to open"
-                );
-                continue;
-            }
+        if !promote_executed_experience_to_open_for_resolution(
+            pool,
+            experience.experience_id,
+            experience.state,
+            now_micros,
+            "failed to transition experience to open",
+        ) {
+            continue;
         }
 
         let resolution_anchor_micros = atc_resolution_anchor_micros(experience);
@@ -3886,6 +3944,42 @@ fn sweep_open_experiences_for_resolution(
         }
         // Otherwise: still within resolution window, leave as open.
     }
+}
+
+fn looks_like_project_slug(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty() && !trimmed.contains('/') && !trimmed.contains('\\')
+}
+
+fn atc_project_keys_match(left: &str, right: &str) -> bool {
+    let left = left.trim();
+    let right = right.trim();
+    if left.is_empty() || right.is_empty() {
+        return left.eq_ignore_ascii_case(right);
+    }
+    if left.eq_ignore_ascii_case(right) {
+        return true;
+    }
+
+    let left_identity = mcp_agent_mail_core::resolve_project_identity(left);
+    let right_identity = mcp_agent_mail_core::resolve_project_identity(right);
+    if left_identity
+        .human_key
+        .eq_ignore_ascii_case(&right_identity.human_key)
+        || left_identity
+            .canonical_path
+            .eq_ignore_ascii_case(&right_identity.canonical_path)
+    {
+        return true;
+    }
+
+    // Only fall back to slug matching when at least one side actually looks
+    // like a slug. Two distinct filesystem paths can legitimately slugify to
+    // the same value, so pure path-vs-path comparison must stay exact.
+    (looks_like_project_slug(left) || looks_like_project_slug(right))
+        && left_identity
+            .slug
+            .eq_ignore_ascii_case(&right_identity.slug)
 }
 
 /// Resolve open conflict-subsystem experiences when reservation events arrive (br-0qt6e.2.4).
@@ -3940,15 +4034,11 @@ pub(crate) fn resolve_conflict_experiences_on_reservation_event(
             continue;
         }
         // Skip experiences from a different project if project scoping is available.
-        // NOTE: project_key may be stored as a slug while `project` may be a human_key
-        // (or vice versa). Case-insensitive contains-check handles both formats:
-        // slug "data-projects-foo" vs human_key "/data/projects/foo".
+        // Project keys may be persisted as either human_key paths or slugs, but
+        // matching must remain exact enough to avoid prefix collisions between
+        // unrelated projects.
         if let Some(ref exp_project) = experience.project_key {
-            if !exp_project.is_empty()
-                && !exp_project.eq_ignore_ascii_case(project)
-                && !exp_project.contains(project)
-                && !project.contains(exp_project.as_str())
-            {
+            if !exp_project.is_empty() && !atc_project_keys_match(exp_project, project) {
                 continue;
             }
         }
@@ -3961,6 +4051,16 @@ pub(crate) fn resolve_conflict_experiences_on_reservation_event(
             regret: None,
             evidence: Some(evidence.clone()),
         };
+
+        if !promote_executed_experience_to_open_for_resolution(
+            pool,
+            experience.experience_id,
+            experience.state,
+            now_micros,
+            "failed to transition conflict experience to open before resolution",
+        ) {
+            continue;
+        }
 
         let cx2 = Cx::for_request_with_budget(Budget::INFINITE);
         if let asupersync::Outcome::Err(error) =
@@ -4429,10 +4529,12 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                 }
                 let execution =
                     atc_execution_snapshot(now_micros, &effect, executor_mode.as_str(), &status);
-                if recent_executions.len() >= ATC_OPERATOR_EXECUTION_CAPACITY {
-                    let _ = recent_executions.pop_front();
-                }
-                recent_executions.push_back(execution);
+                record_atc_operator_execution(
+                    &mut recent_executions,
+                    &mut recent_actions,
+                    &mut visible_actions,
+                    execution,
+                );
                 // Throttled outcomes still perform durable work, so they must
                 // count against the per-tick action budget.
                 processed_this_tick = processed_this_tick.saturating_add(1);
@@ -4463,16 +4565,12 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
             }
             let execution =
                 atc_execution_snapshot(now_micros, &effect, executor_mode.as_str(), &status);
-            if recent_executions.len() >= ATC_OPERATOR_EXECUTION_CAPACITY {
-                let _ = recent_executions.pop_front();
-            }
-            recent_executions.push_back(execution.clone());
-            let action_snapshot = atc_action_snapshot_from_execution(&execution);
-            visible_actions.push(action_snapshot.clone());
-            if recent_actions.len() >= ATC_OPERATOR_ACTION_CAPACITY {
-                let _ = recent_actions.pop_front();
-            }
-            recent_actions.push_back(action_snapshot);
+            record_atc_operator_execution(
+                &mut recent_executions,
+                &mut recent_actions,
+                &mut visible_actions,
+                execution,
+            );
             processed_this_tick = processed_this_tick.saturating_add(1);
         }
 
@@ -11739,6 +11837,101 @@ mod tests {
             Some(NonExecutionReason::BudgetExhausted { ref budget_name, .. })
                 if budget_name == "pending_queue_capacity"
         ));
+    }
+
+    #[test]
+    fn conflict_reservation_resolution_promotes_executed_rows_before_resolving() {
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("conflict-resolution.db");
+
+        let init_conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open base schema connection");
+        init_conn
+            .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init pragmas");
+        init_conn
+            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        match block_on(mcp_agent_mail_db::schema::migrate_to_latest_base(
+            &cx, &init_conn,
+        )) {
+            asupersync::Outcome::Ok(_) => {}
+            asupersync::Outcome::Err(error) => panic!("apply migrations: {error}"),
+            other => panic!("unexpected migration outcome: {other:?}"),
+        }
+        drop(init_conn);
+
+        let pool = mcp_agent_mail_db::create_pool(&mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create pool");
+
+        let row = ExperienceRow {
+            experience_id: 0,
+            decision_id: 41,
+            effect_id: 91,
+            trace_id: "trc-conflict-resolution".to_string(),
+            claim_id: "clm-conflict-resolution".to_string(),
+            evidence_id: "evi-conflict-resolution".to_string(),
+            state: ExperienceState::Executed,
+            subsystem: ExperienceSubsystem::Conflict,
+            decision_class: "reservation_conflict".to_string(),
+            subject: "AlphaAgent".to_string(),
+            project_key: Some("/tmp/project-a".to_string()),
+            policy_id: Some("conflict-r1".to_string()),
+            effect_kind: EffectKind::Advisory,
+            action: "RecommendReservation".to_string(),
+            posterior: vec![("Clear".to_string(), 0.40), ("Conflict".to_string(), 0.60)],
+            expected_loss: 1.2,
+            runner_up_action: Some("Wait".to_string()),
+            runner_up_loss: Some(1.6),
+            evidence_summary: "reservation conflict persists".to_string(),
+            calibration_healthy: true,
+            safe_mode_active: false,
+            non_execution_reason: None,
+            outcome: None,
+            created_ts_micros: 1_700_000_000_002_000,
+            dispatched_ts_micros: Some(1_700_000_000_002_050),
+            executed_ts_micros: Some(1_700_000_000_002_100),
+            resolved_ts_micros: None,
+            features: Some(FeatureVector::zeroed()),
+            feature_ext: None,
+            context: None,
+        };
+
+        block_on(mcp_agent_mail_db::queries::append_atc_experience(
+            &cx, &pool, &row,
+        ))
+        .into_result()
+        .expect("append conflict experience");
+
+        resolve_conflict_experiences_on_reservation_event(
+            &pool,
+            "AlphaAgent",
+            "/tmp/project-a",
+            "reservation_granted",
+            true,
+            serde_json::json!({ "signal": "grant" }),
+        );
+
+        let remaining = block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
+            &cx,
+            &pool,
+            Some("AlphaAgent"),
+            10,
+        ))
+        .into_result()
+        .expect("fetch remaining open experiences");
+        assert!(
+            remaining.is_empty(),
+            "reservation-event resolution should consume executed conflict experiences once promoted to open"
+        );
     }
 
     #[test]
@@ -21969,6 +22162,24 @@ mod tests {
             atc_effect_semantic_key(&left),
             atc_effect_semantic_key(&right)
         );
+    }
+
+    #[test]
+    fn atc_project_keys_match_accepts_slug_and_human_key_for_same_project() {
+        let human_key = "/tmp/agent-mail-project-alpha";
+        let slug = mcp_agent_mail_core::compute_project_slug(human_key);
+
+        assert!(atc_project_keys_match(&slug, human_key));
+        assert!(atc_project_keys_match(human_key, &slug));
+    }
+
+    #[test]
+    fn atc_project_keys_match_rejects_prefix_collision() {
+        let left = "/tmp/agent-mail-project";
+        let right = "/tmp/agent-mail-project-backup";
+
+        assert!(!atc_project_keys_match(left, right));
+        assert!(!atc_project_keys_match(right, left));
     }
 
     #[test]

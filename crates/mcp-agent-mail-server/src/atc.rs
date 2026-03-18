@@ -8689,9 +8689,7 @@ pub fn atc_tick_report(now_micros: i64) -> Option<AtcTickReport> {
     let mut engine = match engine_lock.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
-            tracing::error!(
-                "ATC engine mutex was poisoned (a previous tick panicked); recovering"
-            );
+            tracing::error!("ATC engine mutex was poisoned (a previous tick panicked); recovering");
             poisoned.into_inner()
         }
     };
