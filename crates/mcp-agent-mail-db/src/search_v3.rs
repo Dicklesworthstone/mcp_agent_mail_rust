@@ -836,11 +836,11 @@ pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
     };
 
     let handles = bridge.handles();
-    // Reduce memory footprint to 3MB (minimum Tantivy allowed) since we are
-    // only indexing a single message and immediately committing.
+    // Use minimum Tantivy arena (15MB) since we are only indexing a single
+    // message and immediately committing.
     let mut writer = bridge
         .index()
-        .writer(3_000_000)
+        .writer(15_000_000)
         .map_err(|e| format!("Tantivy writer error: {e}"))?;
     upsert_indexable_message(&writer, handles, msg)?;
 
