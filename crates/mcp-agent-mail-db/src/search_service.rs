@@ -451,7 +451,16 @@ fn apply_cursor_window(mut results: Vec<SearchResult>, query: &SearchQuery) -> V
 
     results.retain(|result| {
         let score = cursor_sort_score(result, query.ranking);
-        score > cursor.score || (score.to_bits() == cursor.score.to_bits() && result.id > cursor.id)
+        match query.ranking {
+            RankingMode::Recency => {
+                score > cursor.score
+                    || (score.to_bits() == cursor.score.to_bits() && result.id > cursor.id)
+            }
+            RankingMode::Relevance => {
+                score < cursor.score
+                    || (score.to_bits() == cursor.score.to_bits() && result.id > cursor.id)
+            }
+        }
     });
     results
 }
@@ -4336,6 +4345,91 @@ mod tests {
         assert_eq!(
             remaining.iter().map(|result| result.id).collect::<Vec<_>>(),
             vec![1]
+        );
+    }
+
+    #[test]
+    fn relevance_cursor_fallback_skips_higher_scored_results_when_boundary_missing() {
+        let page = vec![
+            SearchResult {
+                doc_kind: DocKind::Message,
+                id: 10,
+                project_id: Some(1),
+                title: "best".to_string(),
+                body: String::new(),
+                score: Some(0.9),
+                importance: None,
+                ack_required: None,
+                created_ts: None,
+                thread_id: None,
+                from_agent: None,
+                from_agent_id: None,
+                to: None,
+                cc: None,
+                bcc: None,
+                reason_codes: Vec::new(),
+                score_factors: Vec::new(),
+                redacted: false,
+                redaction_reason: None,
+            },
+            SearchResult {
+                doc_kind: DocKind::Message,
+                id: 20,
+                project_id: Some(1),
+                title: "boundary".to_string(),
+                body: String::new(),
+                score: Some(0.8),
+                importance: None,
+                ack_required: None,
+                created_ts: None,
+                thread_id: None,
+                from_agent: None,
+                from_agent_id: None,
+                to: None,
+                cc: None,
+                bcc: None,
+                reason_codes: Vec::new(),
+                score_factors: Vec::new(),
+                redacted: false,
+                redaction_reason: None,
+            },
+        ];
+        let cursor = compute_next_cursor(&page, page.len(), RankingMode::Relevance).unwrap();
+        let query = SearchQuery {
+            ranking: RankingMode::Relevance,
+            cursor: Some(cursor),
+            ..SearchQuery::default()
+        };
+        let remaining = apply_cursor_window(
+            vec![
+                page[0].clone(),
+                SearchResult {
+                    doc_kind: DocKind::Message,
+                    id: 30,
+                    project_id: Some(1),
+                    title: "after".to_string(),
+                    body: String::new(),
+                    score: Some(0.7),
+                    importance: None,
+                    ack_required: None,
+                    created_ts: None,
+                    thread_id: None,
+                    from_agent: None,
+                    from_agent_id: None,
+                    to: None,
+                    cc: None,
+                    bcc: None,
+                    reason_codes: Vec::new(),
+                    score_factors: Vec::new(),
+                    redacted: false,
+                    redaction_reason: None,
+                },
+            ],
+            &query,
+        );
+        assert_eq!(
+            remaining.iter().map(|result| result.id).collect::<Vec<_>>(),
+            vec![30]
         );
     }
 

@@ -1143,25 +1143,45 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    // Split into two migrations so each contains a single statement,
+    // per the contract documented at line 438-440.
     migrations.push(Migration::new(
         "v14_create_file_reservation_releases".to_string(),
         "create sidecar release ledger for file_reservations".to_string(),
         "CREATE TABLE IF NOT EXISTS file_reservation_releases (\
             reservation_id INTEGER PRIMARY KEY REFERENCES file_reservations(id),\
             released_ts INTEGER NOT NULL\
-        );\
-        CREATE INDEX IF NOT EXISTS idx_file_reservation_releases_ts \
-            ON file_reservation_releases(released_ts);"
+        )"
+        .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v14b_idx_file_reservation_releases_ts".to_string(),
+        "index on file_reservation_releases.released_ts".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_file_reservation_releases_ts \
+            ON file_reservation_releases(released_ts)"
             .to_string(),
         String::new(),
     ));
 
+    // Split into three migrations so each contains a single statement.
     migrations.push(Migration::new(
         "v15_add_recipients_json_to_messages".to_string(),
         "add recipients_json column to messages table".to_string(),
-        "ALTER TABLE messages ADD COLUMN recipients_json TEXT;\
-         UPDATE messages SET recipients_json = '{}' WHERE recipients_json IS NULL OR recipients_json = '';\
-         CREATE TRIGGER IF NOT EXISTS trg_messages_default_recipients_json \
+        "ALTER TABLE messages ADD COLUMN recipients_json TEXT".to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v15b_backfill_recipients_json".to_string(),
+        "backfill recipients_json with empty object for existing rows".to_string(),
+        "UPDATE messages SET recipients_json = '{}' WHERE recipients_json IS NULL OR recipients_json = ''"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v15c_trg_messages_default_recipients_json".to_string(),
+        "trigger to default recipients_json on insert".to_string(),
+        "CREATE TRIGGER IF NOT EXISTS trg_messages_default_recipients_json \
          AFTER INSERT ON messages \
          WHEN NEW.recipients_json IS NULL OR NEW.recipients_json = '' \
          BEGIN \
@@ -1388,6 +1408,8 @@ fn is_unsupported_by_franken(id: &str) -> bool {
                 | "v10a_dedup_agents_case_insensitive"
                 | "v10b_idx_agents_project_name_nocase"
                 | "v15_add_recipients_json_to_messages"
+                | "v15b_backfill_recipients_json"
+                | "v15c_trg_messages_default_recipients_json"
         )
 }
 
