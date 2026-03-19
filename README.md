@@ -883,8 +883,8 @@ All configuration via environment variables. The server reads them at startup vi
 | `HTTP_PORT` | `8765` | Bind port |
 | `HTTP_PATH` | `/mcp/` | MCP base path |
 | `HTTP_BEARER_TOKEN` | (from `.env` file) | Auth token |
-| `DATABASE_URL` | `sqlite:///:memory:` | SQLite connection URL |
-| `STORAGE_ROOT` | `~/.mcp_agent_mail` | Archive root directory |
+| `DATABASE_URL` | `sqlite+aiosqlite:///./storage.sqlite3` | SQLite connection URL (relative to working directory) |
+| `STORAGE_ROOT` | XDG-aware (see below) | Archive root directory |
 | `LOG_LEVEL` | `info` | Minimum log level |
 | `TUI_ENABLED` | `true` | Interactive TUI toggle |
 | `TUI_HIGH_CONTRAST` | `false` | Accessibility mode |
@@ -963,10 +963,28 @@ mcp_agent_mail_rust/
 └── rust-toolchain.toml                     # Nightly toolchain requirement
 ```
 
-### Storage Layout
+### Canonical File Layout
+
+The runtime uses several paths whose defaults have evolved across versions.
+This table resolves the three-way ambiguity:
+
+| Path | Purpose | Notes |
+|------|---------|-------|
+| `~/.mcp_agent_mail_git_mailbox_repo/` | Legacy archive root (pre-v1) | No longer created; honored if it already exists on disk |
+| `$XDG_DATA_HOME/mcp-agent-mail/git_mailbox_repo/` | Current archive root (`STORAGE_ROOT` default) | `~/.local/share/mcp-agent-mail/git_mailbox_repo/` on most Linux systems |
+| `$XDG_CONFIG_HOME/mcp-agent-mail/config.env` | Canonical env file (installer writes here) | `~/.config/mcp-agent-mail/config.env` on most Linux systems |
+| `$XDG_CONFIG_HOME/mcp-agent-mail/.env` | Compatibility env file | Checked when `config.env` is absent |
+| `~/.mcp_agent_mail/.env` | Legacy env file | Checked after XDG paths |
+| `./storage.sqlite3` | Runtime database (`DATABASE_URL` default) | Relative to working directory, or absolute if configured |
+
+The `STORAGE_ROOT` resolution logic: if the legacy path `~/.mcp_agent_mail_git_mailbox_repo/`
+exists on disk, it is used for backward compatibility. Otherwise the XDG data
+directory is preferred. Override with `STORAGE_ROOT=/your/path` in the environment.
+
+### Storage Layout (inside STORAGE_ROOT)
 
 ```
-~/.mcp_agent_mail/                          # STORAGE_ROOT
+$STORAGE_ROOT/                              # e.g. ~/.local/share/mcp-agent-mail/git_mailbox_repo/
 ├── projects/
 │   └── {project_slug}/
 │       ├── .git/                           # Per-project git repository

@@ -25,8 +25,10 @@ am serve-http --no-auth
 ```
 
 The `am serve-http` command sets `LOG_RICH_ENABLED=true` and auto-discovers
-`HTTP_BEARER_TOKEN` from `~/.mcp_agent_mail/.env` (fallback:
-`~/mcp_agent_mail/.env`).
+`HTTP_BEARER_TOKEN` from the user env file. Resolution order:
+`$XDG_CONFIG_HOME/mcp-agent-mail/config.env`, then
+`$XDG_CONFIG_HOME/mcp-agent-mail/.env`, then `~/.mcp_agent_mail/.env`
+(fallback: `~/mcp_agent_mail/.env`).
 
 ### CLI vs Server Binaries (Dual-Mode)
 
@@ -57,9 +59,9 @@ Before starting, verify:
 | Check           | How to verify                                              |
 |-----------------|------------------------------------------------------------|
 | Port ownership  | `ss -tlnp \| grep 8765` (reuse existing Agent Mail if live) |
-| Storage dir     | `ls -la ~/.mcp_agent_mail/` (writable)                     |
-| Database URL    | `echo $DATABASE_URL` (defaults to in-memory)               |
-| Auth token      | `cat ~/.mcp_agent_mail/.env` (has token)                   |
+| Storage dir     | `ls -la $STORAGE_ROOT` or `ls -la ~/.local/share/mcp-agent-mail/` (writable) |
+| Database URL    | `echo $DATABASE_URL` (defaults to `sqlite+aiosqlite:///./storage.sqlite3`) |
+| Auth token      | Check `$XDG_CONFIG_HOME/mcp-agent-mail/config.env` or `~/.mcp_agent_mail/.env` |
 | Disk space      | `df -h .` (>100 MB free)                                   |
 
 If port `8765` is already used by Agent Mail, reuse it instead of force-killing.
@@ -244,7 +246,7 @@ is used in hot paths.
 
 | Variable                       | Default               | Description                      |
 |--------------------------------|-----------------------|----------------------------------|
-| `DATABASE_URL`                 | `sqlite:///:memory:`  | SQLite connection URL            |
+| `DATABASE_URL`                 | `sqlite+aiosqlite:///./storage.sqlite3` | SQLite connection URL (relative to working directory) |
 | `DATABASE_POOL_SIZE`           | auto (25)             | Connection pool size             |
 | `DATABASE_MAX_OVERFLOW`        | auto (75)             | Additional overflow connections   |
 | `DATABASE_POOL_TIMEOUT`        | `15` (seconds)        | Pool acquisition timeout         |
@@ -265,7 +267,7 @@ is used in hot paths.
 
 | Variable             | Default                  | Description                   |
 |----------------------|--------------------------|-------------------------------|
-| `STORAGE_ROOT`       | `~/.mcp_agent_mail`      | Archive root directory        |
+| `STORAGE_ROOT`       | XDG-aware (see README)   | Archive root directory (see Canonical File Layout in README) |
 | `GIT_AUTHOR_NAME`    | `mcp-agent-mail`         | Git commit author name        |
 | `GIT_AUTHOR_EMAIL`   | `mail@agent.local`       | Git commit author email       |
 
@@ -366,7 +368,7 @@ sqlite3 "$DATABASE_URL" "PRAGMA wal_checkpoint(TRUNCATE);"
 
 **Fix:**
 1. Verify token is set: `echo $HTTP_BEARER_TOKEN`
-2. Check env file: `cat ~/.mcp_agent_mail/.env`
+2. Check env file: `cat ${XDG_CONFIG_HOME:-~/.config}/mcp-agent-mail/config.env` (or legacy `~/.mcp_agent_mail/.env`)
 3. For local dev, use `--no-auth` or set `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED=true`
 
 ### SQLite corruption
@@ -440,12 +442,13 @@ attempts) and removes stale locks older than 60 seconds as a last resort.
 
 **Fix:**
 ```bash
-# Check for stale locks
-find ~/.mcp_agent_mail -name "index.lock" -ls
+# Check for stale locks (adjust path to your STORAGE_ROOT)
+find "${STORAGE_ROOT:-${XDG_DATA_HOME:-~/.local/share}/mcp-agent-mail/git_mailbox_repo}" -name "index.lock" -ls
 
 # If the owning process is dead, quarantine the stale lock:
-mv ~/.mcp_agent_mail/archive/projects/<slug>/.git/index.lock \
-   ~/.mcp_agent_mail/archive/projects/<slug>/.git/index.lock.stale
+SROOT="${STORAGE_ROOT:-${XDG_DATA_HOME:-~/.local/share}/mcp-agent-mail/git_mailbox_repo}"
+mv "$SROOT/projects/<slug>/.git/index.lock" \
+   "$SROOT/projects/<slug>/.git/index.lock.stale"
 ```
 
 ### Disk space warnings
@@ -454,8 +457,8 @@ mv ~/.mcp_agent_mail/archive/projects/<slug>/.git/index.lock \
 
 **Fix:**
 ```bash
-# Check disk usage
-du -sh ~/.mcp_agent_mail/
+# Check disk usage (adjust path to your STORAGE_ROOT)
+du -sh "${STORAGE_ROOT:-${XDG_DATA_HOME:-~/.local/share}/mcp-agent-mail/git_mailbox_repo}/"
 
 # Clean old archives
 # (retention system handles this automatically if enabled)
@@ -568,9 +571,10 @@ sqlite3 /path/to/storage.sqlite3 "PRAGMA integrity_check; PRAGMA journal_mode; P
 ps aux | grep mcp-agent-mail
 cat /proc/$(pgrep -f mcp-agent-mail)/status | grep -E 'VmRSS|VmSize|Threads'
 
-# 5. Disk usage
-du -sh ~/.mcp_agent_mail/
-df -h ~/.mcp_agent_mail/
+# 5. Disk usage (adjust path to your STORAGE_ROOT)
+SROOT="${STORAGE_ROOT:-${XDG_DATA_HOME:-~/.local/share}/mcp-agent-mail/git_mailbox_repo}"
+du -sh "$SROOT/"
+df -h "$SROOT/"
 
 # 6. MCP resource snapshots (if server is running)
 curl -s http://127.0.0.1:8765/mcp/ -H "Authorization: Bearer $HTTP_BEARER_TOKEN" \
