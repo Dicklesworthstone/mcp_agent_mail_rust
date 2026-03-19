@@ -185,6 +185,7 @@ fn parse_remote_url(url: &str) -> Option<(String, String)> {
     }
 
     if let Some(pos) = u.find("://") {
+        let scheme = &u[..pos];
         let after = &u[pos + 3..];
         let mut parts = after.splitn(2, '/');
         let host_part = parts.next().unwrap_or("");
@@ -196,6 +197,13 @@ fn parse_remote_url(url: &str) -> Option<(String, String)> {
             .unwrap_or(host_part)
             .to_lowercase();
         if host.is_empty() {
+            if scheme.eq_ignore_ascii_case("file") {
+                let path = after.trim_start_matches('/');
+                if path.is_empty() {
+                    return None;
+                }
+                return Some(("file".to_string(), path.to_string()));
+            }
             return None;
         }
         return Some((host, path_part.to_string()));
@@ -209,6 +217,10 @@ fn parse_remote_url(url: &str) -> Option<(String, String)> {
         return Some((host, path));
     }
 
+    if let Some(parsed) = parse_local_remote_path(u) {
+        return Some(parsed);
+    }
+
     if u.contains(':') {
         let mut parts = u.splitn(2, ':');
         let host = parts.next()?.to_lowercase();
@@ -219,50 +231,93 @@ fn parse_remote_url(url: &str) -> Option<(String, String)> {
     None
 }
 
+fn looks_like_windows_drive_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+}
+
+fn parse_local_remote_path(value: &str) -> Option<(String, String)> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let is_explicit_local_path = trimmed.starts_with('/')
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+        || trimmed.starts_with("~/")
+        || trimmed.starts_with("\\\\")
+        || trimmed.starts_with(".\\")
+        || trimmed.starts_with("..\\")
+        || trimmed.starts_with("~\\")
+        || looks_like_windows_drive_path(trimmed);
+
+    if !is_explicit_local_path {
+        return None;
+    }
+
+    Some(("file".to_string(), trimmed.to_string()))
+}
+
+fn normalized_remote_path_segments(path: &str) -> Vec<String> {
+    let mut normalized = path.replace('\\', "/");
+    if normalized.starts_with('/') {
+        normalized = normalized.trim_start_matches('/').to_string();
+    }
+    if let Some(stripped) = normalized.strip_prefix("~/") {
+        normalized = stripped.to_string();
+    }
+    while normalized.contains("//") {
+        normalized = normalized.replace("//", "/");
+    }
+
+    let mut segments = Vec::new();
+    for segment in normalized.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                if !segments.is_empty() {
+                    segments.pop();
+                }
+            }
+            other => segments.push(other.to_string()),
+        }
+    }
+
+    if let Some(last) = segments.last_mut()
+        && Path::new(last.as_str())
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("git"))
+    {
+        last.truncate(last.len().saturating_sub(4));
+    }
+
+    segments
+}
+
 #[cfg(test)]
 fn normalize_remote_first_two(url: &str) -> Option<String> {
-    let (host, mut path) = parse_remote_url(url)?;
-    if path.starts_with('/') {
-        path = path.trim_start_matches('/').to_string();
-    }
-    if Path::new(&path)
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("git"))
-    {
-        path.truncate(path.len().saturating_sub(4));
-    }
-    while path.contains("//") {
-        path = path.replace("//", "/");
-    }
-    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let (host, path) = parse_remote_url(url)?;
+    let parts = normalized_remote_path_segments(&path);
     if parts.len() < 2 {
         return None;
     }
-    let owner = parts[0];
-    let repo = parts[1];
+    let owner = &parts[0];
+    let repo = &parts[1];
     Some(format!("{host}/{owner}/{repo}"))
 }
 
 fn normalize_remote_last_two(url: &str) -> Option<String> {
-    let (host, mut path) = parse_remote_url(url)?;
-    if path.starts_with('/') {
-        path = path.trim_start_matches('/').to_string();
-    }
-    if Path::new(&path)
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("git"))
-    {
-        path.truncate(path.len().saturating_sub(4));
-    }
-    while path.contains("//") {
-        path = path.replace("//", "/");
-    }
-    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let (host, path) = parse_remote_url(url)?;
+    let parts = normalized_remote_path_segments(&path);
     if parts.len() < 2 {
         return None;
     }
-    let owner = parts[parts.len() - 2];
-    let repo = parts[parts.len() - 1];
+    let owner = &parts[parts.len() - 2];
+    let repo = &parts[parts.len() - 1];
     Some(format!("{host}/{owner}/{repo}"))
 }
 
@@ -790,6 +845,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_remote_file_uri_without_host() {
+        let (host, path) = parse_remote_url("file:///srv/git/team/repo.git").unwrap();
+        assert_eq!(host, "file");
+        assert_eq!(path, "srv/git/team/repo.git");
+    }
+
+    #[test]
+    fn parse_remote_absolute_local_path() {
+        let (host, path) = parse_remote_url("/srv/git/team/repo.git").unwrap();
+        assert_eq!(host, "file");
+        assert_eq!(path, "/srv/git/team/repo.git");
+    }
+
+    #[test]
+    fn parse_remote_windows_drive_path() {
+        let (host, path) = parse_remote_url(r"C:\repos\team\repo.git").unwrap();
+        assert_eq!(host, "file");
+        assert_eq!(path, r"C:\repos\team\repo.git");
+    }
+
+    #[test]
+    fn parse_remote_windows_unc_path() {
+        let (host, path) = parse_remote_url(r"\\server\share\repo.git").unwrap();
+        assert_eq!(host, "file");
+        assert_eq!(path, r"\\server\share\repo.git");
+    }
+
+    #[test]
     fn parse_remote_empty_returns_none() {
         assert!(parse_remote_url("").is_none());
     }
@@ -876,6 +959,36 @@ mod tests {
         let result =
             normalize_remote_last_two("https://gitlab.com///team//service///api.git").unwrap();
         assert_eq!(result, "gitlab.com/service/api");
+    }
+
+    #[test]
+    fn normalize_remote_last_two_file_uri() {
+        let result = normalize_remote_last_two("file:///srv/git/team/repo.git").unwrap();
+        assert_eq!(result, "file/team/repo");
+    }
+
+    #[test]
+    fn normalize_remote_last_two_absolute_local_path() {
+        let result = normalize_remote_last_two("/srv/git/team/repo.git").unwrap();
+        assert_eq!(result, "file/team/repo");
+    }
+
+    #[test]
+    fn normalize_remote_last_two_relative_local_path() {
+        let result = normalize_remote_last_two("../upstream/repo.git").unwrap();
+        assert_eq!(result, "file/upstream/repo");
+    }
+
+    #[test]
+    fn normalize_remote_last_two_windows_drive_path() {
+        let result = normalize_remote_last_two(r"C:\repos\team\repo.git").unwrap();
+        assert_eq!(result, "file/team/repo");
+    }
+
+    #[test]
+    fn normalize_remote_last_two_windows_unc_path() {
+        let result = normalize_remote_last_two(r"\\server\share\repo.git").unwrap();
+        assert_eq!(result, "file/share/repo");
     }
 
     // -----------------------------------------------------------------------

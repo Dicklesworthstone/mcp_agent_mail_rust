@@ -446,7 +446,6 @@ impl MailExplorerScreen {
     }
 
     /// Sync the `VirtualizedListState` selection with the current cursor.
-    #[allow(dead_code)]
     fn sync_list_state(&self) {
         let mut state = self.list_state.borrow_mut();
         if self.entries.is_empty() {
@@ -1557,6 +1556,7 @@ impl MailScreen for MailExplorerScreen {
 
             let filter_focused = matches!(self.focus, Focus::FilterRail);
             let results_focused = matches!(self.focus, Focus::ResultList);
+            self.sync_list_state();
             render_filter_rail(frame, filter_area, self, filter_focused);
             render_results(
                 frame,
@@ -2152,7 +2152,11 @@ fn render_detail(
     });
 
     let visible_height = usize::from(content_inner.height).max(1);
-    let max_scroll = lines.len().saturating_sub(visible_height);
+    // Use a generous max_scroll to ensure all wrapped content is reachable.
+    // The exact wrapped line count is hard to compute without rendering, so
+    // we use 3x the logical line count as an upper bound (most lines wrap
+    // to at most 3 visual lines at typical terminal widths).
+    let max_scroll = (lines.len().saturating_mul(3)).saturating_sub(visible_height);
     max_scroll_cell.set(max_scroll);
     let clamped_scroll = scroll.min(max_scroll);
     Paragraph::new(Text::from_lines(lines))

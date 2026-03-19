@@ -495,12 +495,14 @@ impl ComposeState {
     }
 
     fn clamp_body_cursor(&mut self) {
-        let lines = self.body_lines();
-        let last_line = lines.len().saturating_sub(1);
+        let line_count = self.body.split('\n').count();
+        let last_line = line_count.saturating_sub(1);
         self.body_cursor_line = self.body_cursor_line.min(last_line);
-        let line_len = lines
-            .get(self.body_cursor_line)
-            .map_or(0, |line| char_count(line));
+        let line_len = self
+            .body
+            .split('\n')
+            .nth(self.body_cursor_line)
+            .map_or(0, char_count);
         self.body_cursor_col = self.body_cursor_col.min(line_len);
     }
 

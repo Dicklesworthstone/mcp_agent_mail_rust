@@ -720,6 +720,42 @@ fn encode_recipients_json(
     .to_string()
 }
 
+fn parse_salvaged_recipients_json(
+    recipients_json: Option<String>,
+    message_id: i64,
+    stats: &mut ReconstructStats,
+) -> (String, Vec<String>, Vec<String>, Vec<String>) {
+    let empty = (
+        encode_recipients_json(&[], &[], &[]),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let Some(recipients_json) = recipients_json.filter(|json| !json.trim().is_empty()) else {
+        return empty;
+    };
+
+    let parsed: serde_json::Value = match serde_json::from_str(&recipients_json) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            stats.warnings.push(format!(
+                "Salvage message {message_id} has invalid recipients_json; dropping malformed recipient metadata: {err}"
+            ));
+            return empty;
+        }
+    };
+
+    let to_names = json_str_array(&parsed, "to");
+    let cc_names = json_str_array(&parsed, "cc");
+    let bcc_names = json_str_array(&parsed, "bcc");
+    (
+        encode_recipients_json(&to_names, &cc_names, &bcc_names),
+        to_names,
+        cc_names,
+        bcc_names,
+    )
+}
+
 fn sync_reconstructed_message_recipients_json(conn: &DbConn, message_id: i64) -> DbResult<()> {
     let rows = conn
         .query_sync(
@@ -1530,9 +1566,12 @@ fn merge_salvaged_database(
         }
     }
 
+    let mut reconstructed_recipient_agent_ids: HashMap<(i64, String), i64> = HashMap::new();
+    let mut recipient_json_updates = BTreeSet::new();
+
     if has_messages {
         let message_columns = table_columns(&salvage_conn, "messages")?;
-        let Some(message_select) = build_salvage_select(
+        if let Some(message_select) = build_salvage_select(
             "messages",
             &message_columns,
             &["id", "project_id", "sender_id"],
@@ -1548,222 +1587,258 @@ fn merge_salvaged_database(
             ],
             stats,
             salvage_db_path,
-        ) else {
-            return Ok(());
-        };
-        let message_rows = salvage_conn
-            .query_sync(
-                &format!("SELECT {message_select} FROM messages ORDER BY id"),
-                &[],
-            )
-            .map_err(|e| DbError::Sqlite(format!("reconstruct salvage: query messages: {e}")))?;
-
-        for row in &message_rows {
-            let Some(message_id) = row.get_named::<i64>("id").ok().filter(|value| *value > 0)
-            else {
-                continue;
-            };
-            if message_id_exists(&target_conn, message_id)? {
-                continue;
-            }
-
-            let Some(source_project_id) = row
-                .get_named::<i64>("project_id")
-                .ok()
-                .filter(|value| *value > 0)
-            else {
-                continue;
-            };
-            let Some(&target_project_id) = project_id_map.get(&source_project_id) else {
-                stats.warnings.push(format!(
-                    "Salvage message {message_id} referenced missing project id {source_project_id}; skipping"
-                ));
-                continue;
-            };
-
-            let Some(source_sender_id) = row
-                .get_named::<i64>("sender_id")
-                .ok()
-                .filter(|value| *value > 0)
-            else {
-                continue;
-            };
-            let Some(&target_sender_id) = agent_id_map.get(&source_sender_id) else {
-                stats.warnings.push(format!(
-                    "Salvage message {message_id} referenced missing sender id {source_sender_id}; skipping"
-                ));
-                continue;
-            };
-
-            let thread_id = row
-                .get_named::<String>("thread_id")
-                .ok()
-                .and_then(|raw| sanitize_reconstructed_thread_id(&raw));
-            let thread_value = thread_id.map_or(Value::Null, Value::Text);
-            let recipients_json = row
-                .get_named::<String>("recipients_json")
-                .ok()
-                .filter(|json| !json.trim().is_empty())
-                .unwrap_or_else(|| encode_recipients_json(&[], &[], &[]));
-
-            target_conn
-                .execute_sync(
-                    "INSERT OR IGNORE INTO messages \
-                     (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    &[
-                        Value::BigInt(message_id),
-                        Value::BigInt(target_project_id),
-                        Value::BigInt(target_sender_id),
-                        thread_value,
-                        Value::Text(row.get_named::<String>("subject").unwrap_or_default()),
-                        Value::Text(row.get_named::<String>("body_md").unwrap_or_default()),
-                        Value::Text(
-                            row.get_named::<String>("importance")
-                                .unwrap_or_else(|_| "normal".to_string()),
-                        ),
-                        Value::BigInt(i64::from(
-                            row.get_named::<i64>("ack_required").unwrap_or(0) != 0,
-                        )),
-                        Value::BigInt(
-                            row.get_named::<i64>("created_ts")
-                                .unwrap_or_else(|_| crate::now_micros()),
-                        ),
-                        Value::Text(recipients_json),
-                        Value::Text(
-                            row.get_named::<String>("attachments")
-                                .unwrap_or_else(|_| "[]".to_string()),
-                        ),
-                    ],
+        ) {
+            let message_rows = salvage_conn
+                .query_sync(
+                    &format!("SELECT {message_select} FROM messages ORDER BY id"),
+                    &[],
                 )
                 .map_err(|e| {
-                    DbError::Sqlite(format!("reconstruct salvage: insert message {message_id}: {e}"))
+                    DbError::Sqlite(format!("reconstruct salvage: query messages: {e}"))
                 })?;
-            stats.salvaged_messages += 1;
+
+            for row in &message_rows {
+                let Some(message_id) = row.get_named::<i64>("id").ok().filter(|value| *value > 0)
+                else {
+                    continue;
+                };
+                if message_id_exists(&target_conn, message_id)? {
+                    continue;
+                }
+
+                let Some(source_project_id) = row
+                    .get_named::<i64>("project_id")
+                    .ok()
+                    .filter(|value| *value > 0)
+                else {
+                    continue;
+                };
+                let Some(&target_project_id) = project_id_map.get(&source_project_id) else {
+                    stats.warnings.push(format!(
+                        "Salvage message {message_id} referenced missing project id {source_project_id}; skipping"
+                    ));
+                    continue;
+                };
+
+                let Some(source_sender_id) = row
+                    .get_named::<i64>("sender_id")
+                    .ok()
+                    .filter(|value| *value > 0)
+                else {
+                    continue;
+                };
+                let Some(&target_sender_id) = agent_id_map.get(&source_sender_id) else {
+                    stats.warnings.push(format!(
+                        "Salvage message {message_id} referenced missing sender id {source_sender_id}; skipping"
+                    ));
+                    continue;
+                };
+
+                let thread_id = row
+                    .get_named::<String>("thread_id")
+                    .ok()
+                    .and_then(|raw| sanitize_reconstructed_thread_id(&raw));
+                let thread_value = thread_id.map_or(Value::Null, Value::Text);
+                let (recipients_json, to_names, cc_names, bcc_names) =
+                    parse_salvaged_recipients_json(
+                        row.get_named::<String>("recipients_json").ok(),
+                        message_id,
+                        stats,
+                    );
+
+                target_conn
+                    .execute_sync(
+                        "INSERT OR IGNORE INTO messages \
+                         (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        &[
+                            Value::BigInt(message_id),
+                            Value::BigInt(target_project_id),
+                            Value::BigInt(target_sender_id),
+                            thread_value,
+                            Value::Text(row.get_named::<String>("subject").unwrap_or_default()),
+                            Value::Text(row.get_named::<String>("body_md").unwrap_or_default()),
+                            Value::Text(
+                                row.get_named::<String>("importance")
+                                    .unwrap_or_else(|_| "normal".to_string()),
+                            ),
+                            Value::BigInt(i64::from(
+                                row.get_named::<i64>("ack_required").unwrap_or(0) != 0,
+                            )),
+                            Value::BigInt(
+                                row.get_named::<i64>("created_ts")
+                                    .unwrap_or_else(|_| crate::now_micros()),
+                            ),
+                            Value::Text(recipients_json),
+                            Value::Text(
+                                row.get_named::<String>("attachments")
+                                    .unwrap_or_else(|_| "[]".to_string()),
+                            ),
+                        ],
+                    )
+                    .map_err(|e| {
+                        DbError::Sqlite(format!(
+                            "reconstruct salvage: insert message {message_id}: {e}"
+                        ))
+                    })?;
+                stats.salvaged_messages += 1;
+
+                for name in &to_names {
+                    let agent_id = ensure_agent_exists(
+                        &target_conn,
+                        target_project_id,
+                        name,
+                        &mut reconstructed_recipient_agent_ids,
+                    )?;
+                    insert_recipient(&target_conn, message_id, agent_id, "to")?;
+                    stats.salvaged_recipients += 1;
+                    recipient_json_updates.insert(message_id);
+                }
+                for name in &cc_names {
+                    let agent_id = ensure_agent_exists(
+                        &target_conn,
+                        target_project_id,
+                        name,
+                        &mut reconstructed_recipient_agent_ids,
+                    )?;
+                    insert_recipient(&target_conn, message_id, agent_id, "cc")?;
+                    stats.salvaged_recipients += 1;
+                    recipient_json_updates.insert(message_id);
+                }
+                for name in &bcc_names {
+                    let agent_id = ensure_agent_exists(
+                        &target_conn,
+                        target_project_id,
+                        name,
+                        &mut reconstructed_recipient_agent_ids,
+                    )?;
+                    insert_recipient(&target_conn, message_id, agent_id, "bcc")?;
+                    stats.salvaged_recipients += 1;
+                    recipient_json_updates.insert(message_id);
+                }
+            }
         }
     }
 
     if has_recipients {
-        let mut recipient_json_updates = BTreeSet::new();
         let recipient_columns = table_columns(&salvage_conn, "message_recipients")?;
-        let Some(recipient_select) = build_salvage_select(
+        if let Some(recipient_select) = build_salvage_select(
             "message_recipients",
             &recipient_columns,
             &["message_id", "agent_id", "kind"],
             &["read_ts", "ack_ts"],
             stats,
             salvage_db_path,
-        ) else {
-            return Ok(());
-        };
-        let recipient_rows = salvage_conn
-            .query_sync(
-                &format!(
-                    "SELECT {recipient_select} FROM message_recipients ORDER BY message_id, agent_id, kind"
-                ),
-                &[],
-            )
-            .map_err(|e| DbError::Sqlite(format!("reconstruct salvage: query recipients: {e}")))?;
-
-        for row in &recipient_rows {
-            let Some(message_id) = row
-                .get_named::<i64>("message_id")
-                .ok()
-                .filter(|value| *value > 0)
-            else {
-                continue;
-            };
-            if !message_id_exists(&target_conn, message_id)? {
-                continue;
-            }
-
-            let Some(source_agent_id) = row
-                .get_named::<i64>("agent_id")
-                .ok()
-                .filter(|value| *value > 0)
-            else {
-                continue;
-            };
-            let Some(&target_agent_id) = agent_id_map.get(&source_agent_id) else {
-                continue;
-            };
-            let kind = row
-                .get_named::<String>("kind")
-                .unwrap_or_else(|_| "to".to_string());
-            let read_ts = row.get_named::<i64>("read_ts").ok();
-            let ack_ts = row.get_named::<i64>("ack_ts").ok();
-            recipient_json_updates.insert(message_id);
-
-            let existing_rows = target_conn
+        ) {
+            let recipient_rows = salvage_conn
                 .query_sync(
-                    "SELECT read_ts, ack_ts FROM message_recipients \
-                     WHERE message_id = ? AND agent_id = ? AND kind = ? LIMIT 1",
-                    &[
-                        Value::BigInt(message_id),
-                        Value::BigInt(target_agent_id),
-                        Value::Text(kind.clone()),
-                    ],
+                    &format!(
+                        "SELECT {recipient_select} FROM message_recipients ORDER BY message_id, agent_id, kind"
+                    ),
+                    &[],
                 )
-                .map_err(|e| {
-                    DbError::Sqlite(format!(
-                        "reconstruct salvage: query recipient state for message {message_id}: {e}"
-                    ))
-                })?;
+                .map_err(|e| DbError::Sqlite(format!("reconstruct salvage: query recipients: {e}")))?;
 
-            if existing_rows.is_empty() {
-                target_conn
-                    .execute_sync(
-                        "INSERT OR IGNORE INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
-                         VALUES (?, ?, ?, ?, ?)",
+            for row in &recipient_rows {
+                let Some(message_id) = row
+                    .get_named::<i64>("message_id")
+                    .ok()
+                    .filter(|value| *value > 0)
+                else {
+                    continue;
+                };
+                if !message_id_exists(&target_conn, message_id)? {
+                    continue;
+                }
+
+                let Some(source_agent_id) = row
+                    .get_named::<i64>("agent_id")
+                    .ok()
+                    .filter(|value| *value > 0)
+                else {
+                    continue;
+                };
+                let Some(&target_agent_id) = agent_id_map.get(&source_agent_id) else {
+                    continue;
+                };
+                let kind = row
+                    .get_named::<String>("kind")
+                    .unwrap_or_else(|_| "to".to_string());
+                let read_ts = row.get_named::<i64>("read_ts").ok();
+                let ack_ts = row.get_named::<i64>("ack_ts").ok();
+                recipient_json_updates.insert(message_id);
+
+                let existing_rows = target_conn
+                    .query_sync(
+                        "SELECT read_ts, ack_ts FROM message_recipients \
+                         WHERE message_id = ? AND agent_id = ? AND kind = ? LIMIT 1",
                         &[
                             Value::BigInt(message_id),
                             Value::BigInt(target_agent_id),
-                            Value::Text(kind),
-                            read_ts.map_or(Value::Null, Value::BigInt),
-                            ack_ts.map_or(Value::Null, Value::BigInt),
+                            Value::Text(kind.clone()),
                         ],
                     )
                     .map_err(|e| {
                         DbError::Sqlite(format!(
-                            "reconstruct salvage: insert recipient for message {message_id}: {e}"
+                            "reconstruct salvage: query recipient state for message {message_id}: {e}"
                         ))
                     })?;
-                stats.salvaged_recipients += 1;
-                continue;
-            }
 
-            let existing_row = &existing_rows[0];
-            let current_read_ts = existing_row.get_named::<i64>("read_ts").ok();
-            let current_ack_ts = existing_row.get_named::<i64>("ack_ts").ok();
-            if current_read_ts.is_none() && read_ts.is_some()
-                || current_ack_ts.is_none() && ack_ts.is_some()
-            {
-                target_conn
-                    .execute_sync(
-                        "UPDATE message_recipients SET \
-                             read_ts = COALESCE(read_ts, ?), \
-                             ack_ts = COALESCE(ack_ts, ?) \
-                         WHERE message_id = ? AND agent_id = ? AND kind = ?",
-                        &[
-                            read_ts.map_or(Value::Null, Value::BigInt),
-                            ack_ts.map_or(Value::Null, Value::BigInt),
-                            Value::BigInt(message_id),
-                            Value::BigInt(target_agent_id),
-                            Value::Text(kind),
-                        ],
-                    )
-                    .map_err(|e| {
-                        DbError::Sqlite(format!(
-                            "reconstruct salvage: update recipient state for message {message_id}: {e}"
-                        ))
-                    })?;
-                stats.salvaged_recipients += 1;
+                if existing_rows.is_empty() {
+                    target_conn
+                        .execute_sync(
+                            "INSERT OR IGNORE INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
+                             VALUES (?, ?, ?, ?, ?)",
+                            &[
+                                Value::BigInt(message_id),
+                                Value::BigInt(target_agent_id),
+                                Value::Text(kind),
+                                read_ts.map_or(Value::Null, Value::BigInt),
+                                ack_ts.map_or(Value::Null, Value::BigInt),
+                            ],
+                        )
+                        .map_err(|e| {
+                            DbError::Sqlite(format!(
+                                "reconstruct salvage: insert recipient for message {message_id}: {e}"
+                            ))
+                        })?;
+                    stats.salvaged_recipients += 1;
+                    continue;
+                }
+
+                let existing_row = &existing_rows[0];
+                let current_read_ts = existing_row.get_named::<i64>("read_ts").ok();
+                let current_ack_ts = existing_row.get_named::<i64>("ack_ts").ok();
+                if current_read_ts.is_none() && read_ts.is_some()
+                    || current_ack_ts.is_none() && ack_ts.is_some()
+                {
+                    target_conn
+                        .execute_sync(
+                            "UPDATE message_recipients SET \
+                                 read_ts = COALESCE(read_ts, ?), \
+                                 ack_ts = COALESCE(ack_ts, ?) \
+                             WHERE message_id = ? AND agent_id = ? AND kind = ?",
+                            &[
+                                read_ts.map_or(Value::Null, Value::BigInt),
+                                ack_ts.map_or(Value::Null, Value::BigInt),
+                                Value::BigInt(message_id),
+                                Value::BigInt(target_agent_id),
+                                Value::Text(kind),
+                            ],
+                        )
+                        .map_err(|e| {
+                            DbError::Sqlite(format!(
+                                "reconstruct salvage: update recipient state for message {message_id}: {e}"
+                            ))
+                        })?;
+                    stats.salvaged_recipients += 1;
+                }
             }
         }
+    }
 
-        for message_id in recipient_json_updates {
-            sync_reconstructed_message_recipients_json(&target_conn, message_id)?;
-        }
+    for message_id in recipient_json_updates {
+        sync_reconstructed_message_recipients_json(&target_conn, message_id)?;
     }
 
     target_conn
@@ -3097,6 +3172,137 @@ archive body
                 .get_named::<String>("name")
                 .expect("recipient name"),
             "Carol"
+        );
+    }
+
+    #[test]
+    fn reconstruct_with_salvage_rebuilds_recipients_when_recipient_table_is_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed_missing_recipients.db");
+        let salvage_db_path = tmp.path().join("salvage_missing_recipients.db");
+        let storage_root = tmp.path().join("storage");
+
+        std::fs::create_dir_all(storage_root.join("projects")).unwrap();
+
+        let salvage_conn = DbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE projects (
+                    id INTEGER PRIMARY KEY,
+                    slug TEXT NOT NULL,
+                    human_key TEXT,
+                    created_at INTEGER
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE agents (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    name TEXT NOT NULL
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    sender_id INTEGER NOT NULL,
+                    subject TEXT,
+                    body_md TEXT,
+                    created_ts INTEGER,
+                    recipients_json TEXT
+                )",
+            )
+            .unwrap();
+
+        salvage_conn
+            .query_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (100, 'test-project', '/test-project', 1)",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO agents (id, project_id, name) VALUES
+                    (10, 100, 'Alice'),
+                    (11, 100, 'Bob'),
+                    (12, 100, 'Carol')",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts, recipients_json)
+                 VALUES
+                    (2, 100, 10, 'DB-only', 'db body', 2, '{\"to\":[\"Bob\"],\"cc\":\"Carol\",\"bcc\":[]}')",
+                &[],
+            )
+            .unwrap();
+
+        let stats =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("salvage merge should succeed");
+        assert_eq!(stats.salvaged_projects, 1);
+        assert_eq!(stats.salvaged_agents, 3);
+        assert_eq!(stats.salvaged_messages, 1);
+        assert_eq!(stats.salvaged_recipients, 2);
+
+        let conn = DbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let message_rows = conn
+            .query_sync("SELECT recipients_json FROM messages WHERE id = 2", &[])
+            .unwrap();
+        assert_eq!(message_rows.len(), 1);
+        let recipients_json = message_rows[0]
+            .get_named::<String>("recipients_json")
+            .expect("recipients_json");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recipients_json)
+                .expect("recipients_json parses"),
+            serde_json::json!({
+                "to": ["Bob"],
+                "cc": ["Carol"],
+                "bcc": [],
+            })
+        );
+
+        let recipient_rows = conn
+            .query_sync(
+                "SELECT a.name AS name, mr.kind AS kind
+                 FROM message_recipients mr
+                 JOIN agents a ON a.id = mr.agent_id
+                 WHERE mr.message_id = 2
+                 ORDER BY mr.kind, a.name",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(recipient_rows.len(), 2);
+        assert_eq!(
+            recipient_rows[0]
+                .get_named::<String>("kind")
+                .expect("first recipient kind"),
+            "cc"
+        );
+        assert_eq!(
+            recipient_rows[0]
+                .get_named::<String>("name")
+                .expect("first recipient name"),
+            "Carol"
+        );
+        assert_eq!(
+            recipient_rows[1]
+                .get_named::<String>("kind")
+                .expect("second recipient kind"),
+            "to"
+        );
+        assert_eq!(
+            recipient_rows[1]
+                .get_named::<String>("name")
+                .expect("second recipient name"),
+            "Bob"
         );
     }
 

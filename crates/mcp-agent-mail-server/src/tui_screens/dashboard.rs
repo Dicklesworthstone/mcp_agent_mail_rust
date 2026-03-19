@@ -5550,10 +5550,10 @@ fn compute_heatmap_grid(event_log: &VecDeque<EventEntry>, num_cols: usize) -> He
         .map(|e| e.timestamp_micros)
         .max()
         .unwrap_or(0);
-    let ts_span = (ts_max - ts_min).max(1);
+    let ts_span = ts_max.saturating_sub(ts_min).max(1);
     let mut grid = vec![vec![0u32; num_cols]; HEATMAP_EVENT_KINDS];
     for entry in event_log {
-        let col = ((entry.timestamp_micros - ts_min) as f64 / ts_span as f64
+        let col = ((entry.timestamp_micros.saturating_sub(ts_min)) as f64 / ts_span as f64
             * (num_cols as f64 - 1.0)) as usize;
         let col = col.min(num_cols.saturating_sub(1));
         let row = heatmap_kind_index(entry.kind);

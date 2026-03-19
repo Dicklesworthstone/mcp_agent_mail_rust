@@ -2280,11 +2280,21 @@ impl SearchCockpitScreen {
         if row >= list_height {
             return;
         }
+        // Walk result items from the scroll offset, accumulating their
+        // variable heights (1 or 3), to find which item the clicked row
+        // falls within.
         let start = self.list_state.borrow().scroll_offset();
-        let idx = start.saturating_add(row);
-        if idx < self.results.len() {
-            self.cursor = idx;
-            self.detail_scroll.set(0);
+        let mut accumulated_rows = 0usize;
+        for (i, result) in self.results.iter().enumerate().skip(start) {
+            let h = if result.doc_kind == DocKind::Message
+                && (!result.context_snippet.is_empty() || !result.body_preview.is_empty())
+            { 3usize } else { 1usize };
+            if row < accumulated_rows + h {
+                self.cursor = i;
+                self.detail_scroll.set(0);
+                return;
+            }
+            accumulated_rows += h;
         }
     }
 
