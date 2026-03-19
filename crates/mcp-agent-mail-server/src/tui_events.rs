@@ -1756,7 +1756,7 @@ impl TimelineDataProvider {
     /// Refresh the cache by converting any new events.
     pub fn refresh(&mut self) {
         if self.dirty {
-            // Full rebuild
+            // Full rebuild — only clear dirty if we actually got the lock.
             if let Some(events) = self.ring.try_iter_recent(self.ring.capacity()) {
                 self.rows.clear();
                 self.rows.reserve(events.len());
@@ -1764,8 +1764,8 @@ impl TimelineDataProvider {
                     self.rows.push(TimelineRow::from_event(event));
                     self.last_seq = self.last_seq.max(event.seq());
                 }
+                self.dirty = false;
             }
-            self.dirty = false;
         } else {
             // Incremental update
             let new_events = self.ring.events_since_seq(self.last_seq);

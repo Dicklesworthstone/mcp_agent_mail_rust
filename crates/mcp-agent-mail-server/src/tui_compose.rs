@@ -433,10 +433,10 @@ impl ComposeState {
             return Err(msg);
         }
 
-        if self.subject.len() > MAX_SUBJECT_LEN {
+        if char_count(&self.subject) > MAX_SUBJECT_LEN {
             let msg = format!(
                 "Subject too long ({}/{})",
-                self.subject.len(),
+                char_count(&self.subject),
                 MAX_SUBJECT_LEN
             );
             self.error = Some(msg.clone());
@@ -475,6 +475,10 @@ impl ComposeState {
             return vec![""];
         }
         self.body.split('\n').collect()
+    }
+
+    fn body_has_capacity_for(&self, additional_bytes: usize) -> bool {
+        self.body.len().saturating_add(additional_bytes) <= MAX_BODY_LEN
     }
 
     /// Handle a key event. Returns a [`ComposeAction`] describing what happened.
@@ -616,7 +620,7 @@ impl ComposeState {
     fn handle_body_key(&mut self, key: &KeyEvent) -> ComposeAction {
         match key.code {
             KeyCode::Enter => {
-                if self.body.len() < MAX_BODY_LEN {
+                if self.body_has_capacity_for(1) {
                     let offset = self.body_offset();
                     self.body.insert(offset, '\n');
                     self.body_cursor_line += 1;
@@ -705,7 +709,7 @@ impl ComposeState {
                 }
             }
             KeyCode::Char(c) if !key.modifiers.contains(Modifiers::CTRL) => {
-                if self.body.len() < MAX_BODY_LEN {
+                if self.body_has_capacity_for(c.len_utf8()) {
                     let offset = self.body_offset();
                     self.body.insert(offset, c);
                     self.body_cursor_col += 1;
@@ -762,6 +766,32 @@ enum TextTarget {
 
 fn char_count(s: &str) -> usize {
     s.chars().count()
+}
+
+fn char_display_width(ch: char) -> usize {
+    ftui::text::char_width(ch).max(1)
+}
+
+fn display_width(s: &str) -> usize {
+    s.chars().map(char_display_width).sum()
+}
+
+fn display_width_up_to_char_index(s: &str, char_idx: usize) -> usize {
+    s.chars().take(char_idx).map(char_display_width).sum()
+}
+
+fn truncate_to_display_width(s: &str, max_width: usize) -> String {
+    let mut rendered_width = 0_usize;
+    let mut truncated = String::new();
+    for ch in s.chars() {
+        let ch_width = char_display_width(ch);
+        if rendered_width + ch_width > max_width {
+            break;
+        }
+        truncated.push(ch);
+        rendered_width += ch_width;
+    }
+    truncated
 }
 
 fn byte_index_from_char_index(s: &str, char_idx: usize) -> usize {
@@ -1054,7 +1084,12 @@ impl<'a> ComposePanel<'a> {
 
                 // Draw cursor
                 if is_active {
-                    let cursor_x = inner.x + 1 + self.state.subject_cursor as u16;
+                    let cursor_x = inner.x
+                        + 1
+                        + display_width_up_to_char_index(
+                            &self.state.subject,
+                            self.state.subject_cursor,
+                        ) as u16;
                     if cursor_x < inner.right() - 1 {
                         self.set_cursor_cell(cursor_x, y, &cp, frame);
                     }
@@ -1107,7 +1142,7 @@ impl<'a> ComposePanel<'a> {
                 }
                 let line_idx = self.state.body_scroll + vi;
                 let line_text = lines.get(line_idx).unwrap_or(&"");
-                let truncated: String = line_text.chars().take(inner_w.saturating_sub(2)).collect();
+                let truncated = truncate_to_display_width(line_text, inner_w.saturating_sub(2));
                 self.draw_text(
                     inner.x + 1,
                     y,
@@ -1120,7 +1155,10 @@ impl<'a> ComposePanel<'a> {
 
                 // Cursor in body
                 if is_active && line_idx == self.state.body_cursor_line {
-                    let cursor_x = inner.x + 1 + self.state.body_cursor_col as u16;
+                    let cursor_x = inner.x
+                        + 1
+                        + display_width_up_to_char_index(line_text, self.state.body_cursor_col)
+                            as u16;
                     if cursor_x < inner.right() - 1 {
                         self.set_cursor_cell(cursor_x, y, &cp, frame);
                     }
@@ -1227,7 +1265,12 @@ impl<'a> ComposePanel<'a> {
                 self.draw_bordered_line(inner.x, y, inner_w, display, fg, border_fg, cp.bg, frame);
 
                 if is_active {
-                    let cursor_x = inner.x + 1 + self.state.thread_id_cursor as u16;
+                    let cursor_x = inner.x
+                        + 1
+                        + display_width_up_to_char_index(
+                            &self.state.thread_id,
+                            self.state.thread_id_cursor,
+                        ) as u16;
                     if cursor_x < inner.right() - 1 {
                         self.set_cursor_cell(cursor_x, y, &cp, frame);
                     }
@@ -1306,14 +1349,21 @@ impl<'a> ComposePanel<'a> {
     ) {
         let mut col = x;
         for ch in text.chars() {
-            if col >= max_x {
+            let w = char_display_width(ch) as u16;
+            if col + w > max_x {
                 break;
             }
             let mut cell = Cell::from_char(ch);
             cell.fg = fg;
             cell.bg = bg;
             frame.buffer.set_fast(col, y, cell);
-            col += 1;
+            for fill_col in 1..w {
+                let mut continuation = Cell::from_char(' ');
+                continuation.fg = fg;
+                continuation.bg = bg;
+                frame.buffer.set_fast(col + fill_col, y, continuation);
+            }
+            col += w;
         }
     }
 
@@ -1343,14 +1393,17 @@ impl<'a> ComposePanel<'a> {
 
         // Content
         let content_width = width.saturating_sub(2);
-        let mut col = x + 1;
-        for ch in text.chars().take(content_width) {
-            let mut c = Cell::from_char(ch);
-            c.fg = fg;
-            c.bg = bg;
-            frame.buffer.set_fast(col, y, c);
-            col += 1;
-        }
+        let visible_text = truncate_to_display_width(text, content_width);
+        self.draw_text(
+            x + 1,
+            y,
+            &visible_text,
+            fg,
+            bg,
+            right.saturating_sub(1),
+            frame,
+        );
+        let mut col = x + 1 + display_width(&visible_text) as u16;
         // Pad remaining
         while col < right.saturating_sub(1) {
             let mut c = Cell::from_char(' ');
@@ -1405,6 +1458,25 @@ mod tests {
         let mut s = ComposeState::new();
         s.set_available_agents(names.iter().map(std::string::ToString::to_string).collect());
         s
+    }
+
+    #[test]
+    fn display_width_up_to_char_index_counts_wide_chars() {
+        let text = "A界B";
+        assert_eq!(display_width_up_to_char_index(text, 0), 0);
+        assert_eq!(display_width_up_to_char_index(text, 1), 1);
+        assert_eq!(display_width_up_to_char_index(text, 2), 3);
+        assert_eq!(display_width_up_to_char_index(text, 3), 4);
+    }
+
+    #[test]
+    fn truncate_to_display_width_respects_wide_chars() {
+        let text = "A界B";
+        assert_eq!(truncate_to_display_width(text, 0), "");
+        assert_eq!(truncate_to_display_width(text, 1), "A");
+        assert_eq!(truncate_to_display_width(text, 2), "A");
+        assert_eq!(truncate_to_display_width(text, 3), "A界");
+        assert_eq!(truncate_to_display_width(text, 4), "A界B");
     }
 
     // ── ComposeField ───────────────────────────────────────────
@@ -2160,6 +2232,17 @@ mod tests {
         s.body_cursor_col = MAX_BODY_LEN;
         s.handle_key(&make_key(KeyCode::Enter));
         assert_eq!(s.body.len(), MAX_BODY_LEN);
+    }
+
+    #[test]
+    fn body_rejects_multibyte_input_that_would_exceed_max_length() {
+        let mut s = ComposeState::new();
+        s.active_field = ComposeField::Body;
+        s.body = "x".repeat(MAX_BODY_LEN - 1);
+        s.body_cursor_col = MAX_BODY_LEN - 1;
+        s.handle_key(&make_key(KeyCode::Char('界')));
+        assert_eq!(s.body.len(), MAX_BODY_LEN - 1);
+        assert_eq!(s.body_cursor_col, MAX_BODY_LEN - 1);
     }
 
     // ── Edge-case: overlay area extremes ──────────────────────

@@ -77,7 +77,7 @@ impl ActionTier {
     #[must_use]
     pub const fn exploration_budget_fraction(self) -> f64 {
         match self {
-            Self::LowRisk => 0.10,   // 10% of ticks
+            Self::LowRisk => 0.10,    // 10% of ticks
             Self::MediumRisk => 0.05, // 5% conditionally
             Self::HighRisk => 0.0,    // never explore
         }
@@ -173,6 +173,28 @@ pub struct AdmissibilityContext {
     pub exploration_used_fraction: f64,
     /// Is a rollback currently active?
     pub rollback_active: bool,
+}
+
+fn denial_code_for_failed_gate(
+    gate_name: &str,
+    ctx: &AdmissibilityContext,
+    tier: ActionTier,
+) -> DenialCode {
+    match gate_name {
+        "rollback" => DenialCode::RollbackActive,
+        "calibration" => DenialCode::CalibrationUnhealthy,
+        "risk_budget" => DenialCode::RiskBudgetExhausted,
+        "regime" => DenialCode::RegimeUnstable,
+        "evidence_quality" => DenialCode::EvidenceQualityLow,
+        "exploration_budget" => {
+            if !ctx.is_incumbent_policy && tier == ActionTier::HighRisk {
+                DenialCode::HighRiskExploration
+            } else {
+                DenialCode::ExplorationBudgetExhausted
+            }
+        }
+        _ => DenialCode::CalibrationUnhealthy,
+    }
 }
 
 /// Evaluate the admissibility gate for a proposed action.
@@ -284,19 +306,7 @@ pub fn evaluate_admissibility(ctx: &AdmissibilityContext) -> AdmissibilityResult
     if let Some(idx) = failure_idx {
         let gate_name = gates[idx].gate;
         let detail = gates[idx].detail.clone();
-        let code = match reason.as_str() {
-            "locked" => DenialCode::RegionLocked,
-            "quota" => DenialCode::QuotaExceeded,
-            "security" => DenialCode::SecurityPolicyViolation,
-            "concurrency" => DenialCode::ConcurrencyLimit,
-            "rate_limit" => DenialCode::RateLimited,
-            "dependency" => DenialCode::DependencyFailure,
-            "stale" => DenialCode::ContextStale,
-            "unauthorized" => DenialCode::Unauthorized,
-            "malformed" => DenialCode::MalformedRequest,
-            "not_found" => DenialCode::ResourceNotFound,
-            _ => DenialCode::CalibrationUnhealthy,
-        };
+        let code = denial_code_for_failed_gate(gate_name, ctx, tier);
 
         AdmissibilityResult {
             admitted: false,
@@ -467,6 +477,22 @@ mod tests {
         let result = evaluate_admissibility(&ctx);
         assert!(!result.admitted);
         assert_eq!(result.denial_code, Some(DenialCode::HighRiskExploration));
+    }
+
+    #[test]
+    fn low_risk_exploration_budget_exhausted_blocks() {
+        let ctx = AdmissibilityContext {
+            effect_kind: EffectKind::Advisory,
+            is_incumbent_policy: false,
+            exploration_used_fraction: 0.10,
+            ..clean_context()
+        };
+        let result = evaluate_admissibility(&ctx);
+        assert!(!result.admitted);
+        assert_eq!(
+            result.denial_code,
+            Some(DenialCode::ExplorationBudgetExhausted)
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Verification Coverage Ledger
 
-Canonical inventory for [br-aazao.1](br-aazao.1) / `br-aazao.1.1` / `br-aazao.1.2` / `br-aazao.1.3`.
+Canonical inventory for [br-aazao.1](br-aazao.1) / `br-aazao.1.1` / `br-aazao.1.2` / `br-aazao.1.3` / `br-aazao.2.1`.
 
 ## Scope
 
@@ -15,7 +15,7 @@ This pass is intentionally concrete about:
 - where the current surface is mostly behavioral vs mostly contract/snapshot oriented
 - which obvious low-coverage or realism-risk areas should feed later beads
 
-This pass does **not** try to finish the realism policy work from `br-aazao.2`. It does, however, include the crate-cluster inventory from `br-aazao.1.1`, the shell-suite inventory slice from `br-aazao.1.2`, and the realism/ownership ledger from `br-aazao.1.3`.
+This pass does **not** try to finish the remaining substitute-compensation policy from `br-aazao.2.2` or the closure/sign-off policy from `br-aazao.2.3`. It does, however, include the crate-cluster inventory from `br-aazao.1.1`, the shell-suite inventory slice from `br-aazao.1.2`, the realism/ownership ledger from `br-aazao.1.3`, and the reusable evidence-grade taxonomy from `br-aazao.2.1`.
 
 ## Evidence Sources
 
@@ -314,13 +314,46 @@ Dedicated `tests/*.rs` harness count by crate:
 - The verification epic also calls out stubbed LLM completions, mock release artifacts, and fake repo/owner-state scenarios that still need explicit realism grading.
 - [guard_env_tests.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-guard/tests/guard_env_tests.rs) and similar harnesses correctly use local synthetic fixtures for isolated policy checks; these should be treated as local-fixture confidence, not full real-path workflow proof.
 
-## Realism Grade Rubric (`br-aazao.1.3`)
+## Realism Grade Rubric (`br-aazao.1.3` / `br-aazao.2.1`)
 
 - `R0 Real-path`: production code paths exercised with the real runtime and durable state machinery. Local tempdirs and ephemeral DB files are fine if the test is still using the real engine rather than a substitute.
 - `R1 Deterministic local fixture`: real code over synthetic local files, fixture payloads, or controlled repo/archive layouts. Good for logic and migration confidence, weaker for external integration claims.
 - `R2 Sanctioned substitute`: an intentional offline stand-in that preserves a meaningful contract boundary, but is still not the real dependency. Good for repeatability, not enough for sign-off on the replaced dependency.
 - `R3 Mock / stub / fake lane`: explicit fake behavior or mocked external surface. Useful for branch coverage and control flow, but should be called out as realism debt when it sits on a critical path.
 - `R4 Thin / fragmented / unowned`: little direct coverage, or coverage only exists indirectly through lower layers. These surfaces need explicit ownership before confidence claims mean much.
+
+### Classification Rules
+
+- Classify by the strongest dependency that was replaced, not by the test name. A test called “integration” can still be `R2` or `R3` if it swaps out the critical dependency.
+- “Uses the real binary/runtime” is not enough for `R0` if the decisive external truth source is mocked. Real CLI plus mocked release API is still not `R0` for self-update confidence.
+- Tempdirs, ephemeral SQLite files, loopback HTTP, and locally created Git repos still count as `R0` or `R1` when the real engine is under test and the substitute is only the environment setup.
+- `R1` and `R2` are not interchangeable. `R1` keeps the real subsystem and controls its inputs; `R2` swaps the dependency but keeps a meaningful contract boundary.
+- `R3` is for explicit fake behavior, not for “just offline.” If the test would pass with behavior that could never happen in production without the stub, it belongs in `R3`.
+- `R4` is not a failure state by itself. It is a bookkeeping signal that the surface still lacks enough direct proof to support strong claims.
+
+### Repo Examples By Grade
+
+| Grade | Meaning in this repo | Representative examples |
+|---|---|---|
+| `R0 Real-path` | Real engine, real state transitions, real durable stores, no substituted dependency on the claim being made | [atc_experience_lifecycle.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/atc_experience_lifecycle.rs), [query_integration.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/query_integration.rs), most direct shell suites using [e2e_lib.sh](/data/projects/mcp_agent_mail_rust/scripts/e2e_lib.sh) against the real binaries |
+| `R1 Deterministic local fixture` | Real subsystem over synthetic local data or controlled archive/repo layout | reconstruct/archive/share tests that synthesize archive trees or lock files; isolated guard/storage/share fixture-driven policy tests |
+| `R2 Sanctioned substitute` | Contract-preserving offline stand-in that is intentionally second-best evidence | [toon_integration.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-core/tests/toon_integration.rs), [test_toon.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_toon.sh) with [toon_stub_encoder.sh](/data/projects/mcp_agent_mail_rust/scripts/toon_stub_encoder.sh) |
+| `R3 Mock / stub / fake lane` | Explicitly mocked or fake behavior used to force branches or simulate unavailable services | [test_llm.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_llm.sh), [test_self_update.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_self_update.sh), search `StubEngine` / `StubEmbedder` harnesses in [engine.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-search-core/src/engine.rs) and [fs_bridge.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-search-core/src/fs_bridge.rs) |
+| `R4 Thin / fragmented / unowned` | Surface has little direct proof, or only indirect proof through lower layers | [crates/mcp-agent-mail/src/main.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail/src/main.rs), [crates/mcp-agent-mail-wasm/src/lib.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-wasm/src/lib.rs), [crates/mcp-agent-mail-agent-detect/src/lib.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-agent-detect/src/lib.rs) |
+
+### How The Taxonomy Applies Across Test Lanes
+
+| Lane | What `R0` means | Common lower-grade patterns | Review implication |
+|---|---|---|---|
+| Unit / inline `#[cfg(test)]` | Real state machine, parser, DB/query path, or algorithm with no substituted dependency on the claim surface | tempdir/archive fixtures (`R1`), stubbed collaborators (`R2`/`R3`) | Unit tests can absolutely be `R0`; the distinction is realism of the exercised dependency path, not test size |
+| Conformance / parity | Real implementation checked against a reference contract, schema, or golden fixture | reference-only snapshots and format fixtures often land in `R1`; stub-backed parity harnesses land in `R2` or `R3` | Passing conformance proves contract shape, not necessarily real operational behavior |
+| E2E shell / workflow | Real binaries, real HTTP or stdio transport, real local stores, and no mocked decisive dependency for the claim | wrapper-only observability (`still R0 but weaker evidence quality`), mocked release/LLM endpoints (`R3`), stub encoders (`R2`) | “E2E” is not automatically `R0`; if the critical dependency is mocked, the workflow still needs compensating real-path coverage elsewhere |
+
+### Program-Level Use
+
+- Use this taxonomy in review comments, bead descriptions, and final sign-off instead of vague phrases like “real enough” or “integration-ish.”
+- When a test mixes layers, record the highest-confidence claim it can honestly support. Do not let one real component upgrade the whole test if the decisive dependency is still fake.
+- Future beads should reuse these grades directly and only add narrower subsystem-specific rules, not invent a parallel vocabulary.
 
 ## Prioritized Realism And Ownership Ledger (`br-aazao.1.3`)
 
@@ -349,6 +382,8 @@ Dedicated `tests/*.rs` harness count by crate:
 
 ## Obvious Follow-On Targets
 
+- `br-aazao.2.2`: define which substitute lanes are still allowed, which are forbidden, and what compensating real-path evidence must exist.
+- `br-aazao.2.3`: convert the taxonomy into an explicit closure/sign-off rubric so later verification beads can be judged mechanically.
 - `br-aazao.3`: replace the biggest fake-binary, stub-encoder, and mock-release lanes with real-path inputs where that confidence claim matters.
 - `br-aazao.4`: isolate or replace the search/embedder/LLM substitute lanes so ranking and summarization realism claims stay honest.
 - `br-aazao.8.1`: add the missing per-suite `manifest.json` contract so the current rich artifact set becomes uniformly machine-readable at the case level.

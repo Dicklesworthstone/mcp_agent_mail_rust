@@ -227,7 +227,10 @@ impl DebtLedger {
     /// Count of debts that warrant experimentation.
     #[must_use]
     pub fn experiment_worthy_count(&self) -> usize {
-        self.entries.iter().filter(|e| e.warrants_experiment()).count()
+        self.entries
+            .iter()
+            .filter(|e| e.warrants_experiment())
+            .count()
     }
 
     /// Total active (unresolved) debts.
@@ -240,7 +243,11 @@ impl DebtLedger {
     #[must_use]
     pub fn by_severity(&self) -> Vec<&IdentifiabilityDebt> {
         let mut sorted: Vec<_> = self.entries.iter().collect();
-        sorted.sort_by(|a, b| b.severity.partial_cmp(&a.severity).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|a, b| {
+            b.severity
+                .partial_cmp(&a.severity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         sorted
     }
 }
@@ -344,8 +351,10 @@ pub fn score_voi(input: &VoIInput) -> VoIScore {
 
     // Raw VoI: combination of information gain, debt severity, and staleness.
     // Higher entropy and staleness increase the value of new information.
-    let staleness_factor = (f64::from(u32::try_from(input.staleness_micros.max(0)).unwrap_or(u32::MAX)) / 600_000_000.0).min(2.0); // clamp [0, 2×]
-    let base_utility = 1.0;
+    let staleness_factor =
+        (f64::from(u32::try_from(input.staleness_micros.max(0)).unwrap_or(u32::MAX))
+            / 600_000_000.0)
+            .min(2.0); // clamp [0, 2×]
     let raw_voi = input.estimated_info_gain
         * input.debt_severity
         * 0.3f64.mul_add(input.posterior_entropy, 1.0)
@@ -528,9 +537,15 @@ pub fn check_eligibility(ctx: &EligibilityContext) -> EligibilityResult {
         name: "evidence_quality".to_string(),
         passed: evidence_ok,
         description: if evidence_ok {
-            format!("trusted evidence fraction {:.0}% >= 50%", ctx.trusted_evidence_fraction * 100.0)
+            format!(
+                "trusted evidence fraction {:.0}% >= 50%",
+                ctx.trusted_evidence_fraction * 100.0
+            )
         } else {
-            format!("trusted evidence fraction {:.0}% < 50%", ctx.trusted_evidence_fraction * 100.0)
+            format!(
+                "trusted evidence fraction {:.0}% < 50%",
+                ctx.trusted_evidence_fraction * 100.0
+            )
         },
     });
     if !evidence_ok && first_refusal.is_none() {
@@ -588,7 +603,10 @@ pub fn check_eligibility(ctx: &EligibilityContext) -> EligibilityResult {
         description: if voi_ok {
             format!("VoI score {:.3} >= {MIN_VOI_SCORE:.3}", ctx.voi_score)
         } else {
-            format!("VoI score {:.3} < {MIN_VOI_SCORE:.3}: not worth experimenting", ctx.voi_score)
+            format!(
+                "VoI score {:.3} < {MIN_VOI_SCORE:.3}: not worth experimenting",
+                ctx.voi_score
+            )
         },
     });
     if !voi_ok && first_refusal.is_none() {
@@ -627,13 +645,13 @@ pub struct ExperimentBudget {
 
 impl ExperimentBudget {
     /// Whether the budget has capacity for another experiment.
-    #[must_use] 
+    #[must_use]
     pub const fn has_capacity(&self) -> bool {
         self.used_experiments < self.max_experiments
     }
 
     /// Whether the window has expired.
-    #[must_use] 
+    #[must_use]
     pub const fn is_expired(&self, now_micros: i64) -> bool {
         now_micros.saturating_sub(self.window_start_micros) > self.window_duration_micros
     }
@@ -681,9 +699,10 @@ impl ExperimentBudgetTable {
         now_micros: i64,
     ) -> &mut ExperimentBudget {
         // Find existing entry.
-        let idx = self.entries.iter().position(|e| {
-            e.action_family == action_family && e.cohort_key == cohort_key
-        });
+        let idx = self
+            .entries
+            .iter()
+            .position(|e| e.action_family == action_family && e.cohort_key == cohort_key);
 
         if let Some(i) = idx {
             let entry = &mut self.entries[i];
@@ -706,7 +725,7 @@ impl ExperimentBudgetTable {
     }
 
     /// Whether the global experiment fraction is within limits.
-    #[must_use] 
+    #[must_use]
     pub fn global_fraction_ok(&self) -> bool {
         if self.global_action_count == 0 {
             return true;
@@ -727,7 +746,7 @@ impl ExperimentBudgetTable {
 
     /// Global experiment rate (as a fraction).
     #[allow(clippy::cast_precision_loss)]
-    #[must_use] 
+    #[must_use]
     pub fn global_exploration_rate(&self) -> f64 {
         if self.global_action_count == 0 {
             return 0.0;
@@ -831,7 +850,7 @@ mod tests {
             "cohort".to_string(),
             DebtType::SparseData,
             0.5,
-            200, // meets required_count
+            200,  // meets required_count
             0.90, // meets target_confidence
             1_000_000,
         );
@@ -877,9 +896,33 @@ mod tests {
     #[test]
     fn test_debt_by_severity() {
         let mut ledger = DebtLedger::new();
-        ledger.add_debt("a".into(), "c".into(), DebtType::SparseData, 0.3, 10, 0.5, 0);
-        ledger.add_debt("b".into(), "c".into(), DebtType::SparseData, 0.9, 10, 0.5, 0);
-        ledger.add_debt("c".into(), "c".into(), DebtType::SparseData, 0.6, 10, 0.5, 0);
+        ledger.add_debt(
+            "a".into(),
+            "c".into(),
+            DebtType::SparseData,
+            0.3,
+            10,
+            0.5,
+            0,
+        );
+        ledger.add_debt(
+            "b".into(),
+            "c".into(),
+            DebtType::SparseData,
+            0.9,
+            10,
+            0.5,
+            0,
+        );
+        ledger.add_debt(
+            "c".into(),
+            "c".into(),
+            DebtType::SparseData,
+            0.6,
+            10,
+            0.5,
+            0,
+        );
         let sorted = ledger.by_severity();
         assert_eq!(sorted[0].action_family, "b");
         assert_eq!(sorted[1].action_family, "c");
@@ -918,7 +961,11 @@ mod tests {
             is_reversible: true,
         };
         let score = score_voi(&input);
-        assert!(score.justified, "Expected justified: score={:.4}, reason={}", score.net_voi, score.reason);
+        assert!(
+            score.justified,
+            "Expected justified: score={:.4}, reason={}",
+            score.net_voi, score.reason
+        );
         assert_eq!(score.reason, VoIDecision::ExperimentJustified);
     }
 
@@ -1017,7 +1064,10 @@ mod tests {
         ctx.decision_sufficient = true;
         let result = check_eligibility(&ctx);
         assert!(!result.eligible);
-        assert_eq!(result.refusal, Some(ExperimentRefusalCode::AlreadySufficient));
+        assert_eq!(
+            result.refusal,
+            Some(ExperimentRefusalCode::AlreadySufficient)
+        );
     }
 
     #[test]
@@ -1108,10 +1158,19 @@ mod tests {
     #[test]
     fn test_debt_type_display() {
         assert_eq!(DebtType::SparseData.to_string(), "sparse_data");
-        assert_eq!(DebtType::ConfoundedAttribution.to_string(), "confounded_attribution");
+        assert_eq!(
+            DebtType::ConfoundedAttribution.to_string(),
+            "confounded_attribution"
+        );
         assert_eq!(DebtType::RegimeDiscounted.to_string(), "regime_discounted");
-        assert_eq!(DebtType::ContaminatedEvidence.to_string(), "contaminated_evidence");
-        assert_eq!(DebtType::WeakCounterfactual.to_string(), "weak_counterfactual");
+        assert_eq!(
+            DebtType::ContaminatedEvidence.to_string(),
+            "contaminated_evidence"
+        );
+        assert_eq!(
+            DebtType::WeakCounterfactual.to_string(),
+            "weak_counterfactual"
+        );
         assert_eq!(DebtType::FairnessBound.to_string(), "fairness_bound");
     }
 
@@ -1125,13 +1184,22 @@ mod tests {
 
     #[test]
     fn test_refusal_code_display() {
-        assert_eq!(ExperimentRefusalCode::HighRiskAction.to_string(), "high_risk_action");
-        assert_eq!(ExperimentRefusalCode::VoIInsufficient.to_string(), "voi_insufficient");
+        assert_eq!(
+            ExperimentRefusalCode::HighRiskAction.to_string(),
+            "high_risk_action"
+        );
+        assert_eq!(
+            ExperimentRefusalCode::VoIInsufficient.to_string(),
+            "voi_insufficient"
+        );
     }
 
     #[test]
     fn test_voi_decision_display() {
-        assert_eq!(VoIDecision::ExperimentJustified.to_string(), "experiment_justified");
+        assert_eq!(
+            VoIDecision::ExperimentJustified.to_string(),
+            "experiment_justified"
+        );
         assert_eq!(VoIDecision::Irreversible.to_string(), "irreversible");
     }
 }

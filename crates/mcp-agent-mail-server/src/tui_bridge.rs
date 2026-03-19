@@ -260,16 +260,20 @@ fn assert_screen_truth(snapshot: &ScreenDiagnosticSnapshot) {
     let has_raw_rows = snapshot.raw_count > 0;
     let rendered_none = snapshot.rendered_count == 0;
     let user_filter_active = query_params_explain_empty_state(&snapshot.query_params);
-    assert!(
-        !(has_raw_rows && rendered_none && !user_filter_active),
-        "[truth_assertion] screen={} scope={} raw_count={} rendered_count={} query_params={} \
-possible silent false-empty state",
-        snapshot.screen,
-        snapshot.scope,
-        snapshot.raw_count,
-        snapshot.rendered_count,
-        snapshot.query_params
-    );
+    // Use tracing::warn instead of assert! — a transient race between the
+    // DB poller updating raw_count and the render loop producing
+    // rendered_count == 0 (e.g., first render after data arrives) would
+    // panic the entire TUI process if this were an assert.
+    if has_raw_rows && rendered_none && !user_filter_active {
+        tracing::warn!(
+            screen = %snapshot.screen,
+            scope = %snapshot.scope,
+            raw_count = snapshot.raw_count,
+            rendered_count = snapshot.rendered_count,
+            query_params = %snapshot.query_params,
+            "possible silent false-empty state (truth assertion)"
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
