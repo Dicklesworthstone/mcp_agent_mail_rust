@@ -22,7 +22,7 @@ use crate::error::{DbError, DbResult};
 use crate::schema;
 use sqlmodel_core::Value;
 use sqlmodel_sqlite::SqliteConnection as DbConn;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 fn is_real_directory(path: &Path) -> bool {
@@ -432,7 +432,7 @@ fn discover_messages(
 ) -> DbResult<()> {
     // Walk year directories
     let Ok(years) = std::fs::read_dir(messages_dir) else {
-        return;
+        return Ok(());
     };
 
     let mut message_files: Vec<PathBuf> = Vec::new();
@@ -551,12 +551,7 @@ fn parse_and_insert_message(
     let to_names = json_str_array(&msg, "to");
     let cc_names = json_str_array(&msg, "cc");
     let bcc_names = json_str_array(&msg, "bcc");
-    let recipients_json = serde_json::json!({
-        "to": &to_names,
-        "cc": &cc_names,
-        "bcc": &bcc_names,
-    })
-    .to_string();
+    let recipients_json = encode_recipients_json(&to_names, &cc_names, &bcc_names);
 
     // Insert message, preserving canonical frontmatter ID when available.
     //
@@ -710,6 +705,73 @@ fn insert_recipient(conn: &DbConn, message_id: i64, agent_id: i64, kind: &str) -
     )
     .map(|_| ())
     .map_err(|e| DbError::Sqlite(format!("insert recipient: {e}")))
+}
+
+fn encode_recipients_json(
+    to_names: &[String],
+    cc_names: &[String],
+    bcc_names: &[String],
+) -> String {
+    serde_json::json!({
+        "to": to_names,
+        "cc": cc_names,
+        "bcc": bcc_names,
+    })
+    .to_string()
+}
+
+fn sync_reconstructed_message_recipients_json(conn: &DbConn, message_id: i64) -> DbResult<()> {
+    let rows = conn
+        .query_sync(
+            "SELECT a.name AS name, mr.kind AS kind \
+             FROM message_recipients mr \
+             JOIN agents a ON a.id = mr.agent_id \
+             WHERE mr.message_id = ? \
+             ORDER BY CASE mr.kind WHEN 'to' THEN 0 WHEN 'cc' THEN 1 WHEN 'bcc' THEN 2 ELSE 3 END, \
+                      a.name COLLATE NOCASE",
+            &[Value::BigInt(message_id)],
+        )
+        .map_err(|e| {
+            DbError::Sqlite(format!(
+                "reconstruct salvage: query recipients_json rows for message {message_id}: {e}"
+            ))
+        })?;
+
+    let mut to_names = Vec::new();
+    let mut cc_names = Vec::new();
+    let mut bcc_names = Vec::new();
+
+    for row in rows {
+        let name = row.get_named::<String>("name").map_err(|e| {
+            DbError::Sqlite(format!(
+                "reconstruct salvage: decode recipient name for message {message_id}: {e}"
+            ))
+        })?;
+        let kind = row.get_named::<String>("kind").map_err(|e| {
+            DbError::Sqlite(format!(
+                "reconstruct salvage: decode recipient kind for message {message_id}: {e}"
+            ))
+        })?;
+        match kind.as_str() {
+            "cc" => cc_names.push(name),
+            "bcc" => bcc_names.push(name),
+            _ => to_names.push(name),
+        }
+    }
+
+    conn.execute_sync(
+        "UPDATE messages SET recipients_json = ? WHERE id = ?",
+        &[
+            Value::Text(encode_recipients_json(&to_names, &cc_names, &bcc_names)),
+            Value::BigInt(message_id),
+        ],
+    )
+    .map(|_| ())
+    .map_err(|e| {
+        DbError::Sqlite(format!(
+            "reconstruct salvage: update recipients_json for message {message_id}: {e}"
+        ))
+    })
 }
 
 struct ArchivedFileReservation {
@@ -1481,6 +1543,7 @@ fn merge_salvaged_database(
                 "importance",
                 "ack_required",
                 "created_ts",
+                "recipients_json",
                 "attachments",
             ],
             stats,
@@ -1537,12 +1600,17 @@ fn merge_salvaged_database(
                 .ok()
                 .and_then(|raw| sanitize_reconstructed_thread_id(&raw));
             let thread_value = thread_id.map_or(Value::Null, Value::Text);
+            let recipients_json = row
+                .get_named::<String>("recipients_json")
+                .ok()
+                .filter(|json| !json.trim().is_empty())
+                .unwrap_or_else(|| encode_recipients_json(&[], &[], &[]));
 
             target_conn
                 .execute_sync(
                     "INSERT OR IGNORE INTO messages \
-                     (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     &[
                         Value::BigInt(message_id),
                         Value::BigInt(target_project_id),
@@ -1561,6 +1629,7 @@ fn merge_salvaged_database(
                             row.get_named::<i64>("created_ts")
                                 .unwrap_or_else(|_| crate::now_micros()),
                         ),
+                        Value::Text(recipients_json),
                         Value::Text(
                             row.get_named::<String>("attachments")
                                 .unwrap_or_else(|_| "[]".to_string()),
@@ -1575,6 +1644,7 @@ fn merge_salvaged_database(
     }
 
     if has_recipients {
+        let mut recipient_json_updates = BTreeSet::new();
         let recipient_columns = table_columns(&salvage_conn, "message_recipients")?;
         let Some(recipient_select) = build_salvage_select(
             "message_recipients",
@@ -1622,6 +1692,7 @@ fn merge_salvaged_database(
                 .unwrap_or_else(|_| "to".to_string());
             let read_ts = row.get_named::<i64>("read_ts").ok();
             let ack_ts = row.get_named::<i64>("ack_ts").ok();
+            recipient_json_updates.insert(message_id);
 
             let existing_rows = target_conn
                 .query_sync(
@@ -1688,6 +1759,10 @@ fn merge_salvaged_database(
                     })?;
                 stats.salvaged_recipients += 1;
             }
+        }
+
+        for message_id in recipient_json_updates {
+            sync_reconstructed_message_recipients_json(&target_conn, message_id)?;
         }
     }
 
@@ -2953,7 +3028,10 @@ archive body
 
         let conn = DbConn::open_file(db_path.to_str().unwrap()).unwrap();
         let message_rows = conn
-            .query_sync("SELECT id, subject FROM messages ORDER BY id", &[])
+            .query_sync(
+                "SELECT id, subject, recipients_json FROM messages ORDER BY id",
+                &[],
+            )
             .unwrap();
         assert_eq!(message_rows.len(), 2);
         assert_eq!(
@@ -2961,6 +3039,18 @@ archive body
                 .get_named::<String>("subject")
                 .expect("subject"),
             "DB-only"
+        );
+        let db_only_recipients_json = message_rows[1]
+            .get_named::<String>("recipients_json")
+            .expect("db-only recipients_json");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&db_only_recipients_json)
+                .expect("db-only recipients_json parses"),
+            serde_json::json!({
+                "to": ["Carol"],
+                "cc": [],
+                "bcc": [],
+            })
         );
 
         let recipient_rows = conn
