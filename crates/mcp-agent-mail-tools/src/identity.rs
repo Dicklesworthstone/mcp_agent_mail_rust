@@ -1073,6 +1073,44 @@ pub fn cleanup_pane_identities(
         .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
 }
 
+/// List all registered agents in a project.
+///
+/// # Parameters
+/// - `project_key`: Project slug or human key
+///
+/// # Returns
+/// Array of agent entries with name, role (program), project scope, registration time, last seen
+#[tool(
+    description = "List all registered agents in a project.\n\nReturns agent name, role (program), model, task description, registration time (inception_ts), and last seen (last_active_ts).\n\nParameters\n----------\nproject_key : str\n    Project slug or human key.\n\nReturns\n-------\nstr (JSON)\n    Array of agent objects with fields: name, program, model, task_description, inception_ts, last_active_ts, contact_policy."
+)]
+pub async fn list_agents(ctx: &McpContext, project_key: String) -> McpResult<String> {
+    let pool = get_db_pool()?;
+    let project = resolve_project(ctx, &pool, &project_key).await?;
+    let project_id = project.id.unwrap_or(0);
+
+    let agents = db_outcome_to_mcp_result(
+        mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id).await,
+    )?;
+
+    let entries: Vec<serde_json::Value> = agents
+        .into_iter()
+        .map(|a| {
+            json!({
+                "name": a.name,
+                "program": a.program,
+                "model": a.model,
+                "task_description": a.task_description,
+                "inception_ts": micros_to_iso(a.inception_ts),
+                "last_active_ts": micros_to_iso(a.last_active_ts),
+                "contact_policy": a.contact_policy,
+            })
+        })
+        .collect();
+
+    serde_json::to_string(&entries)
+        .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

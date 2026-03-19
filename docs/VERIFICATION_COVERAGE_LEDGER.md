@@ -1,6 +1,6 @@
 # Verification Coverage Ledger
 
-Canonical inventory for [br-aazao.1](br-aazao.1) / `br-aazao.1.1`.
+Canonical inventory for [br-aazao.1](br-aazao.1) / `br-aazao.1.1` / `br-aazao.1.2` / `br-aazao.1.3`.
 
 ## Scope
 
@@ -11,10 +11,11 @@ This pass is intentionally concrete about:
 - where inline `#[cfg(test)]` coverage already exists
 - which crates have dedicated `tests/*.rs` integration harnesses
 - where conformance and parity coverage lives
+- how the shell E2E surface is split between direct suites, thin wrappers, and specialized harness lanes
 - where the current surface is mostly behavioral vs mostly contract/snapshot oriented
 - which obvious low-coverage or realism-risk areas should feed later beads
 
-This pass does **not** try to finish the realism policy work from `br-aazao.2` or the full shell-suite inventory from `br-aazao.1.2`. It does, however, note the largest realism clues already visible from the current test corpus.
+This pass does **not** try to finish the realism policy work from `br-aazao.2`. It does, however, include the crate-cluster inventory from `br-aazao.1.1`, the shell-suite inventory slice from `br-aazao.1.2`, and the realism/ownership ledger from `br-aazao.1.3`.
 
 ## Evidence Sources
 
@@ -24,6 +25,8 @@ This pass does **not** try to finish the realism policy work from `br-aazao.2` o
 - `rg -n '#[cfg(test)]' crates/*/src`
 - `find crates -maxdepth 3 -path '*/tests/*.rs' -type f`
 - `find tests/e2e -maxdepth 1 -name 'test_*.sh'`
+- `find scripts -maxdepth 1 -name 'e2e*.sh'`
+- `rg -n 'source .*e2e_lib\.sh|source .*e2e_search_v3_lib\.sh|exec .*scripts/e2e_.*\.sh|bash .*scripts/e2e_.*\.sh' tests/e2e scripts`
 - representative test reads from:
   - [toon_integration.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-core/tests/toon_integration.rs)
   - [scope_policy_property.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/scope_policy_property.rs)
@@ -271,6 +274,39 @@ Dedicated `tests/*.rs` harness count by crate:
 - ATC logic has a lot of local correctness testing, but its cross-crate orchestration proof is still fragmented.
 - Snapshot/golden/parity coverage is abundant in server/CLI surfaces; later beads should be careful not to mistake output stability for true workflow realism.
 
+## Shell E2E Suite Inventory (`br-aazao.1.2`)
+
+### Entry Surface
+
+- The authoritative runner is `am e2e run --project <repo> [suite...]`, with suite discovery documented in [AGENTS.md](/data/projects/mcp_agent_mail_rust/AGENTS.md) and implemented via the CLI.
+- [scripts/e2e_test.sh](/data/projects/mcp_agent_mail_rust/scripts/e2e_test.sh) is now a compatibility shim. By default it delegates to `am e2e run`; only `AM_E2E_FORCE_LEGACY=1` keeps the old in-script execution path alive.
+- The common shell artifact contract is rooted in [scripts/e2e_lib.sh](/data/projects/mcp_agent_mail_rust/scripts/e2e_lib.sh): `e2e_init_artifacts()` creates `diagnostics/`, `trace/`, `transcript/`, `logs/`, and `screenshots/`, while `e2e_summary()` writes `summary.json`, `meta.json`, `metrics.json`, repro files, forensic indexes, and a validated `bundle.json`.
+
+### Suite Topology
+
+| Lane | Count | Shape | Representative files | Artifact richness |
+|---|---:|---|---|---|
+| Thin wrapper suites | 22 | `tests/e2e/test_*.sh` delegates directly to a sibling `scripts/e2e_*.sh` implementation | [test_http.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_http.sh), [test_cli.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_cli.sh), [test_tui_a11y.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_tui_a11y.sh), [test_share.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_share.sh) | Wrapper itself is thin; all useful logging comes from the delegated script |
+| Direct common-harness suites | 102 | Suite sources [e2e_lib.sh](/data/projects/mcp_agent_mail_rust/scripts/e2e_lib.sh) and owns its assertions inline | [test_stdio.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_stdio.sh), [test_macros.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_macros.sh), [test_workflow_happy_path.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_workflow_happy_path.sh), [test_robot.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_robot.sh) | Rich default artifact set: trace, transcript, diagnostics, repro breadcrumbs, summary/meta/metrics, validated bundle manifest |
+| Search V3 specialized harness suites | 4 | Suite sources [e2e_search_v3_lib.sh](/data/projects/mcp_agent_mail_rust/scripts/e2e_search_v3_lib.sh), which extends the base harness | [test_search_v3_http.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_search_v3_http.sh), [test_search_v3_stdio.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_search_v3_stdio.sh), [test_search_v3_shadow_parity.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_search_v3_shadow_parity.sh) | Richer-than-base: adds per-case request/response capture, ranking diffs, index metadata, and Search V3 run manifests |
+| Optional-harness soak/stress wrapper | 1 | Suite can source `e2e_lib.sh` when present but still carries a standalone fallback | [test_soak_harness.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_soak_harness.sh) | Variable; richer when `e2e_lib.sh` is present, less uniform than the main harness lanes |
+
+### Wrapper vs Direct Notes
+
+- The wrapper lane is concentrated in legacy/compatibility-oriented suites where the canonical logic already lives under `scripts/`: archive, CLI, CI, console, dual-mode, HTTP, share, serve, and the heavier TUI flows.
+- The direct lane is now the dominant path. Most suites under [tests/e2e](/data/projects/mcp_agent_mail_rust/tests/e2e) are not thin wrappers; they are full suites that source the common harness and own their assertions inline.
+- The Search V3 lane is intentionally separate. It still inherits the base harness, but it layers additional ranking/index diagnostics under `test_logs/search_v3/...`, so it should not be treated as just another generic `e2e_lib.sh` consumer.
+- The soak harness is the clearest outlier: it tries to reuse the common harness, but it is still designed to degrade gracefully if that harness is unavailable. That makes it useful operationally, but less uniform as a verification artifact producer.
+
+### Harness Richness and Artifact Gaps
+
+- The common harness is already materially richer than a “stdout + exit code” shell runner. It captures structured traces, environment snapshots with redaction, transcript summaries, repro breadcrumbs, fixture IDs, and a validated `bundle.json`.
+- The biggest artifact-contract gap is that the common harness does **not** emit the per-suite `manifest.json` requested by [br-aazao.8.1](br-aazao.8.1). Current artifacts are rich, but case-level manifest structure is still implicit across `summary.json`, `trace/events.jsonl`, `bundle.json`, and suite-specific sidecars.
+- Thin wrappers inherit richness from their delegated scripts, but the wrapper files themselves add almost no observability beyond the delegation comment and fallback invocation hints. That is acceptable for compatibility, but not a substitute for auditing the underlying script.
+- Several suites explicitly weaken artifact enforcement by tolerating summary failure on some paths with `e2e_summary || true`. Representative examples live in [scripts/e2e_http.sh](/data/projects/mcp_agent_mail_rust/scripts/e2e_http.sh), [scripts/e2e_console.sh](/data/projects/mcp_agent_mail_rust/scripts/e2e_console.sh), [scripts/e2e_share.sh](/data/projects/mcp_agent_mail_rust/scripts/e2e_share.sh), [scripts/e2e_tui_full_traversal.sh](/data/projects/mcp_agent_mail_rust/scripts/e2e_tui_full_traversal.sh), and [tests/e2e/test_http_streamable.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_http_streamable.sh).
+- One suite calls out a known harness weakness directly: [test_check_inbox.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_check_inbox.sh) documents that `e2e_summary` may fail because of a pre-existing bug in `e2e_write_server_log_stats`, then suppresses the failure. That is a real artifact-confidence gap, not just a stylistic nit.
+- Compatibility fallback breadcrumbs remain widespread in suite headers. That is helpful operationally, but it means the docs/comments still normalize the deprecated shim path almost everywhere even though `am e2e run` is the authoritative interface now.
+
 ## Realism Clues Already Visible
 
 - [toon_integration.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-core/tests/toon_integration.rs) explicitly uses deterministic stub encoders.
@@ -278,17 +314,51 @@ Dedicated `tests/*.rs` harness count by crate:
 - The verification epic also calls out stubbed LLM completions, mock release artifacts, and fake repo/owner-state scenarios that still need explicit realism grading.
 - [guard_env_tests.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-guard/tests/guard_env_tests.rs) and similar harnesses correctly use local synthetic fixtures for isolated policy checks; these should be treated as local-fixture confidence, not full real-path workflow proof.
 
+## Realism Grade Rubric (`br-aazao.1.3`)
+
+- `R0 Real-path`: production code paths exercised with the real runtime and durable state machinery. Local tempdirs and ephemeral DB files are fine if the test is still using the real engine rather than a substitute.
+- `R1 Deterministic local fixture`: real code over synthetic local files, fixture payloads, or controlled repo/archive layouts. Good for logic and migration confidence, weaker for external integration claims.
+- `R2 Sanctioned substitute`: an intentional offline stand-in that preserves a meaningful contract boundary, but is still not the real dependency. Good for repeatability, not enough for sign-off on the replaced dependency.
+- `R3 Mock / stub / fake lane`: explicit fake behavior or mocked external surface. Useful for branch coverage and control flow, but should be called out as realism debt when it sits on a critical path.
+- `R4 Thin / fragmented / unowned`: little direct coverage, or coverage only exists indirectly through lower layers. These surfaces need explicit ownership before confidence claims mean much.
+
+## Prioritized Realism And Ownership Ledger (`br-aazao.1.3`)
+
+| Surface | Current grade | Evidence | Priority | Expected owner / next bead |
+|---|---|---|---|---|
+| Real DB lifecycle and query orchestration | `R0 Real-path` | [atc_experience_lifecycle.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/atc_experience_lifecycle.rs) and [query_integration.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-db/tests/query_integration.rs) explicitly exercise real SQLite, real migrations, real queries, and real FTS with no mocks | Critical-path confidence already present; preserve it | `br-aazao.5` should extend this style when closing remaining core/DB/storage/guard gaps |
+| Direct transport/workflow E2E suites using the common harness | `R0 Real-path` with observability debt | Most `tests/e2e/test_*.sh` suites invoke the real binaries and real local HTTP/stdio paths via [e2e_lib.sh](/data/projects/mcp_agent_mail_rust/scripts/e2e_lib.sh), but artifact structure is still uneven and wrapper suites hide delegated logic | High | `br-aazao.8.1`, `br-aazao.9`, `br-aazao.10`, and `br-aazao.11` own the remaining artifact and matrix closure work |
+| TOON encoder integration and golden capture | `R2 Sanctioned substitute` | [toon_integration.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-core/tests/toon_integration.rs) and [test_toon.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_toon.sh) intentionally rely on [toon_stub_encoder.sh](/data/projects/mcp_agent_mail_rust/scripts/toon_stub_encoder.sh) and [toon_stub_encoder_fail.sh](/data/projects/mcp_agent_mail_rust/scripts/toon_stub_encoder_fail.sh) instead of a real encoder install | High: user-visible formatting surface, but current proof is offline-contract only | `br-aazao.3` should replace or explicitly isolate this lane with real-path inputs |
+| Search semantic/embedder engine adapter tests | `R3 Mock / stub / fake lane` | Search-core and DB search modules use `StubEngine`, `StubLifecycle`, and `StubEmbedder` in files like [engine.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-search-core/src/engine.rs), [fs_bridge.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-search-core/src/fs_bridge.rs), [two_tier.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-search-core/src/two_tier.rs), and [updater.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-search-core/src/updater.rs) | High: search quality claims are realism-sensitive | `br-aazao.4` owns stub embedder / stub engine isolation or replacement |
+| LLM-assisted thread summarization E2E | `R3 Mock / stub / fake lane` | [test_llm.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_llm.sh) declares itself “stubbed, offline” and forces `MCP_AGENT_MAIL_LLM_STUB=1` for deterministic output | High: product surface exists, but current evidence is explicitly synthetic | `br-aazao.4` should separate sanctioned offline smoke from any real-model confidence claims |
+| Self-update / installer release-flow E2E | `R3 Mock / stub / fake lane` | [test_self_update.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_self_update.sh) uses mocked release endpoints, local HTTP, and tiny synthetic payloads; related install/fresh-install suites also build fake destinations and fake tool installations | High: install/update failures are operator-facing and recent regressions proved this path is fragile | `br-aazao.3` should own real-path release/install inputs and demote the mock lane to explicit substitute coverage |
+| Share / reconstruct / archive salvage tests with synthetic repo data | `R1 Deterministic local fixture` | Share, deploy, storage, and reconstruct coverage often uses fake encrypted blobs, fake archive trees, or fake lock ownership to drive recovery logic, which is appropriate for fault isolation but not equivalent to full live archive round-trips | Medium | `br-aazao.5` and `br-aazao.7` should preserve the fixture lanes but add more end-to-end archive/recovery proof where the workflow matters |
+| Binary entrypoints, WASM, and agent-detect | `R4 Thin / fragmented / unowned` | [crates/mcp-agent-mail/src/main.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail/src/main.rs), [crates/mcp-agent-mail-wasm/src/lib.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-wasm/src/lib.rs), and [crates/mcp-agent-mail-agent-detect/src/lib.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-agent-detect/src/lib.rs) have notably lighter direct harness coverage than the mainline crates | Medium, but easy to forget | `br-aazao.7` is the obvious home for WASM/agent-detect closure; entrypoint/runtime surface follow-up should also feed `br-aazao.6` where CLI/server behavior is shared |
+
+### Critical-Path Gaps To Treat As Realism Debt, Not “More Tests”
+
+- `TOON`: current coverage proves the envelope contract, not a real encoder deployment. This is a release-confidence gap, not a missing-assertion nit.
+- `Search + embedder + LLM`: these lanes already have good algorithm and contract coverage, but the substitutes are sitting on product-critical ranking and summarization paths. They need explicit realism boundaries.
+- `Installer + self-update`: the mocked release/test-install lanes are useful, but recent live failures show they cannot be mistaken for production-proof coverage.
+- `Shell E2E artifacts`: the harness is rich, but until `manifest.json` and summary-failure enforcement are uniform, downstream forensic automation still has blind spots.
+
+### Secondary Gaps Where Ownership Matters More Than Raw Test Count
+
+- `share`, `wasm`, `agent-detect`, and the binary entrypoint surfaces are the clearest places where coverage depth is still thin enough to warrant dedicated closure beads.
+- Local-fixture tests in guard/storage/share are doing the right job for narrow policy/fault logic. The missing piece is not deleting those tests; it is pairing them with a few higher-level real-path proofs where they currently stand alone.
+
 ## Obvious Follow-On Targets
 
-- `br-aazao.1.2`: full shell/E2E suite inventory, harness richness, and artifact-gap ledger.
-- `br-aazao.1.3`: realism grading and ownership mapping, especially for TOON, search/embedder, LLM, installer, and fake repo lanes.
+- `br-aazao.8.1`: add the missing per-suite `manifest.json` contract so the current rich artifact set becomes uniformly machine-readable at the case level.
 - `br-aazao.5` / `6` / `7`: use the per-crate laggards above to drive concrete closure work instead of broad “add more tests” efforts.
 
-## Completion Bar For `br-aazao.1.1`
+## Completion Bar For `br-aazao.1`
 
-This ledger satisfies the specific `1.1.1` inventory slice if future beads can now point to one file for:
+This ledger satisfies the `br-aazao.1` audit parent if future beads can now point to one file for:
 
 - which crates already have inline test density
 - which crates already have dedicated integration/conformance harnesses
 - where coverage is primarily behavioral vs contract/snapshot
-- which crate clusters are obviously thin enough to deserve follow-on work
+- how the shell E2E surface is actually partitioned between wrappers, direct suites, and specialized harnesses
+- which major surfaces are presently `R0` / `R1` / `R2` / `R3` / `R4`
+- which downstream beads own the most important realism and coverage gaps

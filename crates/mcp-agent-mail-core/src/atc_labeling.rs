@@ -668,7 +668,7 @@ fn validate_evidence_timing(
     None
 }
 
-fn censor_exogenous_recovery(
+const fn censor_exogenous_recovery(
     window: AttributionWindow,
     evidence: &ExecutionEvidence,
 ) -> Option<LabelingResult> {

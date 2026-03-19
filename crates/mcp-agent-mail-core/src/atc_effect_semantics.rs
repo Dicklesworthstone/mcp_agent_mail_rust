@@ -88,7 +88,7 @@ impl EffectRiskClass {
 
     /// Classify an `EffectKind` into a risk class.
     #[must_use]
-    pub fn for_effect_kind(kind: EffectKind) -> Self {
+    pub const fn for_effect_kind(kind: EffectKind) -> Self {
         match kind {
             EffectKind::Advisory | EffectKind::RoutingSuggestion | EffectKind::NoAction => {
                 Self::LowRiskNudge
@@ -217,13 +217,13 @@ pub fn validate_preconditions(family: &str, context: &PreconditionContext) -> Pr
             }
             // Must not be a confirmed dead-agent release.
             total += 1;
-            if !context.release_in_this_tick {
-                passed += 1;
-            } else {
+            if context.release_in_this_tick {
                 failures.push(PreconditionFailure {
                     precondition: "not_confirmed_release".to_string(),
                     reason: "agent already marked for release; advisory is redundant".to_string(),
                 });
+            } else {
+                passed += 1;
             }
             // Liveness evidence must support inactivity suspicion.
             total += 1;
@@ -268,13 +268,13 @@ pub fn validate_preconditions(family: &str, context: &PreconditionContext) -> Pr
                 });
             }
             total += 1;
-            if !context.release_in_this_tick {
-                passed += 1;
-            } else {
+            if context.release_in_this_tick {
                 failures.push(PreconditionFailure {
                     precondition: "not_releasing_this_tick".to_string(),
                     reason: "agent marked for release; probing is redundant".to_string(),
                 });
+            } else {
+                passed += 1;
             }
         }
         "reservation_release" => {
@@ -594,7 +594,7 @@ pub struct EscalationState {
 impl EscalationState {
     /// Create a fresh escalation state for a new agent.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             level: EscalationLevel::None,
             unanswered_at_level: 0,
@@ -605,20 +605,20 @@ impl EscalationState {
     }
 
     /// Record that an effect was emitted at the current level.
-    pub fn record_effect(&mut self, now_micros: i64) {
+    pub const fn record_effect(&mut self, now_micros: i64) {
         self.unanswered_at_level += 1;
         self.last_effect_ts_micros = now_micros;
     }
 
     /// Record that the agent acknowledged/responded (resets escalation).
-    pub fn record_acknowledgment(&mut self) {
+    pub const fn record_acknowledgment(&mut self) {
         self.level = EscalationLevel::None;
         self.unanswered_at_level = 0;
     }
 
     /// Check whether escalation is warranted and advance if so.
     /// Returns the new level if escalation occurred.
-    pub fn maybe_escalate(&mut self, now_micros: i64) -> Option<EscalationLevel> {
+    pub const fn maybe_escalate(&mut self, now_micros: i64) -> Option<EscalationLevel> {
         if self.level.is_terminal() {
             return None;
         }
@@ -638,7 +638,7 @@ impl EscalationState {
 
     /// The recommended effect family for the current escalation level.
     #[must_use]
-    pub fn recommended_family(&self) -> &'static str {
+    pub const fn recommended_family(&self) -> &'static str {
         match self.level {
             EscalationLevel::None | EscalationLevel::Advisory => "liveness_monitoring",
             EscalationLevel::Probe => "liveness_probe",
@@ -834,13 +834,13 @@ pub const NOISE_ESCALATION_COOLDOWN_MICROS: i64 = 600_000_000; // 10 minutes
 
 /// Check whether the per-agent advisory noise budget is exceeded.
 #[must_use]
-pub fn is_advisory_noise_exceeded(advisories_in_last_hour: u32) -> bool {
+pub const fn is_advisory_noise_exceeded(advisories_in_last_hour: u32) -> bool {
     advisories_in_last_hour >= MAX_ADVISORIES_PER_AGENT_PER_HOUR
 }
 
 /// Check whether the global toast rate is exceeded.
 #[must_use]
-pub fn is_toast_rate_exceeded(toasts_in_last_minute: u32) -> bool {
+pub const fn is_toast_rate_exceeded(toasts_in_last_minute: u32) -> bool {
     toasts_in_last_minute >= MAX_TOASTS_PER_MINUTE
 }
 

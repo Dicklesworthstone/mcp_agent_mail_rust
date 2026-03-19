@@ -193,7 +193,7 @@ impl AgentContaminationTracker {
             )]
             let rate = {
                 let elapsed_minutes = elapsed_micros as f64 / 60_000_000.0;
-                (self.event_count_in_window as f64 / elapsed_minutes) as u32
+                (f64::from(self.event_count_in_window) / elapsed_minutes) as u32
             };
             rate
         } else {
@@ -250,7 +250,7 @@ impl AgentContaminationTracker {
     }
 
     /// Reset the tracker (e.g., on regime change).
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.event_count_in_window = 0;
         self.duplicate_traces = 0;
         self.total_signals = 0;

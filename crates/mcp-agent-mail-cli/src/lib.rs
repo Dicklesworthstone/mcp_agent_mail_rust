@@ -4493,6 +4493,32 @@ const SQLITE_ROBOT_READ_COLUMNS: [(&str, &str); 40] = [
     ("agent_links", "updated_ts"),
 ];
 
+const SQLITE_MAIL_INBOX_READ_TABLES: [&str; 4] =
+    ["projects", "agents", "messages", "message_recipients"];
+
+const SQLITE_MAIL_INBOX_READ_COLUMNS: [(&str, &str); 20] = [
+    ("projects", "id"),
+    ("projects", "slug"),
+    ("projects", "human_key"),
+    ("agents", "id"),
+    ("agents", "project_id"),
+    ("agents", "name"),
+    ("messages", "id"),
+    ("messages", "project_id"),
+    ("messages", "sender_id"),
+    ("messages", "thread_id"),
+    ("messages", "subject"),
+    ("messages", "body_md"),
+    ("messages", "importance"),
+    ("messages", "ack_required"),
+    ("messages", "created_ts"),
+    ("message_recipients", "message_id"),
+    ("message_recipients", "agent_id"),
+    ("message_recipients", "kind"),
+    ("message_recipients", "read_ts"),
+    ("message_recipients", "ack_ts"),
+];
+
 const SQLITE_ROBOT_ATTACHMENTS_READ_TABLES: [&str; 3] = ["projects", "agents", "messages"];
 
 const SQLITE_ROBOT_ATTACHMENTS_READ_COLUMNS: [(&str, &str); 11] = [
@@ -4511,6 +4537,14 @@ const SQLITE_ROBOT_ATTACHMENTS_READ_COLUMNS: [(&str, &str); 11] = [
 
 fn sqlite_conn_supports_robot_reads(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
     sqlite_conn_supports_required_reads(conn, &SQLITE_ROBOT_READ_TABLES, &SQLITE_ROBOT_READ_COLUMNS)
+}
+
+fn sqlite_conn_supports_mail_inbox_reads(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
+    sqlite_conn_supports_required_reads(
+        conn,
+        &SQLITE_MAIL_INBOX_READ_TABLES,
+        &SQLITE_MAIL_INBOX_READ_COLUMNS,
+    )
 }
 
 fn sqlite_conn_supports_robot_attachment_reads(
@@ -5518,6 +5552,55 @@ fn open_db_sync_with_database_url_and_storage_root(
 pub(crate) fn open_db_sync() -> CliResult<mcp_agent_mail_db::DbConn> {
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     open_db_sync_with_database_url(&cfg.database_url)
+}
+
+fn open_db_sync_mail_inbox_best_effort_with_database_url(
+    database_url: &str,
+) -> CliResult<mcp_agent_mail_db::DbConn> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        ..Default::default()
+    };
+    let path = cfg
+        .sqlite_path()
+        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+    let path = resolve_sqlite_path_with_absolute_candidate(&path);
+    let (conn, _opened_path) = open_sqlite_with_fallback(&path)?;
+    if sqlite_conn_supports_mail_inbox_reads(&conn)? {
+        return Ok(conn);
+    }
+    Err(CliError::Other(
+        "mail inbox fallback requires the inbox read schema".to_string(),
+    ))
+}
+
+pub(crate) fn open_db_sync_mail_inbox_with_database_url(
+    database_url: &str,
+) -> CliResult<mcp_agent_mail_db::DbConn> {
+    if let Ok(conn) = open_db_sync_mail_inbox_best_effort_with_database_url(database_url) {
+        return Ok(conn);
+    }
+    match open_db_sync_with_database_url(database_url) {
+        Ok(conn) => Ok(conn),
+        Err(error) if is_resource_busy_cli_error(&error) => {
+            match open_db_sync_mail_inbox_best_effort_with_database_url(database_url) {
+                Ok(conn) => {
+                    tracing::warn!(
+                        database_url,
+                        "mail inbox falling back to best-effort sqlite read after busy init/recovery path"
+                    );
+                    Ok(conn)
+                }
+                Err(_) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn open_db_sync_mail_inbox() -> CliResult<mcp_agent_mail_db::DbConn> {
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    open_db_sync_mail_inbox_with_database_url(&cfg.database_url)
 }
 
 fn open_db_sync_robot_best_effort_with_database_url(
@@ -15394,61 +15477,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                                 output::emit_empty(fmt, "No messages.");
                                 return Ok(());
                             }
-
-                            output::emit_output(&data, fmt, || {
-                                let mut table = output::CliTable::new(vec![
-                                    "ID",
-                                    "FROM",
-                                    "SUBJECT",
-                                    "IMPORTANCE",
-                                    "TIME",
-                                ]);
-                                for row in &data {
-                                    table.add_row(vec![
-                                        row.get("id")
-                                            .and_then(|v| v.as_i64())
-                                            .unwrap_or(0)
-                                            .to_string(),
-                                        row.get("from")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or_default()
-                                            .to_string(),
-                                        truncate_str(
-                                            row.get("subject")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or_default(),
-                                            50,
-                                        ),
-                                        row.get("importance")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or_default()
-                                            .to_string(),
-                                        row.get("created_ts")
-                                            .and_then(|v| v.as_str())
-                                            .map(format_iso_timestamp_short)
-                                            .unwrap_or_default(),
-                                    ]);
-                                }
-                                table.render();
-
-                                if include_bodies {
-                                    for row in &data {
-                                        ftui_runtime::ftui_println!(
-                                            "\n--- #{} {} ---",
-                                            row.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
-                                            row.get("subject")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or_default()
-                                        );
-                                        ftui_runtime::ftui_println!(
-                                            "{}",
-                                            row.get("body_md")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or_default()
-                                        );
-                                    }
-                                }
-                            });
+                            render_mail_inbox_output(&data, fmt, include_bodies);
                             return Ok(());
                         }
                         Err(err) => {
@@ -15468,12 +15497,6 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 }
             }
 
-            let ctx = context::AsyncCliContext::open()?;
-            let cx = asupersync::Cx::for_request();
-            let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
-            let pid = proj.id.unwrap_or(0);
-            let agent = resolve_agent_async(&cx, &ctx.pool, pid, &agent_name).await?;
-
             let since_ts = match since.as_deref() {
                 None => None,
                 Some(s) => Some(mcp_agent_mail_db::iso_to_micros(s).ok_or_else(|| {
@@ -15481,20 +15504,55 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 })?),
             };
 
-            let rows = outcome_to_result(
-                mcp_agent_mail_db::queries::fetch_inbox(
-                    &cx,
-                    &ctx.pool,
-                    pid,
-                    agent.id.unwrap_or(0),
-                    urgent_only,
-                    since_ts,
-                    limit.max(0) as usize,
+            let local_async_data = async {
+                let ctx = context::AsyncCliContext::open()?;
+                let cx = asupersync::Cx::for_request();
+                let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
+                let pid = proj.id.unwrap_or(0);
+                let agent = resolve_agent_async(&cx, &ctx.pool, pid, &agent_name).await?;
+                let rows = outcome_to_result(
+                    mcp_agent_mail_db::queries::fetch_inbox(
+                        &cx,
+                        &ctx.pool,
+                        pid,
+                        agent.id.unwrap_or(0),
+                        urgent_only,
+                        since_ts,
+                        limit.max(0) as usize,
+                    )
+                    .await,
+                )?;
+                Ok::<Vec<serde_json::Value>, CliError>(
+                    rows
+                        .iter()
+                        .map(|row| inbox_row_to_json(row, include_bodies))
+                        .collect::<Vec<_>>(),
                 )
-                .await,
-            )?;
+            };
 
-            if rows.is_empty() {
+            let data = match local_async_data.await {
+                Ok(data) => data,
+                Err(error) if is_resource_busy_cli_error(&error) => {
+                    let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
+                    tracing::warn!(
+                        project_key = %project_key,
+                        agent_name = %agent_name,
+                        "mail inbox falling back to direct sqlite read after busy async pool path"
+                    );
+                    fetch_mail_inbox_direct_with_database_url(
+                        &database_url,
+                        &project_key,
+                        &agent_name,
+                        urgent_only,
+                        since_ts,
+                        limit.max(0),
+                        include_bodies,
+                    )?
+                }
+                Err(error) => return Err(error),
+            };
+
+            if data.is_empty() {
                 if let Some(message) = server_error {
                     tracing::debug!(message = %message, "mail inbox fell back to local database after server lookup failed");
                 }
@@ -15502,37 +15560,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 return Ok(());
             }
 
-            // Build serializable data for JSON/TOON
-            let data: Vec<serde_json::Value> = rows
-                .iter()
-                .map(|r| inbox_row_to_json(r, include_bodies))
-                .collect();
-
-            output::emit_output(&data, fmt, || {
-                let mut table =
-                    output::CliTable::new(vec!["ID", "FROM", "SUBJECT", "IMPORTANCE", "TIME"]);
-                for r in &rows {
-                    table.add_row(vec![
-                        r.message.id.unwrap_or(0).to_string(),
-                        r.sender_name.clone(),
-                        truncate_str(&r.message.subject, 50),
-                        r.message.importance.clone(),
-                        context::format_ts_short(r.message.created_ts),
-                    ]);
-                }
-                table.render();
-
-                if include_bodies {
-                    for r in &rows {
-                        ftui_runtime::ftui_println!(
-                            "\n--- #{} {} ---",
-                            r.message.id.unwrap_or(0),
-                            r.message.subject
-                        );
-                        ftui_runtime::ftui_println!("{}", r.message.body_md);
-                    }
-                }
-            });
+            render_mail_inbox_output(&data, fmt, include_bodies);
             Ok(())
         }
 
@@ -17613,6 +17641,59 @@ fn build_launchd_args_xml(
         .join("\n")
 }
 
+/// Resolve the absolute database path from a database_url string.
+///
+/// Handles the `sqlite+aiosqlite:///./path` and `sqlite:///path` prefixes.
+/// The Python `aiosqlite` convention uses `sqlite+aiosqlite:///./path` for
+/// relative paths and `sqlite+aiosqlite:////absolute/path` for absolute paths
+/// (four slashes). We normalize both to `sqlite:///absolute/path`.
+fn resolve_absolute_database_url(database_url: &str, cwd: &Path) -> String {
+    // Strip scheme prefix including the conventional third slash.
+    let path_part = database_url
+        .strip_prefix("sqlite+aiosqlite:///")
+        .or_else(|| database_url.strip_prefix("sqlite:///"))
+        .unwrap_or(database_url);
+
+    let db_path = Path::new(path_part);
+    let abs_path = if db_path.is_absolute() {
+        db_path.to_path_buf()
+    } else {
+        cwd.join(db_path)
+    };
+
+    // Reconstruct: sqlite:// + absolute_path (which starts with `/`, giving `sqlite:///...`)
+    format!("sqlite://{}", abs_path.display())
+}
+
+fn build_systemd_unit_content(
+    exec_args: &str,
+    working_dir: &Path,
+    database_url: &str,
+    storage_root: &Path,
+) -> String {
+    format!(
+        r#"[Unit]
+Description=MCP Agent Mail Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={exec_args}
+WorkingDirectory={working_dir}
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+Environment=DATABASE_URL={database_url}
+Environment=STORAGE_ROOT={storage_root}
+
+[Install]
+WantedBy=default.target
+"#,
+        working_dir = working_dir.display(),
+        storage_root = storage_root.display(),
+    )
+}
+
 fn service_install_systemd(
     am_bin: &Path,
     host: Option<String>,
@@ -17630,22 +17711,17 @@ fn service_install_systemd(
     validate_service_bind_addr(listen_host, listen_port)?;
     let exec_args = build_systemd_exec_start(am_bin, listen_host, listen_port, no_auth);
 
-    let unit_content = format!(
-        r#"[Unit]
-Description=MCP Agent Mail Server
-After=network.target
+    let config = mcp_agent_mail_core::Config::from_env();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(&home));
+    let abs_db_url = resolve_absolute_database_url(&config.database_url, &cwd);
+    let abs_storage_root = if config.storage_root.is_absolute() {
+        config.storage_root.clone()
+    } else {
+        cwd.join(&config.storage_root)
+    };
 
-[Service]
-Type=simple
-ExecStart={exec_args}
-Restart=on-failure
-RestartSec=5
-Environment=RUST_LOG=info
-
-[Install]
-WantedBy=default.target
-"#,
-    );
+    let unit_content =
+        build_systemd_unit_content(&exec_args, &cwd, &abs_db_url, &abs_storage_root);
 
     std::fs::write(&unit_path, &unit_content)?;
     ftui_runtime::ftui_println!("Wrote {}", unit_path.display());
@@ -17663,6 +17739,57 @@ WantedBy=default.target
     );
     ftui_runtime::ftui_println!("Listening on http://{}:{}", listen_host, listen_port);
     Ok(())
+}
+
+fn build_launchd_plist_content(
+    args_xml: &str,
+    log_dir: &Path,
+    working_dir: &Path,
+    database_url: &str,
+    storage_root: &Path,
+) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LAUNCHD_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+{args_xml}
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{working_dir}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{log_dir}/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>{log_dir}/stderr.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+        <key>DATABASE_URL</key>
+        <string>{database_url}</string>
+        <key>STORAGE_ROOT</key>
+        <string>{storage_root}</string>
+    </dict>
+</dict>
+</plist>
+"#,
+        log_dir = xml_escape_text(log_dir.display().to_string().as_str()),
+        working_dir = xml_escape_text(working_dir.display().to_string().as_str()),
+        database_url = xml_escape_text(database_url),
+        storage_root = xml_escape_text(storage_root.display().to_string().as_str()),
+    )
 }
 
 fn service_install_launchd(
@@ -17686,38 +17813,21 @@ fn service_install_launchd(
     let uid = current_uid()?;
     let args_xml = build_launchd_args_xml(am_bin, listen_host, listen_port, no_auth);
 
-    let plist_content = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{LAUNCHD_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-{args_xml}
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
-    <key>StandardOutPath</key>
-    <string>{log_dir}/stdout.log</string>
-    <key>StandardErrorPath</key>
-    <string>{log_dir}/stderr.log</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>RUST_LOG</key>
-        <string>info</string>
-    </dict>
-</dict>
-</plist>
-"#,
-        log_dir = xml_escape_text(log_dir.display().to_string().as_str()),
+    let config = mcp_agent_mail_core::Config::from_env();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(&home));
+    let abs_db_url = resolve_absolute_database_url(&config.database_url, &cwd);
+    let abs_storage_root = if config.storage_root.is_absolute() {
+        config.storage_root.clone()
+    } else {
+        cwd.join(&config.storage_root)
+    };
+
+    let plist_content = build_launchd_plist_content(
+        &args_xml,
+        &log_dir,
+        &cwd,
+        &abs_db_url,
+        &abs_storage_root,
     );
 
     // Stop existing job first (ignore errors — may not be loaded).
@@ -18184,6 +18294,91 @@ mod tests {
         assert_eq!(
             xml_escape_text("<tag attr=\"value\">Tom & 'Jerry'</tag>"),
             "&lt;tag attr=&quot;value&quot;&gt;Tom &amp; &apos;Jerry&apos;&lt;/tag&gt;"
+        );
+    }
+
+    #[test]
+    fn build_systemd_unit_content_includes_absolute_paths() {
+        let unit = build_systemd_unit_content(
+            "/usr/local/bin/am serve-http --host 127.0.0.1 --port 8765 --no-tui",
+            Path::new("/home/user/projects/myapp"),
+            "sqlite:///home/user/projects/myapp/storage.sqlite3",
+            Path::new("/home/user/.local/share/mcp-agent-mail/git_mailbox_repo"),
+        );
+        assert!(
+            unit.contains("WorkingDirectory=/home/user/projects/myapp"),
+            "unit must contain absolute WorkingDirectory"
+        );
+        assert!(
+            unit.contains("Environment=DATABASE_URL=sqlite:///home/user/projects/myapp/storage.sqlite3"),
+            "unit must contain absolute DATABASE_URL"
+        );
+        assert!(
+            unit.contains("Environment=STORAGE_ROOT=/home/user/.local/share/mcp-agent-mail/git_mailbox_repo"),
+            "unit must contain absolute STORAGE_ROOT"
+        );
+    }
+
+    #[test]
+    fn resolve_absolute_database_url_makes_relative_path_absolute() {
+        let cwd = Path::new("/home/user/projects/myapp");
+        let result = resolve_absolute_database_url("sqlite+aiosqlite:///./storage.sqlite3", cwd);
+        // sqlite:// + /home/user/projects/myapp/./storage.sqlite3
+        assert_eq!(
+            result,
+            "sqlite:///home/user/projects/myapp/./storage.sqlite3"
+        );
+        // After `sqlite://`, the path portion must be absolute
+        let path_part = result.strip_prefix("sqlite://").unwrap();
+        assert!(
+            Path::new(path_part).is_absolute(),
+            "database path must be absolute: {path_part}"
+        );
+    }
+
+    #[test]
+    fn resolve_absolute_database_url_preserves_already_absolute() {
+        // Four slashes in the URI convention: sqlite:// + /data/agent_mail.db
+        // After stripping sqlite:///, path_part is "data/agent_mail.db" which is
+        // relative, so it gets joined against cwd. To provide a truly absolute path
+        // use the four-slash form: sqlite:////data/agent_mail.db
+        let cwd = Path::new("/tmp");
+        let result = resolve_absolute_database_url("sqlite:////data/agent_mail.db", cwd);
+        assert_eq!(result, "sqlite:///data/agent_mail.db");
+    }
+
+    #[test]
+    fn build_launchd_plist_includes_absolute_paths() {
+        let plist = build_launchd_plist_content(
+            "        <string>/usr/local/bin/am</string>",
+            Path::new("/Users/dev/Library/Logs/agent-mail"),
+            Path::new("/Users/dev/projects/myapp"),
+            "sqlite:///Users/dev/projects/myapp/storage.sqlite3",
+            Path::new("/Users/dev/.local/share/mcp-agent-mail/git_mailbox_repo"),
+        );
+        assert!(
+            plist.contains("<key>WorkingDirectory</key>"),
+            "plist must contain WorkingDirectory key"
+        );
+        assert!(
+            plist.contains("<string>/Users/dev/projects/myapp</string>"),
+            "plist must contain absolute working directory value"
+        );
+        assert!(
+            plist.contains("<key>DATABASE_URL</key>"),
+            "plist must contain DATABASE_URL key"
+        );
+        assert!(
+            plist.contains("<string>sqlite:///Users/dev/projects/myapp/storage.sqlite3</string>"),
+            "plist must contain absolute DATABASE_URL value"
+        );
+        assert!(
+            plist.contains("<key>STORAGE_ROOT</key>"),
+            "plist must contain STORAGE_ROOT key"
+        );
+        assert!(
+            plist.contains("<string>/Users/dev/.local/share/mcp-agent-mail/git_mailbox_repo</string>"),
+            "plist must contain absolute STORAGE_ROOT value"
         );
     }
 
@@ -30578,6 +30773,44 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn sqlite_conn_supports_mail_inbox_reads_accepts_minimal_inbox_schema() {
+        let conn = mcp_agent_mail_db::DbConn::open_memory().expect("open memory db");
+        for sql in [
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts DATETIME NOT NULL)",
+            "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
+        ] {
+            conn.execute_raw(sql)
+                .expect("create mail inbox readable table");
+        }
+
+        assert!(
+            sqlite_conn_supports_mail_inbox_reads(&conn).expect("mail inbox schema probe"),
+            "minimal inbox query schema should be sufficient for best-effort inbox reads"
+        );
+    }
+
+    #[test]
+    fn sqlite_conn_supports_mail_inbox_reads_rejects_missing_required_columns() {
+        let conn = mcp_agent_mail_db::DbConn::open_memory().expect("open memory db");
+        for sql in [
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, subject TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts DATETIME NOT NULL)",
+            "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, read_ts DATETIME, ack_ts DATETIME)",
+        ] {
+            conn.execute_raw(sql)
+                .expect("create partial mail inbox readable table");
+        }
+
+        assert!(
+            !sqlite_conn_supports_mail_inbox_reads(&conn).expect("mail inbox schema probe"),
+            "missing thread/body/kind columns must not be blessed for inbox fallback"
+        );
+    }
+
+    #[test]
     fn open_db_sync_with_database_url_skips_canonical_init_for_initialized_db_under_reserved_lock()
     {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -30639,6 +30872,93 @@ startup_timeout_sec = 42
             }
         };
         assert!(table_count > 0, "sqlite_master should remain readable");
+
+        release_tx.send(()).expect("release lock thread");
+        open_thread.join().expect("join open thread");
+        lock_thread.join().expect("join lock thread");
+    }
+
+    #[test]
+    fn open_db_sync_mail_inbox_with_database_url_falls_back_under_reserved_lock_for_mail_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("mail-inbox-fallback.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let db_path_str = db_path.to_string_lossy().into_owned();
+
+        let seed_conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open seed db");
+        for stmt in [
+            "PRAGMA foreign_keys = OFF",
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, thread_id TEXT, subject TEXT NOT NULL, body_md TEXT NOT NULL, importance TEXT NOT NULL, ack_required INTEGER NOT NULL, created_ts DATETIME NOT NULL)",
+            "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts DATETIME, ack_ts DATETIME, PRIMARY KEY (message_id, agent_id, kind))",
+            "INSERT INTO projects (id, slug, human_key) VALUES (1, 'mail-lock', '/tmp/mail-lock')",
+            "INSERT INTO agents (id, project_id, name) VALUES (1, 1, 'Sender')",
+            "INSERT INTO agents (id, project_id, name) VALUES (2, 1, 'Receiver')",
+            "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts) VALUES (1, 1, 1, 'br-1', 'subject', 'body', 'normal', 0, '2026-03-12 11:00:00')",
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (1, 2, 'to', NULL, NULL)",
+        ] {
+            seed_conn.execute_raw(stmt).expect("seed statement");
+        }
+        drop(seed_conn);
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let lock_path = db_path_str.clone();
+        let lock_thread = std::thread::spawn(move || {
+            let lock_conn =
+                sqlmodel_sqlite::SqliteConnection::open_file(&lock_path).expect("open lock db");
+            lock_conn
+                .execute_raw("PRAGMA busy_timeout = 1;")
+                .expect("set lock busy_timeout");
+            lock_conn
+                .execute_raw("BEGIN IMMEDIATE")
+                .expect("hold reserved sqlite lock");
+            ready_tx.send(()).expect("signal lock ready");
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("wait for release");
+            lock_conn
+                .execute_raw("ROLLBACK")
+                .expect("release sqlite lock");
+        });
+
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("wait for lock thread");
+
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let open_url = db_url.clone();
+        let open_thread = std::thread::spawn(move || {
+            let result = open_db_sync_mail_inbox_with_database_url(&open_url).and_then(|conn| {
+                conn.query_sync("SELECT COUNT(*) AS c FROM message_recipients", &[])
+                    .map_err(|e| {
+                        CliError::Other(format!("message_recipients count failed: {e}"))
+                    })
+                    .map(|rows| {
+                        rows.first()
+                            .and_then(|row| row.get_named::<i64>("c").ok())
+                            .unwrap_or(0)
+                    })
+            });
+            result_tx.send(result).expect("send open result");
+        });
+
+        let recipient_count = match result_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(result) => result.expect("mail inbox helper should fall back to read-only open"),
+            Err(err) => {
+                let _ = release_tx.send(());
+                open_thread.join().expect("join open thread after timeout");
+                lock_thread.join().expect("join lock thread after timeout");
+                panic!(
+                    "mail inbox open should not wait for canonical init under reserved lock: {err}"
+                );
+            }
+        };
+        assert_eq!(
+            recipient_count, 1,
+            "mail inbox fallback should preserve readable inbox data"
+        );
 
         release_tx.send(()).expect("release lock thread");
         open_thread.join().expect("join open thread");
@@ -35231,7 +35551,7 @@ pub fn check_inbox_direct(config: &CheckInboxDirectConfig) -> CliResult<CheckInb
         ));
     }
 
-    let conn = open_db_sync()?;
+    let conn = open_db_sync_mail_inbox()?;
 
     // Resolve project ID from project_key (try slug first, then human_key)
     let project_rows = conn
@@ -35313,6 +35633,126 @@ pub fn check_inbox_direct(config: &CheckInboxDirectConfig) -> CliResult<CheckInb
         urgent_or_high_count,
         messages,
     })
+}
+
+fn fetch_mail_inbox_direct_with_database_url(
+    database_url: &str,
+    project_key: &str,
+    agent_name: &str,
+    urgent_only: bool,
+    since_ts: Option<i64>,
+    limit: i64,
+    include_bodies: bool,
+) -> CliResult<Vec<serde_json::Value>> {
+    use sqlmodel_core::Value;
+
+    let conn = open_db_sync_mail_inbox_with_database_url(database_url)?;
+    let project = crate::context::resolve_project(&conn, project_key)?;
+    let agent = crate::context::resolve_agent(&conn, project.id, agent_name)?;
+
+    let mut sql = String::from(
+        "SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, \
+                m.created_ts, m.thread_id, mr.kind, sender.name AS sender_name \
+         FROM message_recipients mr \
+         JOIN messages m ON m.id = mr.message_id \
+         JOIN agents sender ON sender.id = m.sender_id \
+         WHERE mr.agent_id = ? AND m.project_id = ?",
+    );
+    let mut params = vec![Value::BigInt(agent.id), Value::BigInt(project.id)];
+
+    if urgent_only {
+        sql.push_str(" AND m.importance IN ('high', 'urgent')");
+    }
+    if let Some(ts) = since_ts {
+        sql.push_str(" AND m.created_ts > ?");
+        params.push(Value::BigInt(ts));
+    }
+    sql.push_str(" ORDER BY m.created_ts DESC LIMIT ?");
+    params.push(Value::BigInt(limit.max(0)));
+
+    let rows = conn
+        .query_sync(&sql, &params)
+        .map_err(|e| CliError::Other(format!("inbox query failed: {e}")))?;
+
+    let mut data = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let mut value = serde_json::json!({
+            "id": row.get_named::<i64>("id").unwrap_or(0),
+            "subject": row.get_named::<String>("subject").unwrap_or_default(),
+            "from": row.get_named::<String>("sender_name").unwrap_or_default(),
+            "importance": row.get_named::<String>("importance").unwrap_or_default(),
+            "ack_required": row.get_named::<i64>("ack_required").unwrap_or(0) != 0,
+            "created_ts": mcp_agent_mail_db::micros_to_iso(
+                row.get_named::<i64>("created_ts").unwrap_or(0),
+            ),
+            "kind": row.get_named::<String>("kind").unwrap_or_default(),
+            "thread_id": row.get_named::<Option<String>>("thread_id").unwrap_or(None),
+        });
+        if include_bodies {
+            value.as_object_mut().unwrap().insert(
+                "body_md".to_string(),
+                serde_json::Value::String(row.get_named("body_md").unwrap_or_default()),
+            );
+        }
+        data.push(value);
+    }
+
+    Ok(data)
+}
+
+fn render_mail_inbox_output(
+    data: &[serde_json::Value],
+    fmt: output::CliOutputFormat,
+    include_bodies: bool,
+) {
+    output::emit_output(&data, fmt, || {
+        let mut table = output::CliTable::new(vec!["ID", "FROM", "SUBJECT", "IMPORTANCE", "TIME"]);
+        for row in data {
+            table.add_row(vec![
+                row.get("id")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+                    .to_string(),
+                row.get("from")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                truncate_str(
+                    row.get("subject")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default(),
+                    50,
+                ),
+                row.get("importance")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                row.get("created_ts")
+                    .and_then(|v| v.as_str())
+                    .map(format_iso_timestamp_short)
+                    .unwrap_or_default(),
+            ]);
+        }
+        table.render();
+
+        if include_bodies {
+            for row in data {
+                ftui_runtime::ftui_println!(
+                    "\n--- #{} {} ---",
+                    row.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
+                    row.get("subject")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                );
+                ftui_runtime::ftui_println!(
+                    "{}",
+                    row.get("body_md")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                );
+            }
+        }
+    });
 }
 
 /// Format microsecond timestamp as ISO-8601 string.
@@ -35740,12 +36180,8 @@ async fn get_project_record(
     }
     let slug = mcp_agent_mail_core::compute_project_slug(&canonical);
 
-    let try_human_key = |key: &str| async move {
-        mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, key).await
-    };
-
     if path.is_absolute() {
-        let out = try_human_key(&canonical).await;
+        let out = mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, &canonical).await;
         match out {
             asupersync::Outcome::Ok(row) => return Ok(row),
             asupersync::Outcome::Err(_) => {}
@@ -35758,7 +36194,7 @@ async fn get_project_record(
         }
 
         if canonical != raw {
-            let out = try_human_key(raw).await;
+            let out = mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, raw).await;
             match out {
                 asupersync::Outcome::Ok(row) => return Ok(row),
                 asupersync::Outcome::Err(_) => {}
@@ -35794,7 +36230,7 @@ async fn get_project_record(
     }
 
     if !path.is_absolute() {
-        let out = try_human_key(&canonical).await;
+        let out = mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, &canonical).await;
         match out {
             asupersync::Outcome::Ok(row) => return Ok(row),
             asupersync::Outcome::Err(_) => {}
@@ -35807,7 +36243,7 @@ async fn get_project_record(
         }
 
         if canonical != raw {
-            let out = try_human_key(raw).await;
+            let out = mcp_agent_mail_db::queries::get_project_by_human_key(cx, pool, raw).await;
             match out {
                 asupersync::Outcome::Ok(row) => return Ok(row),
                 asupersync::Outcome::Err(_) => {}

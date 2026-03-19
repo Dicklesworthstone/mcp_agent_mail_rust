@@ -469,6 +469,7 @@ fn count_old_messages(agents_dir: &Path, max_age_days: u64) -> usize {
 }
 
 /// Count files older than cutoff in a directory tree.
+#[allow(dead_code)]
 fn count_old_files_recursive(dir: &Path, cutoff: std::time::SystemTime) -> u64 {
     if !is_real_directory(dir) {
         return 0;

@@ -199,6 +199,13 @@ pub const TOOL_META_MAP: &[(&str, ToolMeta)] = &[
             complexity: "low",
         },
     ),
+    (
+        "list_agents",
+        ToolMeta {
+            capabilities: &["audit", "identity"],
+            complexity: "medium",
+        },
+    ),
     // Messaging
     (
         "send_message",

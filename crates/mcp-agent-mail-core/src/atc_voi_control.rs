@@ -232,7 +232,7 @@ impl DebtLedger {
 
     /// Total active (unresolved) debts.
     #[must_use]
-    pub fn active_count(&self) -> usize {
+    pub const fn active_count(&self) -> usize {
         self.entries.len()
     }
 
@@ -347,8 +347,8 @@ pub fn score_voi(input: &VoIInput) -> VoIScore {
     let staleness_factor = (input.staleness_micros.max(0) as f64 / 600_000_000.0).min(2.0); // clamp [0, 2×]
     let raw_voi = input.estimated_info_gain
         * input.debt_severity
-        * (1.0 + 0.3 * input.posterior_entropy)
-        * (1.0 + 0.2 * staleness_factor);
+        * 0.3f64.mul_add(input.posterior_entropy, 1.0)
+        * 0.2f64.mul_add(staleness_factor, 1.0);
 
     // Cost penalties.
     let noise_penalty = input.noise_cost * 2.0; // noise is weighted 2× (user trust is precious)
@@ -511,10 +511,10 @@ pub fn check_eligibility(ctx: &EligibilityContext) -> EligibilityResult {
     gates.push(EligibilityGate {
         name: "safe_mode".to_string(),
         passed: !ctx.safe_mode_active,
-        description: if !ctx.safe_mode_active {
-            "safe mode inactive".to_string()
-        } else {
+        description: if ctx.safe_mode_active {
             "experiments are blocked during safe mode".to_string()
+        } else {
+            "safe mode inactive".to_string()
         },
     });
     if ctx.safe_mode_active && first_refusal.is_none() {
@@ -540,10 +540,10 @@ pub fn check_eligibility(ctx: &EligibilityContext) -> EligibilityResult {
     gates.push(EligibilityGate {
         name: "uncertainty_limited".to_string(),
         passed: !ctx.decision_sufficient,
-        description: if !ctx.decision_sufficient {
-            "stratum is uncertainty-limited, experiments may help".to_string()
-        } else {
+        description: if ctx.decision_sufficient {
             "stratum is already decision-sufficient, no experiment needed".to_string()
+        } else {
+            "stratum is uncertainty-limited, experiments may help".to_string()
         },
     });
     if ctx.decision_sufficient && first_refusal.is_none() {
@@ -626,19 +626,19 @@ pub struct ExperimentBudget {
 
 impl ExperimentBudget {
     /// Whether the budget has capacity for another experiment.
-    #[must_use]
-    pub fn has_capacity(&self) -> bool {
+    #[must_use] 
+    pub const fn has_capacity(&self) -> bool {
         self.used_experiments < self.max_experiments
     }
 
     /// Whether the window has expired.
-    #[must_use]
-    pub fn is_expired(&self, now_micros: i64) -> bool {
+    #[must_use] 
+    pub const fn is_expired(&self, now_micros: i64) -> bool {
         now_micros.saturating_sub(self.window_start_micros) > self.window_duration_micros
     }
 
     /// Consume one experiment from the budget. Returns false if exhausted.
-    pub fn consume(&mut self) -> bool {
+    pub const fn consume(&mut self) -> bool {
         if self.has_capacity() {
             self.used_experiments += 1;
             true
@@ -648,7 +648,7 @@ impl ExperimentBudget {
     }
 
     /// Reset the budget for a new window.
-    pub fn reset(&mut self, now_micros: i64) {
+    pub const fn reset(&mut self, now_micros: i64) {
         self.used_experiments = 0;
         self.window_start_micros = now_micros;
     }
@@ -705,7 +705,7 @@ impl ExperimentBudgetTable {
     }
 
     /// Whether the global experiment fraction is within limits.
-    #[must_use]
+    #[must_use] 
     pub fn global_fraction_ok(&self) -> bool {
         if self.global_action_count == 0 {
             return true;
@@ -715,13 +715,25 @@ impl ExperimentBudgetTable {
     }
 
     /// Record an experiment being executed.
-    pub fn record_experiment(&mut self) {
+    pub const fn record_experiment(&mut self) {
         self.global_experiment_count += 1;
     }
 
     /// Record any action being executed (for fraction tracking).
-    pub fn record_action(&mut self) {
+    pub const fn record_action(&mut self) {
         self.global_action_count += 1;
+    }
+
+    /// Global experiment rate (as a fraction).
+    #[must_use] 
+    pub fn global_experiment_rate(&self) -> f64 {
+        if self.global_action_count == 0 {
+            return 0.0;
+        }
+        
+        // Use lossy cast as acceptable for monitoring rates
+        #[allow(clippy::cast_precision_loss)]
+        (self.global_experiment_count as f64 / self.global_action_count as f64)
     }
 }
 

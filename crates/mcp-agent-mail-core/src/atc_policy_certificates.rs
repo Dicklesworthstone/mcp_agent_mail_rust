@@ -570,7 +570,7 @@ pub struct ConfidenceSequence {
 impl ConfidenceSequence {
     /// Create a new confidence sequence with default parameters.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             log_e_value: 0.0,
             lambda: 0.5, // conservative capital allocation
@@ -586,7 +586,7 @@ impl ConfidenceSequence {
     /// Alpha is clamped to `[1e-15, 1.0]` to prevent division-by-zero
     /// in `threshold()` and infinite propagation in downstream logic.
     #[must_use]
-    pub fn with_alpha(alpha: f64) -> Self {
+    pub const fn with_alpha(alpha: f64) -> Self {
         Self { alpha: alpha.clamp(1e-15, 1.0), ..Self::new() }
     }
 
@@ -599,7 +599,7 @@ impl ConfidenceSequence {
         // requires λ_i to be F_{i-1}-measurable — it must only depend on
         // past data, not the current observation. So we apply the current
         // lambda first, then adapt it for the NEXT observation.
-        let factor = (1.0 + self.lambda * advantage).max(1e-6);
+        let factor = self.lambda.mul_add(advantage, 1.0).max(1e-6);
         self.log_e_value += factor.ln();
 
         self.n_observations += 1;
@@ -707,8 +707,7 @@ impl EvidenceTransferability {
         match self {
             Self::Transferable => 1.0,
             Self::DiscountedTransfer => 0.5,
-            Self::RegimeSensitive => 0.0,
-            Self::NonTransferable => 0.0,
+            Self::RegimeSensitive | Self::NonTransferable => 0.0,
         }
     }
 }
@@ -1013,14 +1012,13 @@ pub fn evaluate_certificate(input: CertificateInput) -> PolicyPromotionCertifica
     }
 
     // ── Gate 4: Evidence domination ──
-    if input.evidence_quality.max_agent_influence_fraction > MAX_SINGLE_AGENT_EVIDENCE_FRACTION {
-        if let Some(agent) = &input.evidence_quality.most_influential_agent {
-            block_reasons.push(CertificationBlockReason::EvidenceDomination {
-                agent: agent.clone(),
-                fraction: input.evidence_quality.max_agent_influence_fraction,
-                max_allowed: MAX_SINGLE_AGENT_EVIDENCE_FRACTION,
-            });
-        }
+    if input.evidence_quality.max_agent_influence_fraction > MAX_SINGLE_AGENT_EVIDENCE_FRACTION
+        && let Some(agent) = &input.evidence_quality.most_influential_agent {
+        block_reasons.push(CertificationBlockReason::EvidenceDomination {
+            agent: agent.clone(),
+            fraction: input.evidence_quality.max_agent_influence_fraction,
+            max_allowed: MAX_SINGLE_AGENT_EVIDENCE_FRACTION,
+        });
     }
 
     // ── Gate 5: Attribution quality ──
@@ -1112,15 +1110,15 @@ pub fn evaluate_certificate(input: CertificateInput) -> PolicyPromotionCertifica
     }
 
     // ── Gate 13: Safety regression (from DR result) ──
-    if let Some(ref dr) = dr_result {
-        if dr.dr_advantage < 0.0 {
-            block_reasons.push(CertificationBlockReason::SafetyRegression {
-                metric: "doubly_robust_advantage".to_string(),
-                incumbent_value: dr.incumbent_mean_loss,
-                candidate_value: dr.candidate_dr_loss,
-                max_regression: 0.0,
-            });
-        }
+    if let Some(ref dr) = dr_result
+        && dr.dr_advantage < 0.0
+    {
+        block_reasons.push(CertificationBlockReason::SafetyRegression {
+            metric: "doubly_robust_advantage".to_string(),
+            incumbent_value: dr.incumbent_mean_loss,
+            candidate_value: dr.candidate_dr_loss,
+            max_regression: 0.0,
+        });
     }
 
     // ── Verdict ──
@@ -1168,23 +1166,23 @@ impl PolicyPromotionCertificate {
 
     /// Whether the certificate has expired (by time or regime change).
     #[must_use]
-    pub fn is_expired(&self, now_micros: i64, current_regime_id: RegimeId) -> bool {
+    pub const fn is_expired(&self, now_micros: i64, current_regime_id: RegimeId) -> bool {
         // Expired if regime changed.
         if current_regime_id != self.regime.regime_id {
             return true;
         }
         // Expired if past validity window.
-        if let Some(until) = self.valid_until_ts_micros {
-            if now_micros > until {
-                return true;
-            }
+        if let Some(until) = self.valid_until_ts_micros
+            && now_micros > until
+        {
+            return true;
         }
         false
     }
 
-    /// Number of block reasons (0 = certified).
-    #[must_use]
-    pub fn block_count(&self) -> usize {
+    /// Number of distinct block reasons (0 if certified).
+    #[must_use] 
+    pub const fn block_count(&self) -> usize {
         self.block_reasons.len()
     }
 
@@ -1293,7 +1291,7 @@ mod tests {
         (0..n).map(|i| DRObservation {
             candidate_selected: i % 3 == 0, // ~33% selection
             propensity: 0.33,
-            realized_loss: 0.5 - advantage * 0.5,
+            realized_loss: advantage.mul_add(-0.5, 0.5),
             predicted_loss: 0.5,
             evidence_weight: 1.0,
             attribution_weight: 1.0,

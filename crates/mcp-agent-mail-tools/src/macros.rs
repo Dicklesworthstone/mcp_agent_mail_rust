@@ -631,7 +631,7 @@ pub async fn macro_contact_handshake(
         None
     };
 
-    let has_welcome = welcome_subject.is_some() && welcome_body.is_some();
+    let _has_welcome = welcome_subject.is_some() && welcome_body.is_some();
     let thread_id_for_log = thread_id.clone();
 
     let welcome_val = if let (Some(subject), Some(body)) = (welcome_subject, welcome_body) {

@@ -695,6 +695,17 @@ fn build_tool_directory() -> ToolDirectory {
                     complexity: "low".to_string(),
                 },
                 ToolDirectoryEntry {
+                    name: "list_agents".to_string(),
+                    summary: "List all registered agents in a project with name, role, model, task, registration and last-seen timestamps.".to_string(),
+                    use_when: "Discovering which agents are active in a project before sending messages or coordinating work.".to_string(),
+                    related: vec!["register_agent".to_string(), "whois".to_string()],
+                    expected_frequency: "At the start of each session or before sending messages.".to_string(),
+                    required_capabilities: vec!["audit".to_string(), "identity".to_string()],
+                    usage_examples: vec![ToolUsageExample { hint: "Discover agents".to_string(), sample: "list_agents(project_key='backend')".to_string() }],
+                    capabilities: vec!["audit".to_string(), "identity".to_string()],
+                    complexity: "medium".to_string(),
+                },
+                ToolDirectoryEntry {
                     name: "set_contact_policy".to_string(),
                     summary: "Set inbound contact policy (open, auto, contacts_only, block_all).".to_string(),
                     use_when: "Adjusting how permissive an agent is about unsolicited messages.".to_string(),
@@ -2577,7 +2588,7 @@ fn outbox_message_from_row(
     row: &mcp_agent_mail_db::sqlmodel::Row,
     to: Vec<String>,
     cc: Vec<String>,
-    bcc: Vec<String>,
+    _bcc: Vec<String>,
 ) -> OutboxMessageEntry {
     let id: i64 = row.get_as(0).unwrap_or(0);
     let subject: String = row.get_as(4).unwrap_or_default();
@@ -5826,6 +5837,76 @@ mod resource_shape_tests {
                 schemas["schemas"].is_array(),
                 schemas_query["schemas"].is_array()
             );
+        });
+    }
+
+    #[test]
+    fn tool_list_agents_returns_registered_agents() {
+        with_serialized_resources(|| {
+            run_async(|cx: Cx| async move {
+                let ctx = McpContext::new(cx.clone(), 1);
+                let project_key = format!("/tmp/resources-tool-list-agents-{}", unique_suffix());
+
+                crate::ensure_project(&ctx, project_key.clone(), None)
+                    .await
+                    .expect("ensure_project");
+
+                // Register two agents (names must be adjective+noun format)
+                crate::register_agent(
+                    &ctx,
+                    project_key.clone(),
+                    "codex-cli".to_string(),
+                    "gpt-5".to_string(),
+                    Some("GreenLake".to_string()),
+                    Some("backend development".to_string()),
+                    None,
+                )
+                .await
+                .expect("register_agent GreenLake");
+
+                crate::register_agent(
+                    &ctx,
+                    project_key.clone(),
+                    "claude-code".to_string(),
+                    "sonnet-4.5".to_string(),
+                    Some("BlueDog".to_string()),
+                    Some("frontend work".to_string()),
+                    None,
+                )
+                .await
+                .expect("register_agent BlueDog");
+
+                // Call list_agents tool
+                let result = crate::list_agents(&ctx, project_key.clone())
+                    .await
+                    .expect("list_agents tool");
+
+                let agents: Vec<Value> =
+                    serde_json::from_str(&result).expect("parse list_agents");
+                assert!(
+                    agents.len() >= 2,
+                    "expected at least 2 agents, got {}",
+                    agents.len()
+                );
+
+                let green = agents
+                    .iter()
+                    .find(|a| a["name"] == "GreenLake")
+                    .expect("GreenLake should be in list");
+                assert_eq!(green["program"], "codex-cli");
+                assert_eq!(green["model"], "gpt-5");
+                assert_eq!(green["task_description"], "backend development");
+                assert!(green["inception_ts"].as_str().is_some());
+                assert!(green["last_active_ts"].as_str().is_some());
+
+                let blue = agents
+                    .iter()
+                    .find(|a| a["name"] == "BlueDog")
+                    .expect("BlueDog should be in list");
+                assert_eq!(blue["program"], "claude-code");
+                assert_eq!(blue["model"], "sonnet-4.5");
+                assert_eq!(blue["task_description"], "frontend work");
+            });
         });
     }
 }

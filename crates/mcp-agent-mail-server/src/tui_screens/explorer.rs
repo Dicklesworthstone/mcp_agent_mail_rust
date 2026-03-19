@@ -446,6 +446,7 @@ impl MailExplorerScreen {
     }
 
     /// Sync the `VirtualizedListState` selection with the current cursor.
+    #[allow(dead_code)]
     fn sync_list_state(&self) {
         let mut state = self.list_state.borrow_mut();
         if self.entries.is_empty() {

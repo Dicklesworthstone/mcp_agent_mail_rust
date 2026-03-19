@@ -722,8 +722,9 @@ impl ReadCache {
                 }
                 let lookup_key = (*entry_scope, *agent_id);
                 let entry = id_cache.peek(&lookup_key)?;
-                (entry.value.project_id == project_id && entry.value.name == name)
-                    .then_some(*agent_id)
+                (entry.value.project_id == project_id
+                    && entry.value.name.eq_ignore_ascii_case(name))
+                .then_some(*agent_id)
             }));
         }
 

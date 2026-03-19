@@ -8,7 +8,7 @@
 
 #![forbid(unsafe_code)]
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::io::IsTerminal;
 use unicode_width::UnicodeWidthStr;
 

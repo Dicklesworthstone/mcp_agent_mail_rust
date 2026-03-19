@@ -1163,6 +1163,7 @@ pub const TOOL_CLUSTER_MAP: &[(&str, &str)] = &[
     ("whois", clusters::IDENTITY),
     ("resolve_pane_identity", clusters::IDENTITY),
     ("cleanup_pane_identities", clusters::IDENTITY),
+    ("list_agents", clusters::IDENTITY),
     // Messaging
     ("send_message", clusters::MESSAGING),
     ("reply_message", clusters::MESSAGING),

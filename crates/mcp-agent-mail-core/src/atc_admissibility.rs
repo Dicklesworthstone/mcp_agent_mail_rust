@@ -335,7 +335,7 @@ pub struct RollbackTriggers {
 impl RollbackTriggers {
     /// Whether any trigger is active.
     #[must_use]
-    pub fn any_triggered(&self) -> bool {
+    pub const fn any_triggered(&self) -> bool {
         self.regret_exceeded
             || self.safe_mode_entered
             || self.regime_change_detected
@@ -345,7 +345,7 @@ impl RollbackTriggers {
 
     /// Get the primary trigger reason.
     #[must_use]
-    pub fn primary_reason(&self) -> Option<&'static str> {
+    pub const fn primary_reason(&self) -> Option<&'static str> {
         if self.safe_mode_entered {
             Some("safe mode entered")
         } else if self.regret_exceeded {

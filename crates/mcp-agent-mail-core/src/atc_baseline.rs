@@ -501,7 +501,7 @@ mod tests {
             t.tick_budget_micros <= 50_000,
             "tick budget should be <50ms"
         );
-        assert!(t.probe_interval_micros > t.tick_budget_micros as i64);
+        assert!(t.probe_interval_micros > t.tick_budget_micros);
         assert!(t.estimated_probe_cost_micros < t.tick_budget_micros);
     }
 

@@ -291,8 +291,7 @@ impl AdaptationEngine {
                     .partial_cmp(&b.selection_probability)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+            .map_or(0, |(i, _)| i);
 
         self.selected_index = best_idx;
         &self.candidates[best_idx]
@@ -391,7 +390,7 @@ impl AdaptationEngine {
 
     /// Number of candidate policies.
     #[must_use]
-    pub fn candidate_count(&self) -> usize {
+    pub const fn candidate_count(&self) -> usize {
         self.candidates.len()
     }
 

@@ -82,7 +82,11 @@ pub fn export_static_site(config: &ExportConfig) -> Result<ExportManifest, Strin
         .map_err(|e| format!("create output dir {}: {e}", config.output_dir.display()))?;
 
     let pool = get_pool()?;
-    let cx = Cx::for_testing();
+    // Use infinite budget — static export is a batch CLI operation, not a
+    // request-scoped handler. Individual DB queries have their own timeouts
+    // via pool acquire. Using for_request_with_budget (not for_testing) to
+    // get proper production Cx lineage for tracing/observability.
+    let cx = Cx::for_request_with_budget(asupersync::Budget::INFINITE);
     let mut files = BTreeMap::new();
 
     // ── 1. Enumerate projects ───────────────────────────────────────

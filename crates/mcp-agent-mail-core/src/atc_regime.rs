@@ -140,7 +140,7 @@ pub enum RegimeAction {
 impl RegimeManager {
     /// Create a new regime manager with default settings.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             current_regime_id: 0,
             phase: RegimePhase::Stable,
@@ -269,7 +269,7 @@ impl RegimeManager {
 
     /// Whether policy promotion is currently allowed.
     #[must_use]
-    pub fn promotion_allowed(&self) -> bool {
+    pub const fn promotion_allowed(&self) -> bool {
         !self.promotion_gated
     }
 

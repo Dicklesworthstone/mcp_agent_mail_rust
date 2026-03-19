@@ -190,16 +190,14 @@ pub fn shrink_single(
     let n = estimate.local_count as f64;
     let between = population.between_variance;
 
-    let shrinkage_weight = if between < 1e-10 {
-        // Homogeneous population → full pooling.
-        MAX_SHRINKAGE_WEIGHT
+    let shrinkage_weight = if between > 0.0 && n > 0.0 {
+        let raw = within / n.mul_add(between, within);
+        raw.clamp(0.0, 1.0)
     } else {
-        let raw = within / (within + n * between);
-        raw.clamp(0.0, MAX_SHRINKAGE_WEIGHT)
+        1.0 // maximal shrinkage if no between-group variance or no samples
     };
 
-    let shrunk = (1.0 - shrinkage_weight) * estimate.local_mean
-        + shrinkage_weight * population.grand_mean;
+    let shrunk = (1.0 - shrinkage_weight).mul_add(estimate.local_mean, shrinkage_weight * population.grand_mean);
 
     // Effective sample size: local_count + weight × population_count.
     let effective = n + shrinkage_weight * population.total_count as f64;

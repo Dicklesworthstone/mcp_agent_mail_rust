@@ -207,8 +207,7 @@ impl OpenExperienceIndex {
                 None
             }
             Some(set) if set.len() == 1 => set.iter().next().copied(),
-            Some(_) => None,
-            None => None,
+            Some(_) | None => None,
         };
 
         if let Some(id) = remaining_id

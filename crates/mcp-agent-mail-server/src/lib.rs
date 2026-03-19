@@ -120,7 +120,7 @@ use mcp_agent_mail_tools::{
     ConfigEnvironmentQueryResource, ConfigEnvironmentResource, CreateAgentIdentity, EnsureProduct,
     EnsureProject, FetchInbox, FetchInboxProduct, FileReservationPaths, FileReservationsResource,
     ForceReleaseFileReservation, HealthCheck, IdentityProjectResource, InboxResource,
-    InstallPrecommitGuard, ListContacts, MacroContactHandshake, MacroFileReservationCycle,
+    InstallPrecommitGuard, ListAgents, ListContacts, MacroContactHandshake, MacroFileReservationCycle,
     MacroPrepareThread, MacroStartSession, MailboxResource, MailboxWithCommitsResource,
     MarkMessageRead, MessageDetailsResource, OutboxResource, ProductDetailsResource, ProductsLink,
     ProjectDetailsResource, ProjectsListQueryResource, ProjectsListResource, RegisterAgent,
@@ -519,6 +519,13 @@ pub fn build_server(config: &mcp_agent_mail_core::Config) -> Server {
         "cleanup_pane_identities",
         clusters::IDENTITY,
         CleanupPaneIdentities,
+    );
+    let server = add_tool(
+        server,
+        config,
+        "list_agents",
+        clusters::IDENTITY,
+        ListAgents,
     );
     let server = add_tool(
         server,
@@ -3853,7 +3860,6 @@ fn promote_executed_experience_to_open_for_resolution(
             );
             false
         }
-        _ => false,
     }
 }
 
@@ -3955,11 +3961,13 @@ fn sweep_open_experiences_for_resolution(
     }
 }
 
+#[allow(dead_code)]
 fn looks_like_project_slug(value: &str) -> bool {
     let trimmed = value.trim();
     !trimmed.is_empty() && !trimmed.contains('/') && !trimmed.contains('\\')
 }
 
+#[allow(dead_code)]
 fn atc_project_keys_match(left: &str, right: &str) -> bool {
     let left = left.trim();
     let right = right.trim();
@@ -4002,6 +4010,7 @@ fn atc_project_keys_match(left: &str, right: &str) -> bool {
 /// When wired from domain event derivers, this helper must remain cheap because
 /// it is intended for inline use rather than periodic sweeping: bounded at 20
 /// open experiences per call.
+#[allow(dead_code)]
 pub(crate) fn resolve_conflict_experiences_on_reservation_event(
     pool: &mcp_agent_mail_db::DbPool,
     agent: &str,

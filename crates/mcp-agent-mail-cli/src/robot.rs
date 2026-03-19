@@ -9287,7 +9287,8 @@ mod tests {
             "CREATE TABLE projects (
                 id INTEGER PRIMARY KEY,
                 slug TEXT NOT NULL,
-                human_key TEXT NOT NULL
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT 0
             )",
             &empty,
         )
@@ -9380,7 +9381,8 @@ mod tests {
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
 
         conn.query_sync(
-            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT 0)",
             &empty,
         ).expect("create projects");
         conn.query_sync(
@@ -9449,7 +9451,8 @@ mod tests {
             "CREATE TABLE projects (
                 id INTEGER PRIMARY KEY,
                 slug TEXT NOT NULL,
-                human_key TEXT NOT NULL
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT 0
             )",
             &empty,
         )
@@ -10541,7 +10544,8 @@ mod tests {
             "CREATE TABLE projects (
                 id INTEGER PRIMARY KEY,
                 slug TEXT NOT NULL,
-                human_key TEXT NOT NULL
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT 0
             )",
             &empty,
         )
@@ -10630,7 +10634,8 @@ mod tests {
             "CREATE TABLE projects (
                 id INTEGER PRIMARY KEY,
                 slug TEXT NOT NULL,
-                human_key TEXT NOT NULL
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT 0
             )",
             &empty,
         )
@@ -10678,7 +10683,8 @@ mod tests {
             "CREATE TABLE projects (
                 id INTEGER PRIMARY KEY,
                 slug TEXT NOT NULL,
-                human_key TEXT NOT NULL
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT 0
             )",
             &empty,
         )
@@ -10760,7 +10766,8 @@ mod tests {
             "CREATE TABLE projects (
                 id INTEGER PRIMARY KEY,
                 slug TEXT NOT NULL,
-                human_key TEXT NOT NULL
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT 0
             )",
             &empty,
         )
@@ -11005,7 +11012,8 @@ mod tests {
             "CREATE TABLE projects (
                 id INTEGER PRIMARY KEY,
                 slug TEXT NOT NULL,
-                human_key TEXT NOT NULL
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT 0
             )",
             &[],
         )
