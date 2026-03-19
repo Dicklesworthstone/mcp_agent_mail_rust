@@ -4,7 +4,7 @@
       "type": "http",
       "url": "http://127.0.0.1:8765/mcp/",
       "headers": {
-        "Authorization": "Bearer 19f4826e059238a617a614371c615eb066d9396223bb18c6de5be2a55f5970b1"
+        "Authorization": "Bearer 552e3d77c4386828e5fc260b6243d44c9880177a1f945224e1aed7be1efd3c48"
       }
     }
   }
