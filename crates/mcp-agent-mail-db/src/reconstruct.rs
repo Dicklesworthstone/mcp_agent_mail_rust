@@ -957,6 +957,246 @@ fn build_salvage_select(
     Some(selected.join(", "))
 }
 
+fn merge_salvaged_created_at(current_created_at: i64, salvaged_created_at: i64) -> i64 {
+    if salvaged_created_at <= 0 {
+        current_created_at
+    } else if current_created_at <= 0 {
+        salvaged_created_at
+    } else {
+        current_created_at.min(salvaged_created_at)
+    }
+}
+
+fn merge_salvaged_inception_ts(current_inception_ts: i64, salvaged_inception_ts: i64) -> i64 {
+    if salvaged_inception_ts <= 0 {
+        current_inception_ts
+    } else if current_inception_ts <= 0 {
+        salvaged_inception_ts
+    } else {
+        current_inception_ts.min(salvaged_inception_ts)
+    }
+}
+
+fn merge_salvaged_last_active_ts(current_last_active_ts: i64, salvaged_last_active_ts: i64) -> i64 {
+    if salvaged_last_active_ts <= 0 {
+        current_last_active_ts
+    } else if current_last_active_ts <= 0 {
+        salvaged_last_active_ts
+    } else {
+        current_last_active_ts.max(salvaged_last_active_ts)
+    }
+}
+
+fn should_replace_placeholder_text(current: &str, salvaged: &str, placeholder: &str) -> bool {
+    let current = current.trim();
+    let salvaged = salvaged.trim();
+    !salvaged.is_empty()
+        && salvaged != placeholder
+        && (current.is_empty() || current == placeholder)
+}
+
+fn should_replace_default_policy(current: &str, salvaged: &str) -> bool {
+    let current = current.trim();
+    let salvaged = salvaged.trim();
+    !salvaged.is_empty() && salvaged != "auto" && (current.is_empty() || current == "auto")
+}
+
+fn enrich_existing_project_from_salvage(
+    conn: &DbConn,
+    project_id: i64,
+    slug: &str,
+    salvaged_human_key: &str,
+    salvaged_created_at: i64,
+) -> DbResult<()> {
+    let existing_rows = conn
+        .query_sync(
+            "SELECT human_key, created_at FROM projects WHERE id = ? LIMIT 1",
+            &[Value::BigInt(project_id)],
+        )
+        .map_err(|e| {
+            DbError::Sqlite(format!(
+                "reconstruct salvage: query project state for slug {slug}: {e}"
+            ))
+        })?;
+    let Some(existing_row) = existing_rows.first() else {
+        return Ok(());
+    };
+
+    let current_human_key = existing_row
+        .get_named::<String>("human_key")
+        .unwrap_or_else(|_| format!("/{slug}"));
+    let current_created_at = existing_row
+        .get_named::<i64>("created_at")
+        .unwrap_or_default();
+    let fallback_human_key = format!("/{slug}");
+    let next_human_key =
+        if current_human_key.trim().is_empty() || current_human_key == fallback_human_key {
+            let candidate = salvaged_human_key.trim();
+            if Path::new(candidate).is_absolute() {
+                candidate.to_string()
+            } else {
+                current_human_key.clone()
+            }
+        } else {
+            current_human_key.clone()
+        };
+    let next_created_at = merge_salvaged_created_at(current_created_at, salvaged_created_at);
+
+    if next_human_key != current_human_key || next_created_at != current_created_at {
+        conn.execute_sync(
+            "UPDATE projects SET human_key = ?, created_at = ? WHERE id = ?",
+            &[
+                Value::Text(next_human_key),
+                Value::BigInt(next_created_at),
+                Value::BigInt(project_id),
+            ],
+        )
+        .map_err(|e| {
+            DbError::Sqlite(format!(
+                "reconstruct salvage: enrich project metadata for slug {slug}: {e}"
+            ))
+        })?;
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enrich_existing_agent_from_salvage(
+    conn: &DbConn,
+    agent_id: i64,
+    name: &str,
+    salvaged_program: &str,
+    salvaged_model: &str,
+    salvaged_task_description: &str,
+    salvaged_inception_ts: i64,
+    salvaged_last_active_ts: i64,
+    salvaged_attachments_policy: &str,
+    salvaged_contact_policy: &str,
+) -> DbResult<()> {
+    let existing_rows = conn
+        .query_sync(
+            "SELECT program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy \
+             FROM agents WHERE id = ? LIMIT 1",
+            &[Value::BigInt(agent_id)],
+        )
+        .map_err(|e| {
+            DbError::Sqlite(format!(
+                "reconstruct salvage: query agent state for {name}: {e}"
+            ))
+        })?;
+    let Some(existing_row) = existing_rows.first() else {
+        return Ok(());
+    };
+
+    let current_program = existing_row
+        .get_named::<String>("program")
+        .unwrap_or_else(|_| "unknown".to_string());
+    let current_model = existing_row
+        .get_named::<String>("model")
+        .unwrap_or_else(|_| "unknown".to_string());
+    let current_task_description = existing_row
+        .get_named::<String>("task_description")
+        .unwrap_or_default();
+    let current_inception_ts = existing_row
+        .get_named::<i64>("inception_ts")
+        .unwrap_or_default();
+    let current_last_active_ts = existing_row
+        .get_named::<i64>("last_active_ts")
+        .unwrap_or_default();
+    let current_attachments_policy = existing_row
+        .get_named::<String>("attachments_policy")
+        .unwrap_or_else(|_| "auto".to_string());
+    let current_contact_policy = existing_row
+        .get_named::<String>("contact_policy")
+        .unwrap_or_else(|_| "auto".to_string());
+    let is_placeholder_agent = current_program.trim() == "unknown"
+        && current_model.trim() == "unknown"
+        && current_task_description.trim().is_empty()
+        && current_attachments_policy.trim() == "auto"
+        && current_contact_policy.trim() == "auto";
+
+    let next_program =
+        if should_replace_placeholder_text(&current_program, salvaged_program, "unknown") {
+            salvaged_program.trim().to_string()
+        } else {
+            current_program.clone()
+        };
+    let next_model = if should_replace_placeholder_text(&current_model, salvaged_model, "unknown") {
+        salvaged_model.trim().to_string()
+    } else {
+        current_model.clone()
+    };
+    let next_task_description = if should_replace_placeholder_text(
+        &current_task_description,
+        salvaged_task_description,
+        "",
+    ) {
+        salvaged_task_description.trim().to_string()
+    } else {
+        current_task_description.clone()
+    };
+    let next_inception_ts =
+        merge_salvaged_inception_ts(current_inception_ts, salvaged_inception_ts);
+    let next_last_active_ts = if is_placeholder_agent && salvaged_last_active_ts > 0 {
+        salvaged_last_active_ts
+    } else {
+        merge_salvaged_last_active_ts(current_last_active_ts, salvaged_last_active_ts)
+    };
+    let next_attachments_policy = if should_replace_default_policy(
+        &current_attachments_policy,
+        salvaged_attachments_policy,
+    ) {
+        salvaged_attachments_policy.trim().to_string()
+    } else {
+        current_attachments_policy.clone()
+    };
+    let next_contact_policy =
+        if should_replace_default_policy(&current_contact_policy, salvaged_contact_policy) {
+            salvaged_contact_policy.trim().to_string()
+        } else {
+            current_contact_policy.clone()
+        };
+
+    if next_program != current_program
+        || next_model != current_model
+        || next_task_description != current_task_description
+        || next_inception_ts != current_inception_ts
+        || next_last_active_ts != current_last_active_ts
+        || next_attachments_policy != current_attachments_policy
+        || next_contact_policy != current_contact_policy
+    {
+        conn.execute_sync(
+            "UPDATE agents SET \
+                 program = ?, \
+                 model = ?, \
+                 task_description = ?, \
+                 inception_ts = ?, \
+                 last_active_ts = ?, \
+                 attachments_policy = ?, \
+                 contact_policy = ? \
+             WHERE id = ?",
+            &[
+                Value::Text(next_program),
+                Value::Text(next_model),
+                Value::Text(next_task_description),
+                Value::BigInt(next_inception_ts),
+                Value::BigInt(next_last_active_ts),
+                Value::Text(next_attachments_policy),
+                Value::Text(next_contact_policy),
+                Value::BigInt(agent_id),
+            ],
+        )
+        .map_err(|e| {
+            DbError::Sqlite(format!(
+                "reconstruct salvage: enrich agent metadata for {name}: {e}"
+            ))
+        })?;
+    }
+
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn merge_salvaged_database(
     target_db_path: &Path,
@@ -1032,19 +1272,26 @@ fn merge_salvaged_database(
                 continue;
             }
 
-            if let Ok(target_project_id) =
-                query_last_insert_or_existing_id(&target_conn, "projects", "slug", &slug)
-            {
-                project_id_map.insert(source_project_id, target_project_id);
-                continue;
-            }
-
             let human_key = row
                 .get_named::<String>("human_key")
                 .unwrap_or_else(|_| format!("/{slug}"));
             let created_at = row
                 .get_named::<i64>("created_at")
                 .unwrap_or_else(|_| crate::now_micros());
+
+            if let Ok(target_project_id) =
+                query_last_insert_or_existing_id(&target_conn, "projects", "slug", &slug)
+            {
+                enrich_existing_project_from_salvage(
+                    &target_conn,
+                    target_project_id,
+                    &slug,
+                    &human_key,
+                    created_at,
+                )?;
+                project_id_map.insert(source_project_id, target_project_id);
+                continue;
+            }
             target_conn
                 .execute_sync(
                     "INSERT OR IGNORE INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
@@ -1123,6 +1370,28 @@ fn merge_salvaged_database(
                 continue;
             }
 
+            let salvaged_program = row
+                .get_named::<String>("program")
+                .unwrap_or_else(|_| "unknown".to_string());
+            let salvaged_model = row
+                .get_named::<String>("model")
+                .unwrap_or_else(|_| "unknown".to_string());
+            let salvaged_task_description = row
+                .get_named::<String>("task_description")
+                .unwrap_or_default();
+            let salvaged_inception_ts = row
+                .get_named::<i64>("inception_ts")
+                .unwrap_or_else(|_| crate::now_micros());
+            let salvaged_last_active_ts = row
+                .get_named::<i64>("last_active_ts")
+                .unwrap_or_else(|_| crate::now_micros());
+            let salvaged_attachments_policy = row
+                .get_named::<String>("attachments_policy")
+                .unwrap_or_else(|_| "auto".to_string());
+            let salvaged_contact_policy = row
+                .get_named::<String>("contact_policy")
+                .unwrap_or_else(|_| "auto".to_string());
+
             let existed = query_last_insert_or_existing_id_composite(
                 &target_conn,
                 "agents",
@@ -1141,34 +1410,13 @@ fn merge_salvaged_database(
                     &[
                         Value::BigInt(target_project_id),
                         Value::Text(name.clone()),
-                        Value::Text(
-                            row.get_named::<String>("program")
-                                .unwrap_or_else(|_| "unknown".to_string()),
-                        ),
-                        Value::Text(
-                            row.get_named::<String>("model")
-                                .unwrap_or_else(|_| "unknown".to_string()),
-                        ),
-                        Value::Text(
-                            row.get_named::<String>("task_description")
-                                .unwrap_or_default(),
-                        ),
-                        Value::BigInt(
-                            row.get_named::<i64>("inception_ts")
-                                .unwrap_or_else(|_| crate::now_micros()),
-                        ),
-                        Value::BigInt(
-                            row.get_named::<i64>("last_active_ts")
-                                .unwrap_or_else(|_| crate::now_micros()),
-                        ),
-                        Value::Text(
-                            row.get_named::<String>("attachments_policy")
-                                .unwrap_or_else(|_| "auto".to_string()),
-                        ),
-                        Value::Text(
-                            row.get_named::<String>("contact_policy")
-                                .unwrap_or_else(|_| "auto".to_string()),
-                        ),
+                        Value::Text(salvaged_program.clone()),
+                        Value::Text(salvaged_model.clone()),
+                        Value::Text(salvaged_task_description.clone()),
+                        Value::BigInt(salvaged_inception_ts),
+                        Value::BigInt(salvaged_last_active_ts),
+                        Value::Text(salvaged_attachments_policy.clone()),
+                        Value::Text(salvaged_contact_policy.clone()),
                     ],
                 )
                 .map_err(|e| {
@@ -1186,6 +1434,19 @@ fn merge_salvaged_database(
             agent_id_map.insert(source_agent_id, target_agent_id);
             if existed.is_none() {
                 stats.salvaged_agents += 1;
+            } else {
+                enrich_existing_agent_from_salvage(
+                    &target_conn,
+                    target_agent_id,
+                    &name,
+                    &salvaged_program,
+                    &salvaged_model,
+                    &salvaged_task_description,
+                    salvaged_inception_ts,
+                    salvaged_last_active_ts,
+                    &salvaged_attachments_policy,
+                    &salvaged_contact_policy,
+                )?;
             }
         }
     }
@@ -2722,5 +2983,154 @@ archive body
                 .expect("recipient name"),
             "Carol"
         );
+    }
+
+    #[test]
+    fn reconstruct_with_salvage_enriches_fallback_project_and_agent_metadata() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed_enriched.db");
+        let salvage_db_path = tmp.path().join("salvage_enriched.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("orphan-slug");
+        let messages_dir = project_dir.join("messages").join("2026").join("02");
+        std::fs::create_dir_all(&messages_dir).unwrap();
+        std::fs::write(
+            messages_dir.join("2026-02-22T12-00-00Z__archive__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "Archive copy",
+  "importance": "normal",
+  "created_ts": "2026-02-22T12:00:00Z"
+}
+---
+
+archive body
+"#,
+        )
+        .unwrap();
+
+        let salvage_conn = DbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE projects (
+                    id INTEGER PRIMARY KEY,
+                    slug TEXT NOT NULL,
+                    human_key TEXT,
+                    created_at INTEGER
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE agents (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    program TEXT,
+                    model TEXT,
+                    task_description TEXT,
+                    inception_ts INTEGER,
+                    last_active_ts INTEGER,
+                    attachments_policy TEXT,
+                    contact_policy TEXT
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (100, 'orphan-slug', '/Users/demo/projects/orphan', 123)",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO agents
+                 (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+                 VALUES
+                    (10, 100, 'Alice', 'codex-cli', 'gpt-5', 'investigating', 10, 99, 'inline', 'contacts_only'),
+                    (11, 100, 'Bob', 'claude-code', 'sonnet', 'reviewing', 20, 120, 'auto', 'open')",
+                &[],
+            )
+            .unwrap();
+
+        reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+            .expect("salvage merge should enrich fallback rows");
+
+        let conn = DbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let project_rows = conn
+            .query_sync(
+                "SELECT human_key, created_at FROM projects WHERE slug = 'orphan-slug'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(project_rows.len(), 1);
+        assert_eq!(
+            project_rows[0]
+                .get_named::<String>("human_key")
+                .expect("human_key"),
+            "/Users/demo/projects/orphan"
+        );
+        assert_eq!(
+            project_rows[0]
+                .get_named::<i64>("created_at")
+                .expect("created_at"),
+            123
+        );
+
+        let alice_rows = conn
+            .query_sync(
+                "SELECT program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy
+                 FROM agents
+                 WHERE name = 'Alice'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(alice_rows.len(), 1);
+        let alice = &alice_rows[0];
+        assert_eq!(alice.get_named::<String>("program").unwrap(), "codex-cli");
+        assert_eq!(alice.get_named::<String>("model").unwrap(), "gpt-5");
+        assert_eq!(
+            alice.get_named::<String>("task_description").unwrap(),
+            "investigating"
+        );
+        assert_eq!(alice.get_named::<i64>("inception_ts").unwrap(), 10);
+        assert_eq!(alice.get_named::<i64>("last_active_ts").unwrap(), 99);
+        assert_eq!(
+            alice.get_named::<String>("attachments_policy").unwrap(),
+            "inline"
+        );
+        assert_eq!(
+            alice.get_named::<String>("contact_policy").unwrap(),
+            "contacts_only"
+        );
+
+        let bob_rows = conn
+            .query_sync(
+                "SELECT program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy
+                 FROM agents
+                 WHERE name = 'Bob'",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(bob_rows.len(), 1);
+        let bob = &bob_rows[0];
+        assert_eq!(bob.get_named::<String>("program").unwrap(), "claude-code");
+        assert_eq!(bob.get_named::<String>("model").unwrap(), "sonnet");
+        assert_eq!(
+            bob.get_named::<String>("task_description").unwrap(),
+            "reviewing"
+        );
+        assert_eq!(bob.get_named::<i64>("inception_ts").unwrap(), 20);
+        assert_eq!(bob.get_named::<i64>("last_active_ts").unwrap(), 120);
+        assert_eq!(
+            bob.get_named::<String>("attachments_policy").unwrap(),
+            "auto"
+        );
+        assert_eq!(bob.get_named::<String>("contact_policy").unwrap(), "open");
     }
 }

@@ -701,6 +701,10 @@ pub fn package_directory_as_zip(source_dir: &Path, destination: &Path) -> ShareR
     // Collect and sort entries for reproducibility
     let mut entries = Vec::new();
     collect_entries_ctx(&source, &source, &mut entries, "ZIP")?;
+    if let Ok(relative_dest) = dest.strip_prefix(&source) {
+        let relative_dest = relative_dest.to_string_lossy().replace('\\', "/");
+        entries.retain(|entry| entry != &relative_dest);
+    }
     entries.sort();
 
     for relative_path in &entries {
@@ -2177,6 +2181,26 @@ mod tests {
         let h1 = super::sha256_file(&zip1).unwrap();
         let h2 = super::sha256_file(&zip2).unwrap();
         assert_eq!(h1, h2, "zip output should be deterministic");
+    }
+
+    #[test]
+    fn zip_excludes_destination_when_archive_is_inside_source_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("a.txt"), b"alpha").unwrap();
+        std::fs::write(source.join("nested/b.txt"), b"bravo").unwrap();
+
+        let zip_path = source.join("bundle.zip");
+        package_directory_as_zip(&source, &zip_path).unwrap();
+
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|index| archive.by_index(index).unwrap().name().to_string())
+            .collect();
+
+        assert_eq!(names, vec!["a.txt", "nested/b.txt"]);
     }
 
     #[test]

@@ -270,19 +270,36 @@ fn resolve_sri_file_path(bundle_root: &Path, relative_path: &str) -> Result<Path
     // while some tooling may emit bundle-root relative paths. Accept either.
     let direct = bundle_root.join(relative_path);
     if direct.exists() {
-        // Verify the resolved path is still under bundle_root (prevents symlink escape).
-        if let (Ok(canonical_root), Ok(canonical_file)) =
-            (bundle_root.canonicalize(), direct.canonicalize())
-        {
-            if !canonical_file.starts_with(&canonical_root) {
-                return Err(format!(
-                    "path traversal blocked: '{relative_path}' resolves outside bundle root"
-                ));
-            }
-        }
-        return Ok(direct);
+        return validate_sri_resolved_path(bundle_root, direct, relative_path);
     }
-    Ok(bundle_root.join("viewer").join(relative_path))
+    validate_sri_resolved_path(
+        bundle_root,
+        bundle_root.join("viewer").join(relative_path),
+        relative_path,
+    )
+}
+
+fn validate_sri_resolved_path(
+    bundle_root: &Path,
+    candidate: PathBuf,
+    relative_path: &str,
+) -> Result<PathBuf, String> {
+    if !candidate.exists() {
+        return Ok(candidate);
+    }
+
+    let canonical_root = bundle_root
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize bundle root: {error}"))?;
+    let canonical_candidate = candidate
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize '{relative_path}': {error}"))?;
+    if !canonical_candidate.starts_with(&canonical_root) {
+        return Err(format!(
+            "path traversal blocked: '{relative_path}' resolves outside bundle root"
+        ));
+    }
+    Ok(candidate)
 }
 
 /// Result of bundle verification.
@@ -712,6 +729,51 @@ mod tests {
         assert!(result.sri_checked);
         assert!(result.sri_valid);
         assert!(result.error.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_sri_viewer_fallback_blocks_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("viewer").join("vendor");
+        std::fs::create_dir_all(&vendor_dir).unwrap();
+
+        let escaped_target = outside.path().join("payload.js");
+        std::fs::write(&escaped_target, b"console.log('outside bundle')").unwrap();
+        symlink(&escaped_target, vendor_dir.join("payload.js")).unwrap();
+
+        let expected_sri = format!(
+            "sha256-{}",
+            base64_encode(&sha256_bytes(b"console.log('outside bundle')"))
+        );
+        let manifest = serde_json::json!({
+            "viewer": {
+                "sri": {
+                    "vendor/payload.js": expected_sri
+                }
+            }
+        });
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+        let result = verify_bundle(dir.path(), None).unwrap();
+        assert!(result.sri_checked);
+        assert!(
+            !result.sri_valid,
+            "viewer-relative symlink escapes must fail verification"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("outside bundle root"),
+            "expected bundle-root containment failure, got {:?}",
+            result.error
+        );
     }
 
     #[test]

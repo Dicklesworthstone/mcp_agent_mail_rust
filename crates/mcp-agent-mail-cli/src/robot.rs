@@ -1727,6 +1727,13 @@ impl RobotDbHandle {
         })
     }
 
+    fn open_local_attachments() -> Result<Self, CliError> {
+        Ok(Self {
+            conn: crate::open_db_sync_robot_attachments()?,
+            _snapshot_dir: None,
+        })
+    }
+
     fn open_archive_snapshot(storage_root: &Path) -> Result<Self, CliError> {
         let snapshot_dir = tempfile::tempdir()
             .map_err(|e| CliError::Other(format!("robot archive snapshot tempdir failed: {e}")))?;
@@ -1759,6 +1766,18 @@ struct ResolvedRobotScope {
 }
 
 impl ResolvedRobotScope {
+    fn conn(&self) -> &DbConn {
+        &self.db.conn
+    }
+}
+
+struct ResolvedRobotProjectScope {
+    db: RobotDbHandle,
+    project_id: i64,
+    project_slug: String,
+}
+
+impl ResolvedRobotProjectScope {
     fn conn(&self) -> &DbConn {
         &self.db.conn
     }
@@ -1894,6 +1913,18 @@ fn resolve_robot_scope_with_handle(
     })
 }
 
+fn resolve_robot_project_scope_with_handle(
+    db: RobotDbHandle,
+    project_flag: Option<&str>,
+) -> Result<ResolvedRobotProjectScope, CliError> {
+    let (project_id, project_slug) = resolve_project(&db.conn, project_flag)?;
+    Ok(ResolvedRobotProjectScope {
+        db,
+        project_id,
+        project_slug,
+    })
+}
+
 fn resolve_robot_scope_with_archive_fallback(
     local: RobotDbHandle,
     storage_root: &Path,
@@ -1927,6 +1958,36 @@ fn resolve_robot_scope_with_archive_fallback(
     }
 }
 
+fn resolve_robot_project_scope_with_archive_fallback(
+    local: RobotDbHandle,
+    storage_root: &Path,
+    project_flag: Option<&str>,
+) -> Result<ResolvedRobotProjectScope, CliError> {
+    match resolve_robot_project_scope_with_handle(local, project_flag) {
+        Ok(scope) => Ok(scope),
+        Err(local_error) => {
+            let project_key = resolved_project_flag_or_env(project_flag);
+            if !should_try_archive_snapshot(
+                &local_error,
+                project_key.as_deref(),
+                None,
+                storage_root,
+            ) {
+                return Err(local_error);
+            }
+
+            tracing::warn!(
+                project = project_key.as_deref().unwrap_or(""),
+                error = %local_error,
+                "robot command falling back to archive snapshot because local db is missing requested project"
+            );
+
+            let snapshot = RobotDbHandle::open_archive_snapshot(storage_root)?;
+            resolve_robot_project_scope_with_handle(snapshot, project_flag)
+        }
+    }
+}
+
 fn resolve_robot_scope(
     project_flag: Option<&str>,
     agent_flag: Option<&str>,
@@ -1934,6 +1995,22 @@ fn resolve_robot_scope(
     let local = RobotDbHandle::open_local()?;
     let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
     resolve_robot_scope_with_archive_fallback(local, &storage_root, project_flag, agent_flag)
+}
+
+fn resolve_robot_project_scope(
+    project_flag: Option<&str>,
+) -> Result<ResolvedRobotProjectScope, CliError> {
+    let local = RobotDbHandle::open_local()?;
+    let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
+    resolve_robot_project_scope_with_archive_fallback(local, &storage_root, project_flag)
+}
+
+fn resolve_robot_attachments_project_scope(
+    project_flag: Option<&str>,
+) -> Result<ResolvedRobotProjectScope, CliError> {
+    let local = RobotDbHandle::open_local_attachments()?;
+    let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
+    resolve_robot_project_scope_with_archive_fallback(local, &storage_root, project_flag)
 }
 
 /// Format seconds into human-readable relative time.
@@ -6173,29 +6250,27 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             format_output(&env, format)?
         }
         RobotSubcommand::Thread { id, limit, since } => {
-            let conn = crate::open_db_sync_robot()?;
-            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
+            let scope = resolve_robot_project_scope(args.project.as_deref())?;
 
             // For thread command, bodies included in md/json, excluded in toon
             let include_bodies = format != OutputFormat::Toon;
             let data = build_thread(
-                &conn,
-                project_id,
+                scope.conn(),
+                scope.project_id,
                 &id,
                 limit,
                 since.as_deref(),
                 include_bodies,
             )?;
             let mut env = RobotEnvelope::new(cmd_name, format, data);
-            env._meta.project = Some(project_slug);
+            env._meta.project = Some(scope.project_slug);
             format_output_md(&env, format)?
         }
         RobotSubcommand::Message { id } => {
-            let conn = crate::open_db_sync_robot()?;
-            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
-            let data = build_message(&conn, project_id, id)?;
+            let scope = resolve_robot_project_scope(args.project.as_deref())?;
+            let data = build_message(scope.conn(), scope.project_id, id)?;
             let mut env = RobotEnvelope::new(cmd_name, format, data);
-            env._meta.project = Some(project_slug);
+            env._meta.project = Some(scope.project_slug);
             format_output_md(&env, format)?
         }
         RobotSubcommand::Search {
@@ -6555,11 +6630,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             kind,
             source,
         } => {
-            let conn = crate::open_db_sync_robot()?;
-            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
+            let scope = resolve_robot_project_scope(args.project.as_deref())?;
             let events = build_timeline(
-                &conn,
-                project_id,
+                scope.conn(),
+                scope.project_id,
                 since.as_deref(),
                 kind.as_deref(),
                 source.as_deref(),
@@ -6573,7 +6647,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
 
             let count = events.len();
             let mut env = RobotEnvelope::new(cmd_name, format, TimelineData { count, events });
-            env._meta.project = Some(project_slug);
+            env._meta.project = Some(scope.project_slug);
             format_output(&env, format)?
         }
         RobotSubcommand::Overview => {
@@ -6598,10 +6672,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             format_output(&env, format)?
         }
         RobotSubcommand::Analytics => {
-            let conn = crate::open_db_sync_robot()?;
-            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
-            let agent = resolve_optional_agent_id(&conn, project_id, args.agent.as_deref())?;
-            let anomalies = build_analytics(&conn, project_id, agent)?;
+            let scope = resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
+            let anomalies = build_analytics(scope.conn(), scope.project_id, scope.agent.clone())?;
 
             #[derive(Serialize)]
             struct AnalyticsData {
@@ -6618,7 +6690,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     anomalies: anomalies.clone(),
                 },
             );
-            env._meta.project = Some(project_slug);
+            env._meta.project = Some(scope.project_slug);
             for a in &anomalies {
                 env = env.with_alert(&a.severity, &a.headline, Some(a.remediation.clone()));
             }
@@ -6640,9 +6712,8 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             format_output(&env, format)?
         }
         RobotSubcommand::Contacts => {
-            let conn = crate::open_db_sync_robot()?;
-            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
-            let contacts = build_contacts(&conn, project_id)?;
+            let scope = resolve_robot_project_scope(args.project.as_deref())?;
+            let contacts = build_contacts(scope.conn(), scope.project_id)?;
 
             #[derive(Serialize)]
             struct ContactsData {
@@ -6652,7 +6723,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
 
             let count = contacts.len();
             let mut env = RobotEnvelope::new(cmd_name, format, ContactsData { count, contacts });
-            env._meta.project = Some(project_slug);
+            env._meta.project = Some(scope.project_slug);
             format_output(&env, format)?
         }
         RobotSubcommand::Projects => {
@@ -6670,10 +6741,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             format_output(&env, format)?
         }
         RobotSubcommand::Attachments => {
-            let conn = crate::open_db_sync_robot_attachments()?;
-            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
+            let scope = resolve_robot_attachments_project_scope(args.project.as_deref())?;
 
-            let rows = conn
+            let rows = scope
+                .conn()
                 .query_sync(
                     "SELECT m.id, m.subject, m.attachments, a.name AS sender_name, m.created_ts
                      FROM messages m
@@ -6681,7 +6752,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                      WHERE m.project_id = ? AND m.attachments != '[]'
                      ORDER BY m.created_ts DESC
                      LIMIT 100",
-                    &[Value::BigInt(project_id)],
+                    &[Value::BigInt(scope.project_id)],
                 )
                 .map_err(|e| CliError::Other(format!("attachments query: {e}")))?;
 
@@ -6699,7 +6770,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                         sender: sender.clone(),
                         subject: truncate_str(&subject, 60).to_string(),
                         message_id: msg_id,
-                        project: project_slug.clone(),
+                        project: scope.project_slug.clone(),
                     });
                 }
             }
@@ -6713,7 +6784,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let count = attachments.len();
             let mut env =
                 RobotEnvelope::new(cmd_name, format, AttachmentsData { count, attachments });
-            env._meta.project = Some(project_slug);
+            env._meta.project = Some(scope.project_slug);
             format_output(&env, format)?
         }
         RobotSubcommand::Navigate { uri } => {
@@ -10545,6 +10616,98 @@ mod tests {
             scope.agent.as_ref().map(|(_, name)| name.as_str()),
             Some("CoralMarsh")
         );
+    }
+
+    #[test]
+    fn resolve_robot_project_scope_falls_back_to_archive_snapshot_for_missing_project() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let local_db_path = temp_dir.path().join("robot_project_scope_fallback.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(local_db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create projects table");
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key)
+             VALUES (1, 'other-project', '/tmp/other-project')",
+            &empty,
+        )
+        .expect("insert unrelated local project");
+
+        let storage_root = tempfile::tempdir().expect("storage root");
+        let project_dir = storage_root.path().join("projects").join("demo-project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"demo-project","human_key":"/tmp/demo-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+
+        let scope = resolve_robot_project_scope_with_archive_fallback(
+            RobotDbHandle::from_conn(conn),
+            storage_root.path(),
+            Some("/tmp/demo-project"),
+        )
+        .expect("archive fallback should resolve missing project");
+
+        assert_eq!(scope.project_slug, "demo-project");
+        assert!(scope.project_id > 0);
+    }
+
+    #[test]
+    fn resolve_robot_attachments_project_scope_falls_back_to_archive_snapshot_for_missing_project()
+    {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let local_db_path = temp_dir
+            .path()
+            .join("robot_attachment_scope_fallback.sqlite3");
+        let local_db_url = format!("sqlite:///{}", local_db_path.display());
+        let conn = mcp_agent_mail_db::DbConn::open_file(local_db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create projects table");
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key)
+             VALUES (1, 'other-project', '/tmp/other-project')",
+            &empty,
+        )
+        .expect("insert unrelated local project");
+        drop(conn);
+
+        let storage_root = tempfile::tempdir().expect("storage root");
+        let project_dir = storage_root.path().join("projects").join("demo-project");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"demo-project","human_key":"/tmp/demo-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+
+        let storage_root_str = storage_root.path().to_string_lossy().into_owned();
+        let scope = with_navigate_resource_env(&local_db_url, &storage_root_str, || {
+            resolve_robot_attachments_project_scope(Some("/tmp/demo-project"))
+        })
+        .expect("attachment scope should fall back to archive snapshot");
+
+        assert_eq!(scope.project_slug, "demo-project");
+        assert!(scope.project_id > 0);
     }
 
     #[test]

@@ -31,6 +31,8 @@ use std::sync::{
 };
 
 use chrono::{DateTime, Utc};
+use fastmcp::McpErrorCode;
+use fastmcp::prelude::McpContext;
 
 use mcp_agent_mail_core::{AgentDetectError, AgentDetectOptions, Config, resolve_project_identity};
 use mcp_agent_mail_share as share;
@@ -15224,53 +15226,37 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 }
                 ServerToolCall::Unavailable(_) => {}
                 ServerToolCall::Rejected(message) => {
-                    return Err(CliError::Other(format!(
-                        "send_message via server failed: {message}"
-                    )));
+                    if !mail_server_rejection_allows_local_fallback(&message) {
+                        return Err(CliError::Other(format!(
+                            "send_message via server failed: {message}"
+                        )));
+                    }
+                    tracing::debug!(
+                        message = %message,
+                        "mail send fell back to local tool after server scope mismatch"
+                    );
                 }
             }
 
-            let ctx = context::AsyncCliContext::open()?;
-            let cx = asupersync::Cx::for_request();
-            let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
-            let pid = proj.id.unwrap_or(0);
-            let sender_row = resolve_agent_async(&cx, &ctx.pool, pid, &sender).await?;
-
-            // Parse recipients
-            let mut recipients: Vec<(i64, &str)> = Vec::new();
-            for name in &to_names {
-                let agent = resolve_agent_async(&cx, &ctx.pool, pid, name).await?;
-                recipients.push((agent.id.unwrap_or(0), "to"));
-            }
-            if let Some(ref cc_str) = cc {
-                for name in cc_str.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                    let agent = resolve_agent_async(&cx, &ctx.pool, pid, name).await?;
-                    recipients.push((agent.id.unwrap_or(0), "cc"));
-                }
-            }
-
-            let msg = outcome_to_result(
-                mcp_agent_mail_db::queries::create_message_with_recipients(
-                    &cx,
-                    &ctx.pool,
-                    pid,
-                    sender_row.id.unwrap_or(0),
-                    &subject,
-                    &body,
-                    thread_id.as_deref(),
-                    &importance,
-                    ack_required,
-                    "", // attachments
-                    &recipients,
-                )
-                .await,
-            )?;
-
-            let data = message_row_to_json(&msg, &sender);
+            let payload = call_send_message_tool_locally(
+                &project_key,
+                &sender,
+                &to_names,
+                &subject,
+                &body,
+                cc_names.as_deref(),
+                &importance,
+                ack_required,
+                thread_id.as_deref(),
+            )
+            .await?;
+            let data = server_message_payload_to_cli_json(payload).ok_or_else(|| {
+                CliError::Other("unexpected local send_message response shape".to_string())
+            })?;
             output::emit_output(&data, fmt, || {
                 output::success(&format!(
                     "Message sent (id={}) to {}",
-                    msg.id.unwrap_or(0),
+                    data.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
                     to
                 ));
             });
@@ -15328,80 +15314,36 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 }
                 ServerToolCall::Unavailable(_) => {}
                 ServerToolCall::Rejected(message) => {
-                    return Err(CliError::Other(format!(
-                        "reply_message via server failed: {message}"
-                    )));
+                    if !mail_server_rejection_allows_local_fallback(&message) {
+                        return Err(CliError::Other(format!(
+                            "reply_message via server failed: {message}"
+                        )));
+                    }
+                    tracing::debug!(
+                        message = %message,
+                        "mail reply fell back to local tool after server scope mismatch"
+                    );
                 }
             }
 
-            let ctx = context::AsyncCliContext::open()?;
-            let cx = asupersync::Cx::for_request();
-            let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
-            let pid = proj.id.unwrap_or(0);
-            let sender_row = resolve_agent_async(&cx, &ctx.pool, pid, &sender).await?;
-
-            // Get original message to derive thread_id and default recipient
-            let orig = get_message_by_id_async(&cx, &ctx.pool, message_id).await?;
-            ensure_message_in_project(&orig, pid, message_id)?;
-            let thread_id = orig
-                .thread_id
-                .clone()
-                .unwrap_or_else(|| message_id.to_string());
-
-            // Determine recipients
-            let to_names: Vec<String> = if let Some(ref explicit_to) = to {
-                explicit_to
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            } else {
-                // Default to original sender
-                let orig_sender = outcome_to_result(
-                    mcp_agent_mail_db::queries::get_agent_by_id(&cx, &ctx.pool, orig.sender_id)
-                        .await,
-                )?;
-                vec![orig_sender.name.clone()]
-            };
-
-            let mut recipients: Vec<(i64, &str)> = Vec::new();
-            for name in &to_names {
-                let agent = resolve_agent_async(&cx, &ctx.pool, pid, name).await?;
-                recipients.push((agent.id.unwrap_or(0), "to"));
-            }
-
-            // Prefix subject
-            let subject = if orig.subject.len() >= 3
-                && orig.subject.as_bytes()[..3].eq_ignore_ascii_case(b"re:")
-            {
-                orig.subject.clone()
-            } else {
-                format!("Re: {}", orig.subject)
-            };
-
-            let msg = outcome_to_result(
-                mcp_agent_mail_db::queries::create_message_with_recipients(
-                    &cx,
-                    &ctx.pool,
-                    pid,
-                    sender_row.id.unwrap_or(0),
-                    &subject,
-                    &body,
-                    Some(&thread_id),
-                    &orig.importance,
-                    orig.ack_required != 0,
-                    "",
-                    &recipients,
-                )
-                .await,
-            )?;
-
-            let data = message_row_to_json(&msg, &sender);
+            let payload = call_reply_message_tool_locally(
+                &project_key,
+                message_id,
+                &sender,
+                &body,
+                explicit_to.as_deref(),
+            )
+            .await?;
+            let data = server_message_payload_to_cli_json(payload).ok_or_else(|| {
+                CliError::Other("unexpected local reply_message response shape".to_string())
+            })?;
             output::emit_output(&data, fmt, || {
                 output::success(&format!(
                     "Reply sent (id={}, thread={})",
-                    msg.id.unwrap_or(0),
-                    thread_id
+                    data.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
+                    data.get("thread_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
                 ));
             });
             Ok(())
@@ -17094,8 +17036,9 @@ mod mail_server_cli_bridge_tests {
         build_server_reply_message_arguments, build_server_send_message_arguments,
         classify_server_tool_call, coerce_tool_result_json, coerce_tool_result_json_or_error,
         ensure_message_in_project, fetch_inbox_server_rejection_allows_local_fallback,
-        product_inbox_row_to_json, server_inbox_payload_to_cli_json,
-        server_message_payload_to_cli_json, sort_product_inbox_items_desc,
+        mail_server_rejection_allows_local_fallback, product_inbox_row_to_json,
+        server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
+        sort_product_inbox_items_desc,
     };
 
     #[test]
@@ -17423,6 +17366,12 @@ mod mail_server_cli_bridge_tests {
         assert!(fetch_inbox_server_rejection_allows_local_fallback(
             "Project '/tmp/legacy-project' not found"
         ));
+        assert!(fetch_inbox_server_rejection_allows_local_fallback(
+            "agent not found: LegacyReceiver"
+        ));
+        assert!(fetch_inbox_server_rejection_allows_local_fallback(
+            "project not found: /tmp/legacy-project"
+        ));
     }
 
     #[test]
@@ -17431,6 +17380,32 @@ mod mail_server_cli_bridge_tests {
             "JSON-RPC error -32601: method not found; data=null"
         ));
         assert!(!fetch_inbox_server_rejection_allows_local_fallback(
+            "authentication failed (HTTP 401) while calling http://127.0.0.1:8765/mcp/; check AGENT_MAIL_TOKEN/HTTP_BEARER_TOKEN"
+        ));
+    }
+
+    #[test]
+    fn mail_server_rejection_allows_local_fallback_for_missing_scope() {
+        assert!(mail_server_rejection_allows_local_fallback(
+            "Agent 'LegacyReceiver' not found. Project '/tmp/legacy-project' has no registered agents yet. Use register_agent to create an agent identity first."
+        ));
+        assert!(mail_server_rejection_allows_local_fallback(
+            "Project '/tmp/legacy-project' not found"
+        ));
+        assert!(mail_server_rejection_allows_local_fallback(
+            "agent not found: LegacyReceiver"
+        ));
+        assert!(mail_server_rejection_allows_local_fallback(
+            "project not found: /tmp/legacy-project"
+        ));
+    }
+
+    #[test]
+    fn mail_server_rejection_blocks_fallback_for_rpc_or_auth_errors() {
+        assert!(!mail_server_rejection_allows_local_fallback(
+            "JSON-RPC error -32601: method not found; data=null"
+        ));
+        assert!(!mail_server_rejection_allows_local_fallback(
             "authentication failed (HTTP 401) while calling http://127.0.0.1:8765/mcp/; check AGENT_MAIL_TOKEN/HTTP_BEARER_TOKEN"
         ));
     }
@@ -35488,7 +35463,7 @@ fn server_tool_error_is_unavailable(error: &CliError) -> bool {
     }
 }
 
-fn fetch_inbox_server_rejection_allows_local_fallback(message: &str) -> bool {
+fn mail_server_rejection_allows_local_fallback(message: &str) -> bool {
     let lower = message.trim().to_ascii_lowercase();
     if lower.is_empty()
         || lower.starts_with("json-rpc error")
@@ -35500,7 +35475,91 @@ fn fetch_inbox_server_rejection_allows_local_fallback(message: &str) -> bool {
 
     (lower.starts_with("project '") && lower.contains(" not found"))
         || (lower.starts_with("agent '") && lower.contains(" not found"))
+        || lower.starts_with("project not found:")
+        || lower.starts_with("agent not found:")
         || lower.contains("has no registered agents yet")
+}
+
+fn fetch_inbox_server_rejection_allows_local_fallback(message: &str) -> bool {
+    mail_server_rejection_allows_local_fallback(message)
+}
+
+fn mcp_error_to_cli_error(err: fastmcp::prelude::McpError) -> CliError {
+    match err.code {
+        McpErrorCode::InvalidParams | McpErrorCode::ResourceNotFound => {
+            CliError::InvalidArgument(err.message)
+        }
+        _ => CliError::Other(err.message),
+    }
+}
+
+fn parse_tool_json_payload(tool_name: &str, payload: &str) -> CliResult<serde_json::Value> {
+    serde_json::from_str(payload).map_err(|error| {
+        CliError::Other(format!(
+            "local {tool_name} returned invalid JSON payload: {error}"
+        ))
+    })
+}
+
+async fn call_send_message_tool_locally(
+    project_key: &str,
+    sender: &str,
+    to_names: &[String],
+    subject: &str,
+    body: &str,
+    cc_names: Option<&[String]>,
+    importance: &str,
+    ack_required: bool,
+    thread_id: Option<&str>,
+) -> CliResult<serde_json::Value> {
+    let ctx = McpContext::new(asupersync::Cx::for_request(), 1);
+    let payload = mcp_agent_mail_tools::messaging::send_message(
+        &ctx,
+        project_key.to_string(),
+        sender.to_string(),
+        to_names.to_vec(),
+        subject.to_string(),
+        body.to_string(),
+        cc_names.map(|names| names.to_vec()),
+        None,
+        None,
+        None,
+        Some(importance.to_string()),
+        Some(ack_required),
+        thread_id.map(str::to_string),
+        None,
+        None,
+        None,
+    )
+    .await
+    .map_err(mcp_error_to_cli_error)?;
+    parse_tool_json_payload("send_message", &payload)
+}
+
+async fn call_reply_message_tool_locally(
+    project_key: &str,
+    message_id: i64,
+    sender: &str,
+    body: &str,
+    to_names: Option<&[String]>,
+) -> CliResult<serde_json::Value> {
+    let ctx = McpContext::new(asupersync::Cx::for_request(), 1);
+    let payload = mcp_agent_mail_tools::messaging::reply_message(
+        &ctx,
+        project_key.to_string(),
+        message_id,
+        sender.to_string(),
+        body.to_string(),
+        to_names.map(|names| names.to_vec()),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .map_err(mcp_error_to_cli_error)?;
+    parse_tool_json_payload("reply_message", &payload)
 }
 
 fn classify_server_tool_call(

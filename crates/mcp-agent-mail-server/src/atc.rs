@@ -830,6 +830,15 @@ impl EvidenceLedger {
         self.records.iter()
     }
 
+    /// Insert a pre-existing record directly into the ledger (used for replay).
+    pub fn insert_raw(&mut self, record: AtcDecisionRecord) {
+        self.next_id = self.next_id.max(record.id + 1);
+        if self.records.len() >= self.capacity {
+            self.records.pop_front();
+        }
+        self.records.push_back(record);
+    }
+
     /// Number of records in the ledger.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -1668,7 +1677,7 @@ impl AgentRhythm {
         self.var_interval.max(0.0).sqrt()
     }
 
-    /// Suspicion threshold using Tail-Risk DRO (Conditional Value at Risk) 
+    /// Suspicion threshold using Tail-Risk DRO (Conditional Value at Risk)
     /// via a Hill Estimator for the Pareto tail index.
     #[must_use]
     pub fn suspicion_threshold(&self, k: f64) -> f64 {
@@ -1681,7 +1690,7 @@ impl AgentRhythm {
 
         // Top 20% for tail estimation
         let tail_count = (sorted.len() / 5).max(3);
-        let threshold_val = sorted[tail_count].max(1.0); 
+        let threshold_val = sorted[tail_count].max(1.0);
 
         let mut sum_log_ratio = 0.0;
         for i in 0..tail_count {
@@ -1691,14 +1700,14 @@ impl AgentRhythm {
         let tail_index = if sum_log_ratio > 0.0 {
             (tail_count as f64) / sum_log_ratio
         } else {
-            2.0 
+            2.0
         };
 
         // Ensure alpha > 1.0 for valid CVaR
         let alpha = tail_index.max(1.05);
 
         // Map k to a quantile q (e.g. k=3 -> 0.99)
-        let q = 1.0 - (0.03 / k.max(1.0)); 
+        let q = 1.0 - (0.03 / k.max(1.0));
 
         let tail_prob = (tail_count as f64) / (sorted.len() as f64);
 
@@ -3727,7 +3736,7 @@ impl AtcSlowControllerState {
         // Target: utilization < 0.75 and minimal debt
         let target_utilization = 0.75;
         let debt_ratio = self.budget_debt_micros / u64_to_f64(tick_budget_micros.max(1));
-        
+
         // Error is positive when we have slack (under-utilized, no debt)
         // Error is negative when overloaded (over-utilized, high debt)
         let mut error = target_utilization - utilization_ratio - (0.5 * debt_ratio);
@@ -3742,7 +3751,7 @@ impl AtcSlowControllerState {
         let nominal_bias = 0.5;
 
         // Update fraction with PI output (position form)
-        self.probe_budget_fraction = (nominal_bias + p_term + i_term).clamp(0.05, 1.0);        
+        self.probe_budget_fraction = (nominal_bias + p_term + i_term).clamp(0.05, 1.0);
         // Map fraction to discrete probe limit
         let float_limit = (self.probe_budget_fraction * usize_to_f64(baseline_probe_limit)).round();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -5367,22 +5376,24 @@ impl AtcEngine {
                 let subject = cycle.join(" → ");
                 let evidence_summary =
                     format!("deterministic deadlock cycle in {project}: {subject}");
-                    
+
                 // Causal Bottleneck Analysis
                 let mut best_target = cycle[0].clone();
                 let mut max_score = -1.0;
                 let graph = self.conflict_graphs.get(project);
 
                 for agent in cycle {
-                    let survival_rate = self.agents.get(agent)
+                    let survival_rate = self
+                        .agents
+                        .get(agent)
                         .map(|e| e.core.posterior_probability(LivenessState::Alive))
                         .unwrap_or(1.0);
-                        
+
                     let vcg_priority = graph
                         .and_then(|g| g.hard_edges.get(agent))
                         .map(|edges| edges.len() as f64)
                         .unwrap_or(1.0);
-                        
+
                     // Score = Expected wait reduction weighted by probability they are already stuck/dead
                     let score = vcg_priority * (1.0 - survival_rate + 0.01);
                     if score > max_score {
@@ -5397,7 +5408,7 @@ impl AtcEngine {
                     subject: &subject,
                     policy_id: None,
                     posterior: Vec::new(),
-                    action: "ForceRelease",
+                    action: "AdvisoryMessage",
                     expected_loss: 0.0,
                     runner_up_loss: 0.0,
                     loss_table: Vec::new(),
@@ -5407,44 +5418,35 @@ impl AtcEngine {
                     fallback_reason: decision_fallback_reason.as_deref(),
                     timestamp_micros: now_micros,
                 });
-                
-                if !decision_fallback_active {
-                    actions.push(AtcTickAction::ReleaseReservations {
-                        agent: best_target.clone(),
+
+                // Deadlock cycles remain advisory-only unless independent liveness evidence
+                // supports a reservation release. The semantics and operator guidance for
+                // deadlock remediation are explicitly manual/stale-holder review, so do not
+                // auto-release a live agent merely because they participate in a cycle.
+                let fallback_suffix = decision_fallback_reason
+                    .as_deref()
+                    .map_or_else(String::new, |reason| {
+                        format!(" Automated release remains disabled while {reason}.")
                     });
-                    if let Some(effect) = self.effect_plan_for_decision_id(
-                        decision_id,
-                        now_micros,
-                        "release_reservations_requested",
-                        "conflict",
-                        "deadlock_remediation",
-                        best_target,
-                        Some(project.clone()),
-                        Some(format!("[ATC] Causal bottleneck released to break cycle: {subject}")),
-                    ) {
-                        effects.push(effect);
-                    }
-                } else {
-                    let message = format!(
-                        "[ATC] Deadlock in {project}: {subject}. Targeted {} for release, but safe mode is active.",
-                        best_target
-                    );
-                    actions.push(AtcTickAction::SendAdvisory {
-                        agent: best_target.clone(),
-                        message: message.clone(),
-                    });
-                    if let Some(effect) = self.effect_plan_for_decision_id(
-                        decision_id,
-                        now_micros,
-                        "send_advisory",
-                        "conflict",
-                        "deadlock_remediation",
-                        best_target,
-                        Some(project.clone()),
-                        Some(message),
-                    ) {
-                        effects.push(effect);
-                    }
+                let message = format!(
+                    "[ATC] Deadlock in {project}: {subject}. {} is the likeliest stale-holder bottleneck; inspect the cycle and release only inactive work if safe.{}",
+                    best_target, fallback_suffix
+                );
+                actions.push(AtcTickAction::SendAdvisory {
+                    agent: best_target.clone(),
+                    message: message.clone(),
+                });
+                if let Some(effect) = self.effect_plan_for_decision_id(
+                    decision_id,
+                    now_micros,
+                    "send_advisory",
+                    "conflict",
+                    "deadlock_remediation",
+                    best_target,
+                    Some(project.clone()),
+                    Some(message),
+                ) {
+                    effects.push(effect);
                 }
             }
         }
@@ -5588,7 +5590,10 @@ impl AtcEngine {
         let mut withheld_releases = Vec::new();
         if let Some(conformal_lock) = ATC_CONFORMAL.get()
             && let Ok(conformal) = conformal_lock.lock()
-            && conformal.is_uncertain(AtcSubsystem::Liveness, self.liveness_core.max_possible_loss())
+            && conformal.is_uncertain(
+                AtcSubsystem::Liveness,
+                self.liveness_core.max_possible_loss(),
+            )
         {
             actions.retain(|action| match action {
                 AtcTickAction::ReleaseReservations { agent } => {
@@ -8127,7 +8132,8 @@ impl SubsystemConformal {
     #[must_use]
     pub fn is_uncertain(&self, max_possible_loss: f64) -> bool {
         // Uncertainty threshold is 20% of the maximum possible loss
-        self.interval_width().is_some_and(|w| w > max_possible_loss * 0.20)
+        self.interval_width()
+            .is_some_and(|w| w > max_possible_loss * 0.20)
     }
 }
 
@@ -8573,16 +8579,36 @@ impl AtcEngine {
                 ReplayEvent::Decision(record) => {
                     if record.subsystem == AtcSubsystem::Liveness {
                         if let Some(entry) = self.agents.get_mut(&record.subject) {
-                            entry.core.posterior = record.posterior.clone();
+                            let parsed_posterior: Vec<(LivenessState, f64)> = record
+                                .posterior
+                                .iter()
+                                .filter_map(|(s, p)| {
+                                    let state = match s.as_str() {
+                                        "Alive" => LivenessState::Alive,
+                                        "Flaky" => LivenessState::Flaky,
+                                        "Dead" => LivenessState::Dead,
+                                        _ => return None,
+                                    };
+                                    Some((state, *p))
+                                })
+                                .collect();
+                            entry.core.posterior = parsed_posterior;
                         }
                     }
                     self.ledger.insert_raw(record);
                 }
-                ReplayEvent::Feedback { decision_id, actual_loss } => {
-                    if let Some(record) = self.ledger.get_by_id(decision_id).cloned() {
+                ReplayEvent::Feedback {
+                    decision_id,
+                    actual_loss,
+                } => {
+                    if let Some(record) = self.ledger.get(decision_id).cloned() {
                         if let Some(conformal_lock) = ATC_CONFORMAL.get() {
                             if let Ok(mut conformal) = conformal_lock.lock() {
-                                conformal.observe(record.subsystem, record.expected_loss, actual_loss);
+                                conformal.observe(
+                                    record.subsystem,
+                                    record.expected_loss,
+                                    actual_loss,
+                                );
                             }
                         }
                     }
@@ -8590,23 +8616,48 @@ impl AtcEngine {
                 ReplayEvent::Activity(synthesis_event) => {
                     self.session_summary.absorb(&synthesis_event);
                     match synthesis_event {
-                        SynthesisEvent::MessageSent { ref from, timestamp_micros, .. } => {
-                            self.observe_agent_activity(from, timestamp_micros);
+                        SynthesisEvent::MessageSent {
+                            ref from,
+                            timestamp_micros,
+                            ..
+                        } => {
+                            self.observe_activity(from, None, timestamp_micros);
                         }
-                        SynthesisEvent::MessageReceived { ref agent, timestamp_micros } => {
-                            self.observe_agent_activity(agent, timestamp_micros);
+                        SynthesisEvent::MessageReceived {
+                            ref agent,
+                            timestamp_micros,
+                        } => {
+                            self.observe_activity(agent, None, timestamp_micros);
                         }
-                        SynthesisEvent::ReservationGranted { ref agent, timestamp_micros } => {
-                            self.observe_agent_activity(agent, timestamp_micros);
+                        SynthesisEvent::ReservationGranted {
+                            ref agent,
+                            timestamp_micros,
+                        } => {
+                            self.observe_activity(agent, None, timestamp_micros);
                         }
-                        SynthesisEvent::ReservationReleased { ref agent, timestamp_micros } => {
-                            self.observe_agent_activity(agent, timestamp_micros);
+                        SynthesisEvent::ReservationReleased {
+                            ref agent,
+                            timestamp_micros,
+                        } => {
+                            self.observe_activity(agent, None, timestamp_micros);
                         }
                         _ => {}
                     }
                 }
-                ReplayEvent::Tick { total_micros, tick_budget_micros, utilization_ratio, budget_exceeded, baseline_probe_limit } => {
-                    self.slow_controller.note_tick(total_micros, tick_budget_micros, utilization_ratio, budget_exceeded, baseline_probe_limit);
+                ReplayEvent::Tick {
+                    total_micros,
+                    tick_budget_micros,
+                    utilization_ratio,
+                    budget_exceeded,
+                    baseline_probe_limit,
+                } => {
+                    self.slow_controller.note_tick(
+                        total_micros,
+                        tick_budget_micros,
+                        utilization_ratio,
+                        budget_exceeded,
+                        baseline_probe_limit,
+                    );
                 }
             }
         }
@@ -9733,6 +9784,69 @@ mod alien_enhancement_tests {
             engine.agent_liveness("ConformalTick"),
             Some(LivenessState::Dead),
             "suppressed release should not leave the agent in Dead state"
+        );
+    }
+
+    #[test]
+    fn deadlock_cycles_remain_advisory_without_independent_dead_agent_evidence() {
+        let mut engine = AtcEngine::new_for_testing();
+        let mut graph = ProjectConflictGraph::default();
+        graph.generation = 1;
+        graph.hard_edges.insert(
+            "AgentA".to_string(),
+            vec![HardEdge {
+                holder: "AgentA".to_string(),
+                blocked: "AgentB".to_string(),
+                contested_patterns: vec!["src/lib.rs".to_string()],
+                since: 1,
+            }],
+        );
+        graph.hard_edges.insert(
+            "AgentB".to_string(),
+            vec![HardEdge {
+                holder: "AgentB".to_string(),
+                blocked: "AgentA".to_string(),
+                contested_patterns: vec!["src/main.rs".to_string()],
+                since: 2,
+            }],
+        );
+        engine
+            .conflict_graphs
+            .insert("deadlock-project".to_string(), graph);
+        engine.dirty_projects.insert("deadlock-project".to_string());
+
+        let report = engine.run_tick(1_700_000_000_000_000);
+        assert!(
+            !report
+                .actions
+                .iter()
+                .any(|action| matches!(action, AtcTickAction::ReleaseReservations { .. })),
+            "deadlock remediation should not auto-release reservations without separate liveness evidence"
+        );
+        assert!(
+            report.actions.iter().any(|action| matches!(
+                action,
+                AtcTickAction::SendAdvisory { agent, message }
+                    if (agent == "AgentA" || agent == "AgentB")
+                        && message.contains("Deadlock in deadlock-project")
+                        && message.contains("release only inactive work")
+            )),
+            "deadlock remediation should emit a targeted advisory instead"
+        );
+        assert!(
+            !report
+                .effects
+                .iter()
+                .any(|effect| effect.kind == "release_reservations_requested"),
+            "deadlock remediation effects must stay advisory-only"
+        );
+        assert!(
+            report.effects.iter().any(|effect| {
+                effect.kind == "send_advisory"
+                    && effect.category == "conflict"
+                    && effect.semantics.family == "deadlock_remediation"
+            }),
+            "deadlock remediation should still publish a durable advisory effect"
         );
     }
 

@@ -336,6 +336,29 @@ fn send_with_retries(
     }))
 }
 
+fn probe_ip_is_internal(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => probe_ipv4_is_internal(v4),
+        std::net::IpAddr::V6(v6) => probe_ipv6_is_internal(v6),
+    }
+}
+
+fn probe_ipv4_is_internal(ip: std::net::Ipv4Addr) -> bool {
+    ip.is_private() || ip.is_loopback() || ip.is_unspecified() || ip.is_link_local()
+}
+
+fn probe_ipv6_is_internal(ip: std::net::Ipv6Addr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() {
+        return true;
+    }
+    if let Some(mapped) = ip.to_ipv4_mapped() {
+        return probe_ipv4_is_internal(mapped);
+    }
+    let s0 = ip.segments()[0];
+    // ULA (fc00::/7) or link-local (fe80::/10)
+    (s0 & 0xfe00 == 0xfc00) || (s0 & 0xffc0 == 0xfe80)
+}
+
 /// Perform a single HTTP GET request (no redirect following, no retry).
 fn probe_single_get(
     parsed: &ParsedUrl,
@@ -365,15 +388,7 @@ fn probe_single_get(
 
     // Reject probes to private/loopback/link-local addresses (SSRF protection).
     let ip = resolved.ip();
-    if ip.is_loopback()
-        || ip.is_unspecified()
-        || matches!(ip, std::net::IpAddr::V4(v4) if v4.is_private() || v4.is_link_local())
-        || matches!(ip, std::net::IpAddr::V6(v6) if {
-            let s0 = v6.segments()[0];
-            // ULA (fc00::/7) or link-local (fe80::/10)
-            (s0 & 0xfe00 == 0xfc00) || (s0 & 0xffc0 == 0xfe80)
-        })
-    {
+    if probe_ip_is_internal(ip) {
         return Err(ProbeError::ConnectionError {
             detail: format!(
                 "probing private/internal address {} is not allowed",
@@ -1200,6 +1215,17 @@ mod tests {
     #[test]
     fn sanitize_header_value_replaces_other_control_bytes() {
         assert_eq!(sanitized_header_value("agent\x00\x7f\tok"), "agent   ok");
+    }
+
+    #[test]
+    fn internal_probe_classifier_rejects_ipv4_mapped_loopback() {
+        let ip = "::ffff:127.0.0.1"
+            .parse::<std::net::Ipv6Addr>()
+            .expect("parse mapped loopback");
+        assert!(
+            probe_ipv6_is_internal(ip),
+            "IPv4-mapped loopback addresses must be rejected by SSRF filtering"
+        );
     }
 
     #[test]

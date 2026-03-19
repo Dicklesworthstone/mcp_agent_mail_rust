@@ -3070,8 +3070,8 @@ enum AtcExecutorMode {
 
 impl AtcExecutorMode {
     fn from_env() -> Self {
-        match std::env::var("AM_ATC_EXECUTOR_MODE")
-            .ok()
+        match mcp_agent_mail_core::config::full_env_value("AM_ATC_EXECUTOR_MODE")
+            .as_deref()
             .map(|value| value.trim().to_ascii_lowercase())
             .as_deref()
         {

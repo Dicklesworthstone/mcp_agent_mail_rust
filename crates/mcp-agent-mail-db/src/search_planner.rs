@@ -433,6 +433,11 @@ impl SearchCursor {
         let hex = score_part.strip_prefix('s')?;
         let bits = u64::from_str_radix(hex, 16).ok()?;
         let score = f64::from_bits(bits);
+        // Reject non-finite scores (NaN/Infinity from crafted tokens) —
+        // they cause silent pagination failure in SQL comparisons.
+        if !score.is_finite() {
+            return None;
+        }
         let id = id_part.parse::<i64>().ok()?;
         Some(Self { score, id })
     }
