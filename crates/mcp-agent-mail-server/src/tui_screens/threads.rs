@@ -1121,7 +1121,8 @@ impl ThreadExplorerScreen {
         let cursor_clamped = self.cursor.min(total.saturating_sub(1));
         let (start, end) = viewport_range(total, visible_height, cursor_clamped);
         let viewport_len = end.saturating_sub(start);
-        let show_subject = visible_height > viewport_len * 2 || viewport_len <= 5;
+        let show_subject = (visible_height > viewport_len * 2 || viewport_len <= 5)
+            && (inner.width as usize) >= THREAD_SUBJECT_LINE_MIN_WIDTH;
         let idx = if show_subject {
             start.saturating_add(rel_y / 2)
         } else {
@@ -3772,7 +3773,10 @@ fn render_thread_detail(
     });
 
     let visible_height = usize::from(preview_content.height).max(1);
-    let max_scroll = preview_lines.len().saturating_sub(visible_height);
+    // Use a generous upper bound for max_scroll to ensure all word-wrapped
+    // content is reachable. The exact wrapped line count is hard to compute
+    // without rendering, so we use 3x the logical line count.
+    let max_scroll = preview_lines.len().saturating_mul(3).saturating_sub(visible_height);
     max_scroll_cell.set(max_scroll);
 
     let clamped_scroll = scroll.min(max_scroll);

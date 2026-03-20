@@ -275,6 +275,12 @@ impl ArchiveBrowserScreen {
         }
     }
 
+    fn preview_max_scroll(&self) -> u16 {
+        self.preview_content
+            .as_ref()
+            .map_or(0, |c| u16::try_from(c.lines().count().saturating_sub(5)).unwrap_or(u16::MAX))
+    }
+
     fn clear_preview(&mut self) {
         self.preview_content = None;
         self.preview_path.clear();
@@ -814,13 +820,15 @@ impl ArchiveBrowserScreen {
                 self.preview_focused = false;
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                self.preview_scroll = self.preview_scroll.saturating_add(1);
+                let max = self.preview_max_scroll();
+                self.preview_scroll = self.preview_scroll.saturating_add(1).min(max);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.preview_scroll = self.preview_scroll.saturating_sub(1);
             }
             KeyCode::Char('d') if key.modifiers.contains(Modifiers::CTRL) => {
-                self.preview_scroll = self.preview_scroll.saturating_add(20);
+                let max = self.preview_max_scroll();
+                self.preview_scroll = self.preview_scroll.saturating_add(20).min(max);
             }
             KeyCode::Char('u') if key.modifiers.contains(Modifiers::CTRL) => {
                 self.preview_scroll = self.preview_scroll.saturating_sub(20);

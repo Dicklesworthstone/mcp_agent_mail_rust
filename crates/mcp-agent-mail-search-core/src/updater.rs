@@ -66,6 +66,7 @@ static UPDATER_LOCK_POISON_LOGGED: AtomicBool = AtomicBool::new(false);
 struct PendingState {
     changes: VecDeque<DocChange>,
     last_flush: Instant,
+    retry_pending: bool,
     stats: UpdaterStats,
 }
 
@@ -84,6 +85,7 @@ impl IncrementalUpdater {
             pending: Mutex::new(PendingState {
                 changes: VecDeque::new(),
                 last_flush: Instant::now(),
+                retry_pending: false,
                 stats: UpdaterStats::default(),
             }),
         }
@@ -156,7 +158,8 @@ impl IncrementalUpdater {
         if state.changes.is_empty() {
             return false;
         }
-        state.changes.len() >= self.config.batch_size
+        state.retry_pending
+            || state.changes.len() >= self.config.batch_size
             || state.last_flush.elapsed() >= self.config.flush_interval
     }
 
@@ -178,6 +181,9 @@ impl IncrementalUpdater {
     pub fn flush(&self, backend: &dyn IndexLifecycle) -> SearchResult<usize> {
         let changes: Vec<DocChange> = {
             let mut state = self.lock_pending_state();
+            // We are actively attempting any queued retry now; only a newly
+            // unapplied tail should keep the immediate-retry signal set.
+            state.retry_pending = false;
             state.changes.drain(..).collect()
         };
 
@@ -216,6 +222,7 @@ impl IncrementalUpdater {
             for change in changes.iter().skip(applied_clamped).rev() {
                 state.changes.push_front(change.clone());
             }
+            state.retry_pending = true;
         }
 
         let duration = start.elapsed();
@@ -223,6 +230,9 @@ impl IncrementalUpdater {
         {
             let mut state = self.lock_pending_state();
             state.last_flush = Instant::now();
+            if state.changes.is_empty() {
+                state.retry_pending = false;
+            }
             state.stats.total_applied += applied_clamped as u64;
             state.stats.flush_count += 1;
             state.stats.last_flush_duration = Some(duration);
@@ -234,6 +244,7 @@ impl IncrementalUpdater {
     /// Drain pending changes without applying them (for testing or shutdown)
     pub fn drain(&self) -> Vec<DocChange> {
         let mut state = self.lock_pending_state();
+        state.retry_pending = false;
         state.changes.drain(..).collect()
     }
 }
@@ -1180,5 +1191,59 @@ mod tests {
         let stats = updater.stats();
         assert_eq!(stats.total_applied, 1);
         assert_eq!(stats.flush_count, 1);
+    }
+
+    #[test]
+    fn partial_flush_marks_remaining_work_ready_for_immediate_retry() {
+        let updater = IncrementalUpdater::with_config(UpdaterConfig {
+            batch_size: 100,
+            flush_interval: Duration::from_hours(1),
+            ..UpdaterConfig::default()
+        });
+        let backend = PartialLifecycle {
+            applied_per_call: 1,
+        };
+
+        assert!(updater.on_message_upsert(&sample_message_row()));
+        assert!(updater.on_agent_upsert(&sample_agent_row()));
+
+        assert!(!updater.should_flush());
+        let applied = updater
+            .flush(&backend)
+            .expect("partial flush should succeed");
+        assert_eq!(applied, 1);
+        assert!(
+            updater.should_flush(),
+            "unapplied tail should remain immediately retryable"
+        );
+    }
+
+    #[test]
+    fn drain_clears_partial_retry_signal() {
+        let updater = IncrementalUpdater::with_config(UpdaterConfig {
+            batch_size: 100,
+            flush_interval: Duration::from_hours(1),
+            ..UpdaterConfig::default()
+        });
+        let backend = PartialLifecycle {
+            applied_per_call: 1,
+        };
+
+        assert!(updater.on_message_upsert(&sample_message_row()));
+        assert!(updater.on_agent_upsert(&sample_agent_row()));
+        updater
+            .flush(&backend)
+            .expect("partial flush should succeed");
+        assert!(updater.should_flush());
+
+        let drained = updater.drain();
+        assert_eq!(drained.len(), 1);
+        assert!(!updater.should_flush());
+
+        assert!(updater.on_project_upsert(&sample_project_row()));
+        assert!(
+            !updater.should_flush(),
+            "new work after a drain should use normal flush thresholds"
+        );
     }
 }
