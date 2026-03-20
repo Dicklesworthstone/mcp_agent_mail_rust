@@ -35634,7 +35634,10 @@ pub fn check_inbox_direct(config: &CheckInboxDirectConfig) -> CliResult<CheckInb
         ));
     }
 
-    let conn = open_db_sync_mail_inbox()?;
+    let conn = mcp_agent_mail_db::guard_db_conn(
+        open_db_sync_mail_inbox()?,
+        "check_inbox_direct metadata connection",
+    );
     let project_id = crate::context::resolve_project(&conn, &config.project_key)?.id;
     let agent_id = resolve_agent_id_for_inbox_check(&conn, project_id, &config.agent_name)?;
     let sqlite_path = mcp_agent_mail_db::DbPoolConfig::from_env()
@@ -35703,7 +35706,10 @@ fn fetch_mail_inbox_direct_with_database_url(
     include_bodies: bool,
 ) -> CliResult<Vec<serde_json::Value>> {
     let validated_limit = validate_mail_inbox_limit(limit)?;
-    let conn = open_db_sync_mail_inbox_with_database_url(database_url)?;
+    let conn = mcp_agent_mail_db::guard_db_conn(
+        open_db_sync_mail_inbox_with_database_url(database_url)?,
+        "fetch_mail_inbox_direct metadata connection",
+    );
     let project = crate::context::resolve_project(&conn, project_key)?;
     let agent = crate::context::resolve_agent(&conn, project.id, agent_name)?;
     let sqlite_path = mcp_agent_mail_db::DbPoolConfig {

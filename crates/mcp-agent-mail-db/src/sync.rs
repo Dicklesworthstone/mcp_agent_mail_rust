@@ -311,7 +311,9 @@ pub fn mark_messages_read_batch_sync(
     message_ids: &[i64],
 ) -> Result<(), DbError> {
     let conn = open_sync_conn(sqlite_path)?;
-    mark_messages_read_batch_sync_conn(&conn, agent_id, message_ids)
+    let result = mark_messages_read_batch_sync_conn(&conn, agent_id, message_ids);
+    crate::close_db_conn(conn, "mark_messages_read_batch_sync connection");
+    result
 }
 
 fn begin_sync_write_tx(conn: &DbConn) -> Result<(), DbError> {
