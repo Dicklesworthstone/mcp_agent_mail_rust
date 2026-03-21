@@ -949,9 +949,9 @@ impl DashboardScreen {
     fn should_render_bottom_rail(
         quick_query: &str,
         preview: Option<&RecentMessagePreview>,
-        _force_dense_surface: bool,
+        force_dense_surface: bool,
     ) -> bool {
-        !quick_query.trim().is_empty() || preview.is_some()
+        !quick_query.trim().is_empty() || preview.is_some() || force_dense_surface
     }
 
     /// Build the `ReactiveLayout` for the main content area.
@@ -1133,10 +1133,13 @@ const fn should_enable_mega_dashboard_density(main_area: Rect) -> bool {
 
 const fn should_render_console_log_panel(
     manual_enabled: bool,
-    mega_dense_surface: bool,
-    console_log_lines: usize,
+    _mega_dense_surface: bool,
+    _console_log_lines: usize,
 ) -> bool {
-    manual_enabled || (mega_dense_surface && console_log_lines > 0)
+    // Only show the console log panel when the user explicitly toggles it
+    // with `L`. Auto-enabling it on large terminals displaces the far more
+    // useful recent-message preview rail.
+    manual_enabled
 }
 
 impl Default for DashboardScreen {

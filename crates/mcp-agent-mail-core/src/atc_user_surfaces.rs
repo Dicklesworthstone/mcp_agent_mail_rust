@@ -444,6 +444,7 @@ pub const NOISE_POLICIES: &[NoisePolicy] = &[
 
 /// Safe defaults for surface behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct SafeDefaults {
     /// Default view mode (summary vs. drill-down).
     pub default_view: ViewMode,
@@ -586,8 +587,11 @@ pub const GOLDEN_WORKFLOWS: &[GoldenWorkflow] = &[
 // Surface card builder
 // ──────────────────────────────────────────────────────────────────────
 
-/// Build a surface card for the given state and context.
+/// Build a summary card for a surface state.
+///
+/// This consolidates the state into a quick-glance representation.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn build_surface_card(
     state: SurfaceState,
     headline: String,

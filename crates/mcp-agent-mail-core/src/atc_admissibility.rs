@@ -182,7 +182,6 @@ fn denial_code_for_failed_gate(
 ) -> DenialCode {
     match gate_name {
         "rollback" => DenialCode::RollbackActive,
-        "calibration" => DenialCode::CalibrationUnhealthy,
         "risk_budget" => DenialCode::RiskBudgetExhausted,
         "regime" => DenialCode::RegimeUnstable,
         "evidence_quality" => DenialCode::EvidenceQualityLow,
@@ -201,6 +200,7 @@ fn denial_code_for_failed_gate(
 ///
 /// Returns whether the action is admitted and detailed gate results.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn evaluate_admissibility(ctx: &AdmissibilityContext) -> AdmissibilityResult {
     let tier = ActionTier::from_effect_kind(ctx.effect_kind);
     let mut gates = Vec::new();

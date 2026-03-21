@@ -1913,7 +1913,7 @@ impl ProjectConflictGraph {
                     return true;
                 }
                 if clear_all {
-                    removed = removed.saturating_add(1);
+                    removed = removed.saturating_add(edge.contested_patterns.len().max(1));
                     return false;
                 }
                 let before = edge.contested_patterns.len();

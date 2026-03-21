@@ -80,7 +80,6 @@ impl EffectRiskClass {
     pub fn for_family(family: &str) -> Self {
         match family {
             "liveness_monitoring" | "withheld_release_notice" => Self::LowRiskNudge,
-            "liveness_probe" | "deadlock_remediation" | "release_notice" => Self::MediumRiskCheck,
             "reservation_release" => Self::HighRiskIntervention,
             _ => Self::MediumRiskCheck, // unknown defaults to medium
         }
@@ -137,6 +136,7 @@ impl std::fmt::Display for EffectRiskClass {
 
 /// Runtime context for precondition checking.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct PreconditionContext {
     /// Whether the project context is available.
     pub has_project_context: bool,
@@ -185,6 +185,7 @@ pub struct PreconditionFailure {
 /// Returns a `PreconditionResult` documenting which checks passed
 /// and which failed. The effect should only proceed if `result.passed`.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn validate_preconditions(family: &str, context: &PreconditionContext) -> PreconditionResult {
     let mut failures = Vec::new();
     let mut total = 0u32;
@@ -540,8 +541,7 @@ impl EscalationLevel {
         match self {
             Self::None => Self::Advisory,
             Self::Advisory => Self::Probe,
-            Self::Probe => Self::Release,
-            Self::Release => Self::Release, // terminal
+            Self::Probe | Self::Release => Self::Release, // terminal
         }
     }
 
@@ -556,10 +556,9 @@ impl EscalationLevel {
     #[must_use]
     pub const fn escalation_threshold(self) -> u32 {
         match self {
-            Self::None => 0,     // first advisory is free
             Self::Advisory => 3, // 3 unanswered advisories → escalate to probe
             Self::Probe => 2,    // 2 unanswered probes → escalate to release
-            Self::Release => 0,  // terminal, no further escalation
+            Self::None | Self::Release => 0,  // first advisory is free, terminal has no escalation
         }
     }
 }

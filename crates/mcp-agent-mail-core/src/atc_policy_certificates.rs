@@ -1040,6 +1040,7 @@ pub struct CertificateInput {
 /// every gate check and collects all block reasons (not short-circuiting)
 /// so the certificate documents the complete failure picture.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn evaluate_certificate(input: CertificateInput) -> PolicyPromotionCertificate {
     let mut block_reasons = Vec::new();
 

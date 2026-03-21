@@ -126,12 +126,15 @@ fn first_literal_segment_end(norm: &str) -> Option<usize> {
 }
 
 fn is_directory_prefix(prefix: &str, full: &str) -> bool {
-    prefix.is_empty()
-        || (full.starts_with(prefix)
-            && full
-                .as_bytes()
-                .get(prefix.len())
-                .is_some_and(|b| *b == b'/'))
+    if prefix.is_empty() {
+        return true;
+    }
+    let is_prefix = if cfg!(any(target_os = "macos", target_os = "windows")) {
+        full.len() >= prefix.len() && full[..prefix.len()].eq_ignore_ascii_case(prefix)
+    } else {
+        full.starts_with(prefix)
+    };
+    is_prefix && full.as_bytes().get(prefix.len()).is_some_and(|b| *b == b'/')
 }
 
 impl CompiledPattern {
@@ -239,7 +242,12 @@ impl CompiledPattern {
 
     #[must_use]
     pub fn overlaps(&self, other: &Self) -> bool {
-        if self.norm == other.norm {
+        let exact_match = if cfg!(any(target_os = "macos", target_os = "windows")) {
+            self.norm.eq_ignore_ascii_case(&other.norm)
+        } else {
+            self.norm == other.norm
+        };
+        if exact_match {
             return true;
         }
 
@@ -274,9 +282,17 @@ impl CompiledPattern {
         if let (Some(left_end), Some(right_end)) = (
             self.first_literal_segment_end,
             other.first_literal_segment_end,
-        ) && self.norm[..left_end] != other.norm[..right_end]
-        {
-            return false;
+        ) {
+            let left_seg = &self.norm[..left_end];
+            let right_seg = &other.norm[..right_end];
+            let mismatch = if cfg!(any(target_os = "macos", target_os = "windows")) {
+                !left_seg.eq_ignore_ascii_case(right_seg)
+            } else {
+                left_seg != right_seg
+            };
+            if mismatch {
+                return false;
+            }
         }
 
         // 2. Heuristic check for intersecting paths/globs

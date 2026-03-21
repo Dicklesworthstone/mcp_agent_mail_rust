@@ -187,6 +187,7 @@ impl DebtLedger {
     }
 
     /// Add a new debt entry to the ledger.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_debt(
         &mut self,
         action_family: String,
@@ -752,6 +753,17 @@ impl ExperimentBudgetTable {
             return 0.0;
         }
         self.global_experiment_count as f64 / self.global_action_count as f64
+    }
+
+    /// Effective experiment rate (as a fraction), accounting for the global cap.
+    #[must_use]
+    pub fn effective_experiment_rate(&self) -> f64 {
+        if self.global_action_count == 0 {
+            0.0
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            (self.global_experiment_count as f64 / self.global_action_count as f64)
+        }
     }
 }
 

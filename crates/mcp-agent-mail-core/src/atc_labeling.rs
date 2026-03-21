@@ -482,9 +482,10 @@ fn label_open_or_executed(input: &LabelingInput) -> LabelingResult {
 }
 
 /// Label a non-execution experience (Throttled, Suppressed, Skipped).
+#[must_use]
+#[allow(clippy::too_many_lines)]
 fn label_non_execution(input: &LabelingInput) -> LabelingResult {
-    let window = attribution_window(input.effect_kind);
-    let anchor = input.created_ts_micros;
+    let mut reasons = Vec::new();
 
     if input.subject_departed {
         return LabelingResult {

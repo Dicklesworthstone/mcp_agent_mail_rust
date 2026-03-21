@@ -162,6 +162,9 @@ impl AgentContaminationTracker {
         ts_micros: i64,
         window_duration_micros: i64,
     ) -> Vec<ContaminationSignal> {
+        const MIN_BURST_OBSERVATION_MICROS: i64 = 1_000_000; // 1 second
+        const MIN_BURST_EVENT_COUNT: u32 = 3;
+
         let mut signals = Vec::new();
 
         // Check for burst. Use saturating_sub to handle clock skew safely.
@@ -179,8 +182,6 @@ impl AgentContaminationTracker {
         // rate from near-instant events is 3/min × 60 = 180/min — still a
         // valid signal. True bursts (11 events in 10s = 66/min) are detected
         // reliably once the 1-second floor is passed.
-        const MIN_BURST_OBSERVATION_MICROS: i64 = 1_000_000; // 1 second
-        const MIN_BURST_EVENT_COUNT: u32 = 3;
         let events_per_minute =
             if self.event_count_in_window >= MIN_BURST_EVENT_COUNT && window_duration_micros > 0 {
                 let actual_elapsed = ts_micros.saturating_sub(self.window_start_micros);

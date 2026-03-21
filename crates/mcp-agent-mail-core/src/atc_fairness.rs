@@ -464,6 +464,7 @@ impl FairnessSnapshot {
     /// Assess whether assigning more burden to `target` is fair enough to
     /// allow, merely penalize, or veto.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn assess_candidate(
         &self,
         budget: &FairnessBudget,
