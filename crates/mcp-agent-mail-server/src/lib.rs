@@ -12810,7 +12810,7 @@ mod tests {
         let state = build_state(config);
         let notification = JsonRpcRequest::notification("notifications/cancelled", None);
         // Stateless dispatch: notification returns None (no response)
-        assert!(state.dispatch(notification).is_none());
+        assert!(block_on(state.dispatch(notification)).is_none());
     }
 
     #[test]
@@ -12818,7 +12818,7 @@ mod tests {
         let config = mcp_agent_mail_core::Config::default();
         let state = build_state(config);
         let request = JsonRpcRequest::new("nonexistent/method", None, 1_i64);
-        let resp = state.dispatch(request);
+        let resp = block_on(state.dispatch(request));
         assert!(
             resp.is_some(),
             "unknown method should still return a response"
