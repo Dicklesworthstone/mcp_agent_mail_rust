@@ -31,7 +31,7 @@ use mcp_agent_mail_server::tui_app::{MailAppModel, MailMsg};
 use mcp_agent_mail_server::tui_bridge::TuiSharedState;
 use mcp_agent_mail_server::tui_screens::{
     ALL_SCREEN_IDS, MailScreen, MailScreenId, agents::AgentsScreen, analytics::AnalyticsScreen,
-    archive_browser::ArchiveBrowserScreen, attachments::AttachmentExplorerScreen,
+    archive_browser::ArchiveBrowserScreen, atc::AtcScreen, attachments::AttachmentExplorerScreen,
     contacts::ContactsScreen, dashboard::DashboardScreen, explorer::MailExplorerScreen,
     messages::MessageBrowserScreen, projects::ProjectsScreen, reservations::ReservationsScreen,
     search::SearchCockpitScreen, system_health::SystemHealthScreen, threads::ThreadExplorerScreen,
@@ -197,6 +197,7 @@ const fn screen_name(id: MailScreenId) -> &'static str {
         MailScreenId::Analytics => "Analytics",
         MailScreenId::Attachments => "Attachments",
         MailScreenId::ArchiveBrowser => "ArchiveBrowser",
+        MailScreenId::Atc => "Atc",
     }
 }
 
@@ -217,6 +218,7 @@ fn new_screen(id: MailScreenId, state: &Arc<TuiSharedState>) -> Box<dyn MailScre
         MailScreenId::Analytics => Box::new(AnalyticsScreen::new()),
         MailScreenId::Attachments => Box::new(AttachmentExplorerScreen::new()),
         MailScreenId::ArchiveBrowser => Box::new(ArchiveBrowserScreen::new()),
+        MailScreenId::Atc => Box::new(AtcScreen::new()),
     }
 }
 

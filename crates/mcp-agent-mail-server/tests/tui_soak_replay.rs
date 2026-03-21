@@ -928,5 +928,6 @@ const fn screen_name(id: MailScreenId) -> &'static str {
         MailScreenId::Analytics => "Analytics",
         MailScreenId::Attachments => "Attachments",
         MailScreenId::ArchiveBrowser => "ArchiveBrowser",
+        MailScreenId::Atc => "Atc",
     }
 }
