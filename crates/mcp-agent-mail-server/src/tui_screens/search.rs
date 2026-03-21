@@ -2288,7 +2288,11 @@ impl SearchCockpitScreen {
         for (i, result) in self.results.iter().enumerate().skip(start) {
             let h = if result.doc_kind == DocKind::Message
                 && (!result.context_snippet.is_empty() || !result.body_preview.is_empty())
-            { 3usize } else { 1usize };
+            {
+                3usize
+            } else {
+                1usize
+            };
             if row < accumulated_rows + h {
                 self.cursor = i;
                 self.detail_scroll.set(0);

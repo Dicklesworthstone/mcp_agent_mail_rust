@@ -3,10 +3,10 @@
 //! Exposes blocking DB queries used by UI loops and backgrounds threads
 //! that cannot easily integrate with the async `sqlmodel_pool`.
 
+use crate::DbConn;
 use crate::error::DbError;
 use crate::models::MessageRow;
 use crate::queries::InboxRow;
-use crate::DbConn;
 use sqlmodel_core::Value;
 
 const MAX_SYNC_IN_CLAUSE_ITEMS: usize = 500;
@@ -198,7 +198,9 @@ fn open_sync_conn(sqlite_path: &str) -> Result<DbConn, DbError> {
 }
 
 fn placeholders(count: usize) -> String {
-    std::iter::repeat_n("?", count).collect::<Vec<_>>().join(",")
+    std::iter::repeat_n("?", count)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn is_missing_inbox_stats_table_error(message: &str) -> bool {

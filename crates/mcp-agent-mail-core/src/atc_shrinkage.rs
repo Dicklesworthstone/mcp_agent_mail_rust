@@ -156,10 +156,7 @@ pub fn shrink_estimates(
 
 /// Apply shrinkage to a single stratum estimate.
 #[must_use]
-pub fn shrink_single(
-    estimate: &StratumEstimate,
-    population: &CohortStats,
-) -> ShrunkEstimate {
+pub fn shrink_single(estimate: &StratumEstimate, population: &CohortStats) -> ShrunkEstimate {
     // Insufficient local support → pure population pooling.
     if estimate.local_count < MIN_LOCAL_SUPPORT {
         return ShrunkEstimate {
@@ -197,7 +194,10 @@ pub fn shrink_single(
         1.0 // maximal shrinkage if no between-group variance or no samples
     };
 
-    let shrunk = (1.0 - shrinkage_weight).mul_add(estimate.local_mean, shrinkage_weight * population.grand_mean);
+    let shrunk = (1.0 - shrinkage_weight).mul_add(
+        estimate.local_mean,
+        shrinkage_weight * population.grand_mean,
+    );
 
     // Effective sample size: local_count + weight × population_count.
     let effective = n + shrinkage_weight * population.total_count as f64;
@@ -256,10 +256,7 @@ pub fn compute_cohort_stats(estimates: &[StratumEstimate]) -> CohortStats {
 
     // Average within-stratum variance.
     let within_variance = {
-        let vars: Vec<f64> = estimates
-            .iter()
-            .filter_map(|e| e.local_variance)
-            .collect();
+        let vars: Vec<f64> = estimates.iter().filter_map(|e| e.local_variance).collect();
         if vars.is_empty() {
             // Fallback: use between-strata variance directly as a proxy
             // for within-variance. This is conservative: when within ≈
@@ -338,7 +335,11 @@ mod tests {
 
         let shrunk = shrink_single(&strong, &pop);
         // With 200 observations and large between-variance, local should dominate.
-        assert!(shrunk.shrinkage_weight < 0.1, "weight={}", shrunk.shrinkage_weight);
+        assert!(
+            shrunk.shrinkage_weight < 0.1,
+            "weight={}",
+            shrunk.shrinkage_weight
+        );
         assert!((shrunk.shrunk_mean - 0.8).abs() < 0.05);
         assert!(shrunk.has_local_support);
     }

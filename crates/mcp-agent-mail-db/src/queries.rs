@@ -1290,9 +1290,8 @@ async fn cleanup_committed_message_after_consistency_failure(
     );
 
     // Use a HashSet for O(1) dedup instead of O(n) Vec::contains per insertion.
-    let mut seen = std::collections::HashSet::with_capacity(
-        recipient_agent_ids.len() + recipient_rows.len(),
-    );
+    let mut seen =
+        std::collections::HashSet::with_capacity(recipient_agent_ids.len() + recipient_rows.len());
     let mut affected_agent_ids =
         Vec::with_capacity(recipient_agent_ids.len() + recipient_rows.len());
     for &agent_id in recipient_agent_ids {

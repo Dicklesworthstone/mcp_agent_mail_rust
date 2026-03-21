@@ -153,10 +153,7 @@ impl std::fmt::Display for CertificateVerdict {
 #[serde(rename_all = "snake_case")]
 pub enum CertificationBlockReason {
     /// Not enough observations (combined selected + counterfactual).
-    InsufficientData {
-        observed: u64,
-        required: u64,
-    },
+    InsufficientData { observed: u64, required: u64 },
 
     /// The regime is unstable (transitioning or cooling) or has not
     /// dwelled long enough for reliable promotion evidence.
@@ -253,38 +250,115 @@ impl std::fmt::Display for CertificationBlockReason {
             Self::InsufficientData { observed, required } => {
                 write!(f, "insufficient data: {observed}/{required} observations")
             }
-            Self::RegimeUnstable { phase, dwell_secs, required_dwell_secs } => {
-                write!(f, "regime unstable: phase={phase}, dwell={dwell_secs}s (need {required_dwell_secs}s)")
+            Self::RegimeUnstable {
+                phase,
+                dwell_secs,
+                required_dwell_secs,
+            } => {
+                write!(
+                    f,
+                    "regime unstable: phase={phase}, dwell={dwell_secs}s (need {required_dwell_secs}s)"
+                )
             }
-            Self::SparseLocalSupport { worst_stratum, shrinkage_weight, max_acceptable } => {
-                write!(f, "sparse local support: stratum={worst_stratum}, shrinkage={shrinkage_weight:.2} (max {max_acceptable:.2})")
+            Self::SparseLocalSupport {
+                worst_stratum,
+                shrinkage_weight,
+                max_acceptable,
+            } => {
+                write!(
+                    f,
+                    "sparse local support: stratum={worst_stratum}, shrinkage={shrinkage_weight:.2} (max {max_acceptable:.2})"
+                )
             }
-            Self::OverlapFailure { candidate_selection_fraction, min_required } => {
-                write!(f, "overlap failure: selection fraction={candidate_selection_fraction:.3} (need {min_required:.3})")
+            Self::OverlapFailure {
+                candidate_selection_fraction,
+                min_required,
+            } => {
+                write!(
+                    f,
+                    "overlap failure: selection fraction={candidate_selection_fraction:.3} (need {min_required:.3})"
+                )
             }
-            Self::SuspiciousEvidence { trusted_fraction, required_fraction, quarantined_count } => {
-                write!(f, "suspicious evidence: trusted={trusted_fraction:.2} (need {required_fraction:.2}), quarantined={quarantined_count}")
+            Self::SuspiciousEvidence {
+                trusted_fraction,
+                required_fraction,
+                quarantined_count,
+            } => {
+                write!(
+                    f,
+                    "suspicious evidence: trusted={trusted_fraction:.2} (need {required_fraction:.2}), quarantined={quarantined_count}"
+                )
             }
-            Self::AttributionConfounding { clean_fraction, required_fraction, ambiguous_count } => {
-                write!(f, "attribution confounding: clean={clean_fraction:.2} (need {required_fraction:.2}), ambiguous={ambiguous_count}")
+            Self::AttributionConfounding {
+                clean_fraction,
+                required_fraction,
+                ambiguous_count,
+            } => {
+                write!(
+                    f,
+                    "attribution confounding: clean={clean_fraction:.2} (need {required_fraction:.2}), ambiguous={ambiguous_count}"
+                )
             }
-            Self::WeakLowerBound { e_value, threshold, dr_advantage } => {
-                write!(f, "weak lower bound: e-value={e_value:.4} (need {threshold:.1}), DR advantage={dr_advantage:.4}")
+            Self::WeakLowerBound {
+                e_value,
+                threshold,
+                dr_advantage,
+            } => {
+                write!(
+                    f,
+                    "weak lower bound: e-value={e_value:.4} (need {threshold:.1}), DR advantage={dr_advantage:.4}"
+                )
             }
-            Self::TailBudgetViolation { effect_kind, observed_rate, budget_rate } => {
-                write!(f, "tail budget violation: {effect_kind:?} rate={observed_rate:.4} (budget {budget_rate:.4})")
+            Self::TailBudgetViolation {
+                effect_kind,
+                observed_rate,
+                budget_rate,
+            } => {
+                write!(
+                    f,
+                    "tail budget violation: {effect_kind:?} rate={observed_rate:.4} (budget {budget_rate:.4})"
+                )
             }
-            Self::UnresolvedAttributionBacklog { pending_count, max_pending } => {
-                write!(f, "unresolved attribution backlog: {pending_count}/{max_pending}")
+            Self::UnresolvedAttributionBacklog {
+                pending_count,
+                max_pending,
+            } => {
+                write!(
+                    f,
+                    "unresolved attribution backlog: {pending_count}/{max_pending}"
+                )
             }
-            Self::SafetyRegression { metric, incumbent_value, candidate_value, max_regression } => {
-                write!(f, "safety regression: {metric}: incumbent={incumbent_value:.4}, candidate={candidate_value:.4} (max regression {max_regression:.4})")
+            Self::SafetyRegression {
+                metric,
+                incumbent_value,
+                candidate_value,
+                max_regression,
+            } => {
+                write!(
+                    f,
+                    "safety regression: {metric}: incumbent={incumbent_value:.4}, candidate={candidate_value:.4} (max regression {max_regression:.4})"
+                )
             }
-            Self::EvidenceDomination { agent, fraction, max_allowed } => {
-                write!(f, "evidence domination: agent={agent}, fraction={fraction:.3} (max {max_allowed:.3})")
+            Self::EvidenceDomination {
+                agent,
+                fraction,
+                max_allowed,
+            } => {
+                write!(
+                    f,
+                    "evidence domination: agent={agent}, fraction={fraction:.3} (max {max_allowed:.3})"
+                )
             }
-            Self::TailRiskSpike { window_max_loss, mean_loss, ratio, max_ratio } => {
-                write!(f, "tail-risk spike: max={window_max_loss:.4}, mean={mean_loss:.4}, ratio={ratio:.2} (max {max_ratio:.1})")
+            Self::TailRiskSpike {
+                window_max_loss,
+                mean_loss,
+                ratio,
+                max_ratio,
+            } => {
+                write!(
+                    f,
+                    "tail-risk spike: max={window_max_loss:.4}, mean={mean_loss:.4}, ratio={ratio:.2} (max {max_ratio:.1})"
+                )
             }
         }
     }
@@ -587,7 +661,10 @@ impl ConfidenceSequence {
     /// in `threshold()` and infinite propagation in downstream logic.
     #[must_use]
     pub const fn with_alpha(alpha: f64) -> Self {
-        Self { alpha: alpha.clamp(1e-15, 1.0), ..Self::new() }
+        Self {
+            alpha: alpha.clamp(1e-15, 1.0),
+            ..Self::new()
+        }
     }
 
     /// Process a new observation (advantage = incumbent_loss - candidate_loss).
@@ -616,8 +693,7 @@ impl ConfidenceSequence {
             let std_dev = variance.max(1e-10).sqrt();
             // Optimal lambda for sub-Gaussian case: mean / (2 * variance).
             // Clamp to [0.01, 2.0] for stability.
-            self.lambda = (self.running_mean / (2.0 * std_dev * std_dev))
-                .clamp(0.01, 2.0);
+            self.lambda = (self.running_mean / (2.0 * std_dev * std_dev)).clamp(0.01, 2.0);
         }
     }
 
@@ -815,7 +891,6 @@ pub struct PolicyPromotionCertificate {
     pub verdict: CertificateVerdict,
 
     // ── Policy identification ──
-
     /// Candidate policy ID (proposed replacement).
     pub candidate_id: String,
 
@@ -826,17 +901,14 @@ pub struct PolicyPromotionCertificate {
     pub policy_revision: u64,
 
     // ── Regime context ──
-
     /// Regime state at the time of evaluation.
     pub regime: RegimeSnapshot,
 
     // ── Off-policy evaluation ──
-
     /// Results of the doubly-robust estimator.
     pub dr_result: Option<DoublyRobustResult>,
 
     // ── Confidence sequence ──
-
     /// Current e-value from the confidence sequence.
     pub e_value: f64,
 
@@ -847,27 +919,22 @@ pub struct PolicyPromotionCertificate {
     pub cs_significant: bool,
 
     // ── Evidence quality ──
-
     /// Summary of evidence quality.
     pub evidence_quality: EvidenceQualitySummary,
 
     // ── Attribution quality ──
-
     /// Summary of attribution confidence.
     pub attribution: AttributionSummary,
 
     // ── Stratum support ──
-
     /// Per-stratum support information.
     pub strata: Vec<StratumSupport>,
 
     // ── Budget checks ──
-
     /// Per-effect-kind false-action budget results.
     pub budget_checks: Vec<EffectBudgetCheck>,
 
     // ── Tail risk ──
-
     /// Maximum single-window loss observed for the candidate.
     pub tail_max_loss: f64,
 
@@ -878,13 +945,11 @@ pub struct PolicyPromotionCertificate {
     pub tail_risk_ratio: f64,
 
     // ── Block reasons (if refused) ──
-
     /// All reasons why the certificate was refused.
     /// Empty if `verdict == Certified`.
     pub block_reasons: Vec<CertificationBlockReason>,
 
     // ── Traceability ──
-
     /// Assumption keys that were verified as part of certification.
     pub verified_assumption_keys: Vec<String>,
 
@@ -1013,7 +1078,8 @@ pub fn evaluate_certificate(input: CertificateInput) -> PolicyPromotionCertifica
 
     // ── Gate 4: Evidence domination ──
     if input.evidence_quality.max_agent_influence_fraction > MAX_SINGLE_AGENT_EVIDENCE_FRACTION
-        && let Some(agent) = &input.evidence_quality.most_influential_agent {
+        && let Some(agent) = &input.evidence_quality.most_influential_agent
+    {
         block_reasons.push(CertificationBlockReason::EvidenceDomination {
             agent: agent.clone(),
             fraction: input.evidence_quality.max_agent_influence_fraction,
@@ -1041,9 +1107,7 @@ pub fn evaluate_certificate(input: CertificateInput) -> PolicyPromotionCertifica
 
     // ── Gate 7: Stratum support (sparse data check) ──
     for stratum in &input.strata {
-        if stratum.shrinkage_weight > MAX_ACCEPTABLE_SHRINKAGE
-            && !stratum.has_local_support
-        {
+        if stratum.shrinkage_weight > MAX_ACCEPTABLE_SHRINKAGE && !stratum.has_local_support {
             block_reasons.push(CertificationBlockReason::SparseLocalSupport {
                 worst_stratum: stratum.stratum_key.clone(),
                 shrinkage_weight: stratum.shrinkage_weight,
@@ -1060,9 +1124,7 @@ pub fn evaluate_certificate(input: CertificateInput) -> PolicyPromotionCertifica
     let cs = &input.confidence_sequence;
     let cs_significant = cs.is_significant();
     if !cs_significant {
-        let dr_adv = dr_result
-            .as_ref()
-            .map_or(0.0, |r| r.dr_advantage);
+        let dr_adv = dr_result.as_ref().map_or(0.0, |r| r.dr_advantage);
         block_reasons.push(CertificationBlockReason::WeakLowerBound {
             e_value: cs.e_value(),
             threshold: cs.threshold(),
@@ -1128,7 +1190,8 @@ pub fn evaluate_certificate(input: CertificateInput) -> PolicyPromotionCertifica
         CertificateVerdict::Refused
     };
 
-    let valid_until = input.validity_duration_micros
+    let valid_until = input
+        .validity_duration_micros
         .map(|dur| input.now_ts_micros.saturating_add(dur));
 
     PolicyPromotionCertificate {
@@ -1181,7 +1244,7 @@ impl PolicyPromotionCertificate {
     }
 
     /// Number of distinct block reasons (0 if certified).
-    #[must_use] 
+    #[must_use]
     pub const fn block_count(&self) -> usize {
         self.block_reasons.len()
     }
@@ -1288,14 +1351,16 @@ mod tests {
     }
 
     fn make_default_observations(n: usize, advantage: f64) -> Vec<DRObservation> {
-        (0..n).map(|i| DRObservation {
-            candidate_selected: i % 3 == 0, // ~33% selection
-            propensity: 0.33,
-            realized_loss: advantage.mul_add(-0.5, 0.5),
-            predicted_loss: 0.5,
-            evidence_weight: 1.0,
-            attribution_weight: 1.0,
-        }).collect()
+        (0..n)
+            .map(|i| DRObservation {
+                candidate_selected: i % 3 == 0, // ~33% selection
+                propensity: 0.33,
+                realized_loss: advantage.mul_add(-0.5, 0.5),
+                predicted_loss: 0.5,
+                evidence_weight: 1.0,
+                attribution_weight: 1.0,
+            })
+            .collect()
     }
 
     fn make_significant_cs() -> ConfidenceSequence {
@@ -1344,7 +1409,11 @@ mod tests {
     fn test_certified_when_all_gates_pass() {
         let input = make_default_input();
         let cert = evaluate_certificate(input);
-        assert!(cert.is_certified(), "Expected certified, got: {}", cert.summary());
+        assert!(
+            cert.is_certified(),
+            "Expected certified, got: {}",
+            cert.summary()
+        );
         assert!(cert.block_reasons.is_empty());
         assert_eq!(cert.verdict, CertificateVerdict::Certified);
     }
@@ -1355,9 +1424,11 @@ mod tests {
         input.evidence_quality.total_observations = 50;
         let cert = evaluate_certificate(input);
         assert!(!cert.is_certified());
-        assert!(cert.block_reasons.iter().any(|r| matches!(r,
-            CertificationBlockReason::InsufficientData { .. }
-        )));
+        assert!(
+            cert.block_reasons
+                .iter()
+                .any(|r| matches!(r, CertificationBlockReason::InsufficientData { .. }))
+        );
     }
 
     #[test]
@@ -1366,9 +1437,11 @@ mod tests {
         input.regime.phase = "transitioning".to_string();
         let cert = evaluate_certificate(input);
         assert!(!cert.is_certified());
-        assert!(cert.block_reasons.iter().any(|r| matches!(r,
-            CertificationBlockReason::RegimeUnstable { .. }
-        )));
+        assert!(
+            cert.block_reasons
+                .iter()
+                .any(|r| matches!(r, CertificationBlockReason::RegimeUnstable { .. }))
+        );
     }
 
     #[test]
@@ -1377,9 +1450,11 @@ mod tests {
         input.regime.stability_age_secs = 120; // only 2 minutes, need 10
         let cert = evaluate_certificate(input);
         assert!(!cert.is_certified());
-        assert!(cert.block_reasons.iter().any(|r| matches!(r,
-            CertificationBlockReason::RegimeUnstable { .. }
-        )));
+        assert!(
+            cert.block_reasons
+                .iter()
+                .any(|r| matches!(r, CertificationBlockReason::RegimeUnstable { .. }))
+        );
     }
 
     #[test]
@@ -1388,9 +1463,11 @@ mod tests {
         input.evidence_quality.trusted_fraction = 0.40;
         let cert = evaluate_certificate(input);
         assert!(!cert.is_certified());
-        assert!(cert.block_reasons.iter().any(|r| matches!(r,
-            CertificationBlockReason::SuspiciousEvidence { .. }
-        )));
+        assert!(
+            cert.block_reasons
+                .iter()
+                .any(|r| matches!(r, CertificationBlockReason::SuspiciousEvidence { .. }))
+        );
     }
 
     #[test]
@@ -1399,9 +1476,11 @@ mod tests {
         input.evidence_quality.quarantined_count = 5;
         let cert = evaluate_certificate(input);
         assert!(!cert.is_certified());
-        assert!(cert.block_reasons.iter().any(|r| matches!(r,
-            CertificationBlockReason::SuspiciousEvidence { .. }
-        )));
+        assert!(
+            cert.block_reasons
+                .iter()
+                .any(|r| matches!(r, CertificationBlockReason::SuspiciousEvidence { .. }))
+        );
     }
 
     #[test]
@@ -1410,9 +1489,11 @@ mod tests {
         input.evidence_quality.max_agent_influence_fraction = 0.35;
         let cert = evaluate_certificate(input);
         assert!(!cert.is_certified());
-        assert!(cert.block_reasons.iter().any(|r| matches!(r,
-            CertificationBlockReason::EvidenceDomination { .. }
-        )));
+        assert!(
+            cert.block_reasons
+                .iter()
+                .any(|r| matches!(r, CertificationBlockReason::EvidenceDomination { .. }))
+        );
     }
 
     #[test]
@@ -1421,9 +1502,11 @@ mod tests {
         input.attribution.clean_or_primary_fraction = 0.30;
         let cert = evaluate_certificate(input);
         assert!(!cert.is_certified());
-        assert!(cert.block_reasons.iter().any(|r| matches!(r,
-            CertificationBlockReason::AttributionConfounding { .. }
-        )));
+        assert!(
+            cert.block_reasons
+                .iter()
+                .any(|r| matches!(r, CertificationBlockReason::AttributionConfounding { .. }))
+        );
     }
 
     #[test]
@@ -1432,9 +1515,11 @@ mod tests {
         input.candidate_selection_fraction = 0.01; // barely selected
         let cert = evaluate_certificate(input);
         assert!(!cert.is_certified());
-        assert!(cert.block_reasons.iter().any(|r| matches!(r,
-            CertificationBlockReason::OverlapFailure { .. }
-        )));
+        assert!(
+            cert.block_reasons
+                .iter()
+                .any(|r| matches!(r, CertificationBlockReason::OverlapFailure { .. }))
+        );
     }
 
     #[test]
@@ -1450,9 +1535,11 @@ mod tests {
         }];
         let cert = evaluate_certificate(input);
         assert!(!cert.is_certified());
-        assert!(cert.block_reasons.iter().any(|r| matches!(r,
-            CertificationBlockReason::SparseLocalSupport { .. }
-        )));
+        assert!(
+            cert.block_reasons
+                .iter()
+                .any(|r| matches!(r, CertificationBlockReason::SparseLocalSupport { .. }))
+        );
     }
 
     #[test]
@@ -1462,9 +1549,11 @@ mod tests {
         input.confidence_sequence = ConfidenceSequence::new();
         let cert = evaluate_certificate(input);
         assert!(!cert.is_certified());
-        assert!(cert.block_reasons.iter().any(|r| matches!(r,
-            CertificationBlockReason::WeakLowerBound { .. }
-        )));
+        assert!(
+            cert.block_reasons
+                .iter()
+                .any(|r| matches!(r, CertificationBlockReason::WeakLowerBound { .. }))
+        );
     }
 
     #[test]
@@ -1480,9 +1569,11 @@ mod tests {
         }];
         let cert = evaluate_certificate(input);
         assert!(!cert.is_certified());
-        assert!(cert.block_reasons.iter().any(|r| matches!(r,
-            CertificationBlockReason::TailBudgetViolation { .. }
-        )));
+        assert!(
+            cert.block_reasons
+                .iter()
+                .any(|r| matches!(r, CertificationBlockReason::TailBudgetViolation { .. }))
+        );
     }
 
     #[test]
@@ -1492,9 +1583,11 @@ mod tests {
         input.tail_mean_loss = 0.5;
         let cert = evaluate_certificate(input);
         assert!(!cert.is_certified());
-        assert!(cert.block_reasons.iter().any(|r| matches!(r,
-            CertificationBlockReason::TailRiskSpike { .. }
-        )));
+        assert!(
+            cert.block_reasons
+                .iter()
+                .any(|r| matches!(r, CertificationBlockReason::TailRiskSpike { .. }))
+        );
     }
 
     #[test]
@@ -1504,7 +1597,8 @@ mod tests {
         input.max_pending_attributions = 50;
         let cert = evaluate_certificate(input);
         assert!(!cert.is_certified());
-        assert!(cert.block_reasons.iter().any(|r| matches!(r,
+        assert!(cert.block_reasons.iter().any(|r| matches!(
+            r,
             CertificationBlockReason::UnresolvedAttributionBacklog { .. }
         )));
     }
@@ -1518,7 +1612,11 @@ mod tests {
         let cert = evaluate_certificate(input);
         assert!(!cert.is_certified());
         // Should have at least 3 block reasons (not short-circuited).
-        assert!(cert.block_count() >= 3, "Expected >=3 blocks, got {}", cert.block_count());
+        assert!(
+            cert.block_count() >= 3,
+            "Expected >=3 blocks, got {}",
+            cert.block_count()
+        );
     }
 
     #[test]
@@ -1547,7 +1645,10 @@ mod tests {
         for _ in 0..200 {
             cs.update(0.2);
         }
-        assert!(cs.is_significant(), "CS should be significant after 200 positive updates");
+        assert!(
+            cs.is_significant(),
+            "CS should be significant after 200 positive updates"
+        );
         assert!(cs.e_value() > cs.threshold());
     }
 
@@ -1590,16 +1691,21 @@ mod tests {
     #[test]
     fn test_doubly_robust_clipping() {
         // Observations with very low propensity → should trigger clipping.
-        let obs: Vec<DRObservation> = (0..50).map(|_| DRObservation {
-            candidate_selected: true,
-            propensity: 0.001, // very low → high importance weight
-            realized_loss: 0.3,
-            predicted_loss: 0.5,
-            evidence_weight: 1.0,
-            attribution_weight: 1.0,
-        }).collect();
+        let obs: Vec<DRObservation> = (0..50)
+            .map(|_| DRObservation {
+                candidate_selected: true,
+                propensity: 0.001, // very low → high importance weight
+                realized_loss: 0.3,
+                predicted_loss: 0.5,
+                evidence_weight: 1.0,
+                attribution_weight: 1.0,
+            })
+            .collect();
         let result = compute_doubly_robust(&obs, 0.5).unwrap();
-        assert!(result.n_clipped > 0, "Expected clipped weights with low propensity");
+        assert!(
+            result.n_clipped > 0,
+            "Expected clipped weights with low propensity"
+        );
     }
 
     #[test]
@@ -1628,22 +1734,30 @@ mod tests {
             });
         }
         let result = compute_doubly_robust(&obs, 0.5).unwrap();
-        assert_eq!(result.n_observations, 3, "Only contributing observations should be counted");
+        assert_eq!(
+            result.n_observations, 3,
+            "Only contributing observations should be counted"
+        );
         assert_eq!(result.n_selected, 3);
     }
 
     #[test]
     fn test_doubly_robust_all_zero_weight_returns_none() {
-        let obs: Vec<DRObservation> = (0..10).map(|_| DRObservation {
-            candidate_selected: true,
-            propensity: 0.5,
-            realized_loss: 0.4,
-            predicted_loss: 0.5,
-            evidence_weight: 0.0, // all zero weight
-            attribution_weight: 1.0,
-        }).collect();
+        let obs: Vec<DRObservation> = (0..10)
+            .map(|_| DRObservation {
+                candidate_selected: true,
+                propensity: 0.5,
+                realized_loss: 0.4,
+                predicted_loss: 0.5,
+                evidence_weight: 0.0, // all zero weight
+                attribution_weight: 1.0,
+            })
+            .collect();
         let result = compute_doubly_robust(&obs, 0.5);
-        assert!(result.is_none(), "All-zero-weight observations should return None");
+        assert!(
+            result.is_none(),
+            "All-zero-weight observations should return None"
+        );
     }
 
     #[test]
@@ -1726,9 +1840,21 @@ mod tests {
 
     #[test]
     fn test_transferability_display() {
-        assert_eq!(EvidenceTransferability::Transferable.to_string(), "transferable");
-        assert_eq!(EvidenceTransferability::DiscountedTransfer.to_string(), "discounted");
-        assert_eq!(EvidenceTransferability::RegimeSensitive.to_string(), "regime_sensitive");
-        assert_eq!(EvidenceTransferability::NonTransferable.to_string(), "non_transferable");
+        assert_eq!(
+            EvidenceTransferability::Transferable.to_string(),
+            "transferable"
+        );
+        assert_eq!(
+            EvidenceTransferability::DiscountedTransfer.to_string(),
+            "discounted"
+        );
+        assert_eq!(
+            EvidenceTransferability::RegimeSensitive.to_string(),
+            "regime_sensitive"
+        );
+        assert_eq!(
+            EvidenceTransferability::NonTransferable.to_string(),
+            "non_transferable"
+        );
     }
 }

@@ -1242,7 +1242,7 @@ pub fn schema_migrations() -> Vec<Migration> {
          BEGIN \
              UPDATE messages SET recipients_json = '{}' WHERE id = NEW.id; \
          END"
-            .to_string(),
+        .to_string(),
         String::new(),
     ));
 

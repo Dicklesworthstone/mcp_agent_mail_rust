@@ -3776,7 +3776,10 @@ fn render_thread_detail(
     // Use a generous upper bound for max_scroll to ensure all word-wrapped
     // content is reachable. The exact wrapped line count is hard to compute
     // without rendering, so we use 3x the logical line count.
-    let max_scroll = preview_lines.len().saturating_mul(3).saturating_sub(visible_height);
+    let max_scroll = preview_lines
+        .len()
+        .saturating_mul(3)
+        .saturating_sub(visible_height);
     max_scroll_cell.set(max_scroll);
 
     let clamped_scroll = scroll.min(max_scroll);

@@ -300,13 +300,11 @@ pub async fn request_contact(
 
     // Only send intro mail if the target's policy allows it and the link
     // is not blocked (a re-request against a blocked link should be silent).
-    let should_send_intro =
-        to_row.contact_policy != "block_all" && link_row.status != "blocked";
+    let should_send_intro = to_row.contact_policy != "block_all" && link_row.status != "blocked";
 
     if should_send_intro {
         let subject = format!("Contact request from {from_agent}");
-        let body_md =
-            format!("{from_agent} requests permission to contact {target_agent_name}.");
+        let body_md = format!("{from_agent} requests permission to contact {target_agent_name}.");
 
         let to_id = to_row.id.unwrap_or(0);
         let recipients: &[(i64, &str)] = &[(to_id, "to")];

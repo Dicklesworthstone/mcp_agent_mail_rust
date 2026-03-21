@@ -1619,8 +1619,10 @@ mod tests {
 
     #[test]
     fn conformance_fixture_multi_thread_has_required_fields() {
-        let content =
-            conformance_fixture_completion("digest across threads", "Digest these threads: T-1, T-2");
+        let content = conformance_fixture_completion(
+            "digest across threads",
+            "Digest these threads: T-1, T-2",
+        );
         let val = extract_brace_json(&content).unwrap();
         assert!(val["threads"].is_array());
         assert!(val["aggregate"]["top_mentions"].is_array());

@@ -181,24 +181,23 @@ impl AgentContaminationTracker {
         // reliably once the 1-second floor is passed.
         const MIN_BURST_OBSERVATION_MICROS: i64 = 1_000_000; // 1 second
         const MIN_BURST_EVENT_COUNT: u32 = 3;
-        let events_per_minute = if self.event_count_in_window >= MIN_BURST_EVENT_COUNT
-            && window_duration_micros > 0
-        {
-            let actual_elapsed = ts_micros.saturating_sub(self.window_start_micros);
-            let elapsed_micros = actual_elapsed.max(MIN_BURST_OBSERVATION_MICROS);
-            #[allow(
-                clippy::cast_precision_loss,
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss
-            )]
-            let rate = {
-                let elapsed_minutes = elapsed_micros as f64 / 60_000_000.0;
-                (f64::from(self.event_count_in_window) / elapsed_minutes) as u32
+        let events_per_minute =
+            if self.event_count_in_window >= MIN_BURST_EVENT_COUNT && window_duration_micros > 0 {
+                let actual_elapsed = ts_micros.saturating_sub(self.window_start_micros);
+                let elapsed_micros = actual_elapsed.max(MIN_BURST_OBSERVATION_MICROS);
+                #[allow(
+                    clippy::cast_precision_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss
+                )]
+                let rate = {
+                    let elapsed_minutes = elapsed_micros as f64 / 60_000_000.0;
+                    (f64::from(self.event_count_in_window) / elapsed_minutes) as u32
+                };
+                rate
+            } else {
+                0 // not enough events to compute a rate
             };
-            rate
-        } else {
-            0 // not enough events to compute a rate
-        };
 
         if events_per_minute > BURST_RATE_THRESHOLD {
             signals.push(ContaminationSignal {
@@ -227,7 +226,9 @@ impl AgentContaminationTracker {
         }
 
         self.last_event_micros = ts_micros;
-        self.total_signals = self.total_signals.saturating_add(u32::try_from(signals.len()).unwrap_or(u32::MAX));
+        self.total_signals = self
+            .total_signals
+            .saturating_add(u32::try_from(signals.len()).unwrap_or(u32::MAX));
 
         // Update quality based on signal count.
         self.quality = if self.total_signals == 0 {

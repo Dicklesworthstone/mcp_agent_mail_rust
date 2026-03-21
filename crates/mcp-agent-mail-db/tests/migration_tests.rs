@@ -124,18 +124,41 @@ fn assert_migrated_fixture_state(conn: &DbConn) {
             &[],
         )
         .expect("query migrated agent_link");
-    let al_created_type: String = agent_link[0].get_named("ct").expect("agent_link created type");
-    let al_created_val: i64 = agent_link[0].get_named("cv").expect("agent_link created val");
-    let al_updated_type: String = agent_link[0].get_named("ut").expect("agent_link updated type");
-    let al_updated_val: i64 = agent_link[0].get_named("uv").expect("agent_link updated val");
+    let al_created_type: String = agent_link[0]
+        .get_named("ct")
+        .expect("agent_link created type");
+    let al_created_val: i64 = agent_link[0]
+        .get_named("cv")
+        .expect("agent_link created val");
+    let al_updated_type: String = agent_link[0]
+        .get_named("ut")
+        .expect("agent_link updated type");
+    let al_updated_val: i64 = agent_link[0]
+        .get_named("uv")
+        .expect("agent_link updated val");
     let al_expires_null: i64 = agent_link[0]
         .get_named("expires_null")
         .expect("agent_link expires null");
-    assert_eq!(al_created_type, "integer", "agent_links.created_ts should be integer");
-    assert_eq!(al_created_val, TS_WITH_MICROS, "agent_links.created_ts should match expected micros");
-    assert_eq!(al_updated_type, "integer", "agent_links.updated_ts should be integer");
-    assert_eq!(al_updated_val, TS_NO_FRACTION, "agent_links.updated_ts should match expected micros");
-    assert_eq!(al_expires_null, 1, "agent_links.expires_ts NULL should stay NULL");
+    assert_eq!(
+        al_created_type, "integer",
+        "agent_links.created_ts should be integer"
+    );
+    assert_eq!(
+        al_created_val, TS_WITH_MICROS,
+        "agent_links.created_ts should match expected micros"
+    );
+    assert_eq!(
+        al_updated_type, "integer",
+        "agent_links.updated_ts should be integer"
+    );
+    assert_eq!(
+        al_updated_val, TS_NO_FRACTION,
+        "agent_links.updated_ts should match expected micros"
+    );
+    assert_eq!(
+        al_expires_null, 1,
+        "agent_links.expires_ts NULL should stay NULL"
+    );
 
     // project_sibling_suggestions: created_ts (no micros) and evaluated_ts (with micros)
     let suggestion = conn
@@ -156,10 +179,22 @@ fn assert_migrated_fixture_state(conn: &DbConn) {
     let pss_dismissed_null: i64 = suggestion[0]
         .get_named("dismissed_null")
         .expect("pss dismissed null");
-    assert_eq!(pss_created_type, "integer", "project_sibling_suggestions.created_ts should be integer");
-    assert_eq!(pss_eval_type, "integer", "project_sibling_suggestions.evaluated_ts should be integer");
-    assert_eq!(pss_confirmed_null, 1, "project_sibling_suggestions.confirmed_ts NULL should stay NULL");
-    assert_eq!(pss_dismissed_null, 1, "project_sibling_suggestions.dismissed_ts NULL should stay NULL");
+    assert_eq!(
+        pss_created_type, "integer",
+        "project_sibling_suggestions.created_ts should be integer"
+    );
+    assert_eq!(
+        pss_eval_type, "integer",
+        "project_sibling_suggestions.evaluated_ts should be integer"
+    );
+    assert_eq!(
+        pss_confirmed_null, 1,
+        "project_sibling_suggestions.confirmed_ts NULL should stay NULL"
+    );
+    assert_eq!(
+        pss_dismissed_null, 1,
+        "project_sibling_suggestions.dismissed_ts NULL should stay NULL"
+    );
 
     let fts_rows = conn
         .query_sync(

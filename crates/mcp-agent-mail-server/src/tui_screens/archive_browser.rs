@@ -276,9 +276,9 @@ impl ArchiveBrowserScreen {
     }
 
     fn preview_max_scroll(&self) -> u16 {
-        self.preview_content
-            .as_ref()
-            .map_or(0, |c| u16::try_from(c.lines().count().saturating_sub(5)).unwrap_or(u16::MAX))
+        self.preview_content.as_ref().map_or(0, |c| {
+            u16::try_from(c.lines().count().saturating_sub(5)).unwrap_or(u16::MAX)
+        })
     }
 
     fn clear_preview(&mut self) {

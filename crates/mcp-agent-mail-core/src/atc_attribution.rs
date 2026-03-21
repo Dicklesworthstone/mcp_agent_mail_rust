@@ -212,17 +212,12 @@ pub fn attribute_outcome(
     }
 
     // Multiple candidates — check subsystem overlap.
-    let subsystems: std::collections::HashSet<&str> = eligible
-        .iter()
-        .map(|c| c.subsystem.as_str())
-        .collect();
+    let subsystems: std::collections::HashSet<&str> =
+        eligible.iter().map(|c| c.subsystem.as_str()).collect();
 
     if subsystems.len() == eligible.len() {
         // All from different subsystems — disjoint, no interference.
-        let most_recent = eligible
-            .iter()
-            .min_by_key(|c| c.delay_micros)
-            .unwrap();
+        let most_recent = eligible.iter().min_by_key(|c| c.delay_micros).unwrap();
         return AttributionResult {
             confidence: AttributionConfidence::Clean,
             primary_cause: Some(most_recent.experience_id),
@@ -328,7 +323,10 @@ mod tests {
         ];
         let result = attribute_outcome(&causes, 1_000_000, DEFAULT_ELIGIBILITY_WINDOW_MICROS);
         assert_eq!(result.confidence, AttributionConfidence::Clean);
-        assert_eq!(result.reason_code, AttributionReasonCode::DisjointSubsystems);
+        assert_eq!(
+            result.reason_code,
+            AttributionReasonCode::DisjointSubsystems
+        );
         assert!(!result.interference_detected);
     }
 

@@ -8,17 +8,17 @@
 //! Each step is verified with SELECT queries to prove the data is
 //! actually in the database and transitions are correct.
 
-use asupersync::runtime::RuntimeBuilder;
 use asupersync::Cx;
+use asupersync::runtime::RuntimeBuilder;
 use mcp_agent_mail_core::experience::{
     EffectKind, ExperienceOutcome, ExperienceRow, ExperienceState, ExperienceSubsystem,
     FeatureVector, NonExecutionReason,
 };
-use mcp_agent_mail_db::{DbConn, DbPool, DbPoolConfig, create_pool};
 use mcp_agent_mail_db::queries::{
     append_atc_experience, fetch_open_atc_experiences, resolve_atc_experience,
     transition_atc_experience, update_atc_experience_rollup,
 };
+use mcp_agent_mail_db::{DbConn, DbPool, DbPoolConfig, create_pool};
 
 /// Create a real SQLite database via the production migration path.
 ///
@@ -29,17 +29,13 @@ use mcp_agent_mail_db::queries::{
 /// 4. Run ALL migrations via the migration runner (v16 ATC tables, v18 EWMA columns)
 ///
 /// This proves that a fresh install or legacy upgrade gets all ATC tables automatically.
-fn setup_real_db(
-    rt: &asupersync::runtime::Runtime,
-    name: &str,
-) -> (Cx, DbPool, tempfile::TempDir) {
+fn setup_real_db(rt: &asupersync::runtime::Runtime, name: &str) -> (Cx, DbPool, tempfile::TempDir) {
     let cx = Cx::for_testing();
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join(name);
 
     // Step 1: Create DB file with PRAGMAs and base schema (same as pool init).
-    let init_conn = DbConn::open_file(db_path.display().to_string())
-        .expect("open DB file");
+    let init_conn = DbConn::open_file(db_path.display().to_string()).expect("open DB file");
     init_conn
         .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
         .expect("apply PRAGMAs");
@@ -150,30 +146,55 @@ fn full_probe_lifecycle_with_resolution_and_rollup() {
         // ── Step 2: Dispatch ──
         eprintln!("[2/6] TRANSITION: planned → dispatched");
         transition_atc_experience(
-            &cx, &pool, exp_id, ExperienceState::Dispatched,
-            1_700_000_000_100_000, None, None,
-        ).await.into_result().expect("dispatch");
+            &cx,
+            &pool,
+            exp_id,
+            ExperienceState::Dispatched,
+            1_700_000_000_100_000,
+            None,
+            None,
+        )
+        .await
+        .into_result()
+        .expect("dispatch");
         eprintln!("[2/6] OK: dispatched");
 
         // ── Step 3: Execute ──
         eprintln!("[3/6] TRANSITION: dispatched → executed");
         transition_atc_experience(
-            &cx, &pool, exp_id, ExperienceState::Executed,
-            1_700_000_000_200_000, None,
+            &cx,
+            &pool,
+            exp_id,
+            ExperienceState::Executed,
+            1_700_000_000_200_000,
+            None,
             Some(&serde_json::json!({"probe_sent": true})),
-        ).await.into_result().expect("execute");
+        )
+        .await
+        .into_result()
+        .expect("execute");
         eprintln!("[3/6] OK: executed");
 
         // ── Step 4: Open ──
         eprintln!("[4/6] TRANSITION: executed → open");
         transition_atc_experience(
-            &cx, &pool, exp_id, ExperienceState::Open,
-            1_700_000_000_300_000, None, None,
-        ).await.into_result().expect("open");
+            &cx,
+            &pool,
+            exp_id,
+            ExperienceState::Open,
+            1_700_000_000_300_000,
+            None,
+            None,
+        )
+        .await
+        .into_result()
+        .expect("open");
 
         // Verify open query finds it
         let open = fetch_open_atc_experiences(&cx, &pool, Some("GreenCastle"), 10)
-            .await.into_result().expect("fetch open");
+            .await
+            .into_result()
+            .expect("fetch open");
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].experience_id, exp_id);
         eprintln!("[4/6] OK: open (verified via fetch_open_atc_experiences)");
@@ -189,19 +210,23 @@ fn full_probe_lifecycle_with_resolution_and_rollup() {
         };
         eprintln!("[5/6] RESOLVE: correct=true, loss=0.5, regret=0.0");
         resolve_atc_experience(&cx, &pool, exp_id, &outcome)
-            .await.into_result().expect("resolve");
+            .await
+            .into_result()
+            .expect("resolve");
 
         // Verify it's gone from open
         let open_after = fetch_open_atc_experiences(&cx, &pool, Some("GreenCastle"), 10)
-            .await.into_result().expect("re-fetch open");
+            .await
+            .into_result()
+            .expect("re-fetch open");
         assert_eq!(open_after.len(), 0);
 
         // Verify the resolved experience has the outcome stored in the DB.
         // Re-read the row directly via a sync connection to confirm
         // state=resolved and outcome_json is populated.
         let db_path = _dir.path().join("atc_lifecycle_full.db");
-        let verify_conn = DbConn::open_file(db_path.display().to_string())
-            .expect("open for verification");
+        let verify_conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open for verification");
         let verify_rows = verify_conn.query_sync(
             "SELECT state, outcome_json, resolved_ts FROM atc_experiences WHERE experience_id = ?",
             &[sqlmodel_core::Value::BigInt(exp_id as i64)],
@@ -211,26 +236,47 @@ fn full_probe_lifecycle_with_resolution_and_rollup() {
             sqlmodel_core::Value::Text(s) => Some(s.as_str()),
             _ => None,
         });
-        assert_eq!(state_val, Some("resolved"), "DB row must be in resolved state");
+        assert_eq!(
+            state_val,
+            Some("resolved"),
+            "DB row must be in resolved state"
+        );
         let outcome_val = verify_rows[0].get(1).and_then(|v| match v {
             sqlmodel_core::Value::Text(s) => Some(s.clone()),
             _ => None,
         });
         assert!(outcome_val.is_some(), "outcome_json must be populated");
-        let outcome_json: serde_json::Value = serde_json::from_str(&outcome_val.unwrap())
-            .expect("outcome_json must be valid JSON");
-        assert_eq!(outcome_json["correct"], true, "outcome.correct must be true");
-        assert_eq!(outcome_json["actual_loss"], 0.5, "outcome.actual_loss must be 0.5");
+        let outcome_json: serde_json::Value =
+            serde_json::from_str(&outcome_val.unwrap()).expect("outcome_json must be valid JSON");
+        assert_eq!(
+            outcome_json["correct"], true,
+            "outcome.correct must be true"
+        );
+        assert_eq!(
+            outcome_json["actual_loss"], 0.5,
+            "outcome.actual_loss must be 0.5"
+        );
         eprintln!("[5/6] OK: resolved (verified state=resolved + outcome in DB)");
 
         // ── Step 6: Rollup ──
         eprintln!("[6/6] ROLLUP: stratum=liveness:probe:tier0");
         update_atc_experience_rollup(
-            &cx, &pool,
-            "liveness:probe:tier0", "liveness", "probe", 0,
-            ExperienceState::Resolved, true, 0.5, 0.0, 200_000,
+            &cx,
+            &pool,
+            "liveness:probe:tier0",
+            "liveness",
+            "probe",
+            0,
+            ExperienceState::Resolved,
+            true,
+            0.5,
+            0.0,
+            200_000,
             1_700_000_000_500_000,
-        ).await.into_result().expect("rollup");
+        )
+        .await
+        .into_result()
+        .expect("rollup");
         eprintln!("[6/6] OK: rollup updated");
 
         eprintln!("\n === FULL LIFECYCLE PASSED ===");
@@ -250,14 +296,24 @@ fn throttled_non_execution_path() {
         eprintln!("\n[THROTTLE] Testing non-execution path...");
 
         let stored = append_atc_experience(&cx, &pool, &row)
-            .await.into_result().expect("append");
+            .await
+            .into_result()
+            .expect("append");
         let exp_id = stored.experience_id;
 
         // Dispatch
         transition_atc_experience(
-            &cx, &pool, exp_id, ExperienceState::Dispatched,
-            1_700_000_001_000_000, None, None,
-        ).await.into_result().expect("dispatch");
+            &cx,
+            &pool,
+            exp_id,
+            ExperienceState::Dispatched,
+            1_700_000_001_000_000,
+            None,
+            None,
+        )
+        .await
+        .into_result()
+        .expect("dispatch");
 
         // Throttle
         let reason = NonExecutionReason::BudgetExhausted {
@@ -266,14 +322,23 @@ fn throttled_non_execution_path() {
             threshold: 0.90,
         };
         transition_atc_experience(
-            &cx, &pool, exp_id, ExperienceState::Throttled,
-            1_700_000_001_100_000, Some(&reason),
+            &cx,
+            &pool,
+            exp_id,
+            ExperienceState::Throttled,
+            1_700_000_001_100_000,
+            Some(&reason),
             Some(&serde_json::json!({"throttle": "probe budget exhausted"})),
-        ).await.into_result().expect("throttle");
+        )
+        .await
+        .into_result()
+        .expect("throttle");
 
         // Throttled is terminal — should not appear in open query
         let open = fetch_open_atc_experiences(&cx, &pool, Some("BlueLake"), 10)
-            .await.into_result().expect("fetch open");
+            .await
+            .into_result()
+            .expect("fetch open");
         assert_eq!(open.len(), 0);
 
         eprintln!("[THROTTLE] OK: Planned → Dispatched → Throttled (terminal)");
@@ -289,13 +354,21 @@ fn state_machine_rejects_invalid_transition() {
     rt.block_on(async {
         let row = make_probe_experience(500, 600, "RedMountain");
         let stored = append_atc_experience(&cx, &pool, &row)
-            .await.into_result().expect("append");
+            .await
+            .into_result()
+            .expect("append");
 
         eprintln!("\n[INVALID] Attempting Planned → Resolved (should fail)...");
         let result = transition_atc_experience(
-            &cx, &pool, stored.experience_id, ExperienceState::Resolved,
-            1_700_000_000_000_000, None, None,
-        ).await;
+            &cx,
+            &pool,
+            stored.experience_id,
+            ExperienceState::Resolved,
+            1_700_000_000_000_000,
+            None,
+            None,
+        )
+        .await;
 
         assert!(
             matches!(result, asupersync::Outcome::Err(_)),
@@ -320,9 +393,18 @@ fn one_decision_many_effects() {
         e2.action = "AdvisoryMessage".to_string();
         let e3 = make_probe_experience(900, 903, "Agent3");
 
-        let s1 = append_atc_experience(&cx, &pool, &e1).await.into_result().expect("e1");
-        let s2 = append_atc_experience(&cx, &pool, &e2).await.into_result().expect("e2");
-        let s3 = append_atc_experience(&cx, &pool, &e3).await.into_result().expect("e3");
+        let s1 = append_atc_experience(&cx, &pool, &e1)
+            .await
+            .into_result()
+            .expect("e1");
+        let s2 = append_atc_experience(&cx, &pool, &e2)
+            .await
+            .into_result()
+            .expect("e2");
+        let s3 = append_atc_experience(&cx, &pool, &e3)
+            .await
+            .into_result()
+            .expect("e3");
 
         // All different experience_ids, same decision_id
         assert_ne!(s1.experience_id, s2.experience_id);
@@ -331,8 +413,10 @@ fn one_decision_many_effects() {
         assert_eq!(s2.decision_id, 900);
         assert_eq!(s3.decision_id, 900);
 
-        eprintln!("[FANOUT] OK: 3 experiences [{}, {}, {}] for decision 900",
-            s1.experience_id, s2.experience_id, s3.experience_id);
+        eprintln!(
+            "[FANOUT] OK: 3 experiences [{}, {}, {}] for decision 900",
+            s1.experience_id, s2.experience_id, s3.experience_id
+        );
     });
 }
 
@@ -345,11 +429,22 @@ fn idempotent_append() {
     rt.block_on(async {
         let row = make_probe_experience(1000, 1001, "TestAgent");
 
-        let first = append_atc_experience(&cx, &pool, &row).await.into_result().expect("first");
-        let second = append_atc_experience(&cx, &pool, &row).await.into_result().expect("second");
+        let first = append_atc_experience(&cx, &pool, &row)
+            .await
+            .into_result()
+            .expect("first");
+        let second = append_atc_experience(&cx, &pool, &row)
+            .await
+            .into_result()
+            .expect("second");
 
-        assert_eq!(first.experience_id, second.experience_id,
-            "duplicate append must return same experience_id");
-        eprintln!("[IDEMPOTENT] OK: same experience_id={}", first.experience_id);
+        assert_eq!(
+            first.experience_id, second.experience_id,
+            "duplicate append must return same experience_id"
+        );
+        eprintln!(
+            "[IDEMPOTENT] OK: same experience_id={}",
+            first.experience_id
+        );
     });
 }

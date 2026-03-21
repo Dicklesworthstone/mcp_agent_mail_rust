@@ -147,8 +147,8 @@ pub const fn default_budget_config(kind: EffectKind) -> BudgetConfig {
         EffectKind::Release => BudgetConfig {
             max_false_action_rate: 0.0, // zero tolerance
             min_observations: 20,
-            cooldown_micros: 600_000_000, // 10 minutes
-            recovery_streak: 20,          // 20 consecutive correct
+            cooldown_micros: 600_000_000,   // 10 minutes
+            recovery_streak: 20,            // 20 consecutive correct
             stress_threshold_fraction: 0.0, // always stressed if any false positive
         },
         // ForceReservation: near-zero false positives — forcing a reservation
@@ -525,11 +525,7 @@ impl RiskBudgetTable {
 
     /// Check admissibility for an action in a given stratum.
     #[must_use]
-    pub fn check_admissibility(
-        &self,
-        key: &StratumKey,
-        now_micros: i64,
-    ) -> AdmissibilityResult {
+    pub fn check_admissibility(&self, key: &StratumKey, now_micros: i64) -> AdmissibilityResult {
         if let Some(budget) = self.budgets.get(key).filter(|b| b.has_sufficient_data()) {
             return budget.check_admissibility(now_micros);
         }

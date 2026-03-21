@@ -3060,9 +3060,11 @@ pub async fn fetch_inbox(
     // inbox fetches.
     {
         let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
-        if let Err(e) =
-            mcp_agent_mail_db::sync::mark_messages_read_batch_sync(pool.sqlite_path(), agent_id, &ids)
-        {
+        if let Err(e) = mcp_agent_mail_db::sync::mark_messages_read_batch_sync(
+            pool.sqlite_path(),
+            agent_id,
+            &ids,
+        ) {
             tracing::warn!(
                 agent_id = agent_id,
                 count = ids.len(),

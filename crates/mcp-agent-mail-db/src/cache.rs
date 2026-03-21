@@ -462,7 +462,11 @@ impl ReadCache {
         // Without this, "BlueLake" and "bluelake" would be different cache keys
         // but the same agent in the database.
         let name_lower = name.to_ascii_lowercase();
-        let key = (scope_fingerprint(scope), project_id, InternedStr::new(&name_lower));
+        let key = (
+            scope_fingerprint(scope),
+            project_id,
+            InternedStr::new(&name_lower),
+        );
         {
             let cache = self.agents_by_key.read();
             let Some(entry) = cache.peek(&key) else {

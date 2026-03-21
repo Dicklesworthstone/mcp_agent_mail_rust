@@ -117,12 +117,7 @@ fn detect_suspicious_file_reservation(pattern: &str) -> Option<String> {
     let compiled = mcp_agent_mail_core::pattern_overlap::CompiledPattern::cached(pattern);
     let norm = compiled.normalized();
 
-    if norm == "*"
-        || norm == "**"
-        || norm == "**/*"
-        || norm == "**/**"
-        || norm.is_empty()
-    {
+    if norm == "*" || norm == "**" || norm == "**/*" || norm == "**/**" || norm.is_empty() {
         return Some(format!(
             "Pattern '{pattern}' is too broad (normalizes to '{norm}'). It will block all other agents from editing any files."
         ));
@@ -414,7 +409,10 @@ pub async fn file_reservation_paths(
     if paths.len() > MAX_PATHS_PER_CALL {
         return Err(legacy_tool_error(
             "TOO_MANY_PATHS",
-            &format!("Maximum {MAX_PATHS_PER_CALL} paths per reservation call, got {}", paths.len()),
+            &format!(
+                "Maximum {MAX_PATHS_PER_CALL} paths per reservation call, got {}",
+                paths.len()
+            ),
             true,
             json!({ "count": paths.len(), "max": MAX_PATHS_PER_CALL }),
         ));

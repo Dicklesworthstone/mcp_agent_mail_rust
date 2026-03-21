@@ -124,17 +124,11 @@ pub enum RegimeAction {
         reason: String,
     },
     /// Detection was suppressed due to hysteresis (within dwell).
-    Suppressed {
-        reason: &'static str,
-    },
+    Suppressed { reason: &'static str },
     /// System entered cooling due to rapid detections.
-    CoolingEntered {
-        rapid_count: u32,
-    },
+    CoolingEntered { rapid_count: u32 },
     /// Discount should be applied to EWMA rollups.
-    DiscountRollups {
-        factor: f64,
-    },
+    DiscountRollups { factor: f64 },
 }
 
 impl RegimeManager {
@@ -171,9 +165,8 @@ impl RegimeManager {
                 self.phase = RegimePhase::Transitioning;
                 self.phase_started_ts_micros = now_micros;
                 self.promotion_gated = true;
-                self.last_transition_reason = Some(format!(
-                    "{direction} detected (CUSUM={cusum_value:.3})"
-                ));
+                self.last_transition_reason =
+                    Some(format!("{direction} detected (CUSUM={cusum_value:.3})"));
 
                 // Apply discount immediately on entering transition.
                 self.discount_applied = true;
@@ -282,8 +275,7 @@ impl RegimeManager {
     /// Get a compact summary for operator display.
     #[must_use]
     pub fn summary(&self, now_micros: i64) -> RegimeSummary {
-        let phase_age_secs =
-            now_micros.saturating_sub(self.phase_started_ts_micros) / 1_000_000;
+        let phase_age_secs = now_micros.saturating_sub(self.phase_started_ts_micros) / 1_000_000;
 
         RegimeSummary {
             regime_id: self.current_regime_id,
@@ -354,7 +346,10 @@ mod tests {
         let action = mgr.tick(2_100_000);
         assert!(matches!(
             action,
-            RegimeAction::TransitionConfirmed { new_regime_id: 1, .. }
+            RegimeAction::TransitionConfirmed {
+                new_regime_id: 1,
+                ..
+            }
         ));
         assert!(mgr.is_stable());
         assert!(mgr.promotion_allowed());
@@ -409,7 +404,10 @@ mod tests {
         let action = mgr.tick(4_100_000); // 2.1s after cooling start
         assert!(matches!(
             action,
-            RegimeAction::TransitionConfirmed { new_regime_id: 1, .. }
+            RegimeAction::TransitionConfirmed {
+                new_regime_id: 1,
+                ..
+            }
         ));
         assert!(mgr.is_stable());
     }

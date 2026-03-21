@@ -893,7 +893,10 @@ pub async fn whois(
             // Return a user-friendly error without leaking internal project_id.
             return Err(legacy_tool_error(
                 "AGENT_NOT_FOUND",
-                &format!("Agent '{agent_name}' not found in project '{}'", project.slug),
+                &format!(
+                    "Agent '{agent_name}' not found in project '{}'",
+                    project.slug
+                ),
                 true,
                 serde_json::json!({ "agent_name": agent_name, "project": project.slug }),
             ));

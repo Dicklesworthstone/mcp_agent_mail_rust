@@ -789,7 +789,8 @@ fn share_bp(numerator: u64, denominator: u64) -> u16 {
     }
     // Use u128 intermediate to avoid saturation at u64::MAX which would
     // produce incorrect share values (e.g., u64::MAX / denominator >> 10000).
-    let share_128 = u128::from(numerator) * u128::from(FAIRNESS_BASIS_POINTS) / u128::from(denominator);
+    let share_128 =
+        u128::from(numerator) * u128::from(FAIRNESS_BASIS_POINTS) / u128::from(denominator);
     // Cap at FAIRNESS_BASIS_POINTS (10000 = 100%) since shares cannot exceed 100%.
     u16::try_from(share_128.min(u128::from(FAIRNESS_BASIS_POINTS))).unwrap_or(FAIRNESS_BASIS_POINTS)
 }

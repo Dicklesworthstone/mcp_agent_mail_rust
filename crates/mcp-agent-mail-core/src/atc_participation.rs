@@ -195,8 +195,9 @@ impl ParticipationEvent {
             Self::MessageSent { agent, .. }
             | Self::MessageReceived { agent, .. }
             | Self::MessageAcknowledged { agent, .. } => agent,
-            Self::AdvisorySent { target_agent, .. }
-            | Self::ProbeSent { target_agent, .. } => target_agent,
+            Self::AdvisorySent { target_agent, .. } | Self::ProbeSent { target_agent, .. } => {
+                target_agent
+            }
         }
     }
 
@@ -216,11 +217,21 @@ impl ParticipationEvent {
     #[must_use]
     pub const fn timestamp_micros(&self) -> i64 {
         match self {
-            Self::MessageSent { timestamp_micros, .. }
-            | Self::MessageReceived { timestamp_micros, .. }
-            | Self::MessageAcknowledged { timestamp_micros, .. }
-            | Self::AdvisorySent { timestamp_micros, .. }
-            | Self::ProbeSent { timestamp_micros, .. } => *timestamp_micros,
+            Self::MessageSent {
+                timestamp_micros, ..
+            }
+            | Self::MessageReceived {
+                timestamp_micros, ..
+            }
+            | Self::MessageAcknowledged {
+                timestamp_micros, ..
+            }
+            | Self::AdvisorySent {
+                timestamp_micros, ..
+            }
+            | Self::ProbeSent {
+                timestamp_micros, ..
+            } => *timestamp_micros,
         }
     }
 }

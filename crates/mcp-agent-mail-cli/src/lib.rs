@@ -15536,8 +15536,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                     .await,
                 )?;
                 Ok::<Vec<serde_json::Value>, CliError>(
-                    rows
-                        .iter()
+                    rows.iter()
                         .map(|row| inbox_row_to_json(row, include_bodies))
                         .collect::<Vec<_>>(),
                 )
@@ -15558,7 +15557,8 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                         &agent_name,
                         urgent_only,
                         since_ts,
-                        i64::try_from(validated_limit).expect("validated mail inbox limit fits i64"),
+                        i64::try_from(validated_limit)
+                            .expect("validated mail inbox limit fits i64"),
                         include_bodies,
                     )?
                 }
@@ -17077,9 +17077,9 @@ mod mail_server_cli_bridge_tests {
         build_server_reply_message_arguments, build_server_send_message_arguments,
         classify_server_tool_call, coerce_tool_result_json, coerce_tool_result_json_or_error,
         ensure_message_in_project, fetch_inbox_server_rejection_allows_local_fallback,
-        is_resource_busy_cli_error, mail_server_rejection_allows_local_fallback, product_inbox_row_to_json,
-        server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
-        sort_product_inbox_items_desc,
+        is_resource_busy_cli_error, mail_server_rejection_allows_local_fallback,
+        product_inbox_row_to_json, server_inbox_payload_to_cli_json,
+        server_message_payload_to_cli_json, sort_product_inbox_items_desc,
     };
 
     #[test]
@@ -17783,8 +17783,7 @@ fn service_install_systemd(
         cwd.join(&config.storage_root)
     };
 
-    let unit_content =
-        build_systemd_unit_content(&exec_args, &cwd, &abs_db_url, &abs_storage_root);
+    let unit_content = build_systemd_unit_content(&exec_args, &cwd, &abs_db_url, &abs_storage_root);
 
     std::fs::write(&unit_path, &unit_content)?;
     ftui_runtime::ftui_println!("Wrote {}", unit_path.display());
@@ -17885,13 +17884,8 @@ fn service_install_launchd(
         cwd.join(&config.storage_root)
     };
 
-    let plist_content = build_launchd_plist_content(
-        &args_xml,
-        &log_dir,
-        &cwd,
-        &abs_db_url,
-        &abs_storage_root,
-    );
+    let plist_content =
+        build_launchd_plist_content(&args_xml, &log_dir, &cwd, &abs_db_url, &abs_storage_root);
 
     // Stop existing job first (ignore errors — may not be loaded).
     let _ = run_cmd(
@@ -18373,11 +18367,15 @@ mod tests {
             "unit must contain absolute WorkingDirectory"
         );
         assert!(
-            unit.contains("Environment=DATABASE_URL=sqlite:///home/user/projects/myapp/storage.sqlite3"),
+            unit.contains(
+                "Environment=DATABASE_URL=sqlite:///home/user/projects/myapp/storage.sqlite3"
+            ),
             "unit must contain absolute DATABASE_URL"
         );
         assert!(
-            unit.contains("Environment=STORAGE_ROOT=/home/user/.local/share/mcp-agent-mail/git_mailbox_repo"),
+            unit.contains(
+                "Environment=STORAGE_ROOT=/home/user/.local/share/mcp-agent-mail/git_mailbox_repo"
+            ),
             "unit must contain absolute STORAGE_ROOT"
         );
     }
@@ -18440,7 +18438,9 @@ mod tests {
             "plist must contain STORAGE_ROOT key"
         );
         assert!(
-            plist.contains("<string>/Users/dev/.local/share/mcp-agent-mail/git_mailbox_repo</string>"),
+            plist.contains(
+                "<string>/Users/dev/.local/share/mcp-agent-mail/git_mailbox_repo</string>"
+            ),
             "plist must contain absolute STORAGE_ROOT value"
         );
     }
@@ -31006,9 +31006,7 @@ startup_timeout_sec = 42
         let open_thread = std::thread::spawn(move || {
             let result = open_db_sync_mail_inbox_with_database_url(&open_url).and_then(|conn| {
                 conn.query_sync("SELECT COUNT(*) AS c FROM message_recipients", &[])
-                    .map_err(|e| {
-                        CliError::Other(format!("message_recipients count failed: {e}"))
-                    })
+                    .map_err(|e| CliError::Other(format!("message_recipients count failed: {e}")))
                     .map(|rows| {
                         rows.first()
                             .and_then(|row| row.get_named::<i64>("c").ok())

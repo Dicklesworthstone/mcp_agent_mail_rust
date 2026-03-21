@@ -120,20 +120,20 @@ use mcp_agent_mail_tools::{
     ConfigEnvironmentQueryResource, ConfigEnvironmentResource, CreateAgentIdentity, EnsureProduct,
     EnsureProject, FetchInbox, FetchInboxProduct, FileReservationPaths, FileReservationsResource,
     ForceReleaseFileReservation, HealthCheck, IdentityProjectResource, InboxResource,
-    InstallPrecommitGuard, ListAgents, ListContacts, MacroContactHandshake, MacroFileReservationCycle,
-    MacroPrepareThread, MacroStartSession, MailboxResource, MailboxWithCommitsResource,
-    MarkMessageRead, MessageDetailsResource, OutboxResource, ProductDetailsResource, ProductsLink,
-    ProjectDetailsResource, ProjectsListQueryResource, ProjectsListResource, RegisterAgent,
-    ReleaseBuildSlot, ReleaseFileReservations, RenewBuildSlot, RenewFileReservations, ReplyMessage,
-    RequestContact, ResolvePaneIdentity, RespondContact, SearchMessages, SearchMessagesProduct,
-    SendMessage, SetContactPolicy, SummarizeThread, SummarizeThreadProduct, ThreadDetailsResource,
-    ToolingCapabilitiesResource, ToolingDiagnosticsQueryResource, ToolingDiagnosticsResource,
-    ToolingDirectoryQueryResource, ToolingDirectoryResource, ToolingLocksQueryResource,
-    ToolingLocksResource, ToolingMetricsCoreQueryResource, ToolingMetricsCoreResource,
-    ToolingMetricsQueryResource, ToolingMetricsResource, ToolingRecentResource,
-    ToolingSchemasQueryResource, ToolingSchemasResource, UninstallPrecommitGuard,
-    ViewsAckOverdueResource, ViewsAckRequiredResource, ViewsAcksStaleResource,
-    ViewsUrgentUnreadResource, Whois, clusters,
+    InstallPrecommitGuard, ListAgents, ListContacts, MacroContactHandshake,
+    MacroFileReservationCycle, MacroPrepareThread, MacroStartSession, MailboxResource,
+    MailboxWithCommitsResource, MarkMessageRead, MessageDetailsResource, OutboxResource,
+    ProductDetailsResource, ProductsLink, ProjectDetailsResource, ProjectsListQueryResource,
+    ProjectsListResource, RegisterAgent, ReleaseBuildSlot, ReleaseFileReservations, RenewBuildSlot,
+    RenewFileReservations, ReplyMessage, RequestContact, ResolvePaneIdentity, RespondContact,
+    SearchMessages, SearchMessagesProduct, SendMessage, SetContactPolicy, SummarizeThread,
+    SummarizeThreadProduct, ThreadDetailsResource, ToolingCapabilitiesResource,
+    ToolingDiagnosticsQueryResource, ToolingDiagnosticsResource, ToolingDirectoryQueryResource,
+    ToolingDirectoryResource, ToolingLocksQueryResource, ToolingLocksResource,
+    ToolingMetricsCoreQueryResource, ToolingMetricsCoreResource, ToolingMetricsQueryResource,
+    ToolingMetricsResource, ToolingRecentResource, ToolingSchemasQueryResource,
+    ToolingSchemasResource, UninstallPrecommitGuard, ViewsAckOverdueResource,
+    ViewsAckRequiredResource, ViewsAcksStaleResource, ViewsUrgentUnreadResource, Whois, clusters,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -8053,11 +8053,7 @@ to skip auth for local requests.</p>
     async fn dispatch(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
         // Upgrade self_ref to Arc so we can move into the 'static spawn_blocking closure.
         // This keeps ALL synchronous router/DB work off the async worker threads.
-        let Some(arc_self) = self
-            .self_ref
-            .get()
-            .and_then(std::sync::Weak::upgrade)
-        else {
+        let Some(arc_self) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
             // self_ref not set or HttpState already dropped — fall back to inline sync.
             let id = request.id.clone();
             return match self.dispatch_inner(request) {
@@ -8069,10 +8065,8 @@ to skip auth for local requests.</p>
         };
 
         let id = request.id.clone();
-        let result = asupersync::runtime::spawn_blocking(move || {
-            arc_self.dispatch_inner(request)
-        })
-        .await;
+        let result =
+            asupersync::runtime::spawn_blocking(move || arc_self.dispatch_inner(request)).await;
 
         match result {
             Ok(value) => id.map(|req_id| JsonRpcResponse::success(req_id, value)),

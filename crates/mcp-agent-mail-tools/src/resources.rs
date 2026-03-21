@@ -266,8 +266,7 @@ async fn resolve_existing_resource_project(
     projects
         .into_iter()
         .find(|project| {
-            project.slug.eq_ignore_ascii_case(&project_key)
-                || project.human_key == project_key // human_key is a path — case-sensitive
+            project.slug.eq_ignore_ascii_case(&project_key) || project.human_key == project_key // human_key is a path — case-sensitive
         })
         .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Project not found"))
 }
@@ -5881,8 +5880,7 @@ mod resource_shape_tests {
                     .await
                     .expect("list_agents tool");
 
-                let agents: Vec<Value> =
-                    serde_json::from_str(&result).expect("parse list_agents");
+                let agents: Vec<Value> = serde_json::from_str(&result).expect("parse list_agents");
                 assert!(
                     agents.len() >= 2,
                     "expected at least 2 agents, got {}",
