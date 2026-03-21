@@ -2,6 +2,10 @@
 /target/
 .cargo-target-*/
 
+# OS junk
+.DS_Store
+**/.DS_Store
+
 # SQLite databases (runtime)
 *.sqlite3
 *.sqlite3-wal
