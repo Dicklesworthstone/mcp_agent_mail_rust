@@ -459,6 +459,7 @@ impl std::fmt::Display for ExperimentRefusalCode {
 
 /// Context for experiment eligibility checking.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct EligibilityContext {
     /// The effect kind of the proposed experiment.
     pub effect_kind: EffectKind,
@@ -485,6 +486,7 @@ pub struct EligibilityContext {
 /// Returns all gate results (not short-circuited) so the caller can
 /// explain every reason an experiment was denied.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn check_eligibility(ctx: &EligibilityContext) -> EligibilityResult {
     let mut gates = Vec::new();
     let mut first_refusal = None;

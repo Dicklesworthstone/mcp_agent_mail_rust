@@ -485,7 +485,8 @@ fn label_open_or_executed(input: &LabelingInput) -> LabelingResult {
 #[must_use]
 #[allow(clippy::too_many_lines)]
 fn label_non_execution(input: &LabelingInput) -> LabelingResult {
-    let mut reasons = Vec::new();
+    let window = attribution_window(input.effect_kind);
+    let anchor = input.created_ts_micros;
 
     if input.subject_departed {
         return LabelingResult {
