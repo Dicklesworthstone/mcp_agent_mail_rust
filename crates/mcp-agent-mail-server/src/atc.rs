@@ -4727,7 +4727,7 @@ impl AtcEngine {
                 let entry = occupied.get_mut();
                 let program_changed = entry.program != program;
                 if project_key.is_some() {
-                    entry.project_key = project_key.clone();
+                    entry.project_key = project_key;
                 }
                 entry.program = program.to_string();
                 if program_changed {

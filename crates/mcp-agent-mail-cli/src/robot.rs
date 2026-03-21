@@ -5432,7 +5432,7 @@ fn build_atc_data(
             && snapshot
                 .tracked_agents
                 .iter()
-                .any(|agent| atc_agent_is_degraded(agent)));
+                .any(atc_agent_is_degraded));
     let has_conflicts = snapshot.deadlock_cycles > 0
         || !reservation_conflicts.is_empty()
         || snapshot

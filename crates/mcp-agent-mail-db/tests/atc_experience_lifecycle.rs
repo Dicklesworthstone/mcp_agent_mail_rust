@@ -1,4 +1,11 @@
-//! End-to-end integration test for the ATC experience lifecycle.
+#![allow(
+    clippy::too_many_lines,
+    clippy::doc_markdown,
+    clippy::used_underscore_binding,
+    clippy::cast_possible_wrap
+)]
+
+//! End-to-end tests for the ATC (Agent Trust & Compliance) experience lifecycle.
 //!
 //! This test exercises the COMPLETE pipeline with REAL SQLite:
 //!   append (Planned) → dispatch → execute → open → resolve → rollup

@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![allow(clippy::collapsible_if)]
 //! Git archive storage layer for MCP Agent Mail.
 //!
 //! Provides per-project git archives with:

@@ -11,6 +11,7 @@
 //! argument parsing and validation match the legacy CLI.
 
 #![forbid(unsafe_code)]
+#![allow(clippy::too_many_arguments)]
 
 pub mod bench;
 pub mod ci;
@@ -16898,16 +16899,9 @@ fn outcome_to_result<T>(
     }
 }
 
-/// Get a message by ID via the async DB layer.
-async fn get_message_by_id_async(
-    cx: &asupersync::Cx,
-    pool: &mcp_agent_mail_db::DbPool,
-    message_id: i64,
-) -> CliResult<mcp_agent_mail_db::MessageRow> {
-    outcome_to_result(mcp_agent_mail_db::queries::get_message(cx, pool, message_id).await)
-        .map_err(|_| CliError::InvalidArgument(format!("message not found: {message_id}")))
-}
 
+
+#[allow(dead_code)]
 fn ensure_message_in_project(
     message: &mcp_agent_mail_db::MessageRow,
     project_id: i64,

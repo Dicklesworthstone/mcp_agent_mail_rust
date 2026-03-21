@@ -82,7 +82,7 @@
     },
     {
       "check": "binary_version",
-      "detail": "am 0.2.7 (expected v0.2.7)",
+      "detail": "am 0.2.9 (expected v0.2.9)",
       "status": "ok"
     },
     {

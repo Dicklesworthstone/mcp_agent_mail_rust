@@ -13,6 +13,25 @@
 //! to/from `chrono::NaiveDateTime` for API compatibility.
 
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::result_large_err,
+    clippy::match_same_arms,
+    clippy::sliced_string_as_bytes,
+    clippy::needless_pass_by_value,
+    clippy::ref_option,
+    clippy::cast_precision_loss,
+    clippy::too_many_lines,
+    clippy::manual_let_else,
+    clippy::option_if_let_else,
+    clippy::too_many_arguments,
+    clippy::items_after_statements,
+    clippy::bool_to_int_with_if,
+    clippy::redundant_clone,
+    clippy::doc_markdown,
+    clippy::unused_async,
+    clippy::uninlined_format_args,
+    clippy::missing_const_for_fn
+)]
 
 pub mod cache;
 pub mod coalesce;

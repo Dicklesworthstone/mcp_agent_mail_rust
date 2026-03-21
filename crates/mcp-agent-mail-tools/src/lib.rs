@@ -14,7 +14,14 @@
 //! And 20+ MCP resources for read-only data access.
 
 #![forbid(unsafe_code)]
-#![allow(clippy::needless_pass_by_value)]
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::needless_borrows_for_generic_args,
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::needless_borrow,
+    clippy::manual_ignore_case_cmp
+)]
 
 pub mod build_slots;
 pub mod contacts;

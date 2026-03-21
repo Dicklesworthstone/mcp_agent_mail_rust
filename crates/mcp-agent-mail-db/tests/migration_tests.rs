@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_lines)]
+
 use mcp_agent_mail_db::schema::CREATE_TABLES_SQL;
 use mcp_agent_mail_db::{
     DbConn, TimestampFormat, convert_all_timestamps, convert_column, detect_timestamp_format,

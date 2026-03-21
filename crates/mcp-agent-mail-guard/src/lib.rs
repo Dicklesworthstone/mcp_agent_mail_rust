@@ -770,7 +770,7 @@ def glob_to_regex(pattern):
     regex = re.sub(r"\\?\{(.+?)\\?\}", lambda m: "(" + m.group(1).replace("\\", "").replace(",", "|") + ")", regex)
     return regex
 
-def glob_match(path, pattern):
+fn glob_match(path, pattern):
     """Simple shell-style glob matching (similar to Rust implementation)."""
     # NOTE: path must be a concrete path, pattern is the glob.
     normalized_f = normalize_match_input(path)
@@ -875,7 +875,7 @@ if __name__ == "__main__":
         .replace("__HOOK_NAME_TEXT__", hook_name)
         .replace(
             "__PROJECT_TEXT__",
-            &project.replace('\n', " ").replace('\r', " "),
+            &project.replace(['\n', '\r'], " "),
         )
         .replace("__PROJECT_JSON__", &project_json)
         .replace("__HOOK_NAME_JSON__", &hook_name_json)
@@ -1546,8 +1546,7 @@ pub fn get_staged_paths(repo_root: &Path) -> GuardResult<Vec<String>> {
         // Fail-closed: if git diff fails, return an error so the guard blocks
         // the commit rather than silently allowing it through with no checks.
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(GuardError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(GuardError::Io(std::io::Error::other(
             format!(
                 "git diff --cached failed (exit {}): {}",
                 output.status.code().unwrap_or(-1),
@@ -2229,7 +2228,10 @@ mod tests {
         .expect("write reservation");
 
         let records = read_active_reservations_from_archive(&archive, false).expect("read");
-        assert!(records.is_empty());
+        assert!(
+            records.is_empty(),
+            "positive numeric released_ts should skip reservation"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2517,7 +2519,7 @@ mod tests {
     fn staged_paths_includes_renames() {
         let td = tempfile::TempDir::new().expect("tempdir");
         let repo_dir = td.path().join("repo");
-        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
         run_git(&repo_dir, &["init", "-q"]);
         run_git(&repo_dir, &["config", "user.email", "test@test.com"]);
         run_git(&repo_dir, &["config", "user.name", "test"]);
@@ -2544,7 +2546,7 @@ mod tests {
     fn staged_paths_simple_add() {
         let td = tempfile::TempDir::new().expect("tempdir");
         let repo_dir = td.path().join("repo");
-        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
         run_git(&repo_dir, &["init", "-q"]);
         run_git(&repo_dir, &["config", "user.email", "test@test.com"]);
         run_git(&repo_dir, &["config", "user.name", "test"]);
@@ -2640,7 +2642,7 @@ mod tests {
     fn staged_paths_empty_when_nothing_staged() {
         let td = tempfile::TempDir::new().expect("tempdir");
         let repo_dir = td.path().join("repo");
-        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
         run_git(&repo_dir, &["init", "-q"]);
 
         let paths = get_staged_paths(&repo_dir).expect("staged paths");
@@ -3008,7 +3010,7 @@ mod tests {
             "expires_ts": future.to_rfc3339(),
             "released_ts": null
         });
-        std::fs::write(&outside_res_dir.join("escaped.json"), payload.to_string())
+        std::fs::write(outside_res_dir.join("escaped.json"), payload.to_string())
             .expect("write escaped reservation");
         symlink(&outside_res_dir, archive.join("file_reservations"))
             .expect("symlink reservations dir");

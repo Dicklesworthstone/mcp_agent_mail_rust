@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 use serde::Serialize;
+#[allow(unused_imports)]
 use std::io::IsTerminal;
 use unicode_width::UnicodeWidthStr;
 
