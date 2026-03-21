@@ -7,6 +7,7 @@
 pub mod agents;
 pub mod analytics;
 pub mod archive_browser;
+pub mod atc;
 pub mod attachments;
 pub mod contacts;
 pub mod dashboard;
@@ -97,6 +98,7 @@ pub enum MailScreenId {
     Analytics,
     Attachments,
     ArchiveBrowser,
+    Atc,
 }
 
 /// All screen IDs in display order.
@@ -116,6 +118,7 @@ pub const ALL_SCREEN_IDS: &[MailScreenId] = &[
     MailScreenId::Analytics,
     MailScreenId::Attachments,
     MailScreenId::ArchiveBrowser,
+    MailScreenId::Atc,
 ];
 
 /// Shifted number-row symbols used for direct jump bindings beyond screen 10.
@@ -802,6 +805,13 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         short_label: "Archive",
         category: ScreenCategory::Operations,
         description: "Two-pane Git archive browser with directory tree and file content preview",
+    },
+    MailScreenMeta {
+        id: MailScreenId::Atc,
+        title: "ATC",
+        short_label: "ATC",
+        category: ScreenCategory::System,
+        description: "Air Traffic Controller decision engine with agent liveness, conflict, and evidence ledger",
     },
 ];
 
