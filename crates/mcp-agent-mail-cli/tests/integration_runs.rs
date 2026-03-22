@@ -51,6 +51,9 @@ struct TestEnv {
     tmp: tempfile::TempDir,
     db_path: PathBuf,
     storage_root: PathBuf,
+    home_dir: PathBuf,
+    xdg_config_home: PathBuf,
+    hostile_repo: PathBuf,
 }
 
 impl TestEnv {
@@ -58,10 +61,21 @@ impl TestEnv {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("mailbox.sqlite3");
         let storage_root = tmp.path().join("storage_root");
+        let home_dir = tmp.path().join("home");
+        let xdg_config_home = home_dir.join(".config");
+        let hostile_repo = tmp.path().join("hostile_repo");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        std::fs::create_dir_all(&xdg_config_home).expect("create xdg config home");
+        std::fs::create_dir_all(home_dir.join(".cache")).expect("create xdg cache home");
+        std::fs::create_dir_all(home_dir.join(".local/share")).expect("create xdg data home");
+        std::fs::create_dir_all(&hostile_repo).expect("create hostile repo");
         Self {
             tmp,
             db_path,
             storage_root,
+            home_dir,
+            xdg_config_home,
+            hostile_repo,
         }
     }
 
@@ -83,6 +97,50 @@ impl TestEnv {
             ("HTTP_PORT".to_string(), "1".to_string()),
             ("HTTP_PATH".to_string(), "/mcp/".to_string()),
         ]
+    }
+
+    fn hermetic_env(&self) -> Vec<(String, String)> {
+        vec![
+            ("HOME".to_string(), self.home_dir.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".to_string(),
+                self.xdg_config_home.display().to_string(),
+            ),
+            (
+                "XDG_CACHE_HOME".to_string(),
+                self.home_dir.join(".cache").display().to_string(),
+            ),
+            (
+                "XDG_DATA_HOME".to_string(),
+                self.home_dir.join(".local/share").display().to_string(),
+            ),
+            (
+                "PATH".to_string(),
+                "/usr/local/bin:/usr/bin:/bin".to_string(),
+            ),
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+            ("LC_ALL".to_string(), "C.UTF-8".to_string()),
+            ("AGENT_NAME".to_string(), "RusticGlen".to_string()),
+            ("HTTP_HOST".to_string(), "127.0.0.1".to_string()),
+            ("HTTP_PORT".to_string(), "1".to_string()),
+            ("HTTP_PATH".to_string(), "/mcp/".to_string()),
+        ]
+    }
+
+    fn user_config_env_path(&self) -> PathBuf {
+        self.xdg_config_home.join("mcp-agent-mail/config.env")
+    }
+
+    fn write_user_config_env(&self, contents: &str) {
+        let path = self.user_config_env_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create user config dir");
+        }
+        std::fs::write(path, contents).expect("write user config env");
+    }
+
+    fn hostile_repo(&self) -> &Path {
+        &self.hostile_repo
     }
 }
 
@@ -115,6 +173,19 @@ fn run_am(
     } else {
         cmd.output().expect("spawn am")
     }
+}
+
+fn run_am_hermetic(env: &[(String, String)], cwd: Option<&Path>, args: &[&str]) -> Output {
+    let mut cmd = Command::new(am_bin());
+    cmd.env_clear();
+    cmd.args(args);
+    if let Some(cwd) = cwd {
+        cmd.current_dir(cwd);
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("spawn hermetic am")
 }
 
 fn init_cli_schema(db_path: &Path) {
@@ -1263,6 +1334,88 @@ fn doctor_check_on_migrated_db_passes() {
     assert!(
         stdout.contains("All checks passed."),
         "expected all checks passed:\n{stdout}"
+    );
+}
+
+#[test]
+fn doctor_check_and_list_projects_ignore_hostile_repo_dotenv_when_user_config_exists() {
+    let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
+    let conn = mcp_agent_mail_db::DbConn::open_file(env.db_path.display().to_string())
+        .expect("open sqlite db");
+    insert_project(
+        &conn,
+        1,
+        "migrated-mailbox",
+        "/Users/tester/projects/mcp_agent_mail",
+    );
+
+    env.write_user_config_env(&format!(
+        "DATABASE_URL={}\nSTORAGE_ROOT={}\n",
+        env.database_url(),
+        env.storage_root.display()
+    ));
+
+    std::fs::write(
+        env.hostile_repo().join(".env"),
+        "DATABASE_URL=sqlite:///./storage.sqlite3\nSTORAGE_ROOT=./storage_root\n",
+    )
+    .expect("write hostile repo .env");
+    std::fs::write(
+        env.hostile_repo().join("storage.sqlite3"),
+        b"this is not a sqlite database",
+    )
+    .expect("write hostile sqlite placeholder");
+
+    let list_out = run_am_hermetic(
+        &env.hermetic_env(),
+        Some(env.hostile_repo()),
+        &["list-projects", "--json"],
+    );
+    assert!(
+        list_out.status.success(),
+        "expected list-projects success\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&list_out.stdout),
+        String::from_utf8_lossy(&list_out.stderr)
+    );
+    let projects: serde_json::Value =
+        serde_json::from_slice(&list_out.stdout).expect("valid list-projects JSON");
+    let projects = projects.as_array().expect("project array");
+    assert!(
+        projects
+            .iter()
+            .any(|project| project.get("slug").and_then(|v| v.as_str()) == Some("migrated-mailbox")),
+        "expected seeded migrated project, got:\n{}",
+        serde_json::to_string_pretty(&projects).unwrap()
+    );
+
+    let doctor_out = run_am_hermetic(
+        &env.hermetic_env(),
+        Some(env.hostile_repo()),
+        &["doctor", "check", "--json"],
+    );
+    assert!(
+        doctor_out.status.success(),
+        "expected doctor check success\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&doctor_out.stdout),
+        String::from_utf8_lossy(&doctor_out.stderr)
+    );
+    let doctor: serde_json::Value =
+        serde_json::from_slice(&doctor_out.stdout).expect("valid doctor JSON");
+    let checks = doctor["checks"].as_array().expect("checks array");
+    let database_detail = checks
+        .iter()
+        .find(|check| check.get("check").and_then(|v| v.as_str()) == Some("database"))
+        .and_then(|check| check.get("detail"))
+        .and_then(|detail| detail.as_str())
+        .expect("database detail");
+    assert!(
+        database_detail.contains(&env.db_path.display().to_string()),
+        "doctor check did not use installer/user-config database:\n{database_detail}"
+    );
+    assert!(
+        !database_detail.contains("./storage.sqlite3"),
+        "doctor check incorrectly reported repo-local sqlite path:\n{database_detail}"
     );
 }
 

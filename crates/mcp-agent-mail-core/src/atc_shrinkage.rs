@@ -189,9 +189,9 @@ pub fn shrink_single(estimate: &StratumEstimate, population: &CohortStats) -> Sh
 
     let shrinkage_weight = if between > 0.0 && n > 0.0 {
         let raw = within / n.mul_add(between, within);
-        raw.clamp(0.0, 1.0)
+        raw.clamp(0.0, MAX_SHRINKAGE_WEIGHT)
     } else {
-        1.0 // maximal shrinkage if no between-group variance or no samples
+        MAX_SHRINKAGE_WEIGHT // cap population trust even under full pooling
     };
 
     let shrunk = (1.0 - shrinkage_weight).mul_add(

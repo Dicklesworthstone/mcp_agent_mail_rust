@@ -8,17 +8,27 @@ Versions marked **[Release]** have published [GitHub Releases](https://github.co
 
 ## Unreleased
 
-3 commits since v0.2.12 | [Compare](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.2.12...main)
-
-### Migration and Dependencies
-
-- Run full migrations via canonical SQLite for ALTER TABLE support ([3c939d7](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/3c939d7))
-- Update dependency versions for crates.io publish cascade ([85d948b](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/85d948b))
-- Update asupersync dep to 0.2.9 ([3955d99](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/commit/3955d99))
+No changes yet.
 
 ---
 
-## [v0.2.12](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.2.12) — 2026-03-21 **[Release — Latest]**
+## [v0.2.13](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.2.13) — 2026-03-22 **[Release — Latest]**
+
+8 commits since v0.2.12 | [Compare](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.2.12...v0.2.13)
+
+Hardens Python-to-Rust migration and startup so installed `am` keeps using the migrated mailbox database instead of being hijacked by repo-local `.env` files. Also makes doctor/migration recovery much more tolerant of SQLite snapshot conflicts and stale legacy schema state.
+
+### Changes
+
+- Prefer installer-managed user config over working-directory `.env` files during startup and doctor flows
+- Treat SQLite snapshot-conflict errors as recoverable so startup and doctor repair fall back into recovery instead of bailing out
+- Reconcile legacy migration edge cases where `recipients_json` already exists or stale message FTS triggers still point at missing `fts_messages`
+- Honor the documented ATC shrinkage cap when between-group variance collapses to zero instead of silently using uncapped full pooling
+- Add a hermetic regression test that reproduces the exact hostile cwd `.env` override scenario and proves the installed database path still wins
+
+---
+
+## [v0.2.12](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.2.12) — 2026-03-21 **[Release]**
 
 2 commits since v0.2.11 | [Compare](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.2.11...v0.2.12)
 
