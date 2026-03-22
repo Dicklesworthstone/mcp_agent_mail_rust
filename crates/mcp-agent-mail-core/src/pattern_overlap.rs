@@ -134,7 +134,11 @@ fn is_directory_prefix(prefix: &str, full: &str) -> bool {
     } else {
         full.starts_with(prefix)
     };
-    is_prefix && full.as_bytes().get(prefix.len()).is_some_and(|b| *b == b'/')
+    is_prefix
+        && full
+            .as_bytes()
+            .get(prefix.len())
+            .is_some_and(|b| *b == b'/')
 }
 
 impl CompiledPattern {

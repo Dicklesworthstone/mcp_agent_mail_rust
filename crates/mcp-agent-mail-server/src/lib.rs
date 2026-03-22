@@ -3166,7 +3166,10 @@ impl AtcExecutorMode {
 
 impl AtcOperatorActionSnapshot {
     fn console_line(&self) -> String {
-        self.message.as_deref().map_or_else(|| format!("[ATC:{}] {} {}", self.category, self.kind, self.agent), |message| format!("[ATC:{}] {} -> {}", self.category, self.agent, message))
+        self.message.as_deref().map_or_else(
+            || format!("[ATC:{}] {} {}", self.category, self.kind, self.agent),
+            |message| format!("[ATC:{}] {} -> {}", self.category, self.agent, message),
+        )
     }
 }
 

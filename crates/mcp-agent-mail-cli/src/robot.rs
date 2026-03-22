@@ -5428,11 +5428,7 @@ fn build_atc_data(
     let show_decisions = decisions_flag || default_sections;
     let show_executions = default_sections && !snapshot.recent_executions.is_empty();
     let show_liveness = liveness_flag
-        || (default_sections
-            && snapshot
-                .tracked_agents
-                .iter()
-                .any(atc_agent_is_degraded));
+        || (default_sections && snapshot.tracked_agents.iter().any(atc_agent_is_degraded));
     let has_conflicts = snapshot.deadlock_cycles > 0
         || !reservation_conflicts.is_empty()
         || snapshot

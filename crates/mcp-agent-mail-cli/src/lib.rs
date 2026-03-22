@@ -4574,6 +4574,15 @@ fn is_resource_busy_cli_error(error: &CliError) -> bool {
     })
 }
 
+fn is_snapshot_conflict_cli_error(error: &CliError) -> bool {
+    match error {
+        CliError::Other(message) => {
+            mcp_agent_mail_db::is_sqlite_snapshot_conflict_error_message(message)
+        }
+        _ => false,
+    }
+}
+
 fn sqlite_conn_quick_check_ok_canonical(
     conn: &sqlmodel_sqlite::SqliteConnection,
 ) -> CliResult<bool> {
@@ -4672,7 +4681,9 @@ where
                 path.display(),
                 e
             );
-            if is_sqlite_recovery_error_message(&e.to_string()) {
+            if is_sqlite_recovery_error_message(&e.to_string())
+                || mcp_agent_mail_db::is_sqlite_snapshot_conflict_error_message(&e.to_string())
+            {
                 return Ok(false);
             }
             return Err(CliError::Other(format!(
@@ -4775,7 +4786,7 @@ where
         Ok(v) => v,
         Err(e) => {
             let msg = e.to_string();
-            if is_sqlite_recovery_error_message(&msg) {
+            if is_sqlite_recovery_error_message(&msg) || is_snapshot_conflict_cli_error(&e) {
                 false
             } else {
                 return Err(CliError::Other(format!(
@@ -16899,8 +16910,6 @@ fn outcome_to_result<T>(
     }
 }
 
-
-
 #[allow(dead_code)]
 fn ensure_message_in_project(
     message: &mcp_agent_mail_db::MessageRow,
@@ -24380,6 +24389,34 @@ startup_timeout_sec = 42
         assert!("ok" == "ok", "ok should be healthy");
         let bad = "*** in database main ***";
         assert!(bad != "ok", "corruption string should not be healthy");
+    }
+
+    #[test]
+    fn sqlite_doctor_sanity_treats_snapshot_conflict_as_unhealthy_instead_of_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("snapshot-conflict.sqlite3");
+        std::fs::write(&db_path, b"placeholder").unwrap();
+
+        let result = sqlite_doctor_sanity_with_health_probe(
+            &db_path.display().to_string(),
+            |_path| {
+                Err(CliError::Other(
+                    "Resource is temporarily busy. Wait a moment and try again. (cannot open DB at ./storage.sqlite3: Connection error: database is busy (snapshot conflict on pages: page 4434 > snapshot db_size 4433 (latest: 4433)))"
+                        .to_string(),
+                ))
+            },
+        )
+        .expect("snapshot conflicts should be classified as unhealthy, not fatal");
+
+        assert!(
+            !result.0,
+            "snapshot conflict should force repair/reconstruct"
+        );
+        assert!(
+            result.1.contains("Health probes failed"),
+            "unexpected detail: {}",
+            result.1
+        );
     }
 
     #[test]
@@ -34244,8 +34281,6 @@ fn handle_doctor_repair_with(
         .map(|path| PathBuf::from(resolve_sqlite_path_with_absolute_candidate(&path)))
         .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
 
-    let conn = open_db_sync_with_database_url_and_storage_root(database_url, Some(storage_root))?;
-
     ftui_runtime::ftui_println!("Running database repair...");
     if !confirm_mutating_doctor_action(
         "Proceed with database repair? This can create backups, rebuild FTS tables, VACUUM/ANALYZE, and delete orphaned rows.",
@@ -34279,6 +34314,8 @@ fn handle_doctor_repair_with(
             false,
         );
     }
+
+    let conn = open_db_sync_with_database_url_and_storage_root(database_url, Some(storage_root))?;
 
     // 2. Optional backup before repair
     if !dry_run {

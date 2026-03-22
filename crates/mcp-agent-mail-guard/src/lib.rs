@@ -873,10 +873,7 @@ if __name__ == "__main__":
 
     template
         .replace("__HOOK_NAME_TEXT__", hook_name)
-        .replace(
-            "__PROJECT_TEXT__",
-            &project.replace(['\n', '\r'], " "),
-        )
+        .replace("__PROJECT_TEXT__", &project.replace(['\n', '\r'], " "))
         .replace("__PROJECT_JSON__", &project_json)
         .replace("__HOOK_NAME_JSON__", &hook_name_json)
 }
@@ -1546,13 +1543,11 @@ pub fn get_staged_paths(repo_root: &Path) -> GuardResult<Vec<String>> {
         // Fail-closed: if git diff fails, return an error so the guard blocks
         // the commit rather than silently allowing it through with no checks.
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(GuardError::Io(std::io::Error::other(
-            format!(
-                "git diff --cached failed (exit {}): {}",
-                output.status.code().unwrap_or(-1),
-                stderr.trim(),
-            ),
-        )));
+        return Err(GuardError::Io(std::io::Error::other(format!(
+            "git diff --cached failed (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            stderr.trim(),
+        ))));
     }
 
     parse_name_status_z(&output.stdout)
@@ -2265,10 +2260,7 @@ mod tests {
         // "MyAgent" should not conflict with its own reservation
         let conflicts =
             check_path_conflicts(&paths, &reservations, "MyAgent", false).expect("conflicts");
-        assert!(
-            conflicts.is_empty(),
-            "own reservations should be skipped"
-        );
+        assert!(conflicts.is_empty(), "own reservations should be skipped");
     }
 
     #[test]
@@ -2296,9 +2288,8 @@ mod tests {
         let paths = vec!["shared/README.md".to_string()];
 
         // SharedAgent's non-exclusive reservation should not block
-        let conflicts =
-            check_path_conflicts(&paths, &reservations, "SomeOtherAgent", false)
-                .expect("conflicts");
+        let conflicts = check_path_conflicts(&paths, &reservations, "SomeOtherAgent", false)
+            .expect("conflicts");
         assert!(
             conflicts.is_empty(),
             "non-exclusive reservations should not conflict"
@@ -2397,8 +2388,7 @@ mod tests {
 
     #[test]
     fn check_path_conflicts_rename_old_and_new_paths_conflict_independently() {
-        let renamed_paths = parse_name_status_z(b"R100\0src/old.rs\0src/new.rs\0")
-            .expect("parse");
+        let renamed_paths = parse_name_status_z(b"R100\0src/old.rs\0src/new.rs\0").expect("parse");
         let reservations = vec![
             reservation("src/old.rs", "OldOwner", true),
             reservation("src/new.rs", "NewOwner", true),

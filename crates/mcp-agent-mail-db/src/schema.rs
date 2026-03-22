@@ -1850,6 +1850,113 @@ fn migration_step_error(migration: &Migration, phase: &str, err: &SqlError) -> S
     ))
 }
 
+#[must_use]
+fn is_missing_fts_messages_error(err: &SqlError) -> bool {
+    let lower = err.to_string().to_ascii_lowercase();
+    lower.contains("no such table: main.fts_messages")
+        || lower.contains("no such table: fts_messages")
+}
+
+#[must_use]
+fn is_duplicate_column_error(err: &SqlError) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("duplicate column name")
+}
+
+#[must_use]
+fn trim_sql_identifier(token: &str) -> &str {
+    token.trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '[' | ']' | ';'))
+}
+
+#[must_use]
+fn parse_alter_table_add_column(sql: &str) -> Option<(String, String)> {
+    let tokens: Vec<&str> = sql.split_whitespace().collect();
+    if tokens.len() < 5
+        || !tokens[0].eq_ignore_ascii_case("alter")
+        || !tokens[1].eq_ignore_ascii_case("table")
+        || !tokens[3].eq_ignore_ascii_case("add")
+    {
+        return None;
+    }
+
+    let table = trim_sql_identifier(tokens[2]);
+    if table.is_empty() {
+        return None;
+    }
+
+    let column_idx = if tokens
+        .get(4)
+        .is_some_and(|token| token.eq_ignore_ascii_case("column"))
+    {
+        5
+    } else {
+        4
+    };
+    let column = trim_sql_identifier(tokens.get(column_idx)?);
+    if column.is_empty() {
+        return None;
+    }
+
+    Some((table.to_string(), column.to_string()))
+}
+
+async fn migration_statement_already_satisfied<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+    migration: &Migration,
+    err: &SqlError,
+) -> Outcome<bool, SqlError> {
+    if !is_duplicate_column_error(err) {
+        return Outcome::Ok(false);
+    }
+    let Some((table, column)) = parse_alter_table_add_column(&migration.up) else {
+        return Outcome::Ok(false);
+    };
+
+    let sql = format!("SELECT 1 AS present FROM pragma_table_info('{table}') WHERE name = $1");
+    let params = [Value::Text(column)];
+    match conn.query(cx, &sql, &params).await {
+        Outcome::Ok(rows) => Outcome::Ok(!rows.is_empty()),
+        Outcome::Err(query_err) => Outcome::Err(query_err),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
+async fn cleanup_legacy_message_fts_artifacts<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<(), SqlError> {
+    const CLEANUP_SQL: [&str; 7] = [
+        "DROP TRIGGER IF EXISTS fts_messages_ai",
+        "DROP TRIGGER IF EXISTS fts_messages_ad",
+        "DROP TRIGGER IF EXISTS fts_messages_au",
+        "DROP TRIGGER IF EXISTS messages_ai",
+        "DROP TRIGGER IF EXISTS messages_ad",
+        "DROP TRIGGER IF EXISTS messages_au",
+        "DROP TABLE IF EXISTS fts_messages",
+    ];
+
+    for sql in CLEANUP_SQL {
+        match execute_migration_ddl_with_lock_retry(
+            cx,
+            conn,
+            sql,
+            "cleanup legacy message fts artifacts",
+        )
+        .await
+        {
+            Outcome::Ok(()) => {}
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+
+    Outcome::Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_single_migration_with_lock_retry<C: Connection>(
     cx: &Cx,
@@ -1886,18 +1993,71 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
         match conn.execute(cx, &migration.up, &[]).await {
             Outcome::Ok(_) => {}
             Outcome::Err(err) => {
-                rollback_migration_txn_quietly(cx, conn).await;
-                if retries >= MIGRATION_RUN_LOCK_RETRIES || !is_retryable_migration_lock_error(&err)
+                if migration.id == "v15b_backfill_recipients_json"
+                    && is_missing_fts_messages_error(&err)
                 {
-                    return Outcome::Err(migration_step_error(
-                        migration,
-                        "migration statement",
-                        &err,
-                    ));
+                    rollback_migration_txn_quietly(cx, conn).await;
+                    match cleanup_legacy_message_fts_artifacts(cx, conn).await {
+                        Outcome::Ok(()) => {
+                            tracing::warn!(
+                                migration_id = %migration.id,
+                                error = %err,
+                                "migration backfill hit stale legacy FTS artifacts; cleaned them up and retrying"
+                            );
+                            continue;
+                        }
+                        Outcome::Err(cleanup_err) => {
+                            return Outcome::Err(migration_step_error(
+                                migration,
+                                "legacy fts cleanup",
+                                &cleanup_err,
+                            ));
+                        }
+                        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+                    }
                 }
-                std::thread::sleep(migration_retry_delay(retries));
-                retries += 1;
-                continue;
+
+                match migration_statement_already_satisfied(cx, conn, migration, &err).await {
+                    Outcome::Ok(true) => {
+                        tracing::warn!(
+                            migration_id = %migration.id,
+                            error = %err,
+                            "migration statement already satisfied by existing schema; recording migration"
+                        );
+                    }
+                    Outcome::Ok(false) => {
+                        rollback_migration_txn_quietly(cx, conn).await;
+                        if retries >= MIGRATION_RUN_LOCK_RETRIES
+                            || !is_retryable_migration_lock_error(&err)
+                        {
+                            return Outcome::Err(migration_step_error(
+                                migration,
+                                "migration statement",
+                                &err,
+                            ));
+                        }
+                        std::thread::sleep(migration_retry_delay(retries));
+                        retries += 1;
+                        continue;
+                    }
+                    Outcome::Err(check_err) => {
+                        rollback_migration_txn_quietly(cx, conn).await;
+                        return Outcome::Err(migration_step_error(
+                            migration,
+                            "already-satisfied probe",
+                            &check_err,
+                        ));
+                    }
+                    Outcome::Cancelled(reason) => {
+                        rollback_migration_txn_quietly(cx, conn).await;
+                        return Outcome::Cancelled(reason);
+                    }
+                    Outcome::Panicked(payload) => {
+                        rollback_migration_txn_quietly(cx, conn).await;
+                        return Outcome::Panicked(payload);
+                    }
+                }
             }
             Outcome::Cancelled(reason) => {
                 rollback_migration_txn_quietly(cx, conn).await;
@@ -2314,6 +2474,128 @@ mod tests {
         assert_eq!(
             rows[0].get_named::<String>("slug").unwrap_or_default(),
             "proj"
+        );
+    }
+
+    #[test]
+    fn add_column_migration_records_when_column_already_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("migrations_duplicate_column_reconcile.db");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+
+        conn.execute_raw(
+            "CREATE TABLE messages (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                recipients_json TEXT NOT NULL DEFAULT '{}',\
+                attachments TEXT NOT NULL DEFAULT '[]'\
+            )",
+        )
+        .expect("create messages table");
+
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                init_migrations_table(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("init migrations table");
+                run_single_migration_with_lock_retry(
+                    &cx,
+                    conn,
+                    &Migration::new(
+                        "v15_add_recipients_json_to_messages".to_string(),
+                        "add recipients_json column to messages table".to_string(),
+                        "ALTER TABLE messages ADD COLUMN recipients_json TEXT".to_string(),
+                        String::new(),
+                    ),
+                )
+                .await
+                .into_result()
+                .expect("reconcile duplicate add-column migration");
+            }
+        });
+
+        let rows = conn
+            .query_sync(
+                &format!("SELECT id FROM {MIGRATIONS_TABLE_NAME} WHERE id = $1"),
+                &[Value::Text(
+                    "v15_add_recipients_json_to_messages".to_string(),
+                )],
+            )
+            .expect("query migration row");
+        assert_eq!(rows.len(), 1, "expected migration row to be recorded");
+    }
+
+    #[test]
+    fn recipients_backfill_recovers_from_stale_fts_triggers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join("migrations_reconcile_stale_fts_triggers.db");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+
+        conn.execute_raw(
+            "CREATE TABLE messages (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                recipients_json TEXT,\
+                attachments TEXT NOT NULL DEFAULT '[]'\
+            )",
+        )
+        .expect("create messages table");
+        conn.execute_raw("INSERT INTO messages (recipients_json) VALUES (NULL)")
+            .expect("insert legacy message row");
+        conn.execute_raw(
+            "CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN \
+                INSERT INTO fts_messages(message_id, subject, body) VALUES (NEW.id, '', ''); \
+            END",
+        )
+        .expect("create stale update trigger");
+
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                init_migrations_table(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("init migrations table");
+                run_single_migration_with_lock_retry(
+                    &cx,
+                    conn,
+                    &Migration::new(
+                        "v15b_backfill_recipients_json".to_string(),
+                        "backfill recipients_json with empty object for existing rows".to_string(),
+                        "UPDATE messages SET recipients_json = '{}' WHERE recipients_json IS NULL OR recipients_json = ''"
+                            .to_string(),
+                        String::new(),
+                    ),
+                )
+                .await
+                .into_result()
+                .expect("retry recipients_json backfill after stale trigger cleanup");
+            }
+        });
+
+        let rows = conn
+            .query_sync("SELECT recipients_json FROM messages WHERE id = 1", &[])
+            .expect("query messages");
+        assert_eq!(
+            rows[0]
+                .get_named::<String>("recipients_json")
+                .expect("recipients_json value"),
+            "{}"
+        );
+
+        let trigger_rows = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = 'messages_au'",
+                &[],
+            )
+            .expect("query trigger existence");
+        assert!(
+            trigger_rows.is_empty(),
+            "expected stale messages_au trigger to be removed"
         );
     }
 

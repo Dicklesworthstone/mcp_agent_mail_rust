@@ -1946,17 +1946,21 @@ fn redact_db_url(url: &str) -> String {
 
 /// Detect which config source tier provided a given key.
 ///
-/// Checks tiers in order: process env → project `.env` → user env → default.
+/// Checks tiers in order: process env → user env → project `.env` → default.
+///
+/// The user-global env file is the installer-managed canonical config, so it
+/// must beat opportunistic working-directory `.env` files. This keeps the
+/// installed `am` binary stable across arbitrary current working directories.
 #[must_use]
 pub fn detect_source(key: &str) -> ConfigSource {
     if env::var(key).is_ok() {
         return ConfigSource::ProcessEnv;
     }
-    if dotenv_value(key).is_some() {
-        return ConfigSource::ProjectDotenv;
-    }
     if user_env_value(key).is_some() {
         return ConfigSource::UserEnvFile;
+    }
+    if dotenv_value(key).is_some() {
+        return ConfigSource::ProjectDotenv;
     }
     ConfigSource::Default
 }
@@ -2090,7 +2094,7 @@ pub fn user_env_value(key: &str) -> Option<String> {
     user_env_values().get(key).cloned()
 }
 
-/// Read a value with full precedence: process env → project `.env` → user env file.
+/// Read a value with full precedence: process env → user env file → project `.env`.
 #[must_use]
 pub fn full_env_value(key: &str) -> Option<String> {
     env_value(key)
@@ -2098,15 +2102,16 @@ pub fn full_env_value(key: &str) -> Option<String> {
 
 fn layered_env_value(
     process_value: Option<String>,
-    project_dotenv_value: Option<String>,
     user_envfile_value: Option<String>,
+    project_dotenv_value: Option<String>,
 ) -> Option<String> {
     process_value
-        .or(project_dotenv_value)
         .or(user_envfile_value)
+        .or(project_dotenv_value)
 }
 
-/// Read a value from the real environment first, falling back to project and user envfiles.
+/// Read a value from the real environment first, then the user-global env file,
+/// then the working-directory `.env`.
 #[must_use]
 pub fn env_value(key: &str) -> Option<String> {
     #[cfg(test)]
@@ -2116,7 +2121,7 @@ pub fn env_value(key: &str) -> Option<String> {
     if let Some(v) = process_env_override_value(key) {
         return Some(v);
     }
-    layered_env_value(env::var(key).ok(), dotenv_value(key), user_env_value(key))
+    layered_env_value(env::var(key).ok(), user_env_value(key), dotenv_value(key))
 }
 
 fn normalize_http_path(raw: &str) -> String {
@@ -3330,23 +3335,23 @@ mod tests {
 
     #[test]
     fn layered_env_value_uses_user_env_as_final_fallback() {
-        let value = layered_env_value(None, None, Some("from-user".to_string()));
+        let value = layered_env_value(None, Some("from-user".to_string()), None);
         assert_eq!(value.as_deref(), Some("from-user"));
     }
 
     #[test]
-    fn layered_env_value_preserves_process_project_user_precedence() {
-        let project_only = layered_env_value(
+    fn layered_env_value_preserves_process_user_project_precedence() {
+        let user_wins = layered_env_value(
             None,
-            Some("from-project".to_string()),
             Some("from-user".to_string()),
+            Some("from-project".to_string()),
         );
-        assert_eq!(project_only.as_deref(), Some("from-project"));
+        assert_eq!(user_wins.as_deref(), Some("from-user"));
 
         let process_wins = layered_env_value(
             Some("from-process".to_string()),
-            Some("from-project".to_string()),
             Some("from-user".to_string()),
+            Some("from-project".to_string()),
         );
         assert_eq!(process_wins.as_deref(), Some("from-process"));
     }

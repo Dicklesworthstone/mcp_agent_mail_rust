@@ -134,10 +134,7 @@ impl AtcScreen {
     }
 
     fn move_agent_selection(&mut self, delta: i32) {
-        let count = self
-            .snapshot
-            .as_ref()
-            .map_or(0, |s| s.tracked_agents.len());
+        let count = self.snapshot.as_ref().map_or(0, |s| s.tracked_agents.len());
         if count == 0 {
             return;
         }

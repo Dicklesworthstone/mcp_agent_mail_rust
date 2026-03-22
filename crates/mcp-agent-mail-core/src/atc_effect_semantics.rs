@@ -556,9 +556,9 @@ impl EscalationLevel {
     #[must_use]
     pub const fn escalation_threshold(self) -> u32 {
         match self {
-            Self::Advisory => 3, // 3 unanswered advisories → escalate to probe
-            Self::Probe => 2,    // 2 unanswered probes → escalate to release
-            Self::None | Self::Release => 0,  // first advisory is free, terminal has no escalation
+            Self::Advisory => 3,             // 3 unanswered advisories → escalate to probe
+            Self::Probe => 2,                // 2 unanswered probes → escalate to release
+            Self::None | Self::Release => 0, // first advisory is free, terminal has no escalation
         }
     }
 }

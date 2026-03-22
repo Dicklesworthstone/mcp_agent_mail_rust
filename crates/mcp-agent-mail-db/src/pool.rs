@@ -1377,9 +1377,19 @@ fn sqlite_lock_retry_delay(retry_index: usize) -> Duration {
 }
 
 #[must_use]
+pub fn is_sqlite_snapshot_conflict_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("snapshot conflict on pages")
+        || lower.contains("busy_snapshot")
+        || lower.contains("snapshot too old")
+        || (lower.contains("snapshot db_size") && lower.contains("page "))
+}
+
+#[must_use]
 pub fn is_sqlite_recovery_error_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     is_corruption_error_message(message)
+        || is_sqlite_snapshot_conflict_error_message(message)
         || lower.contains("out of memory")
         || lower.contains("cursor stack is empty")
         || lower.contains("called `option::unwrap()` on a `none` value")
@@ -1791,7 +1801,9 @@ where
     let conn = match open_sqlite_file_with_lock_retry(path_str.as_ref()) {
         Ok(conn) => conn,
         Err(e) => {
-            if is_corruption_error_message(&e.to_string()) {
+            let msg = e.to_string();
+            if is_corruption_error_message(&msg) || is_sqlite_snapshot_conflict_error_message(&msg)
+            {
                 return Ok(false);
             }
             return Err(e);
@@ -1802,7 +1814,9 @@ where
         Ok(false) => return Ok(false),
         Ok(true) => {}
         Err(e) => {
-            if is_corruption_error_message(&e.to_string()) {
+            let msg = e.to_string();
+            if is_corruption_error_message(&msg) || is_sqlite_snapshot_conflict_error_message(&msg)
+            {
                 return Ok(false);
             }
             return Err(e);
@@ -1813,7 +1827,9 @@ where
         Ok(false) => return Ok(false),
         Ok(true) => {}
         Err(e) => {
-            if is_corruption_error_message(&e.to_string()) {
+            let msg = e.to_string();
+            if is_corruption_error_message(&msg) || is_sqlite_snapshot_conflict_error_message(&msg)
+            {
                 return Ok(false);
             }
             return Err(e);
@@ -1826,6 +1842,7 @@ where
         Err(e) => {
             let msg = e.to_string();
             if is_corruption_error_message(&msg)
+                || is_sqlite_snapshot_conflict_error_message(&msg)
                 || msg.to_ascii_lowercase().contains("out of memory")
             {
                 return Ok(false);
@@ -3879,6 +3896,10 @@ mod tests {
             "called `Option::unwrap()` on a `None` value"
         ));
         assert!(is_sqlite_recovery_error_message("internal error"));
+        assert!(is_sqlite_recovery_error_message(
+            "database is busy (snapshot conflict on pages: page 4434 > snapshot db_size 4433 (latest: 4433))"
+        ));
+        assert!(is_sqlite_recovery_error_message("SQLITE_BUSY_SNAPSHOT"));
         assert!(!is_sqlite_recovery_error_message("database is locked"));
         assert!(!is_sqlite_recovery_error_message("table not found"));
     }
@@ -4577,6 +4598,16 @@ mod tests {
     #[test]
     fn recovery_error_detects_internal_error() {
         assert!(is_sqlite_recovery_error_message("internal error"));
+    }
+
+    #[test]
+    fn recovery_error_detects_snapshot_conflict() {
+        assert!(is_sqlite_snapshot_conflict_error_message(
+            "database is busy (snapshot conflict on pages: page 4434 > snapshot db_size 4433 (latest: 4433))"
+        ));
+        assert!(is_sqlite_snapshot_conflict_error_message(
+            "BUSY_SNAPSHOT while opening database"
+        ));
     }
 
     #[test]
