@@ -5697,7 +5697,22 @@ pub(crate) fn open_db_sync_robot_attachments_with_database_url(
     if let Ok(conn) = open_db_sync_robot_attachments_best_effort_with_database_url(database_url) {
         return Ok(conn);
     }
-    open_db_sync_with_database_url(database_url)
+    match open_db_sync_with_database_url(database_url) {
+        Ok(conn) => Ok(conn),
+        Err(error) if is_resource_busy_cli_error(&error) => {
+            match open_db_sync_robot_attachments_best_effort_with_database_url(database_url) {
+                Ok(conn) => {
+                    tracing::warn!(
+                        database_url,
+                        "robot attachments falling back to best-effort sqlite read after busy init/recovery path"
+                    );
+                    Ok(conn)
+                }
+                Err(_) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn open_db_sync_robot() -> CliResult<mcp_agent_mail_db::DbConn> {
@@ -5729,9 +5744,9 @@ fn handle_config(action: ConfigCommand) -> CliResult<()> {
                 let updated: Vec<String> = existing
                     .lines()
                     .map(|line: &str| {
-                        if line.starts_with("AGENT_MAIL_HTTP_PORT=") {
+                        if line.starts_with("HTTP_PORT=") {
                             found = true;
-                            format!("AGENT_MAIL_HTTP_PORT={port}")
+                            format!("HTTP_PORT={port}")
                         } else {
                             line.to_string()
                         }
@@ -5740,10 +5755,10 @@ fn handle_config(action: ConfigCommand) -> CliResult<()> {
                 if found {
                     updated.join("\n")
                 } else {
-                    format!("{existing}\nAGENT_MAIL_HTTP_PORT={port}")
+                    format!("{existing}\nHTTP_PORT={port}")
                 }
             } else {
-                format!("AGENT_MAIL_HTTP_PORT={port}\n")
+                format!("HTTP_PORT={port}\n")
             };
             std::fs::write(&env_path, content).map_err(|e| {
                 CliError::Other(format!("Failed to write {}: {e}", env_path.display()))
@@ -6843,6 +6858,61 @@ fn active_reservation_predicate_sql(table_ref: &str) -> String {
     mcp_agent_mail_db::queries::active_reservation_predicate_for(table_ref)
 }
 
+/// Resolve a project identifier (slug or human_key path) to the canonical
+/// slug stored in the database.  This mirrors the dual-lookup that
+/// `resolve_project` in the MCP tool layer performs: if the identifier
+/// looks like an absolute path we first try matching by `human_key`, then
+/// fall back to slugifying the path and matching by slug.
+fn resolve_project_slug_for_cli(
+    conn: &mcp_agent_mail_db::DbConn,
+    identifier: &str,
+) -> CliResult<String> {
+    // Fast path: try direct slug match first.
+    let slug_rows = conn
+        .query_sync(
+            "SELECT slug FROM projects WHERE slug = ?",
+            &[sqlmodel_core::Value::Text(identifier.to_string())],
+        )
+        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+    if let Some(row) = slug_rows.first()
+        && let Ok(slug) = row.get_named::<String>("slug")
+    {
+        return Ok(slug);
+    }
+
+    // If the identifier looks like an absolute path, try matching by human_key.
+    if std::path::Path::new(identifier).is_absolute() {
+        let hk_rows = conn
+            .query_sync(
+                "SELECT slug FROM projects WHERE human_key = ?",
+                &[sqlmodel_core::Value::Text(identifier.to_string())],
+            )
+            .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+        if let Some(row) = hk_rows.first()
+            && let Ok(slug) = row.get_named::<String>("slug")
+        {
+            return Ok(slug);
+        }
+        // Last resort: slugify the path and try again.
+        let slugified = mcp_agent_mail_core::slugify(identifier);
+        let slug_rows = conn
+            .query_sync(
+                "SELECT slug FROM projects WHERE slug = ?",
+                &[sqlmodel_core::Value::Text(slugified.clone())],
+            )
+            .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+        if let Some(row) = slug_rows.first()
+            && let Ok(slug) = row.get_named::<String>("slug")
+        {
+            return Ok(slug);
+        }
+    }
+
+    Err(CliError::InvalidArgument(format!(
+        "project not found: {identifier}"
+    )))
+}
+
 fn handle_file_reservations_with_conn(
     conn: &mcp_agent_mail_db::DbConn,
     action: FileReservationsCommand,
@@ -6855,6 +6925,7 @@ fn handle_file_reservations_with_conn(
             active_only,
             all,
         } => {
+            let project = resolve_project_slug_for_cli(conn, &project)?;
             let active_reservation_predicate =
                 active_reservation_predicate_sql("file_reservations");
             let sql = if active_only {
@@ -6925,6 +6996,7 @@ fn handle_file_reservations_with_conn(
             Ok(())
         }
         FileReservationsCommand::Active { project, limit } => {
+            let project = resolve_project_slug_for_cli(conn, &project)?;
             let limit = limit.unwrap_or(50);
             let active_reservation_predicate =
                 active_reservation_predicate_sql("file_reservations");
@@ -6963,6 +7035,7 @@ fn handle_file_reservations_with_conn(
             Ok(())
         }
         FileReservationsCommand::Soon { project, minutes } => {
+            let project = resolve_project_slug_for_cli(conn, &project)?;
             let minutes = minutes.unwrap_or(30);
             let threshold_us = now_us.saturating_add(minutes.saturating_mul(60_000_000));
             let active_reservation_predicate =
@@ -7015,6 +7088,7 @@ fn handle_file_reservations_with_conn(
             shared,
             reason,
         } => {
+            let project = resolve_project_slug_for_cli(conn, &project)?;
             let exclusive_val = if shared { false } else { exclusive };
             let ttl = ttl.max(60); // Min 60s
 
@@ -7138,6 +7212,7 @@ fn handle_file_reservations_with_conn(
             paths,
             ids,
         } => {
+            let project = resolve_project_slug_for_cli(conn, &project)?;
             let extend = extend_seconds.max(60);
             let extend_us = extend.saturating_mul(1_000_000);
 
@@ -7243,6 +7318,7 @@ fn handle_file_reservations_with_conn(
             paths,
             ids,
         } => {
+            let project = resolve_project_slug_for_cli(conn, &project)?;
             let proj_rows = conn
                 .query_sync(
                     "SELECT id FROM projects WHERE slug = ?",
@@ -7321,6 +7397,7 @@ fn handle_file_reservations_with_conn(
             Ok(())
         }
         FileReservationsCommand::Conflicts { project, paths } => {
+            let project = resolve_project_slug_for_cli(conn, &project)?;
             let proj_rows = conn
                 .query_sync(
                     "SELECT id FROM projects WHERE slug = ?",
@@ -8878,6 +8955,13 @@ fn write_update_cache(result: &UpdateCheckResult) {
     );
 }
 
+/// Remove the update-check cache file so that stale "update available"
+/// messages don't persist after a successful self-update.
+fn invalidate_update_cache() {
+    let path = update_check_cache_path();
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Compare two semver-like version strings (e.g., "0.1.0" vs "0.2.0").
 /// Returns true if `latest` is newer than `current`.
 fn is_newer_version(current: &str, latest: &str) -> bool {
@@ -9217,18 +9301,20 @@ fn download_and_verify_release(version: &str) -> Result<DownloadedRelease, Strin
     })?;
 
     let (asset_url, filename) = release_asset_url(version, &target);
-    let checksum_url = format!("{asset_url}.sha256");
+    let base = self_update_releases_base_url();
+    let checksum_url = format!("{base}/v{version}/SHA256SUMS");
 
-    // Download checksum file first (small, validates availability)
+    // Download SHA256SUMS file first (small, validates availability)
     ftui_runtime::ftui_eprintln!("Downloading checksum...");
     let checksum_body = download_file_sync(&checksum_url)?;
     let checksum_text = String::from_utf8(checksum_body)
         .map_err(|_| "checksum file is not valid UTF-8".to_string())?;
-    // Checksum file format: "<hex>  <filename>" or just "<hex>"
+    // SHA256SUMS format: "<hex>  <filename>" per line — find the line matching our artifact
     let expected_hash = checksum_text
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| "empty checksum file".to_string())?
+        .lines()
+        .find(|line| line.contains(&filename))
+        .and_then(|line| line.split_whitespace().next())
+        .ok_or_else(|| format!("no checksum found for {filename} in SHA256SUMS"))?
         .to_string();
 
     // Download the archive
@@ -9502,6 +9588,9 @@ fn handle_self_update_full(force: bool, target_version: Option<String>) -> CliRe
                 "Update complete (v{current} -> v{}). Restart am to use the new version.",
                 release.version
             );
+            // Invalidate the update-check cache so doctor/--version don't
+            // report a stale "update available" hint after upgrading.
+            invalidate_update_cache();
             // Clean up temp directory
             let _ = std::fs::remove_dir_all(&release.extract_dir);
             Ok(())
@@ -15345,7 +15434,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 }
             }
 
-            let payload = call_send_message_tool_locally(
+            let local_send_future = Box::pin(call_send_message_tool_locally(
                 &project_key,
                 &sender,
                 &to_names,
@@ -15355,8 +15444,22 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 &importance,
                 ack_required,
                 thread_id.as_deref(),
+            ));
+            let payload = match asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_secs(30),
+                local_send_future,
             )
-            .await?;
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(CliError::Other(
+                        "mail send timed out after 30s — the server may be unresponsive"
+                            .to_string(),
+                    ));
+                }
+            };
             let data = server_message_payload_to_cli_json(payload).ok_or_else(|| {
                 CliError::Other("unexpected local send_message response shape".to_string())
             })?;
@@ -31144,6 +31247,91 @@ startup_timeout_sec = 42
         assert_eq!(
             agent_count, 2,
             "robot fallback should preserve readable data"
+        );
+
+        release_tx.send(()).expect("release lock thread");
+        open_thread.join().expect("join open thread");
+        lock_thread.join().expect("join lock thread");
+    }
+
+    #[test]
+    fn open_db_sync_robot_attachments_with_database_url_falls_back_under_reserved_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("robot-attachments-fallback.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let db_path_str = db_path.to_string_lossy().into_owned();
+
+        let seed_conn = mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open seed db");
+        for stmt in [
+            "PRAGMA foreign_keys = OFF",
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL, human_key TEXT NOT NULL)",
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, sender_id INTEGER NOT NULL, subject TEXT NOT NULL, attachments TEXT NOT NULL DEFAULT '[]', created_ts DATETIME NOT NULL)",
+            "INSERT INTO projects (id, slug, human_key) VALUES (1, 'robot-attachments-lock', '/tmp/robot-attachments-lock')",
+            "INSERT INTO agents (id, project_id, name) VALUES (1, 1, 'AttachReader')",
+            "INSERT INTO messages (id, project_id, sender_id, subject, attachments, created_ts) VALUES (1, 1, 1, 'artifact', '[\"bundle.zip\"]', '2026-03-12 11:00:00')",
+        ] {
+            seed_conn.execute_raw(stmt).expect("seed statement");
+        }
+        drop(seed_conn);
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let lock_path = db_path_str.clone();
+        let lock_thread = std::thread::spawn(move || {
+            let lock_conn =
+                sqlmodel_sqlite::SqliteConnection::open_file(&lock_path).expect("open lock db");
+            lock_conn
+                .execute_raw("PRAGMA busy_timeout = 1;")
+                .expect("set lock busy_timeout");
+            lock_conn
+                .execute_raw("BEGIN IMMEDIATE")
+                .expect("hold reserved sqlite lock");
+            ready_tx.send(()).expect("signal lock ready");
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("wait for release");
+            lock_conn
+                .execute_raw("ROLLBACK")
+                .expect("release sqlite lock");
+        });
+
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("wait for lock thread");
+
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let open_url = db_url.clone();
+        let open_thread = std::thread::spawn(move || {
+            let result =
+                open_db_sync_robot_attachments_with_database_url(&open_url).and_then(|conn| {
+                    conn.query_sync("SELECT COUNT(*) AS c FROM messages", &[])
+                        .map_err(|e| CliError::Other(format!("messages count failed: {e}")))
+                        .map(|rows| {
+                            rows.first()
+                                .and_then(|row| row.get_named::<i64>("c").ok())
+                                .unwrap_or(0)
+                        })
+                });
+            result_tx.send(result).expect("send open result");
+        });
+
+        let message_count = match result_rx.recv_timeout(std::time::Duration::from_secs(1)) {
+            Ok(result) => {
+                result.expect("robot attachments helper should fall back to read-only open")
+            }
+            Err(err) => {
+                let _ = release_tx.send(());
+                open_thread.join().expect("join open thread after timeout");
+                lock_thread.join().expect("join lock thread after timeout");
+                panic!(
+                    "robot attachments open should not wait for canonical init under reserved lock: {err}"
+                );
+            }
+        };
+        assert_eq!(
+            message_count, 1,
+            "robot attachments fallback should preserve readable attachment rows"
         );
 
         release_tx.send(()).expect("release lock thread");

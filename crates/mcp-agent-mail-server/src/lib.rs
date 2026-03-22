@@ -10605,6 +10605,29 @@ mod tests {
     }
 
     #[test]
+    fn readiness_check_recovers_missing_sqlite_before_startup_integrity_check() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let db_path = temp.path().join("missing.sqlite3");
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = storage_root;
+        config.integrity_check_on_startup = true;
+
+        let result = readiness_check(&config);
+        assert!(
+            result.is_ok(),
+            "missing DB should be auto-initialized/recovered before startup integrity check: {result:?}"
+        );
+        assert!(
+            db_path.exists(),
+            "readiness check should leave behind an initialized sqlite file"
+        );
+    }
+
+    #[test]
     fn tui_deferred_wait_helpers_stop_on_headless_detach() {
         let _guard = TUI_STATE_TEST_LOCK
             .lock()

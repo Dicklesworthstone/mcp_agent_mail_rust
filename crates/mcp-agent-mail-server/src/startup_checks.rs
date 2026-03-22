@@ -1684,6 +1684,23 @@ mod tests {
     }
 
     #[test]
+    fn integrity_probe_missing_db_without_archive_is_ok_for_fresh_startup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("fresh.sqlite3");
+        let storage_root = temp.path().join("storage");
+
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = storage_root;
+
+        let result = probe_integrity(&config);
+        assert!(
+            matches!(result, ProbeResult::Ok { name: "integrity" }),
+            "fresh startup with a missing DB should not surface IntegrityCorruption: {result:?}"
+        );
+    }
+
+    #[test]
     fn sqlite_memory_url_with_query_passes() {
         let mut config = default_config();
         config.database_url = "sqlite:///:memory:?cache=shared".into();

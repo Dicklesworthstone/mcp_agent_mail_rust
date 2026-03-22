@@ -3482,7 +3482,8 @@ mod tests {
         assert_eq!(result.duration_us, 0, "memory check should be instant");
     }
 
-    /// Verify `run_startup_integrity_check` returns Ok for non-existent DB file.
+    /// Verify `run_startup_integrity_check` treats a missing DB file as
+    /// integrity corruption so callers can trigger recovery/initialization.
     #[test]
     fn startup_integrity_check_missing_file() {
         let dir = tempfile::tempdir().unwrap();
