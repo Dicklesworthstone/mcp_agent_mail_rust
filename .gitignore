@@ -156,6 +156,9 @@ clippy_out.*
 # SQLite memory-mode test DB files (leaked by in-memory URI tests)
 crates/mcp-agent-mail-db/file:*
 
+# In-memory test scratch files (leaked by concurrent test runners)
+crates/mcp-agent-mail-db/mem_*
+
 # Agent-generated Python fix scripts
 /fix_*.py
 
