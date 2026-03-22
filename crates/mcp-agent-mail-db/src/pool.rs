@@ -1181,6 +1181,41 @@ async fn run_sqlite_init_once(
         }
 
         drop(mig_conn);
+
+        // Run full migrations (including v10-v15) via canonical SQLite.
+        //
+        // Base-mode migrations intentionally skip migrations that require
+        // features unsupported by FrankenConnection (e.g. ALTER TABLE ADD
+        // COLUMN reparsing). Canonical SQLite handles these correctly, so we
+        // open a second connection to apply any remaining pending migrations
+        // such as v15 (recipients_json column addition).
+        let canonical_conn = match open_sqlite_file_with_lock_retry_canonical(sqlite_path) {
+            Ok(conn) => conn,
+            Err(err) => {
+                return Outcome::Err(SqlError::Custom(format!(
+                    "sqlite init stage=open_canonical_for_full_migrations failed: {err}"
+                )));
+            }
+        };
+
+        if let Err(err) = canonical_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL) {
+            return Outcome::Err(SqlError::Custom(format!(
+                "sqlite init stage=canonical_pragmas failed: {err}"
+            )));
+        }
+
+        match schema::migrate_to_latest(cx, &canonical_conn).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => {
+                return Outcome::Err(SqlError::Custom(format!(
+                    "sqlite init stage=migrate_to_latest (full) failed: {err}"
+                )));
+            }
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+
+        drop(canonical_conn);
     }
 
     let runtime_conn = crate::guard_db_conn(
