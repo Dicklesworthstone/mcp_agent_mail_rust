@@ -11894,7 +11894,7 @@ impl DoctorProjectIdentity {
         }
     }
 
-    fn matches(&self, other: &Self) -> bool {
+    fn exact_matches(&self, other: &Self) -> bool {
         self.human_key
             .as_deref()
             .zip(other.human_key.as_deref())
@@ -11904,10 +11904,6 @@ impl DoctorProjectIdentity {
                 .as_deref()
                 .zip(other.slug.as_deref())
                 .is_some_and(|(left, right)| left == right)
-            || ((self.human_key.is_none() || other.human_key.is_none())
-                && doctor_project_identity_match_tokens(self)
-                    .into_iter()
-                    .any(|left| doctor_project_identity_match_tokens(other).contains(&left)))
     }
 
     fn display_label(&self) -> String {
@@ -11940,6 +11936,41 @@ fn doctor_project_identity_match_tokens(
         tokens.insert(basename);
     }
     tokens
+}
+
+fn doctor_project_identity_token_candidates<'a>(
+    archive_identity: &DoctorProjectIdentity,
+    db_identities: &'a std::collections::BTreeSet<DoctorProjectIdentity>,
+) -> Vec<&'a DoctorProjectIdentity> {
+    let archive_tokens = doctor_project_identity_match_tokens(archive_identity);
+    if archive_tokens.is_empty() {
+        return Vec::new();
+    }
+
+    db_identities
+        .iter()
+        .filter(|db_identity| {
+            (archive_identity.human_key.is_none() || db_identity.human_key.is_none())
+                && !archive_tokens.is_disjoint(&doctor_project_identity_match_tokens(db_identity))
+        })
+        .collect()
+}
+
+fn doctor_archive_identity_matches_db(
+    archive_identity: &DoctorProjectIdentity,
+    db_identities: &std::collections::BTreeSet<DoctorProjectIdentity>,
+) -> bool {
+    let exact_match_count = db_identities
+        .iter()
+        .filter(|db_identity| archive_identity.exact_matches(db_identity));
+    match exact_match_count.take(2).count() {
+        1 => return true,
+        2 => return false,
+        0 => {}
+        _ => unreachable!("take(2) limits the exact match count"),
+    }
+
+    doctor_project_identity_token_candidates(archive_identity, db_identities).len() == 1
 }
 
 fn doctor_project_human_key_basename(human_key: &str) -> Option<&str> {
@@ -12798,9 +12829,7 @@ fn doctor_archive_db_drift_detail(
         .project_identities
         .iter()
         .filter(|archive_identity| {
-            !db.project_identities
-                .iter()
-                .any(|db_identity| archive_identity.matches(db_identity))
+            !doctor_archive_identity_matches_db(archive_identity, &db.project_identities)
         })
         .map(DoctorProjectIdentity::display_label)
         .collect::<Vec<_>>();
@@ -24898,6 +24927,42 @@ startup_timeout_sec = 42
         };
 
         assert_eq!(doctor_archive_db_drift_detail(&archive, &db), None);
+    }
+
+    #[test]
+    fn doctor_archive_db_drift_detail_flags_ambiguous_slug_only_archive_project_candidates() {
+        let archive = DoctorArchiveInventory {
+            projects: 1,
+            agents: 1,
+            messages: 1,
+            project_identities: std::collections::BTreeSet::from([DoctorProjectIdentity {
+                slug: Some("shared".to_string()),
+                human_key: None,
+            }]),
+            ..DoctorArchiveInventory::default()
+        };
+        let db = DoctorDbInventory {
+            counts: DoctorInventoryCounts {
+                projects: 2,
+                agents: 1,
+                messages: 1,
+            },
+            project_identities: std::collections::BTreeSet::from([
+                DoctorProjectIdentity {
+                    slug: Some("tmp-one-shared".to_string()),
+                    human_key: Some("/tmp/one/shared".to_string()),
+                },
+                DoctorProjectIdentity {
+                    slug: Some("var-two-shared".to_string()),
+                    human_key: Some("/var/two/shared".to_string()),
+                },
+            ]),
+        };
+
+        let detail = doctor_archive_db_drift_detail(&archive, &db)
+            .expect("ambiguous basename-only project should remain visible as drift");
+        assert!(detail.contains("missing archive project(s) in DB"));
+        assert!(detail.contains("shared"));
     }
 
     #[test]

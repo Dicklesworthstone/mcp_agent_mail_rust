@@ -1525,6 +1525,10 @@ fn is_expired(ts_str: &str, now: &chrono::DateTime<chrono::Utc>) -> bool {
         let utc = dt.and_utc();
         return utc <= *now;
     }
+    // Fallback for string-wrapped numeric timestamps (microseconds)
+    if let Ok(num) = ts_str.parse::<i64>() {
+        return num <= now.timestamp_micros();
+    }
     // If we can't parse, treat as NOT expired (conservative/fail-closed)
     false
 }
