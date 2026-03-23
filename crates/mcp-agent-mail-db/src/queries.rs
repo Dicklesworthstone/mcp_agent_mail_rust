@@ -9197,6 +9197,8 @@ mod tests {
                 Some("suppressed")
             );
 
+            drop(conn);
+
             let invalid = transition_atc_experience(
                 &cx,
                 &pool,

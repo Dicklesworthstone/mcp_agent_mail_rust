@@ -1229,9 +1229,11 @@ mod tests {
         let capacity = 100; // small=10, main=90
         let cache = ReadCache::with_capacity(capacity);
 
-        // Insert Agent0 and immediately access it to bump freq
+        // Insert Agent0 and immediately access it to bump freq.
+        // Must access at least HIT_WRITE_MAINTENANCE_INTERVAL times to trigger
+        // the write-side maintenance that actually bumps the S3-FIFO freq.
         cache.put_agent(&make_agent_with_id("Agent0", 1, 0));
-        for _ in 0..3 {
+        for _ in 0..8 {
             let _ = cache.get_agent(1, "Agent0");
         }
 

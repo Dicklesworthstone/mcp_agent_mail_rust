@@ -1709,7 +1709,7 @@ fn parse_query_terms(raw: &str) -> Vec<String> {
             .split_whitespace()
             .map(str::trim)
             .filter(|part| !part.is_empty())
-            .map(str::to_ascii_lowercase)
+            .map(str::to_lowercase)
             .collect();
         let result = terms.clone();
         *cell.borrow_mut() = (raw.to_string(), terms);
@@ -1817,7 +1817,7 @@ fn event_entry_search_key(entry: &EventEntry) -> String {
         entry.severity.badge(),
         entry.icon
     )
-    .to_ascii_lowercase()
+    .to_lowercase()
 }
 
 fn parse_tool_end_duration(summary: &str) -> Option<(String, u64)> {

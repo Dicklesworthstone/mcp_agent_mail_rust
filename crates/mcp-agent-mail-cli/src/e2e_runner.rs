@@ -590,14 +590,21 @@ impl Runner {
     fn run_suite_once(&self, suite: &Suite) -> std::io::Result<SuiteExecution> {
         // Build the command
         let mut cmd = Command::new("bash");
-        cmd.arg(&suite.path)
-            .current_dir(&self.config.project_root)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.arg(&suite.script_path);
+        cmd.current_dir(&self.config.project_root);
 
-        for (k, v) in env_vars {
-            cmd.env(k, v);
+        // Set environment
+        cmd.env("E2E_PROJECT_ROOT", &self.config.project_root);
+        if self.config.keep_tmp {
+            cmd.env("AM_E2E_KEEP_TMP", "1");
         }
+        for (key, value) in &self.config.env {
+            cmd.env(key, value);
+        }
+
+        // Capture output
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
 
         let mut child = cmd.spawn()?;
 
