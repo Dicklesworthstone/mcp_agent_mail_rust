@@ -6415,8 +6415,17 @@ fn apply_frame_contrast_guard(
             let needs_surface_materialization = bg_color.a() == 0;
             let needs_text_materialization = fg_color.a() == 0;
             let effective_bg = materialize_effective_background(bg_color, fallback_surface);
+            let is_decorative = !is_grapheme && !is_continuation
+                && symbol_opt.is_some()
+                && is_decorative_glyph(symbol);
+            // Pick an appropriate default fg for transparent cells: decorative
+            // glyphs get a subtle color, while regular text gets max contrast.
             let materialized_fg = if needs_text_materialization {
-                cache.best_readable_fg(effective_bg, tp)
+                if is_decorative {
+                    cache.best_readable_decorative_fg(effective_bg, tp)
+                } else {
+                    cache.best_readable_fg(effective_bg, tp)
+                }
             } else {
                 fg_color
             };
@@ -6445,7 +6454,6 @@ fn apply_frame_contrast_guard(
             if symbol_opt.is_none() && !is_grapheme {
                 continue;
             }
-            let is_decorative = !is_grapheme && is_decorative_glyph(symbol);
             let min_ratio = if symbol.is_whitespace() {
                 0.0
             } else if is_decorative {
