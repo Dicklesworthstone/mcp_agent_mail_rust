@@ -2056,15 +2056,27 @@ pub fn dotenv_value(key: &str) -> Option<String> {
 
 /// Candidate paths for the user-global env file, checked in order.
 ///
-/// 1. `$XDG_CONFIG_HOME/mcp-agent-mail/config.env` — canonical installer path
-/// 2. `$XDG_CONFIG_HOME/mcp-agent-mail/.env` — compatibility mirror for older binaries
-/// 3. `~/.mcp_agent_mail/.env` — legacy preferred over the old shell wrapper
-/// 4. `~/mcp_agent_mail/.env` — legacy (old shell wrapper)
+/// 1. `~/.config/mcp-agent-mail/config.env` — canonical installer path
+/// 2. `~/.config/mcp-agent-mail/.env` — compatibility mirror for older binaries
+/// 3. Native config dir `mcp-agent-mail/config.env` (e.g. `$XDG_CONFIG_HOME/...`,
+///    or macOS `~/Library/Application Support/...`) when different from `~/.config`
+/// 4. Native config dir `mcp-agent-mail/.env`
+/// 5. `~/.mcp_agent_mail/.env` — legacy preferred over the old shell wrapper
+/// 6. `~/mcp_agent_mail/.env` — legacy (old shell wrapper)
+fn push_user_env_candidate_dir(candidates: &mut Vec<PathBuf>, dir: &Path) {
+    for file_name in ["config.env", ".env"] {
+        let candidate = dir.join(file_name);
+        if !candidates.iter().any(|existing| existing == &candidate) {
+            candidates.push(candidate);
+        }
+    }
+}
+
 fn user_env_file_candidates(home: &Path, xdg_config_dir: Option<&Path>) -> Vec<PathBuf> {
-    let mut candidates = Vec::with_capacity(4);
+    let mut candidates = Vec::with_capacity(6);
+    push_user_env_candidate_dir(&mut candidates, &home.join(".config").join(XDG_APP_DIR));
     if let Some(xdg) = xdg_config_dir {
-        candidates.push(xdg.join("config.env"));
-        candidates.push(xdg.join(".env"));
+        push_user_env_candidate_dir(&mut candidates, xdg);
     }
     candidates.push(home.join(".mcp_agent_mail").join(".env"));
     candidates.push(home.join("mcp_agent_mail").join(".env"));
@@ -3421,6 +3433,23 @@ mod tests {
     }
 
     #[test]
+    fn user_env_file_path_prefers_portable_dot_config_installer_path_on_macos() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let portable = tmp.path().join(".config/mcp-agent-mail");
+        let native = tmp
+            .path()
+            .join("Library/Application Support")
+            .join("mcp-agent-mail");
+        std::fs::create_dir_all(&portable).unwrap();
+        std::fs::create_dir_all(&native).unwrap();
+        std::fs::write(portable.join("config.env"), "FOO=portable\n").unwrap();
+        std::fs::write(native.join("config.env"), "FOO=native\n").unwrap();
+
+        let selected = user_env_file_path_from(tmp.path(), Some(&native)).expect("env path");
+        assert_eq!(selected, portable.join("config.env"));
+    }
+
+    #[test]
     fn user_env_file_path_prefers_xdg_dotenv_mirror_over_legacy() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let xdg = tmp.path().join(".config/mcp-agent-mail");
@@ -3432,6 +3461,31 @@ mod tests {
 
         let selected = user_env_file_path_from(tmp.path(), Some(&xdg)).expect("env path");
         assert_eq!(selected, xdg.join(".env"));
+    }
+
+    #[test]
+    fn user_env_file_candidates_do_not_duplicate_same_portable_and_native_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let portable = tmp.path().join(".config").join(XDG_APP_DIR);
+        let candidates = user_env_file_candidates(tmp.path(), Some(&portable));
+        let config_env = portable.join("config.env");
+        let compat_env = portable.join(".env");
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|path| *path == &config_env)
+                .count(),
+            1,
+            "config.env candidate should not be duplicated when dirs::config_dir matches ~/.config"
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|path| *path == &compat_env)
+                .count(),
+            1,
+            ".env candidate should not be duplicated when dirs::config_dir matches ~/.config"
+        );
     }
 
     // -----------------------------------------------------------------------
