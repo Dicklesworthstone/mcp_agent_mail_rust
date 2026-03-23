@@ -401,11 +401,91 @@ check_write_permissions() {
   fi
 }
 
+capture_command_with_timeout() {
+  local timeout_secs="$1"
+  shift
+
+  CAPTURED_CMD_OUTPUT=""
+  CAPTURED_CMD_STATUS=0
+
+  if command -v python3 >/dev/null 2>&1; then
+    local output_file status_file tmp_root rc
+    tmp_root="${TMP:-/tmp}"
+    output_file="${tmp_root}/am-install-capture.$$.$RANDOM.out"
+    status_file="${tmp_root}/am-install-capture.$$.$RANDOM.status"
+
+    if python3 - "$timeout_secs" "$output_file" "$status_file" "$@" <<'PY'
+import subprocess
+import sys
+import time
+
+timeout_secs = float(sys.argv[1])
+output_path = sys.argv[2]
+status_path = sys.argv[3]
+cmd = sys.argv[4:]
+
+proc = subprocess.Popen(
+    cmd,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
+)
+
+deadline = time.time() + timeout_secs
+timed_out = False
+while time.time() < deadline:
+    if proc.poll() is not None:
+        break
+    time.sleep(0.05)
+
+if proc.poll() is None:
+    timed_out = True
+    proc.kill()
+
+output, _ = proc.communicate()
+with open(output_path, "w", encoding="utf-8") as handle:
+    handle.write(output or "")
+with open(status_path, "w", encoding="utf-8") as handle:
+    handle.write("124" if timed_out else str(proc.returncode))
+
+sys.exit(124 if timed_out else proc.returncode)
+PY
+    then
+      rc=0
+    else
+      rc=$?
+    fi
+
+    [ -f "$output_file" ] && CAPTURED_CMD_OUTPUT=$(cat "$output_file")
+    [ -f "$status_file" ] && CAPTURED_CMD_STATUS=$(cat "$status_file")
+    rm -f "$output_file" "$status_file" 2>/dev/null || true
+
+    if [ -z "${CAPTURED_CMD_STATUS:-}" ]; then
+      CAPTURED_CMD_STATUS="$rc"
+    fi
+    return "$CAPTURED_CMD_STATUS"
+  fi
+
+  if CAPTURED_CMD_OUTPUT=$("$@" 2>&1); then
+    CAPTURED_CMD_STATUS=0
+    return 0
+  fi
+  CAPTURED_CMD_STATUS=$?
+  return "$CAPTURED_CMD_STATUS"
+}
+
 check_existing_install() {
   verbose "check_existing_install:start dest=${DEST}"
   if [ -x "$DEST/$BIN_CLI" ]; then
     local current
-    current=$("$DEST/$BIN_CLI" --version 2>/dev/null | head -1 || echo "")
+    if capture_command_with_timeout 3 "$DEST/$BIN_CLI" --version; then
+      current=$(printf '%s\n' "$CAPTURED_CMD_OUTPUT" | head -1)
+    else
+      current=$(printf '%s\n' "$CAPTURED_CMD_OUTPUT" | head -1)
+      if [ "$CAPTURED_CMD_STATUS" -eq 124 ]; then
+        verbose "check_existing_install:am timeout path=${DEST}/$BIN_CLI"
+      fi
+    fi
     if [ -n "$current" ]; then
       info "Existing am detected: $current"
       verbose "check_existing_install:am version=${current}"
@@ -413,7 +493,14 @@ check_existing_install() {
   fi
   if [ -x "$DEST/$BIN_SERVER" ]; then
     local current
-    current=$("$DEST/$BIN_SERVER" --version 2>/dev/null | head -1 || echo "")
+    if capture_command_with_timeout 3 "$DEST/$BIN_SERVER" --version; then
+      current=$(printf '%s\n' "$CAPTURED_CMD_OUTPUT" | head -1)
+    else
+      current=$(printf '%s\n' "$CAPTURED_CMD_OUTPUT" | head -1)
+      if [ "$CAPTURED_CMD_STATUS" -eq 124 ]; then
+        verbose "check_existing_install:server timeout path=${DEST}/$BIN_SERVER"
+      fi
+    fi
     if [ -n "$current" ]; then
       info "Existing mcp-agent-mail detected: $current"
       verbose "check_existing_install:mcp-agent-mail version=${current}"
@@ -469,6 +556,11 @@ RUST_DB_PATH=""
 PYTHON_ALIAS_DISPLACED_COUNT=0
 PYTHON_CURRENT_SHELL_TAKEOVER_POSSIBLE=1
 LEGACY_LAUNCHER_SHIM_COUNT=0
+MAC_DIRECT_EXEC_COMPAT_MODE=0
+MAC_DIRECT_EXEC_COMPAT_REASON=""
+MAC_DIRECT_EXEC_COMPAT_LAUNCHER=""
+CAPTURED_CMD_OUTPUT=""
+CAPTURED_CMD_STATUS=0
 
 # T1.1: Detect Python am alias in shell rc files
 detect_python_alias() {
@@ -930,18 +1022,26 @@ probe_database_format_with_installed_am() {
 
   [ -x "$cli_bin" ] || return 1
 
-  if output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$db_path" "$cli_bin" migrate --check 2>&1); then
-    :
+  if capture_command_with_timeout 5 env AM_INTERFACE_MODE=cli DATABASE_URL="sqlite:///$db_path" "$cli_bin" migrate --check; then
+    output="$CAPTURED_CMD_OUTPUT"
   else
+    output="$CAPTURED_CMD_OUTPUT"
     verbose "db_probe:primary_nonzero db=${db_path}"
+    if [ "$CAPTURED_CMD_STATUS" -eq 124 ]; then
+      verbose "db_probe:primary_timeout db=${db_path}"
+    fi
   fi
   PYTHON_DB_FORMAT=$(extract_migrate_check_format "$output")
 
   if [ -z "$PYTHON_DB_FORMAT" ]; then
-    if fallback_output=$(AM_INTERFACE_MODE=cli DATABASE_URL="sqlite+aiosqlite:///$db_path" "$cli_bin" migrate --check 2>&1); then
-      :
+    if capture_command_with_timeout 5 env AM_INTERFACE_MODE=cli DATABASE_URL="sqlite+aiosqlite:///$db_path" "$cli_bin" migrate --check; then
+      fallback_output="$CAPTURED_CMD_OUTPUT"
     else
+      fallback_output="$CAPTURED_CMD_OUTPUT"
       verbose "db_probe:fallback_nonzero db=${db_path}"
+      if [ "$CAPTURED_CMD_STATUS" -eq 124 ]; then
+        verbose "db_probe:fallback_timeout db=${db_path}"
+      fi
     fi
     if [ -n "$fallback_output" ]; then
       if [ -n "$output" ]; then
@@ -2066,6 +2166,116 @@ maybe_add_path() {
     fi
   fi
   verbose "maybe_add_path:done"
+}
+
+detect_mac_direct_exec_compat_mode() {
+  MAC_DIRECT_EXEC_COMPAT_MODE=0
+  MAC_DIRECT_EXEC_COMPAT_REASON=""
+
+  [ "${PLATFORM:-}" = "darwin" ] || return 1
+  [ "$PYTHON_CLONE_FOUND" -eq 1 ] || return 1
+  [ -n "${PYTHON_CLONE_PATH:-}" ] || return 1
+  [ -x "$DEST/$BIN_CLI" ] || return 1
+
+  local help_output=""
+  if capture_command_with_timeout 3 "$DEST/$BIN_CLI" --help; then
+    help_output="$CAPTURED_CMD_OUTPUT"
+    if printf '%s\n' "$help_output" | grep -qE '(^|[[:space:]])serve-http([[:space:]]|$)'; then
+      return 1
+    fi
+    MAC_DIRECT_EXEC_COMPAT_REASON="installed Rust CLI did not expose the expected command surface on this macOS host"
+  else
+    help_output="$CAPTURED_CMD_OUTPUT"
+    if [ "$CAPTURED_CMD_STATUS" -eq 124 ]; then
+      MAC_DIRECT_EXEC_COMPAT_REASON="direct execution of installed Rust binaries timed out on this macOS host"
+    else
+      MAC_DIRECT_EXEC_COMPAT_REASON="installed Rust CLI exited non-zero during a direct execution probe on this macOS host"
+    fi
+  fi
+
+  MAC_DIRECT_EXEC_COMPAT_MODE=1
+  verbose "mac_exec_compat:enabled reason=${MAC_DIRECT_EXEC_COMPAT_REASON}"
+  return 0
+}
+
+install_mac_python_cli_compat_launcher() {
+  [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 1 ] || return 0
+  [ "$PYTHON_CLONE_FOUND" -eq 1 ] || return 1
+  [ -n "${PYTHON_CLONE_PATH:-}" ] || return 1
+
+  local compat_dir="$HOME/.config/mcp-agent-mail"
+  local compat_launcher="${compat_dir}/am-python-compat.sh"
+  local python_exec=""
+
+  mkdir -p "$compat_dir"
+  if [ -n "${PYTHON_VENV_PATH:-}" ] && [ -x "${PYTHON_VENV_PATH}/bin/python" ]; then
+    python_exec="${PYTHON_VENV_PATH}/bin/python"
+  elif [ -x "${PYTHON_CLONE_PATH}/.venv/bin/python" ]; then
+    python_exec="${PYTHON_CLONE_PATH}/.venv/bin/python"
+  elif command -v python3 >/dev/null 2>&1; then
+    python_exec="$(command -v python3)"
+  else
+    warn "Python compatibility mode requested, but no python3 interpreter was found"
+    return 1
+  fi
+
+  cat > "$compat_launcher" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+cd "${PYTHON_CLONE_PATH}"
+exec "${python_exec}" -m mcp_agent_mail.cli "\$@"
+EOF
+  chmod 0644 "$compat_launcher"
+  MAC_DIRECT_EXEC_COMPAT_LAUNCHER="$compat_launcher"
+  verbose "mac_exec_compat:launcher path=${compat_launcher}"
+}
+
+install_mac_python_cli_shell_alias() {
+  [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 1 ] || return 0
+  [ -n "${MAC_DIRECT_EXEC_COMPAT_LAUNCHER:-}" ] || return 1
+
+  local rc_files=("$HOME/.zshrc" "$HOME/.bashrc")
+  local rc marker_start marker_end block timestamp backup
+  marker_start="# >>> mcp-agent-mail mac exec compat >>>"
+  marker_end="# <<< mcp-agent-mail mac exec compat <<<"
+  block="${marker_start}
+am() { /bin/bash \"${MAC_DIRECT_EXEC_COMPAT_LAUNCHER}\" \"\$@\"; }
+${marker_end}"
+
+  for rc in "${rc_files[@]}"; do
+    if [ -f "$rc" ] && grep -Fq "$marker_start" "$rc" 2>/dev/null; then
+      continue
+    fi
+
+    if [ -f "$rc" ]; then
+      timestamp=$(date +%Y%m%d_%H%M%S)
+      backup="${rc}.bak.mcp-agent-mail-${timestamp}-${RANDOM}"
+      cp -p "$rc" "$backup"
+      verbose "mac_exec_compat:rc_backup rc=${rc} backup=${backup}"
+    fi
+
+    {
+      [ ! -f "$rc" ] || [ ! -s "$rc" ] || echo ""
+      printf '%s\n' "$block"
+    } >> "$rc"
+    MAC_DIRECT_EXEC_COMPAT_REASON="${MAC_DIRECT_EXEC_COMPAT_REASON}; shell alias installed in ${rc}"
+  done
+}
+
+activate_mac_python_cli_compat_shell() {
+  [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 1 ] || return 0
+  [ -t 0 ] || return 0
+
+  local shell_bin="${SHELL:-/bin/zsh}"
+  case "$(basename "$shell_bin")" in
+    zsh|bash)
+      warn "Launching a fresh interactive shell so 'am' resolves via the Python compatibility entrypoint on this Mac"
+      exec "$shell_bin" -il
+      ;;
+    *)
+      warn "Open a fresh shell to use the Python compatibility entrypoint for 'am' on this Mac"
+      ;;
+  esac
 }
 
 detect_mcp_configs() {
@@ -3698,7 +3908,14 @@ check_installed_version() {
   fi
 
   local installed_version
-  installed_version=$("$DEST/$BIN_CLI" --version 2>/dev/null | head -1 | sed 's/.*\([0-9]\+\.[0-9]\+\.[0-9]\+\).*/\1/')
+  if capture_command_with_timeout 3 "$DEST/$BIN_CLI" --version; then
+    installed_version=$(printf '%s\n' "$CAPTURED_CMD_OUTPUT" | head -1 | sed 's/.*\([0-9]\+\.[0-9]\+\.[0-9]\+\).*/\1/')
+  else
+    if [ "$CAPTURED_CMD_STATUS" -eq 124 ]; then
+      verbose "check_installed_version:timeout path=${DEST}/$BIN_CLI"
+    fi
+    return 1
+  fi
 
   if [ -z "$installed_version" ]; then
     return 1
@@ -3749,14 +3966,30 @@ existing_rust_binaries_are_skip_safe() {
   fi
 
   local cli_help=""
-  cli_help=$("$DEST/$BIN_CLI" --help 2>&1 || true)
+  if capture_command_with_timeout 3 "$DEST/$BIN_CLI" --help; then
+    cli_help="$CAPTURED_CMD_OUTPUT"
+  else
+    cli_help="$CAPTURED_CMD_OUTPUT"
+    if [ "$CAPTURED_CMD_STATUS" -eq 124 ]; then
+      EXISTING_INSTALL_REPAIR_REASON="'$DEST/$BIN_CLI --help' timed out"
+      return 1
+    fi
+  fi
   if ! printf '%s\n' "$cli_help" | grep -qE '(^|[[:space:]])serve-http([[:space:]]|$)'; then
     EXISTING_INSTALL_REPAIR_REASON="'$DEST/$BIN_CLI --help' is missing the expected CLI surface"
     return 1
   fi
 
   local server_help=""
-  server_help=$("$DEST/$BIN_SERVER" --help 2>&1 || true)
+  if capture_command_with_timeout 3 "$DEST/$BIN_SERVER" --help; then
+    server_help="$CAPTURED_CMD_OUTPUT"
+  else
+    server_help="$CAPTURED_CMD_OUTPUT"
+    if [ "$CAPTURED_CMD_STATUS" -eq 124 ]; then
+      EXISTING_INSTALL_REPAIR_REASON="'$DEST/$BIN_SERVER --help' timed out"
+      return 1
+    fi
+  fi
   if ! printf '%s\n' "$server_help" | grep -qE '^Usage: mcp-agent-mail ' || \
      ! printf '%s\n' "$server_help" | grep -qE '(^|[[:space:]])serve([[:space:]]|$)'; then
     EXISTING_INSTALL_REPAIR_REASON="'$DEST/$BIN_SERVER --help' is missing the expected server surface"
@@ -4316,56 +4549,73 @@ ok "  $DEST/$BIN_SERVER"
 ok "  $DEST/$BIN_CLI"
 maybe_add_path
 
+if detect_mac_direct_exec_compat_mode; then
+  warn "macOS direct execution compatibility mode enabled"
+  warn "  Reason: ${MAC_DIRECT_EXEC_COMPAT_REASON}"
+  if install_mac_python_cli_compat_launcher && install_mac_python_cli_shell_alias; then
+    ok "Installed Python compatibility launcher for interactive 'am' usage"
+  else
+    err "Failed to install the Python compatibility launcher for this macOS host"
+    error_support_hint
+    exit 1
+  fi
+fi
+
 # Displace Python installation if detected (T2.2)
 if [ "$PYTHON_DETECTED" -eq 1 ]; then
-  MIGRATE_PYTHON=1
-  if [ "$FORCE_NO_MIGRATE" -eq 1 ]; then
+  if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 1 ]; then
     MIGRATE_PYTHON=0
-    warn "Skipping Python displacement due to --no-migrate."
-  elif [ "$FORCE_MIGRATE" -eq 1 ]; then
+    warn "Keeping the existing Python installation active because this macOS host blocks direct execution of the newly installed Rust binaries."
+  else
     MIGRATE_PYTHON=1
-    info "Forcing Python displacement due to --migrate."
-  elif [ "$EASY" -eq 0 ] && [ -t 0 ]; then
-    # Interactive mode: ask the user
-    echo ""
-    info "An existing Python mcp-agent-mail installation was detected."
-    info "The Rust binary has been installed. To ensure 'am' resolves to the"
-    info "new Rust version, the Python alias/binary should be displaced."
-    echo ""
-    printf "%s" "Migrate from Python to Rust? [Y/n] "
-    read -r answer </dev/tty 2>/dev/null || answer="y"
-    case "$answer" in
-      [nN]*)
-        MIGRATE_PYTHON=0
-        warn "Skipping Python displacement."
-        if [ "$PYTHON_ALIAS_FOUND" -eq 1 ]; then
-          warn "The shell alias 'am' still points to the Python version."
-          warn "The Rust binary is available as: $DEST/$BIN_CLI"
-          warn "To use Rust: remove the alias from $PYTHON_ALIAS_FILE or run:"
-          warn "  $DEST/$BIN_CLI <command>"
-        fi
-        ;;
-    esac
-  fi
+    if [ "$FORCE_NO_MIGRATE" -eq 1 ]; then
+      MIGRATE_PYTHON=0
+      warn "Skipping Python displacement due to --no-migrate."
+    elif [ "$FORCE_MIGRATE" -eq 1 ]; then
+      MIGRATE_PYTHON=1
+      info "Forcing Python displacement due to --migrate."
+    elif [ "$EASY" -eq 0 ] && [ -t 0 ]; then
+      # Interactive mode: ask the user
+      echo ""
+      info "An existing Python mcp-agent-mail installation was detected."
+      info "The Rust binary has been installed. To ensure 'am' resolves to the"
+      info "new Rust version, the Python alias/binary should be displaced."
+      echo ""
+      printf "%s" "Migrate from Python to Rust? [Y/n] "
+      read -r answer </dev/tty 2>/dev/null || answer="y"
+      case "$answer" in
+        [nN]*)
+          MIGRATE_PYTHON=0
+          warn "Skipping Python displacement."
+          if [ "$PYTHON_ALIAS_FOUND" -eq 1 ]; then
+            warn "The shell alias 'am' still points to the Python version."
+            warn "The Rust binary is available as: $DEST/$BIN_CLI"
+            warn "To use Rust: remove the alias from $PYTHON_ALIAS_FILE or run:"
+            warn "  $DEST/$BIN_CLI <command>"
+          fi
+          ;;
+      esac
+    fi
 
-  if [ "$MIGRATE_PYTHON" -eq 1 ]; then
-    stop_python_server
-    if ! displace_python_alias; then
-      err "Failed to fully displace legacy 'am' alias/function definitions."
-      err "Please remove remaining alias/function manually, then rerun installer."
-      err "You can still use the Rust binary directly at: $DEST/$BIN_CLI"
-      error_support_hint
-      exit 1
+    if [ "$MIGRATE_PYTHON" -eq 1 ]; then
+      stop_python_server
+      if ! displace_python_alias; then
+        err "Failed to fully displace legacy 'am' alias/function definitions."
+        err "Please remove remaining alias/function manually, then rerun installer."
+        err "You can still use the Rust binary directly at: $DEST/$BIN_CLI"
+        error_support_hint
+        exit 1
+      fi
+      if ! displace_python_binary; then
+        err "Failed to displace legacy 'am' launcher in PATH."
+        err "Please remove or rename the legacy launcher manually, then rerun installer."
+        err "You can still use the Rust binary directly at: $DEST/$BIN_CLI"
+        error_support_hint
+        exit 1
+      fi
+      resolve_database_path
+      migrate_env_config
     fi
-    if ! displace_python_binary; then
-      err "Failed to displace legacy 'am' launcher in PATH."
-      err "Please remove or rename the legacy launcher manually, then rerun installer."
-      err "You can still use the Rust binary directly at: $DEST/$BIN_CLI"
-      error_support_hint
-      exit 1
-    fi
-    resolve_database_path
-    migrate_env_config
   fi
 fi
 
@@ -4392,7 +4642,7 @@ fi
 # Set up MCP configs for fresh installs (non-interactive, auto-detect).
 # Codex is written directly in HTTP URL mode here so the one-liner does not
 # depend on a particular released `am setup` implementation.
-if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ]; then
+if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ] && [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ]; then
   setup_mcp_configs "$DEST/$BIN_SERVER"
 fi
 
@@ -4402,13 +4652,13 @@ fi
 #   - env var preservation (bearer token, storage root)
 #   - BOM/JSONC/trailing-comma tolerance
 #   - Backup before modification
-if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ]; then
+if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ] && [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ]; then
   update_mcp_configs "$DEST/$BIN_SERVER" "$DEST/$BIN_CLI"
 fi
 
 # Re-sync Codex last so an older released `am` cannot leave Codex in stdio or
 # mixed transport mode after the installer has already chosen HTTP.
-if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ]; then
+if [ "${AM_INSTALL_SKIP_MCP_SETUP:-0}" != "1" ] && [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ]; then
   sync_codex_http_configs "$DEST/$BIN_SERVER"
 fi
 
@@ -4945,7 +5195,7 @@ SQL
 }
 
 # Run database migration if we copied a Python DB
-if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
+if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ] && [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
   info "Running database migration on copied Python database"
   migration_start=0
   migration_end=0
@@ -5266,6 +5516,11 @@ if [ -n "$PYTHON_DB_MIGRATED_PATH" ] && [ -f "$PYTHON_DB_MIGRATED_PATH" ]; then
   fi
 fi
 
+if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 1 ]; then
+  warn "Rust database migration was skipped because this macOS host rejected direct execution of the installed Rust binaries."
+  warn "The existing Python data path remains active through the compatibility launcher."
+fi
+
 if [ "${MIGRATE_PYTHON:-0}" -eq 1 ] && [ "$PYTHON_CURRENT_SHELL_TAKEOVER_POSSIBLE" -eq 1 ]; then
   if ! install_legacy_launcher_takeover_shims; then
     err "Failed to install the legacy current-shell handoff shim."
@@ -5278,12 +5533,29 @@ if [ "${MIGRATE_PYTHON:-0}" -eq 1 ] && [ "$PYTHON_CURRENT_SHELL_TAKEOVER_POSSIBL
   fi
 fi
 
-ensure_remote_http_client_readiness
+if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ]; then
+  ensure_remote_http_client_readiness
+else
+  warn "Skipping Rust HTTP endpoint readiness checks because this macOS host is using the Python compatibility launcher."
+fi
 
 # T2.4: Post-install verification
 verify_installation() {
   local issues=0
   verbose "verify_installation:start dest=${DEST} shell=${SHELL:-unknown}"
+
+  if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 1 ]; then
+    ok "VERIFY: macOS Python compatibility mode is active"
+    warn "VERIFY: Rust direct-exec probes were skipped because this Mac blocked the installed Rust binaries"
+    local am_descriptor=""
+    am_descriptor=$(interactive_shell_am_descriptor)
+    if printf '%s\n' "$am_descriptor" | grep -qiE 'alias|function'; then
+      ok "VERIFY: interactive shell resolves 'am' via shell compatibility glue"
+    else
+      warn "VERIFY: open a fresh shell so the compatibility 'am' function is loaded"
+    fi
+    return 0
+  fi
 
   # Surface guard helpers: ensure CLI/server binaries were not swapped.
   local cli_help=""
@@ -5430,4 +5702,11 @@ if [ "$QUIET" -eq 0 ]; then
   else
     echo -e "\033[0;90mTo uninstall: ./install.sh --uninstall --dest $DEST\033[0m"
   fi
+fi
+
+if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 1 ]; then
+  echo ""
+  warn "This macOS host is using the Python compatibility launcher for 'am'."
+  warn "The installed Rust binaries remain on disk, but direct execution was blocked by the host."
+  activate_mac_python_cli_compat_shell
 fi

@@ -62,24 +62,10 @@ pub enum CliError {
 pub type CliResult<T> = Result<T, CliError>;
 
 #[derive(Parser, Debug)]
-#[command(name = "am", version = version_with_update_hint(), about = "MCP Agent Mail CLI (Rust)")]
+#[command(name = "am", version = env!("CARGO_PKG_VERSION"), about = "MCP Agent Mail CLI (Rust)")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
-}
-
-/// Build a version string that includes an update hint if a cached check exists.
-fn version_with_update_hint() -> &'static str {
-    static VERSION: OnceLock<String> = OnceLock::new();
-    VERSION.get_or_init(|| {
-        let base = env!("CARGO_PKG_VERSION");
-        // Check update cache (fast, no network)
-        if let Some(UpdateCheckResult::UpdateAvailable { latest, .. }) = read_update_cache() {
-            format!("{base} (update available: {latest} — run `am self-update`)")
-        } else {
-            base.to_string()
-        }
-    })
 }
 
 #[derive(Subcommand, Debug)]
@@ -21738,6 +21724,12 @@ command = "mcp-agent-mail"
     fn clap_parses_migrate() {
         let m = Cli::try_parse_from(["am", "migrate"]).unwrap();
         assert!(matches!(m.command, Some(Commands::Migrate { .. })));
+    }
+
+    #[test]
+    fn clap_top_level_version_is_static_package_version() {
+        let command = Cli::command();
+        assert_eq!(command.get_version(), Some(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]
