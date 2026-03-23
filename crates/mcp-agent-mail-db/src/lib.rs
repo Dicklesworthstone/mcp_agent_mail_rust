@@ -109,11 +109,12 @@ pub use pool::{
     DbPool, DbPoolConfig, auto_pool_size, create_pool, ensure_sqlite_file_healthy,
     ensure_sqlite_file_healthy_with_archive, get_or_create_pool, is_corruption_error_message,
     is_sqlite_recovery_error_message, is_sqlite_snapshot_conflict_error_message,
-    open_sqlite_file_with_recovery,
+    open_sqlite_file_with_recovery, reconstruct_sqlite_file_with_archive_salvage,
 };
 pub use queries::{MvccRetryMetrics, mvcc_retry_metrics};
 pub use reconstruct::{
-    ReconstructStats, reconstruct_from_archive, reconstruct_from_archive_with_salvage,
+    ArchiveMessageInventory, ReconstructStats, reconstruct_from_archive,
+    reconstruct_from_archive_with_salvage, scan_archive_message_inventory,
 };
 pub use retry::{
     CIRCUIT_BREAKER, CIRCUIT_DB, CIRCUIT_GIT, CIRCUIT_LLM, CIRCUIT_SIGNAL, CircuitBreaker,

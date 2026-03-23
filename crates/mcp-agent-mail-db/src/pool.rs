@@ -2206,6 +2206,111 @@ fn quarantine_reconstructed_candidate(
 }
 
 #[allow(clippy::result_large_err)]
+fn restore_quarantined_primary(
+    primary_path: &Path,
+    quarantined_path: &Path,
+) -> Result<(), SqlError> {
+    if !quarantined_path.exists() {
+        return Ok(());
+    }
+
+    if primary_path.exists() {
+        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+        let _ = quarantine_reconstructed_candidate(
+            primary_path,
+            &timestamp,
+            "archive-reconcile-restore",
+        );
+    }
+
+    std::fs::rename(quarantined_path, primary_path).map_err(|e| {
+        SqlError::Custom(format!(
+            "failed to restore original database {} from {}: {e}",
+            primary_path.display(),
+            quarantined_path.display()
+        ))
+    })
+}
+
+/// Rebuild a healthy-but-stale SQLite file from the archive while salvaging the
+/// current primary database for any DB-only state that is not archived.
+#[allow(clippy::result_large_err)]
+pub fn reconstruct_sqlite_file_with_archive_salvage(
+    primary_path: &Path,
+    storage_root: &Path,
+) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
+    if !primary_path.exists() {
+        return crate::reconstruct::reconstruct_from_archive(primary_path, storage_root)
+            .map_err(|e| SqlError::Custom(e.to_string()));
+    }
+
+    if let Ok(conn) = open_sqlite_file_with_recovery(primary_path.to_string_lossy().as_ref()) {
+        let _ = conn.query_sync("PRAGMA busy_timeout=60000;", &[]);
+        let _ = conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[]);
+    }
+
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let base_name = primary_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("storage.sqlite3");
+    let quarantined =
+        primary_path.with_file_name(format!("{base_name}.archive-reconcile-{timestamp}"));
+
+    std::fs::rename(primary_path, &quarantined).map_err(|e| {
+        SqlError::Custom(format!(
+            "failed to quarantine database {} for archive reconciliation: {e}",
+            primary_path.display()
+        ))
+    })?;
+    let _ = quarantine_sidecar(primary_path, "-wal", &timestamp);
+    let _ = quarantine_sidecar(primary_path, "-shm", &timestamp);
+
+    match crate::reconstruct::reconstruct_from_archive_with_salvage(
+        primary_path,
+        storage_root,
+        Some(&quarantined),
+    ) {
+        Ok(stats) => match sqlite_file_is_healthy(primary_path) {
+            Ok(true) => Ok(stats),
+            Ok(false) => {
+                let _ = quarantine_reconstructed_candidate(
+                    primary_path,
+                    &timestamp,
+                    "archive-reconcile-failed",
+                );
+                restore_quarantined_primary(primary_path, &quarantined)?;
+                Err(SqlError::Custom(format!(
+                    "archive reconciliation produced an unhealthy database at {}",
+                    primary_path.display()
+                )))
+            }
+            Err(e) => {
+                let _ = quarantine_reconstructed_candidate(
+                    primary_path,
+                    &timestamp,
+                    "archive-reconcile-failed",
+                );
+                restore_quarantined_primary(primary_path, &quarantined)?;
+                Err(e)
+            }
+        },
+        Err(e) => {
+            let _ = quarantine_reconstructed_candidate(
+                primary_path,
+                &timestamp,
+                "archive-reconcile-failed",
+            );
+            restore_quarantined_primary(primary_path, &quarantined)?;
+            Err(SqlError::Custom(format!(
+                "archive reconciliation failed for {}: {e}",
+                primary_path.display()
+            )))
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
 fn restore_from_backup(primary_path: &Path, backup_path: &Path) -> Result<(), SqlError> {
     if !is_real_file(backup_path) {
         return Err(SqlError::Custom(format!(

@@ -11885,6 +11885,28 @@ struct DoctorInventoryCounts {
     messages: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DoctorArchiveInventory {
+    projects: u64,
+    agents: u64,
+    messages: u64,
+    canonical_message_files: u64,
+    duplicate_canonical_message_files: u64,
+    duplicate_canonical_message_ids: u64,
+    thread_digests: u64,
+    unparseable_canonical_message_files: u64,
+}
+
+impl DoctorArchiveInventory {
+    fn counts(&self) -> DoctorInventoryCounts {
+        DoctorInventoryCounts {
+            projects: self.projects,
+            agents: self.agents,
+            messages: self.messages,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DoctorServerRuntimeDiagnostics {
     port_status: mcp_agent_mail_server::startup_checks::PortStatus,
@@ -11947,8 +11969,7 @@ fn summarize_agent_mail_process_samples(samples: &[DoctorProcessSample]) -> Stri
     ordered.sort_by(|left, right| {
         right
             .cpu_percent
-            .partial_cmp(&left.cpu_percent)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&left.cpu_percent)
             .then_with(|| left.pid.cmp(&right.pid))
     });
 
@@ -12406,19 +12427,136 @@ fn doctor_required_tables(conn: &mcp_agent_mail_db::DbConn) -> CliResult<Vec<Str
         .collect())
 }
 
-fn collect_doctor_archive_inventory(storage_root: &Path) -> CliResult<DoctorInventoryCounts> {
-    let projects_root = storage_root.join("projects");
-    if !path_is_real_directory(&projects_root) {
-        return Ok(DoctorInventoryCounts::default());
+fn doctor_archive_frontmatter_bounds(content: &str) -> Option<(usize, usize)> {
+    let start = content.find("---json")?;
+    let after_start = &content[start..];
+    let json_start = if after_start.starts_with("---json\r\n") {
+        start + "---json\r\n".len()
+    } else if after_start.starts_with("---json\n") {
+        start + "---json\n".len()
+    } else {
+        return None;
+    };
+
+    let mut search_from = json_start;
+    while let Some(relative) = content[search_from..].find("---") {
+        let marker_start = search_from + relative;
+        if marker_start == 0 || !content[..marker_start].ends_with('\n') {
+            search_from = marker_start + 3;
+            continue;
+        }
+
+        let after_marker = marker_start + 3;
+        if after_marker == content.len()
+            || content[after_marker..].starts_with("\r\n")
+            || content[after_marker..].starts_with('\n')
+        {
+            return Some((json_start, marker_start));
+        }
+        search_from = marker_start + 3;
     }
 
-    let mut counts = DoctorInventoryCounts::default();
-    let entries = std::fs::read_dir(&projects_root).map_err(|e| {
-        CliError::Other(format!(
-            "failed to read archive projects root {}: {e}",
-            projects_root.display()
-        ))
-    })?;
+    None
+}
+
+fn doctor_extract_json_frontmatter(content: &str) -> Option<&str> {
+    let (json_start, json_end) = doctor_archive_frontmatter_bounds(content)?;
+    Some(&content[json_start..json_end])
+}
+
+fn doctor_archive_path_components(path: &Path) -> Vec<&str> {
+    path.iter().filter_map(|part| part.to_str()).collect()
+}
+
+fn doctor_is_archive_year_component(value: &str) -> bool {
+    value.len() == 4 && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn doctor_is_archive_month_component(value: &str) -> bool {
+    value.len() == 2 && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn scan_doctor_project_messages(
+    messages_dir: &Path,
+    global_message_ids: &mut std::collections::HashSet<i64>,
+    duplicate_message_ids: &mut std::collections::HashSet<i64>,
+) -> DoctorArchiveInventory {
+    let mut inventory = DoctorArchiveInventory::default();
+    for entry in walkdir::WalkDir::new(messages_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let file_type = entry.file_type();
+        if !file_type.is_file() || file_type.is_symlink() {
+            continue;
+        }
+        if entry.path().extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+
+        let Ok(relative) = entry.path().strip_prefix(messages_dir) else {
+            continue;
+        };
+        let components = doctor_archive_path_components(relative);
+        if components.first().copied() == Some("threads") {
+            inventory.thread_digests += 1;
+            continue;
+        }
+        if components.len() != 3
+            || !doctor_is_archive_year_component(components[0])
+            || !doctor_is_archive_month_component(components[1])
+        {
+            continue;
+        }
+
+        inventory.canonical_message_files += 1;
+
+        let Ok(content) = std::fs::read_to_string(entry.path()) else {
+            inventory.unparseable_canonical_message_files += 1;
+            continue;
+        };
+        let Some(frontmatter) = doctor_extract_json_frontmatter(&content) else {
+            inventory.unparseable_canonical_message_files += 1;
+            continue;
+        };
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(frontmatter) else {
+            inventory.unparseable_canonical_message_files += 1;
+            continue;
+        };
+
+        if let Some(message_id) = message
+            .get("id")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|&id| id > 0)
+        {
+            if global_message_ids.insert(message_id) {
+                inventory.messages += 1;
+            } else {
+                inventory.duplicate_canonical_message_files += 1;
+                if duplicate_message_ids.insert(message_id) {
+                    inventory.duplicate_canonical_message_ids += 1;
+                }
+            }
+        } else {
+            inventory.messages += 1;
+        }
+    }
+    inventory
+}
+
+fn collect_doctor_archive_inventory(storage_root: &Path) -> DoctorArchiveInventory {
+    let projects_root = storage_root.join("projects");
+    if !path_is_real_directory(&projects_root) {
+        return DoctorArchiveInventory::default();
+    }
+
+    let mut inventory = DoctorArchiveInventory::default();
+    let Ok(entries) = std::fs::read_dir(&projects_root) else {
+        return inventory;
+    };
+    let mut global_message_ids = std::collections::HashSet::new();
+    let mut duplicate_message_ids = std::collections::HashSet::new();
 
     for entry in entries.flatten() {
         let project_path = entry.path();
@@ -12428,16 +12566,12 @@ fn collect_doctor_archive_inventory(storage_root: &Path) -> CliResult<DoctorInve
         if !project_type.is_dir() || project_type.is_symlink() {
             continue;
         }
-        counts.projects += 1;
+        inventory.projects += 1;
 
         let agents_dir = project_path.join("agents");
-        if path_is_real_directory(&agents_dir) {
-            let agent_entries = std::fs::read_dir(&agents_dir).map_err(|e| {
-                CliError::Other(format!(
-                    "failed to read archive agents dir {}: {e}",
-                    agents_dir.display()
-                ))
-            })?;
+        if path_is_real_directory(&agents_dir)
+            && let Ok(agent_entries) = std::fs::read_dir(&agents_dir)
+        {
             for agent_entry in agent_entries.flatten() {
                 let Ok(agent_type) = agent_entry.file_type() else {
                     continue;
@@ -12446,25 +12580,30 @@ fn collect_doctor_archive_inventory(storage_root: &Path) -> CliResult<DoctorInve
                     continue;
                 }
                 if path_is_real_file(&agent_entry.path().join("profile.json")) {
-                    counts.agents += 1;
+                    inventory.agents += 1;
                 }
             }
         }
 
         let messages_dir = project_path.join("messages");
         if path_is_real_directory(&messages_dir) {
-            counts.messages += walkdir::WalkDir::new(&messages_dir)
-                .into_iter()
-                .filter_map(Result::ok)
-                .filter(|entry| {
-                    entry.file_type().is_file()
-                        && entry.path().extension().and_then(|ext| ext.to_str()) == Some("md")
-                })
-                .count() as u64;
+            let message_inventory = scan_doctor_project_messages(
+                &messages_dir,
+                &mut global_message_ids,
+                &mut duplicate_message_ids,
+            );
+            inventory.messages += message_inventory.messages;
+            inventory.canonical_message_files += message_inventory.canonical_message_files;
+            inventory.duplicate_canonical_message_files +=
+                message_inventory.duplicate_canonical_message_files;
+            inventory.thread_digests += message_inventory.thread_digests;
+            inventory.unparseable_canonical_message_files +=
+                message_inventory.unparseable_canonical_message_files;
         }
     }
 
-    Ok(counts)
+    inventory.duplicate_canonical_message_ids = duplicate_message_ids.len() as u64;
+    inventory
 }
 
 fn collect_doctor_db_inventory(
@@ -12490,15 +12629,13 @@ fn collect_doctor_db_inventory(
 }
 
 fn doctor_archive_db_drift_detail(
-    storage_root: &Path,
-    conn: &mcp_agent_mail_db::DbConn,
-) -> CliResult<Option<String>> {
-    let archive = collect_doctor_archive_inventory(storage_root)?;
-    if archive == DoctorInventoryCounts::default() {
-        return Ok(None);
+    archive: &DoctorArchiveInventory,
+    db: &DoctorInventoryCounts,
+) -> Option<String> {
+    if archive.counts() == DoctorInventoryCounts::default() {
+        return None;
     }
 
-    let db = collect_doctor_db_inventory(conn)?;
     let mut drift = Vec::new();
     if archive.projects > db.projects {
         drift.push(format!(
@@ -12520,12 +12657,38 @@ fn doctor_archive_db_drift_detail(
     }
 
     if drift.is_empty() {
-        Ok(None)
+        None
     } else {
-        Ok(Some(format!(
+        Some(format!(
             "Archive contains more canonical records than the SQLite DB ({})",
             drift.join(", ")
-        )))
+        ))
+    }
+}
+
+fn doctor_archive_inventory_suffix(archive: &DoctorArchiveInventory) -> String {
+    let mut extras = Vec::new();
+    if archive.canonical_message_files > archive.messages {
+        extras.push(format!(
+            "raw canonical files={} (duplicate files={} across {} message id(s))",
+            archive.canonical_message_files,
+            archive.duplicate_canonical_message_files,
+            archive.duplicate_canonical_message_ids
+        ));
+    }
+    if archive.thread_digests > 0 {
+        extras.push(format!("thread digests={}", archive.thread_digests));
+    }
+    if archive.unparseable_canonical_message_files > 0 {
+        extras.push(format!(
+            "unparseable canonical files={}",
+            archive.unparseable_canonical_message_files
+        ));
+    }
+    if extras.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", extras.join(", "))
     }
 }
 
@@ -12635,13 +12798,15 @@ fn doctor_database_fix_strategy(
         });
     }
 
-    if archive_available
-        && let Some(detail) = doctor_archive_db_drift_detail(storage_root, &opened.conn)?
-    {
-        return Ok(DoctorDatabaseFixStrategy::Reconstruct(format!(
-            "{detail}; reconstruct from archive {}",
-            archive_root.display()
-        )));
+    if archive_available {
+        let archive = collect_doctor_archive_inventory(storage_root);
+        let db = collect_doctor_db_inventory(&opened.conn)?;
+        if let Some(detail) = doctor_archive_db_drift_detail(&archive, &db) {
+            return Ok(DoctorDatabaseFixStrategy::Reconstruct(format!(
+                "{detail}; reconstruct from archive {}",
+                archive_root.display()
+            )));
+        }
     }
 
     let integrity_ok = match opened.conn.query_sync("PRAGMA integrity_check", &[]) {
@@ -13113,25 +13278,26 @@ fn handle_doctor_check_with(
         }));
     } else {
         match open_db_for_doctor_check(database_url).and_then(|conn| {
-            let archive = collect_doctor_archive_inventory(storage_root)?;
+            let archive = collect_doctor_archive_inventory(storage_root);
             let db = collect_doctor_db_inventory(&conn)?;
-            let drift = doctor_archive_db_drift_detail(storage_root, &conn)?;
+            let drift = doctor_archive_db_drift_detail(&archive, &db);
             Ok((archive, db, drift))
         }) {
             Ok((archive, db, Some(detail))) => checks.push(serde_json::json!({
                 "check": "archive_db_parity",
                 "status": "fail",
                 "detail": format!(
-                    "{detail}; archive(projects={}, agents={}, messages={}), db(projects={}, agents={}, messages={})",
+                    "{detail}; archive(projects={}, agents={}, messages={}), db(projects={}, agents={}, messages={}){}",
                     archive.projects,
                     archive.agents,
                     archive.messages,
                     db.projects,
                     db.agents,
-                    db.messages
+                    db.messages,
+                    doctor_archive_inventory_suffix(&archive)
                 ),
             })),
-            Ok((archive, _db, None)) if archive == DoctorInventoryCounts::default() => {
+            Ok((archive, _db, None)) if archive.counts() == DoctorInventoryCounts::default() => {
                 checks.push(serde_json::json!({
                     "check": "archive_db_parity",
                     "status": "warn",
@@ -13143,15 +13309,16 @@ fn handle_doctor_check_with(
             }
             Ok((archive, db, None)) => checks.push(serde_json::json!({
                 "check": "archive_db_parity",
-                "status": "ok",
+                "status": if archive.unparseable_canonical_message_files > 0 { "warn" } else { "ok" },
                 "detail": format!(
-                    "Archive and SQLite inventory are aligned enough for recovery checks: archive(projects={}, agents={}, messages={}), db(projects={}, agents={}, messages={})",
+                    "Archive and SQLite inventory are aligned enough for recovery checks: archive(projects={}, agents={}, messages={}), db(projects={}, agents={}, messages={}){}",
                     archive.projects,
                     archive.agents,
                     archive.messages,
                     db.projects,
                     db.agents,
-                    db.messages
+                    db.messages,
+                    doctor_archive_inventory_suffix(&archive)
                 ),
             })),
             Err(err) => checks.push(serde_json::json!({
@@ -24289,6 +24456,118 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn scan_archive_stats_deduplicates_canonical_ids_and_ignores_thread_digests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let project_dir = storage_root.join("projects").join("demo-project");
+        let agent_dir = project_dir.join("agents").join("BlueLake");
+        let canonical_dir = project_dir.join("messages").join("2026").join("03");
+        let threads_dir = project_dir.join("messages").join("threads");
+
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&canonical_dir).unwrap();
+        std::fs::create_dir_all(&threads_dir).unwrap();
+        std::fs::write(agent_dir.join("profile.json"), "{}").unwrap();
+        std::fs::write(
+            canonical_dir.join("2026-03-12T00-00-00Z__first__7.md"),
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"First\"}\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            canonical_dir.join("2026-03-12T00-01-00Z__duplicate__7.md"),
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Duplicate\"}\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            canonical_dir.join("2026-03-12T00-02-00Z__third__8.md"),
+            "---json\n{\"id\":8,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Third\"}\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(threads_dir.join("thread-1.md"), "# Thread thread-1\n").unwrap();
+
+        let stats = scan_archive_stats(&storage_root);
+        assert_eq!(stats.projects, 1);
+        assert_eq!(stats.agents, 1);
+        assert_eq!(stats.message_files, 2);
+        assert_eq!(stats.canonical_message_files, 3);
+        assert_eq!(stats.duplicate_canonical_message_files, 1);
+        assert_eq!(stats.duplicate_canonical_message_ids, 1);
+        assert_eq!(stats.thread_digests, 1);
+        assert_eq!(stats.unparseable_canonical_message_files, 0);
+    }
+
+    #[test]
+    fn doctor_reconstruct_dry_run_reports_unique_messages_not_raw_markdown_files() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let db_path = tmp.path().join("dry-run.db");
+        let project_dir = storage_root.join("projects").join("demo-project");
+        let canonical_dir = project_dir.join("messages").join("2026").join("03");
+        let threads_dir = project_dir.join("messages").join("threads");
+
+        std::fs::create_dir_all(&canonical_dir).unwrap();
+        std::fs::create_dir_all(&threads_dir).unwrap();
+        std::fs::write(
+            canonical_dir.join("2026-03-12T00-00-00Z__first__7.md"),
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"First\"}\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            canonical_dir.join("2026-03-12T00-01-00Z__duplicate__7.md"),
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Duplicate\"}\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(threads_dir.join("thread-1.md"), "# Thread thread-1\n").unwrap();
+
+        let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+        handle_doctor_reconstruct_with(Some(&db_path), Some(&storage_root), true, false, true)
+            .expect("dry run should succeed");
+        let output = capture.drain_to_string();
+        let payload = output
+            .lines()
+            .find(|line| line.trim_start().starts_with('{'))
+            .expect("json output line");
+        let value: serde_json::Value =
+            serde_json::from_str(payload).expect("parse dry-run json output");
+        assert_eq!(value["would_recover"]["message_files"], 1);
+        assert_eq!(value["would_recover"]["canonical_message_files"], 2);
+        assert_eq!(
+            value["would_recover"]["duplicate_canonical_message_files"],
+            1
+        );
+        assert_eq!(value["would_recover"]["duplicate_canonical_message_ids"], 1);
+        assert_eq!(value["would_recover"]["thread_digests"], 1);
+    }
+
+    #[test]
+    fn doctor_archive_db_drift_detail_uses_unique_logical_message_count() {
+        let archive = DoctorArchiveInventory {
+            projects: 1,
+            agents: 1,
+            messages: 2,
+            canonical_message_files: 3,
+            duplicate_canonical_message_files: 1,
+            duplicate_canonical_message_ids: 1,
+            thread_digests: 4,
+            unparseable_canonical_message_files: 0,
+        };
+        let db = DoctorInventoryCounts {
+            projects: 1,
+            agents: 1,
+            messages: 2,
+        };
+
+        assert_eq!(doctor_archive_db_drift_detail(&archive, &db), None);
+        assert_eq!(
+            doctor_archive_inventory_suffix(&archive),
+            "; raw canonical files=3 (duplicate files=1 across 1 message id(s)), thread digests=4"
+        );
+    }
+
+    #[test]
     fn doctor_repair_rejects_unimplemented_project_scope() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("repair_scope.sqlite3");
@@ -35165,6 +35444,11 @@ fn handle_doctor_reconstruct_with(
                         "projects": stats.projects,
                         "agents": stats.agents,
                         "message_files": stats.message_files,
+                        "canonical_message_files": stats.canonical_message_files,
+                        "duplicate_canonical_message_files": stats.duplicate_canonical_message_files,
+                        "duplicate_canonical_message_ids": stats.duplicate_canonical_message_ids,
+                        "thread_digests": stats.thread_digests,
+                        "unparseable_canonical_message_files": stats.unparseable_canonical_message_files,
                     }
                 })
             );
@@ -35172,7 +35456,24 @@ fn handle_doctor_reconstruct_with(
             ftui_runtime::ftui_println!("Would recover from archive:");
             ftui_runtime::ftui_println!("  Projects:      {}", stats.projects);
             ftui_runtime::ftui_println!("  Agents:        {}", stats.agents);
-            ftui_runtime::ftui_println!("  Message files: {}", stats.message_files);
+            ftui_runtime::ftui_println!("  Messages:      {}", stats.message_files);
+            if stats.canonical_message_files > stats.message_files {
+                ftui_runtime::ftui_println!(
+                    "  Canonical files: {} ({} duplicate file(s) across {} message id(s))",
+                    stats.canonical_message_files,
+                    stats.duplicate_canonical_message_files,
+                    stats.duplicate_canonical_message_ids
+                );
+            }
+            if stats.thread_digests > 0 {
+                ftui_runtime::ftui_println!("  Thread digests: {}", stats.thread_digests);
+            }
+            if stats.unparseable_canonical_message_files > 0 {
+                ftui_runtime::ftui_println!(
+                    "  Unparseable canonical files: {}",
+                    stats.unparseable_canonical_message_files
+                );
+            }
             ftui_runtime::ftui_println!("  Database path: {}", db_path.display());
             ftui_runtime::ftui_println!("No changes made.");
         }
@@ -35270,6 +35571,8 @@ fn handle_doctor_reconstruct_with(
                     "agents": stats.agents,
                     "messages": stats.messages,
                     "recipients": stats.recipients,
+                    "duplicate_canonical_message_files": stats.duplicate_canonical_message_files,
+                    "duplicate_canonical_message_ids": stats.duplicate_canonical_message_ids,
                     "parse_errors": stats.parse_errors,
                     "salvaged_projects": stats.salvaged_projects,
                     "salvaged_agents": stats.salvaged_agents,
@@ -35307,83 +35610,24 @@ struct ArchiveScanStats {
     projects: usize,
     agents: usize,
     message_files: usize,
+    canonical_message_files: usize,
+    duplicate_canonical_message_files: usize,
+    duplicate_canonical_message_ids: usize,
+    thread_digests: usize,
+    unparseable_canonical_message_files: usize,
 }
 
 fn scan_archive_stats(storage_root: &Path) -> ArchiveScanStats {
-    let mut stats = ArchiveScanStats {
-        projects: 0,
-        agents: 0,
-        message_files: 0,
-    };
-
-    let projects_dir = storage_root.join("projects");
-    if !path_is_real_directory(&projects_dir) {
-        return stats;
-    }
-    let entries = match std::fs::read_dir(&projects_dir) {
-        Ok(e) => e,
-        Err(_) => return stats,
-    };
-
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() || file_type.is_symlink() {
-            continue;
-        }
-        stats.projects += 1;
-        let project_dir = entry.path();
-
-        // Count agents
-        let agents_dir = project_dir.join("agents");
-        if path_is_real_directory(&agents_dir)
-            && let Ok(agent_entries) = std::fs::read_dir(&agents_dir)
-        {
-            for ae in agent_entries.flatten() {
-                let Ok(agent_type) = ae.file_type() else {
-                    continue;
-                };
-                if !agent_type.is_dir() || agent_type.is_symlink() {
-                    continue;
-                }
-                if path_is_real_file(&ae.path().join("profile.json")) {
-                    stats.agents += 1;
-                }
-            }
-        }
-
-        // Count message files
-        let messages_dir = project_dir.join("messages");
-        if path_is_real_directory(&messages_dir) {
-            count_md_files_recursive(&messages_dir, &mut stats.message_files);
-        }
-    }
-
-    stats
-}
-
-fn count_md_files_recursive(dir: &Path, count: &mut usize) {
-    if !path_is_real_directory(dir) {
-        return;
-    }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_symlink() {
-            continue;
-        }
-        if file_type.is_dir() {
-            count_md_files_recursive(&path, count);
-        } else if file_type.is_file() && path.extension().is_some_and(|e| e == "md") {
-            *count += 1;
-        }
+    let inventory = collect_doctor_archive_inventory(storage_root);
+    ArchiveScanStats {
+        projects: inventory.projects as usize,
+        agents: inventory.agents as usize,
+        message_files: inventory.messages as usize,
+        canonical_message_files: inventory.canonical_message_files as usize,
+        duplicate_canonical_message_files: inventory.duplicate_canonical_message_files as usize,
+        duplicate_canonical_message_ids: inventory.duplicate_canonical_message_ids as usize,
+        thread_digests: inventory.thread_digests as usize,
+        unparseable_canonical_message_files: inventory.unparseable_canonical_message_files as usize,
     }
 }
 

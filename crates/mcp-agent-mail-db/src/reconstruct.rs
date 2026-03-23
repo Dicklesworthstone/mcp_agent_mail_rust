@@ -33,6 +33,8 @@ fn is_real_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
 }
 
+const DUPLICATE_CANONICAL_WARNING_SAMPLE_LIMIT: usize = 5;
+
 /// Statistics returned after a reconstruction attempt.
 #[derive(Debug, Clone, Default)]
 pub struct ReconstructStats {
@@ -44,6 +46,12 @@ pub struct ReconstructStats {
     pub messages: usize,
     /// Number of message-recipient rows inserted.
     pub recipients: usize,
+    /// Number of duplicate canonical archive files skipped because their
+    /// positive frontmatter `id` had already been recovered.
+    pub duplicate_canonical_message_files: usize,
+    /// Number of distinct logical message ids represented by the skipped
+    /// duplicate canonical archive files.
+    pub duplicate_canonical_message_ids: usize,
     /// Number of projects recovered only from a salvaged database.
     pub salvaged_projects: usize,
     /// Number of agents recovered only from a salvaged database.
@@ -56,6 +64,73 @@ pub struct ReconstructStats {
     pub parse_errors: usize,
     /// Human-readable warnings collected during reconstruction.
     pub warnings: Vec<String>,
+    duplicate_canonical_id_set: BTreeSet<i64>,
+}
+
+/// Lightweight canonical archive inventory used for drift detection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArchiveMessageInventory {
+    /// Number of canonical archive files under `messages/YYYY/MM/*.md`.
+    pub canonical_message_files: usize,
+    /// Number of unique positive message ids represented by those files.
+    pub unique_message_ids: usize,
+    /// Number of duplicate canonical archive files skipped by id.
+    pub duplicate_canonical_message_files: usize,
+    /// Number of distinct ids represented by the duplicate files.
+    pub duplicate_canonical_message_ids: usize,
+    /// Largest positive canonical message id observed in the archive.
+    pub latest_message_id: Option<i64>,
+    /// Number of canonical message files that failed JSON frontmatter parsing.
+    pub parse_errors: usize,
+}
+
+impl ArchiveMessageInventory {
+    fn record_message_id(&mut self, message_id: i64, seen_ids: &mut BTreeSet<i64>) {
+        self.latest_message_id = Some(
+            self.latest_message_id
+                .map_or(message_id, |current| current.max(message_id)),
+        );
+        if seen_ids.insert(message_id) {
+            self.unique_message_ids += 1;
+        } else {
+            self.duplicate_canonical_message_files += 1;
+        }
+    }
+}
+
+impl ReconstructStats {
+    fn record_duplicate_canonical_message(&mut self, message_id: i64, file_path: &Path) {
+        self.duplicate_canonical_message_files += 1;
+        if self.duplicate_canonical_id_set.insert(message_id) {
+            self.duplicate_canonical_message_ids += 1;
+        }
+        if self.duplicate_canonical_message_files <= DUPLICATE_CANONICAL_WARNING_SAMPLE_LIMIT {
+            self.warnings.push(format!(
+                "Duplicate canonical message id {message_id} in {}; keeping the first archive artifact and skipping the duplicate",
+                file_path.display()
+            ));
+        }
+    }
+
+    fn finalize_duplicate_warnings(&mut self) {
+        if self.duplicate_canonical_message_files <= DUPLICATE_CANONICAL_WARNING_SAMPLE_LIMIT {
+            return;
+        }
+
+        let sample_ids = self
+            .duplicate_canonical_id_set
+            .iter()
+            .take(DUPLICATE_CANONICAL_WARNING_SAMPLE_LIMIT)
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.warnings.push(format!(
+            "Skipped {} duplicate canonical message file(s) across {} logical message id(s); sample ids: {}",
+            self.duplicate_canonical_message_files,
+            self.duplicate_canonical_message_ids,
+            sample_ids
+        ));
+    }
 }
 
 impl std::fmt::Display for ReconstructStats {
@@ -65,6 +140,13 @@ impl std::fmt::Display for ReconstructStats {
             "reconstructed {} projects, {} agents, {} messages ({} recipients), {} parse errors",
             self.projects, self.agents, self.messages, self.recipients, self.parse_errors
         )?;
+        if self.duplicate_canonical_message_files > 0 {
+            write!(
+                f,
+                "; skipped {} duplicate canonical file(s) across {} message id(s)",
+                self.duplicate_canonical_message_files, self.duplicate_canonical_message_ids
+            )?;
+        }
         if self.salvaged_projects > 0
             || self.salvaged_agents > 0
             || self.salvaged_messages > 0
@@ -81,6 +163,135 @@ impl std::fmt::Display for ReconstructStats {
         }
         Ok(())
     }
+}
+
+/// Scan canonical archive message files without writing to SQLite.
+#[must_use]
+pub fn scan_archive_message_inventory(storage_root: &Path) -> ArchiveMessageInventory {
+    let mut inventory = ArchiveMessageInventory::default();
+    let projects_dir = storage_root.join("projects");
+    if !is_real_directory(&projects_dir) {
+        return inventory;
+    }
+
+    let Ok(project_entries) = std::fs::read_dir(&projects_dir) else {
+        return inventory;
+    };
+
+    let mut seen_ids = BTreeSet::new();
+    let mut duplicate_ids = BTreeSet::new();
+
+    for entry in project_entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        scan_project_archive_message_inventory(
+            &path.join("messages"),
+            &mut inventory,
+            &mut seen_ids,
+            &mut duplicate_ids,
+        );
+    }
+
+    inventory.duplicate_canonical_message_ids = duplicate_ids.len();
+    inventory
+}
+
+fn scan_project_archive_message_inventory(
+    messages_dir: &Path,
+    inventory: &mut ArchiveMessageInventory,
+    seen_ids: &mut BTreeSet<i64>,
+    duplicate_ids: &mut BTreeSet<i64>,
+) {
+    if !is_real_directory(messages_dir) {
+        return;
+    }
+
+    let Ok(year_entries) = std::fs::read_dir(messages_dir) else {
+        return;
+    };
+
+    for year_entry in year_entries.flatten() {
+        let year_path = year_entry.path();
+        let Ok(year_type) = year_entry.file_type() else {
+            continue;
+        };
+        if !year_type.is_dir() || year_type.is_symlink() {
+            continue;
+        }
+        let Some(year_name) = year_path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if year_name.len() != 4 || !year_name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+
+        let Ok(month_entries) = std::fs::read_dir(&year_path) else {
+            continue;
+        };
+        for month_entry in month_entries.flatten() {
+            let month_path = month_entry.path();
+            let Ok(month_type) = month_entry.file_type() else {
+                continue;
+            };
+            if !month_type.is_dir() || month_type.is_symlink() {
+                continue;
+            }
+            let Some(month_name) = month_path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if month_name.len() != 2 || !month_name.bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+
+            let Ok(file_entries) = std::fs::read_dir(&month_path) else {
+                continue;
+            };
+            for file_entry in file_entries.flatten() {
+                let file_path = file_entry.path();
+                let Ok(file_type) = file_entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_file()
+                    || file_type.is_symlink()
+                    || file_path.extension().is_none_or(|ext| ext != "md")
+                {
+                    continue;
+                }
+
+                inventory.canonical_message_files += 1;
+                match scan_archive_message_id(&file_path) {
+                    Ok(Some(message_id)) => {
+                        let existed = seen_ids.contains(&message_id);
+                        inventory.record_message_id(message_id, seen_ids);
+                        if existed {
+                            duplicate_ids.insert(message_id);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => inventory.parse_errors += 1,
+                }
+            }
+        }
+    }
+}
+
+fn scan_archive_message_id(file_path: &Path) -> DbResult<Option<i64>> {
+    let content = std::fs::read_to_string(file_path)
+        .map_err(|e| DbError::Sqlite(format!("read {}: {e}", file_path.display())))?;
+    let Some(frontmatter) = extract_json_frontmatter(&content) else {
+        return Ok(None);
+    };
+    let msg: serde_json::Value = serde_json::from_str(frontmatter)
+        .map_err(|e| DbError::Sqlite(format!("bad JSON in {}: {e}", file_path.display())))?;
+    Ok(msg
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|id| *id > 0))
 }
 
 /// Reconstruct the database from the Git archive at `storage_root`.
@@ -291,6 +502,7 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
     // single clean file ready for the runtime to open with its own settings.
     let _ = conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE);");
 
+    stats.finalize_duplicate_warnings();
     tracing::info!(%stats, "database reconstruction from archive complete");
     Ok(stats)
 }
@@ -567,10 +779,7 @@ fn parse_and_insert_message(
     if let Some(cid) = canonical_id
         && message_id_exists(conn, cid)?
     {
-        stats.warnings.push(format!(
-            "Duplicate canonical message id {cid} in {}; keeping the first archive artifact and skipping the duplicate",
-            file_path.display()
-        ));
+        stats.record_duplicate_canonical_message(cid, file_path);
         return Ok(());
     }
 
@@ -2250,12 +2459,15 @@ mod tests {
             agents: 5,
             messages: 100,
             recipients: 200,
+            duplicate_canonical_message_files: 0,
+            duplicate_canonical_message_ids: 0,
             salvaged_projects: 0,
             salvaged_agents: 0,
             salvaged_messages: 0,
             salvaged_recipients: 0,
             parse_errors: 3,
             warnings: vec![],
+            duplicate_canonical_id_set: BTreeSet::new(),
         };
         let display = stats.to_string();
         assert!(display.contains("2 projects"));
@@ -2705,6 +2917,8 @@ second body
 
         let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
         assert_eq!(stats.messages, 1, "duplicate canonical id must be skipped");
+        assert_eq!(stats.duplicate_canonical_message_files, 1);
+        assert_eq!(stats.duplicate_canonical_message_ids, 1);
         assert_eq!(
             stats.recipients, 1,
             "duplicate recipient rows must not merge"
