@@ -1608,12 +1608,16 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> CliResult<()> {
                     path.display()
                 )));
             }
-            if !path.is_file() {
+            if path.is_file() {
                 return Err(CliError::InvalidArgument(format!(
-                    "broken symlink encountered during recursive copy: {}",
+                    "symlinked files are not supported during recursive copy: {}",
                     path.display()
                 )));
             }
+            return Err(CliError::InvalidArgument(format!(
+                "broken symlink encountered during recursive copy: {}",
+                path.display()
+            )));
         }
         if path.is_dir() {
             copy_dir_recursive(&path, &target)?;
@@ -2364,6 +2368,28 @@ mod tests {
         match err {
             CliError::InvalidArgument(msg) => {
                 assert!(msg.contains("broken symlink encountered"));
+            }
+            other => panic!("expected invalid argument, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_recursive_rejects_symlinked_files() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        let outside = tmp.path().join("outside.txt");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(&outside, "outside-payload").unwrap();
+        symlink(&outside, src.join("file-link")).unwrap();
+
+        let err = copy_dir_recursive(&src, &dst).unwrap_err();
+        match err {
+            CliError::InvalidArgument(msg) => {
+                assert!(msg.contains("symlinked files are not supported"));
             }
             other => panic!("expected invalid argument, got {other:?}"),
         }

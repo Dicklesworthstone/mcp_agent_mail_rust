@@ -2039,8 +2039,45 @@ fn self_process_repo(
         None
     };
 
-    let drained_count =
-        batch.len() as u64 + spilled_work.as_ref().map_or(0, |w| w.pending_requests);
+    struct PanicGuard<'a> {
+        rq: &'a RepoQueue,
+        work_cv: &'a Arc<(Mutex<u64>, std::sync::Condvar)>,
+        worker_count: usize,
+        pending_batch: Vec<CoalescerCommitFields>,
+        inflight_batch: Option<Vec<CoalescerCommitFields>>,
+        pending_spilled: Option<CoalescerSpilledWork>,
+        inflight_spilled: Option<CoalescerSpilledWork>,
+    }
+    impl<'a> Drop for PanicGuard<'a> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                if coalescer_restore_drained_work_on_panic(
+                    self.rq,
+                    &mut self.pending_batch,
+                    &mut self.inflight_batch,
+                    &mut self.pending_spilled,
+                    &mut self.inflight_spilled,
+                ) {
+                    coalescer_signal_worker(self.work_cv, self.worker_count);
+                }
+            }
+        }
+    }
+    let mut panic_guard = PanicGuard {
+        rq,
+        work_cv,
+        worker_count,
+        pending_batch: batch,
+        inflight_batch: None,
+        pending_spilled: spilled_work,
+        inflight_spilled: None,
+    };
+
+    let drained_count = panic_guard.pending_batch.len() as u64
+        + panic_guard
+            .pending_spilled
+            .as_ref()
+            .map_or(0, |w| w.pending_requests);
 
     if drained_count == 0 {
         // Defensive self-heal: if depth and queue contents diverge, reconcile
@@ -2049,8 +2086,17 @@ fn self_process_repo(
     }
 
     // Phase 4: Commit
-    if !batch.is_empty() {
-        for chunk in batch.chunks(COALESCER_MAX_BATCH_SIZE) {
+    while !panic_guard.pending_batch.is_empty() {
+        let chunk_size = panic_guard
+            .pending_batch
+            .len()
+            .min(COALESCER_MAX_BATCH_SIZE);
+        let chunk = panic_guard
+            .pending_batch
+            .drain(..chunk_size)
+            .collect::<Vec<_>>();
+        panic_guard.inflight_batch = Some(chunk);
+        if let Some(chunk) = panic_guard.inflight_batch.as_ref() {
             let outcome = coalescer_commit_batch(repo_root, chunk, stats, batch_sizes);
             let failed_requests = outcome.failed_requests;
 
@@ -2103,9 +2149,13 @@ fn self_process_repo(
                 coalescer_requeue_requests(rq, failed_requests);
             }
         }
+        panic_guard.inflight_batch = None;
     }
 
-    if let Some(work) = &spilled_work {
+    if let Some(work) = panic_guard.pending_spilled.take() {
+        panic_guard.inflight_spilled = Some(work);
+    }
+    if let Some(work) = panic_guard.inflight_spilled.as_ref() {
         let outcome = coalescer_commit_spilled_work(work, stats, batch_sizes);
         if let Some(failed_work) = outcome.failed_work {
             rq.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
@@ -2144,6 +2194,7 @@ fn self_process_repo(
                 .commits_total
                 .fetch_add(outcome.committed_commits, Ordering::Relaxed);
         }
+        panic_guard.inflight_spilled = None;
     }
 
     // Release processing lock (via guard drop) + update last_serviced timestamp
@@ -2158,12 +2209,7 @@ fn self_process_repo(
             .any(|r| r.depth.load(Ordering::Relaxed) > 0)
     };
     if more_work {
-        let (lock, cvar) = &**work_cv;
-        {
-            let mut wake_tokens = lock.lock().unwrap_or_else(|e| e.into_inner());
-            *wake_tokens = wake_tokens.saturating_add(1).min(worker_count as u64);
-        }
-        cvar.notify_one();
+        coalescer_signal_worker(work_cv, worker_count);
     }
 }
 
@@ -2191,6 +2237,44 @@ fn coalescer_update_pending(pending_requests: &Arc<AtomicU64>, drained: u64) {
     } else {
         metrics.storage.commit_over_80_since_us.set(0);
     }
+}
+
+fn coalescer_signal_worker(work_cv: &Arc<(Mutex<u64>, std::sync::Condvar)>, worker_count: usize) {
+    let (lock, cvar) = &**work_cv;
+    {
+        let mut wake_tokens = lock.lock().unwrap_or_else(|e| e.into_inner());
+        *wake_tokens = wake_tokens.saturating_add(1).min(worker_count as u64);
+    }
+    cvar.notify_one();
+}
+
+fn coalescer_restore_drained_work_on_panic(
+    rq: &RepoQueue,
+    pending_batch: &mut Vec<CoalescerCommitFields>,
+    inflight_batch: &mut Option<Vec<CoalescerCommitFields>>,
+    pending_spilled: &mut Option<CoalescerSpilledWork>,
+    inflight_spilled: &mut Option<CoalescerSpilledWork>,
+) -> bool {
+    let mut restored_any = false;
+    if !pending_batch.is_empty() {
+        coalescer_requeue_requests(rq, std::mem::take(pending_batch));
+        restored_any = true;
+    }
+    if let Some(batch) = inflight_batch.take()
+        && !batch.is_empty()
+    {
+        coalescer_requeue_requests(rq, batch);
+        restored_any = true;
+    }
+    if let Some(work) = pending_spilled.take() {
+        coalescer_restore_spilled_work(rq, work);
+        restored_any = true;
+    }
+    if let Some(work) = inflight_spilled.take() {
+        coalescer_restore_spilled_work(rq, work);
+        restored_any = true;
+    }
+    restored_any
 }
 
 fn coalescer_depth_decrement(depth: &AtomicU64, drained: u64) -> u64 {
@@ -10893,6 +10977,67 @@ mod tests {
             spill.inner.as_ref().map(|repo| repo.pending_requests),
             Some(2)
         );
+    }
+
+    #[test]
+    fn coalescer_restore_drained_work_on_panic_requeues_inflight_before_remaining_batch() {
+        let rq = RepoQueue {
+            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            spill: std::sync::Mutex::new(CoalescerSpillState::default()),
+            depth: AtomicU64::new(0),
+            processing: AtomicBool::new(false),
+            last_serviced_us: AtomicU64::new(0),
+            metrics: RepoCommitMetrics::default(),
+        };
+        let mk_req = |message: &str, path: &str| CoalescerCommitFields {
+            enqueued_at: std::time::Instant::now(),
+            git_author_name: "Panic".to_string(),
+            git_author_email: "panic@example.com".to_string(),
+            message: message.to_string(),
+            rel_paths: vec![path.to_string()],
+        };
+        let mut pending_batch = vec![mk_req("third", "c.txt"), mk_req("fourth", "d.txt")];
+        let mut inflight_batch = Some(vec![mk_req("first", "a.txt"), mk_req("second", "b.txt")]);
+        let mut pending_spilled = Some(CoalescerSpilledWork {
+            repo_root: std::path::PathBuf::from("/tmp/fake-repo"),
+            pending_requests: 2,
+            earliest_enqueued_at: std::time::Instant::now(),
+            dirty_all: false,
+            paths: vec!["spill-a.txt".to_string(), "spill-b.txt".to_string()],
+            git_author_name: "Spill".to_string(),
+            git_author_email: "spill@example.com".to_string(),
+            message_first_lines: vec!["spill".to_string()],
+            message_total: 2,
+        });
+        let mut inflight_spilled = None;
+
+        assert!(coalescer_restore_drained_work_on_panic(
+            &rq,
+            &mut pending_batch,
+            &mut inflight_batch,
+            &mut pending_spilled,
+            &mut inflight_spilled,
+        ));
+
+        assert!(pending_batch.is_empty());
+        assert!(inflight_batch.is_none());
+        assert!(pending_spilled.is_none());
+        assert!(inflight_spilled.is_none());
+        assert_eq!(rq.depth.load(Ordering::Relaxed), 6);
+
+        let queue = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let queued_messages = queue
+            .iter()
+            .map(|req| req.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(queued_messages, vec!["first", "second", "third", "fourth"]);
+        drop(queue);
+
+        let spill = rq.spill.lock().unwrap_or_else(|e| e.into_inner());
+        let restored = spill.inner.as_ref().expect("spill should be restored");
+        assert_eq!(restored.pending_requests, 2);
+        assert!(restored.paths.contains("spill-a.txt"));
+        assert!(restored.paths.contains("spill-b.txt"));
     }
 
     #[test]

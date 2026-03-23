@@ -1623,6 +1623,13 @@ pub fn get_push_paths(repo_root: &Path, stdin_lines: &str) -> GuardResult<Vec<St
                 if output.status.success() {
                     let paths = parse_name_status_z(&output.stdout)?;
                     all_paths.extend(paths);
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(GuardError::Io(std::io::Error::other(format!(
+                        "git diff-tree failed for {sha} (exit {}): {}",
+                        output.status.code().unwrap_or(-1),
+                        stderr.trim(),
+                    ))));
                 }
             }
         } else if let Some(range) = diff_range {
@@ -1635,6 +1642,13 @@ pub fn get_push_paths(repo_root: &Path, stdin_lines: &str) -> GuardResult<Vec<St
             if output.status.success() {
                 let paths = parse_name_status_z(&output.stdout)?;
                 all_paths.extend(paths);
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(GuardError::Io(std::io::Error::other(format!(
+                    "git diff fallback failed for {range} (exit {}): {}",
+                    output.status.code().unwrap_or(-1),
+                    stderr.trim(),
+                ))));
             }
         };
     }

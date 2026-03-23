@@ -2178,6 +2178,8 @@ pub async fn reply_message(
     subject_prefix: Option<String>,
     importance: Option<String>,
     ack_required: Option<bool>,
+    attachment_paths: Option<Vec<String>>,
+    convert_images: Option<bool>,
 ) -> McpResult<String> {
     // Normalize names
     let sender_name =
@@ -2330,6 +2332,38 @@ effective_free_bytes={free}"
         subject
     };
 
+    let embed_policy =
+        mcp_agent_mail_storage::EmbedPolicy::from_str_policy(&sender.attachments_policy);
+    let sender_forces_convert = matches!(
+        embed_policy,
+        mcp_agent_mail_storage::EmbedPolicy::Inline | mcp_agent_mail_storage::EmbedPolicy::File
+    );
+    let do_convert = if sender_forces_convert {
+        true
+    } else {
+        convert_images.unwrap_or(config.convert_images)
+    };
+
+    let (final_body, all_attachment_meta, all_attachment_rel_paths) = process_message_attachments(
+        config,
+        &project.slug,
+        &project.human_key,
+        Path::new(&project.human_key),
+        &subject,
+        &body_md,
+        attachment_paths.as_deref(),
+        do_convert,
+        embed_policy,
+    )?;
+
+    // Serialize processed attachment metadata as JSON array
+    let attachments_json = serde_json::to_string(&all_attachment_meta).unwrap_or_else(|e| {
+        tracing::error!(
+            "attachment metadata serialization failed, falling back to empty array: {e}"
+        );
+        "[]".to_string()
+    });
+
     // ── Per-message size limits (subject/total) ──
     if config.max_subject_bytes > 0 && subject.len() > config.max_subject_bytes {
         return Err(legacy_tool_error(
@@ -2349,7 +2383,7 @@ effective_free_bytes={free}"
     }
 
     if config.max_total_message_bytes > 0 {
-        let total_size = subject.len().saturating_add(body_md.len());
+        let total_size = subject.len().saturating_add(final_body.len());
         if total_size > config.max_total_message_bytes {
             return Err(legacy_tool_error(
                 "INVALID_ARGUMENT",
@@ -2748,11 +2782,11 @@ effective_free_bytes={free}"
             project_id,
             sender_id,
             &subject,
-            &body_md,
+            &final_body,
             Some(&thread_id),
             &importance_val,
             ack_required.unwrap_or(original.ack_required != 0),
-            "[]", // No attachments for reply by default
+            &attachments_json,
             &recipient_refs,
         )
         .await,
@@ -2816,7 +2850,7 @@ effective_free_bytes={free}"
             "project_slug": &project.slug,
             "importance": &reply.importance,
             "ack_required": reply.ack_required != 0,
-            "attachments": serde_json::Value::Array(vec![]),
+            "attachments": &all_attachment_meta,
             "reply_to": message_id,
         });
         try_write_message_archive(
@@ -2826,7 +2860,7 @@ effective_free_bytes={free}"
             &reply.body_md,
             &sender.name,
             &all_recipient_names,
-            &[],
+            &all_attachment_rel_paths,
         );
     }
 
@@ -2840,7 +2874,7 @@ effective_free_bytes={free}"
         importance: reply.importance.clone(),
         ack_required: reply.ack_required != 0,
         created_ts: Some(micros_to_iso(reply.created_ts)),
-        attachments: vec![],
+        attachments: all_attachment_meta.clone(),
         from: sender.name.clone(),
         to: resolved_to.to_vec(),
         cc: resolved_cc_recipients.to_vec(),
@@ -2856,7 +2890,7 @@ effective_free_bytes={free}"
         importance: reply.importance,
         ack_required: reply.ack_required != 0,
         created_ts: Some(micros_to_iso(reply.created_ts)),
-        attachments: vec![],
+        attachments: all_attachment_meta,
         body_md: reply.body_md,
         from: sender.name.clone(),
         to: resolved_to.into_vec(),

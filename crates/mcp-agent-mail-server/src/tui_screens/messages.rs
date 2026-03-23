@@ -1566,6 +1566,8 @@ impl MessageBrowserScreen {
             None,
             None,
             ack_required,
+            None,
+            None,
         ));
 
         match result {

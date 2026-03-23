@@ -2772,11 +2772,7 @@ mod tests {
         std::fs::create_dir_all(&real_agent).unwrap();
         std::fs::create_dir_all(&real_messages).unwrap();
         std::fs::create_dir_all(linked_project.parent().unwrap()).unwrap();
-        std::fs::write(
-            real_agent.join("profile.json"),
-            "{}",
-        )
-        .unwrap();
+        std::fs::write(real_agent.join("profile.json"), "{}").unwrap();
         std::fs::write(
             real_messages.join("note.md"),
             "---json\n{\"from\":\"Ghost\",\"to\":[],\"subject\":\"hi\"}\n---\nbody\n",
@@ -2934,10 +2930,7 @@ mod tests {
             1_i64,
             "archive placeholder project id should remain stable"
         );
-        assert_eq!(
-            rows[0].get_named::<String>("slug").unwrap(),
-            "test-project"
-        );
+        assert_eq!(rows[0].get_named::<String>("slug").unwrap(), "test-project");
         assert_eq!(
             rows[0].get_named::<String>("human_key").unwrap(),
             "/test-project"

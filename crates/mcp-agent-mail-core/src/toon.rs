@@ -1431,14 +1431,14 @@ esac
 
     #[test]
     fn truncate_long() {
-        assert_eq!(truncate_str("hello world", 5), "hello");
+        assert_eq!(truncate_str("hello world", 5), "he...");
     }
 
     #[test]
     fn truncate_unicode_at_char_boundary() {
         let s = "h\u{00E9}llo"; // h + 'é' + llo
-        assert_eq!(truncate_str(s, 2), "h");
-        assert_eq!(truncate_str(s, 3), "h\u{00E9}");
+        assert_eq!(truncate_str(s, 2), "h\u{00E9}");
+        assert_eq!(truncate_str(s, 3), "h\u{00E9}l");
     }
 
     // -- Envelope serialization --

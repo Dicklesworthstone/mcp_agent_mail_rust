@@ -434,6 +434,23 @@ fn cursor_sort_score(result: &SearchResult, ranking: RankingMode) -> f64 {
 }
 
 fn apply_cursor_window(mut results: Vec<SearchResult>, query: &SearchQuery) -> Vec<SearchResult> {
+    match query.ranking {
+        RankingMode::Recency => {
+            results.sort_by(|a, b| {
+                let a_score = cursor_sort_score(a, query.ranking);
+                let b_score = cursor_sort_score(b, query.ranking);
+                a_score.total_cmp(&b_score).then_with(|| a.id.cmp(&b.id))
+            });
+        }
+        RankingMode::Relevance => {
+            results.sort_by(|a, b| {
+                let a_score = cursor_sort_score(a, query.ranking);
+                let b_score = cursor_sort_score(b, query.ranking);
+                b_score.total_cmp(&a_score).then_with(|| a.id.cmp(&b.id))
+            });
+        }
+    }
+
     let Some(cursor_str) = query.cursor.as_deref() else {
         return results;
     };
@@ -4296,6 +4313,92 @@ mod tests {
                 importance: None,
                 ack_required: None,
                 created_ts: Some(200),
+                thread_id: None,
+                from_agent: None,
+                from_agent_id: None,
+                to: None,
+                cc: None,
+                bcc: None,
+                reason_codes: Vec::new(),
+                score_factors: Vec::new(),
+                redacted: false,
+                redaction_reason: None,
+            },
+        ];
+        let cursor = compute_next_cursor(&page, page.len(), RankingMode::Recency).unwrap();
+        let query = SearchQuery {
+            ranking: RankingMode::Recency,
+            cursor: Some(cursor),
+            ..SearchQuery::default()
+        };
+        let remaining = apply_cursor_window(
+            vec![
+                page[0].clone(),
+                page[1].clone(),
+                SearchResult {
+                    doc_kind: DocKind::Message,
+                    id: 1,
+                    project_id: Some(1),
+                    title: "older".to_string(),
+                    body: String::new(),
+                    score: Some(0.0),
+                    importance: None,
+                    ack_required: None,
+                    created_ts: Some(100),
+                    thread_id: None,
+                    from_agent: None,
+                    from_agent_id: None,
+                    to: None,
+                    cc: None,
+                    bcc: None,
+                    reason_codes: Vec::new(),
+                    score_factors: Vec::new(),
+                    redacted: false,
+                    redaction_reason: None,
+                },
+            ],
+            &query,
+        );
+        assert_eq!(
+            remaining.iter().map(|result| result.id).collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn recency_cursor_with_missing_created_ts_keeps_older_results_after_boundary() {
+        let page = vec![
+            SearchResult {
+                doc_kind: DocKind::Message,
+                id: 3,
+                project_id: Some(1),
+                title: "newest".to_string(),
+                body: String::new(),
+                score: Some(0.0),
+                importance: None,
+                ack_required: None,
+                created_ts: Some(300),
+                thread_id: None,
+                from_agent: None,
+                from_agent_id: None,
+                to: None,
+                cc: None,
+                bcc: None,
+                reason_codes: Vec::new(),
+                score_factors: Vec::new(),
+                redacted: false,
+                redaction_reason: None,
+            },
+            SearchResult {
+                doc_kind: DocKind::Message,
+                id: 2,
+                project_id: Some(1),
+                title: "boundary".to_string(),
+                body: String::new(),
+                score: Some(-150.0),
+                importance: None,
+                ack_required: None,
+                created_ts: None,
                 thread_id: None,
                 from_agent: None,
                 from_agent_id: None,

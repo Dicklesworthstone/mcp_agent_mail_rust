@@ -37128,6 +37128,8 @@ async fn call_reply_message_tool_locally(
         None,
         None,
         None,
+        None,
+        None,
     )
     .await
     .map_err(mcp_error_to_cli_error)?;

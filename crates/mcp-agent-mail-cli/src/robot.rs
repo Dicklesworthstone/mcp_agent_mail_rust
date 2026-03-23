@@ -8099,10 +8099,7 @@ mod tests {
     #[test]
     fn test_truncate_str() {
         assert_eq!(truncate_str("hello", 10), "hello");
-        assert_eq!(
-            truncate_str("hello world this is long", 10),
-            "hello w..."
-        );
+        assert_eq!(truncate_str("hello world this is long", 10), "hello w...");
     }
 
     // ── Track 4 Tests: Monitoring & Analytics ────────────────────────────────
