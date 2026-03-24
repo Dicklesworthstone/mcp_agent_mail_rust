@@ -486,8 +486,10 @@ mod tests {
         let project_id = project.id.expect("project id");
 
         let sender = match block_on(async {
-            queries::register_agent(&cx, &pool, project_id, "RedFox", "test", "test", None, None, None)
-                .await
+            queries::register_agent(
+                &cx, &pool, project_id, "RedFox", "test", "test", None, None, None,
+            )
+            .await
         }) {
             Outcome::Ok(a) => a,
             other => panic!("register_agent(sender, None) failed: {other:?}"),
@@ -496,8 +498,7 @@ mod tests {
 
         let recipient = match block_on(async {
             queries::register_agent(
-                &cx, &pool, project_id, "BlueBear", "test", "test", None, None,
-                None,
+                &cx, &pool, project_id, "BlueBear", "test", "test", None, None, None,
             )
             .await
         }) {
@@ -926,8 +927,10 @@ mod tests {
         let project_id = project.id.expect("project id");
 
         let sender = match block_on(async {
-            queries::register_agent(&cx, &pool, project_id, "RedFox", "test", "test", None, None, None)
-                .await
+            queries::register_agent(
+                &cx, &pool, project_id, "RedFox", "test", "test", None, None, None,
+            )
+            .await
         }) {
             Outcome::Ok(a) => a,
             other => panic!("register_agent(sender, None) failed: {other:?}"),
@@ -936,8 +939,7 @@ mod tests {
 
         let recip1 = match block_on(async {
             queries::register_agent(
-                &cx, &pool, project_id, "BlueBear", "test", "test", None, None,
-                None,
+                &cx, &pool, project_id, "BlueBear", "test", "test", None, None, None,
             )
             .await
         }) {
@@ -948,8 +950,7 @@ mod tests {
 
         let recip2 = match block_on(async {
             queries::register_agent(
-                &cx, &pool, project_id, "GoldHawk", "test", "test", None, None,
-                None,
+                &cx, &pool, project_id, "GoldHawk", "test", "test", None, None, None,
             )
             .await
         }) {

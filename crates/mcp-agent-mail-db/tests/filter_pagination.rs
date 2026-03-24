@@ -80,8 +80,10 @@ fn seed_agent(pool: &DbPool, project_id: i64, name: &str) -> i64 {
         let pool = pool.clone();
         let name = name.to_string();
         async move {
-            match queries::register_agent(&cx, &pool, project_id, &name, "test", "test", None, None, None)
-                .await
+            match queries::register_agent(
+                &cx, &pool, project_id, &name, "test", "test", None, None, None,
+            )
+            .await
             {
                 Outcome::Ok(a) => a.id.expect("agent id"),
                 other => panic!("register_agent failed: {other:?}"),

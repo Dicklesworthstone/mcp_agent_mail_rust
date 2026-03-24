@@ -450,13 +450,14 @@ fn stress_concurrent_file_reservations() {
                 _ => panic!("register agent1 failed"),
             };
 
-            let a2 =
-                match queries::register_agent(&cx, &p, pid, "BluePond", "test", "test", None, None, None)
-                    .await
-                {
-                    Outcome::Ok(r) => r,
-                    _ => panic!("register agent2 failed"),
-                };
+            let a2 = match queries::register_agent(
+                &cx, &p, pid, "BluePond", "test", "test", None, None, None,
+            )
+            .await
+            {
+                Outcome::Ok(r) => r,
+                _ => panic!("register agent2 failed"),
+            };
 
             (pid, a1.id.unwrap(), a2.id.unwrap())
         })
@@ -746,13 +747,14 @@ fn stress_concurrent_inbox_and_send() {
                 _ => panic!("register sender failed"),
             };
 
-            let receiver =
-                match queries::register_agent(&cx, &p, pid, "DarkBay", "test", "test", None, None, None)
-                    .await
-                {
-                    Outcome::Ok(r) => r,
-                    _ => panic!("register receiver failed"),
-                };
+            let receiver = match queries::register_agent(
+                &cx, &p, pid, "DarkBay", "test", "test", None, None, None,
+            )
+            .await
+            {
+                Outcome::Ok(r) => r,
+                _ => panic!("register receiver failed"),
+            };
 
             (pid, sender.id.unwrap(), receiver.id.unwrap())
         })
@@ -882,21 +884,23 @@ fn stress_concurrent_read_ack() {
             };
             let pid = proj.id.unwrap();
 
-            let sender =
-                match queries::register_agent(&cx, &p, pid, "BoldFox", "test", "test", None, None, None)
-                    .await
-                {
-                    Outcome::Ok(r) => r,
-                    _ => panic!("register sender failed"),
-                };
+            let sender = match queries::register_agent(
+                &cx, &p, pid, "BoldFox", "test", "test", None, None, None,
+            )
+            .await
+            {
+                Outcome::Ok(r) => r,
+                _ => panic!("register sender failed"),
+            };
 
-            let receiver =
-                match queries::register_agent(&cx, &p, pid, "QuietOwl", "test", "test", None, None, None)
-                    .await
-                {
-                    Outcome::Ok(r) => r,
-                    _ => panic!("register receiver failed"),
-                };
+            let receiver = match queries::register_agent(
+                &cx, &p, pid, "QuietOwl", "test", "test", None, None, None,
+            )
+            .await
+            {
+                Outcome::Ok(r) => r,
+                _ => panic!("register receiver failed"),
+            };
 
             let msg = match queries::create_message(
                 &cx,
@@ -1509,22 +1513,24 @@ fn fetch_unacked_returns_pending_and_excludes_acknowledged() {
         };
         let pid = proj.id.unwrap();
 
-        let sender =
-            match queries::register_agent(&cx, &pool, pid, "GreenElk", "test", "test", None, None, None)
-                .await
-            {
-                Outcome::Ok(a) => a,
-                Outcome::Err(e) => panic!("register sender failed: {e:?}"),
-                _ => panic!("register sender: unexpected outcome"),
-            };
-        let receiver =
-            match queries::register_agent(&cx, &pool, pid, "BlueDeer", "test", "test", None, None, None)
-                .await
-            {
-                Outcome::Ok(a) => a,
-                Outcome::Err(e) => panic!("register receiver failed: {e:?}"),
-                _ => panic!("register receiver: unexpected outcome"),
-            };
+        let sender = match queries::register_agent(
+            &cx, &pool, pid, "GreenElk", "test", "test", None, None, None,
+        )
+        .await
+        {
+            Outcome::Ok(a) => a,
+            Outcome::Err(e) => panic!("register sender failed: {e:?}"),
+            _ => panic!("register sender: unexpected outcome"),
+        };
+        let receiver = match queries::register_agent(
+            &cx, &pool, pid, "BlueDeer", "test", "test", None, None, None,
+        )
+        .await
+        {
+            Outcome::Ok(a) => a,
+            Outcome::Err(e) => panic!("register receiver failed: {e:?}"),
+            _ => panic!("register receiver: unexpected outcome"),
+        };
 
         let sender_id = sender.id.unwrap();
         let receiver_id = receiver.id.unwrap();
@@ -1669,6 +1675,7 @@ fn cache_zipfian_thrashing() {
                 last_active_ts: 0,
                 attachments_policy: "auto".to_string(),
                 contact_policy: "open".to_string(),
+                reaper_exempt: 0,
             }
         })
         .collect();
@@ -1764,6 +1771,7 @@ fn cache_zipfian_within_capacity() {
             last_active_ts: 0,
             attachments_policy: "auto".to_string(),
             contact_policy: "open".to_string(),
+            reaper_exempt: 0,
         })
         .collect();
 
@@ -1833,6 +1841,7 @@ fn cache_concurrent_zipfian_access() {
                 last_active_ts: 0,
                 attachments_policy: "auto".to_string(),
                 contact_policy: "open".to_string(),
+                reaper_exempt: 0,
             })
             .collect(),
     );
@@ -1936,7 +1945,18 @@ fn setup_project_and_agents(pool: &DbPool) -> (i64, i64, i64) {
     let sender_id = block_on_with_retry(3, |cx| {
         let pool = pool.clone();
         async move {
-            queries::register_agent(&cx, &pool, pid, "BoldCastle", "test", "test", None, None, None).await
+            queries::register_agent(
+                &cx,
+                &pool,
+                pid,
+                "BoldCastle",
+                "test",
+                "test",
+                None,
+                None,
+                None,
+            )
+            .await
         }
     })
     .id
@@ -1945,7 +1965,18 @@ fn setup_project_and_agents(pool: &DbPool) -> (i64, i64, i64) {
     let receiver_id = block_on_with_retry(3, |cx| {
         let pool = pool.clone();
         async move {
-            queries::register_agent(&cx, &pool, pid, "QuietLake", "test", "test", None, None, None).await
+            queries::register_agent(
+                &cx,
+                &pool,
+                pid,
+                "QuietLake",
+                "test",
+                "test",
+                None,
+                None,
+                None,
+            )
+            .await
         }
     })
     .id
@@ -3248,13 +3279,14 @@ fn edge_case_message_to_self() {
         };
         let pid = proj.id.unwrap();
 
-        let agent =
-            match queries::register_agent(&cx, &pool, pid, "GoldLake", "test", "test", None, None, None)
-                .await
-            {
-                Outcome::Ok(r) => r,
-                _ => panic!("register agent failed"),
-            };
+        let agent = match queries::register_agent(
+            &cx, &pool, pid, "GoldLake", "test", "test", None, None, None,
+        )
+        .await
+        {
+            Outcome::Ok(r) => r,
+            _ => panic!("register agent failed"),
+        };
         let agent_id = agent.id.unwrap();
 
         // Send a message where sender == recipient (message-to-self)
@@ -3310,13 +3342,14 @@ fn edge_case_force_release_idempotency() {
         };
         let pid = proj.id.unwrap();
 
-        let agent =
-            match queries::register_agent(&cx, &pool, pid, "RedPeak", "test", "test", None, None, None)
-                .await
-            {
-                Outcome::Ok(r) => r,
-                _ => panic!("register agent failed"),
-            };
+        let agent = match queries::register_agent(
+            &cx, &pool, pid, "RedPeak", "test", "test", None, None, None,
+        )
+        .await
+        {
+            Outcome::Ok(r) => r,
+            _ => panic!("register agent failed"),
+        };
         let agent_id = agent.id.unwrap();
 
         // Create a file reservation
@@ -3375,13 +3408,14 @@ fn edge_case_release_reservations_idempotency() {
         };
         let pid = proj.id.unwrap();
 
-        let agent =
-            match queries::register_agent(&cx, &pool, pid, "BluePond", "test", "test", None, None, None)
-                .await
-            {
-                Outcome::Ok(r) => r,
-                _ => panic!("register agent failed"),
-            };
+        let agent = match queries::register_agent(
+            &cx, &pool, pid, "BluePond", "test", "test", None, None, None,
+        )
+        .await
+        {
+            Outcome::Ok(r) => r,
+            _ => panic!("register agent failed"),
+        };
         let agent_id = agent.id.unwrap();
 
         // Create two file reservations

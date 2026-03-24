@@ -764,13 +764,14 @@ fn seed_corpus() -> SeededCorpus {
 
             let mut agent_map = HashMap::new();
             for name in &sender_names {
-                let agent =
-                    match queries::register_agent(&cx, &p, pid, name, "bench", "test", None, None, None)
-                        .await
-                    {
-                        Outcome::Ok(r) => r,
-                        other => panic!("register_agent({name}, None) failed: {other:?}"),
-                    };
+                let agent = match queries::register_agent(
+                    &cx, &p, pid, name, "bench", "test", None, None, None,
+                )
+                .await
+                {
+                    Outcome::Ok(r) => r,
+                    other => panic!("register_agent({name}, None) failed: {other:?}"),
+                };
                 agent_map.insert(name.to_string(), agent.id.unwrap());
             }
 

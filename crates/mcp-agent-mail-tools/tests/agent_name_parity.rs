@@ -158,6 +158,7 @@ fn test_invalid_format_detection() {
             Some(invalid.clone()),
             Some("parity test".to_string()),
             None,
+            None,
         )
         .await
         .expect_err("invalid format should fail");

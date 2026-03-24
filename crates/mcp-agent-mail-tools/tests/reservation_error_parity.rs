@@ -59,6 +59,7 @@ async fn setup_project_and_agents(ctx: &McpContext, project_key: &str, agents: &
             Some((*name).to_string()),
             Some("reservation parity test".to_string()),
             None,
+            None,
         )
         .await
         .expect("register_agent");

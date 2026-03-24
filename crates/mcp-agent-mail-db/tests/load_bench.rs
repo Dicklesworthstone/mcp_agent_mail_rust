@@ -335,8 +335,18 @@ fn load_scenario_b_message_burst() {
             let pp = pool.clone();
             let n = name.clone();
             async move {
-                queries::register_agent(&cx, &pp, project_id, &n, "load-bench", "model", None, None, None)
-                    .await
+                queries::register_agent(
+                    &cx,
+                    &pp,
+                    project_id,
+                    &n,
+                    "load-bench",
+                    "model",
+                    None,
+                    None,
+                    None,
+                )
+                .await
             }
         })
         .id
@@ -776,8 +786,18 @@ fn load_scenario_d_thundering_herd() {
             let pp = pool.clone();
             let n = name.clone();
             async move {
-                queries::register_agent(&cx, &pp, project_id, &n, "load-bench", "model", None, None, None)
-                    .await
+                queries::register_agent(
+                    &cx,
+                    &pp,
+                    project_id,
+                    &n,
+                    "load-bench",
+                    "model",
+                    None,
+                    None,
+                    None,
+                )
+                .await
             }
         })
         .id

@@ -645,7 +645,7 @@ fn build_tool_directory() -> ToolDirectory {
                     related: vec!["create_agent_identity".to_string(), "whois".to_string()],
                     expected_frequency: "At the start of each automated work session.".to_string(),
                     required_capabilities: vec!["identity".to_string()],
-                    usage_examples: vec![ToolUsageExample { hint: "Resume persona".to_string(), sample: "register_agent(project_key='/abs/path/backend', program='codex', model='gpt5', None)".to_string() }],
+                    usage_examples: vec![ToolUsageExample { hint: "Resume persona".to_string(), sample: "register_agent(project_key='/abs/path/backend', program='codex', model='gpt5')".to_string() }],
                     capabilities: vec!["identity".to_string()],
                     complexity: "medium".to_string(),
                 },
@@ -4223,7 +4223,7 @@ mod resource_shape_tests {
         .await
         {
             Outcome::Ok(agent) => agent,
-            other => panic!("register_agent({name}, None) failed: {other:?}"),
+            other => panic!("register_agent({name}) failed: {other:?}"),
         }
     }
 
@@ -4343,8 +4343,8 @@ mod resource_shape_tests {
         let project_key = format!("/tmp/resources-populated-{}", unique_suffix());
         let project = ensure_project(cx, &pool, &project_key).await;
         let project_id = project.id.unwrap_or(0);
-        let sender = register_agent(cx, &pool, project_id, "SilverFox", None).await;
-        let recipient = register_agent(cx, &pool, project_id, "GoldenLynx", None).await;
+        let sender = register_agent(cx, &pool, project_id, "SilverFox").await;
+        let recipient = register_agent(cx, &pool, project_id, "GoldenLynx").await;
         let thread_id = format!("thread-{}", unique_suffix());
         let message = create_message(
             cx,
@@ -4488,9 +4488,9 @@ mod resource_shape_tests {
                 let project_key = format!("/tmp/resources-bcc-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
-                let sender = register_agent(&cx, &pool, project_id, "BlueLake", None).await;
-                let recipient = register_agent(&cx, &pool, project_id, "RedPeak", None).await;
-                let hidden = register_agent(&cx, &pool, project_id, "RedFox", None).await;
+                let sender = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let recipient = register_agent(&cx, &pool, project_id, "RedPeak").await;
+                let hidden = register_agent(&cx, &pool, project_id, "RedFox").await;
                 let thread_id = format!("thread-bcc-{}", unique_suffix());
                 let message = create_message_with_bcc(
                     &cx,
@@ -4607,7 +4607,7 @@ mod resource_shape_tests {
                 let project_key = format!("/tmp/resources-empty-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
-                let agent = register_agent(&cx, &pool, project_id, "BlueOtter", None).await;
+                let agent = register_agent(&cx, &pool, project_id, "BlueOtter").await;
                 let ctx = McpContext::new(cx.clone(), 1);
                 let project_ref = project.human_key.clone();
                 let agent_name = agent.name.clone();
@@ -4840,7 +4840,7 @@ mod resource_shape_tests {
                 let project_key = format!("/tmp/resources-invalid-since-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
-                let agent = register_agent(&cx, &pool, project_id, "BlueLake", None).await;
+                let agent = register_agent(&cx, &pool, project_id, "BlueLake").await;
                 let ctx = McpContext::new(cx.clone(), 1);
                 let project_ref = project.human_key.clone();
 
@@ -4877,8 +4877,8 @@ mod resource_shape_tests {
                 let project_key = format!("/tmp/resources-urgent-read-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
-                let sender = register_agent(&cx, &pool, project_id, "SilverFox", None).await;
-                let recipient = register_agent(&cx, &pool, project_id, "GoldenLynx", None).await;
+                let sender = register_agent(&cx, &pool, project_id, "SilverFox").await;
+                let recipient = register_agent(&cx, &pool, project_id, "GoldenLynx").await;
                 let thread_id = format!("thread-read-{}", unique_suffix());
                 let message = create_message(
                     &cx,
@@ -5194,8 +5194,8 @@ mod resource_shape_tests {
                 let project_key = format!("/tmp/resources-attachments-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
-                let sender = register_agent(&cx, &pool, project_id, "BlueLake", None).await;
-                let recipient = register_agent(&cx, &pool, project_id, "RedPeak", None).await;
+                let sender = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let recipient = register_agent(&cx, &pool, project_id, "RedPeak").await;
                 let thread_id = format!("thread-attachments-{}", unique_suffix());
                 let attachments_json = r#"[{"name":"artifact.txt","path":"attachments/artifact.txt","content_type":"text/plain","size":12}]"#;
                 let message = create_message_with_attachments(
@@ -5335,8 +5335,8 @@ mod resource_shape_tests {
                 let project_key = format!("/tmp/resources-case-insensitive-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
-                let sender = register_agent(&cx, &pool, project_id, "BlueLake", None).await;
-                let recipient = register_agent(&cx, &pool, project_id, "RedPeak", None).await;
+                let sender = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let recipient = register_agent(&cx, &pool, project_id, "RedPeak").await;
                 let message = create_message(
                     &cx,
                     &pool,
@@ -5479,7 +5479,7 @@ mod resource_shape_tests {
                 )
                 .await;
                 let project_id = project.id.unwrap_or(0);
-                let primary = register_agent(&cx, &pool, project_id, "BlueLake", None).await;
+                let primary = register_agent(&cx, &pool, project_id, "BlueLake").await;
 
                 let conn = match pool.acquire(&cx).await {
                     Outcome::Ok(c) => c,
@@ -5529,8 +5529,8 @@ mod resource_shape_tests {
                 let project_key = format!("/tmp/resources-thread-toggle-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
-                let sender = register_agent(&cx, &pool, project_id, "GrayPine", None).await;
-                let recipient = register_agent(&cx, &pool, project_id, "MistyPeak", None).await;
+                let sender = register_agent(&cx, &pool, project_id, "GrayPine").await;
+                let recipient = register_agent(&cx, &pool, project_id, "MistyPeak").await;
                 let thread_id = format!("thread-toggle-{}", unique_suffix());
                 let _ = create_message(
                     &cx,
@@ -5578,7 +5578,7 @@ mod resource_shape_tests {
                 let project_key = format!("/tmp/resources-reservations-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
-                let agent = register_agent(&cx, &pool, project_id, "AmberRiver", None).await;
+                let agent = register_agent(&cx, &pool, project_id, "AmberRiver").await;
                 let agent_id = agent.id.unwrap_or(0);
 
                 let active_rows = match queries::create_file_reservations(
@@ -5668,7 +5668,7 @@ mod resource_shape_tests {
                 let project_key = format!("/tmp/resources-missing-workspace-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
-                let agent = register_agent(&cx, &pool, project_id, "AmberRiver", None).await;
+                let agent = register_agent(&cx, &pool, project_id, "AmberRiver").await;
                 let agent_id = agent.id.unwrap_or(0);
 
                 let created = match queries::create_file_reservations(
@@ -5746,7 +5746,7 @@ mod resource_shape_tests {
                 let project_key = format!("/tmp/resources-release-artifacts-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
-                let agent = register_agent(&cx, &pool, project_id, "AmberRiver", None).await;
+                let agent = register_agent(&cx, &pool, project_id, "AmberRiver").await;
                 let agent_id = agent.id.unwrap_or(0);
 
                 let created = match queries::create_file_reservations(

@@ -1492,7 +1492,7 @@ async fn mvcc_backoff(_cx: &Cx, attempt: u32) {
     use crate::retry::RetryConfig;
     let config = RetryConfig {
         base_delay: std::time::Duration::from_millis(25),
-        max_delay: std::time::Duration::from_millis(2000),
+        max_delay: std::time::Duration::from_secs(2),
         use_circuit_breaker: false,
         ..Default::default()
     };

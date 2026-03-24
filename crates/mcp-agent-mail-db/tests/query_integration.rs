@@ -274,7 +274,18 @@ fn register_agent_invalid_name_rejected() {
     let pid = setup_project(&pool);
     let pool2 = pool.clone();
     let result = block_on(|cx| async move {
-        queries::register_agent(&cx, &pool2, pid, "EaglePeak", "test", "model", None, None, None).await
+        queries::register_agent(
+            &cx,
+            &pool2,
+            pid,
+            "EaglePeak",
+            "test",
+            "model",
+            None,
+            None,
+            None,
+        )
+        .await
     });
     assert!(
         matches!(result, Outcome::Err(DbError::InvalidArgument { .. })),

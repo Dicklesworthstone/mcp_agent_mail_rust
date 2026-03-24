@@ -61,6 +61,7 @@ async fn setup_project_and_agent(ctx: &McpContext, project_key: &str, agent: &st
         Some(agent.to_string()),
         Some("messaging parity test".to_string()),
         None,
+        None,
     )
     .await
     .expect("register_agent");

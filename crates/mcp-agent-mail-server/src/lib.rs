@@ -22429,9 +22429,8 @@ mod tests {
             .await
         });
 
-        let err = match result {
-            Err(e) => e,
-            Ok(_) => panic!("should fail after max retries, but got Ok"),
+        let Err(err) = result else {
+            panic!("should fail after max retries, but got Ok");
         };
         assert_eq!(
             attempts, HTTP_SUPERVISOR_MAX_CONSECUTIVE_RESTART_FAILURES,

@@ -1553,7 +1553,7 @@ mod tests {
         .await
         {
             Outcome::Ok(agent) => agent,
-            other => panic!("register_agent({name}, None) failed: {other:?}"),
+            other => panic!("register_agent({name}) failed: {other:?}"),
         }
     }
 
@@ -2179,7 +2179,7 @@ mod tests {
                 let project_key = format!("/tmp/release-expired-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
-                let agent = register_agent(&cx, &pool, project_id, "AmberRiver", None).await;
+                let agent = register_agent(&cx, &pool, project_id, "AmberRiver").await;
                 let agent_id = agent.id.unwrap_or(0);
 
                 let created = match queries::create_file_reservations(

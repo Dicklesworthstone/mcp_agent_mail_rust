@@ -866,9 +866,7 @@ impl DbPool {
         );
 
         conn.execute_raw("PRAGMA busy_timeout = 5000;")
-            .map_err(|e| {
-                DbError::Sqlite(format!("passive checkpoint: busy_timeout: {e}"))
-            })?;
+            .map_err(|e| DbError::Sqlite(format!("passive checkpoint: busy_timeout: {e}")))?;
 
         let rows = conn
             .query_sync("PRAGMA wal_checkpoint(PASSIVE);", &[])
@@ -4825,7 +4823,8 @@ mod tests {
         let db_path = dir.path().join("cleanup_test.db");
         // Create a real DB so the main file exists.
         let conn = DbConn::open_file(db_path.to_str().unwrap()).expect("open");
-        conn.execute_raw("CREATE TABLE t (x INTEGER)").expect("create table");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create table");
         drop(conn);
 
         // Create a 0-byte WAL sidecar (simulating crash artifact).
@@ -4844,7 +4843,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("preserve_test.db");
         let conn = DbConn::open_file(db_path.to_str().unwrap()).expect("open");
-        conn.execute_raw("CREATE TABLE t (x INTEGER)").expect("create table");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create table");
         drop(conn);
 
         // Create a non-empty WAL sidecar.
