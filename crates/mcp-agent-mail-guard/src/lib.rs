@@ -683,6 +683,8 @@ def get_active_reservations():
             continue
         if not entry.name.endswith(".json"):
             continue
+        if entry.is_symlink():
+            continue
         try:
             with open(entry.path, "r", encoding="utf-8") as handle:
                 record = json.load(handle)
