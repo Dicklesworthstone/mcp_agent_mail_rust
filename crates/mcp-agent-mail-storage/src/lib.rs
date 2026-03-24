@@ -3628,6 +3628,15 @@ fn ensure_dir(dir: &Path) -> std::io::Result<()> {
             return Ok(());
         }
     }
+    if path_existing_prefix_has_symlink(dir)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to create directory through symlinked path: {}",
+                dir.display()
+            ),
+        ));
+    }
     fs::create_dir_all(dir)?;
     {
         let mut cache = DIR_CACHE.lock().unwrap_or_else(|e| e.into_inner());
@@ -6989,27 +6998,16 @@ fn append_trailers(message: &str) -> String {
 /// The base is expected to already be canonicalized (avoiding repeated
 /// `readlink` syscalls).  The target is canonicalized via `fs::canonicalize()`
 /// to resolve any symlinks before comparison, preventing symlink-based path
-/// traversal attacks.  Falls back to manual normalization when the target
-/// does not yet exist on disk.
+/// traversal attacks. For paths that do not yet exist, we canonicalize the
+/// nearest existing ancestor and append the missing suffix so symlinked parent
+/// directories are still resolved correctly.
 fn rel_path_cached(canonical_base: &Path, target: &Path) -> Result<String> {
-    // Resolve symlinks in the target path for safe comparison.
-    // If canonicalize fails (file doesn't exist yet), fall back to manual normalization.
     let canonical_target = match target.canonicalize() {
         Ok(p) => p,
-        Err(_) => {
-            // Manual normalization for paths that don't exist on disk yet.
-            let mut norm = PathBuf::new();
-            for component in target.components() {
-                match component {
-                    std::path::Component::ParentDir => {
-                        norm.pop();
-                    }
-                    std::path::Component::CurDir => {}
-                    _ => norm.push(component),
-                }
-            }
-            norm
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            canonicalize_with_existing_prefix(target).map_err(StorageError::Io)?
         }
+        Err(err) => return Err(StorageError::Io(err)),
     };
 
     canonical_target
@@ -7119,6 +7117,15 @@ fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
     }
 
     let parent = path.parent().unwrap_or(Path::new("."));
+    if path_existing_prefix_has_symlink(parent)? {
+        return Err(StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to write through symlinked parent path: {}",
+                parent.display()
+            ),
+        )));
+    }
 
     // Use pid + seq + filename-hash for a unique temp name.
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -7149,6 +7156,61 @@ fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
         let _ = fs::remove_file(&tmp_path);
     }
     result
+}
+
+fn canonicalize_with_existing_prefix(path: &Path) -> std::io::Result<PathBuf> {
+    let mut missing_suffix = Vec::new();
+    let mut current = path;
+
+    loop {
+        match current.canonicalize() {
+            Ok(canonical_current) => {
+                let mut resolved = canonical_current;
+                for component in missing_suffix.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = current.file_name() else {
+                    return Err(err);
+                };
+                missing_suffix.push(name.to_os_string());
+                let Some(parent) = current.parent() else {
+                    return Err(err);
+                };
+                current = parent;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn path_existing_prefix_has_symlink(path: &Path) -> std::io::Result<bool> {
+    let mut current = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir()?
+    };
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            Component::CurDir => continue,
+            Component::ParentDir => current.push(".."),
+            Component::Normal(part) => current.push(part),
+        }
+
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(false)
 }
 
 /// ISO 8601 timestamp for the current time.
@@ -8129,6 +8191,52 @@ mod tests {
 
         // Backslash normalization
         assert!(resolve_archive_relative_path(&archive, "..\\..\\etc\\passwd").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rel_path_cached_rejects_missing_target_under_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside_tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+        let outside = outside_tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, archive.root.join("escape")).unwrap();
+
+        let target = archive.root.join("escape").join("message.md");
+        let err = rel_path_cached(&archive.canonical_repo_root, &target)
+            .expect_err("symlinked parent should be rejected");
+        assert!(matches!(err, StorageError::InvalidPath(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_text_rejects_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside_tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+        let outside = outside_tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, archive.root.join("escape")).unwrap();
+
+        let target = archive.root.join("escape").join("message.md");
+        let err =
+            write_text(&target, "payload", false).expect_err("symlinked parent should be rejected");
+        assert!(
+            err.to_string().contains("symlinked path")
+                || err.to_string().contains("symlinked parent"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !outside.join("message.md").exists(),
+            "write should not escape outside the archive root"
+        );
     }
 
     #[test]
