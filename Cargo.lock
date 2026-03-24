@@ -2209,7 +2209,7 @@ dependencies = [
  "fsqlite-wal",
  "hashbrown 0.14.5",
  "lazy_static",
- "lru 0.12.5",
+ "lru 0.16.3",
  "regex",
  "serde",
  "serde_json",
