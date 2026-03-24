@@ -1687,8 +1687,8 @@ impl AgentRhythm {
         let mut sorted: Vec<f64> = self.recent_intervals.iter().copied().collect();
         sorted.sort_by(|a, b| b.total_cmp(a)); // Descending
 
-        // Top 20% for tail estimation
-        let tail_count = (sorted.len() / 5).max(3);
+        // Top 20% for tail estimation, clamped to valid index range
+        let tail_count = (sorted.len() / 5).max(3).min(sorted.len() - 1);
         let threshold_val = sorted[tail_count].max(1.0);
 
         let mut sum_log_ratio = 0.0;
