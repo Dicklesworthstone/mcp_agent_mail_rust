@@ -1973,10 +1973,77 @@ fn refuse_auto_recovery_with_live_sidecars(primary_path: &Path) -> Result<(), Sq
         return Ok(());
     }
 
-    Err(SqlError::Custom(format!(
-        "refusing automatic sqlite recovery for {} while live WAL/SHM sidecars are present; stop the server and run explicit repair",
-        primary_path.display()
-    )))
+    // Stale WAL/SHM files are common after crashes or failed migrations.
+    // Instead of immediately refusing recovery, try to checkpoint the WAL.
+    // If no other process holds a lock, the checkpoint will succeed and we
+    // can remove the sidecars, allowing recovery to proceed.
+    tracing::info!(
+        path = %primary_path.display(),
+        "live WAL/SHM sidecars detected; attempting checkpoint before recovery"
+    );
+    match try_checkpoint_and_clear_sidecars(primary_path) {
+        Ok(()) => {
+            tracing::info!(
+                path = %primary_path.display(),
+                "WAL checkpoint succeeded; sidecars cleared, proceeding with recovery"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            // If the error is a lock/busy error, another process truly holds the DB
+            if is_lock_error(&err_str) {
+                Err(SqlError::Custom(format!(
+                    "cannot recover {} — another process holds a lock on the database; \
+                     stop the server first, then retry",
+                    primary_path.display()
+                )))
+            } else {
+                Err(SqlError::Custom(format!(
+                    "cannot recover {} while live WAL/SHM sidecars are present; \
+                     automatic checkpoint failed: {e}; stop the server and run explicit repair",
+                    primary_path.display()
+                )))
+            }
+        }
+    }
+}
+
+/// Try to checkpoint the WAL and remove sidecar files.
+#[allow(clippy::result_large_err)]
+fn try_checkpoint_and_clear_sidecars(primary_path: &Path) -> Result<(), SqlError> {
+    let path_str = primary_path.to_string_lossy();
+    let conn = sqlmodel_sqlite::SqliteConnection::open_file(path_str.as_ref())?;
+    // Attempt a truncating checkpoint to fold WAL changes into the main DB
+    conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    drop(conn);
+    // Remove any residual sidecars left after the successful checkpoint.
+    remove_sqlite_sidecars(primary_path);
+    if sqlite_file_has_live_sidecars(primary_path) {
+        return Err(SqlError::Custom(format!(
+            "checkpoint completed for {} but non-empty WAL/SHM sidecars remain",
+            primary_path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Remove WAL and SHM sidecar files if they exist.
+fn remove_sqlite_sidecars(primary_path: &Path) {
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar_os = primary_path.as_os_str().to_os_string();
+        sidecar_os.push(suffix);
+        let sidecar_path = PathBuf::from(sidecar_os);
+        if sidecar_path.exists()
+            && let Err(e) = std::fs::remove_file(&sidecar_path)
+        {
+            tracing::warn!(
+                path = %sidecar_path.display(),
+                error = %e,
+                "failed to remove sqlite sidecar"
+            );
+        }
+    }
 }
 
 #[must_use]
@@ -2173,7 +2240,11 @@ fn has_quarantined_primary_artifact(primary_path: &Path) -> bool {
     } else {
         parent
     };
-    let corrupt_prefix = format!("{file_name}.corrupt-");
+    let quarantine_prefixes = [
+        format!("{file_name}.corrupt-"),
+        format!("{file_name}.archive-reconcile-"),
+        format!("{file_name}.reconstruct-"),
+    ];
 
     std::fs::read_dir(scan_dir)
         .ok()
@@ -2181,7 +2252,11 @@ fn has_quarantined_primary_artifact(primary_path: &Path) -> bool {
         .flatten()
         .flatten()
         .filter_map(|entry| entry.file_name().into_string().ok())
-        .any(|name| name.starts_with(&corrupt_prefix))
+        .any(|name| {
+            quarantine_prefixes
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        })
 }
 
 #[must_use]
@@ -2197,6 +2272,13 @@ fn resolve_sqlite_path_with_absolute_fallback(sqlite_path: &str) -> String {
 
     // Preserve explicitly relative paths exactly as configured.
     if sqlite_path.starts_with("./") || sqlite_path.starts_with("../") {
+        return sqlite_path.to_string();
+    }
+
+    // Only reinterpret the path when the configured relative file actually
+    // exists and is unhealthy. A missing relative path may be a legitimate
+    // fresh-start target and must not be silently rewritten to `/<path>`.
+    if !relative_path.exists() {
         return sqlite_path.to_string();
     }
 
@@ -2228,24 +2310,117 @@ pub fn normalize_sqlite_path_for_pool_key(sqlite_path: &str) -> String {
 }
 
 #[allow(clippy::result_large_err)]
-fn quarantine_sidecar(primary_path: &Path, suffix: &str, timestamp: &str) -> Result<(), SqlError> {
+fn quarantined_sidecar_path(
+    primary_path: &Path,
+    suffix: &str,
+    label: &str,
+    timestamp: &str,
+) -> PathBuf {
+    let base_name = primary_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("storage.sqlite3");
+    primary_path.with_file_name(format!("{base_name}{suffix}.{label}-{timestamp}"))
+}
+
+#[allow(clippy::result_large_err)]
+fn quarantine_sidecar_with_label(
+    primary_path: &Path,
+    suffix: &str,
+    label: &str,
+    timestamp: &str,
+) -> Result<(), SqlError> {
     let mut source_os = primary_path.as_os_str().to_os_string();
     source_os.push(suffix);
     let source = PathBuf::from(source_os);
     if !source.exists() {
         return Ok(());
     }
-    let base_name = primary_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("storage.sqlite3");
-    let target = primary_path.with_file_name(format!("{base_name}{suffix}.corrupt-{timestamp}"));
+    let target = quarantined_sidecar_path(primary_path, suffix, label, timestamp);
     std::fs::rename(&source, &target).map_err(|e| {
         SqlError::Custom(format!(
             "failed to quarantine sidecar {}: {e}",
             source.display()
         ))
     })
+}
+
+#[allow(clippy::result_large_err)]
+fn quarantine_sidecar(primary_path: &Path, suffix: &str, timestamp: &str) -> Result<(), SqlError> {
+    quarantine_sidecar_with_label(primary_path, suffix, "corrupt", timestamp)
+}
+
+#[allow(clippy::result_large_err)]
+fn restore_quarantined_primary_with_sidecar_label(
+    primary_path: &Path,
+    quarantined_path: &Path,
+    sidecar_label: &str,
+    timestamp: &str,
+) -> Result<(), SqlError> {
+    if !quarantined_path.exists() {
+        return Ok(());
+    }
+
+    if primary_path.exists() {
+        let restore_timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+        let _ = quarantine_reconstructed_candidate(
+            primary_path,
+            &restore_timestamp,
+            "archive-reconcile-restore",
+        );
+    }
+
+    std::fs::rename(quarantined_path, primary_path).map_err(|e| {
+        SqlError::Custom(format!(
+            "failed to restore original database {} from {}: {e}",
+            primary_path.display(),
+            quarantined_path.display()
+        ))
+    })?;
+
+    restore_quarantined_sidecar(primary_path, "-wal", sidecar_label, timestamp)?;
+    restore_quarantined_sidecar(primary_path, "-shm", sidecar_label, timestamp)?;
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn quarantine_corrupt_sidecars_or_restore_primary(
+    primary_path: &Path,
+    quarantined_path: &Path,
+    timestamp: &str,
+    context: &str,
+) -> Result<(), SqlError> {
+    if let Err(e) = quarantine_sidecar(primary_path, "-wal", timestamp) {
+        if let Err(restore_err) =
+            restore_quarantined_primary(primary_path, quarantined_path, timestamp)
+        {
+            return Err(SqlError::Custom(format!(
+                "failed to quarantine WAL sidecar for {context} at {}: {e}; rollback of quarantined database also failed: {restore_err}",
+                primary_path.display()
+            )));
+        }
+        return Err(SqlError::Custom(format!(
+            "failed to quarantine WAL sidecar for {context} at {}: {e}",
+            primary_path.display()
+        )));
+    }
+
+    if let Err(e) = quarantine_sidecar(primary_path, "-shm", timestamp) {
+        if let Err(restore_err) =
+            restore_quarantined_primary(primary_path, quarantined_path, timestamp)
+        {
+            return Err(SqlError::Custom(format!(
+                "failed to quarantine SHM sidecar for {context} at {}: {e}; rollback of quarantined database also failed: {restore_err}",
+                primary_path.display()
+            )));
+        }
+        return Err(SqlError::Custom(format!(
+            "failed to quarantine SHM sidecar for {context} at {}: {e}",
+            primary_path.display()
+        )));
+    }
+
+    Ok(())
 }
 
 #[allow(clippy::result_large_err)]
@@ -2270,49 +2445,104 @@ fn quarantine_reconstructed_candidate(
         ))
     })?;
 
-    if let Err(e) = quarantine_sidecar(primary_path, "-wal", timestamp) {
-        tracing::warn!(
-            sidecar = %format!("{}-wal", primary_path.display()),
-            error = %e,
-            "failed to quarantine WAL sidecar for reconstructed candidate; continuing"
-        );
+    if let Err(e) = quarantine_sidecar_with_label(primary_path, "-wal", reason, timestamp) {
+        if let Err(restore_err) = restore_quarantined_primary_with_sidecar_label(
+            primary_path,
+            &quarantined,
+            reason,
+            timestamp,
+        ) {
+            return Err(SqlError::Custom(format!(
+                "failed to quarantine WAL sidecar for reconstructed candidate {}: {e}; rollback also failed: {restore_err}",
+                primary_path.display()
+            )));
+        }
+        return Err(SqlError::Custom(format!(
+            "failed to quarantine WAL sidecar for reconstructed candidate {}: {e}",
+            primary_path.display()
+        )));
     }
-    if let Err(e) = quarantine_sidecar(primary_path, "-shm", timestamp) {
-        tracing::warn!(
-            sidecar = %format!("{}-shm", primary_path.display()),
-            error = %e,
-            "failed to quarantine SHM sidecar for reconstructed candidate; continuing"
-        );
+    if let Err(e) = quarantine_sidecar_with_label(primary_path, "-shm", reason, timestamp) {
+        if let Err(restore_err) = restore_quarantined_primary_with_sidecar_label(
+            primary_path,
+            &quarantined,
+            reason,
+            timestamp,
+        ) {
+            return Err(SqlError::Custom(format!(
+                "failed to quarantine SHM sidecar for reconstructed candidate {}: {e}; rollback also failed: {restore_err}",
+                primary_path.display()
+            )));
+        }
+        return Err(SqlError::Custom(format!(
+            "failed to quarantine SHM sidecar for reconstructed candidate {}: {e}",
+            primary_path.display()
+        )));
     }
 
     Ok(Some(quarantined))
 }
 
 #[allow(clippy::result_large_err)]
-fn restore_quarantined_primary(
+fn restore_quarantined_sidecar(
     primary_path: &Path,
-    quarantined_path: &Path,
+    suffix: &str,
+    label: &str,
+    timestamp: &str,
 ) -> Result<(), SqlError> {
-    if !quarantined_path.exists() {
+    let quarantined = quarantined_sidecar_path(primary_path, suffix, label, timestamp);
+    let metadata = match std::fs::symlink_metadata(&quarantined) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(SqlError::Custom(format!(
+                "failed to inspect quarantined sidecar {}: {e}",
+                quarantined.display()
+            )));
+        }
+    };
+
+    if !metadata.file_type().is_file() {
+        tracing::warn!(
+            path = %quarantined.display(),
+            "skipping non-file sqlite sidecar quarantine artifact during restore"
+        );
         return Ok(());
     }
 
-    if primary_path.exists() {
-        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-        let _ = quarantine_reconstructed_candidate(
-            primary_path,
-            &timestamp,
-            "archive-reconcile-restore",
-        );
+    let mut live_os = primary_path.as_os_str().to_os_string();
+    live_os.push(suffix);
+    let live_path = PathBuf::from(live_os);
+    if live_path.exists() {
+        std::fs::remove_file(&live_path).map_err(|e| {
+            SqlError::Custom(format!(
+                "failed to clear restored sidecar destination {}: {e}",
+                live_path.display()
+            ))
+        })?;
     }
 
-    std::fs::rename(quarantined_path, primary_path).map_err(|e| {
+    std::fs::rename(&quarantined, &live_path).map_err(|e| {
         SqlError::Custom(format!(
-            "failed to restore original database {} from {}: {e}",
-            primary_path.display(),
-            quarantined_path.display()
+            "failed to restore original sidecar {} from {}: {e}",
+            live_path.display(),
+            quarantined.display()
         ))
     })
+}
+
+#[allow(clippy::result_large_err)]
+fn restore_quarantined_primary(
+    primary_path: &Path,
+    quarantined_path: &Path,
+    timestamp: &str,
+) -> Result<(), SqlError> {
+    restore_quarantined_primary_with_sidecar_label(
+        primary_path,
+        quarantined_path,
+        "corrupt",
+        timestamp,
+    )
 }
 
 /// Rebuild a healthy-but-stale SQLite file from the archive while salvaging the
@@ -2323,6 +2553,12 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
     storage_root: &Path,
 ) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
     if !primary_path.exists() {
+        if has_quarantined_primary_artifact(primary_path) {
+            return Err(SqlError::Custom(format!(
+                "database file {} is missing but quarantined recovery artifact(s) exist; refusing archive salvage reconstruction without operator action",
+                primary_path.display()
+            )));
+        }
         return crate::reconstruct::reconstruct_from_archive(primary_path, storage_root)
             .map_err(|e| SqlError::Custom(e.to_string()));
     }
@@ -2346,8 +2582,12 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
             primary_path.display()
         ))
     })?;
-    let _ = quarantine_sidecar(primary_path, "-wal", &timestamp);
-    let _ = quarantine_sidecar(primary_path, "-shm", &timestamp);
+    quarantine_corrupt_sidecars_or_restore_primary(
+        primary_path,
+        &quarantined,
+        &timestamp,
+        "archive reconciliation",
+    )?;
 
     match crate::reconstruct::reconstruct_from_archive_with_salvage(
         primary_path,
@@ -2362,7 +2602,7 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
                     &timestamp,
                     "archive-reconcile-failed",
                 );
-                restore_quarantined_primary(primary_path, &quarantined)?;
+                restore_quarantined_primary(primary_path, &quarantined, &timestamp)?;
                 Err(SqlError::Custom(format!(
                     "archive reconciliation produced an unhealthy database at {}",
                     primary_path.display()
@@ -2374,7 +2614,7 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
                     &timestamp,
                     "archive-reconcile-failed",
                 );
-                restore_quarantined_primary(primary_path, &quarantined)?;
+                restore_quarantined_primary(primary_path, &quarantined, &timestamp)?;
                 Err(e)
             }
         },
@@ -2384,7 +2624,7 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
                 &timestamp,
                 "archive-reconcile-failed",
             );
-            restore_quarantined_primary(primary_path, &quarantined)?;
+            restore_quarantined_primary(primary_path, &quarantined, &timestamp)?;
             Err(SqlError::Custom(format!(
                 "archive reconciliation failed for {}: {e}",
                 primary_path.display()
@@ -2418,23 +2658,23 @@ fn restore_from_backup(primary_path: &Path, backup_path: &Path) -> Result<(), Sq
         })?;
     }
 
-    if let Err(e) = quarantine_sidecar(primary_path, "-wal", &timestamp) {
-        tracing::warn!(
-            sidecar = %format!("{}-wal", primary_path.display()),
-            error = %e,
-            "failed to quarantine WAL sidecar; continuing"
-        );
-    }
-    if let Err(e) = quarantine_sidecar(primary_path, "-shm", &timestamp) {
-        tracing::warn!(
-            sidecar = %format!("{}-shm", primary_path.display()),
-            error = %e,
-            "failed to quarantine SHM sidecar; continuing"
-        );
-    }
+    quarantine_corrupt_sidecars_or_restore_primary(
+        primary_path,
+        &quarantined_db,
+        &timestamp,
+        "backup restore",
+    )?;
 
     if let Err(e) = std::fs::copy(backup_path, primary_path) {
-        let _ = std::fs::rename(&quarantined_db, primary_path);
+        if let Err(restore_err) =
+            restore_quarantined_primary(primary_path, &quarantined_db, &timestamp)
+        {
+            return Err(SqlError::Custom(format!(
+                "failed to restore backup {} into {}: {e}; rollback of quarantined database also failed: {restore_err}",
+                backup_path.display(),
+                primary_path.display()
+            )));
+        }
         return Err(SqlError::Custom(format!(
             "failed to restore backup {} into {}: {e}",
             backup_path.display(),
@@ -2469,31 +2709,32 @@ fn reinitialize_without_backup(primary_path: &Path) -> Result<(), SqlError> {
         })?;
     }
 
-    if let Err(e) = quarantine_sidecar(primary_path, "-wal", &timestamp) {
-        tracing::warn!(
-            sidecar = %format!("{}-wal", primary_path.display()),
-            error = %e,
-            "failed to quarantine WAL sidecar during scratch reinit; continuing"
-        );
-    }
-    if let Err(e) = quarantine_sidecar(primary_path, "-shm", &timestamp) {
-        tracing::warn!(
-            sidecar = %format!("{}-shm", primary_path.display()),
-            error = %e,
-            "failed to quarantine SHM sidecar during scratch reinit; continuing"
-        );
-    }
+    quarantine_corrupt_sidecars_or_restore_primary(
+        primary_path,
+        &quarantined_db,
+        &timestamp,
+        "scratch reinitialization",
+    )?;
 
     let path_str = primary_path.to_string_lossy();
-    let _conn = crate::guard_db_conn(
-        open_sqlite_file_with_lock_retry(path_str.as_ref()).map_err(|e| {
-            SqlError::Custom(format!(
+    let conn = match open_sqlite_file_with_lock_retry(path_str.as_ref()) {
+        Ok(conn) => conn,
+        Err(e) => {
+            if let Err(restore_err) =
+                restore_quarantined_primary(primary_path, &quarantined_db, &timestamp)
+            {
+                return Err(SqlError::Custom(format!(
+                    "failed to initialize fresh sqlite file {}: {e}; rollback of quarantined database also failed: {restore_err}",
+                    primary_path.display()
+                )));
+            }
+            return Err(SqlError::Custom(format!(
                 "failed to initialize fresh sqlite file {}: {e}",
                 primary_path.display()
-            ))
-        })?,
-        "scratch sqlite reinit connection",
-    );
+            )));
+        }
+    };
+    let _conn = crate::guard_db_conn(conn, "scratch sqlite reinit connection");
 
     tracing::warn!(
         primary = %primary_path.display(),
@@ -2518,6 +2759,9 @@ fn reinitialize_without_backup(primary_path: &Path) -> Result<(), SqlError> {
 #[allow(clippy::result_large_err)]
 pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
     let exists = primary_path.exists();
+    if exists {
+        cleanup_empty_wal_sidecar(primary_path.to_string_lossy().as_ref());
+    }
     if exists && sqlite_file_is_healthy(primary_path)? {
         return Ok(());
     }
@@ -2578,6 +2822,9 @@ pub fn ensure_sqlite_file_healthy_with_archive(
     storage_root: &Path,
 ) -> Result<(), SqlError> {
     let had_primary = primary_path.exists();
+    if had_primary {
+        cleanup_empty_wal_sidecar(primary_path.to_string_lossy().as_ref());
+    }
     if had_primary && sqlite_file_is_healthy(primary_path)? {
         return Ok(());
     }
@@ -2609,7 +2856,7 @@ pub fn ensure_sqlite_file_healthy_with_archive(
         // Missing file, no backup.
         if has_quarantined_primary_artifact(primary_path) {
             return Err(SqlError::Custom(format!(
-                "database file {} is missing but quarantined corrupt artifact(s) exist; refusing blank reinitialization without operator action",
+                "database file {} is missing but quarantined recovery artifact(s) exist; refusing blank reinitialization without operator action",
                 primary_path.display()
             )));
         }
@@ -2641,8 +2888,12 @@ pub fn ensure_sqlite_file_healthy_with_archive(
                 primary_path.display()
             ))
         })?;
-        let _ = quarantine_sidecar(primary_path, "-wal", &timestamp);
-        let _ = quarantine_sidecar(primary_path, "-shm", &timestamp);
+        quarantine_corrupt_sidecars_or_restore_primary(
+            primary_path,
+            &quarantined,
+            &timestamp,
+            "archive-aware reconstruction",
+        )?;
     }
 
     match crate::reconstruct::reconstruct_from_archive(primary_path, storage_root) {
@@ -4266,7 +4517,10 @@ mod tests {
     }
 
     #[test]
-    fn ensure_sqlite_file_healthy_refuses_auto_recovery_with_live_sidecars() {
+    fn ensure_sqlite_file_healthy_clears_stale_sidecars_and_recovers() {
+        // Stale sidecars from a crash should be cleaned up automatically.
+        // The checkpoint will fail (corrupt primary) but remove_sqlite_sidecars
+        // should delete the fake sidecar files, allowing recovery to proceed.
         let dir = tempfile::tempdir().expect("tempdir");
         let primary = dir.path().join("storage.sqlite3");
         let wal = dir.path().join("storage.sqlite3-wal");
@@ -4275,16 +4529,21 @@ mod tests {
         std::fs::write(&wal, b"x").expect("write wal");
         std::fs::write(&shm, b"x").expect("write shm");
 
-        let err = ensure_sqlite_file_healthy(&primary).expect_err("must fail closed");
-        let message = err.to_string();
-        assert!(
-            message.contains("refusing automatic sqlite recovery"),
-            "unexpected error: {message}"
-        );
+        // With stale sidecars (removable files), recovery should proceed
+        // rather than refusing. The function will fail for other reasons
+        // (corrupt primary with no backup), but NOT because of sidecars.
+        let result = ensure_sqlite_file_healthy(&primary);
+        if let Err(ref e) = result {
+            let message = e.to_string();
+            assert!(
+                !message.contains("WAL/SHM sidecars"),
+                "should not refuse recovery for stale removable sidecars; got: {message}"
+            );
+        }
     }
 
     #[test]
-    fn ensure_sqlite_file_healthy_with_archive_refuses_auto_recovery_with_live_sidecars() {
+    fn ensure_sqlite_file_healthy_with_archive_clears_stale_sidecars_and_recovers() {
         let dir = tempfile::tempdir().expect("tempdir");
         let primary = dir.path().join("storage.sqlite3");
         let wal = dir.path().join("storage.sqlite3-wal");
@@ -4295,13 +4554,14 @@ mod tests {
         std::fs::write(&wal, b"x").expect("write wal");
         std::fs::write(&shm, b"x").expect("write shm");
 
-        let err = ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
-            .expect_err("must fail closed");
-        let message = err.to_string();
-        assert!(
-            message.contains("refusing automatic sqlite recovery"),
-            "unexpected error: {message}"
-        );
+        let result = ensure_sqlite_file_healthy_with_archive(&primary, &storage_root);
+        if let Err(ref e) = result {
+            let message = e.to_string();
+            assert!(
+                !message.contains("WAL/SHM sidecars"),
+                "should not refuse recovery for stale removable sidecars; got: {message}"
+            );
+        }
     }
 
     #[test]
@@ -4358,6 +4618,27 @@ mod tests {
     }
 
     #[test]
+    fn resolve_sqlite_path_does_not_hijack_missing_relative_path() {
+        let absolute_dir = tempfile::tempdir().expect("tempdir");
+        let absolute_db = absolute_dir.path().join("storage.sqlite3");
+        let absolute_db_str = absolute_db.to_string_lossy().into_owned();
+        let conn = DbConn::open_file(&absolute_db_str).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create");
+        drop(conn);
+
+        let missing_relative = absolute_db_str.trim_start_matches('/').to_string();
+        let missing_relative_path = PathBuf::from(&missing_relative);
+        assert!(
+            !missing_relative_path.exists(),
+            "test requires the relative path to be absent"
+        );
+
+        let resolved = resolve_sqlite_path_with_absolute_fallback(&missing_relative);
+        assert_eq!(resolved, missing_relative);
+    }
+
+    #[test]
     fn sqlite_identity_key_is_stable_across_pool_clones() {
         let config = DbPoolConfig {
             database_url: "sqlite:///:memory:".to_string(),
@@ -4394,6 +4675,129 @@ mod tests {
 
         // Should not error when WAL doesn't exist.
         quarantine_sidecar(&primary, "-wal", "20260218_120000_000").expect("quarantine noop");
+    }
+
+    #[test]
+    fn restore_quarantined_primary_restores_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("test.db");
+        let wal = dir.path().join("test.db-wal");
+        let shm = dir.path().join("test.db-shm");
+        let quarantined = dir
+            .path()
+            .join("test.db.archive-reconcile-20260218_120000_000");
+
+        std::fs::write(&primary, b"db").expect("write primary");
+        std::fs::write(&wal, b"wal").expect("write wal");
+        std::fs::write(&shm, b"shm").expect("write shm");
+
+        std::fs::rename(&primary, &quarantined).expect("quarantine primary");
+        quarantine_sidecar(&primary, "-wal", "20260218_120000_000").expect("quarantine wal");
+        quarantine_sidecar(&primary, "-shm", "20260218_120000_000").expect("quarantine shm");
+
+        restore_quarantined_primary(&primary, &quarantined, "20260218_120000_000")
+            .expect("restore");
+
+        assert!(primary.exists(), "primary should be restored");
+        assert_eq!(std::fs::read(&wal).unwrap(), b"wal");
+        assert_eq!(std::fs::read(&shm).unwrap(), b"shm");
+    }
+
+    #[test]
+    fn quarantine_reconstructed_candidate_uses_reason_specific_sidecar_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("test.db");
+        let wal = dir.path().join("test.db-wal");
+        std::fs::write(&primary, b"db").expect("write primary");
+        std::fs::write(&wal, b"wal").expect("write wal");
+
+        let quarantined = quarantine_reconstructed_candidate(
+            &primary,
+            "20260218_120000_000",
+            "reconstruct-failed",
+        )
+        .expect("quarantine candidate")
+        .expect("candidate path");
+
+        assert!(!primary.exists(), "primary should be quarantined");
+        assert!(quarantined.exists(), "quarantined primary should exist");
+        assert!(
+            dir.path()
+                .join("test.db-wal.reconstruct-failed-20260218_120000_000")
+                .exists(),
+            "candidate WAL should use a reason-specific quarantine path"
+        );
+        assert!(
+            !dir.path()
+                .join("test.db-wal.corrupt-20260218_120000_000")
+                .exists(),
+            "candidate WAL should not collide with the original corrupt-sidecar namespace"
+        );
+    }
+
+    #[test]
+    fn quarantine_reconstructed_candidate_rolls_back_on_sidecar_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("test.db");
+        let wal = dir.path().join("test.db-wal");
+        let quarantine_target = dir
+            .path()
+            .join("test.db-wal.reconstruct-failed-20260218_120000_000");
+        std::fs::write(&primary, b"db").expect("write primary");
+        std::fs::write(&wal, b"wal").expect("write wal");
+        std::fs::create_dir(&quarantine_target).expect("create blocking target directory");
+
+        let err = quarantine_reconstructed_candidate(
+            &primary,
+            "20260218_120000_000",
+            "reconstruct-failed",
+        )
+        .expect_err("sidecar quarantine failure should roll back");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("failed to quarantine WAL sidecar"),
+            "unexpected error: {err_text}"
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), b"db");
+        assert_eq!(std::fs::read(&wal).unwrap(), b"wal");
+        assert!(
+            !dir.path()
+                .join("test.db.reconstruct-failed-20260218_120000_000")
+                .exists(),
+            "quarantined primary should be rolled back on failure"
+        );
+    }
+
+    #[test]
+    fn quarantine_corrupt_sidecars_or_restore_primary_rolls_back_on_sidecar_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("test.db");
+        let wal = dir.path().join("test.db-wal");
+        let quarantined = dir.path().join("test.db.corrupt-20260218_120000_000");
+        let quarantine_target = dir.path().join("test.db-wal.corrupt-20260218_120000_000");
+        std::fs::write(&primary, b"db").expect("write primary");
+        std::fs::write(&wal, b"wal").expect("write wal");
+        std::fs::rename(&primary, &quarantined).expect("quarantine primary");
+        std::fs::create_dir(&quarantine_target).expect("create blocking target directory");
+
+        let err = quarantine_corrupt_sidecars_or_restore_primary(
+            &primary,
+            &quarantined,
+            "20260218_120000_000",
+            "unit test",
+        )
+        .expect_err("sidecar quarantine failure should roll back");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("failed to quarantine WAL sidecar"),
+            "unexpected error: {err_text}"
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), b"db");
+        assert_eq!(std::fs::read(&wal).unwrap(), b"wal");
+        assert!(
+            !quarantined.exists(),
+            "quarantined primary should be restored on failure"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4565,13 +4969,120 @@ mod tests {
             .expect_err("quarantined corrupt artifacts should block blank reinit");
         let err_text = err.to_string();
         assert!(
-            err_text.contains("quarantined corrupt artifact"),
+            err_text.contains("quarantined recovery artifact"),
             "unexpected error: {err_text}"
         );
         assert!(
             !primary.exists(),
             "recovery must not silently create a fresh DB when only quarantined state exists"
         );
+    }
+
+    #[test]
+    fn archive_recovery_missing_primary_with_archive_reconcile_artifact_is_not_treated_as_fresh_start()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        std::fs::write(
+            dir.path()
+                .join("storage.sqlite3.archive-reconcile-20260307_000000_000"),
+            b"quarantined-archive-reconcile-db",
+        )
+        .unwrap();
+
+        let err = ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+            .expect_err("archive-reconcile artifacts should block blank reinit");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("quarantined recovery artifact"),
+            "unexpected error: {err_text}"
+        );
+        assert!(
+            !primary.exists(),
+            "recovery must not silently create a fresh DB when archive-reconcile state exists"
+        );
+    }
+
+    #[test]
+    fn archive_recovery_missing_primary_with_reconstruct_artifact_is_not_treated_as_fresh_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        std::fs::write(
+            dir.path()
+                .join("storage.sqlite3.reconstruct-failed-20260307_000000_000"),
+            b"quarantined-reconstruct-db",
+        )
+        .unwrap();
+
+        let err = ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+            .expect_err("reconstruct artifacts should block blank reinit");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("quarantined recovery artifact"),
+            "unexpected error: {err_text}"
+        );
+        assert!(
+            !primary.exists(),
+            "recovery must not silently create a fresh DB when reconstruct state exists"
+        );
+    }
+
+    #[test]
+    fn archive_salvage_recovery_missing_primary_with_quarantined_artifact_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        std::fs::write(
+            dir.path()
+                .join("storage.sqlite3.archive-reconcile-20260307_000000_000"),
+            b"quarantined-archive-reconcile-db",
+        )
+        .unwrap();
+        std::fs::create_dir_all(storage_root.join("projects").join("test-proj")).unwrap();
+
+        let err = reconstruct_sqlite_file_with_archive_salvage(&primary, &storage_root)
+            .expect_err("quarantined primary artifacts must block archive-salvage reconstruction");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("quarantined recovery artifact"),
+            "unexpected error: {err_text}"
+        );
+        assert!(
+            !primary.exists(),
+            "archive-salvage path must not recreate a primary when quarantined state exists"
+        );
+    }
+
+    #[test]
+    fn archive_salvage_recovery_restores_original_sidecars_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create table");
+        drop(conn);
+
+        let wal = dir.path().join("storage.sqlite3-wal");
+        let shm = dir.path().join("storage.sqlite3-shm");
+        std::fs::write(&wal, b"original wal").unwrap();
+        std::fs::write(&shm, b"original shm").unwrap();
+
+        let storage_root = dir.path().join("not-a-directory");
+        std::fs::write(&storage_root, b"boom").unwrap();
+
+        let err = reconstruct_sqlite_file_with_archive_salvage(&primary, &storage_root)
+            .expect_err("invalid archive root should fail reconstruction");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("archive reconciliation failed"),
+            "unexpected error: {err_text}"
+        );
+
+        assert!(primary.exists(), "original database should be restored");
+        assert_eq!(std::fs::read(&wal).unwrap(), b"original wal");
+        assert_eq!(std::fs::read(&shm).unwrap(), b"original shm");
     }
 
     /// Archive-aware recovery should skip when DB is already healthy.
@@ -4855,6 +5366,89 @@ mod tests {
         cleanup_empty_wal_sidecar(db_path.to_str().unwrap());
 
         assert!(wal_path.exists(), "non-empty WAL should be preserved");
+    }
+
+    #[test]
+    fn ensure_sqlite_file_healthy_cleans_zero_byte_wal_before_recovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("zero-byte-wal.db");
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create table");
+        drop(conn);
+
+        let wal = dir.path().join("zero-byte-wal.db-wal");
+        std::fs::write(&wal, b"").expect("create empty wal");
+        assert!(wal.exists(), "empty wal stub should exist before recovery");
+
+        ensure_sqlite_file_healthy(&primary).expect("healthy db with empty wal should recover");
+
+        assert!(
+            sqlite_file_is_healthy(&primary).expect("health check after cleanup"),
+            "primary db should remain healthy after empty wal cleanup"
+        );
+        assert!(
+            !wal.exists(),
+            "empty wal stub should be removed instead of forcing backup/reinit recovery"
+        );
+    }
+
+    #[test]
+    fn ensure_sqlite_file_healthy_with_archive_cleans_zero_byte_wal_before_recovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("zero-byte-wal-archive.db");
+        let storage_root = dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create table");
+        drop(conn);
+
+        let wal = dir.path().join("zero-byte-wal-archive.db-wal");
+        std::fs::write(&wal, b"").expect("create empty wal");
+        assert!(
+            wal.exists(),
+            "empty wal stub should exist before archive-aware recovery"
+        );
+
+        ensure_sqlite_file_healthy_with_archive(&primary, &storage_root)
+            .expect("healthy db with empty wal should recover");
+
+        assert!(
+            sqlite_file_is_healthy(&primary).expect("health check after archive-aware cleanup"),
+            "primary db should remain healthy after archive-aware empty wal cleanup"
+        );
+        assert!(
+            !wal.exists(),
+            "archive-aware recovery should remove empty wal stub instead of escalating"
+        );
+    }
+
+    #[test]
+    fn refuse_auto_recovery_with_live_sidecar_directory_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("live-sidecar-dir.db");
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create table");
+        drop(conn);
+
+        let wal_dir = dir.path().join("live-sidecar-dir.db-wal");
+        std::fs::create_dir(&wal_dir).expect("create wal directory");
+        std::fs::write(wal_dir.join("marker"), b"not-a-wal").expect("write marker");
+
+        let err = refuse_auto_recovery_with_live_sidecars(&primary).expect_err("must fail closed");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("automatic checkpoint failed")
+                || err_text.contains("non-empty WAL/SHM sidecars remain"),
+            "unexpected error: {err_text}"
+        );
+        assert!(
+            wal_dir.exists(),
+            "malformed sidecar directory should remain untouched"
+        );
     }
 
     #[test]
