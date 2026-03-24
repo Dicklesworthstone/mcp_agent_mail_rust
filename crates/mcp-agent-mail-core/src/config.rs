@@ -680,7 +680,7 @@ impl Default for Config {
             integrity_check_on_startup: true,
             integrity_check_interval_hours: 24,
 
-            fsqlite_concurrent_mode: true,
+            fsqlite_concurrent_mode: false,
             fsqlite_raptorq_enabled: true,
             fsqlite_concurrent_retries: 5,
 
@@ -717,7 +717,7 @@ impl Default for Config {
             memory_fatal_mb: 8192,    // 8 GB
 
             // HTTP
-            http_host: "0.0.0.0".to_string(),
+            http_host: "127.0.0.1".to_string(),
             http_port: 8765,
             http_path: "/mcp/".to_string(),
             http_bearer_token: None,

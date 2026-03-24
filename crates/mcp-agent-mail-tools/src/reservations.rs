@@ -219,7 +219,7 @@ fn normalize_filter_paths(
                         "INVALID_PATH",
                         "Cannot target the project root directory itself. Please use more specific patterns.",
                         true,
-                        json!({ "path": path }),
+                        json!({ "reason": "targets_project_root" }),
                     ));
                 }
                 if let Some(message) = invalid_file_reservation_pattern(&rel) {
@@ -227,7 +227,7 @@ fn normalize_filter_paths(
                         "INVALID_PATH",
                         message,
                         true,
-                        json!({ "path": path }),
+                        json!({ "reason": "invalid_pattern" }),
                     ));
                 }
                 normalized_paths.push(rel);
@@ -235,11 +235,9 @@ fn normalize_filter_paths(
             None => {
                 return Err(legacy_tool_error(
                     "INVALID_PATH",
-                    format!(
-                        "Path '{path}' is outside the project root. File reservations must be within the project directory.",
-                    ),
+                    "Path is outside the project root. File reservations must be within the project directory.",
                     true,
-                    json!({ "path": path }),
+                    json!({ "reason": "path_outside_project" }),
                 ));
             }
         }
@@ -439,7 +437,7 @@ pub async fn file_reservation_paths(
                 "SUSPICIOUS_PATTERN",
                 &warning,
                 true,
-                json!({ "path": pattern }),
+                json!({ "reason": "suspicious_pattern" }),
             ));
         }
     }
@@ -454,7 +452,7 @@ pub async fn file_reservation_paths(
                         "INVALID_PATH",
                         "Cannot reserve the project root directory itself. Please use more specific patterns.",
                         true,
-                        json!({ "path": p }),
+                        json!({ "reason": "targets_project_root" }),
                     ));
                 }
                 if let Some(message) = invalid_file_reservation_pattern(&rel) {
@@ -462,7 +460,7 @@ pub async fn file_reservation_paths(
                         "INVALID_PATH",
                         message,
                         true,
-                        json!({ "path": p }),
+                        json!({ "reason": "invalid_pattern" }),
                     ));
                 }
                 normalized_paths.push(rel);
@@ -470,11 +468,9 @@ pub async fn file_reservation_paths(
             None => {
                 return Err(legacy_tool_error(
                     "INVALID_PATH",
-                    format!(
-                        "Path '{p}' is outside the project root. File reservations must be within the project directory.",
-                    ),
+                    "Path is outside the project root. File reservations must be within the project directory.",
                     true,
-                    json!({ "path": p }),
+                    json!({ "reason": "path_outside_project" }),
                 ));
             }
         }

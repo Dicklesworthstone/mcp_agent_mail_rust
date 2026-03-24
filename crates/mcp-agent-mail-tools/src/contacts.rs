@@ -95,7 +95,7 @@ pub const VALID_CONTACT_POLICIES: &[&str] = &["open", "auto", "contacts_only", "
 /// Trims whitespace and lowercases without changing semantic intent.
 #[must_use]
 pub fn normalize_contact_policy(raw: &str) -> String {
-    raw.trim().to_ascii_lowercase()
+    raw.replace('\0', "").trim().to_ascii_lowercase()
 }
 
 fn parse_contact_policy(raw: &str) -> String {
@@ -853,8 +853,10 @@ mod tests {
     }
 
     #[test]
-    fn policy_normalization_rejects_null_byte() {
-        assert_eq!(normalize_contact_policy("open\0"), "open\0");
+    fn policy_normalization_strips_null_byte() {
+        assert_eq!(normalize_contact_policy("open\0"), "open");
+        assert_eq!(normalize_contact_policy("\0open\0"), "open");
+        assert_eq!(normalize_contact_policy("\0"), "");
     }
 
     #[test]
