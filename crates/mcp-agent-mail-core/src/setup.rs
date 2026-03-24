@@ -308,7 +308,7 @@ pub fn generate_token() -> String {
 #[must_use]
 pub fn generate_registration_token() -> String {
     let mut bytes = [0u8; 32];
-    let _ = getrandom::getrandom(&mut bytes);
+    getrandom::getrandom(&mut bytes).expect("CSPRNG failure: cannot generate secure token");
     base64url_encode_nopad(&bytes)
 }
 
