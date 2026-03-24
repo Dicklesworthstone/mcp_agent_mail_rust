@@ -5836,10 +5836,20 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
             let pdir = project_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-            let env_file = pdir.join(".env");
+
+            // Canonical config.env path: $XDG_CONFIG_HOME/mcp-agent-mail/config.env
+            // (falls back to ~/.config/mcp-agent-mail/config.env)
+            let config_env_file = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"))
+                })
+                .unwrap_or_else(|| PathBuf::from(".config"))
+                .join("mcp-agent-mail")
+                .join("config.env");
 
             // Resolve token
-            let resolved_token = setup::resolve_token(token.as_deref(), &env_file);
+            let resolved_token = setup::resolve_token(token.as_deref(), &config_env_file);
 
             // Parse agent filter
             let agents = match agent {
@@ -5917,9 +5927,9 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 agent_name: agent_name_val,
             };
 
-            // Save token to .env (unless dry-run)
-            if !dry_run && let Err(e) = setup::save_token_to_env_file(&env_file, &resolved_token) {
-                output::warn(&format!("Could not save token to .env: {e}"));
+            // Save token to canonical config.env (unless dry-run)
+            if !dry_run && let Err(e) = setup::save_token_to_env_file(&config_env_file, &resolved_token) {
+                output::warn(&format!("Could not save token to {}: {e}", config_env_file.display()));
             }
 
             let results = setup::run_setup(&params);
@@ -13148,6 +13158,73 @@ fn extract_mcp_agent_mail_config_url(config_path: &Path, content: &str) -> Optio
     extract_mcp_agent_mail_entry_url(entry)
 }
 
+/// Extract the bearer token from an MCP config file (JSON or TOML).
+///
+/// Returns just the raw token string (without the "Bearer " prefix).
+fn extract_mcp_agent_mail_config_bearer(config_path: &Path, content: &str) -> Option<String> {
+    if config_path.extension().and_then(|e| e.to_str()) == Some("toml") {
+        return extract_mcp_agent_mail_toml_bearer(content);
+    }
+
+    let doc = parse_json_or_json5(content)?;
+    let entry = find_mcp_agent_mail_entry(&doc)?;
+    extract_mcp_agent_mail_entry_bearer(entry)
+}
+
+fn extract_mcp_agent_mail_toml_bearer(content: &str) -> Option<String> {
+    let mut in_target_section = false;
+
+    for raw_line in content.lines() {
+        if let Some(section) = parse_toml_section_header(raw_line) {
+            in_target_section = matches!(
+                section,
+                "mcp_servers.mcp_agent_mail" | "mcp_servers.\"mcp-agent-mail\""
+            );
+            continue;
+        }
+
+        let line = raw_line.trim();
+
+        if !in_target_section || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        // Match: http_headers = { Authorization = "Bearer <token>" }
+        if let Some(rest) = line.strip_prefix("http_headers") {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix('=') {
+                let rest = rest.trim();
+                if let Some(auth_val) = rest
+                    .strip_prefix('{')
+                    .and_then(|inner| inner.rsplit_once('}'))
+                    .map(|(inner, _)| inner.trim())
+                    .and_then(|inner| {
+                        inner
+                            .strip_prefix("Authorization")
+                            .map(|r| r.trim_start())
+                            .and_then(|r| r.strip_prefix('='))
+                            .map(|r| r.trim().trim_matches('"').trim_matches('\''))
+                    })
+                {
+                    return auth_val.strip_prefix("Bearer ").map(|t| t.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_mcp_agent_mail_entry_bearer(entry: &serde_json::Value) -> Option<String> {
+    let auth = entry
+        .as_object()?
+        .get("headers")?
+        .as_object()?
+        .get("Authorization")?
+        .as_str()?;
+    auth.strip_prefix("Bearer ").map(|t| t.to_string())
+}
+
 fn normalize_mcp_config_status_url_host(host: &str) -> &str {
     if host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1" {
         "127.0.0.1"
@@ -14094,11 +14171,18 @@ fn handle_doctor_check_with(
             let mut missing_entry = 0u32;
             let mut parse_errors = 0u32;
             let mut detail_parts: Vec<String> = Vec::new();
-            let desired_urls = check_inbox_server_urls(
-                &env_config.http_host,
-                env_config.http_port,
-                &env_config.http_path,
-            );
+            let desired_urls = if let Ok(agent_mail_url) = std::env::var("AGENT_MAIL_URL") {
+                check_inbox_server_urls_for_agent_mail_url(
+                    &agent_mail_url,
+                    &env_config.http_path,
+                )
+            } else {
+                check_inbox_server_urls(
+                    &env_config.http_host,
+                    env_config.http_port,
+                    &env_config.http_path,
+                )
+            };
             let desired_urls_label = desired_urls.join(" or ");
 
             for loc in &existing {
@@ -14262,6 +14346,44 @@ fn handle_doctor_check_with(
                 "status": mcp_status,
                 "detail": detail,
             }));
+
+            // Sub-check: verify bearer tokens in MCP configs match the canonical token
+            if let Some(canonical_token) = env_config.http_bearer_token.as_deref() {
+                let mut token_mismatch_parts: Vec<String> = Vec::new();
+                for loc in &existing {
+                    let Ok(content) = std::fs::read_to_string(&loc.config_path) else {
+                        continue;
+                    };
+                    if let Some(config_token) =
+                        extract_mcp_agent_mail_config_bearer(&loc.config_path, &content)
+                    {
+                        if config_token != canonical_token {
+                            token_mismatch_parts.push(format!(
+                                "{} ({})",
+                                loc.tool.slug(),
+                                loc.config_path.display()
+                            ));
+                        }
+                    }
+                }
+                if !token_mismatch_parts.is_empty() {
+                    checks.push(serde_json::json!({
+                        "check": "mcp_config_token",
+                        "status": "warn",
+                        "detail": format!(
+                            "Bearer token mismatch in {} config(s): {}. Fix: run `am setup` to re-sync tokens",
+                            token_mismatch_parts.len(),
+                            token_mismatch_parts.join(", ")
+                        ),
+                    }));
+                } else {
+                    checks.push(serde_json::json!({
+                        "check": "mcp_config_token",
+                        "status": "ok",
+                        "detail": "MCP config bearer tokens match canonical token",
+                    }));
+                }
+            }
         }
     }
 

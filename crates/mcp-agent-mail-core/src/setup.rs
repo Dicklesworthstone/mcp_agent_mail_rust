@@ -318,7 +318,7 @@ fn env_value_for_setup(key: &str) -> Option<String> {
 }
 
 /// Resolve the bearer token from multiple sources in priority order:
-/// explicit flag > `HTTP_BEARER_TOKEN` env var > .env file > generate new.
+/// explicit flag > config.env file > `HTTP_BEARER_TOKEN` env var > generate new.
 #[must_use]
 pub fn resolve_token(explicit: Option<&str>, env_file: &Path) -> String {
     if let Some(t) = explicit
@@ -326,12 +326,12 @@ pub fn resolve_token(explicit: Option<&str>, env_file: &Path) -> String {
     {
         return t.to_string();
     }
+    if let Some(t) = read_env_file_token(env_file) {
+        return t;
+    }
     if let Some(t) = env_value_for_setup("HTTP_BEARER_TOKEN")
         && !t.is_empty()
     {
-        return t;
-    }
-    if let Some(t) = read_env_file_token(env_file) {
         return t;
     }
     generate_token()
