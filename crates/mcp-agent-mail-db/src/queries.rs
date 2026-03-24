@@ -812,12 +812,13 @@ fn tracked(conn: &crate::DbConn) -> TrackedConnection<'_> {
 
 /// Whether `BEGIN CONCURRENT` is enabled (MVCC page-level writes).
 ///
-/// Read once from `FSQLITE_CONCURRENT_MODE` env var; defaults to `true`.
+/// Read once from `FSQLITE_CONCURRENT_MODE` env var; defaults to `false`.
 /// When `false`, all transactions use `BEGIN IMMEDIATE` (single-writer).
+/// Set `FSQLITE_CONCURRENT_MODE=true` to opt in to `BEGIN CONCURRENT`.
 static CONCURRENT_MODE_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     std::env::var("FSQLITE_CONCURRENT_MODE")
         .ok()
-        .is_none_or(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 });
 
 fn should_fallback_begin_concurrent(err_msg: &str) -> bool {

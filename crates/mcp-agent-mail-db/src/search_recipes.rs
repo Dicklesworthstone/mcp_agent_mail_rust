@@ -296,11 +296,12 @@ use crate::sqlmodel::Value;
 
 /// Whether sync write helpers should use `BEGIN CONCURRENT`.
 ///
-/// Controlled by `FSQLITE_CONCURRENT_MODE` (default: enabled).
+/// Controlled by `FSQLITE_CONCURRENT_MODE` (default: disabled).
+/// Set `FSQLITE_CONCURRENT_MODE=true` to opt in.
 static SYNC_CONCURRENT_MODE_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     std::env::var("FSQLITE_CONCURRENT_MODE")
         .ok()
-        .is_none_or(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 });
 
 fn begin_sync_write_tx(conn: &DbConn) -> Result<(), String> {
