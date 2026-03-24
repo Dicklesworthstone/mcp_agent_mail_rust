@@ -1171,6 +1171,10 @@ impl Iterator for TwoTierSearchIter<'_> {
                 let Some(ref fast_embedder) = self.searcher.fast_embedder else {
                     // No fast embedder — skip to refinement if available,
                     // otherwise terminate the iterator.
+                    if self.searcher.config.fast_only {
+                        self.phase = 2;
+                        return None;
+                    }
                     if self.searcher.config.quality_only || self.searcher.quality_embedder.is_some()
                     {
                         self.phase = 2;
@@ -1233,7 +1237,9 @@ impl Iterator for TwoTierSearchIter<'_> {
                         self.phase = 2;
                         drop(_embed_fast_span);
                         drop(_search_guard);
-                        if self.searcher.quality_embedder.is_some() {
+                        if self.searcher.config.fast_only {
+                            None
+                        } else if self.searcher.quality_embedder.is_some() {
                             Some(self.run_refinement_phase())
                         } else {
                             None
@@ -2406,6 +2412,72 @@ mod tests {
         assert!(
             matches!(phases[0], SearchPhase::Refined { .. }),
             "should get refined results even with failing fast embedder"
+        );
+    }
+
+    #[test]
+    fn test_fast_only_without_fast_embedder_yields_no_results() {
+        let config = TwoTierConfig {
+            fast_dimension: 4,
+            quality_dimension: 4,
+            fast_only: true,
+            ..TwoTierConfig::default()
+        };
+
+        let mut index = TwoTierIndex::new(&config);
+        index
+            .add_entry(TwoTierEntry {
+                doc_id: 1,
+                doc_kind: DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: vec![f16::from_f32(1.0); 4],
+                quality_embedding: vec![f16::from_f32(1.0); 4],
+                has_quality: true,
+            })
+            .unwrap();
+
+        let quality_embedder: Arc<dyn TwoTierEmbedder> =
+            Arc::new(StubEmbedder::new("quality", vec![1.0, 0.0, 0.0, 0.0]));
+        let searcher = TwoTierSearcher::new(&index, None, Some(quality_embedder), config);
+
+        assert_eq!(
+            searcher.search("query", 10).count(),
+            0,
+            "fast-only mode must not degrade into quality search"
+        );
+    }
+
+    #[test]
+    fn test_fast_only_with_failing_fast_embedder_yields_no_results() {
+        let config = TwoTierConfig {
+            fast_dimension: 4,
+            quality_dimension: 4,
+            fast_only: true,
+            ..TwoTierConfig::default()
+        };
+
+        let mut index = TwoTierIndex::new(&config);
+        index
+            .add_entry(TwoTierEntry {
+                doc_id: 1,
+                doc_kind: DocKind::Message,
+                project_id: Some(1),
+                fast_embedding: vec![f16::from_f32(1.0); 4],
+                quality_embedding: vec![f16::from_f32(1.0); 4],
+                has_quality: true,
+            })
+            .unwrap();
+
+        let fast_embedder: Arc<dyn TwoTierEmbedder> = Arc::new(FailingEmbedder);
+        let quality_embedder: Arc<dyn TwoTierEmbedder> =
+            Arc::new(StubEmbedder::new("quality", vec![1.0, 0.0, 0.0, 0.0]));
+        let searcher =
+            TwoTierSearcher::new(&index, Some(fast_embedder), Some(quality_embedder), config);
+
+        assert_eq!(
+            searcher.search("query", 10).count(),
+            0,
+            "fast-only mode must not fall back to quality after fast embedder failure"
         );
     }
 

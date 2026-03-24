@@ -607,7 +607,7 @@ Check that all parameters have valid values."
     )
     .await;
 
-    let row = db_outcome_to_mcp_result(agent_out)?;
+    let mut row = db_outcome_to_mcp_result(agent_out)?;
     enqueue_agent_semantic_index(&row);
 
     // Generate and persist a registration token for sender identity verification.
@@ -629,6 +629,12 @@ Check that all parameters have valid values."
             );
         }
     }
+
+    // Update the in-memory row so the cache receives the freshly persisted token.
+    // Without this, resolve_agent would serve a stale AgentRow (token = None)
+    // and sender_token verification in send_message would silently downgrade
+    // to unverified.
+    row.registration_token = Some(registration_token.clone());
 
     // Invalidate + repopulate read cache after mutation
     mcp_agent_mail_db::read_cache().invalidate_agent(project_id, &row.name, row.id);
@@ -803,7 +809,7 @@ Check that all parameters have valid values."
     )
     .await;
 
-    let row = match agent_out {
+    let mut row = match agent_out {
         Outcome::Ok(row) => row,
         Outcome::Err(mcp_agent_mail_db::DbError::Duplicate { .. }) => {
             return Err(legacy_tool_error(
@@ -847,6 +853,12 @@ Choose a different name (or omit the name to auto-generate one)."
             );
         }
     }
+
+    // Update the in-memory row so the cache receives the freshly persisted token.
+    // Without this, resolve_agent would serve a stale AgentRow (token = None)
+    // and sender_token verification in send_message would silently downgrade
+    // to unverified.
+    row.registration_token = Some(registration_token.clone());
 
     // Invalidate + repopulate read cache after mutation
     mcp_agent_mail_db::read_cache().invalidate_agent(project_id, &row.name, row.id);
