@@ -1109,6 +1109,14 @@ const HTTP_SUPERVISOR_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const HTTP_SUPERVISOR_CONTROL_CHANNEL_CAPACITY: usize = 32;
 const HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS: u64 = 200;
 const HTTP_SUPERVISOR_RESTART_BACKOFF_MAX_MS: u64 = 5_000;
+/// Maximum consecutive spawn failures before the supervisor gives up and exits.
+///
+/// With exponential backoff (200ms -> 5s cap), 10 failures span roughly 30s of
+/// retry time.  This prevents the process from staying alive indefinitely in a
+/// degraded state where nothing listens on the configured port -- which is the
+/// root cause of macOS LaunchAgent reporting `state=running` with a live PID
+/// while no server is actually reachable.
+const HTTP_SUPERVISOR_MAX_CONSECUTIVE_RESTART_FAILURES: u32 = 10;
 const HTTP_SERVER_STOP_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_SERVER_FORCE_CLOSE_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -1501,6 +1509,44 @@ enum HttpHealthProbeFailure {
     Timeout { elapsed_ms: u128 },
     Status { status: u16, elapsed_ms: u128 },
     Transport { error: String, elapsed_ms: u128 },
+}
+
+/// Maximum time to wait for the startup readiness self-probe to succeed.
+///
+/// This covers the window between the TCP listener accepting connections and the
+/// server being able to serve a `/healthz` 200.  It is intentionally generous to
+/// tolerate slow SQLite WAL recovery or first-run migrations, but short enough
+/// that a launchd-managed process doesn't sit in a degraded "running but not
+/// serving" state for minutes.
+const STARTUP_READINESS_SELF_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Interval between retries inside the startup readiness self-probe loop.
+const STARTUP_READINESS_SELF_PROBE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Verify the just-started HTTP server is actually reachable by probing its
+/// `/healthz` endpoint.  Retries internally until `STARTUP_READINESS_SELF_PROBE_TIMEOUT`
+/// expires.
+///
+/// Returns `Ok(())` if a 200 response is received, or the last
+/// [`HttpHealthProbeFailure`] if the timeout is exceeded.
+async fn startup_readiness_self_probe(
+    cx: &Cx,
+    config: &mcp_agent_mail_core::Config,
+) -> Result<(), HttpHealthProbeFailure> {
+    let deadline = Instant::now() + STARTUP_READINESS_SELF_PROBE_TIMEOUT;
+    let mut last_failure = HttpHealthProbeFailure::Timeout { elapsed_ms: 0 };
+    while Instant::now() < deadline {
+        match probe_http_healthz(cx, config).await {
+            Ok(()) => return Ok(()),
+            Err(failure) => {
+                last_failure = failure;
+                // Brief pause before retrying to avoid busy-looping while the
+                // server is still initialising internal state.
+                sleep(wall_now(), STARTUP_READINESS_SELF_PROBE_RETRY_INTERVAL).await;
+            }
+        }
+    }
+    Err(last_failure)
 }
 
 fn build_http_runtime() -> std::io::Result<Runtime> {
@@ -2576,6 +2622,7 @@ where
     SleepFn: FnMut(Duration) -> SleepFut,
     SleepFut: Future<Output = ()>,
 {
+    let mut consecutive_failures: u32 = 0;
     loop {
         if should_abort() {
             return Err(std::io::Error::new(
@@ -2590,6 +2637,23 @@ where
                 return Ok(new_instance);
             }
             Err(err) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                if consecutive_failures >= HTTP_SUPERVISOR_MAX_CONSECUTIVE_RESTART_FAILURES {
+                    tracing::error!(
+                        consecutive_failures,
+                        max = HTTP_SUPERVISOR_MAX_CONSECUTIVE_RESTART_FAILURES,
+                        host = %config.http_host,
+                        port = config.http_port,
+                        error = %err,
+                        "HTTP server failed to restart after maximum consecutive attempts; giving up"
+                    );
+                    return Err(std::io::Error::other(format!(
+                        "HTTP server failed to bind {}:{} after {} consecutive attempts \
+                         (last error: {err}). The process will exit so the service manager \
+                         can restart it cleanly.",
+                        config.http_host, config.http_port, consecutive_failures,
+                    )));
+                }
                 *last_restart_sleep_ms = restart_backoff_ms(*last_restart_sleep_ms);
                 on_retry_error(&err, *last_restart_sleep_ms);
                 sleep_fn(Duration::from_millis(*last_restart_sleep_ms)).await;
@@ -2620,6 +2684,30 @@ async fn run_http_server_supervisor(
             tui_bridge::TransportBase::from_http_path(&config.http_path)
                 .map_or("custom", tui_bridge::TransportBase::as_str)
         ),
+    );
+
+    // ── Startup readiness self-probe ────────────────────────────────
+    // Verify the newly-bound listener can actually serve requests.
+    // Without this check, the process can appear "running" to launchd/systemd
+    // while the HTTP listener silently failed to start serving.
+    if let Err(failure) = startup_readiness_self_probe(cx, &config).await {
+        tracing::error!(
+            ?failure,
+            host = %config.http_host,
+            port = config.http_port,
+            "Startup readiness self-probe failed — server bound the port but cannot serve requests"
+        );
+        let _ = stop_http_server_instance(instance).await;
+        return Err(std::io::Error::other(format!(
+            "Server bound {}:{} but startup readiness probe failed ({failure:?}). \
+             The server cannot serve requests and will exit.",
+            config.http_host, config.http_port,
+        )));
+    }
+    tracing::info!(
+        host = %config.http_host,
+        port = config.http_port,
+        "Startup readiness self-probe passed — server is accepting requests"
     );
 
     let mut last_restart_sleep_ms: u64 = 0;
@@ -4159,6 +4247,7 @@ fn ensure_atc_executor_identity(
                 "atc-executor".to_string(),
                 Some(atc::ATC_AGENT_NAME.to_string()),
                 Some("ATC automated control plane".to_string()),
+                None,
                 None,
             )
             .await
@@ -22307,6 +22396,59 @@ mod tests {
                 .await
                 .expect("retry helper instance should stop cleanly");
         });
+    }
+
+    #[test]
+    fn respawn_http_server_gives_up_after_max_consecutive_failures() {
+        let runtime = build_http_runtime().expect("build test HTTP runtime");
+        let mut config = mcp_agent_mail_core::Config::default();
+        let mut last_restart_sleep_ms = 0_u64;
+        let mut attempts = 0_u32;
+        let mut retry_errors = Vec::new();
+
+        let result = runtime.block_on(async {
+            respawn_http_server_instance_with_retry_using(
+                &mut config,
+                &mut last_restart_sleep_ms,
+                || false,
+                |err, _backoff_ms| {
+                    retry_errors.push(err.to_string());
+                },
+                |cfg| {
+                    attempts = attempts.saturating_add(1);
+                    std::future::ready(Err::<
+                        (mcp_agent_mail_core::Config, HttpServerInstance),
+                        std::io::Error,
+                    >(std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        "address already in use (test)",
+                    )))
+                },
+                |_duration| std::future::ready(()),
+            )
+            .await
+        });
+
+        assert!(result.is_err(), "should fail after max retries");
+        let err = result.unwrap_err();
+        assert_eq!(
+            attempts, HTTP_SUPERVISOR_MAX_CONSECUTIVE_RESTART_FAILURES,
+            "should attempt exactly {HTTP_SUPERVISOR_MAX_CONSECUTIVE_RESTART_FAILURES} times"
+        );
+        assert_eq!(
+            retry_errors.len() as u32,
+            HTTP_SUPERVISOR_MAX_CONSECUTIVE_RESTART_FAILURES,
+            "on_retry_error should fire for each failure"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("consecutive attempts"),
+            "error message should mention consecutive attempts, got: {msg}"
+        );
+        assert!(
+            msg.contains("address already in use"),
+            "error message should include the last spawn error, got: {msg}"
+        );
     }
 
     #[test]
