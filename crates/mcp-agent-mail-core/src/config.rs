@@ -3399,9 +3399,9 @@ mod tests {
     }
 
     #[test]
-    fn default_http_host_is_wildcard() {
+    fn default_http_host_is_loopback() {
         let config = Config::default();
-        assert_eq!(config.http_host, "0.0.0.0");
+        assert_eq!(config.http_host, "127.0.0.1");
     }
 
     // -----------------------------------------------------------------------

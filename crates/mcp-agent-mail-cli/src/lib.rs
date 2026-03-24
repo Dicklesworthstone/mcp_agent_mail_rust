@@ -3419,8 +3419,13 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
     use mcp_agent_mail_core::setup;
 
     let project_dir = std::env::current_dir().unwrap_or_default();
-    let env_file = project_dir.join(".env");
-    let resolved_token = setup::resolve_token(None, &env_file);
+    let config_env_file = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| PathBuf::from(".config"))
+        .join("mcp-agent-mail")
+        .join("config.env");
+    let resolved_token = setup::resolve_token(None, &config_env_file);
     let agent_name = std::env::var("AGENT_MAIL_AGENT").unwrap_or_default();
     let skip_hooks = agent_name.is_empty();
 
@@ -3510,7 +3515,7 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
         return Ok(());
     }
 
-    setup::save_token_to_env_file(&env_file, &resolved_token)
+    setup::save_token_to_env_file(&config_env_file, &resolved_token)
         .map_err(|e| CliError::Other(format!("setup self-heal token save failed: {e}")))?;
 
     let results = setup::run_setup(&params);
@@ -5989,6 +5994,33 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
             let detected_report = mcp_agent_mail_core::detect_installed_agents(&detect_opts).ok();
 
             let mut statuses = setup::check_status(&params);
+
+            // When AGENT_MAIL_URL is set, re-evaluate url_matches against the
+            // override URL so that `setup status` stays consistent with
+            // `doctor check`.
+            if let Ok(agent_mail_url) = std::env::var("AGENT_MAIL_URL") {
+                let desired_urls = check_inbox_server_urls_for_agent_mail_url(
+                    &agent_mail_url,
+                    &params.path,
+                );
+                for status in &mut statuses {
+                    for cf in &mut status.config_files {
+                        if cf.exists && cf.has_server_entry && !cf.url_matches {
+                            if let Some(actual_url) = extract_mcp_agent_mail_config_url(
+                                std::path::Path::new(&cf.path),
+                                &std::fs::read_to_string(&cf.path).unwrap_or_default(),
+                            ) {
+                                if mcp_config_url_matches_any_expected(
+                                    &actual_url,
+                                    &desired_urls,
+                                ) {
+                                    cf.url_matches = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             // Fill in detected status from agent detection
             if let Some(report) = &detected_report {
@@ -15296,10 +15328,17 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
         let locations = detect_mcp_config_locations_default();
         let existing: Vec<_> = locations.iter().filter(|l| l.exists).collect();
         let mut any_fixable = false;
-        let desired_urls =
-            check_inbox_server_urls(&config.http_host, config.http_port, &config.http_path);
+        let desired_urls = if let Ok(agent_mail_url) = std::env::var("AGENT_MAIL_URL") {
+            check_inbox_server_urls_for_agent_mail_url(&agent_mail_url, &config.http_path)
+        } else {
+            check_inbox_server_urls(&config.http_host, config.http_port, &config.http_path)
+        };
         let desired_url = desired_urls.first().cloned().unwrap_or_else(|| {
-            check_inbox_server_url(&config.http_host, config.http_port, &config.http_path)
+            if let Ok(agent_mail_url) = std::env::var("AGENT_MAIL_URL") {
+                normalize_agent_mail_url(&agent_mail_url, &config.http_path)
+            } else {
+                check_inbox_server_url(&config.http_host, config.http_port, &config.http_path)
+            }
         });
         let desired_bearer_token = config.http_bearer_token.as_deref();
 
