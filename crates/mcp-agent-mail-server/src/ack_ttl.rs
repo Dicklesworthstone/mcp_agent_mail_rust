@@ -486,22 +486,22 @@ mod tests {
         let project_id = project.id.expect("project id");
 
         let sender = match block_on(async {
-            queries::register_agent(&cx, &pool, project_id, "RedFox", "test", "test", None, None)
+            queries::register_agent(&cx, &pool, project_id, "RedFox", "test", "test", None, None, None)
                 .await
         }) {
             Outcome::Ok(a) => a,
-            other => panic!("register_agent(sender) failed: {other:?}"),
+            other => panic!("register_agent(sender, None) failed: {other:?}"),
         };
         let sender_id = sender.id.expect("sender id");
 
         let recipient = match block_on(async {
             queries::register_agent(
                 &cx, &pool, project_id, "BlueBear", "test", "test", None, None,
-            )
+            , None)
             .await
         }) {
             Outcome::Ok(a) => a,
-            other => panic!("register_agent(recipient) failed: {other:?}"),
+            other => panic!("register_agent(recipient, None) failed: {other:?}"),
         };
         let recipient_id = recipient.id.expect("recipient id");
 
@@ -925,33 +925,33 @@ mod tests {
         let project_id = project.id.expect("project id");
 
         let sender = match block_on(async {
-            queries::register_agent(&cx, &pool, project_id, "RedFox", "test", "test", None, None)
+            queries::register_agent(&cx, &pool, project_id, "RedFox", "test", "test", None, None, None)
                 .await
         }) {
             Outcome::Ok(a) => a,
-            other => panic!("register_agent(sender) failed: {other:?}"),
+            other => panic!("register_agent(sender, None) failed: {other:?}"),
         };
         let sender_id = sender.id.expect("sender id");
 
         let recip1 = match block_on(async {
             queries::register_agent(
                 &cx, &pool, project_id, "BlueBear", "test", "test", None, None,
-            )
+            , None)
             .await
         }) {
             Outcome::Ok(a) => a,
-            other => panic!("register_agent(recip1) failed: {other:?}"),
+            other => panic!("register_agent(recip1, None) failed: {other:?}"),
         };
         let recip1_id = recip1.id.expect("recip1 id");
 
         let recip2 = match block_on(async {
             queries::register_agent(
                 &cx, &pool, project_id, "GoldHawk", "test", "test", None, None,
-            )
+            , None)
             .await
         }) {
             Outcome::Ok(a) => a,
-            other => panic!("register_agent(recip2) failed: {other:?}"),
+            other => panic!("register_agent(recip2, None) failed: {other:?}"),
         };
         let recip2_id = recip2.id.expect("recip2 id");
 

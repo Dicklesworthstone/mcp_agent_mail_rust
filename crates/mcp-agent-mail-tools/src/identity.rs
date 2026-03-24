@@ -222,6 +222,8 @@ pub struct AgentResponse {
     pub project_id: i64,
     pub attachments_policy: String,
     #[serde(default)]
+    pub reaper_exempt: bool,
+    #[serde(default)]
     pub capabilities: Vec<String>,
 }
 
@@ -503,6 +505,7 @@ pub async fn register_agent(
     name: Option<String>,
     task_description: Option<String>,
     attachments_policy: Option<String>,
+    reaper_exempt: Option<bool>,
 ) -> McpResult<String> {
     use mcp_agent_mail_core::models::{detect_agent_name_mistake, generate_agent_name};
 
@@ -590,6 +593,7 @@ Check that all parameters have valid values."
         &model,
         task_description.as_deref(),
         Some(&policy),
+        reaper_exempt,
     )
     .await;
 
@@ -637,6 +641,7 @@ Check that all parameters have valid values."
         last_active_ts: micros_to_iso(row.last_active_ts),
         project_id: row.project_id,
         attachments_policy: row.attachments_policy,
+        reaper_exempt: row.reaper_exempt != 0,
         capabilities: DEFAULT_AGENT_CAPABILITIES
             .iter()
             .map(|s| (*s).to_string())
@@ -835,6 +840,7 @@ Choose a different name (or omit the name to auto-generate one)."
         last_active_ts: micros_to_iso(row.last_active_ts),
         project_id: row.project_id,
         attachments_policy: row.attachments_policy,
+        reaper_exempt: row.reaper_exempt != 0,
         capabilities: DEFAULT_AGENT_CAPABILITIES
             .iter()
             .map(|s| (*s).to_string())
@@ -949,6 +955,7 @@ pub async fn whois(
             last_active_ts: micros_to_iso(agent_row.last_active_ts),
             project_id: agent_row.project_id,
             attachments_policy: agent_row.attachments_policy,
+            reaper_exempt: agent_row.reaper_exempt != 0,
             capabilities: DEFAULT_AGENT_CAPABILITIES
                 .iter()
                 .map(|s| (*s).to_string())
@@ -1246,6 +1253,7 @@ mod tests {
             last_active_ts: "2026-02-06T01:00:00Z".into(),
             project_id: 1,
             attachments_policy: "auto".into(),
+            reaper_exempt: false,
             capabilities: DEFAULT_AGENT_CAPABILITIES
                 .iter()
                 .map(|s| (*s).to_string())
@@ -1273,6 +1281,7 @@ mod tests {
             last_active_ts: "2026-02-06T01:00:00Z".into(),
             project_id: 1,
             attachments_policy: "auto".into(),
+            reaper_exempt: false,
             capabilities: DEFAULT_AGENT_CAPABILITIES
                 .iter()
                 .map(|s| (*s).to_string())
@@ -1298,6 +1307,7 @@ mod tests {
                 last_active_ts: "2026-02-06T00:00:00Z".into(),
                 project_id: 1,
                 attachments_policy: "auto".into(),
+                reaper_exempt: false,
                 capabilities: DEFAULT_AGENT_CAPABILITIES
                     .iter()
                     .map(|s| (*s).to_string())
@@ -1331,6 +1341,7 @@ mod tests {
                 last_active_ts: String::new(),
                 project_id: 1,
                 attachments_policy: "none".into(),
+                reaper_exempt: false,
                 capabilities: DEFAULT_AGENT_CAPABILITIES
                     .iter()
                     .map(|s| (*s).to_string())

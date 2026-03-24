@@ -131,11 +131,11 @@ fn seed_project(pool: &DbPool, slug: &str, n_agents: usize) -> (i64, Vec<i64>) {
                     "test-model",
                     None,
                     None,
-                )
+                , None)
                 .await
                 {
                     Outcome::Ok(a) => a.id.expect("agent id"),
-                    other => panic!("register_agent({name}) failed: {other:?}"),
+                    other => panic!("register_agent({name}, None) failed: {other:?}"),
                 }
             }
         });
@@ -758,11 +758,11 @@ fn concurrent_agent_registration_and_messaging() {
                         "test-model",
                         None,
                         None,
-                    )
+                    , None)
                     .await
                     {
                         Outcome::Ok(a) => a.id.expect("agent id"),
-                        other => panic!("register_agent({name}) failed: {other:?}"),
+                        other => panic!("register_agent({name}, None) failed: {other:?}"),
                     }
                 }
             });

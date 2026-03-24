@@ -97,11 +97,11 @@ fn seed_corpus(tag: &str) -> TestCorpus {
                     "opus",
                     None,
                     None,
-                )
+                , None)
                 .await
                 {
                     Outcome::Ok(r) => r,
-                    other => panic!("register_agent({name}) failed: {other:?}"),
+                    other => panic!("register_agent({name}, None) failed: {other:?}"),
                 };
                 agents.insert((name, "alpha"), agent.id.unwrap());
             }
@@ -116,11 +116,11 @@ fn seed_corpus(tag: &str) -> TestCorpus {
                 "opus",
                 None,
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(r) => r,
-                other => panic!("register_agent(RedFox beta) failed: {other:?}"),
+                other => panic!("register_agent(RedFox beta, None) failed: {other:?}"),
             };
             agents.insert(("RedFox", "beta"), rf_b.id.unwrap());
 
@@ -134,11 +134,11 @@ fn seed_corpus(tag: &str) -> TestCorpus {
                 "o3",
                 None,
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(r) => r,
-                other => panic!("register_agent(GreenMeadow) failed: {other:?}"),
+                other => panic!("register_agent(GreenMeadow, None) failed: {other:?}"),
             };
             agents.insert(("GreenMeadow", "beta"), gm.id.unwrap());
 

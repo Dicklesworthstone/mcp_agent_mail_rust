@@ -166,11 +166,11 @@ fn setup_agent(pool: &DbPool, project_id: i64, name: &str) -> i64 {
             "test-model",
             Some("integration test"),
             None,
-        )
+        , None)
         .await
         {
             Outcome::Ok(a) => a.id.unwrap(),
-            other => panic!("register_agent({name}) failed: {other:?}"),
+            other => panic!("register_agent({name}, None) failed: {other:?}"),
         }
     })
 }
@@ -273,7 +273,7 @@ fn register_agent_invalid_name_rejected() {
     let pid = setup_project(&pool);
     let pool2 = pool.clone();
     let result = block_on(|cx| async move {
-        queries::register_agent(&cx, &pool2, pid, "EaglePeak", "test", "model", None, None).await
+        queries::register_agent(&cx, &pool2, pid, "EaglePeak", "test", "model", None, None, None).await
     });
     assert!(
         matches!(result, Outcome::Err(DbError::InvalidArgument { .. })),
@@ -287,7 +287,7 @@ fn register_agent_empty_name_rejected() {
     let pid = setup_project(&pool);
     let pool2 = pool.clone();
     let result = block_on(|cx| async move {
-        queries::register_agent(&cx, &pool2, pid, "", "test", "model", None, None).await
+        queries::register_agent(&cx, &pool2, pid, "", "test", "model", None, None, None).await
     });
     assert!(
         matches!(result, Outcome::Err(_)),
@@ -314,7 +314,7 @@ fn register_agent_idempotent_upsert() {
             "new-model",
             Some("updated"),
             None,
-        )
+        , None)
         .await
         {
             Outcome::Ok(a) => a.id.unwrap(),

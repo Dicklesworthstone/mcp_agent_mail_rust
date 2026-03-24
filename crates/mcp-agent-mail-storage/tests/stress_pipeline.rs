@@ -254,7 +254,7 @@ fn stress_concurrent_message_pipeline_30_agents() {
                 "test-model",
                 Some("stress agent"),
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(row) => row,
@@ -441,7 +441,7 @@ fn stress_multi_project_concurrent_operations() {
                     "test-model",
                     Some("multi-project stress"),
                     None,
-                )
+                , None)
                 .await
                 {
                     Outcome::Ok(row) => row,
@@ -775,7 +775,7 @@ fn stress_mixed_reservations_and_messages() {
                 "test-model",
                 Some("mixed workload agent"),
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(row) => row,
@@ -1083,7 +1083,7 @@ fn stress_pool_exhaustion_with_archive_writes() {
                 "test-model",
                 Some("pool exhaustion test"),
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(row) => row,
@@ -1292,7 +1292,7 @@ fn stress_sustained_mixed_workload_30s() {
                 "test-model",
                 Some("sustained load agent"),
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(row) => row,
@@ -1624,7 +1624,7 @@ fn stress_agent_registration_thundering_herd() {
                             "test-model",
                             Some(&format!("herd thread {t}")),
                             None,
-                        )
+                        , None)
                         .await
                     }
                 });
@@ -1712,7 +1712,7 @@ fn stress_concurrent_inbox_during_message_storm() {
                 "test-model",
                 None,
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(row) => row,
@@ -1913,7 +1913,7 @@ fn stress_150_agent_message_storm() {
                 "test-model",
                 Some("150-agent storm"),
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(row) => row,
@@ -2161,7 +2161,7 @@ fn stress_100_agent_full_lifecycle() {
                 "test-model",
                 Some("lifecycle agent"),
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(row) => row,
@@ -2563,7 +2563,7 @@ fn stress_multi_project_120_agents() {
                     "test-model",
                     Some("multi-project 120 agent test"),
                     None,
-                )
+                , None)
                 .await
                 {
                     Outcome::Ok(row) => row,
@@ -2796,7 +2796,7 @@ fn stress_200_agent_pool_exhaustion_torture() {
                 "test-model",
                 Some("200-agent torture"),
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(row) => row,
@@ -3071,7 +3071,7 @@ fn stress_sustained_100_agents_60s() {
                 "test-model",
                 Some("endurance agent"),
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(row) => row,

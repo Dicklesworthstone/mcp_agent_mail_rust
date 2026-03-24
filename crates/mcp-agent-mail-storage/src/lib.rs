@@ -7549,7 +7549,7 @@ mod tests {
                     "test-model",
                     Some("message pipeline sender"),
                     None,
-                )
+                , None)
                 .await
                 {
                     Outcome::Ok(row) => row,
@@ -7564,7 +7564,7 @@ mod tests {
                     "test-model",
                     Some("message pipeline recipient"),
                     None,
-                )
+                , None)
                 .await
                 {
                     Outcome::Ok(row) => row,
@@ -7690,7 +7690,7 @@ mod tests {
                 "test-model",
                 Some("reservation pipeline agent"),
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(row) => row,

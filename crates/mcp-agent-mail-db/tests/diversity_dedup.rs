@@ -847,7 +847,7 @@ fn db_integrated_diversity_regression() {
             async move {
                 match queries::register_agent(
                     &cx, &pool, project_id, name, "test", "model", None, None,
-                )
+                , None)
                 .await
                 {
                     Outcome::Ok(a) => a.id.expect("agent id"),

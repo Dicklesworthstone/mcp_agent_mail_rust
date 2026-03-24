@@ -355,7 +355,14 @@ fn detect_and_release_stale(
                 let computed = match block_on(async {
                     queries::get_agent_by_id(cx, pool, res.agent_id).await
                 }) {
-                    Outcome::Ok(agent) => now.saturating_sub(agent.last_active_ts) > inactivity_us,
+                    Outcome::Ok(agent) => {
+                        // Reaper-exempt agents are never classified as inactive.
+                        if agent.reaper_exempt != 0 {
+                            false
+                        } else {
+                            now.saturating_sub(agent.last_active_ts) > inactivity_us
+                        }
+                    }
                     _ => false, // Skip stale classification when agent lookup fails.
                 };
                 inactive_agent_cache.insert(res.agent_id, computed);
@@ -1085,7 +1092,7 @@ mod tests {
                 "test",
                 None,
                 None,
-            )
+            , None)
             .await
         }) {
             Outcome::Ok(a) => a,
@@ -1142,7 +1149,7 @@ mod tests {
         let project_id = project.id.expect("project id");
 
         let agent = match fastmcp_core::block_on(async {
-            queries::register_agent(&cx, &pool, project_id, "RedFox", "test", "test", None, None)
+            queries::register_agent(&cx, &pool, project_id, "RedFox", "test", "test", None, None, None)
                 .await
         }) {
             Outcome::Ok(a) => a,

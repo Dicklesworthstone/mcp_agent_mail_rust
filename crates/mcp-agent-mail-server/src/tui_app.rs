@@ -6415,7 +6415,8 @@ fn apply_frame_contrast_guard(
             let needs_surface_materialization = bg_color.a() == 0;
             let needs_text_materialization = fg_color.a() == 0;
             let effective_bg = materialize_effective_background(bg_color, fallback_surface);
-            let is_decorative = !is_grapheme && !is_continuation
+            let is_decorative = !is_grapheme
+                && !is_continuation
                 && symbol_opt.is_some()
                 && is_decorative_glyph(symbol);
             // Pick an appropriate default fg for transparent cells: decorative

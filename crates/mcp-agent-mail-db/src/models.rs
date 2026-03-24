@@ -138,6 +138,11 @@ pub struct AgentRow {
     /// Contact policy: "open" | "auto" | "`contacts_only`" | "`block_all`"
     #[sqlmodel(default = "'auto'")]
     pub contact_policy: String,
+
+    /// Whether this agent is exempt from the inactivity reaper.
+    /// 0 = normal (subject to reaper), 1 = exempt (reaper skips this agent).
+    #[sqlmodel(default = "0")]
+    pub reaper_exempt: i64,
 }
 
 impl Default for AgentRow {
@@ -154,6 +159,7 @@ impl Default for AgentRow {
             last_active_ts: now,
             attachments_policy: "auto".to_string(),
             contact_policy: "auto".to_string(),
+            reaper_exempt: 0,
         }
     }
 }
@@ -174,6 +180,7 @@ impl AgentRow {
             last_active_ts: now,
             attachments_policy: "auto".to_string(),
             contact_policy: "auto".to_string(),
+            reaper_exempt: 0,
         }
     }
 

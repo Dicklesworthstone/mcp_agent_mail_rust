@@ -111,7 +111,7 @@ fn seed_corpus(pool: &DbPool) -> SeededCorpus {
                 "test",
                 Some("v3-conformance sender"),
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(a) => a,
@@ -126,7 +126,7 @@ fn seed_corpus(pool: &DbPool) -> SeededCorpus {
                 "test",
                 Some("v3-conformance recipient"),
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(a) => a,
@@ -156,7 +156,7 @@ fn seed_corpus(pool: &DbPool) -> SeededCorpus {
                 "test",
                 Some("v3-conformance beta sender"),
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(a) => a,

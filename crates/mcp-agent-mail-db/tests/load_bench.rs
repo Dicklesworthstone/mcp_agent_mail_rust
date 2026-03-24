@@ -255,7 +255,7 @@ fn load_scenario_a_registration_storm() {
                                 "model",
                                 None,
                                 None,
-                            )
+                            , None)
                             .await
                         }
                     }) {
@@ -334,7 +334,7 @@ fn load_scenario_b_message_burst() {
             let pp = pool.clone();
             let n = name.clone();
             async move {
-                queries::register_agent(&cx, &pp, project_id, &n, "load-bench", "model", None, None)
+                queries::register_agent(&cx, &pp, project_id, &n, "load-bench", "model", None, None, None)
                     .await
             }
         })
@@ -482,7 +482,7 @@ fn load_scenario_c_mixed_workload() {
                         "model",
                         None,
                         None,
-                    )
+                    , None)
                     .await
                 }
             })
@@ -774,7 +774,7 @@ fn load_scenario_d_thundering_herd() {
             let pp = pool.clone();
             let n = name.clone();
             async move {
-                queries::register_agent(&cx, &pp, project_id, &n, "load-bench", "model", None, None)
+                queries::register_agent(&cx, &pp, project_id, &n, "load-bench", "model", None, None, None)
                     .await
             }
         })
@@ -906,7 +906,7 @@ fn load_scenario_e_inbox_stats_polling_cache_effectiveness() {
                 "model",
                 None,
                 None,
-            )
+            , None)
             .await
         }
     })
@@ -925,7 +925,7 @@ fn load_scenario_e_inbox_stats_polling_cache_effectiveness() {
                 "model",
                 None,
                 None,
-            )
+            , None)
             .await
         }
     })

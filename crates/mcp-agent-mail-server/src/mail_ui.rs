@@ -198,10 +198,10 @@ mod route_regressions {
             "test",
             None,
             None,
-        )));
+        , None)));
         let recipient = outcome_ok(block_on(queries::register_agent(
             &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
-        )));
+        , None)));
 
         let message = outcome_ok(block_on(queries::create_message_with_recipients(
             &cx,
@@ -274,10 +274,10 @@ mod route_regressions {
             "test",
             None,
             None,
-        )));
+        , None)));
         let blue = outcome_ok(block_on(queries::register_agent(
             &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
-        )));
+        , None)));
         let amber = outcome_ok(block_on(queries::register_agent(
             &cx,
             &pool,
@@ -287,7 +287,7 @@ mod route_regressions {
             "test",
             None,
             None,
-        )));
+        , None)));
 
         let root = outcome_ok(block_on(queries::create_message_with_recipients(
             &cx,
@@ -345,10 +345,10 @@ mod route_regressions {
             "test",
             None,
             None,
-        )));
+        , None)));
         let recipient = outcome_ok(block_on(queries::register_agent(
             &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
-        )));
+        , None)));
 
         let root = outcome_ok(block_on(queries::create_message_with_recipients(
             &cx,
@@ -409,10 +409,10 @@ mod route_regressions {
             "test",
             None,
             None,
-        )));
+        , None)));
         let recipient = outcome_ok(block_on(queries::register_agent(
             &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
-        )));
+        , None)));
 
         let root = outcome_ok(block_on(queries::create_message_with_recipients(
             &cx,
@@ -472,10 +472,10 @@ mod route_regressions {
             "test",
             None,
             None,
-        )));
+        , None)));
         let recipient = outcome_ok(block_on(queries::register_agent(
             &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
-        )));
+        , None)));
         let message = outcome_ok(block_on(queries::create_message_with_recipients(
             &cx,
             &pool,
@@ -1269,7 +1269,7 @@ mod auth_route_hardening_regression_suite {
 
         let sender = outcome_ok(block_on(queries::register_agent(
             &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
-        )));
+        , None)));
         let sender_id = sender.id.unwrap_or(0);
         let thread_id = "topic/with space+plus";
 
@@ -2153,7 +2153,7 @@ mod message_route_authorization_tests {
             "test",
             None,
             None,
-        )));
+        , None)));
         let sender_id = sender.id.unwrap_or(0);
 
         let message = outcome_ok(block_on(queries::create_message(
@@ -3783,7 +3783,7 @@ fn handle_overseer_send(
             "Human",
             Some("Human operator providing guidance and oversight to agents"),
             Some("auto"),
-        ),
+        , None),
     )?;
     let overseer_id = overseer.id.unwrap_or(0);
 
@@ -3911,10 +3911,10 @@ mod fresh_eyes_regression_tests {
 
         let sender = outcome_ok(block_on(queries::register_agent(
             &cx, &pool, project_id, "RedFox", "test", "test", None, None,
-        )));
+        , None)));
         let blue = outcome_ok(block_on(queries::register_agent(
             &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
-        )));
+        , None)));
         let green = outcome_ok(block_on(queries::register_agent(
             &cx,
             &pool,
@@ -3924,7 +3924,7 @@ mod fresh_eyes_regression_tests {
             "test",
             None,
             None,
-        )));
+        , None)));
 
         let message = outcome_ok(block_on(queries::create_message_with_recipients(
             &cx,
@@ -4000,10 +4000,10 @@ mod fresh_eyes_regression_tests {
             "test",
             None,
             None,
-        )));
+        , None)));
         let recipient = outcome_ok(block_on(queries::register_agent(
             &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
-        )));
+        , None)));
 
         let root = outcome_ok(block_on(queries::create_message_with_recipients(
             &cx,
@@ -4058,10 +4058,10 @@ mod fresh_eyes_regression_tests {
 
         let sender = outcome_ok(block_on(queries::register_agent(
             &cx, &pool, project_id, "RedFox", "test", "test", None, None,
-        )));
+        , None)));
         let recipient = outcome_ok(block_on(queries::register_agent(
             &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
-        )));
+        , None)));
 
         let high = outcome_ok(block_on(queries::create_message_with_recipients(
             &cx,
@@ -4119,10 +4119,10 @@ mod fresh_eyes_regression_tests {
 
         let sender = outcome_ok(block_on(queries::register_agent(
             &cx, &pool, project_id, "RedFox", "test", "test", None, None,
-        )));
+        , None)));
         let recipient = outcome_ok(block_on(queries::register_agent(
             &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
-        )));
+        , None)));
 
         let root = outcome_ok(block_on(queries::create_message_with_recipients(
             &cx,
@@ -4182,10 +4182,10 @@ mod fresh_eyes_regression_tests {
 
         let sender = outcome_ok(block_on(queries::register_agent(
             &cx, &pool, project_id, "RedFox", "test", "test", None, None,
-        )));
+        , None)));
         let recipient = outcome_ok(block_on(queries::register_agent(
             &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
-        )));
+        , None)));
 
         outcome_ok(block_on(queries::create_message_with_recipients(
             &cx,
@@ -4271,10 +4271,10 @@ mod fresh_eyes_regression_tests {
 
         let sender = outcome_ok(block_on(queries::register_agent(
             &cx, &pool, project_id, "RedFox", "test", "test", None, None,
-        )));
+        , None)));
         let recipient = outcome_ok(block_on(queries::register_agent(
             &cx, &pool, project_id, "BlueLake", "test", "test", None, None,
-        )));
+        , None)));
 
         let message = outcome_ok(block_on(queries::create_message_with_recipients(
             &cx,

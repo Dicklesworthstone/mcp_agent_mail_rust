@@ -1032,7 +1032,7 @@ fn seed_search_fixture(scenario: SearchScenario) -> SearchFixture {
         "bench",
         Some("bench-search sender"),
         Some("auto"),
-    )) {
+    , None)) {
         Outcome::Ok(row) => row,
         Outcome::Err(e) => panic!("register_agent sender failed: {e}"),
         Outcome::Cancelled(_) => panic!("register_agent sender cancelled"),

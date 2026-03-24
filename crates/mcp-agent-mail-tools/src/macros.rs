@@ -103,6 +103,7 @@ pub async fn macro_start_session(
     file_reservation_reason: Option<String>,
     file_reservation_ttl_seconds: Option<i64>,
     inbox_limit: Option<i32>,
+    reaper_exempt: Option<bool>,
 ) -> McpResult<String> {
     let agent_name =
         agent_name.map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n));
@@ -128,6 +129,7 @@ pub async fn macro_start_session(
         agent_name,
         task_description,
         None,
+        reaper_exempt,
     )
     .await?;
     let agent: AgentResponse = parse_json(agent_json, "agent")?;
@@ -269,6 +271,7 @@ pub async fn macro_prepare_thread(
             model,
             agent_name,
             task_description,
+            None,
             None,
         )
         .await?;
@@ -812,6 +815,7 @@ mod tests {
                 last_active_ts: "2026-01-01T00:00:00Z".into(),
                 project_id: 1,
                 attachments_policy: "auto".into(),
+                reaper_exempt: false,
                 capabilities: crate::identity::DEFAULT_AGENT_CAPABILITIES
                     .iter()
                     .map(|s| (*s).to_string())
@@ -954,6 +958,7 @@ mod tests {
                 last_active_ts: String::new(),
                 project_id: 1,
                 attachments_policy: "auto".into(),
+                reaper_exempt: false,
                 capabilities: crate::identity::DEFAULT_AGENT_CAPABILITIES
                     .iter()
                     .map(|s| (*s).to_string())
@@ -1121,6 +1126,7 @@ mod tests {
                 last_active_ts: String::new(),
                 project_id: 1,
                 attachments_policy: "auto".into(),
+                reaper_exempt: false,
                 capabilities: crate::identity::DEFAULT_AGENT_CAPABILITIES
                     .iter()
                     .map(|s| (*s).to_string())
@@ -1164,6 +1170,7 @@ mod tests {
                 last_active_ts: String::new(),
                 project_id: 1,
                 attachments_policy: "auto".into(),
+                reaper_exempt: false,
                 capabilities: crate::identity::DEFAULT_AGENT_CAPABILITIES
                     .iter()
                     .map(|s| (*s).to_string())
@@ -1221,6 +1228,7 @@ mod tests {
                 last_active_ts: String::new(),
                 project_id: 1,
                 attachments_policy: "auto".into(),
+                reaper_exempt: false,
                 capabilities: crate::identity::DEFAULT_AGENT_CAPABILITIES
                     .iter()
                     .map(|s| (*s).to_string())

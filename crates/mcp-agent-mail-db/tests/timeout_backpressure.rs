@@ -215,7 +215,7 @@ fn seed_corpus(cx: &Cx, pool: &DbPool) -> i64 {
             "test-model",
             None,
             None,
-        )
+        , None)
         .await
         {
             Outcome::Ok(a) => a.id.expect("agent id"),

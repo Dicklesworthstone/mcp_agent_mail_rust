@@ -172,7 +172,7 @@ pub(crate) async fn resolve_or_register_sender(
                 &model,
                 task_description,
                 Some("auto"),
-            )
+            , None)
             .await;
             let row = db_outcome_to_mcp_result(out)?;
             enqueue_agent_semantic_index(&row);

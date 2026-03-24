@@ -244,7 +244,7 @@ fn stress_concurrent_register_agent() {
                         &format!("model-{i}"),
                         Some(&format!("task from thread {i}")),
                         None,
-                    )
+                    , None)
                     .await
                     {
                         Outcome::Ok(row) => row,
@@ -317,7 +317,7 @@ fn stress_concurrent_message_sending() {
                 "test",
                 None,
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(r) => r,
@@ -440,7 +440,7 @@ fn stress_concurrent_file_reservations() {
                 "test",
                 None,
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(r) => r,
@@ -448,7 +448,7 @@ fn stress_concurrent_file_reservations() {
             };
 
             let a2 =
-                match queries::register_agent(&cx, &p, pid, "BluePond", "test", "test", None, None)
+                match queries::register_agent(&cx, &p, pid, "BluePond", "test", "test", None, None, None)
                     .await
                 {
                     Outcome::Ok(r) => r,
@@ -615,7 +615,7 @@ fn stress_cache_coherency_mixed_workload() {
                 "test",
                 Some("initial"),
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(_) => {}
@@ -653,7 +653,7 @@ fn stress_cache_coherency_mixed_workload() {
                             &format!("model-w{w}-i{i}"),
                             Some(&format!("task from writer {w} iter {i}")),
                             None,
-                        )
+                        , None)
                         .await;
                     });
                 }
@@ -733,7 +733,7 @@ fn stress_concurrent_inbox_and_send() {
                 "test",
                 None,
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(r) => r,
@@ -741,7 +741,7 @@ fn stress_concurrent_inbox_and_send() {
             };
 
             let receiver =
-                match queries::register_agent(&cx, &p, pid, "DarkBay", "test", "test", None, None)
+                match queries::register_agent(&cx, &p, pid, "DarkBay", "test", "test", None, None, None)
                     .await
                 {
                     Outcome::Ok(r) => r,
@@ -877,7 +877,7 @@ fn stress_concurrent_read_ack() {
             let pid = proj.id.unwrap();
 
             let sender =
-                match queries::register_agent(&cx, &p, pid, "BoldFox", "test", "test", None, None)
+                match queries::register_agent(&cx, &p, pid, "BoldFox", "test", "test", None, None, None)
                     .await
                 {
                     Outcome::Ok(r) => r,
@@ -885,7 +885,7 @@ fn stress_concurrent_read_ack() {
                 };
 
             let receiver =
-                match queries::register_agent(&cx, &p, pid, "QuietOwl", "test", "test", None, None)
+                match queries::register_agent(&cx, &p, pid, "QuietOwl", "test", "test", None, None, None)
                     .await
                 {
                     Outcome::Ok(r) => r,
@@ -1133,7 +1133,7 @@ fn stress_1000_agent_concurrent_workload() {
                                 "stress-model",
                                 None,
                                 None,
-                            )
+                            , None)
                             .await
                         }
                     });
@@ -1503,7 +1503,7 @@ fn fetch_unacked_returns_pending_and_excludes_acknowledged() {
         let pid = proj.id.unwrap();
 
         let sender =
-            match queries::register_agent(&cx, &pool, pid, "GreenElk", "test", "test", None, None)
+            match queries::register_agent(&cx, &pool, pid, "GreenElk", "test", "test", None, None, None)
                 .await
             {
                 Outcome::Ok(a) => a,
@@ -1511,7 +1511,7 @@ fn fetch_unacked_returns_pending_and_excludes_acknowledged() {
                 _ => panic!("register sender: unexpected outcome"),
             };
         let receiver =
-            match queries::register_agent(&cx, &pool, pid, "BlueDeer", "test", "test", None, None)
+            match queries::register_agent(&cx, &pool, pid, "BlueDeer", "test", "test", None, None, None)
                 .await
             {
                 Outcome::Ok(a) => a,
@@ -1929,7 +1929,7 @@ fn setup_project_and_agents(pool: &DbPool) -> (i64, i64, i64) {
     let sender_id = block_on_with_retry(3, |cx| {
         let pool = pool.clone();
         async move {
-            queries::register_agent(&cx, &pool, pid, "BoldCastle", "test", "test", None, None).await
+            queries::register_agent(&cx, &pool, pid, "BoldCastle", "test", "test", None, None, None).await
         }
     })
     .id
@@ -1938,7 +1938,7 @@ fn setup_project_and_agents(pool: &DbPool) -> (i64, i64, i64) {
     let receiver_id = block_on_with_retry(3, |cx| {
         let pool = pool.clone();
         async move {
-            queries::register_agent(&cx, &pool, pid, "QuietLake", "test", "test", None, None).await
+            queries::register_agent(&cx, &pool, pid, "QuietLake", "test", "test", None, None, None).await
         }
     })
     .id
@@ -3016,7 +3016,7 @@ fn chaos_data_integrity_after_cb_recovery() {
                 "test",
                 Some("sender"),
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(r) => r,
@@ -3032,7 +3032,7 @@ fn chaos_data_integrity_after_cb_recovery() {
                 "test",
                 Some("receiver"),
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(r) => r,
@@ -3179,7 +3179,7 @@ fn set_contact_policy_updates_cache() {
                 "test",
                 None,
                 None,
-            )
+            , None)
             .await
             .unwrap();
 
@@ -3239,7 +3239,7 @@ fn edge_case_message_to_self() {
         let pid = proj.id.unwrap();
 
         let agent =
-            match queries::register_agent(&cx, &pool, pid, "GoldLake", "test", "test", None, None)
+            match queries::register_agent(&cx, &pool, pid, "GoldLake", "test", "test", None, None, None)
                 .await
             {
                 Outcome::Ok(r) => r,
@@ -3301,7 +3301,7 @@ fn edge_case_force_release_idempotency() {
         let pid = proj.id.unwrap();
 
         let agent =
-            match queries::register_agent(&cx, &pool, pid, "RedPeak", "test", "test", None, None)
+            match queries::register_agent(&cx, &pool, pid, "RedPeak", "test", "test", None, None, None)
                 .await
             {
                 Outcome::Ok(r) => r,
@@ -3366,7 +3366,7 @@ fn edge_case_release_reservations_idempotency() {
         let pid = proj.id.unwrap();
 
         let agent =
-            match queries::register_agent(&cx, &pool, pid, "BluePond", "test", "test", None, None)
+            match queries::register_agent(&cx, &pool, pid, "BluePond", "test", "test", None, None, None)
                 .await
             {
                 Outcome::Ok(r) => r,

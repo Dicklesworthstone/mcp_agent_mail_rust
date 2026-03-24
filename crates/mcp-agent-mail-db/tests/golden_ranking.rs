@@ -282,11 +282,11 @@ fn seed_corpus(pool: &DbPool) -> (i64, HashMap<&'static str, i64>, BTreeMap<Stri
                     "test-model",
                     Some("golden ranking test agent"),
                     None,
-                )
+                , None)
                 .await
                 {
                     Outcome::Ok(a) => a.id.expect("agent id"),
-                    other => panic!("register_agent({name}) failed: {other:?}"),
+                    other => panic!("register_agent({name}, None) failed: {other:?}"),
                 }
             }
         });

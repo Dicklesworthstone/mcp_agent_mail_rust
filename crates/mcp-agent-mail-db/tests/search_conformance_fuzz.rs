@@ -107,7 +107,7 @@ fn seed_parity_corpus(pool: &DbPool) -> (i64, i64, i64) {
                 "opus-4.6",
                 Some("conformance sender"),
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(a) => a,
@@ -122,7 +122,7 @@ fn seed_parity_corpus(pool: &DbPool) -> (i64, i64, i64) {
                 "opus-4.6",
                 Some("conformance recipient"),
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(a) => a,
@@ -984,7 +984,7 @@ fn parity_project_scoping() {
                 "opus-4.6",
                 Some("other agent"),
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(a) => a.id.unwrap(),
@@ -999,7 +999,7 @@ fn parity_project_scoping() {
                 "opus-4.6",
                 Some("other recipient"),
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(_) => {}

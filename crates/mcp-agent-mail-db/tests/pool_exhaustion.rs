@@ -206,7 +206,7 @@ fn pool_sequential_operations_after_setup() {
                 "test-model",
                 Some("sequential test"),
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(a) => a.id.unwrap(),
@@ -249,7 +249,7 @@ fn pool_sequential_operations_after_setup() {
                 "test-model",
                 Some("another agent"),
                 None,
-            )
+            , None)
             .await
             {
                 Outcome::Ok(a) => a.id.unwrap(),
