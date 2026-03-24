@@ -5153,25 +5153,38 @@ fn recover_sqlite_file_with_storage_root(
     let backup = find_healthy_sqlite_backup(path);
 
     if let Some(backup_path) = backup {
-        // Quarantine the corrupt DB first, then restore from the backup.
-        let _quarantined_db = sqlite_quarantine_path(path, "", &timestamp)?;
-        let _ = sqlite_quarantine_path(path, "-wal", &timestamp)?;
-        let _ = sqlite_quarantine_path(path, "-shm", &timestamp)?;
-
-        std::fs::copy(&backup_path, path).map_err(|e| {
+        // Safety: copy backup to a temp path first, validate it, then
+        // quarantine the original and swap in the validated copy.  This
+        // ensures the original DB is never removed until the replacement
+        // is known-good (same pattern as the reconstruct path below).
+        let temp_restore = next_doctor_artifact_path(path, "restore", "sqlite3");
+        std::fs::copy(&backup_path, &temp_restore).map_err(|e| {
             CliError::Other(format!(
-                "failed to restore sqlite backup {} into {}: {e}",
+                "failed to copy sqlite backup {} to temp path {}: {e}",
                 backup_path.display(),
+                temp_restore.display()
+            ))
+        })?;
+        if !sqlite_file_is_healthy(&temp_restore)? {
+            let _ = std::fs::remove_file(&temp_restore);
+            return Err(CliError::Other(format!(
+                "sqlite backup {} did not pass health check after copy (original is untouched)",
+                backup_path.display()
+            )));
+        }
+        // Validated — now quarantine the corrupt original and swap.
+        if path.exists() {
+            let _ = sqlite_quarantine_path(path, "", &timestamp)?;
+            let _ = sqlite_quarantine_path(path, "-wal", &timestamp)?;
+            let _ = sqlite_quarantine_path(path, "-shm", &timestamp)?;
+        }
+        std::fs::rename(&temp_restore, path).map_err(|e| {
+            CliError::Other(format!(
+                "backup restore succeeded at {} but failed to move into {}: {e}",
+                temp_restore.display(),
                 path.display()
             ))
         })?;
-        if !sqlite_file_is_healthy(path)? {
-            return Err(CliError::Other(format!(
-                "sqlite restore from {} completed, but quick_check still failed for {}",
-                backup_path.display(),
-                path.display()
-            )));
-        }
     } else {
         // Fall back to archive reconstruction if no backup is available.
         // Safety (issue #59): reconstruct into a temp file first, validate it,
