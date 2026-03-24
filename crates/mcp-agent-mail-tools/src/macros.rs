@@ -656,7 +656,6 @@ pub async fn macro_contact_handshake(
                 thread_id,
                 None,
                 None,
-                None,
                 None, // auto_contact_if_blocked
                 None, // sender_token
             )

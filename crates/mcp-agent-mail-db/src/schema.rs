@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS agents (
     attachments_policy TEXT NOT NULL DEFAULT 'auto',
     contact_policy TEXT NOT NULL DEFAULT 'auto',
     reaper_exempt INTEGER NOT NULL DEFAULT 0,
+    registration_token TEXT,
     UNIQUE(project_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_agents_project_name ON agents(project_id, name);
@@ -1502,6 +1503,38 @@ fn is_unsupported_by_franken(id: &str) -> bool {
         )
 }
 
+#[must_use]
+fn create_table_statement_for(table: &str) -> Option<&'static str> {
+    let expected_id = format!("v1_create_table_{table}");
+    CREATE_TABLES_SQL.split(';').find_map(|chunk| {
+        let stmt = chunk.trim();
+        let Some((id, _desc)) = derive_migration_id_and_description(stmt) else {
+            return None;
+        };
+        (id == expected_id).then_some(stmt)
+    })
+}
+
+#[must_use]
+fn base_schema_contains_column(table: &str, column: &str) -> bool {
+    let Some(stmt) = create_table_statement_for(table) else {
+        return false;
+    };
+    let expected_prefix = format!("{} ", column.to_ascii_lowercase());
+    stmt.lines().any(|line| {
+        let normalized = line.trim().trim_end_matches(',').to_ascii_lowercase();
+        normalized == column.to_ascii_lowercase() || normalized.starts_with(&expected_prefix)
+    })
+}
+
+#[must_use]
+fn add_column_migration_is_redundant_for_base_schema(migration: &Migration) -> bool {
+    let Some((table, column)) = parse_alter_table_add_column(&migration.up) else {
+        return false;
+    };
+    base_schema_contains_column(&table, &column)
+}
+
 /// Base-only trigger cleanup migrations.
 ///
 /// Base mode runs during startup to make DB files safe for later runtime access.
@@ -1632,7 +1665,10 @@ pub fn enforce_runtime_fts_cleanup(conn: &DbConn) -> std::result::Result<(), Sql
 pub fn schema_migrations_base() -> Vec<Migration> {
     let mut migrations: Vec<Migration> = schema_migrations()
         .into_iter()
-        .filter(|m| !is_unsupported_by_franken(&m.id))
+        .filter(|m| {
+            !is_unsupported_by_franken(&m.id)
+                && !add_column_migration_is_redundant_for_base_schema(m)
+        })
         .collect();
     migrations.extend(base_trigger_cleanup_migrations());
     migrations
@@ -1777,52 +1813,29 @@ async fn has_applied_migration_id<C: Connection>(
     }
 }
 
-async fn migration_table_row_count<C: Connection>(cx: &Cx, conn: &C) -> Outcome<i64, SqlError> {
-    let sql = format!("SELECT COUNT(*) AS cnt FROM {MIGRATIONS_TABLE_NAME}");
-    match conn.query(cx, &sql, &[]).await {
-        Outcome::Ok(rows) => {
-            let count = rows
-                .first()
-                .and_then(|row| {
-                    row.get_named::<i64>("cnt")
-                        .ok()
-                        .or_else(|| row.get_as::<i64>(0).ok())
-                })
-                .unwrap_or(0);
-            Outcome::Ok(count)
-        }
-        Outcome::Err(err) => Outcome::Err(err),
-        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => Outcome::Panicked(payload),
-    }
-}
-
 async fn migration_set_is_complete<C: Connection>(
     cx: &Cx,
     conn: &C,
     expected: &[Migration],
 ) -> Outcome<bool, SqlError> {
-    let expected_len = i64::try_from(expected.len()).unwrap_or(i64::MAX);
-    let Some(latest_id) = expected.last().map(|m| m.id.clone()) else {
+    let Some(_latest_id) = expected.last().map(|m| m.id.clone()) else {
         return Outcome::Ok(true);
     };
-
-    let has_latest = match has_applied_migration_id(cx, conn, &latest_id).await {
-        Outcome::Ok(value) => value,
+    let sql = format!("SELECT id FROM {MIGRATIONS_TABLE_NAME}");
+    let applied_ids = match conn.query(cx, &sql, &[]).await {
+        Outcome::Ok(rows) => rows
+            .into_iter()
+            .filter_map(|row| row.get_named::<String>("id").ok())
+            .collect::<std::collections::HashSet<_>>(),
         Outcome::Err(err) => return Outcome::Err(err),
         Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
-    if !has_latest {
-        return Outcome::Ok(false);
-    }
-    let applied_count = match migration_table_row_count(cx, conn).await {
-        Outcome::Ok(value) => value,
-        Outcome::Err(err) => return Outcome::Err(err),
-        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-    };
-    Outcome::Ok(applied_count >= expected_len)
+    Outcome::Ok(
+        expected
+            .iter()
+            .all(|migration| applied_ids.contains(&migration.id)),
+    )
 }
 
 async fn run_migrations<C: Connection>(
@@ -2368,6 +2381,8 @@ mod tests {
                 last_active_ts INTEGER NOT NULL,\
                 attachments_policy TEXT NOT NULL DEFAULT 'auto',\
                 contact_policy TEXT NOT NULL DEFAULT 'auto',\
+                reaper_exempt INTEGER NOT NULL DEFAULT 0,\
+                registration_token TEXT,\
                 UNIQUE(project_id, name)\
             )",
             &[],
@@ -2712,6 +2727,75 @@ mod tests {
         assert!(!ids.contains("v6_trg_inbox_stats_insert"));
         assert!(!ids.contains("v6_trg_inbox_stats_mark_read"));
         assert!(!ids.contains("v6_trg_inbox_stats_ack"));
+        assert!(!ids.contains("v19_agents_reaper_exempt"));
+        assert!(!ids.contains("v20_agents_registration_token"));
+    }
+
+    #[test]
+    fn migration_set_is_complete_requires_all_expected_ids() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("migration_set_is_complete_requires_ids.db");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+
+        let is_complete = block_on({
+            let conn = &conn;
+            move |cx| async move {
+                init_migrations_table(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("init migrations table");
+
+                let full = schema_migrations();
+                let missing_id = "v15_add_recipients_json_to_messages";
+                let record_sql = format!(
+                    "INSERT INTO {MIGRATIONS_TABLE_NAME} (id, description, applied_at) VALUES ($1, $2, $3)"
+                );
+
+                for migration in &full {
+                    if migration.id == missing_id {
+                        continue;
+                    }
+                    conn.execute(
+                        &cx,
+                        &record_sql,
+                        &[
+                            Value::Text(migration.id.clone()),
+                            Value::Text(migration.description.clone()),
+                            Value::BigInt(1),
+                        ],
+                    )
+                    .await
+                    .into_result()
+                    .expect("insert migration row");
+                }
+
+                for idx in 0..3 {
+                    conn.execute(
+                        &cx,
+                        &record_sql,
+                        &[
+                            Value::Text(format!("base_test_extra_{idx}")),
+                            Value::Text("extra row".to_string()),
+                            Value::BigInt(1),
+                        ],
+                    )
+                    .await
+                    .into_result()
+                    .expect("insert extra migration row");
+                }
+
+                migration_set_is_complete(&cx, conn, &full)
+                    .await
+                    .into_result()
+                    .expect("check migration completeness")
+            }
+        });
+
+        assert!(
+            !is_complete,
+            "migration completeness must fail when any expected migration id is missing"
+        );
     }
 
     #[test]
@@ -2973,7 +3057,7 @@ mod tests {
         .expect("insert legacy project");
 
         conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS agents (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT NOT NULL DEFAULT '', inception_ts DATETIME NOT NULL, last_active_ts DATETIME NOT NULL, attachments_policy TEXT NOT NULL DEFAULT 'auto', contact_policy TEXT NOT NULL DEFAULT 'auto', UNIQUE(project_id, name))",
+            "CREATE TABLE IF NOT EXISTS agents (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT NOT NULL DEFAULT '', inception_ts DATETIME NOT NULL, last_active_ts DATETIME NOT NULL, attachments_policy TEXT NOT NULL DEFAULT 'auto', contact_policy TEXT NOT NULL DEFAULT 'auto', reaper_exempt INTEGER NOT NULL DEFAULT 0, registration_token TEXT, UNIQUE(project_id, name))",
             &[],
         ).expect("create legacy agents table");
         conn.execute_sync(
@@ -3321,7 +3405,7 @@ VALUES (1, 1, 1, 'src/legacy/**', 1, 'legacy reservation', '2026-02-24 15:33:00'
         .expect("insert project");
 
         conn.execute_sync(
-            "CREATE TABLE IF NOT EXISTS agents (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT NOT NULL DEFAULT '', inception_ts INTEGER NOT NULL, last_active_ts INTEGER NOT NULL, attachments_policy TEXT NOT NULL DEFAULT 'auto', contact_policy TEXT NOT NULL DEFAULT 'auto', UNIQUE(project_id, name))",
+            "CREATE TABLE IF NOT EXISTS agents (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, name TEXT NOT NULL, program TEXT NOT NULL, model TEXT NOT NULL, task_description TEXT NOT NULL DEFAULT '', inception_ts INTEGER NOT NULL, last_active_ts INTEGER NOT NULL, attachments_policy TEXT NOT NULL DEFAULT 'auto', contact_policy TEXT NOT NULL DEFAULT 'auto', reaper_exempt INTEGER NOT NULL DEFAULT 0, registration_token TEXT, UNIQUE(project_id, name))",
             &[],
         ).expect("create agents table");
         conn.execute_sync(

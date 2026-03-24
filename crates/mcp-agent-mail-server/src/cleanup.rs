@@ -534,6 +534,7 @@ fn path_modified_within_grace(path: &Path, now_us: i64, grace_us: i64) -> bool {
         })
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum ActivityProbeResult {
     Active,
     Inactive,
@@ -598,16 +599,28 @@ fn check_directory_activity_fallback(
     now_us: i64,
     grace_us: i64,
 ) -> ActivityProbeResult {
-    for (scanned, entry) in walkdir::WalkDir::new(dir)
+    check_directory_activity_fallback_with_limit(dir, now_us, grace_us, ACTIVITY_PROBE_PATH_LIMIT)
+}
+
+fn check_directory_activity_fallback_with_limit(
+    dir: &Path,
+    now_us: i64,
+    grace_us: i64,
+    path_limit: usize,
+) -> ActivityProbeResult {
+    let mut scanned = 0usize;
+    for entry in walkdir::WalkDir::new(dir)
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .enumerate()
     {
-        if scanned >= ACTIVITY_PROBE_PATH_LIMIT {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if scanned >= path_limit {
             return ActivityProbeResult::Truncated;
         }
+        scanned += 1;
         if path_modified_within_grace(entry.path(), now_us, grace_us) {
             return ActivityProbeResult::Active;
         }
@@ -620,6 +633,22 @@ fn check_glob_activity_fallback(
     pattern: &str,
     now_us: i64,
     grace_us: i64,
+) -> ActivityProbeResult {
+    check_glob_activity_fallback_with_limit(
+        workspace,
+        pattern,
+        now_us,
+        grace_us,
+        ACTIVITY_PROBE_PATH_LIMIT,
+    )
+}
+
+fn check_glob_activity_fallback_with_limit(
+    workspace: &Path,
+    pattern: &str,
+    now_us: i64,
+    grace_us: i64,
+    path_limit: usize,
 ) -> ActivityProbeResult {
     let base_str = workspace.to_string_lossy().replace('\\', "/");
     let base_escaped = glob::Pattern::escape(&base_str);
@@ -635,11 +664,13 @@ fn check_glob_activity_fallback(
         return ActivityProbeResult::Unsupported;
     };
 
-    for (scanned, entry) in paths.flatten().enumerate() {
-        if scanned >= ACTIVITY_PROBE_PATH_LIMIT {
+    let mut scanned = 0usize;
+    for path in paths.flatten() {
+        if scanned >= path_limit {
             return ActivityProbeResult::Truncated;
         }
-        if path_modified_within_grace(&entry, now_us, grace_us) {
+        scanned += 1;
+        if path_modified_within_grace(&path, now_us, grace_us) {
             return ActivityProbeResult::Active;
         }
     }
@@ -1250,6 +1281,22 @@ mod tests {
             now + 10_000_000,
             1_000_000
         ));
+    }
+
+    #[test]
+    fn directory_probe_limit_counts_only_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+        let nested_dir = workspace.join("src").join("nested");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        std::fs::write(nested_dir.join("lib.rs"), "pub fn nested() {}\n").unwrap();
+
+        let now = now_micros();
+        assert_eq!(
+            check_directory_activity_fallback_with_limit(&workspace.join("src"), now, 1_000_000, 1),
+            ActivityProbeResult::Active,
+            "directory entries should not consume the file activity probe budget"
+        );
     }
 
     #[test]

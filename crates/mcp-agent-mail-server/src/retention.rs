@@ -434,7 +434,9 @@ fn count_old_messages(agents_dir: &Path, max_age_days: u64) -> usize {
     };
 
     let mut count = 0usize;
-    let cutoff = chrono::Utc::now() - max_age;
+    let cutoff = chrono::Utc::now()
+        .checked_sub_signed(max_age)
+        .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
     let mut stack = vec![agents_dir.to_path_buf()];
 
     while let Some(current) = stack.pop() {

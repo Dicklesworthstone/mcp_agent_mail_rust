@@ -6,6 +6,7 @@
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use fastmcp::prelude::McpContext;
+use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
 use mcp_agent_mail_tools::{ensure_project, register_agent, reply_message, send_message};
 use serde_json::Value;
 use std::sync::Mutex;
@@ -32,11 +33,24 @@ where
     let _lock = TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let cx = Cx::for_testing();
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
-    rt.block_on(f(cx))
+    let env_suffix = unique_suffix();
+    let db_path = format!("/tmp/messaging-error-parity-{env_suffix}.sqlite3");
+    let database_url = format!("sqlite://{db_path}");
+    let storage_root = format!("/tmp/messaging-error-storage-{env_suffix}");
+    with_process_env_overrides_for_test(
+        &[
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root.as_str()),
+        ],
+        || {
+            Config::reset_cached();
+            let cx = Cx::for_testing();
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build runtime");
+            rt.block_on(f(cx))
+        },
+    )
 }
 
 fn error_object(err: &fastmcp::McpError) -> serde_json::Map<String, Value> {
@@ -175,6 +189,7 @@ fn test_send_message_empty_to_error() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect_err("empty to should fail");
@@ -219,6 +234,7 @@ fn test_invalid_importance_error() {
             None,
             None,
             Some("invalid_level".to_string()),
+            None,
             None,
             None,
             None,
@@ -305,6 +321,7 @@ fn test_reply_message_subject_prefix() {
             vec!["RedPeak".to_string()],
             "Original subject".to_string(),
             "Hello".to_string(),
+            None,
             None,
             None,
             None,
@@ -413,6 +430,7 @@ fn test_broadcast_with_explicit_to_error() {
             None,
             None,
             Some(true),
+            None,
             None,
         )
         .await

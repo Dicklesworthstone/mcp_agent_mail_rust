@@ -136,6 +136,7 @@ async fn send_basic_message(
         None,
         None,
         auto_contact_if_blocked,
+        None,
     )
     .await
 }
@@ -418,6 +419,7 @@ fn test_contact_block_prevents_attachment_archive_artifacts() {
             None,
             None,
             Some(false),
+            None,
         )
         .await
         .expect_err("contacts_only recipient should block send before attachment writes");

@@ -6,8 +6,10 @@
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use fastmcp::prelude::McpContext;
+use mcp_agent_mail_core::{Config, config::with_process_env_overrides_for_test};
 use mcp_agent_mail_tools::{
     ensure_project, fetch_inbox, file_reservation_paths, register_agent, send_message,
+    set_contact_policy,
 };
 use serde_json::Value;
 use std::sync::Mutex;
@@ -34,11 +36,24 @@ where
     let _lock = TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let cx = Cx::for_testing();
-    let rt = RuntimeBuilder::current_thread()
-        .build()
-        .expect("build runtime");
-    rt.block_on(f(cx))
+    let env_suffix = unique_suffix();
+    let db_path = format!("/tmp/validation-error-parity-{env_suffix}.sqlite3");
+    let database_url = format!("sqlite://{db_path}");
+    let storage_root = format!("/tmp/validation-error-storage-{env_suffix}");
+    with_process_env_overrides_for_test(
+        &[
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root.as_str()),
+        ],
+        || {
+            Config::reset_cached();
+            let cx = Cx::for_testing();
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build runtime");
+            rt.block_on(f(cx))
+        },
+    )
 }
 
 fn error_object(err: &fastmcp::McpError) -> serde_json::Map<String, Value> {
@@ -67,6 +82,14 @@ async fn setup_project_and_agent(ctx: &McpContext, project_key: &str, agent: &st
     )
     .await
     .expect("register_agent");
+    set_contact_policy(
+        ctx,
+        project_key.to_string(),
+        agent.to_string(),
+        "open".to_string(),
+    )
+    .await
+    .expect("set_contact_policy");
 }
 
 // -----------------------------------------------------------------------
@@ -171,6 +194,7 @@ fn test_invalid_thread_id_message() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect_err("invalid thread_id should fail");
@@ -242,6 +266,7 @@ fn test_numeric_thread_id_reserved_message() {
             None,
             None,
             Some("123".to_string()),
+            None,
             None,
             None,
             None,
@@ -513,6 +538,7 @@ fn test_subject_truncation_at_200() {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("long subject should succeed with truncation");
@@ -551,6 +577,7 @@ fn test_subject_exactly_200_not_truncated() {
             vec!["RedStone".to_string()],
             subject.clone(),
             "Test body".to_string(),
+            None,
             None,
             None,
             None,

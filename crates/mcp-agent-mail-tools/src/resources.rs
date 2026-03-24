@@ -5066,8 +5066,8 @@ mod resource_shape_tests {
                         Some(thread_id),
                         None,
                         None,
-                        None,
-                        None,
+                        None, // auto_contact_if_blocked
+                        None, // sender_token
                     )
                     .await
                     .expect("send_message"),

@@ -2604,4 +2604,71 @@ http_headers = { Authorization = "Bearer tok" }
             "\"open-code\""
         );
     }
+
+    // ── Sender identity verification helpers (issue #42) ─────────────
+
+    #[test]
+    fn generate_registration_token_is_43_chars_base64url() {
+        let token = generate_registration_token();
+        // 32 bytes => ceil(32*4/3) = 43 chars without padding
+        assert_eq!(token.len(), 43);
+        // Only base64url characters (no +, /, or =)
+        assert!(
+            token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        );
+    }
+
+    #[test]
+    fn generate_registration_token_unique() {
+        let a = generate_registration_token();
+        let b = generate_registration_token();
+        assert_ne!(a, b, "two consecutive tokens must differ");
+    }
+
+    #[test]
+    fn constant_time_eq_equal_slices() {
+        assert!(constant_time_eq(b"hello", b"hello"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn constant_time_eq_different_slices() {
+        assert!(!constant_time_eq(b"hello", b"world"));
+        assert!(!constant_time_eq(b"hello", b"hellx"));
+    }
+
+    #[test]
+    fn constant_time_eq_different_lengths() {
+        assert!(!constant_time_eq(b"hello", b"hell"));
+        assert!(!constant_time_eq(b"hi", b"hello"));
+    }
+
+    #[test]
+    fn constant_time_str_eq_works() {
+        assert!(constant_time_str_eq("abc123", "abc123"));
+        assert!(!constant_time_str_eq("abc123", "abc124"));
+        assert!(!constant_time_str_eq("abc123", "abc12"));
+    }
+
+    #[test]
+    fn base64url_encode_nopad_known_vector() {
+        // Known test vector: [0, 1, 2] => "AAEC" (standard base64)
+        // In base64url: same since no + or / needed
+        let result = base64url_encode_nopad(&[0, 1, 2]);
+        assert_eq!(result, "AAEC");
+    }
+
+    #[test]
+    fn base64url_encode_nopad_empty() {
+        assert_eq!(base64url_encode_nopad(&[]), "");
+    }
+
+    #[test]
+    fn base64url_encode_nopad_single_byte() {
+        // 0xFF => base64url of [255] = "/w" in standard, "_w" in url-safe
+        let result = base64url_encode_nopad(&[0xFF]);
+        assert_eq!(result, "_w");
+    }
 }
