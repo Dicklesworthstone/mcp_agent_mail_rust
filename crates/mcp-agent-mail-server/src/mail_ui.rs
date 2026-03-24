@@ -573,10 +573,13 @@ fn block_on_outcome<T>(
                 500
             };
             tracing::error!("DB error (status {status}): {e}");
-            Err((status, match status {
-                404 => "Not found".to_string(),
-                _ => "Internal server error".to_string(),
-            }))
+            Err((
+                status,
+                match status {
+                    404 => "Not found".to_string(),
+                    _ => "Internal server error".to_string(),
+                },
+            ))
         }
         asupersync::Outcome::Cancelled(_) => Err((503, "Request cancelled".to_string())),
         asupersync::Outcome::Panicked(p) => {

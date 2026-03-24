@@ -684,7 +684,8 @@ pub async fn summarize_thread_product(
     )?;
 
     let msg_limit = parse_product_thread_limit(per_thread_limit)?;
-    let mut rows: Vec<mcp_agent_mail_db::queries::ThreadMessageRow> = Vec::with_capacity(msg_limit);
+    let mut rows: Vec<mcp_agent_mail_db::queries::ThreadMessageRow> =
+        Vec::with_capacity(msg_limit.saturating_mul(projects.len()));
     for p in projects {
         let project_id = p.id.unwrap_or(0);
         let msgs = db_outcome_to_mcp_result(

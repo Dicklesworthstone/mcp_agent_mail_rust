@@ -449,11 +449,12 @@ pub async fn macro_file_reservation_cycle(
         mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
     let ttl = ttl_seconds.map_or(3600, |t| t.clamp(60, 31_536_000));
-    if ttl_seconds.is_some_and(|t| t < 60) {
-        tracing::warn!(
-            "ttl_seconds={} clamped to minimum 60s",
-            ttl_seconds.unwrap_or(0)
-        );
+    if let Some(t) = ttl_seconds {
+        if t < 60 {
+            tracing::warn!("ttl_seconds={t} clamped to minimum 60s");
+        } else if t > 31_536_000 {
+            tracing::warn!("ttl_seconds={t} clamped to maximum 31536000s (1 year)");
+        }
     }
 
     let is_exclusive = exclusive.unwrap_or(true);
@@ -656,6 +657,8 @@ pub async fn macro_contact_handshake(
                 None,
                 None,
                 None,
+                None, // auto_contact_if_blocked
+                None, // sender_token
             )
             .await?;
             Some(parse_json(welcome_json, "welcome_message")?)
@@ -820,6 +823,7 @@ mod tests {
                     .iter()
                     .map(|s| (*s).to_string())
                     .collect(),
+                registration_token: None,
             },
             file_reservations: ReservationResponse {
                 granted: Vec::new(),
@@ -963,6 +967,7 @@ mod tests {
                     .iter()
                     .map(|s| (*s).to_string())
                     .collect(),
+                registration_token: None,
             },
             thread: PreparedThread {
                 thread_id: "br-1".into(),
@@ -1131,6 +1136,7 @@ mod tests {
                     .iter()
                     .map(|s| (*s).to_string())
                     .collect(),
+                registration_token: None,
             },
             file_reservations: ReservationResponse {
                 granted: vec![GrantedReservation {
@@ -1175,6 +1181,7 @@ mod tests {
                     .iter()
                     .map(|s| (*s).to_string())
                     .collect(),
+                registration_token: None,
             },
             file_reservations: ReservationResponse {
                 granted: Vec::new(),
@@ -1233,6 +1240,7 @@ mod tests {
                     .iter()
                     .map(|s| (*s).to_string())
                     .collect(),
+                registration_token: None,
             },
             thread: PreparedThread {
                 thread_id: "nonexistent".into(),

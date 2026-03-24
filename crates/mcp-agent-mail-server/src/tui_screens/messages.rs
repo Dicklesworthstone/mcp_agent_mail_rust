@@ -1473,6 +1473,7 @@ impl MessageBrowserScreen {
             None,
             None,
             None,
+            None,
         ));
 
         match result {
