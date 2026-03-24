@@ -6987,9 +6987,10 @@ fn append_trailers(message: &str) -> String {
 /// Compute a relative path from a pre-canonicalized base to `target`.
 ///
 /// The base is expected to already be canonicalized (avoiding repeated
-/// `readlink` syscalls).  The target is first attempted without
-/// canonicalization (fast path) and only falls back to `canonicalize()`
-/// if `strip_prefix` fails.
+/// `readlink` syscalls).  The target is canonicalized via `fs::canonicalize()`
+/// to resolve any symlinks before comparison, preventing symlink-based path
+/// traversal attacks.  Falls back to manual normalization when the target
+/// does not yet exist on disk.
 fn rel_path_cached(canonical_base: &Path, target: &Path) -> Result<String> {
     // Resolve symlinks in the target path for safe comparison.
     // If canonicalize fails (file doesn't exist yet), fall back to manual normalization.
