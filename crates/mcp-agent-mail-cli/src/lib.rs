@@ -4963,41 +4963,6 @@ fn find_healthy_sqlite_backup(path: &Path) -> Option<PathBuf> {
     None
 }
 
-fn sqlite_quarantine_path(
-    primary_path: &Path,
-    suffix: &str,
-    timestamp: &str,
-) -> CliResult<Option<PathBuf>> {
-    let source = if suffix.is_empty() {
-        primary_path.to_path_buf()
-    } else {
-        let mut source_os = primary_path.as_os_str().to_os_string();
-        source_os.push(suffix);
-        PathBuf::from(source_os)
-    };
-    if !source.exists() {
-        return Ok(None);
-    }
-
-    let base_name = primary_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("storage.sqlite3");
-    let target_name = if suffix.is_empty() {
-        format!("{base_name}.corrupt-{timestamp}")
-    } else {
-        format!("{base_name}{suffix}.corrupt-{timestamp}")
-    };
-    let target = primary_path.with_file_name(target_name);
-    std::fs::rename(&source, &target).map_err(|e| {
-        CliError::Other(format!(
-            "failed to quarantine sqlite artifact {}: {e}",
-            source.display()
-        ))
-    })?;
-    Ok(Some(target))
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SqliteSalvageArtifacts {
     recovered_db: PathBuf,
@@ -5177,19 +5142,7 @@ fn recover_sqlite_file_with_storage_root(
                 backup_path.display()
             )));
         }
-        // Validated — now quarantine the corrupt original and swap.
-        if path.exists() {
-            let _ = sqlite_quarantine_path(path, "", &timestamp)?;
-            let _ = sqlite_quarantine_path(path, "-wal", &timestamp)?;
-            let _ = sqlite_quarantine_path(path, "-shm", &timestamp)?;
-        }
-        std::fs::rename(&temp_restore, path).map_err(|e| {
-            CliError::Other(format!(
-                "backup restore succeeded at {} but failed to move into {}: {e}",
-                temp_restore.display(),
-                path.display()
-            ))
-        })?;
+        swap_validated_sqlite_artifact(path, &temp_restore, &timestamp)?;
     } else {
         // Fall back to archive reconstruction if no backup is available.
         // Safety (issue #59): reconstruct into a temp file first, validate it,
@@ -5251,27 +5204,7 @@ fn recover_sqlite_file_with_storage_root(
                             path.display()
                         )));
                     }
-                    // Validated — now quarantine the original and swap in the temp.
-                    if path.exists() {
-                        let _ = sqlite_quarantine_path(path, "", &timestamp)?;
-                        let _ = sqlite_quarantine_path(path, "-wal", &timestamp)?;
-                        let _ = sqlite_quarantine_path(path, "-shm", &timestamp)?;
-                    }
-                    std::fs::rename(&temp_reconstruct, path).map_err(|e| {
-                        CliError::Other(format!(
-                            "reconstruction succeeded at {} but failed to move into {}: {e}",
-                            temp_reconstruct.display(),
-                            path.display()
-                        ))
-                    })?;
-                    // Move any sidecar files from temp path to final path.
-                    for suf in ["-wal", "-shm"] {
-                        let temp_sidecar = sqlite_sidecar_path(&temp_reconstruct, suf);
-                        if temp_sidecar.exists() {
-                            let final_sidecar = sqlite_sidecar_path(path, suf);
-                            let _ = std::fs::rename(&temp_sidecar, &final_sidecar);
-                        }
-                    }
+                    swap_validated_sqlite_artifact(path, &temp_reconstruct, &timestamp)?;
                 }
                 Err(e) => {
                     // Clean up partial temp file; original is safe.
@@ -5846,9 +5779,7 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
             // (falls back to ~/.config/mcp-agent-mail/config.env)
             let config_env_file = std::env::var_os("XDG_CONFIG_HOME")
                 .map(PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config"))
-                })
+                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
                 .unwrap_or_else(|| PathBuf::from(".config"))
                 .join("mcp-agent-mail")
                 .join("config.env");
@@ -5933,8 +5864,13 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
             };
 
             // Save token to canonical config.env (unless dry-run)
-            if !dry_run && let Err(e) = setup::save_token_to_env_file(&config_env_file, &resolved_token) {
-                output::warn(&format!("Could not save token to {}: {e}", config_env_file.display()));
+            if !dry_run
+                && let Err(e) = setup::save_token_to_env_file(&config_env_file, &resolved_token)
+            {
+                output::warn(&format!(
+                    "Could not save token to {}: {e}",
+                    config_env_file.display()
+                ));
             }
 
             let results = setup::run_setup(&params);
@@ -5999,24 +5935,20 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
             // override URL so that `setup status` stays consistent with
             // `doctor check`.
             if let Ok(agent_mail_url) = std::env::var("AGENT_MAIL_URL") {
-                let desired_urls = check_inbox_server_urls_for_agent_mail_url(
-                    &agent_mail_url,
-                    &params.path,
-                );
+                let desired_urls =
+                    check_inbox_server_urls_for_agent_mail_url(&agent_mail_url, &params.path);
                 for status in &mut statuses {
                     for cf in &mut status.config_files {
-                        if cf.exists && cf.has_server_entry && !cf.url_matches {
-                            if let Some(actual_url) = extract_mcp_agent_mail_config_url(
+                        if cf.exists
+                            && cf.has_server_entry
+                            && !cf.url_matches
+                            && let Some(actual_url) = extract_mcp_agent_mail_config_url(
                                 std::path::Path::new(&cf.path),
                                 &std::fs::read_to_string(&cf.path).unwrap_or_default(),
-                            ) {
-                                if mcp_config_url_matches_any_expected(
-                                    &actual_url,
-                                    &desired_urls,
-                                ) {
-                                    cf.url_matches = true;
-                                }
-                            }
+                            )
+                            && mcp_config_url_matches_any_expected(&actual_url, &desired_urls)
+                        {
+                            cf.url_matches = true;
                         }
                     }
                 }
@@ -13257,6 +13189,35 @@ fn extract_mcp_agent_mail_entry_bearer(entry: &serde_json::Value) -> Option<Stri
     auth.strip_prefix("Bearer ").map(|t| t.to_string())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorMcpConfigBearerStatus {
+    Match,
+    Missing,
+    Mismatch,
+}
+
+fn doctor_mcp_config_bearer_status(
+    config_path: &Path,
+    content: &str,
+    rust_binary: &Path,
+    canonical_token: &str,
+) -> Option<DoctorMcpConfigBearerStatus> {
+    match classify_mcp_agent_mail_config(config_path, content, rust_binary)? {
+        McpAgentMailEntryKind::HttpUrl => {
+            match extract_mcp_agent_mail_config_bearer(config_path, content) {
+                Some(config_token) if config_token == canonical_token => {
+                    Some(DoctorMcpConfigBearerStatus::Match)
+                }
+                Some(_) => Some(DoctorMcpConfigBearerStatus::Mismatch),
+                None => Some(DoctorMcpConfigBearerStatus::Missing),
+            }
+        }
+        McpAgentMailEntryKind::Rust
+        | McpAgentMailEntryKind::Python
+        | McpAgentMailEntryKind::Unknown => None,
+    }
+}
+
 fn normalize_mcp_config_status_url_host(host: &str) -> &str {
     if host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1" {
         "127.0.0.1"
@@ -14204,10 +14165,7 @@ fn handle_doctor_check_with(
             let mut parse_errors = 0u32;
             let mut detail_parts: Vec<String> = Vec::new();
             let desired_urls = if let Ok(agent_mail_url) = std::env::var("AGENT_MAIL_URL") {
-                check_inbox_server_urls_for_agent_mail_url(
-                    &agent_mail_url,
-                    &env_config.http_path,
-                )
+                check_inbox_server_urls_for_agent_mail_url(&agent_mail_url, &env_config.http_path)
             } else {
                 check_inbox_server_urls(
                     &env_config.http_host,
@@ -14381,31 +14339,42 @@ fn handle_doctor_check_with(
 
             // Sub-check: verify bearer tokens in MCP configs match the canonical token
             if let Some(canonical_token) = env_config.http_bearer_token.as_deref() {
-                let mut token_mismatch_parts: Vec<String> = Vec::new();
+                let mut token_problem_parts: Vec<String> = Vec::new();
                 for loc in &existing {
                     let Ok(content) = std::fs::read_to_string(&loc.config_path) else {
                         continue;
                     };
-                    if let Some(config_token) =
-                        extract_mcp_agent_mail_config_bearer(&loc.config_path, &content)
-                    {
-                        if config_token != canonical_token {
-                            token_mismatch_parts.push(format!(
-                                "{} ({})",
+                    match doctor_mcp_config_bearer_status(
+                        &loc.config_path,
+                        &content,
+                        &rust_binary,
+                        canonical_token,
+                    ) {
+                        Some(DoctorMcpConfigBearerStatus::Missing) => {
+                            token_problem_parts.push(format!(
+                                "{} ({}) → missing bearer token",
                                 loc.tool.slug(),
                                 loc.config_path.display()
                             ));
                         }
+                        Some(DoctorMcpConfigBearerStatus::Mismatch) => {
+                            token_problem_parts.push(format!(
+                                "{} ({}) → bearer token mismatch",
+                                loc.tool.slug(),
+                                loc.config_path.display()
+                            ));
+                        }
+                        Some(DoctorMcpConfigBearerStatus::Match) | None => {}
                     }
                 }
-                if !token_mismatch_parts.is_empty() {
+                if !token_problem_parts.is_empty() {
                     checks.push(serde_json::json!({
                         "check": "mcp_config_token",
                         "status": "warn",
                         "detail": format!(
-                            "Bearer token mismatch in {} config(s): {}. Fix: run `am setup` to re-sync tokens",
-                            token_mismatch_parts.len(),
-                            token_mismatch_parts.join(", ")
+                            "Bearer token drift in {} config(s): {}. Fix: run `am setup` to re-sync tokens",
+                            token_problem_parts.len(),
+                            token_problem_parts.join(", ")
                         ),
                     }));
                 } else {
@@ -19635,6 +19604,37 @@ command = "mcp-agent-mail"
             Path::new("/home/test/.local/bin/mcp-agent-mail"),
         );
         assert_eq!(kind, Some(McpAgentMailEntryKind::Unknown));
+    }
+
+    #[test]
+    fn doctor_mcp_config_bearer_status_flags_missing_http_bearer_in_toml() {
+        let content = r#"
+[mcp_servers.mcp_agent_mail]
+url = "http://127.0.0.1:8765/mcp/"
+"#;
+        let status = doctor_mcp_config_bearer_status(
+            Path::new("/tmp/config.toml"),
+            content,
+            Path::new("/home/test/.local/bin/mcp-agent-mail"),
+            "secret",
+        );
+        assert_eq!(status, Some(DoctorMcpConfigBearerStatus::Missing));
+    }
+
+    #[test]
+    fn doctor_mcp_config_bearer_status_accepts_matching_http_bearer_in_toml() {
+        let content = r#"
+[mcp_servers.mcp_agent_mail]
+url = "http://127.0.0.1:8765/mcp/"
+http_headers = { Authorization = "Bearer secret" }
+"#;
+        let status = doctor_mcp_config_bearer_status(
+            Path::new("/tmp/config.toml"),
+            content,
+            Path::new("/home/test/.local/bin/mcp-agent-mail"),
+            "secret",
+        );
+        assert_eq!(status, Some(DoctorMcpConfigBearerStatus::Match));
     }
 
     #[test]
@@ -25371,6 +25371,102 @@ startup_timeout_sec = 42
         assert!(wal_path.exists());
         assert!(shm_path.exists());
         assert!(!quarantine.exists());
+    }
+
+    #[test]
+    fn swap_validated_sqlite_artifact_restores_quarantined_state_on_swap_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("storage.sqlite3");
+        let temp_db_path = tmp.path().join("storage.sqlite3.restore.sqlite3");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+
+        std::fs::write(&db_path, b"original-main").unwrap();
+        std::fs::write(&wal_path, b"original-wal").unwrap();
+        std::fs::write(&shm_path, b"original-shm").unwrap();
+        std::fs::write(&temp_db_path, b"replacement-main").unwrap();
+
+        let err = swap_validated_sqlite_artifact_with(
+            &db_path,
+            &temp_db_path,
+            "20260324_120000_000",
+            |_src, _dst| Err(std::io::Error::other("simulated swap failure")),
+        )
+        .expect_err("swap should fail");
+        assert!(
+            err.to_string().contains("validated sqlite artifact"),
+            "unexpected error: {err}"
+        );
+
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"original-main");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"original-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"original-shm");
+        assert_eq!(std::fs::read(&temp_db_path).unwrap(), b"replacement-main");
+        assert!(
+            std::fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".corrupt-20260324_120000_000")),
+            "rollback should clean up quarantine artifacts"
+        );
+    }
+
+    #[test]
+    fn swap_validated_sqlite_artifact_restores_quarantined_state_on_sidecar_move_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("storage.sqlite3");
+        let temp_db_path = tmp.path().join("storage.sqlite3.restore.sqlite3");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        let temp_wal_path = sqlite_sidecar_path(&temp_db_path, "-wal");
+
+        std::fs::write(&db_path, b"original-main").unwrap();
+        std::fs::write(&wal_path, b"original-wal").unwrap();
+        std::fs::write(&shm_path, b"original-shm").unwrap();
+        std::fs::write(&temp_db_path, b"replacement-main").unwrap();
+        std::fs::write(&temp_wal_path, b"replacement-wal").unwrap();
+
+        let expected_fail_path = temp_wal_path.clone();
+        let err = swap_validated_sqlite_artifact_with(
+            &db_path,
+            &temp_db_path,
+            "20260324_120000_001",
+            |src, dst| std::fs::rename(src, dst),
+            move |src, dst| {
+                if src == expected_fail_path.as_path() {
+                    Err(std::io::Error::other("simulated sidecar move failure"))
+                } else {
+                    std::fs::rename(src, dst)
+                }
+            },
+        )
+        .expect_err("sidecar move should fail");
+        assert!(
+            err.to_string().contains("failed to move sidecar"),
+            "unexpected error: {err}"
+        );
+
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"original-main");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), b"original-wal");
+        assert_eq!(std::fs::read(&shm_path).unwrap(), b"original-shm");
+        assert!(
+            !temp_db_path.exists(),
+            "replacement main database should not remain swapped in after rollback"
+        );
+        assert_eq!(std::fs::read(&temp_wal_path).unwrap(), b"replacement-wal");
+        assert!(
+            std::fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".corrupt-20260324_120000_001")),
+            "rollback should clean up quarantine artifacts"
+        );
     }
 
     #[test]
@@ -35885,6 +35981,101 @@ fn restore_quarantined_sqlite_state(state: &QuarantinedSqliteState) -> CliResult
     Ok(())
 }
 
+fn next_sqlite_quarantine_path(db_path: &Path, timestamp: &str) -> PathBuf {
+    let base_name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("storage.sqlite3");
+    let mut quarantine = db_path.with_file_name(format!("{base_name}.corrupt-{timestamp}"));
+    let mut suffix = 1_u32;
+    while quarantine.exists() {
+        quarantine = db_path.with_file_name(format!("{base_name}.corrupt-{timestamp}-{suffix:02}"));
+        suffix = suffix.saturating_add(1);
+    }
+    quarantine
+}
+
+fn swap_validated_sqlite_artifact(
+    db_path: &Path,
+    temp_db_path: &Path,
+    timestamp: &str,
+) -> CliResult<()> {
+    swap_validated_sqlite_artifact_with(
+        db_path,
+        temp_db_path,
+        timestamp,
+        |src, dst| std::fs::rename(src, dst),
+        |src, dst| std::fs::rename(src, dst),
+    )
+}
+
+fn swap_validated_sqlite_artifact_with<SwapF, MoveSidecarF>(
+    db_path: &Path,
+    temp_db_path: &Path,
+    timestamp: &str,
+    swap_fn: SwapF,
+    move_sidecar_fn: MoveSidecarF,
+) -> CliResult<()>
+where
+    SwapF: FnOnce(&Path, &Path) -> std::io::Result<()>,
+    MoveSidecarF: Fn(&Path, &Path) -> std::io::Result<()>,
+{
+    let quarantined_state = if db_path.exists() {
+        Some(quarantine_sqlite_state(
+            db_path,
+            &next_sqlite_quarantine_path(db_path, timestamp),
+        )?)
+    } else {
+        None
+    };
+
+    if let Err(error) = swap_fn(temp_db_path, db_path) {
+        if let Some(state) = quarantined_state.as_ref()
+            && let Err(restore_err) = restore_quarantined_sqlite_state(state)
+        {
+            return Err(CliError::Other(format!(
+                "validated sqlite artifact {} could not replace {}: {error}; rollback of quarantined database also failed: {restore_err}",
+                temp_db_path.display(),
+                db_path.display()
+            )));
+        }
+        return Err(CliError::Other(format!(
+            "validated sqlite artifact {} could not replace {}: {error}",
+            temp_db_path.display(),
+            db_path.display()
+        )));
+    }
+
+    for suffix in ["-wal", "-shm"] {
+        let temp_sidecar = sqlite_sidecar_path(temp_db_path, suffix);
+        if temp_sidecar.exists() {
+            let final_sidecar = sqlite_sidecar_path(db_path, suffix);
+            if let Err(error) = move_sidecar_fn(&temp_sidecar, &final_sidecar) {
+                if let Some(state) = quarantined_state.as_ref()
+                    && let Err(restore_err) = restore_quarantined_sqlite_state(state)
+                {
+                    return Err(CliError::Other(format!(
+                        "validated sqlite artifact {} replaced {} but failed to move sidecar {} to {}: {error}; rollback of quarantined database also failed: {restore_err}",
+                        temp_db_path.display(),
+                        db_path.display(),
+                        temp_sidecar.display(),
+                        final_sidecar.display()
+                    )));
+                }
+                return Err(CliError::Other(format!(
+                    "validated sqlite artifact {} replaced {} but failed to move sidecar {} to {}: {error}",
+                    temp_db_path.display(),
+                    db_path.display(),
+                    temp_sidecar.display(),
+                    final_sidecar.display()
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct DoctorSalvageArtifact {
     db_path: PathBuf,
@@ -36232,11 +36423,7 @@ fn handle_doctor_reconstruct_with(
     // Build a temp path for reconstruction. The original DB is NOT touched
     // until the new DB is fully built and validated — this is the key safety
     // invariant (see issue #59).
-    let base_name = db_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("storage.sqlite3");
-    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f");
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     let temp_db_path = next_doctor_artifact_path(&db_path, "reconstruct", "sqlite3");
 
     ftui_runtime::ftui_println!(
@@ -36288,53 +36475,11 @@ fn handle_doctor_reconstruct_with(
         )));
     }
 
-    // Reconstruction succeeded and is healthy — now quarantine the original.
-    let quarantined_state = if db_path.exists() {
-        let mut quarantine = db_path.with_file_name(format!("{base_name}.corrupt-{timestamp}"));
-        let mut suffix = 1_u32;
-        while quarantine.exists() {
-            quarantine =
-                db_path.with_file_name(format!("{base_name}.corrupt-{timestamp}-{suffix:02}"));
-            suffix = suffix.saturating_add(1);
-        }
-        ftui_runtime::ftui_println!("Moving original database to {}", quarantine.display());
-        Some(quarantine_sqlite_state(&db_path, &quarantine).map_err(|e| {
-            CliError::Other(format!(
-                "reconstruction succeeded at {} but failed to move original database \
-                 aside: {e}; the reconstructed file is preserved for manual swap",
-                temp_db_path.display()
-            ))
-        })?)
-    } else {
-        None
-    };
-
-    // Swap the validated temp DB into the final path.
-    if let Err(e) = std::fs::rename(&temp_db_path, &db_path) {
-        if let Some(state) = quarantined_state.as_ref()
-            && let Err(restore_err) = restore_quarantined_sqlite_state(state)
-        {
-            return Err(CliError::Other(format!(
-                "reconstruction succeeded but failed to move {} to {}: {e}; \
-                 rollback of quarantined database also failed: {restore_err}",
-                temp_db_path.display(),
-                db_path.display()
-            )));
-        }
-        return Err(CliError::Other(format!(
-            "reconstruction succeeded but failed to move {} to {}: {e}",
-            temp_db_path.display(),
-            db_path.display()
-        )));
-    }
-    // Move any sidecar files from temp path to final path.
-    for suffix in ["-wal", "-shm"] {
-        let temp_sidecar = sqlite_sidecar_path(&temp_db_path, suffix);
-        if temp_sidecar.exists() {
-            let final_sidecar = sqlite_sidecar_path(&db_path, suffix);
-            let _ = std::fs::rename(&temp_sidecar, &final_sidecar);
-        }
-    }
+    swap_validated_sqlite_artifact(&db_path, &temp_db_path, &timestamp).map_err(|err| {
+        CliError::Other(format!(
+            "reconstruction succeeded but final database swap failed: {err}"
+        ))
+    })?;
 
     if let Some(attempt) = &salvage_attempt {
         match attempt {
@@ -37441,6 +37586,7 @@ async fn call_send_message_tool_locally(
         Some(importance.to_string()),
         Some(ack_required),
         thread_id.map(str::to_string),
+        None,
         None,
         None,
         None,
