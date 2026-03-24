@@ -2048,8 +2048,8 @@ pub async fn create_agent(
             }
 
             let insert_sql = "INSERT INTO agents \
-                (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt) \
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
             let insert_params = [
                 Value::BigInt(project_id),
                 Value::Text(name.to_string()),
@@ -2060,6 +2060,7 @@ pub async fn create_agent(
                 Value::BigInt(now),
                 Value::Text(attach_pol.to_string()),
                 Value::Text("auto".to_string()),
+                Value::BigInt(0),
             ];
             match map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await) {
                 Outcome::Ok(_) => {}
@@ -7829,8 +7830,8 @@ pub async fn insert_system_agent(
         try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
         let insert_sql = "INSERT INTO agents \
-            (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+            (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt) \
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
             ON CONFLICT(project_id, name) DO NOTHING";
         let insert_params = [
             Value::BigInt(project_id),
@@ -7842,6 +7843,7 @@ pub async fn insert_system_agent(
             Value::BigInt(now),
             Value::Text("auto".to_string()),
             Value::Text("auto".to_string()),
+            Value::BigInt(0),
         ];
         try_in_tx!(
             cx,
