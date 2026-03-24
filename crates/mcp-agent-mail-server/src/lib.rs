@@ -22414,7 +22414,7 @@ mod tests {
                 |err, _backoff_ms| {
                     retry_errors.push(err.to_string());
                 },
-                |cfg| {
+                |_cfg| {
                     attempts = attempts.saturating_add(1);
                     std::future::ready(Err::<
                         (mcp_agent_mail_core::Config, HttpServerInstance),
@@ -22429,16 +22429,20 @@ mod tests {
             .await
         });
 
-        assert!(result.is_err(), "should fail after max retries");
-        let err = result.unwrap_err();
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("should fail after max retries, but got Ok"),
+        };
         assert_eq!(
             attempts, HTTP_SUPERVISOR_MAX_CONSECUTIVE_RESTART_FAILURES,
             "should attempt exactly {HTTP_SUPERVISOR_MAX_CONSECUTIVE_RESTART_FAILURES} times"
         );
+        // on_retry_error fires for each failure that will be retried, but not
+        // for the final failure (which triggers the give-up path instead).
         assert_eq!(
             retry_errors.len() as u32,
-            HTTP_SUPERVISOR_MAX_CONSECUTIVE_RESTART_FAILURES,
-            "on_retry_error should fire for each failure"
+            HTTP_SUPERVISOR_MAX_CONSECUTIVE_RESTART_FAILURES - 1,
+            "on_retry_error should fire for each retried failure (all but the last)"
         );
         let msg = err.to_string();
         assert!(
