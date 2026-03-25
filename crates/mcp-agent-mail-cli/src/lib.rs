@@ -37499,6 +37499,7 @@ fn handle_doctor_reconstruct_with(
 }
 
 /// Quick archive stats for dry-run mode (no DB writes).
+#[derive(Debug, Clone, Copy, Serialize)]
 struct ArchiveScanStats {
     projects: usize,
     agents: usize,
@@ -37561,34 +37562,34 @@ fn doctor_archive_audit_summary_text(report: &DoctorArchiveAuditReport) -> Vec<S
         lines.push(format!(
             "Sample duplicate id {}: keep {} + {} duplicate(s)",
             group.message_id,
-            truncate_path(&group.keep, 72),
+            truncate_str(&group.keep, 72),
             group.duplicates.len()
         ));
     }
     if let Some(finding) = report.missing_project_metadata.first() {
         lines.push(format!(
             "Sample missing project.json: {}",
-            truncate_path(&finding.project_dir, 72)
+            truncate_str(&finding.project_dir, 72)
         ));
     }
     if let Some(finding) = report.invalid_project_metadata.first() {
         lines.push(format!(
             "Sample invalid project.json: {} ({})",
-            truncate_path(&finding.project_json, 72),
+            truncate_str(&finding.project_json, 72),
             finding.problem
         ));
     }
     if let Some(finding) = report.malformed_message_files.first() {
         lines.push(format!(
             "Sample malformed message: {} ({})",
-            truncate_path(&finding.path, 72),
+            truncate_str(&finding.path, 72),
             finding.problem
         ));
     }
     if let Some(finding) = report.suspicious_projects.first() {
         lines.push(format!(
             "Sample suspicious project: {} ({})",
-            truncate_path(&finding.project_dir, 72),
+            truncate_str(&finding.project_dir, 72),
             finding.reason
         ));
     }

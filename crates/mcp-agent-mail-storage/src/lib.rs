@@ -1551,9 +1551,6 @@ const COALESCER_MAX_BATCH_SIZE: usize = 10;
 const COMMIT_COALESCER_SOFT_CAP: u64 = 8_192;
 /// Maximum worker threads for the coalescer pool.
 const COALESCER_MAX_WORKERS: usize = 32;
-/// Per-repo queue capacity before spilling (now read from `Config::coalescer_queue_cap`).
-#[cfg(test)]
-const COALESCER_REPO_QUEUE_CAP: usize = 512;
 
 const COALESCER_SPILL_PATH_CAP: usize = 4_096;
 const COALESCER_SPILL_MESSAGE_CAP: usize = 32;

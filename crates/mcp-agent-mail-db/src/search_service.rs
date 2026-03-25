@@ -2270,10 +2270,14 @@ struct HybridBudgetGovernorConfig {
 
 impl Default for HybridBudgetGovernorConfig {
     fn default() -> Self {
+        let tight_ms = default_hybrid_budget_governor_tight_ms();
+        // critical must be <= tight to maintain tier ordering:
+        //   remaining <= critical → Critical, remaining <= tight → Tight.
+        let critical_ms = default_hybrid_budget_governor_critical_ms().min(tight_ms);
         Self {
             enabled: true,
-            tight_ms: default_hybrid_budget_governor_tight_ms(),
-            critical_ms: default_hybrid_budget_governor_critical_ms(),
+            tight_ms,
+            critical_ms,
             tight_scale_pct: default_hybrid_budget_governor_tight_scale_pct(),
             critical_scale_pct: default_hybrid_budget_governor_critical_scale_pct(),
             result_floor: default_hybrid_budget_governor_result_floor(),

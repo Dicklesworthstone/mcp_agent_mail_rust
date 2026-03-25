@@ -1104,14 +1104,6 @@ const HTTP_SUPERVISOR_CONTROL_CHANNEL_CAPACITY: usize = 32;
 // The following HTTP supervisor constants have been replaced by Config fields
 // (AM_HTTP_* env vars). They are retained for test assertions only.
 #[cfg(test)]
-const HTTP_SUPERVISOR_PROBE_INTERVAL: Duration = Duration::from_secs(2);
-#[cfg(test)]
-const HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD: u32 = 3;
-#[cfg(test)]
-const HTTP_SUPERVISOR_PROBE_STARTUP_GRACE: Duration = Duration::from_secs(15);
-#[cfg(test)]
-const HTTP_SUPERVISOR_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
-#[cfg(test)]
 const HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS: u64 = 200;
 #[cfg(test)]
 const HTTP_SUPERVISOR_RESTART_BACKOFF_MAX_MS: u64 = 5_000;
@@ -1567,6 +1559,8 @@ fn build_http_runtime() -> std::io::Result<Runtime> {
 }
 
 fn restart_backoff_ms(previous_ms: u64, min_ms: u64, max_ms: u64) -> u64 {
+    // Ensure min <= max; if caller passes inverted bounds, saturate to max.
+    let min_ms = min_ms.min(max_ms);
     if previous_ms == 0 {
         min_ms
     } else {

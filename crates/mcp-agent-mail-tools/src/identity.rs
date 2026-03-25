@@ -13,7 +13,7 @@ use mcp_agent_mail_core::Config;
 use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::messaging::try_dispatch_archive_write;
 use crate::tool_util::{
