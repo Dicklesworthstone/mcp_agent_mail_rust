@@ -932,9 +932,11 @@ fn collect_entries_ctx(
         return Ok(());
     }
 
-    let mut stack = vec![current.to_path_buf()];
+    let base = base.canonicalize()?;
+    let root = current.canonicalize()?;
+    let mut stack = vec![(current.to_path_buf(), vec![root])];
 
-    while let Some(current_dir) = stack.pop() {
+    while let Some((current_dir, ancestry)) = stack.pop() {
         for entry in std::fs::read_dir(current_dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -943,7 +945,10 @@ fn collect_entries_ctx(
                 Err(_) => continue,
             };
             if file_type.is_dir() {
-                stack.push(path);
+                let canonical = path.canonicalize()?;
+                let mut next_ancestry = ancestry.clone();
+                next_ancestry.push(canonical);
+                stack.push((path, next_ancestry));
                 continue;
             }
 
@@ -952,10 +957,10 @@ fn collect_entries_ctx(
                 // Symlinks escaping the source root are a path-traversal
                 // vector and must fail the export immediately.
                 let canonical = path.canonicalize()?;
-                if !canonical.starts_with(base) {
+                if !canonical.starts_with(&base) {
                     return Err(std::io::Error::other(format!(
                         "Refusing to include path outside {context} source: {}",
-                        path.strip_prefix(base)
+                        path.strip_prefix(&base)
                             .unwrap_or(&path)
                             .to_string_lossy()
                             .replace('\\', "/"),
@@ -964,10 +969,22 @@ fn collect_entries_ctx(
                 // Target is inside the source tree.  If it resolves to a
                 // directory, recurse into it; if a file, include it.
                 if canonical.is_dir() {
-                    stack.push(path);
+                    let relative = path
+                        .strip_prefix(&base)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    if ancestry.iter().any(|seen| seen == &canonical) {
+                        return Err(std::io::Error::other(format!(
+                            "Refusing to follow cyclic symlink in {context} source: {relative}",
+                        )));
+                    }
+                    let mut next_ancestry = ancestry.clone();
+                    next_ancestry.push(canonical);
+                    stack.push((path, next_ancestry));
                 } else if canonical.is_file() {
                     let relative = path
-                        .strip_prefix(base)
+                        .strip_prefix(&base)
                         .unwrap_or(&path)
                         .to_string_lossy()
                         .replace('\\', "/");
@@ -981,7 +998,7 @@ fn collect_entries_ctx(
             }
 
             let relative = path
-                .strip_prefix(base)
+                .strip_prefix(&base)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
@@ -2226,6 +2243,24 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn zip_refuses_cyclic_internal_directory_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("nested/a.txt"), b"alpha").unwrap();
+        std::os::unix::fs::symlink(&source, source.join("nested/loop")).unwrap();
+
+        let zip_path = dir.path().join("bundle.zip");
+        let err = package_directory_as_zip(&source, &zip_path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cyclic symlink"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn zip_rejects_symlinked_destination_parent() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source");
@@ -2331,6 +2366,26 @@ mod tests {
         let msg = err.to_string();
         assert!(
             msg.contains("outside viewer source"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn copy_viewer_assets_from_refuses_cyclic_directory_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("viewer_assets");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("nested/index.html"), b"<html>viewer</html>").unwrap();
+        std::os::unix::fs::symlink(&source, source.join("nested/loop")).unwrap();
+
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+
+        let err = copy_viewer_assets_from(&source, &output).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cyclic symlink"),
             "unexpected error message: {msg}"
         );
     }

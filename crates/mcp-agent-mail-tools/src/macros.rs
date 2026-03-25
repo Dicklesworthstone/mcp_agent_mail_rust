@@ -587,13 +587,23 @@ pub async fn macro_contact_handshake(
     })?;
     let target_agent =
         mcp_agent_mail_core::models::normalize_agent_name(&target_agent).unwrap_or(target_agent);
+    let target_resolution =
+        crate::contacts::resolve_contact_target(&target_agent, to_project.as_deref(), &project_key);
+    let pool = get_db_pool()?;
+    let source_project = resolve_project(ctx, &pool, &project_key).await?;
+    let source_project_key = source_project.human_key.clone();
+    let target_project = resolve_project(ctx, &pool, &target_resolution.project_key).await?;
+    let target_project_key = target_project.human_key.clone();
+    let target_agent_name =
+        mcp_agent_mail_core::models::normalize_agent_name(&target_resolution.agent_name)
+            .unwrap_or(target_resolution.agent_name.clone());
+    let is_cross_project = source_project.id != target_project.id;
 
     let should_auto_accept = auto_accept.unwrap_or(false);
     let ttl = match ttl_seconds {
         Some(t) if t > 0 => t.clamp(60, 31_536_000), // consistent with other macros
         _ => 604_800,                                // 7 days
     };
-    let target_project_key = to_project.clone().unwrap_or_else(|| project_key.clone());
 
     // NOTE: Removed manual same-project fast path that bypassed side effects.
     // We now always delegate to request_contact/respond_contact to ensure
@@ -601,10 +611,12 @@ pub async fn macro_contact_handshake(
 
     let request_json = crate::contacts::request_contact(
         ctx,
-        project_key.clone(),
+        source_project_key.clone(),
         from_agent.clone(),
-        target_agent.clone(),
-        Some(target_project_key.clone()),
+        target_agent_name.clone(),
+        target_resolution
+            .explicit_project
+            .then_some(target_project_key.clone()),
         reason.clone(),
         Some(ttl),
         register_if_missing,
@@ -619,10 +631,10 @@ pub async fn macro_contact_handshake(
         let respond_json = crate::contacts::respond_contact(
             ctx,
             target_project_key.clone(),
-            target_agent.clone(),
+            target_agent_name.clone(),
             from_agent.clone(),
-            if to_project.is_some() {
-                Some(project_key.clone())
+            if is_cross_project {
+                Some(source_project_key.clone())
             } else {
                 None
             },
@@ -639,12 +651,12 @@ pub async fn macro_contact_handshake(
     let thread_id_for_log = thread_id.clone();
 
     let welcome_val = if let (Some(subject), Some(body)) = (welcome_subject, welcome_body) {
-        if to_project.is_none() {
+        if !is_cross_project {
             let welcome_json = crate::messaging::send_message(
                 ctx,
-                project_key.clone(),
+                source_project_key.clone(),
                 from_agent.clone(),
-                vec![target_agent.clone()],
+                vec![target_agent_name.clone()],
                 subject,
                 body,
                 None,
@@ -664,7 +676,7 @@ pub async fn macro_contact_handshake(
         } else {
             tracing::debug!(
                 from = %from_agent,
-                to = %target_agent,
+                to = %target_agent_name,
                 "welcome message skipped for cross-project handshake (messaging across projects not yet supported)"
             );
             None
@@ -682,7 +694,7 @@ pub async fn macro_contact_handshake(
     tracing::debug!(
         "Contact handshake from {} to {} in project {} (auto_accept: {}, welcome_sent: {})",
         from_agent,
-        target_agent,
+        target_agent_name,
         project_key,
         should_auto_accept,
         welcome_sent
@@ -1021,6 +1033,23 @@ mod tests {
         let target: Option<String> = None;
         let to_agent: Option<String> = Some("Y".into());
         assert_eq!(target.or(to_agent), Some("Y".into()));
+    }
+
+    #[test]
+    fn handshake_target_shorthand_resolves_for_follow_up_steps() {
+        let resolved =
+            crate::contacts::resolve_contact_target("project:remote#GoldHawk", None, "/default");
+        assert_eq!(resolved.project_key, "remote");
+        assert_eq!(resolved.agent_name, "GoldHawk");
+        assert!(resolved.explicit_project);
+    }
+
+    #[test]
+    fn handshake_target_plain_name_stays_local() {
+        let resolved = crate::contacts::resolve_contact_target("GoldHawk", None, "/default");
+        assert_eq!(resolved.project_key, "/default");
+        assert_eq!(resolved.agent_name, "GoldHawk");
+        assert!(!resolved.explicit_project);
     }
 
     // -----------------------------------------------------------------------

@@ -7115,12 +7115,71 @@ fn write_json(path: &Path, value: &serde_json::Value, sync: bool) -> Result<()> 
     atomic_write_bytes(path, content.as_bytes(), sync)
 }
 
+static ATOMIC_WRITE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+static ATOMIC_WRITE_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[cfg(test)]
+thread_local! {
+    static ATOMIC_WRITE_TEST_LOCK_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+struct AtomicWriteTestGuard {
+    lock: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+#[cfg(test)]
+fn atomic_write_test_guard() -> AtomicWriteTestGuard {
+    let reentrant = ATOMIC_WRITE_TEST_LOCK_DEPTH.with(|depth| {
+        let current = depth.get();
+        depth.set(current + 1);
+        current > 0
+    });
+    let lock = if reentrant {
+        None
+    } else {
+        Some(
+            ATOMIC_WRITE_TEST_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("atomic write test lock poisoned"),
+        )
+    };
+    AtomicWriteTestGuard { lock }
+}
+
+#[cfg(test)]
+impl Drop for AtomicWriteTestGuard {
+    fn drop(&mut self) {
+        drop(self.lock.take());
+        ATOMIC_WRITE_TEST_LOCK_DEPTH.with(|depth| {
+            depth.set(depth.get().saturating_sub(1));
+        });
+    }
+}
+
+fn atomic_write_tmp_path(parent: &Path, path: &Path, seq: u64) -> PathBuf {
+    let name_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut s = std::collections::hash_map::DefaultHasher::new();
+        path.file_name().hash(&mut s);
+        s.finish()
+    };
+    let tmp_name = format!(".tmp-{}-{:016x}-{seq}", std::process::id(), name_hash);
+    parent.join(tmp_name)
+}
+
 /// Write bytes to a file atomically via a temp file + rename.
 ///
 /// The temp file is created in the same directory as the target so that
 /// `fs::rename` is guaranteed to be atomic (same filesystem).
 fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
     use std::io::Write as _;
+
+    #[cfg(test)]
+    let _test_guard = atomic_write_test_guard();
 
     // Refuse to write through symlinks (prevents symlink escape attacks)
     if let Ok(meta) = fs::symlink_metadata(path) {
@@ -7143,35 +7202,44 @@ fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
         )));
     }
 
-    // Use pid + seq + filename-hash for a unique temp name.
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Use pid + seq + filename-hash for a unique temp name. Open with
+    // create_new so pre-existing files or symlinks cannot be clobbered.
+    for _ in 0..64 {
+        let seq = ATOMIC_WRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = atomic_write_tmp_path(parent, path, seq);
 
-    let name_hash = {
-        use std::hash::{Hash, Hasher};
-        let mut s = std::collections::hash_map::DefaultHasher::new();
-        path.file_name().hash(&mut s);
-        s.finish()
-    };
+        let result: std::io::Result<()> = (|| {
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?;
+            f.write_all(data)?;
+            if sync {
+                f.sync_data()?;
+            }
+            fs::rename(&tmp_path, path)?;
+            Ok(())
+        })();
 
-    let tmp_name = format!(".tmp-{}-{:016x}-{seq}", std::process::id(), name_hash,);
-    let tmp_path = parent.join(&tmp_name);
-
-    let result = (|| {
-        let mut f = fs::File::create(&tmp_path)?;
-        f.write_all(data)?;
-        if sync {
-            f.sync_data()?;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                // Best-effort cleanup of temp files we created. If the path
+                // already existed before our open, leave it untouched.
+                let _ = fs::remove_file(&tmp_path);
+                return Err(err.into());
+            }
         }
-        fs::rename(&tmp_path, path)?;
-        Ok(())
-    })();
-
-    if result.is_err() {
-        // Best-effort cleanup of the temp file on any failure
-        let _ = fs::remove_file(&tmp_path);
     }
-    result
+
+    Err(StorageError::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "failed to allocate unique temp file for atomic write in {}",
+            parent.display()
+        ),
+    )))
 }
 
 fn canonicalize_with_existing_prefix(path: &Path) -> std::io::Result<PathBuf> {
@@ -8254,6 +8322,34 @@ mod tests {
         assert!(
             !outside.join("message.md").exists(),
             "write should not escape outside the archive root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_text_skips_preexisting_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside_tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("message.md");
+        let outside = outside_tmp.path().join("outside.txt");
+        fs::write(&outside, "outside").unwrap();
+
+        let _guard = atomic_write_test_guard();
+        ATOMIC_WRITE_TMP_COUNTER.store(0, Ordering::Relaxed);
+        for seq in 0..8 {
+            let tmp_path = atomic_write_tmp_path(tmp.path(), &target, seq);
+            symlink(&outside, &tmp_path).unwrap();
+        }
+
+        write_text(&target, "payload", false).expect("preexisting temp symlinks should be skipped");
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "payload");
+        assert_eq!(
+            fs::read_to_string(&outside).unwrap(),
+            "outside",
+            "atomic write must not follow attacker-controlled temp symlinks"
         );
     }
 

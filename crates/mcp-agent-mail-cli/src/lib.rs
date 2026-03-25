@@ -25166,6 +25166,52 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn sanitize_sqlite_recover_sql_filters_internal_sqlite_tables() {
+        let recovered = "\
+BEGIN;\n\
+PRAGMA writable_schema=ON;\n\
+CREATE TABLE sqlite_sequence(name,seq);\n\
+INSERT INTO sqlite_sequence VALUES('messages',12);\n\
+CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);\n\
+INSERT INTO users VALUES(1,'alice');\n\
+CREATE TABLE sqlite_stat1(tbl,idx,stat);\n\
+INSERT INTO sqlite_master(type,name,tbl_name,rootpage,sql) VALUES('table','bad','bad',0,'x');\n\
+ANALYZE sqlite_master;\n\
+COMMIT;\n";
+
+        let sanitized = sanitize_sqlite_recover_sql(recovered);
+
+        assert!(sanitized.contains("BEGIN;"));
+        assert!(sanitized.contains("CREATE TABLE users"));
+        assert!(sanitized.contains("INSERT INTO users"));
+        assert!(sanitized.contains("COMMIT;"));
+        assert!(!sanitized.contains("writable_schema"));
+        assert!(!sanitized.contains("sqlite_sequence"));
+        assert!(!sanitized.contains("sqlite_stat1"));
+        assert!(!sanitized.contains("sqlite_master"));
+    }
+
+    #[test]
+    fn sanitize_sqlite_recover_sql_preserves_semicolons_inside_strings() {
+        let recovered = "\
+BEGIN;\n\
+CREATE TABLE notes(body TEXT);\n\
+INSERT INTO notes VALUES('hello;still-body');\n\
+COMMIT;\n";
+
+        let sanitized = sanitize_sqlite_recover_sql(recovered);
+
+        assert!(sanitized.contains("INSERT INTO notes VALUES('hello;still-body');"));
+        assert_eq!(
+            sanitized
+                .lines()
+                .filter(|line| line.contains("INSERT INTO notes"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn doctor_archive_db_drift_detail_flags_ambiguous_slug_only_archive_project_candidates() {
         let archive = DoctorArchiveInventory {
             projects: 1,
@@ -36109,6 +36155,106 @@ fn next_doctor_artifact_path(base_path: &Path, label: &str, extension: &str) -> 
     candidate
 }
 
+fn should_keep_sqlite_recover_statement(statement: &str) -> bool {
+    let normalized = statement.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    !(normalized.starts_with("pragma writable_schema")
+        || normalized.contains("sqlite_sequence")
+        || normalized.contains("sqlite_stat")
+        || normalized.contains("insert into sqlite_master")
+        || normalized.contains("update sqlite_master")
+        || normalized.contains("delete from sqlite_master")
+        || normalized.contains("insert into sqlite_schema")
+        || normalized.contains("update sqlite_schema")
+        || normalized.contains("delete from sqlite_schema")
+        || normalized.contains("analyze sqlite_master")
+        || normalized.contains("analyze sqlite_schema"))
+}
+
+fn sanitize_sqlite_recover_sql(recovered_sql: &str) -> String {
+    let mut sanitized = String::new();
+    let mut statement = String::new();
+    let mut chars = recovered_sql.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    while let Some(ch) = chars.next() {
+        if in_line_comment {
+            statement.push(ch);
+            if ch == '\n' {
+                in_line_comment = false;
+            }
+            continue;
+        }
+
+        if in_block_comment {
+            statement.push(ch);
+            if ch == '*' && chars.peek().is_some_and(|next| *next == '/') {
+                statement.push(chars.next().unwrap_or('/'));
+                in_block_comment = false;
+            }
+            continue;
+        }
+
+        if !in_single && !in_double && ch == '-' && chars.peek().is_some_and(|next| *next == '-') {
+            statement.push(ch);
+            statement.push(chars.next().unwrap_or('-'));
+            in_line_comment = true;
+            continue;
+        }
+
+        if !in_single && !in_double && ch == '/' && chars.peek().is_some_and(|next| *next == '*') {
+            statement.push(ch);
+            statement.push(chars.next().unwrap_or('*'));
+            in_block_comment = true;
+            continue;
+        }
+
+        if ch == '\'' && !in_double {
+            let escaped = chars.peek().is_some_and(|next| *next == '\'');
+            statement.push(ch);
+            if escaped {
+                statement.push(chars.next().unwrap_or('\''));
+            } else {
+                in_single = !in_single;
+            }
+            continue;
+        }
+
+        if ch == '"' && !in_single {
+            let escaped = chars.peek().is_some_and(|next| *next == '"');
+            statement.push(ch);
+            if escaped {
+                statement.push(chars.next().unwrap_or('"'));
+            } else {
+                in_double = !in_double;
+            }
+            continue;
+        }
+
+        statement.push(ch);
+        if ch == ';' && !in_single && !in_double {
+            if should_keep_sqlite_recover_statement(&statement) {
+                sanitized.push_str(statement.trim());
+                sanitized.push('\n');
+            }
+            statement.clear();
+        }
+    }
+
+    if !statement.trim().is_empty() && should_keep_sqlite_recover_statement(&statement) {
+        sanitized.push_str(statement.trim());
+        sanitized.push('\n');
+    }
+
+    sanitized
+}
+
 fn attempt_sqlite_salvage_artifact(quarantined_db: &Path) -> DoctorSalvageAttempt {
     let recover_output = match std::process::Command::new("sqlite3")
         .arg(quarantined_db)
@@ -36144,13 +36290,11 @@ fn attempt_sqlite_salvage_artifact(quarantined_db: &Path) -> DoctorSalvageAttemp
         ));
     }
 
-    if recover_output
-        .stdout
-        .iter()
-        .all(|byte| byte.is_ascii_whitespace())
-    {
+    let recovered_sql = String::from_utf8_lossy(&recover_output.stdout);
+    let sanitized_sql = sanitize_sqlite_recover_sql(&recovered_sql);
+    if sanitized_sql.trim().is_empty() {
         return DoctorSalvageAttempt::Failed(format!(
-            "sqlite3 .recover produced no salvageable SQL for {}",
+            "sqlite3 .recover produced no importable SQL for {} after filtering internal sqlite tables",
             quarantined_db.display()
         ));
     }
@@ -36173,7 +36317,7 @@ fn attempt_sqlite_salvage_artifact(quarantined_db: &Path) -> DoctorSalvageAttemp
     };
 
     if let Some(mut stdin) = import_child.stdin.take() {
-        let stdout_data = recover_output.stdout.clone();
+        let stdout_data = sanitized_sql.into_bytes();
         std::thread::spawn(move || {
             let _ = std::io::Write::write_all(&mut stdin, &stdout_data);
         });
@@ -36198,6 +36342,23 @@ fn attempt_sqlite_salvage_artifact(quarantined_db: &Path) -> DoctorSalvageAttemp
         .trim()
         .to_string();
     if !import_output.status.success() {
+        match sqlite_quick_check_via_cli(&salvage_db_path) {
+            Ok(Some(true)) | Ok(None) => {
+                let detail = if import_stderr.is_empty() {
+                    format!("sqlite3 import exited with {}", import_output.status)
+                } else {
+                    truncate_doctor_command(&import_stderr)
+                };
+                return DoctorSalvageAttempt::Succeeded(DoctorSalvageArtifact {
+                    db_path: salvage_db_path.clone(),
+                    detail: format!(
+                        "Recovered a salvage SQLite artifact at {} despite non-fatal sqlite3 import warnings ({detail})",
+                        salvage_db_path.display()
+                    ),
+                });
+            }
+            Ok(Some(false)) | Err(_) => {}
+        }
         return DoctorSalvageAttempt::Failed(format!(
             "sqlite3 import failed for {}: {}",
             salvage_db_path.display(),

@@ -182,14 +182,21 @@ pub(crate) async fn resolve_or_register_sender(
     }
 }
 
-/// Parse `project:<slug>#<Name>` shorthand into a `(project_key, agent_name)` tuple.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContactTargetResolution {
+    pub project_key: String,
+    pub agent_name: String,
+    pub explicit_project: bool,
+}
+
+/// Parse `project:<slug>#<Name>` shorthand into a structured target resolution.
 /// Falls back to the default project and raw agent name if no shorthand match.
-fn parse_contact_target(
+pub(crate) fn resolve_contact_target(
     to_agent: &str,
-    to_project: Option<String>,
+    to_project: Option<&str>,
     default_project: &str,
-) -> (String, String) {
-    let (mut actual_project, actual_agent) = if to_agent.starts_with("project:")
+) -> ContactTargetResolution {
+    let (mut actual_project, actual_agent, shorthand_project) = if to_agent.starts_with("project:")
         && to_agent.contains('#')
         && let Some((slug, agent)) = to_agent.split_once(':').and_then(|(_, rest)| {
             let (slug, agent) = rest.split_once('#')?;
@@ -201,16 +208,32 @@ fn parse_contact_target(
                 Some((slug.to_string(), agent.to_string()))
             }
         }) {
-        (slug, agent)
+        (slug, agent, true)
     } else {
-        (default_project.to_string(), to_agent.to_string())
+        (default_project.to_string(), to_agent.to_string(), false)
     };
 
+    let explicit_project = shorthand_project || to_project.is_some();
     if let Some(tp) = to_project {
-        actual_project = tp;
+        actual_project = tp.to_string();
     }
 
-    (actual_project, actual_agent)
+    ContactTargetResolution {
+        project_key: actual_project,
+        agent_name: actual_agent,
+        explicit_project,
+    }
+}
+
+/// Parse `project:<slug>#<Name>` shorthand into a `(project_key, agent_name)` tuple.
+/// Falls back to the default project and raw agent name if no shorthand match.
+fn parse_contact_target(
+    to_agent: &str,
+    to_project: Option<String>,
+    default_project: &str,
+) -> (String, String) {
+    let resolved = resolve_contact_target(to_agent, to_project.as_deref(), default_project);
+    (resolved.project_key, resolved.agent_name)
 }
 
 /// Request contact approval to message another agent.
@@ -894,6 +917,22 @@ mod tests {
         );
         assert_eq!(proj, "explicit-project");
         assert_eq!(agent, "AgentX");
+    }
+
+    #[test]
+    fn resolve_contact_target_marks_shorthand_as_explicit_project() {
+        let resolved = resolve_contact_target("project:other#AgentX", None, "/default");
+        assert_eq!(resolved.project_key, "other");
+        assert_eq!(resolved.agent_name, "AgentX");
+        assert!(resolved.explicit_project);
+    }
+
+    #[test]
+    fn resolve_contact_target_marks_plain_name_as_local() {
+        let resolved = resolve_contact_target("BlueLake", None, "/default");
+        assert_eq!(resolved.project_key, "/default");
+        assert_eq!(resolved.agent_name, "BlueLake");
+        assert!(!resolved.explicit_project);
     }
 
     // ── TTL validation ──
