@@ -2196,6 +2196,7 @@ fn default_two_tier_fast_first_budget_ms() -> u64 {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(150)
+        .clamp(1, 30_000)
 }
 
 fn default_hybrid_budget_governor_tight_ms() -> u64 {
@@ -2203,6 +2204,7 @@ fn default_hybrid_budget_governor_tight_ms() -> u64 {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(250)
+        .clamp(1, 60_000)
 }
 
 fn default_hybrid_budget_governor_critical_ms() -> u64 {
@@ -2210,6 +2212,7 @@ fn default_hybrid_budget_governor_critical_ms() -> u64 {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(120)
+        .clamp(1, 60_000)
 }
 
 fn default_hybrid_budget_governor_tight_scale_pct() -> u32 {
@@ -2217,6 +2220,7 @@ fn default_hybrid_budget_governor_tight_scale_pct() -> u32 {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(70)
+        .clamp(1, 100)
 }
 
 fn default_hybrid_budget_governor_critical_scale_pct() -> u32 {
@@ -2224,6 +2228,7 @@ fn default_hybrid_budget_governor_critical_scale_pct() -> u32 {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(40)
+        .clamp(1, 100)
 }
 
 fn default_hybrid_budget_governor_result_floor() -> usize {
@@ -2231,6 +2236,7 @@ fn default_hybrid_budget_governor_result_floor() -> usize {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(10)
+        .clamp(1, 200)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

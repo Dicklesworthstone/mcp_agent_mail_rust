@@ -16,11 +16,11 @@
 //! - Returns an `IntegrityCorruption` error so callers can set health to Red.
 //! - Optionally attempts recovery via checkpoint + `VACUUM` + validated file copy.
 
-use crate::DbConn;
 use crate::error::{DbError, DbResult};
+use crate::DbConn;
 use sqlmodel_core::{Row, Value};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 /// Result of an integrity check.
 #[derive(Debug, Clone)]
@@ -238,7 +238,7 @@ pub fn attempt_vacuum_recovery(conn: &DbConn, original_path: &str) -> DbResult<S
     let recovery_path = format!("{original_path}.recovery");
 
     // Remove any leftover recovery file.
-    let _ = std::fs::remove_file(&recovery_path);
+    cleanup_recovery_artifacts(&recovery_path);
 
     // Use PASSIVE checkpoint to flush what we can without modifying the
     // corrupt database aggressively. TRUNCATE could propagate WAL-resident
@@ -260,18 +260,26 @@ pub fn attempt_vacuum_recovery(conn: &DbConn, original_path: &str) -> DbResult<S
     );
 
     // Verify the recovery copy is valid.
-    let recovery_conn = DbConn::open_file(&recovery_path)
-        .map_err(|e| DbError::Sqlite(format!("failed to open recovery copy: {e}")))?;
+    let recovery_conn = DbConn::open_file(&recovery_path).map_err(|e| {
+        cleanup_recovery_artifacts(&recovery_path);
+        DbError::Sqlite(format!("failed to open recovery copy: {e}"))
+    })?;
 
     match quick_check(&recovery_conn) {
         Ok(_) => Ok(recovery_path),
         Err(e) => {
-            let _ = std::fs::remove_file(&recovery_path);
+            cleanup_recovery_artifacts(&recovery_path);
             Err(DbError::Internal(format!(
                 "recovery copy also corrupt: {e}"
             )))
         }
     }
+}
+
+fn cleanup_recovery_artifacts(recovery_path: &str) {
+    let _ = std::fs::remove_file(recovery_path);
+    let _ = std::fs::remove_file(format!("{recovery_path}-wal"));
+    let _ = std::fs::remove_file(format!("{recovery_path}-shm"));
 }
 
 /// Check whether enough time has elapsed since the last full check
@@ -680,5 +688,26 @@ mod tests {
             })
             .unwrap_or(0);
         assert_eq!(cnt, 1, "recovery copy should have the data");
+    }
+
+    #[test]
+    fn cleanup_recovery_artifacts_removes_sidecars() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recovery = dir.path().join("test.db.recovery");
+        std::fs::write(&recovery, b"db").expect("write recovery db");
+        std::fs::write(format!("{}-wal", recovery.display()), b"wal").expect("write recovery wal");
+        std::fs::write(format!("{}-shm", recovery.display()), b"shm").expect("write recovery shm");
+
+        cleanup_recovery_artifacts(recovery.to_str().expect("recovery path"));
+
+        assert!(!recovery.exists(), "recovery db should be removed");
+        assert!(
+            !dir.path().join("test.db.recovery-wal").exists(),
+            "recovery wal should be removed"
+        );
+        assert!(
+            !dir.path().join("test.db.recovery-shm").exists(),
+            "recovery shm should be removed"
+        );
     }
 }
