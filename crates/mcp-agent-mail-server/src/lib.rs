@@ -1094,14 +1094,14 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
     }
 }
 
+// HTTP runtime worker bounds (not user-configurable; use AM_HTTP_WORKER_THREADS).
 const HTTP_RUNTIME_MIN_WORKERS: usize = 4;
 const HTTP_RUNTIME_DEFAULT_WORKERS_CAP: usize = 4;
 const HTTP_RUNTIME_MAX_WORKERS: usize = 64;
-const HTTP_LISTENER_MAX_CONNECTIONS: usize = 4096;
-const HTTP_LISTENER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-// Keep-alive must outlive the supervisor probe cadence and normal MCP bursts.
-// A 1s idle timeout caused stale keep-alive reuse and false liveness failures.
-const HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+// The following HTTP supervisor constants are now configurable via Config fields
+// (AM_HTTP_MAX_CONNECTIONS, AM_HTTP_IDLE_TIMEOUT_SECS, etc.) and are kept as
+// fallbacks only for code paths that don't yet thread Config.
 const HTTP_SUPERVISOR_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 const HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD: u32 = 3;
 const HTTP_SUPERVISOR_PROBE_STARTUP_GRACE: Duration = Duration::from_secs(15);
@@ -1433,21 +1433,21 @@ fn build_http_reactor()
     Ok((create_reactor()?, "default"))
 }
 
-fn hardened_http_listener_config() -> Http1ListenerConfig {
+fn hardened_http_listener_config(config: &mcp_agent_mail_core::Config) -> Http1ListenerConfig {
     let http_config = Http1Config::default()
         // Keep-alive is allowed for polling clients, but with bounded reuse.
         // This limits long-lived connection pathologies while avoiding pure
         // per-request TCP churn in the web UI.
         .keep_alive(true)
         .max_requests(Some(8))
-        .idle_timeout(Some(HTTP_IDLE_TIMEOUT))
+        .idle_timeout(Some(Duration::from_secs(config.http_idle_timeout_secs)))
         .max_headers_size(32 * 1024)
         .max_body_size(10 * 1024 * 1024); // 10MB — must match HttpHandlerConfig.max_body_size
 
     Http1ListenerConfig::default()
         .http_config(http_config)
-        .max_connections(Some(HTTP_LISTENER_MAX_CONNECTIONS))
-        .drain_timeout(HTTP_LISTENER_DRAIN_TIMEOUT)
+        .max_connections(Some(config.http_max_connections))
+        .drain_timeout(Duration::from_secs(config.http_drain_timeout_secs))
 }
 
 fn normalized_probe_host(http_host: &str) -> &str {
@@ -2503,7 +2503,7 @@ async fn spawn_http_server_instance(
             let inner = Arc::clone(&handler_state);
             async move { inner.handle(req).await }
         },
-        hardened_http_listener_config(),
+        hardened_http_listener_config(&config),
     )
     .await?;
 
@@ -2542,6 +2542,7 @@ async fn stop_http_server_instance(instance: HttpServerInstance) -> std::io::Res
         instance,
         HTTP_SERVER_STOP_JOIN_TIMEOUT,
         HTTP_SERVER_FORCE_CLOSE_JOIN_TIMEOUT,
+        HTTP_SERVER_STOP_JOIN_TIMEOUT, // drain uses same timeout as join
     )
     .await
 }
@@ -2550,10 +2551,11 @@ async fn stop_http_server_instance_with_timeouts(
     instance: HttpServerInstance,
     join_timeout: Duration,
     force_close_timeout: Duration,
+    drain_timeout: Duration,
 ) -> std::io::Result<()> {
     let HttpServerInstance { join, shutdown, .. } = instance;
     let mut join = Box::pin(join);
-    let _ = shutdown.begin_drain(HTTP_LISTENER_DRAIN_TIMEOUT);
+    let _ = shutdown.begin_drain(drain_timeout);
     if let Ok(result) = timeout(wall_now(), join_timeout, &mut join).await {
         result
     } else {
@@ -9702,6 +9704,7 @@ fn readiness_check_with_integrity(
         max_lifetime_ms: mcp_agent_mail_db::pool::DEFAULT_POOL_RECYCLE_MS,
         run_migrations: true,
         warmup_connections: 0,
+        cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
     };
 
     let cx = Cx::for_testing();
@@ -17804,9 +17807,12 @@ mod tests {
 
     #[test]
     fn http_probe_timing_does_not_undercut_keep_alive() {
+        // Verify that the *default* idle timeout exceeds the probe interval.
+        // At runtime this is enforced by the Config validation (min 2s idle).
+        let default_config = mcp_agent_mail_core::Config::default();
         assert!(
-            HTTP_IDLE_TIMEOUT > HTTP_SUPERVISOR_PROBE_INTERVAL,
-            "server keep-alive must outlive supervisor probe cadence"
+            default_config.http_idle_timeout_secs > default_config.http_probe_interval_secs,
+            "default keep-alive must outlive default supervisor probe cadence"
         );
     }
 
@@ -22290,6 +22296,7 @@ mod tests {
                 instance,
                 Duration::from_millis(50),
                 Duration::from_millis(250),
+                Duration::from_millis(50),
             )
             .await
             .expect("force-close should unblock shutdown");
@@ -22314,9 +22321,14 @@ mod tests {
         let force_close_timeout = Duration::from_millis(50);
         let start = std::time::Instant::now();
         let err = runtime.block_on(async {
-            stop_http_server_instance_with_timeouts(instance, join_timeout, force_close_timeout)
-                .await
-                .expect_err("stuck join must time out")
+            stop_http_server_instance_with_timeouts(
+                instance,
+                join_timeout,
+                force_close_timeout,
+                join_timeout,
+            )
+            .await
+            .expect_err("stuck join must time out")
         });
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         assert!(

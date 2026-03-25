@@ -139,7 +139,14 @@ struct ListenerPidHint {
 
 /// Maximum age of a PID hint file before it's considered stale (seconds).
 /// Stale hints are ignored to prevent PID recycling attacks.
-const PID_HINT_MAX_AGE_SECS: u64 = 86400; // 24 hours
+/// Override via `AM_pid_hint_max_age_secs()` env var.
+fn pid_hint_max_age_secs() -> u64 {
+    std::env::var("AM_pid_hint_max_age_secs()")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(86400) // 24 hours default
+        .max(60) // safety floor: never less than 1 minute
+}
 
 /// Check the status of a port: free, occupied by Agent Mail, or occupied by another process.
 ///
@@ -533,11 +540,13 @@ fn read_listener_pid_hint(host: &str, port: u16) -> Option<ListenerPidHint> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        if now.saturating_sub(created) > PID_HINT_MAX_AGE_SECS {
+        let max_age = pid_hint_max_age_secs();
+        if now.saturating_sub(created) > max_age {
             tracing::debug!(
                 pid = hint.pid,
                 age_secs = now.saturating_sub(created),
-                "rejecting stale PID hint file (older than {PID_HINT_MAX_AGE_SECS}s)"
+                max_age_secs = max_age,
+                "rejecting stale PID hint file"
             );
             return None;
         }

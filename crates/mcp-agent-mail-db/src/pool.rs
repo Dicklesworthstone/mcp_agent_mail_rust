@@ -94,6 +94,9 @@ pub struct DbPoolConfig {
     /// Number of connections to eagerly open on startup (0 = disabled).
     /// Capped at `min_connections`. Warmup is bounded by `acquire_timeout_ms`.
     pub warmup_connections: usize,
+    /// Total page-cache budget across all connections (KiB).
+    /// Override via `Config::database_cache_budget_kb` / `DATABASE_CACHE_BUDGET_KB`.
+    pub cache_budget_kb: usize,
 }
 
 impl Default for DbPoolConfig {
@@ -106,6 +109,7 @@ impl Default for DbPoolConfig {
             max_lifetime_ms: DEFAULT_POOL_RECYCLE_MS,
             run_migrations: true,
             warmup_connections: 0,
+            cache_budget_kb: schema::DEFAULT_CACHE_BUDGET_KB,
         }
     }
 }
@@ -168,6 +172,10 @@ impl DbPoolConfig {
             max_lifetime_ms: DEFAULT_POOL_RECYCLE_MS,
             run_migrations: true,
             warmup_connections: warmup,
+            cache_budget_kb: env_value("DATABASE_CACHE_BUDGET_KB")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(schema::DEFAULT_CACHE_BUDGET_KB)
+                .clamp(16_384, 4_194_304),
         }
     }
 
@@ -294,7 +302,10 @@ pub struct DbPool {
 impl DbPool {
     fn from_shared_pool(config: &DbPoolConfig, pool: Arc<Pool<DbConn>>) -> DbResult<Self> {
         let sqlite_path = resolve_sqlite_path_with_absolute_fallback(&config.sqlite_path()?);
-        let init_sql = Arc::new(schema::build_conn_pragmas(config.max_connections));
+        let init_sql = Arc::new(schema::build_conn_pragmas(
+            config.max_connections,
+            config.cache_budget_kb,
+        ));
         let stats_sampler = Arc::new(DbPoolStatsSampler::new());
 
         Ok(Self {
@@ -309,7 +320,10 @@ impl DbPool {
     /// Create a new pool (does not open connections until first acquire).
     pub fn new(config: &DbPoolConfig) -> DbResult<Self> {
         let sqlite_path = resolve_sqlite_path_with_absolute_fallback(&config.sqlite_path()?);
-        let init_sql = Arc::new(schema::build_conn_pragmas(config.max_connections));
+        let init_sql = Arc::new(schema::build_conn_pragmas(
+            config.max_connections,
+            config.cache_budget_kb,
+        ));
         let stats_sampler = Arc::new(DbPoolStatsSampler::new());
 
         let pool_config = PoolConfig::new(config.max_connections)
@@ -3329,28 +3343,28 @@ mod tests {
     #[test]
     fn build_conn_pragmas_budget_aware_cache() {
         // 100 connections: 512*1024 / 100 = 5242 KB each
-        let sql_100 = schema::build_conn_pragmas(100);
+        let sql_100 = schema::build_conn_pragmas(100, schema::DEFAULT_CACHE_BUDGET_KB);
         assert!(
             sql_100.contains("cache_size = -5242"),
             "100 conns should get ~5MB each: {sql_100}"
         );
 
         // 25 connections: 512*1024 / 25 = 20971 KB each
-        let sql_25 = schema::build_conn_pragmas(25);
+        let sql_25 = schema::build_conn_pragmas(25, schema::DEFAULT_CACHE_BUDGET_KB);
         assert!(
             sql_25.contains("cache_size = -20971"),
             "25 conns should get ~20MB each: {sql_25}"
         );
 
         // 1 connection: 512*1024 / 1 = 524288 KB → clamped to 65536 (64MB max)
-        let sql_1 = schema::build_conn_pragmas(1);
+        let sql_1 = schema::build_conn_pragmas(1, schema::DEFAULT_CACHE_BUDGET_KB);
         assert!(
             sql_1.contains("cache_size = -65536"),
             "1 conn should get 64MB (clamped max): {sql_1}"
         );
 
         // 500 connections: clamped to 2MB min
-        let sql_500 = schema::build_conn_pragmas(500);
+        let sql_500 = schema::build_conn_pragmas(500, schema::DEFAULT_CACHE_BUDGET_KB);
         assert!(
             sql_500.contains("cache_size = -2048"),
             "500 conns should get 2MB (clamped min): {sql_500}"
@@ -3376,7 +3390,7 @@ mod tests {
     /// Verify `build_conn_pragmas` handles zero pool size gracefully.
     #[test]
     fn build_conn_pragmas_zero_pool_fallback() {
-        let sql = schema::build_conn_pragmas(0);
+        let sql = schema::build_conn_pragmas(0, schema::DEFAULT_CACHE_BUDGET_KB);
         assert!(
             sql.contains("cache_size = -8192"),
             "0 conns should fallback to 8MB: {sql}"
@@ -3390,7 +3404,7 @@ mod tests {
             "fresh probe/read connections must not try to switch journal mode"
         );
 
-        let sql = schema::build_conn_pragmas(4);
+        let sql = schema::build_conn_pragmas(4, schema::DEFAULT_CACHE_BUDGET_KB);
         assert!(
             !sql.contains("journal_mode"),
             "pool connection init must not reissue journal_mode=WAL: {sql}"

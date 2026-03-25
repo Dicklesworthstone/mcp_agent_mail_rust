@@ -269,29 +269,29 @@ PRAGMA threads = 4;
 PRAGMA journal_size_limit = 268435456;
 ";
 
-/// Total memory budget (in KB) for page caches across all pooled connections.
-///
-/// Default: 512 MB. With 100 connections, each gets ~5 MB of page cache.
-/// With 25 connections, each gets ~20 MB. This prevents memory blowup when
-/// `max_connections` increases.
-const TOTAL_CACHE_BUDGET_KB: usize = 512 * 1024;
+/// Default total memory budget (in KB) for page caches across all pooled
+/// connections.  Override at runtime via `Config::database_cache_budget_kb`
+/// / the `DATABASE_CACHE_BUDGET_KB` environment variable.
+pub const DEFAULT_CACHE_BUDGET_KB: usize = 512 * 1024;
 
 /// Build per-connection PRAGMAs with a `cache_size` that respects the total
 /// memory budget.
 ///
-/// `max_connections` is the pool's maximum size. The per-connection cache
-/// is `TOTAL_CACHE_BUDGET_KB / max_connections`, clamped to \[2 MB, 64 MB\].
+/// `max_connections` is the pool's maximum size.  `cache_budget_kb` is the
+/// total page-cache budget across all connections (KiB); pass
+/// `Config::database_cache_budget_kb` or [`DEFAULT_CACHE_BUDGET_KB`].
+/// The per-connection cache is `cache_budget_kb / max_connections`, clamped
+/// to \[2 MB, 64 MB\].
+///
 /// `journal_mode` is intentionally excluded here because the init gate applies
 /// WAL once per database file; repeating that database-wide state change on
 /// every connection creation amplifies lock contention.
 ///
 /// Returns a SQL string suitable for `execute_raw()`.
 #[must_use]
-pub fn build_conn_pragmas(max_connections: usize) -> String {
-    let per_conn_kb = (TOTAL_CACHE_BUDGET_KB
-        .checked_div(max_connections)
-        .unwrap_or(8192))
-    .clamp(2048, 65536);
+pub fn build_conn_pragmas(max_connections: usize, cache_budget_kb: usize) -> String {
+    let per_conn_kb =
+        (cache_budget_kb.checked_div(max_connections).unwrap_or(8192)).clamp(2048, 65536);
 
     format!(
         "\

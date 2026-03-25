@@ -55,7 +55,7 @@ pub struct Config {
     ///
     /// The per-connection `cache_size` PRAGMA is set to
     /// `database_cache_budget_kb / max_connections`, clamped to \[2 MiB, 64 MiB\].
-    /// Override via `DATABASE_CACHE_BUDGET_KB`. Default: 524_288 (512 MiB).
+    /// Override via `DATABASE_CACHE_BUDGET_KB`. Default: `524_288` (512 MiB).
     pub database_cache_budget_kb: usize,
     /// Run `PRAGMA quick_check` on pool initialization (default: true).
     pub integrity_check_on_startup: bool,
@@ -101,6 +101,28 @@ pub struct Config {
     pub http_otel_enabled: bool,
     pub http_otel_service_name: String,
     pub http_otel_exporter_otlp_endpoint: String,
+
+    // HTTP Supervisor tuning (server-side)
+    /// Max simultaneous connections the listener accepts (default 4096).
+    pub http_max_connections: usize,
+    /// Seconds to wait for in-flight requests during graceful shutdown (default 5).
+    pub http_drain_timeout_secs: u64,
+    /// Keep-alive idle timeout in seconds (default 15; <5 risks stale reuse).
+    pub http_idle_timeout_secs: u64,
+    /// Health-probe interval in seconds (default 2).
+    pub http_probe_interval_secs: u64,
+    /// Consecutive probe failures before marking unhealthy (default 3).
+    pub http_probe_failure_threshold: u32,
+    /// Seconds of grace after spawn before probing begins (default 15).
+    pub http_probe_startup_grace_secs: u64,
+    /// Per-probe timeout in seconds (default 1).
+    pub http_probe_timeout_secs: u64,
+    /// Minimum restart back-off in milliseconds (default 200).
+    pub http_restart_backoff_min_ms: u64,
+    /// Maximum restart back-off in milliseconds (default 5000).
+    pub http_restart_backoff_max_ms: u64,
+    /// Consecutive spawn failures before the supervisor exits (default 10).
+    pub http_max_restart_failures: u32,
 
     // Rate Limiting
     pub http_rate_limit_enabled: bool,
@@ -281,6 +303,26 @@ pub struct Config {
     pub atc_ledger_capacity: usize,
     /// Suspicion k-factor for rhythm-based liveness detection.
     pub atc_suspicion_k: f64,
+
+    // Write-behind queue (WBQ) tuning
+    /// Channel capacity for the write-behind queue (default 8192).
+    pub wbq_channel_capacity: usize,
+    /// Max operations drained per WBQ tick (default 256).
+    pub wbq_drain_batch_cap: usize,
+    /// WBQ flush interval in milliseconds (default 100).
+    pub wbq_flush_interval_ms: u64,
+    /// WBQ enqueue timeout in milliseconds (default 100).
+    pub wbq_enqueue_timeout_ms: u64,
+
+    // Git commit coalescer tuning
+    /// Coalescer flush interval in milliseconds (default 50, min 5).
+    pub coalescer_flush_ms: u64,
+    /// Max operations batched per git commit (default 10).
+    pub coalescer_max_batch_size: usize,
+    /// Max parallel commit workers (default 32).
+    pub coalescer_max_workers: usize,
+    /// Per-repo coalescer queue depth (default 512).
+    pub coalescer_queue_cap: usize,
 }
 
 /// Application environment
@@ -734,6 +776,18 @@ impl Default for Config {
             http_otel_service_name: "mcp-agent-mail".to_string(),
             http_otel_exporter_otlp_endpoint: String::new(),
 
+            // HTTP Supervisor tuning
+            http_max_connections: 4096,
+            http_drain_timeout_secs: 5,
+            http_idle_timeout_secs: 15,
+            http_probe_interval_secs: 2,
+            http_probe_failure_threshold: 3,
+            http_probe_startup_grace_secs: 15,
+            http_probe_timeout_secs: 1,
+            http_restart_backoff_min_ms: 200,
+            http_restart_backoff_max_ms: 5_000,
+            http_max_restart_failures: 10,
+
             // Rate Limiting
             http_rate_limit_enabled: false,
             http_rate_limit_backend: RateLimitBackend::Memory,
@@ -773,6 +827,10 @@ impl Default for Config {
                 "whois".to_string(),
                 "search_messages".to_string(),
                 "summarize_thread".to_string(),
+                "list_contacts".to_string(),
+                "fetch_inbox_product".to_string(),
+                "search_messages_product".to_string(),
+                "summarize_thread_product".to_string(),
             ],
 
             // CORS
@@ -851,14 +909,9 @@ impl Default for Config {
             retention_report_enabled: false,
             retention_report_interval_seconds: 3600,
             retention_max_age_days: 180,
-            retention_ignore_project_patterns: vec![
-                "demo".to_string(),
-                "test*".to_string(),
-                "testproj*".to_string(),
-                "testproject".to_string(),
-                "backendproj*".to_string(),
-                "frontendproj*".to_string(),
-            ],
+            // Conservative default: only auto-skip obvious test projects.
+            // Override via RETENTION_IGNORE_PROJECT_PATTERNS env var.
+            retention_ignore_project_patterns: vec!["test*".to_string()],
             quota_enabled: false,
             quota_attachments_limit_bytes: 0,
             quota_inbox_limit_count: 0,
@@ -934,6 +987,18 @@ impl Default for Config {
             atc_cusum_delta: 0.1,
             atc_ledger_capacity: 1000,
             atc_suspicion_k: 3.0,
+
+            // WBQ tuning
+            wbq_channel_capacity: 8_192,
+            wbq_drain_batch_cap: 256,
+            wbq_flush_interval_ms: 100,
+            wbq_enqueue_timeout_ms: 100,
+
+            // Coalescer tuning
+            coalescer_flush_ms: 50,
+            coalescer_max_batch_size: 10,
+            coalescer_max_workers: 32,
+            coalescer_queue_cap: 512,
         }
     }
 }
@@ -1039,11 +1104,9 @@ impl Config {
         config.database_pool_size = env_usize_opt("DATABASE_POOL_SIZE");
         config.database_max_overflow = env_usize_opt("DATABASE_MAX_OVERFLOW");
         config.database_pool_timeout = env_u64_opt("DATABASE_POOL_TIMEOUT");
-        config.database_cache_budget_kb = env_usize(
-            "DATABASE_CACHE_BUDGET_KB",
-            config.database_cache_budget_kb,
-        )
-        .clamp(16_384, 4_194_304); // 16 MiB .. 4 GiB
+        config.database_cache_budget_kb =
+            env_usize("DATABASE_CACHE_BUDGET_KB", config.database_cache_budget_kb)
+                .clamp(16_384, 4_194_304); // 16 MiB .. 4 GiB
         config.integrity_check_on_startup = env_bool(
             "INTEGRITY_CHECK_ON_STARTUP",
             config.integrity_check_on_startup,
@@ -1124,6 +1187,46 @@ impl Config {
         if let Some(v) = env_value("OTEL_EXPORTER_OTLP_ENDPOINT") {
             config.http_otel_exporter_otlp_endpoint = v;
         }
+
+        // HTTP Supervisor tuning
+        config.http_max_connections =
+            env_usize("AM_HTTP_MAX_CONNECTIONS", config.http_max_connections).max(16);
+        config.http_drain_timeout_secs =
+            env_u64("AM_HTTP_DRAIN_TIMEOUT_SECS", config.http_drain_timeout_secs).max(1);
+        config.http_idle_timeout_secs =
+            env_u64("AM_HTTP_IDLE_TIMEOUT_SECS", config.http_idle_timeout_secs).max(2);
+        config.http_probe_interval_secs = env_u64(
+            "AM_HTTP_PROBE_INTERVAL_SECS",
+            config.http_probe_interval_secs,
+        )
+        .max(1);
+        config.http_probe_failure_threshold = env_u64(
+            "AM_HTTP_PROBE_FAILURE_THRESHOLD",
+            u64::from(config.http_probe_failure_threshold),
+        )
+        .clamp(1, 100) as u32;
+        config.http_probe_startup_grace_secs = env_u64(
+            "AM_HTTP_PROBE_STARTUP_GRACE_SECS",
+            config.http_probe_startup_grace_secs,
+        )
+        .max(1);
+        config.http_probe_timeout_secs =
+            env_u64("AM_HTTP_PROBE_TIMEOUT_SECS", config.http_probe_timeout_secs).max(1);
+        config.http_restart_backoff_min_ms = env_u64(
+            "AM_HTTP_RESTART_BACKOFF_MIN_MS",
+            config.http_restart_backoff_min_ms,
+        )
+        .max(50);
+        config.http_restart_backoff_max_ms = env_u64(
+            "AM_HTTP_RESTART_BACKOFF_MAX_MS",
+            config.http_restart_backoff_max_ms,
+        )
+        .max(config.http_restart_backoff_min_ms);
+        config.http_max_restart_failures = env_u64(
+            "AM_HTTP_MAX_RESTART_FAILURES",
+            u64::from(config.http_max_restart_failures),
+        )
+        .clamp(1, 1000) as u32;
 
         // Rate Limiting
         config.http_rate_limit_enabled =
@@ -1315,8 +1418,16 @@ impl Config {
 
         // LLM
         config.llm_enabled = env_bool("LLM_ENABLED", config.llm_enabled);
-        if let Some(v) = env_value("LLM_DEFAULT_MODEL") {
+        let llm_model_explicit = env_value("LLM_DEFAULT_MODEL");
+        if let Some(v) = llm_model_explicit {
             config.llm_default_model = v;
+        } else if config.llm_enabled {
+            eprintln!(
+                "[warn] LLM_ENABLED=true but LLM_DEFAULT_MODEL is not set; \
+                 using compiled default '{}' which may be outdated. \
+                 Set LLM_DEFAULT_MODEL explicitly to suppress this warning.",
+                config.llm_default_model,
+            );
         }
         config.llm_temperature = env_f64("LLM_TEMPERATURE", config.llm_temperature);
         config.llm_max_tokens = env_u32("LLM_MAX_TOKENS", config.llm_max_tokens);
@@ -1668,6 +1779,29 @@ impl Config {
         {
             config.atc_suspicion_k = f;
         }
+
+        // WBQ tuning
+        config.wbq_channel_capacity =
+            env_usize("AM_WBQ_CHANNEL_CAPACITY", config.wbq_channel_capacity).clamp(256, 131_072);
+        config.wbq_drain_batch_cap =
+            env_usize("AM_WBQ_DRAIN_BATCH_CAP", config.wbq_drain_batch_cap).clamp(16, 4_096);
+        config.wbq_flush_interval_ms =
+            env_u64("AM_WBQ_FLUSH_INTERVAL_MS", config.wbq_flush_interval_ms).clamp(10, 10_000);
+        config.wbq_enqueue_timeout_ms =
+            env_u64("AM_WBQ_ENQUEUE_TIMEOUT_MS", config.wbq_enqueue_timeout_ms).clamp(10, 30_000);
+
+        // Coalescer tuning
+        config.coalescer_flush_ms =
+            env_u64("AM_COALESCER_FLUSH_MS", config.coalescer_flush_ms).clamp(5, 5_000);
+        config.coalescer_max_batch_size = env_usize(
+            "AM_COALESCER_MAX_BATCH_SIZE",
+            config.coalescer_max_batch_size,
+        )
+        .clamp(1, 500);
+        config.coalescer_max_workers =
+            env_usize("AM_COALESCER_MAX_WORKERS", config.coalescer_max_workers).clamp(1, 128);
+        config.coalescer_queue_cap =
+            env_usize("AM_COALESCER_QUEUE_CAP", config.coalescer_queue_cap).clamp(16, 16_384);
 
         config
     }
