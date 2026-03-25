@@ -51,6 +51,12 @@ pub struct Config {
     pub database_pool_size: Option<usize>,
     pub database_max_overflow: Option<usize>,
     pub database_pool_timeout: Option<u64>,
+    /// Total page-cache budget across all pooled connections (KiB).
+    ///
+    /// The per-connection `cache_size` PRAGMA is set to
+    /// `database_cache_budget_kb / max_connections`, clamped to \[2 MiB, 64 MiB\].
+    /// Override via `DATABASE_CACHE_BUDGET_KB`. Default: 524_288 (512 MiB).
+    pub database_cache_budget_kb: usize,
     /// Run `PRAGMA quick_check` on pool initialization (default: true).
     pub integrity_check_on_startup: bool,
     /// Hours between periodic full `PRAGMA integrity_check` runs (default: 24, 0 = disabled).
@@ -677,6 +683,7 @@ impl Default for Config {
             database_pool_size: None,
             database_max_overflow: None,
             database_pool_timeout: None,
+            database_cache_budget_kb: 512 * 1024, // 512 MiB
             integrity_check_on_startup: true,
             integrity_check_interval_hours: 24,
 
@@ -1032,6 +1039,11 @@ impl Config {
         config.database_pool_size = env_usize_opt("DATABASE_POOL_SIZE");
         config.database_max_overflow = env_usize_opt("DATABASE_MAX_OVERFLOW");
         config.database_pool_timeout = env_u64_opt("DATABASE_POOL_TIMEOUT");
+        config.database_cache_budget_kb = env_usize(
+            "DATABASE_CACHE_BUDGET_KB",
+            config.database_cache_budget_kb,
+        )
+        .clamp(16_384, 4_194_304); // 16 MiB .. 4 GiB
         config.integrity_check_on_startup = env_bool(
             "INTEGRITY_CHECK_ON_STARTUP",
             config.integrity_check_on_startup,

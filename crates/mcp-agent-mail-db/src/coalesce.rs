@@ -25,13 +25,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-/// Number of independent shards for the coalesce map.
+/// Compute shard count from available CPU parallelism.
 ///
-/// Each shard has its own mutex, so operations on keys that hash to
-/// different shards never contend. 16 is a good default: it is small
-/// enough that `inflight_count()` (which sums all shards) stays fast,
-/// and large enough that contention is negligible for typical workloads.
-const NUM_SHARDS: usize = 16;
+/// Clamped to [4, 64] — 4 shards is the minimum for any meaningful
+/// contention reduction, and beyond 64 the `inflight_count()` summation
+/// cost dominates.
+fn default_num_shards() -> usize {
+    std::thread::available_parallelism()
+        .map_or(4, std::num::NonZero::get)
+        .clamp(4, 64)
+}
 
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(msg) = payload.downcast_ref::<&str>() {
@@ -201,7 +204,8 @@ pub struct CoalesceMetrics {
 ///   `Hash + Eq + Clone + Send + Sync`.
 /// - `V`: The result value. Must be `Clone + Send + Sync` (cloned to joiners).
 pub struct ShardedCoalesceMap<K, V> {
-    shards: [Mutex<HashMap<K, Arc<Slot<V>>>>; NUM_SHARDS],
+    shards: Vec<Mutex<HashMap<K, Arc<Slot<V>>>>>,
+    num_shards: usize,
     max_entries_per_shard: usize,
     join_timeout: Duration,
     // Metrics (lock-free atomics).
@@ -225,10 +229,14 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardedCoalesceMap<K, V> {
     ///   independently.
     #[must_use]
     pub fn new(max_entries: usize, join_timeout: Duration) -> Self {
-        let per_shard = max_entries.saturating_add(NUM_SHARDS - 1) / NUM_SHARDS;
+        let num_shards = default_num_shards();
+        let per_shard = max_entries.saturating_add(num_shards - 1) / num_shards;
         let cap = per_shard.min(8);
         Self {
-            shards: std::array::from_fn(|_| Mutex::new(HashMap::with_capacity(cap))),
+            shards: (0..num_shards)
+                .map(|_| Mutex::new(HashMap::with_capacity(cap)))
+                .collect(),
+            num_shards,
             max_entries_per_shard: per_shard,
             join_timeout,
             leader_count: AtomicU64::new(0),
@@ -239,11 +247,11 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardedCoalesceMap<K, V> {
     }
 
     /// Compute the shard index for a key using `DefaultHasher`.
-    #[allow(clippy::cast_possible_truncation)] // modulo 16 fits in any pointer width
-    fn shard_index(key: &K) -> usize {
+    #[allow(clippy::cast_possible_truncation)]
+    fn shard_index(&self, key: &K) -> usize {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
-        (hasher.finish() as usize) % NUM_SHARDS
+        (hasher.finish() as usize) % self.num_shards
     }
 
     /// Execute `f` or join an existing in-flight operation for the same key.
@@ -264,7 +272,7 @@ impl<K: Hash + Eq + Clone, V: Clone> ShardedCoalesceMap<K, V> {
             Joiner(Arc<Slot<V>>),
         }
 
-        let shard_idx = Self::shard_index(&key);
+        let shard_idx = self.shard_index(&key);
 
         let (role, inflight_count) = {
             let mut map = self.shards[shard_idx]
@@ -1852,18 +1860,21 @@ mod tests {
     #[test]
     fn sharded_hash_distribution() {
         // Verify that hashing distributes keys across multiple shards.
-        // With 100 distinct keys, we expect most of the 16 shards to be hit.
-        let mut shard_hits = [0u32; NUM_SHARDS];
+        let map: CoalesceMap<String, ()> = CoalesceMap::new(100, Duration::from_millis(100));
+        let num_shards = map.num_shards;
+        let mut shard_hits = vec![0u32; num_shards];
         for i in 0..100 {
             let key = format!("distribution-test-key-{i}");
-            let idx = ShardedCoalesceMap::<String, ()>::shard_index(&key);
+            let idx = map.shard_index(&key);
             shard_hits[idx] += 1;
         }
 
+        // With 100 distinct keys, we expect at least 60% of shards to be hit.
+        let min_expected = (num_shards * 60 / 100).max(1);
         let shards_used = shard_hits.iter().filter(|&&c| c > 0).count();
         assert!(
-            shards_used >= 10,
-            "expected at least 10 of 16 shards used, got {shards_used} (distribution: {shard_hits:?})"
+            shards_used >= min_expected,
+            "expected at least {min_expected} of {num_shards} shards used, got {shards_used} (distribution: {shard_hits:?})"
         );
 
         // No single shard should have more than 25% of keys (extreme imbalance).
