@@ -300,8 +300,8 @@ Dedicated `tests/*.rs` harness count by crate:
 
 ### Harness Richness and Artifact Gaps
 
-- The common harness is already materially richer than a “stdout + exit code” shell runner. It captures structured traces, environment snapshots with redaction, transcript summaries, repro breadcrumbs, fixture IDs, and a validated `bundle.json`.
-- The biggest artifact-contract gap is that the common harness does **not** emit the per-suite `manifest.json` requested by [br-aazao.8.1](br-aazao.8.1). Current artifacts are rich, but case-level manifest structure is still implicit across `summary.json`, `trace/events.jsonl`, `bundle.json`, and suite-specific sidecars.
+- The common harness is already materially richer than a “stdout + exit code” shell runner. It captures structured traces, environment snapshots with redaction, transcript summaries, repro breadcrumbs, fixture IDs, a machine-readable per-suite `manifest.json`, and a validated `bundle.json`.
+- The remaining artifact-contract gaps are now mostly about consistency rather than missing structure. Case-level evidence is machine-readable after [br-aazao.8.1](br-aazao.8.1), but some suites still weaken enforcement with `e2e_summary || true`, and thin wrappers still add little observability of their own.
 - Thin wrappers inherit richness from their delegated scripts, but the wrapper files themselves add almost no observability beyond the delegation comment and fallback invocation hints. That is acceptable for compatibility, but not a substitute for auditing the underlying script.
 - Several suites explicitly weaken artifact enforcement by tolerating summary failure on some paths with `e2e_summary || true`. Representative examples live in [scripts/e2e_http.sh](/data/projects/mcp_agent_mail_rust/scripts/e2e_http.sh), [scripts/e2e_console.sh](/data/projects/mcp_agent_mail_rust/scripts/e2e_console.sh), [scripts/e2e_share.sh](/data/projects/mcp_agent_mail_rust/scripts/e2e_share.sh), [scripts/e2e_tui_full_traversal.sh](/data/projects/mcp_agent_mail_rust/scripts/e2e_tui_full_traversal.sh), and [tests/e2e/test_http_streamable.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_http_streamable.sh).
 - One suite calls out a known harness weakness directly: [test_check_inbox.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_check_inbox.sh) documents that `e2e_summary` may fail because of a pre-existing bug in `e2e_write_server_log_stats`, then suppresses the failure. That is a real artifact-confidence gap, not just a stylistic nit.
@@ -373,20 +373,79 @@ Dedicated `tests/*.rs` harness count by crate:
 - `TOON`: current coverage proves the envelope contract, not a real encoder deployment. This is a release-confidence gap, not a missing-assertion nit.
 - `Search + embedder + LLM`: these lanes already have good algorithm and contract coverage, but the substitutes are sitting on product-critical ranking and summarization paths. They need explicit realism boundaries.
 - `Installer + self-update`: the mocked release/test-install lanes are useful, but recent live failures show they cannot be mistaken for production-proof coverage.
-- `Shell E2E artifacts`: the harness is rich, but until `manifest.json` and summary-failure enforcement are uniform, downstream forensic automation still has blind spots.
+- `Shell E2E artifacts`: the harness now has both `manifest.json` and `bundle.json`, but summary-failure suppression and wrapper-level observability still leave forensic blind spots in some suites.
 
 ### Secondary Gaps Where Ownership Matters More Than Raw Test Count
 
 - `share`, `wasm`, `agent-detect`, and the binary entrypoint surfaces are the clearest places where coverage depth is still thin enough to warrant dedicated closure beads.
 - Local-fixture tests in guard/storage/share are doing the right job for narrow policy/fault logic. The missing piece is not deleting those tests; it is pairing them with a few higher-level real-path proofs where they currently stand alone.
 
+## Sanctioned Substitute Policy (`br-aazao.2.2`)
+
+- Default rule: if the decisive dependency can be exercised locally with the real binary, real transport, real storage, or real protocol boundary, prefer `R0` or `R1`. `R2` and `R3` are exceptions, not the default lane.
+- Allowed substitute classes:
+  - `R1 Deterministic local fixture` for synthetic local inputs that still drive the real engine, parser, DB, archive, Git, transport, or rendering stack.
+  - `R2 Sanctioned substitute` only when the stand-in preserves a meaningful contract boundary and exists to make the lane deterministic, offline, or affordable enough to run regularly.
+  - `R3 Mock / stub / fake lane` only for narrow branch forcing, fault injection, or explicit contract smoke where the test clearly does not claim full operational realism.
+- Disallowed substitute classes:
+  - any fake binary, mocked service, stub encoder, stub embedder, or stub LLM path presented as the only proof for a production-facing claim;
+  - any substitute that can produce behavior impossible in production but is not labeled as `R3`;
+  - any substitute lane that lacks a compensating real-path reference and still claims the feature is “covered.”
+
+### Compensation Rules By Dependency Class
+
+| Dependency class | Can a substitute exist? | Minimum compensating real-path evidence |
+|---|---|---|
+| SQLite / archive / filesystem / Git durability | `R1` yes, `R2/R3` only for narrow fault forcing | At least one `R0` or strong `R1` lane must prove the real DB/archive/Git path that the user or operator depends on |
+| MCP stdio / HTTP transport | `R1` yes for payload shaping, `R3` only for isolated failure injection | Real stdio and/or real loopback HTTP E2E must exist somewhere in the stack before the transport claim is considered closed |
+| CLI binaries, installer, self-update artifacts | `R3` allowed for offline smoke and hostile-edge forcing only | Real binary invocation plus at least one real install/update artifact lane must exist before release confidence is claimed |
+| TUI / robot / dashboard surfaces | fixture-driven rendering tests are fine | At least one live operator-facing path must exercise navigation, input, and output on the real surface before sign-off |
+| Search / embedder / LLM paths | substitutes may exist for offline determinism | Stub rankers, embedders, or LLMs do not prove quality; real engine/model evidence or a narrowly scoped contract-only claim is required |
+| Share / export crypto and hosting flows | synthetic bundles are fine for narrow corruption cases | Closure requires at least one real bundle/export/verify path over real crypto and filesystem state; hosted verification claims need a real deploy/verify lane |
+
+### Annotation Rules For `R2` And `R3`
+
+- Every substitute-based test or suite must name the replaced dependency in a nearby comment, module docstring, or suite banner.
+- Every substitute-based lane must state its realism grade (`R2` or `R3`) and what claim it does and does not support.
+- Every substitute-based lane must cite the compensating real-path evidence or the owning bead for that missing evidence.
+- Reviews should reject substitute-based additions that do not meet those annotation rules, even if the test itself is technically useful.
+
+## Coverage Closure And Sign-Off Criteria (`br-aazao.2.3`)
+
+- A surface is only “closed” when the highest-value user or operator claim has a non-fragile `R0` or explicitly adequate `R1` lane, not just because total test count is high.
+- Remaining `R2` and `R3` lanes must be enumerated, justified, and linked to compensating real-path evidence or an open owner bead.
+- Closure is per surface, not per repository. Search quality, installer reliability, and DB durability can be at different closure states at the same time.
+
+### Closure Criteria
+
+- `Closed`: decisive path has real-path evidence at the layer where failure matters, substitute lanes are disclosed, and repro/artifact evidence is good enough for later review.
+- `Conditionally closed`: primary real-path evidence exists, but there is still a tracked realism or observability debt that does not invalidate the core claim.
+- `Open`: decisive path is still carried mainly by `R2`, `R3`, or `R4`, or the real-path lane is missing for the claim being made.
+
+### Blocking Severity
+
+| Severity | Meaning |
+|---|---|
+| Release-blocking | missing real-path proof for installer/update, transport, persistence, crypto/share, search quality, LLM quality, or other operator/user-critical claims |
+| Merge-blocking | new substitute lane without annotation/compensation, a regression that downgrades an existing surface’s realism grade, or a new feature with no stated verification plan |
+| Documentation-only debt | known non-critical realism debt that is already disclosed, graded honestly, and owned by a concrete follow-on bead |
+
+### Sign-Off Template For Later Beads
+
+- `Surface`: subsystem, command, or workflow being signed off.
+- `Claim`: the specific behavior being asserted as covered.
+- `Primary evidence`: the strongest `R0`/`R1` lane supporting the claim.
+- `Residual substitute lanes`: any `R2`/`R3` lanes that remain relevant.
+- `Compensating real-path coverage`: where the substitute debt is paid down elsewhere.
+- `Blocking status`: `release-blocking`, `merge-blocking`, or `documentation-only debt`.
+- `Owner bead`: the bead that owns any remaining closure work.
+- `Decision`: `closed`, `conditionally closed`, or `open`.
+
 ## Obvious Follow-On Targets
 
-- `br-aazao.2.2`: define which substitute lanes are still allowed, which are forbidden, and what compensating real-path evidence must exist.
-- `br-aazao.2.3`: convert the taxonomy into an explicit closure/sign-off rubric so later verification beads can be judged mechanically.
 - `br-aazao.3`: replace the biggest fake-binary, stub-encoder, and mock-release lanes with real-path inputs where that confidence claim matters.
 - `br-aazao.4`: isolate or replace the search/embedder/LLM substitute lanes so ranking and summarization realism claims stay honest.
-- `br-aazao.8.1`: add the missing per-suite `manifest.json` contract so the current rich artifact set becomes uniformly machine-readable at the case level.
+- `br-aazao.8.4`: standardize transcript capture, server logs, and state snapshots so the richer manifest/bundle contract stays consistently useful across suites.
 - `br-aazao.5` / `6` / `7`: use the per-crate laggards above to drive concrete closure work instead of broad “add more tests” efforts.
 
 ## Completion Bar For `br-aazao.1`

@@ -179,6 +179,11 @@ Every component crate includes inline `#[cfg(test)]` unit tests alongside the im
 
 Cross-component integration tests live in the workspace `tests/` directory. E2E tests live in `tests/e2e/`.
 
+Use `docs/VERIFICATION_COVERAGE_LEDGER.md` as the canonical realism/closure policy:
+- `R0` / `R1` can support closure claims when the decisive dependency path is real.
+- `R2` / `R3` substitutes are second-best evidence and must cite compensating real-path coverage.
+- Do not claim a stub-only lane closes a user-facing, transport, persistence, installer/update, search/LLM, or crypto/share path.
+
 ### Unit Tests
 
 ```bash

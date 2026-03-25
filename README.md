@@ -1212,6 +1212,14 @@ Verification checklist:
 - Artifact repro commands reference `am e2e run` (not script-first commands).
 - CI/release docs and runbooks do not present `scripts/e2e_test.sh` as the primary command.
 
+### Verification Realism Policy
+
+The canonical realism and closure policy lives in [docs/VERIFICATION_COVERAGE_LEDGER.md](/data/projects/mcp_agent_mail_rust/docs/VERIFICATION_COVERAGE_LEDGER.md).
+
+- `R0` and `R1` are the lanes that carry closure weight.
+- `R2` and `R3` substitutes are second-best evidence and must name their compensating real-path coverage.
+- Stub-only lanes do not close transport, persistence, install/update, search-quality, LLM-quality, crypto/share, or operator-surface claims by themselves.
+
 ### Key Dependencies
 
 | Crate | Purpose |
