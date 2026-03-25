@@ -2357,26 +2357,30 @@ fn restore_quarantined_primary_with_sidecar_label(
     sidecar_label: &str,
     timestamp: &str,
 ) -> Result<(), SqlError> {
-    if !quarantined_path.exists() {
-        return Ok(());
-    }
-
     if primary_path.exists() {
         let restore_timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-        let _ = quarantine_reconstructed_candidate(
+        quarantine_reconstructed_candidate(
             primary_path,
             &restore_timestamp,
             "archive-reconcile-restore",
-        );
+        )
+        .map_err(|e| {
+            SqlError::Custom(format!(
+                "failed to quarantine live sqlite candidate {} before restore: {e}",
+                primary_path.display()
+            ))
+        })?;
     }
 
-    std::fs::rename(quarantined_path, primary_path).map_err(|e| {
-        SqlError::Custom(format!(
-            "failed to restore original database {} from {}: {e}",
-            primary_path.display(),
-            quarantined_path.display()
-        ))
-    })?;
+    if quarantined_path.exists() {
+        std::fs::rename(quarantined_path, primary_path).map_err(|e| {
+            SqlError::Custom(format!(
+                "failed to restore original database {} from {}: {e}",
+                primary_path.display(),
+                quarantined_path.display()
+            ))
+        })?;
+    }
 
     restore_quarantined_sidecar(primary_path, "-wal", sidecar_label, timestamp)?;
     restore_quarantined_sidecar(primary_path, "-shm", sidecar_label, timestamp)?;
@@ -4703,6 +4707,80 @@ mod tests {
         assert_eq!(std::fs::read(&shm).unwrap(), b"shm");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn restore_quarantined_primary_fails_closed_when_live_candidate_quarantine_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("test.db");
+        let wal = dir.path().join("test.db-wal");
+        let original = dir
+            .path()
+            .join("test.db.archive-reconcile-20260218_120000_000");
+
+        std::fs::write(&primary, b"candidate").expect("write candidate primary");
+        std::fs::write(&wal, b"candidate wal").expect("write candidate wal");
+        std::fs::write(&original, b"original").expect("write original db");
+
+        let original_mode = std::fs::metadata(dir.path())
+            .expect("dir metadata")
+            .permissions()
+            .mode();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("make directory read-only");
+
+        let err = restore_quarantined_primary_with_sidecar_label(
+            &primary,
+            &original,
+            "archive-reconcile",
+            "20260218_120000_000",
+        )
+        .expect_err("live candidate quarantine failure should stop restore");
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(original_mode))
+            .expect("restore directory permissions");
+
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("failed to quarantine live sqlite candidate"),
+            "unexpected error: {err_text}"
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), b"candidate");
+        assert_eq!(std::fs::read(&wal).unwrap(), b"candidate wal");
+        assert_eq!(std::fs::read(&original).unwrap(), b"original");
+    }
+
+    #[test]
+    fn restore_quarantined_primary_restores_sidecars_without_primary_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("test.db");
+        let wal = dir.path().join("test.db-wal");
+        let shm = dir.path().join("test.db-shm");
+
+        std::fs::write(
+            dir.path().join("test.db-wal.corrupt-20260218_120000_000"),
+            b"wal",
+        )
+        .expect("write quarantined wal");
+        std::fs::write(
+            dir.path().join("test.db-shm.corrupt-20260218_120000_000"),
+            b"shm",
+        )
+        .expect("write quarantined shm");
+
+        restore_quarantined_primary(
+            &primary,
+            &dir.path().join("missing.db"),
+            "20260218_120000_000",
+        )
+        .expect("restore sidecars without primary");
+
+        assert!(!primary.exists(), "missing primary should stay absent");
+        assert_eq!(std::fs::read(&wal).unwrap(), b"wal");
+        assert_eq!(std::fs::read(&shm).unwrap(), b"shm");
+    }
+
     #[test]
     fn quarantine_reconstructed_candidate_uses_reason_specific_sidecar_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -4797,6 +4875,39 @@ mod tests {
         assert!(
             !quarantined.exists(),
             "quarantined primary should be restored on failure"
+        );
+    }
+
+    #[test]
+    fn quarantine_corrupt_sidecars_or_restore_primary_restores_sidecars_without_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("test.db");
+        let wal = dir.path().join("test.db-wal");
+        let shm = dir.path().join("test.db-shm");
+        let quarantine_target = dir.path().join("test.db-shm.corrupt-20260218_120000_000");
+        std::fs::write(&wal, b"wal").expect("write wal");
+        std::fs::write(&shm, b"shm").expect("write shm");
+        std::fs::create_dir(&quarantine_target).expect("create blocking target directory");
+
+        let err = quarantine_corrupt_sidecars_or_restore_primary(
+            &primary,
+            &dir.path().join("missing.db"),
+            "20260218_120000_000",
+            "unit test without primary",
+        )
+        .expect_err("sidecar quarantine failure should roll back sidecars");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("failed to quarantine SHM sidecar"),
+            "unexpected error: {err_text}"
+        );
+        assert_eq!(std::fs::read(&wal).unwrap(), b"wal");
+        assert_eq!(std::fs::read(&shm).unwrap(), b"shm");
+        assert!(
+            !dir.path()
+                .join("test.db-wal.corrupt-20260218_120000_000")
+                .exists(),
+            "successful WAL quarantine should be rolled back if SHM quarantine fails"
         );
     }
 
