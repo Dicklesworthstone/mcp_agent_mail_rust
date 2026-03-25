@@ -3469,6 +3469,8 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
         resolve_project_identity(&project_dir.display().to_string()).slug
     };
 
+    let existing_cache = read_setup_self_heal_cache(config, &project_dir);
+
     let params = setup::SetupParams {
         host: config.http_host.clone(),
         port: config.http_port,
@@ -3477,7 +3479,10 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
         project_dir: project_dir.clone(),
         agents: Some(target_agents.clone()),
         dry_run: false,
-        skip_user_config: false,
+        skip_user_config: existing_cache
+            .as_ref()
+            .map(|c| c.skip_user_config)
+            .unwrap_or(false),
         skip_hooks,
         project_slug,
         agent_name,
@@ -3496,8 +3501,6 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
         skip_hooks: params.skip_hooks,
         file_fingerprints: Vec::new(),
     };
-
-    let existing_cache = read_setup_self_heal_cache(config, &project_dir);
     let mut computed_fingerprints: Option<Vec<SetupSelfHealFileFingerprint>> = None;
     let mut build_expected_full_cache = || {
         let fingerprints = computed_fingerprints
