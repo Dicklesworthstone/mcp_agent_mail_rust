@@ -139,9 +139,9 @@ struct ListenerPidHint {
 
 /// Maximum age of a PID hint file before it's considered stale (seconds).
 /// Stale hints are ignored to prevent PID recycling attacks.
-/// Override via `AM_pid_hint_max_age_secs()` env var.
+/// Override via `AM_PID_HINT_MAX_AGE_SECS` env var.
 fn pid_hint_max_age_secs() -> u64 {
-    std::env::var("AM_pid_hint_max_age_secs()")
+    std::env::var("AM_PID_HINT_MAX_AGE_SECS")
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .unwrap_or(86400) // 24 hours default

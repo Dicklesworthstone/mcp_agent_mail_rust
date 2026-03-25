@@ -1484,7 +1484,7 @@ async fn probe_http_healthz(
     let started_at = Instant::now();
     match timeout(
         wall_now(),
-        HTTP_SUPERVISOR_PROBE_TIMEOUT,
+        Duration::from_secs(config.http_probe_timeout_secs),
         client.get(cx, &url),
     )
     .await
@@ -1566,19 +1566,19 @@ fn build_http_runtime() -> std::io::Result<Runtime> {
         .map_err(|err| map_asupersync_err(&err))
 }
 
-fn restart_backoff_ms(previous_ms: u64) -> u64 {
+fn restart_backoff_ms(previous_ms: u64, min_ms: u64, max_ms: u64) -> u64 {
     if previous_ms == 0 {
-        HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS
+        min_ms
     } else {
-        (previous_ms.saturating_mul(2)).min(HTTP_SUPERVISOR_RESTART_BACKOFF_MAX_MS)
+        (previous_ms.saturating_mul(2)).min(max_ms)
     }
 }
 
-fn reset_probe_state() -> (u32, Instant, Instant) {
+fn reset_probe_state(config: &mcp_agent_mail_core::Config) -> (u32, Instant, Instant) {
     (
         0,
-        Instant::now() + HTTP_SUPERVISOR_PROBE_INTERVAL,
-        Instant::now() + HTTP_SUPERVISOR_PROBE_STARTUP_GRACE,
+        Instant::now() + Duration::from_secs(config.http_probe_interval_secs),
+        Instant::now() + Duration::from_secs(config.http_probe_startup_grace_secs),
     )
 }
 
@@ -2640,10 +2640,10 @@ where
             }
             Err(err) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
-                if consecutive_failures >= HTTP_SUPERVISOR_MAX_CONSECUTIVE_RESTART_FAILURES {
+                if consecutive_failures >= config.http_max_restart_failures {
                     tracing::error!(
                         consecutive_failures,
-                        max = HTTP_SUPERVISOR_MAX_CONSECUTIVE_RESTART_FAILURES,
+                        max = config.http_max_restart_failures,
                         host = %config.http_host,
                         port = config.http_port,
                         error = %err,
@@ -2656,7 +2656,11 @@ where
                         config.http_host, config.http_port, consecutive_failures,
                     )));
                 }
-                *last_restart_sleep_ms = restart_backoff_ms(*last_restart_sleep_ms);
+                *last_restart_sleep_ms = restart_backoff_ms(
+                    *last_restart_sleep_ms,
+                    config.http_restart_backoff_min_ms,
+                    config.http_restart_backoff_max_ms,
+                );
                 on_retry_error(&err, *last_restart_sleep_ms);
                 sleep_fn(Duration::from_millis(*last_restart_sleep_ms)).await;
             }
@@ -2713,7 +2717,7 @@ async fn run_http_server_supervisor(
     );
 
     let mut last_restart_sleep_ms: u64 = 0;
-    let (mut liveness_failures, mut next_probe_at, mut probe_grace_until) = reset_probe_state();
+    let (mut liveness_failures, mut next_probe_at, mut probe_grace_until) = reset_probe_state(&config);
 
     loop {
         if cx.is_cancel_requested() {
@@ -2775,7 +2779,7 @@ async fn run_http_server_supervisor(
                 backoff_ms = last_restart_sleep_ms,
                 "HTTP server auto-restarted after unexpected exit"
             );
-            (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state();
+            (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state(&config);
             continue;
         }
 
@@ -2795,7 +2799,7 @@ async fn run_http_server_supervisor(
                     )
                     .await?;
                     last_restart_sleep_ms = 0;
-                    (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state();
+                    (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state(&config);
                     handled_control = true;
                 }
                 Ok(Ok(tui_bridge::ServerControlMsg::SetTransportBase(desired))) => {
@@ -2808,7 +2812,7 @@ async fn run_http_server_supervisor(
                     )
                     .await?;
                     last_restart_sleep_ms = 0;
-                    (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state();
+                    (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state(&config);
                     handled_control = true;
                 }
                 Ok(Ok(tui_bridge::ServerControlMsg::ComposeEnvelope(envelope))) => {
@@ -2838,7 +2842,7 @@ async fn run_http_server_supervisor(
         if now < next_probe_at {
             continue;
         }
-        next_probe_at = now + HTTP_SUPERVISOR_PROBE_INTERVAL;
+        next_probe_at = now + Duration::from_secs(config.http_probe_interval_secs);
 
         let probe_result = probe_http_healthz(cx, &config).await;
         if probe_result.is_ok() {
@@ -2855,13 +2859,13 @@ async fn run_http_server_supervisor(
         tracing::warn!(
             ?probe_failure,
             failures = liveness_failures,
-            threshold = HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD,
+            threshold = config.http_probe_failure_threshold,
             host = %config.http_host,
             port = config.http_port,
             "HTTP liveness probe failed"
         );
 
-        if liveness_failures < HTTP_SUPERVISOR_PROBE_FAILURE_THRESHOLD {
+        if liveness_failures < config.http_probe_failure_threshold {
             continue;
         }
 
@@ -2906,7 +2910,7 @@ async fn run_http_server_supervisor(
             backoff_ms = last_restart_sleep_ms,
             "HTTP server auto-restarted after liveness probe failures"
         );
-        (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state();
+        (liveness_failures, next_probe_at, probe_grace_until) = reset_probe_state(&config);
     }
 }
 
@@ -4588,16 +4592,40 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
     let mut last_summary_log_micros = 0_i64;
     /// Maximum pending effects before backpressure drops oldest.
     const MAX_PENDING_EFFECTS: usize = 512;
+    /// Refresh durable ATC population state once per minute to avoid cold-start
+    /// emptiness and to absorb agents registered outside the current process.
+    const ATC_POPULATION_SYNC_INTERVAL_MICROS: i64 = 60_000_000;
     let mut pending_effects: VecDeque<atc::AtcEffectPlan> = VecDeque::new();
     let mut pending_effect_keys: HashSet<String> = HashSet::new();
     let mut atc_resolution_tick_counter: u64 = 0;
     let mut executor_registered_projects: HashSet<String> = HashSet::new();
+    let mut next_population_sync_micros = 0_i64;
 
     set_atc_operator_snapshot(AtcOperatorSnapshot::warming_up(true));
 
     while !stop.load(Ordering::Relaxed) {
-        let now_micros = mcp_agent_mail_core::timestamps::now_micros();
         let started_at = Instant::now();
+        let sync_check_micros = mcp_agent_mail_core::timestamps::now_micros();
+        if let Some(pool) = atc_db_pool.as_ref()
+            && sync_check_micros >= next_population_sync_micros
+        {
+            match atc::atc_sync_population_from_db(pool) {
+                Ok(stats) => {
+                    tracing::debug!(
+                        projects = stats.projects,
+                        agents = stats.agents,
+                        active_agents = stats.active_agents,
+                        "synchronized ATC population from durable state"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to synchronize ATC population from DB");
+                }
+            }
+            next_population_sync_micros = mcp_agent_mail_core::timestamps::now_micros()
+                .saturating_add(ATC_POPULATION_SYNC_INTERVAL_MICROS);
+        }
+        let now_micros = mcp_agent_mail_core::timestamps::now_micros();
         let (live_summary, new_effects) = match atc::atc_tick_report(now_micros) {
             Some(report) => (Some(report.summary), report.effects),
             None => (None, Vec::new()),
@@ -22390,19 +22418,19 @@ mod tests {
             retry_backoffs,
             vec![
                 HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS,
-                restart_backoff_ms(HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS),
+                restart_backoff_ms(HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS, HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS, HTTP_SUPERVISOR_RESTART_BACKOFF_MAX_MS),
             ]
         );
         assert_eq!(
             slept,
             vec![
                 Duration::from_millis(HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS),
-                Duration::from_millis(restart_backoff_ms(HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS)),
+                Duration::from_millis(restart_backoff_ms(HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS, HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS, HTTP_SUPERVISOR_RESTART_BACKOFF_MAX_MS)),
             ]
         );
         assert_eq!(
             last_restart_sleep_ms,
-            restart_backoff_ms(HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS)
+            restart_backoff_ms(HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS, HTTP_SUPERVISOR_RESTART_BACKOFF_MIN_MS, HTTP_SUPERVISOR_RESTART_BACKOFF_MAX_MS)
         );
 
         runtime.block_on(async {

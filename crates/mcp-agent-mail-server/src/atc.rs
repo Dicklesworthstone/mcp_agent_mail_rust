@@ -8770,6 +8770,9 @@ pub fn atc_observe_activity_with_project(
     project_key: Option<&str>,
     timestamp_micros: i64,
 ) {
+    if agent.trim().is_empty() {
+        return;
+    }
     let Some(engine) = ATC_ENGINE.get() else {
         return;
     };
@@ -8779,7 +8782,142 @@ pub fn atc_observe_activity_with_project(
     if !e.enabled() {
         return;
     }
+    let base_k = e.config.suspicion_k;
+    if !e.agents.contains_key(agent) {
+        // Tool-call activity frequently arrives after ATC startup for agents
+        // that were registered in a previous process lifetime. Auto-register
+        // unknown agents so liveness tracking can start from the first signal.
+        e.register_agent(agent, "unknown-tool", project_key);
+    }
+    drop(e);
+    if let Some(thresholds) = ATC_THRESHOLDS.get()
+        && let Ok(mut t) = thresholds.lock()
+    {
+        t.entry(agent.to_string())
+            .or_insert_with(|| AdaptiveThreshold::new(base_k));
+    }
+    let Some(engine) = ATC_ENGINE.get() else {
+        return;
+    };
+    let Ok(mut e) = engine.lock() else {
+        return;
+    };
     e.observe_activity(agent, project_key, timestamp_micros);
+}
+
+/// Merge an authoritative agent snapshot into the ATC engine.
+///
+/// This is intentionally monotonic for `last_activity_ts`: repeated syncs from
+/// the durable DB/archive must never resurrect an agent based on stale data.
+pub fn atc_sync_agent_snapshot(
+    name: &str,
+    program: &str,
+    project_key: Option<&str>,
+    last_activity_ts: i64,
+) {
+    if name.trim().is_empty() {
+        return;
+    }
+    let Some(engine) = ATC_ENGINE.get() else {
+        return;
+    };
+    let Ok(mut e) = engine.lock() else {
+        return;
+    };
+    if !e.enabled() {
+        return;
+    }
+    let base_k = e.config.suspicion_k;
+    let program = if program.trim().is_empty() {
+        "unknown-tool"
+    } else {
+        program
+    };
+
+    e.register_agent(name, program, project_key);
+    let prior_last_activity = e
+        .agents
+        .get(name)
+        .map_or(0, |entry| entry.rhythm.last_activity_ts);
+    drop(e);
+    if let Some(thresholds) = ATC_THRESHOLDS.get()
+        && let Ok(mut t) = thresholds.lock()
+    {
+        t.entry(name.to_string())
+            .or_insert_with(|| AdaptiveThreshold::new(base_k));
+    }
+    let Some(engine) = ATC_ENGINE.get() else {
+        return;
+    };
+    let Ok(mut e) = engine.lock() else {
+        return;
+    };
+    if last_activity_ts > prior_last_activity {
+        e.observe_activity(name, project_key, last_activity_ts);
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AtcPopulationSyncStats {
+    pub projects: usize,
+    pub agents: usize,
+    pub active_agents: usize,
+}
+
+/// Hydrate the ATC engine from the durable DB snapshot.
+///
+/// This seeds pre-existing agents on cold start and refreshes their latest
+/// known activity monotonically so periodic syncs cannot regress liveness.
+pub fn atc_sync_population_from_db(
+    pool: &mcp_agent_mail_db::DbPool,
+) -> Result<AtcPopulationSyncStats, String> {
+    let cx = asupersync::Cx::for_request_with_budget(asupersync::Budget::INFINITE);
+    let projects =
+        match fastmcp_core::block_on(mcp_agent_mail_db::queries::list_projects(&cx, pool)) {
+            asupersync::Outcome::Ok(rows) => rows,
+            asupersync::Outcome::Err(error) => return Err(error.to_string()),
+            asupersync::Outcome::Cancelled(reason) => {
+                return Err(format!("cancelled: {reason:?}"));
+            }
+            asupersync::Outcome::Panicked(payload) => {
+                return Err(format!("panicked: {}", payload.message()));
+            }
+        };
+
+    let mut stats = AtcPopulationSyncStats::default();
+    for project in projects {
+        let Some(project_id) = project.id else {
+            continue;
+        };
+        stats.projects = stats.projects.saturating_add(1);
+        let agents = match fastmcp_core::block_on(mcp_agent_mail_db::queries::list_agents(
+            &cx, pool, project_id,
+        )) {
+            asupersync::Outcome::Ok(rows) => rows,
+            asupersync::Outcome::Err(error) => return Err(error.to_string()),
+            asupersync::Outcome::Cancelled(reason) => {
+                return Err(format!("cancelled: {reason:?}"));
+            }
+            asupersync::Outcome::Panicked(payload) => {
+                return Err(format!("panicked: {}", payload.message()));
+            }
+        };
+        let project_key = project.human_key.trim();
+        let project_key = (!project_key.is_empty()).then_some(project_key);
+        for agent in agents {
+            stats.agents = stats.agents.saturating_add(1);
+            if agent.last_active_ts > 0 {
+                stats.active_agents = stats.active_agents.saturating_add(1);
+            }
+            atc_sync_agent_snapshot(
+                &agent.name,
+                &agent.program,
+                project_key,
+                agent.last_active_ts,
+            );
+        }
+    }
+    Ok(stats)
 }
 
 #[derive(Debug, Clone)]
@@ -9562,6 +9700,149 @@ mod alien_enhancement_tests {
             engine.agents.is_empty(),
             "disabled ATC should not accumulate tracked agents"
         );
+    }
+
+    #[test]
+    fn observe_activity_auto_registers_unknown_agent() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        reset_global_atc_state_for_test(&config);
+
+        atc_observe_activity_with_project("DriftAgent", Some("/tmp/project"), 1_000_000);
+
+        let engine_lock = ATC_ENGINE.get().expect("engine initialized");
+        let engine = engine_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = engine.agents.get("DriftAgent").expect("agent tracked");
+        assert_eq!(entry.program, "unknown-tool");
+        assert_eq!(entry.project_key.as_deref(), Some("/tmp/project"));
+        assert_eq!(entry.rhythm.last_activity_ts, 1_000_000);
+    }
+
+    #[test]
+    fn sync_agent_snapshot_does_not_resurrect_from_stale_activity() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        reset_global_atc_state_for_test(&config);
+
+        atc_sync_agent_snapshot(
+            "BootstrapAgent",
+            "claude-code",
+            Some("/tmp/project"),
+            5_000_000,
+        );
+
+        {
+            let engine_lock = ATC_ENGINE.get().expect("engine initialized");
+            let mut engine = engine_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = engine
+                .agents
+                .get_mut("BootstrapAgent")
+                .expect("agent tracked");
+            entry.state = LivenessState::Dead;
+            entry.suspect_since = 4_000_000;
+        }
+
+        atc_sync_agent_snapshot(
+            "BootstrapAgent",
+            "codex-cli",
+            Some("/tmp/project"),
+            5_000_000,
+        );
+
+        let engine_lock = ATC_ENGINE.get().expect("engine initialized");
+        let engine = engine_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = engine.agents.get("BootstrapAgent").expect("agent tracked");
+        assert_eq!(entry.program, "codex-cli");
+        assert_eq!(entry.state, LivenessState::Dead);
+        assert_eq!(entry.rhythm.last_activity_ts, 5_000_000);
+    }
+
+    #[test]
+    fn sync_population_from_db_seeds_existing_agents() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = mcp_agent_mail_core::Config::default();
+        reset_global_atc_state_for_test(&config);
+
+        let cx = asupersync::Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("atc-sync-population.db");
+
+        let init_conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        init_conn
+            .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init pragmas");
+        init_conn
+            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        match fastmcp_core::block_on(mcp_agent_mail_db::schema::migrate_to_latest_base(
+            &cx, &init_conn,
+        )) {
+            asupersync::Outcome::Ok(_) => {}
+            asupersync::Outcome::Err(error) => panic!("apply migrations: {error}"),
+            other => panic!("unexpected migration outcome: {other:?}"),
+        }
+        drop(init_conn);
+
+        let pool = mcp_agent_mail_db::create_pool(&mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create pool");
+
+        let project = match fastmcp_core::block_on(mcp_agent_mail_db::queries::ensure_project(
+            &cx,
+            &pool,
+            "/tmp/atc-sync-population",
+        )) {
+            asupersync::Outcome::Ok(project) => project,
+            other => panic!("ensure project: {other:?}"),
+        };
+        let project_id = project.id.expect("project id");
+
+        let agent = match fastmcp_core::block_on(mcp_agent_mail_db::queries::register_agent(
+            &cx,
+            &pool,
+            project_id,
+            "BlueLake",
+            "claude-code",
+            "gpt5",
+            Some("ATC hydration test"),
+            None,
+            None,
+        )) {
+            asupersync::Outcome::Ok(agent) => agent,
+            other => panic!("register agent: {other:?}"),
+        };
+
+        let stats = atc_sync_population_from_db(&pool).expect("sync population");
+        assert_eq!(stats.projects, 1);
+        assert_eq!(stats.agents, 1);
+        assert_eq!(stats.active_agents, 1);
+        assert_eq!(
+            atc_agent_last_activity("BlueLake"),
+            Some(agent.last_active_ts)
+        );
+
+        let summary = atc_summary().expect("summary");
+        assert_eq!(summary.tracked_agents.len(), 1);
+        assert_eq!(summary.tracked_agents[0].name, "BlueLake");
     }
 
     #[test]
