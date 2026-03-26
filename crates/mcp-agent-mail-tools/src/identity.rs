@@ -655,7 +655,7 @@ Check that all parameters have valid values."
     // Generate and persist a registration token for sender identity verification.
     // Every registration (new or update) rotates the token so that only the
     // most recent registrant can prove ownership.
-    let registration_token = mcp_agent_mail_core::setup::generate_registration_token();
+    let mut registration_token = mcp_agent_mail_core::setup::generate_registration_token();
     if let Some(agent_id) = row.id {
         let token_update = mcp_agent_mail_db::queries::update_agent_registration_token(
             ctx.cx(),
@@ -669,14 +669,18 @@ Check that all parameters have valid values."
                 "failed to persist registration_token for agent {}: {e}",
                 row.name
             );
+            // Do not cache or return a token that was not persisted.
+            registration_token.clear();
         }
     }
 
     // Update the in-memory row so the cache receives the freshly persisted token.
     // Without this, resolve_agent would serve a stale AgentRow (token = None)
     // and sender_token verification in send_message would silently downgrade
-    // to unverified.
-    row.registration_token = Some(registration_token.clone());
+    // to unverified.  Only set when persistence succeeded.
+    if !registration_token.is_empty() {
+        row.registration_token = Some(registration_token.clone());
+    }
 
     // Invalidate + repopulate read cache after mutation
     mcp_agent_mail_db::read_cache().invalidate_agent(project_id, &row.name, row.id);
@@ -879,7 +883,7 @@ Choose a different name (or omit the name to auto-generate one)."
     enqueue_agent_semantic_index(&row);
 
     // Generate and persist a registration token for sender identity verification.
-    let registration_token = mcp_agent_mail_core::setup::generate_registration_token();
+    let mut registration_token = mcp_agent_mail_core::setup::generate_registration_token();
     if let Some(agent_id) = row.id {
         let token_update = mcp_agent_mail_db::queries::update_agent_registration_token(
             ctx.cx(),
@@ -893,14 +897,18 @@ Choose a different name (or omit the name to auto-generate one)."
                 "failed to persist registration_token for agent {}: {e}",
                 row.name
             );
+            // Do not cache or return a token that was not persisted.
+            registration_token.clear();
         }
     }
 
     // Update the in-memory row so the cache receives the freshly persisted token.
     // Without this, resolve_agent would serve a stale AgentRow (token = None)
     // and sender_token verification in send_message would silently downgrade
-    // to unverified.
-    row.registration_token = Some(registration_token.clone());
+    // to unverified.  Only set when persistence succeeded.
+    if !registration_token.is_empty() {
+        row.registration_token = Some(registration_token.clone());
+    }
 
     // Invalidate + repopulate read cache after mutation
     mcp_agent_mail_db::read_cache().invalidate_agent(project_id, &row.name, row.id);

@@ -4697,7 +4697,9 @@ pub fn store_attachment(
     // prevention in the image decoder, so it should never be MORE
     // restrictive than the old hard-coded 50 MiB.
     let effective_limit = if config.max_attachment_bytes > 0 {
-        config.max_attachment_bytes.max(FALLBACK_MAX_ATTACHMENT_BYTES)
+        config
+            .max_attachment_bytes
+            .max(FALLBACK_MAX_ATTACHMENT_BYTES)
     } else {
         FALLBACK_MAX_ATTACHMENT_BYTES
     };

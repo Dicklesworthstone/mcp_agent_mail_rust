@@ -250,14 +250,20 @@ pub fn attempt_vacuum_recovery(conn: &DbConn, original_path: &str) -> DbResult<S
     std::fs::copy(original_path, &recovery_path)
         .map_err(|e| DbError::Sqlite(format!("copy recovery failed: {e}")))?;
     // Also copy WAL/SHM so the recovery copy has the full state.
-    let _ = std::fs::copy(
+    // These are best-effort (the files may not exist in rollback-journal mode),
+    // but failures are logged because a missing WAL means recent writes are lost.
+    if let Err(e) = std::fs::copy(
         format!("{original_path}-wal"),
         format!("{recovery_path}-wal"),
-    );
-    let _ = std::fs::copy(
+    ) {
+        tracing::warn!(path = %original_path, error = %e, "WAL copy failed during recovery — recent writes may be missing");
+    }
+    if let Err(e) = std::fs::copy(
         format!("{original_path}-shm"),
         format!("{recovery_path}-shm"),
-    );
+    ) {
+        tracing::debug!(path = %original_path, error = %e, "SHM copy skipped during recovery");
+    }
 
     // Verify the recovery copy is valid.
     let recovery_conn = DbConn::open_file(&recovery_path).map_err(|e| {

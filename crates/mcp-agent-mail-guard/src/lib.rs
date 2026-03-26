@@ -1486,7 +1486,7 @@ fn read_active_reservations_from_archive(
 fn released_ts_marks_record_released(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Null => false,
-        serde_json::Value::Number(number) => number.as_f64().is_none_or(|value| value > 0.0),
+        serde_json::Value::Number(number) => number.as_f64().is_some_and(|value| value > 0.0),
         serde_json::Value::String(text) => {
             let trimmed = text.trim();
             if trimmed.is_empty()
@@ -1501,12 +1501,16 @@ fn released_ts_marks_record_released(value: &serde_json::Value) -> bool {
                 .chars()
                 .all(|ch| ch.is_ascii_digit() || matches!(ch, '.' | '+' | '-'))
             {
-                return trimmed.parse::<f64>().map_or(true, |value| value > 0.0);
+                // Fail-closed: unparseable numeric strings are NOT released.
+                return trimmed.parse::<f64>().is_ok_and(|value| value > 0.0);
             }
 
+            // Non-numeric, non-empty, non-null strings (e.g. ISO timestamps)
+            // are treated as valid release markers.
             true
         }
-        _ => true,
+        // Fail-closed: unexpected JSON types are NOT treated as released.
+        _ => false,
     }
 }
 
