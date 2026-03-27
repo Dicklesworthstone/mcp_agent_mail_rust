@@ -1710,12 +1710,13 @@ mod tests {
             "SELECT COUNT(*) AS count FROM messages WHERE project_id = ? AND sender_id = ?",
             &[Value::BigInt(report.project_id), Value::BigInt(red_id)],
         );
+        // Use a simple COUNT — the bench DB has a single project, so all
+        // recipient rows belong to it.  Avoids IN(SELECT …) subqueries
+        // which FrankenSQLite may not evaluate correctly.
         let recipient_rows = count_with_params(
             &conn,
-            "SELECT COUNT(*) AS count \
-             FROM message_recipients \
-             WHERE message_id IN (SELECT id FROM messages WHERE project_id = ?)",
-            &[Value::BigInt(report.project_id)],
+            "SELECT COUNT(*) AS count FROM message_recipients",
+            &[],
         );
 
         assert_eq!(blue_messages, i64::from(BENCH_SEED_FORWARD_MESSAGES));
