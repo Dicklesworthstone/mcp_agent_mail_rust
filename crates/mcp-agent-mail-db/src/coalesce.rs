@@ -1881,7 +1881,8 @@ mod tests {
         // With fewer shards the expected per-shard count is higher, so we use a
         // proportion-based threshold instead of a hard-coded count.
         let max_per_shard = *shard_hits.iter().max().unwrap();
-        let imbalance_limit = (100_u32 * 50 / 100).max(1); // 50% of 100 keys
+        let num_keys = 100_u32;
+        let imbalance_limit = (num_keys * 50 / 100).max(1); // 50% of keys
         assert!(
             max_per_shard <= imbalance_limit,
             "expected no shard with >{imbalance_limit} of 100 keys, got {max_per_shard} \

@@ -596,7 +596,7 @@ pub async fn macro_contact_handshake(
     let target_project_key = target_project.human_key.clone();
     let target_agent_name =
         mcp_agent_mail_core::models::normalize_agent_name(&target_resolution.agent_name)
-            .unwrap_or(target_resolution.agent_name.clone());
+            .unwrap_or_else(|| target_resolution.agent_name.clone());
     let is_cross_project = source_project.id != target_project.id;
 
     let should_auto_accept = auto_accept.unwrap_or(false);
@@ -651,7 +651,14 @@ pub async fn macro_contact_handshake(
     let thread_id_for_log = thread_id.clone();
 
     let welcome_val = if let (Some(subject), Some(body)) = (welcome_subject, welcome_body) {
-        if !is_cross_project {
+        if is_cross_project {
+            tracing::debug!(
+                from = %from_agent,
+                to = %target_agent_name,
+                "welcome message skipped for cross-project handshake (messaging across projects not yet supported)"
+            );
+            None
+        } else {
             let welcome_json = crate::messaging::send_message(
                 ctx,
                 source_project_key.clone(),
@@ -673,13 +680,6 @@ pub async fn macro_contact_handshake(
             )
             .await?;
             Some(parse_json(welcome_json, "welcome_message")?)
-        } else {
-            tracing::debug!(
-                from = %from_agent,
-                to = %target_agent_name,
-                "welcome message skipped for cross-project handshake (messaging across projects not yet supported)"
-            );
-            None
         }
     } else {
         None

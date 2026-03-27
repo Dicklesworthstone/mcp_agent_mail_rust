@@ -1238,6 +1238,7 @@ pub async fn list_agents(ctx: &McpContext, project_key: String) -> McpResult<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     // ── redact_database_url ──
 
@@ -1586,9 +1587,11 @@ mod tests {
 
     #[test]
     fn reject_ephemeral_project_in_default_storage_allows_custom_storage_roots() {
-        let mut config = Config::default();
-        config.storage_root = PathBuf::from("/tmp/custom-storage-root");
-        config.allow_ephemeral_projects_in_default_storage = false;
+        let config = Config {
+            storage_root: PathBuf::from("/tmp/custom-storage-root"),
+            allow_ephemeral_projects_in_default_storage: false,
+            ..Config::default()
+        };
 
         reject_ephemeral_project_in_default_storage(&config, "/tmp/test-project")
             .expect("custom storage root should allow tmp project");
