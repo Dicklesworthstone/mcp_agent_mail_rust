@@ -14,40 +14,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout frankensearch
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/frankensearch
-          path: ../frankensearch
-          fetch-depth: 1
-
-      - name: Checkout asupersync
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/asupersync
-          path: ../asupersync
-          fetch-depth: 1
-
-      - name: Checkout sqlmodel_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/sqlmodel_rust
-          path: ../sqlmodel_rust
-          fetch-depth: 1
-
-      - name: Checkout frankensqlite
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/frankensqlite
-          path: ../frankensqlite
-          fetch-depth: 1
-
-      - name: Checkout frankentui
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/frankentui
-          path: ../frankentui
-          fetch-depth: 1
+      - name: Clone sibling dependencies
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -64,40 +37,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout frankensearch
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/frankensearch
-          path: ../frankensearch
-          fetch-depth: 1
-
-      - name: Checkout asupersync
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/asupersync
-          path: ../asupersync
-          fetch-depth: 1
-
-      - name: Checkout sqlmodel_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/sqlmodel_rust
-          path: ../sqlmodel_rust
-          fetch-depth: 1
-
-      - name: Checkout frankensqlite
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/frankensqlite
-          path: ../frankensqlite
-          fetch-depth: 1
-
-      - name: Checkout frankentui
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/frankentui
-          path: ../frankentui
-          fetch-depth: 1
+      - name: Clone sibling dependencies
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
 
       - uses: dtolnay/rust-toolchain@nightly
 
@@ -131,40 +77,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout frankensearch
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/frankensearch
-          path: ../frankensearch
-          fetch-depth: 1
-
-      - name: Checkout asupersync
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/asupersync
-          path: ../asupersync
-          fetch-depth: 1
-
-      - name: Checkout sqlmodel_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/sqlmodel_rust
-          path: ../sqlmodel_rust
-          fetch-depth: 1
-
-      - name: Checkout frankensqlite
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/frankensqlite
-          path: ../frankensqlite
-          fetch-depth: 1
-
-      - name: Checkout frankentui
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/frankentui
-          path: ../frankentui
-          fetch-depth: 1
+      - name: Clone sibling dependencies
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
