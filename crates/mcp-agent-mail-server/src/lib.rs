@@ -3146,9 +3146,12 @@ const HEALTH_COUNT_CACHE_TTL: Duration = Duration::from_secs(30);
 /// `Option` so we can distinguish "never fetched" from "fetch failed".
 static HEALTH_COUNT_CACHE: std::sync::LazyLock<Mutex<(Instant, Option<(u64, u64)>)>> =
     std::sync::LazyLock::new(|| {
-        // Initialise with an `Instant` far enough in the past to guarantee the
-        // first call always refreshes.
-        Mutex::new((Instant::now() - HEALTH_COUNT_CACHE_TTL - Duration::from_secs(1), None))
+        // Start with `None` — the read path checks `cached.is_some()` before
+        // trusting the TTL, so the first call always refreshes regardless of
+        // the initial Instant.  (Using `Instant::now() - TTL` would panic if
+        // the server starts within ~31s of system boot on Linux, where
+        // CLOCK_MONOTONIC starts from zero.)
+        Mutex::new((Instant::now(), None))
     });
 
 // ---------------------------------------------------------------------------
@@ -9912,7 +9915,7 @@ fn enrich_readiness_response(database_url: &str, body: &mut serde_json::Value) {
     let cached_counts = {
         let guard = lock_mutex(&HEALTH_COUNT_CACHE);
         let (last_refresh, cached) = &*guard;
-        if last_refresh.elapsed() < HEALTH_COUNT_CACHE_TTL {
+        if cached.is_some() && last_refresh.elapsed() < HEALTH_COUNT_CACHE_TTL {
             *cached
         } else {
             // Cache is stale — release the lock before doing I/O, then
