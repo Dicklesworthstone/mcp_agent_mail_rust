@@ -79,6 +79,95 @@ pub fn check_db_lock_status(config: &Config) -> DbLockStatus {
     }
 }
 
+/// Information about a process holding a database lock.
+#[derive(Debug)]
+struct LockHolder {
+    pid: u32,
+    cmdline: String,
+    is_python: bool,
+}
+
+/// Attempt to identify the process holding an flock on the given file.
+///
+/// On Linux, reads `/proc/locks` to find FLOCK entries whose inode matches the
+/// database file, then reads `/proc/<pid>/cmdline` for the command line. Returns
+/// `None` on non-Linux platforms or if identification fails for any reason.
+fn identify_lock_holder(db_path: &std::path::Path) -> Option<LockHolder> {
+    identify_lock_holder_via_proc(db_path)
+}
+
+#[cfg(target_os = "linux")]
+fn identify_lock_holder_via_proc(db_path: &std::path::Path) -> Option<LockHolder> {
+    use std::os::unix::fs::MetadataExt;
+
+    // Get the inode and device of the database file.
+    let meta = std::fs::metadata(db_path).ok()?;
+    let target_ino = meta.ino();
+    let target_dev = meta.dev();
+    // Extract major/minor from dev_t (Linux encoding).
+    let target_major = ((target_dev >> 8) & 0xfff) as u32;
+    let target_minor = ((target_dev & 0xff) | ((target_dev >> 12) & 0xfff00)) as u32;
+
+    // Parse /proc/locks line by line looking for FLOCK entries that match.
+    // Format: "1: FLOCK  ADVISORY  WRITE 12345 08:01:654321 0 EOF"
+    // The device major:minor fields are in hexadecimal, inode is decimal.
+    let locks_content = std::fs::read_to_string("/proc/locks").ok()?;
+    for line in locks_content.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 8 {
+            continue;
+        }
+        // fields[1] = lock type (FLOCK/POSIX), fields[4] = PID, fields[5] = maj:min:ino
+        if fields[1] != "FLOCK" {
+            continue;
+        }
+        let dev_ino = fields[5];
+        let parts: Vec<&str> = dev_ino.split(':').collect();
+        if parts.len() != 3 {
+            continue;
+        }
+        let Ok(major) = u32::from_str_radix(parts[0], 16) else {
+            continue;
+        };
+        let Ok(minor) = u32::from_str_radix(parts[1], 16) else {
+            continue;
+        };
+        let Ok(ino) = parts[2].parse::<u64>() else {
+            continue;
+        };
+        if ino != target_ino || major != target_major || minor != target_minor {
+            continue;
+        }
+        // Found a matching flock — extract the PID.
+        let Ok(pid) = fields[4].parse::<u32>() else {
+            continue;
+        };
+        // Read the command line from /proc/<pid>/cmdline.
+        let cmdline = pid_command_line(pid).unwrap_or_else(|| format!("<PID {pid}>"));
+        let is_python = cmdline
+            .split_whitespace()
+            .next()
+            .map(|argv0| {
+                let basename = argv0.rsplit(['/', '\\']).next().unwrap_or(argv0);
+                basename.starts_with("python")
+            })
+            .unwrap_or(false);
+        tracing::debug!(pid, %cmdline, is_python, "identified lock holder for db file");
+        return Some(LockHolder {
+            pid,
+            cmdline,
+            is_python,
+        });
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn identify_lock_holder_via_proc(_db_path: &std::path::Path) -> Option<LockHolder> {
+    // /proc/locks is Linux-specific; gracefully return None elsewhere.
+    None
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Port detection types (br-7ri2)
 // ──────────────────────────────────────────────────────────────────────
@@ -1545,10 +1634,42 @@ fn probe_db_lock(config: &Config) -> ProbeResult {
             let Some(sqlite_path) = sqlite_file_path_from_database_url(&config.database_url) else {
                 return ProbeResult::Ok { name: "db-lock" }; // Should be caught by probe_database
             };
+
+            // Best-effort: try to identify the process holding the lock.
+            let holder = identify_lock_holder(&sqlite_path);
+
+            let problem = match &holder {
+                Some(h) => format!(
+                    "Database file {} is exclusively locked by PID {} ({})",
+                    sqlite_path.display(),
+                    h.pid,
+                    h.cmdline,
+                ),
+                None => format!(
+                    "Database file {} is exclusively locked by another process",
+                    sqlite_path.display(),
+                ),
+            };
+
+            let fix = match &holder {
+                Some(h) if h.is_python => format!(
+                    "A Python process (PID {}) appears to hold the lock — this is likely a legacy Python HTTP worker. \
+                     Stop it with `kill {}`, then retry.",
+                    h.pid, h.pid,
+                ),
+                Some(h) => format!(
+                    "Stop the process holding the lock (PID {}: {}) or wait for it to release the database.",
+                    h.pid, h.cmdline,
+                ),
+                None => "Ensure no other 'am' or 'mcp-agent-mail' instances are running with the same database, \
+                         or wait for background tasks to complete."
+                    .into(),
+            };
+
             ProbeResult::Fail(ProbeFailure {
                 name: "db-lock",
-                problem: format!("Database file {} is exclusively locked by another process", sqlite_path.display()),
-                fix: "Ensure no other 'am' or 'mcp-agent-mail' instances are running with the same database, or wait for background tasks to complete.".into(),
+                problem,
+                fix,
             })
         }
         DbLockStatus::Error(msg) => ProbeResult::Fail(ProbeFailure {

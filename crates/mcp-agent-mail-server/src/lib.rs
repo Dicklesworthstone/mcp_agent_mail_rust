@@ -1077,6 +1077,7 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) {
     // Start background backfill for Search V3 if enabled.
     spawn_startup_search_backfill(config);
 
+    log_active_database(config);
     tracing::info!("MCP Agent Mail server (stdio) starting transport loop");
     build_server(config).run_stdio();
 
@@ -1931,6 +1932,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     mcp_agent_mail_core::pre_intern_policies();
 
     prepare_http_runtime_startup(config)?;
+    log_active_database(config);
     let _ = startup_checks::write_listener_pid_hint(&config.http_host, config.http_port);
     heal_storage_lock_artifacts(config);
     init_search_bridge(config);
@@ -2006,6 +2008,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }
     let _ = startup_checks::write_listener_pid_hint(&config.http_host, config.http_port);
+    log_active_database(config);
 
     // ── 2. Pre-paint essentials only ────────────────────────────────
     heal_storage_lock_artifacts(config);
@@ -7422,11 +7425,11 @@ impl HttpState {
                     tracing::warn!(error = %_err, "readiness check failed");
                     return Some(self.error_response(req, 503, "service unavailable"));
                 }
-                return Some(self.health_json_response(
-                    req,
-                    200,
-                    &serde_json::json!({"status":"ready"}),
-                ));
+                let mut body = serde_json::json!({"status":"ready"});
+                // Enrich readiness response with database identity so
+                // operators can verify the correct DB file is active.
+                enrich_readiness_response(&self.config.database_url, &mut body);
+                return Some(self.health_json_response(req, 200, &body));
             }
             "/.well-known/oauth-authorization-server"
             | "/.well-known/oauth-authorization-server/mcp" => {
@@ -8259,8 +8262,40 @@ to skip auth for local requests.</p>
         };
 
         let id = request.id.clone();
-        let result =
-            asupersync::runtime::spawn_blocking(move || arc_self.dispatch_inner(request)).await;
+        let method = request.method.clone();
+        let hard_timeout_secs = self.request_timeout_secs.saturating_add(5);
+        let spawn_future =
+            asupersync::runtime::spawn_blocking(move || arc_self.dispatch_inner(request));
+
+        let result = if hard_timeout_secs == 5 && self.request_timeout_secs == 0 {
+            // request_timeout_secs == 0 means no timeout (infinite budget).
+            spawn_future.await
+        } else {
+            match timeout(
+                wall_now(),
+                std::time::Duration::from_secs(hard_timeout_secs),
+                spawn_future,
+            )
+            .await
+            {
+                Ok(inner) => inner,
+                Err(_elapsed) => {
+                    tracing::error!(
+                        method = %method,
+                        hard_timeout_secs,
+                        "dispatch spawn_blocking timed out — likely SQLite busy_timeout \
+                         exceeded the request budget; returning error to caller"
+                    );
+                    Err(McpError::new(
+                        McpErrorCode::InternalError,
+                        format!(
+                            "Request timed out after {hard_timeout_secs}s \
+                             (method={method}). The database may be under heavy contention."
+                        ),
+                    ))
+                }
+            }
+        };
 
         match result {
             Ok(value) => id.map(|req_id| JsonRpcResponse::success(req_id, value)),
@@ -9713,6 +9748,96 @@ fn readiness_check(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
 
 fn readiness_check_quick(config: &mcp_agent_mail_core::Config) -> Result<(), String> {
     readiness_check_with_integrity(config, false)
+}
+
+/// Emit a prominent startup log line showing which database file is active.
+///
+/// This makes it trivially easy for operators to verify the correct DB when
+/// tailing logs after a restart or deployment.  Also warns when the database
+/// is empty (zero messages) while the archive/storage root contains data,
+/// which typically means the DB was recreated without restoring from archive.
+fn log_active_database(config: &mcp_agent_mail_core::Config) {
+    let db_display: std::borrow::Cow<'_, str> =
+        match mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&config.database_url) {
+            Some(p) => std::borrow::Cow::Owned(p.display().to_string()),
+            None if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(
+                &config.database_url,
+            ) => {
+                std::borrow::Cow::Borrowed(":memory:")
+            }
+            None => std::borrow::Cow::Borrowed("<unknown>"),
+        };
+
+    tracing::info!(
+        database = %db_display,
+        storage_root = %config.storage_root.display(),
+        "Active database"
+    );
+
+    // Best-effort warning: DB is empty but archive root has data.
+    if let Some(conn) = dashboard_open_connection(&config.database_url) {
+        let msg_count = dashboard_count(&conn, "SELECT COUNT(*) AS c FROM messages");
+        if msg_count == 0 {
+            let archive_has_data = config.storage_root.is_dir()
+                && std::fs::read_dir(&config.storage_root)
+                    .ok()
+                    .map_or(false, |mut entries| {
+                        entries.any(|e| e.ok().map_or(false, |e| e.path().is_dir()))
+                    });
+            if archive_has_data {
+                tracing::warn!(
+                    database = %db_display,
+                    storage_root = %config.storage_root.display(),
+                    "Database contains zero messages but the storage root has data — \
+                     the DB may have been recreated without restoring from archive"
+                );
+            }
+        }
+    }
+}
+
+/// Enrich a readiness JSON response with database identity metadata so
+/// operators can verify the correct DB file is active at a glance.
+///
+/// Adds: `database_path` (basename only), `project_count`, `message_count`,
+/// and `version`.  Count queries are best-effort — if they fail the
+/// corresponding fields are set to `null` rather than degrading the overall
+/// readiness signal.
+fn enrich_readiness_response(database_url: &str, body: &mut serde_json::Value) {
+    // Version — always available at compile time.
+    body["version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
+
+    // Database basename (security: never expose the full filesystem path).
+    let db_basename: serde_json::Value =
+        match mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(database_url) {
+            Some(p) => p
+                .file_name()
+                .map(|n| serde_json::Value::String(n.to_string_lossy().into_owned()))
+                .unwrap_or(serde_json::Value::Null),
+            None if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) => {
+                serde_json::json!(":memory:")
+            }
+            None => serde_json::Value::Null,
+        };
+    body["database_path"] = db_basename;
+
+    // Lightweight COUNT queries — reuse the dashboard connection pattern so we
+    // never block the readiness response on a heavy pool build.
+    let counts = dashboard_open_connection(database_url).and_then(|conn| {
+        let projects = dashboard_count(&conn, "SELECT COUNT(*) AS c FROM projects");
+        let messages = dashboard_count(&conn, "SELECT COUNT(*) AS c FROM messages");
+        Some((projects, messages))
+    });
+    match counts {
+        Some((projects, messages)) => {
+            body["project_count"] = serde_json::json!(projects);
+            body["message_count"] = serde_json::json!(messages);
+        }
+        None => {
+            body["project_count"] = serde_json::Value::Null;
+            body["message_count"] = serde_json::Value::Null;
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -17656,7 +17781,13 @@ mod tests {
         let resp = block_on(state.handle(req));
         assert_eq!(resp.status, 200);
         let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-        assert_eq!(body, serde_json::json!({"status": "ready"}));
+        assert_eq!(body["status"], "ready");
+        // Enriched identity fields are present.
+        assert!(body.get("version").is_some(), "version field must be present");
+        assert!(body.get("database_path").is_some(), "database_path field must be present");
+        assert!(body.get("project_count").is_some(), "project_count field must be present");
+        assert!(body.get("message_count").is_some(), "message_count field must be present");
+        assert_eq!(body["database_path"], ":memory:");
     }
 
     #[test]
@@ -17670,7 +17801,11 @@ mod tests {
         let resp = block_on(state.handle(req));
         assert_eq!(resp.status, 200);
         let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-        assert_eq!(body, serde_json::json!({"status": "ready"}));
+        assert_eq!(body["status"], "ready");
+        // Enriched identity fields are present.
+        assert!(body.get("version").is_some(), "version field must be present");
+        assert!(body.get("database_path").is_some(), "database_path field must be present");
+        assert_eq!(body["database_path"], ":memory:");
     }
 
     #[test]
