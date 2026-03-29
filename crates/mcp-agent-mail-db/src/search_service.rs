@@ -2450,7 +2450,6 @@ fn env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
         .clamp(min, max)
 }
 
-#[cfg(feature = "hybrid")]
 fn hybrid_budget_governor_config_from_env() -> HybridBudgetGovernorConfig {
     let defaults = HybridBudgetGovernorConfig::default();
     let tight_ms = defaults.tight_ms.clamp(1, 60_000);
