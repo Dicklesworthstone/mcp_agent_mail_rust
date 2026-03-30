@@ -437,32 +437,48 @@ fn count_old_messages(agents_dir: &Path, max_age_days: u64) -> usize {
     let cutoff = chrono::Utc::now()
         .checked_sub_signed(max_age)
         .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC);
-    let mut stack = vec![agents_dir.to_path_buf()];
+    
+    if let Ok(agents) = std::fs::read_dir(agents_dir) {
+        for agent in agents.flatten() {
+            let Ok(agent_type) = agent.file_type() else {
+                continue;
+            };
+            if !agent_type.is_dir() || agent_type.is_symlink() {
+                continue;
+            }
+            let inbox = agent.path().join("inbox");
+            if !is_real_directory(&inbox) {
+                continue;
+            }
+            
+            let mut stack = vec![inbox];
 
-    while let Some(current) = stack.pop() {
-        if let Ok(entries) = std::fs::read_dir(current) {
-            for entry in entries.flatten() {
-                let Ok(ft) = entry.file_type() else {
-                    continue;
-                };
-                if ft.is_symlink() {
-                    continue;
-                }
+            while let Some(current) = stack.pop() {
+                if let Ok(entries) = std::fs::read_dir(current) {
+                    for entry in entries.flatten() {
+                        let Ok(ft) = entry.file_type() else {
+                            continue;
+                        };
+                        if ft.is_symlink() {
+                            continue;
+                        }
 
-                let p = entry.path();
-                if ft.is_file() {
-                    if p.extension().is_some_and(|e| e == "md") {
-                        if let Ok(meta) = entry.metadata() {
-                            if let Ok(modified) = meta.modified() {
-                                let dt: chrono::DateTime<chrono::Utc> = modified.into();
-                                if dt < cutoff {
-                                    count = count.saturating_add(1);
+                        let p = entry.path();
+                        if ft.is_file() {
+                            if p.extension().is_some_and(|e| e == "md") {
+                                if let Ok(meta) = entry.metadata() {
+                                    if let Ok(modified) = meta.modified() {
+                                        let dt: chrono::DateTime<chrono::Utc> = modified.into();
+                                        if dt < cutoff {
+                                            count = count.saturating_add(1);
+                                        }
+                                    }
                                 }
                             }
+                        } else if ft.is_dir() {
+                            stack.push(p);
                         }
                     }
-                } else if ft.is_dir() {
-                    stack.push(p);
                 }
             }
         }

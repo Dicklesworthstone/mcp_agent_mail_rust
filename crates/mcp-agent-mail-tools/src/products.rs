@@ -53,7 +53,7 @@ fn generate_product_uid(now_micros: i64) -> String {
     let _ = write!(
         out,
         "{:016x}{:08x}{:08x}",
-        now_micros.cast_unsigned(),
+        now_micros as u64,
         pid,
         seq
     );

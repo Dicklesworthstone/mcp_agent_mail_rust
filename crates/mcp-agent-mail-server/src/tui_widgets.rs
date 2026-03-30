@@ -3743,8 +3743,7 @@ impl<'a> MessageCard<'a> {
                 for line in self.body.lines() {
                     let chars = line.chars().count();
                     // Estimate wrapping at 80 chars (safe default for thread view).
-                    #[allow(clippy::cast_possible_truncation)]
-                    let wrapped = (chars / 80) as u16 + 1;
+                    let wrapped = u16::try_from(chars / 80).unwrap_or(u16::MAX).saturating_add(1);
                     body_lines = body_lines.saturating_add(wrapped);
                 }
                 body_lines = body_lines.max(1);

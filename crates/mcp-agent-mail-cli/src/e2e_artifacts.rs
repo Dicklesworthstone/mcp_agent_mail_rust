@@ -1007,11 +1007,12 @@ impl ArtifactManager {
         let mut file = File::create(path)?;
 
         for (key, value) in std::env::vars() {
-            let redacted = if key.contains("TOKEN")
-                || key.contains("SECRET")
-                || key.contains("PASSWORD")
-                || key.contains("KEY")
-                || key.contains("CREDENTIAL")
+            let upper_key = key.to_ascii_uppercase();
+            let redacted = if upper_key.contains("TOKEN")
+                || upper_key.contains("SECRET")
+                || upper_key.contains("PASSWORD")
+                || upper_key.contains("KEY")
+                || upper_key.contains("CREDENTIAL")
             {
                 "[REDACTED]".to_string()
             } else {

@@ -271,16 +271,38 @@ impl SuiteRegistry {
 
     /// Simple glob-like pattern matching.
     fn matches_pattern(name: &str, pattern: &str) -> bool {
-        if pattern.contains('*') {
-            // Simple wildcard matching
-            let parts: Vec<&str> = pattern.split('*').collect();
-            if parts.len() == 2 {
-                let (prefix, suffix) = (parts[0], parts[1]);
-                return name.starts_with(prefix) && name.ends_with(suffix);
+        if !pattern.contains('*') {
+            return name == pattern || name.contains(pattern);
+        }
+
+        let parts: Vec<&str> = pattern.split('*').collect();
+        if parts.is_empty() {
+            return true;
+        }
+
+        let mut current_name = name;
+        for (i, part) in parts.iter().enumerate() {
+            if i == 0 {
+                if !current_name.starts_with(part) {
+                    return false;
+                }
+                current_name = &current_name[part.len()..];
+            } else if i == parts.len() - 1 {
+                if !current_name.ends_with(part) {
+                    return false;
+                }
+            } else {
+                if part.is_empty() {
+                    continue;
+                }
+                if let Some(pos) = current_name.find(part) {
+                    current_name = &current_name[pos + part.len()..];
+                } else {
+                    return false;
+                }
             }
         }
-        // Exact or substring match
-        name == pattern || name.contains(pattern)
+        true
     }
 }
 

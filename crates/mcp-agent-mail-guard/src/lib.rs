@@ -772,7 +772,7 @@ def glob_to_regex(pattern):
     regex = re.sub(r"\\?\{(.+?)\\?\}", lambda m: "(" + m.group(1).replace("\\", "").replace(",", "|") + ")", regex)
     return regex
 
-fn glob_match(path, pattern):
+def glob_match(path, pattern):
     """Simple shell-style glob matching (similar to Rust implementation)."""
     # NOTE: path must be a concrete path, pattern is the glob.
     normalized_f = normalize_match_input(path)
@@ -2288,7 +2288,10 @@ mod tests {
         // "MyAgent" should not conflict with its own reservation
         let conflicts =
             check_path_conflicts(&paths, &reservations, "MyAgent", false).expect("conflicts");
-        assert!(conflicts.is_empty(), "own reservations should be skipped");
+        assert!(
+            conflicts.is_empty(),
+            "own reservations should be skipped"
+        );
     }
 
     #[test]
@@ -2316,8 +2319,9 @@ mod tests {
         let paths = vec!["shared/README.md".to_string()];
 
         // SharedAgent's non-exclusive reservation should not block
-        let conflicts = check_path_conflicts(&paths, &reservations, "SomeOtherAgent", false)
-            .expect("conflicts");
+        let conflicts =
+            check_path_conflicts(&paths, &reservations, "SomeOtherAgent", false)
+                .expect("conflicts");
         assert!(
             conflicts.is_empty(),
             "non-exclusive reservations should not conflict"

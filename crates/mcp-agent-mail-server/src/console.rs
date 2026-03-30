@@ -118,10 +118,17 @@ fn sanitize_url_userinfo(value: &str) -> Option<String> {
     let scheme_end = value.find("://")?;
     let after_scheme = scheme_end + 3;
 
-    // Find the '@' that separates userinfo from host.
-    // We must find it AFTER the scheme.
-    let at_pos = value[after_scheme..].rfind('@')? + after_scheme;
-    let userinfo = &value[after_scheme..at_pos];
+    // The authority section ends at the first '/', '?', or '#'
+    let authority_end = value[after_scheme..]
+        .find(|c| c == '/' || c == '?' || c == '#')
+        .map(|i| i + after_scheme)
+        .unwrap_or(value.len());
+
+    let authority = &value[after_scheme..authority_end];
+
+    // Find the '@' that separates userinfo from host within the authority.
+    let at_pos_in_authority = authority.rfind('@')?;
+    let userinfo = &authority[..at_pos_in_authority];
 
     let colon_pos = userinfo.find(':')?;
     let user = &userinfo[..colon_pos];
@@ -130,12 +137,14 @@ fn sanitize_url_userinfo(value: &str) -> Option<String> {
         return None;
     }
 
+    let absolute_at_pos = after_scheme + at_pos_in_authority;
+
     let mut out = String::with_capacity(value.len() + MASK_REDACTED.len());
     out.push_str(&value[..after_scheme]);
     out.push_str(user);
     out.push(':');
     out.push_str(MASK_REDACTED);
-    out.push_str(&value[at_pos..]);
+    out.push_str(&value[absolute_at_pos..]);
     Some(out)
 }
 

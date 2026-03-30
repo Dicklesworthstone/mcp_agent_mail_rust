@@ -255,9 +255,11 @@ impl CompiledPattern {
             return true;
         }
 
-        if is_directory_prefix(&self.norm, &other.norm)
-            || is_directory_prefix(&other.norm, &self.norm)
-        {
+        if !self.is_glob && is_directory_prefix(&self.norm, &other.norm) {
+            return true;
+        }
+
+        if !other.is_glob && is_directory_prefix(&other.norm, &self.norm) {
             return true;
         }
 

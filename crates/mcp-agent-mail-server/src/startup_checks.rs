@@ -908,7 +908,14 @@ fn wildcard_request_conflicts_with_listener(listener_host: &str, requested_host:
         parse_canonical_ip(listener_host),
         parse_canonical_ip(requested_host),
     ) {
-        (Some(listener_ip), Some(requested_ip)) => listener_ip.is_ipv4() == requested_ip.is_ipv4(),
+        (Some(listener_ip), Some(requested_ip)) => {
+            if requested_ip.is_ipv6() && requested_ip.is_unspecified() {
+                // IPv6 wildcard often covers IPv4 on dual-stack OS
+                true
+            } else {
+                listener_ip.is_ipv4() == requested_ip.is_ipv4()
+            }
+        }
         // Be conservative for named hosts: if we cannot prove they do not conflict,
         // keep them in the candidate set so restart logic can inspect the listener PID.
         _ => true,
@@ -1899,8 +1906,8 @@ mod tests {
     fn format_errors_empty_when_all_pass() {
         let report = StartupReport {
             results: vec![
-                ProbeResult::Ok { name: "test1" },
-                ProbeResult::Ok { name: "test2" },
+                ProbeResult::Ok { name: "ok1" },
+                ProbeResult::Ok { name: "ok2" },
             ],
         };
         assert!(report.is_ok());
@@ -2469,10 +2476,7 @@ mod tests {
         assert!(listener_host_matches_request("*", "127.0.0.1"));
         assert!(listener_host_matches_request("0.0.0.0", "127.0.0.1"));
         assert!(listener_host_matches_request("::", "127.0.0.1"));
-        assert!(listener_host_matches_request(
-            "::ffff:127.0.0.1",
-            "127.0.0.1"
-        ));
+        assert!(listener_host_matches_request("::ffff:127.0.0.1", "127.0.0.1"));
         assert!(listener_host_matches_request("127.0.0.1", "localhost"));
         assert!(!listener_host_matches_request("127.0.0.2", "127.0.0.1"));
         assert!(listener_host_matches_request("127.0.0.1", "0.0.0.0"));

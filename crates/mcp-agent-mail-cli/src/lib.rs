@@ -18127,8 +18127,10 @@ fn truncate_str(s: &str, max: usize) -> String {
     let char_count = s.chars().count();
     if char_count <= max {
         s.to_string()
+    } else if max <= 3 {
+        s.chars().take(max).collect()
     } else {
-        let truncated: String = s.chars().take(max.saturating_sub(3)).collect();
+        let truncated: String = s.chars().take(max - 3).collect();
         format!("{truncated}...")
     }
 }
@@ -31382,7 +31384,7 @@ COMMIT;\n";
         for max in 1..=s.chars().count() + 2 {
             let r = truncate_str(s, max);
             assert!(
-                r.chars().count() <= max.max(3),
+                r.chars().count() <= max,
                 "max={max} got {} chars: {r:?}",
                 r.chars().count()
             );
@@ -35352,11 +35354,12 @@ struct ArchiveRestoreBackupEntry {
 }
 
 fn remove_restore_target_if_exists(path: &Path) -> CliResult<()> {
-    if !path.exists() {
-        return Ok(());
-    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
 
-    let metadata = std::fs::symlink_metadata(path)?;
     if metadata.is_dir() {
         std::fs::remove_dir_all(path)?;
     } else {
@@ -35372,16 +35375,16 @@ fn rollback_archive_restore(
     let mut errors = Vec::new();
 
     for entry in backup_entries.iter().rev() {
-        if entry.original.exists()
-            && let Err(error) = remove_restore_target_if_exists(&entry.original)
-        {
-            errors.push(format!(
-                "failed to remove partially restored {}: {error}",
-                entry.original.display()
-            ));
-            continue;
+        if std::fs::symlink_metadata(&entry.original).is_ok() {
+            if let Err(error) = remove_restore_target_if_exists(&entry.original) {
+                errors.push(format!(
+                    "failed to remove partially restored {}: {error}",
+                    entry.original.display()
+                ));
+                continue;
+            }
         }
-        if entry.backup.exists()
+        if std::fs::symlink_metadata(&entry.backup).is_ok()
             && let Err(error) = std::fs::rename(&entry.backup, &entry.original)
         {
             errors.push(format!(
@@ -35393,14 +35396,13 @@ fn rollback_archive_restore(
     }
 
     for target in cleanup_targets {
-        if !target.exists() {
-            continue;
-        }
-        if let Err(error) = remove_restore_target_if_exists(target) {
-            errors.push(format!(
-                "failed to clean partially restored {}: {error}",
-                target.display()
-            ));
+        if std::fs::symlink_metadata(target).is_ok() {
+            if let Err(error) = remove_restore_target_if_exists(target) {
+                errors.push(format!(
+                    "failed to clean partially restored {}: {error}",
+                    target.display()
+                ));
+            }
         }
     }
 
