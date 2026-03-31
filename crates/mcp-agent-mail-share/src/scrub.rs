@@ -347,19 +347,8 @@ pub fn scrub_snapshot(
             }
         }
 
-        // Generate a unique salt for pseudonymization reproducibility.
-        let pseudonym_salt = {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut h = DefaultHasher::new();
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-                .hash(&mut h);
-            std::process::id().hash(&mut h);
-            format!("{:016x}", h.finish())
-        };
+        // Generate a stable salt for pseudonymization reproducibility (matches Python).
+        let pseudonym_salt = preset.as_str().to_string();
         Ok(ScrubSummary {
             preset: preset.as_str().to_string(),
             pseudonym_salt,
