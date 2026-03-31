@@ -5154,6 +5154,7 @@ mod resource_shape_tests {
                         None,
                         None,
                         None,
+                        None, // sender_token
                     )
                     .await
                     .expect("reply_message"),

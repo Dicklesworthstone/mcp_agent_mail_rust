@@ -107,7 +107,7 @@ fn test_recipient_not_found_error_format() {
         "Use resource://agents/{project_slug} to list registered agents or register new identities."
     );
     let message = format!(
-        "Unable to send message \u{2014} local recipients {name} are not registered in project '{project_human_key}'; {hint}"
+        "Unable to send message &#x2014; local recipients {name} are not registered in project '{project_human_key}'; {hint}"
     );
     let err = legacy_tool_error(
         "RECIPIENT_NOT_FOUND",
@@ -179,17 +179,17 @@ fn test_send_message_empty_to_error() {
             vec![],
             "Test subject".to_string(),
             "Test body".to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None, // cc
+            None, // bcc
+            None, // attachment_paths
+            None, // convert_images
+            None, // importance
+            None, // ack_required
+            None, // thread_id
+            None, // topic
+            None, // broadcast
+            None, // auto_contact_if_blocked
+            None, // sender_token
         )
         .await
         .expect_err("empty to should fail");
@@ -229,17 +229,17 @@ fn test_invalid_importance_error() {
             vec!["RedPeak".to_string()],
             "Test subject".to_string(),
             "Test body".to_string(),
-            None,
-            None,
-            None,
-            None,
-            Some("invalid_level".to_string()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None, // cc
+            None, // bcc
+            None, // attachment_paths
+            None, // convert_images
+            Some("invalid_level".to_string()), // importance
+            None, // ack_required
+            None, // thread_id
+            None, // topic
+            None, // broadcast
+            None, // auto_contact_if_blocked
+            None, // sender_token
         )
         .await
         .expect_err("invalid importance should fail");
@@ -277,14 +277,15 @@ fn test_reply_message_not_found() {
             999_999,
             "BlueLake".to_string(),
             "Reply body".to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None, // to
+            None, // cc
+            None, // bcc
+            None, // subject_prefix
+            None, // importance
+            None, // ack_required
+            None, // attachment_paths
+            None, // convert_images
+            None, // sender_token
         )
         .await
         .expect_err("reply to nonexistent message should fail");
@@ -321,17 +322,17 @@ fn test_reply_message_subject_prefix() {
             vec!["RedPeak".to_string()],
             "Original subject".to_string(),
             "Hello".to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None, // cc
+            None, // bcc
+            None, // attachment_paths
+            None, // convert_images
+            None, // importance
+            None, // ack_required
+            None, // thread_id
+            None, // topic
+            None, // broadcast
+            None, // auto_contact_if_blocked
+            None, // sender_token
         )
         .await
         .expect("send_message should succeed");
@@ -348,14 +349,15 @@ fn test_reply_message_subject_prefix() {
             msg_id,
             "RedPeak".to_string(),
             "Reply body".to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None, // to
+            None, // cc
+            None, // bcc
+            None, // subject_prefix
+            None, // importance
+            None, // ack_required
+            None, // attachment_paths
+            None, // convert_images
+            None, // sender_token
         )
         .await
         .expect("reply should succeed");
@@ -379,14 +381,15 @@ fn test_reply_message_subject_prefix() {
             reply_id,
             "BlueLake".to_string(),
             "Second reply".to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None, // to
+            None, // cc
+            None, // bcc
+            None, // subject_prefix
+            None, // importance
+            None, // ack_required
+            None, // attachment_paths
+            None, // convert_images
+            None, // sender_token
         )
         .await
         .expect("second reply should succeed");
@@ -421,17 +424,17 @@ fn test_broadcast_with_explicit_to_error() {
             vec!["RedPeak".to_string()],
             "Test subject".to_string(),
             "Test body".to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(true),
-            None,
-            None,
+            None, // cc
+            None, // bcc
+            None, // attachment_paths
+            None, // convert_images
+            None, // importance
+            None, // ack_required
+            None, // thread_id
+            None, // topic
+            Some(true), // broadcast
+            None, // auto_contact_if_blocked
+            None, // sender_token
         )
         .await
         .expect_err("broadcast + explicit to should fail");
@@ -447,8 +450,7 @@ fn test_broadcast_with_explicit_to_error() {
             .expect("message");
         assert_eq!(
             msg,
-            "broadcast=true and explicit 'to' recipients are mutually exclusive. \
-             Set broadcast=true with an empty 'to' list, or provide explicit recipients without broadcast."
+            "broadcast=true and explicit 'to' recipients are mutually exclusive. Set broadcast=true with an empty 'to' list, or provide explicit recipients without broadcast."
         );
         assert_eq!(
             payload

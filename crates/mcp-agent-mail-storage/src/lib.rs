@@ -3897,27 +3897,7 @@ fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
 
 /// Write an agent's profile.json to the archive and commit it.
 pub fn write_agent_profile(archive: &ProjectArchive, agent: &serde_json::Value) -> Result<()> {
-    let name = agent
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
-    let name = validate_archive_component("agent name", name)?;
-
-    let profile_dir = archive.root.join("agents").join(name);
-    ensure_dir(&profile_dir)?;
-
-    let profile_path = profile_dir.join("profile.json");
-    write_json(&profile_path, agent, true)?;
-
-    let rel = rel_path_cached(&archive.canonical_repo_root, &profile_path)?;
-    enqueue_async_commit(
-        &archive.repo_root,
-        &Config::default(),
-        &format!("agent: profile {name}"),
-        &[rel],
-    );
-
-    Ok(())
+    write_agent_profile_with_config(archive, &Config::get(), agent)
 }
 
 /// Write an agent's profile.json using explicit config for author info.

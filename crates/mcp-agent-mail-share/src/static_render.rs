@@ -14,7 +14,7 @@
 //! produces byte-identical output (sorted keys, stable iteration order,
 //! no embedded timestamps unless from source data).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -523,7 +523,29 @@ fn discover_messages(
     conn: &SqliteConnection,
     config: &StaticRenderConfig,
 ) -> ShareResult<Vec<MessageInfo>> {
-    // Fetch messages joined with sender agent and project
+    // 1. Fetch all recipients grouped by message_id to avoid N+1 query pattern.
+    // Order by name for determinism.
+    let recipient_rows = conn
+        .query_sync(
+            "SELECT r.message_id, a.name FROM message_recipients r \
+             JOIN agents a ON a.id = r.agent_id \
+             ORDER BY r.message_id, a.name",
+            &[],
+        )
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("discover recipients: {e}"),
+        })?;
+
+    let mut recipient_map: HashMap<i64, Vec<String>> = HashMap::new();
+    for row in recipient_rows {
+        if let Ok(mid) = row.get_named::<i64>("message_id")
+            && let Ok(name) = row.get_named::<String>("name")
+        {
+            recipient_map.entry(mid).or_default().push(name);
+        }
+    }
+
+    // 2. Fetch messages joined with sender agent and project
     let rows = conn
         .query_sync(
             "SELECT m.id, m.subject, m.body_md, m.importance, m.created_ts, \
@@ -562,8 +584,8 @@ fn discover_messages(
 
         let thread_id: Option<String> = row.get_named("thread_id").ok();
 
-        // Fetch recipients for this message
-        let recipients = fetch_recipients(conn, id);
+        // Use pre-fetched recipients
+        let recipients = recipient_map.get(&id).cloned().unwrap_or_default();
 
         messages.push(MessageInfo {
             id,
@@ -578,20 +600,6 @@ fn discover_messages(
         });
     }
     Ok(messages)
-}
-
-fn fetch_recipients(conn: &SqliteConnection, message_id: i64) -> Vec<String> {
-    conn.query_sync(
-        "SELECT a.name FROM message_recipients r \
-         JOIN agents a ON a.id = r.agent_id \
-         WHERE r.message_id = ?1 \
-         ORDER BY a.name",
-        &[SqlValue::BigInt(message_id)],
-    )
-    .unwrap_or_default()
-    .iter()
-    .filter_map(|r| r.get_named::<String>("name").ok())
-    .collect()
 }
 
 fn normalized_thread_id(thread_id: Option<&str>) -> Option<&str> {

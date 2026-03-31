@@ -1570,6 +1570,7 @@ impl MessageBrowserScreen {
             ack_required,
             None,
             None,
+            None, // sender_token
         ));
 
         match result {

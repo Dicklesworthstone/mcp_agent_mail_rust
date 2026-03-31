@@ -122,15 +122,8 @@ fn retention_loop(config: &Config) {
             }
         }
 
-        // Sleep in small increments to allow quick shutdown.
-        let mut remaining = interval;
-        while !remaining.is_zero() {
-            if SHUTDOWN.load(Ordering::Acquire) {
-                return;
-            }
-            let chunk = remaining.min(std::time::Duration::from_secs(1));
-            std::thread::sleep(chunk);
-            remaining = remaining.saturating_sub(chunk);
+        if sleep_with_shutdown(interval) {
+            return;
         }
     }
 }

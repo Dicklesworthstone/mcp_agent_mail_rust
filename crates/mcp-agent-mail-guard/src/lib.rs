@@ -1286,35 +1286,27 @@ fn check_path_conflicts(
             }
 
             // Also check the reverse: pattern's literal base is a prefix of the path.
-            // This is needed for patterns like "src/*" matching "src/subdir/file.rs",
-            // because the globset above with literal_separator(true) won't match
-            // subdirectories unless it has a double star.
-            let literal_base = if res.has_glob {
-                if let Some(idx) = first_glob_index(&res.normalized_pattern) {
-                    let base = &res.normalized_pattern[..idx];
-                    // Trim trailing slash to normalize
-                    base.strip_suffix('/').unwrap_or(base)
-                } else {
-                    &res.normalized_pattern
+            // This is needed for literal directory reservations (e.g. reserving "src/subdir"
+            // blocks edits to "src/subdir/file.rs").
+            // We do NOT do this if the pattern has a glob, because globs like "src/*"
+            // should not recursively lock subdirectories (that's what "src/**" is for).
+            if !res.has_glob {
+                let literal_base = &res.normalized_pattern;
+                if normalized.starts_with(literal_base)
+                    && (literal_base.is_empty()
+                        || normalized
+                            .as_bytes()
+                            .get(literal_base.len())
+                            .is_some_and(|&c| c == b'/'))
+                {
+                    conflicts.push(GuardConflict {
+                        path: path.clone(),
+                        pattern: res.path_pattern.clone(),
+                        holder: res.agent_name.clone(),
+                        expires_ts: res.expires_ts.clone(),
+                    });
+                    break;
                 }
-            } else {
-                &res.normalized_pattern
-            };
-
-            if normalized.starts_with(literal_base)
-                && (literal_base.is_empty()
-                    || normalized
-                        .as_bytes()
-                        .get(literal_base.len())
-                        .is_some_and(|&c| c == b'/'))
-            {
-                conflicts.push(GuardConflict {
-                    path: path.clone(),
-                    pattern: res.path_pattern.clone(),
-                    holder: res.agent_name.clone(),
-                    expires_ts: res.expires_ts.clone(),
-                });
-                break;
             }
         }
     }
@@ -1364,23 +1356,6 @@ fn detect_core_ignorecase(repo_hint: &Path) -> bool {
 /// Returns true if the string contains glob metacharacters.
 fn contains_glob(s: &str) -> bool {
     s.contains('*') || s.contains('?') || s.contains('[') || s.contains('{')
-}
-
-fn first_glob_index(s: &str) -> Option<usize> {
-    let mut best = None;
-    for c in ['*', '?', '[', '{'] {
-        if let Some(idx) = s.find(c) {
-            match best {
-                None => best = Some(idx),
-                Some(current) => {
-                    if idx < current {
-                        best = Some(idx);
-                    }
-                }
-            }
-        }
-    }
-    best
 }
 
 fn is_real_directory(path: &Path) -> bool {
@@ -1482,6 +1457,9 @@ fn read_active_reservations_from_archive(
             .map(str::trim)
             .unwrap_or("")
             .to_string();
+        if pattern.is_empty() {
+            continue;
+        }
 
         let Some(exclusive) = val["exclusive"].as_bool() else {
             continue;
@@ -2408,7 +2386,7 @@ mod tests {
         }];
         
         // "src/*" with literal_separator(true) normally wouldn't match "src/subdir/file.rs"
-        // but our literal_base prefix logic should catch it.
+        // and we removed the literal_base prefix logic for globs.
         let conflicts = check_path_conflicts(
             &["src/subdir/file.rs".to_string()],
             &reservations,
@@ -2416,9 +2394,7 @@ mod tests {
             false,
         ).unwrap();
         
-        assert_eq!(conflicts.len(), 1);
-        assert_eq!(conflicts[0].path, "src/subdir/file.rs");
-        assert_eq!(conflicts[0].pattern, "src/*");
+        assert_eq!(conflicts.len(), 0);
     }
 
     #[test]

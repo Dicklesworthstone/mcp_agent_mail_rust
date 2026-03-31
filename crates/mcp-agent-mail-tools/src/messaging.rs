@@ -4503,6 +4503,7 @@ mod tests {
             reply_to: 3,
             deliveries: vec![],
             count: 1,
+            verified_sender: false,
         };
         let json_str = serde_json::to_string(&original).unwrap();
         let deserialized: ReplyMessageResponse = serde_json::from_str(&json_str).unwrap();

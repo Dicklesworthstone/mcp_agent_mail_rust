@@ -550,10 +550,10 @@ async fn complete_single(
 // Safe JSON extraction
 // ---------------------------------------------------------------------------
 
-/// Parse JSON from LLM output using three fallback strategies:
+/// Parse JSON from LLM output using fallback strategies:
 /// 1. Direct parse (trim whitespace first)
 /// 2. Fenced code block extraction (```json ... ``` or ``` ... ```)
-/// 3. Brace-slice extraction (outermost { ... })
+/// 3. Structural extraction (outermost { ... } or [ ... ])
 #[must_use]
 pub fn parse_json_safely(text: &str) -> Option<Value> {
     let trimmed = text.trim();
@@ -571,20 +571,28 @@ pub fn parse_json_safely(text: &str) -> Option<Value> {
         return Some(v);
     }
 
-    // Strategy 3: brace-slice
-    extract_brace_json(trimmed)
+    // Strategy 3: structural (brace or bracket)
+    extract_structural_json(trimmed)
 }
 
 fn extract_fenced_json(text: &str) -> Option<Value> {
-    // Look for ```json\n...\n``` first, then plain ```\n...\n```
-    let markers = ["```json\n", "```json\r\n", "```\n", "```\r\n"];
+    // Look for ```json ... ``` first, then plain ``` ... ```
+    // We don't require newlines anymore to handle compact LLM outputs.
+    let markers = ["```json", "```"];
     for marker in markers {
         let mut cursor = text;
         while let Some(start_idx) = cursor.find(marker) {
             let content_start = start_idx + marker.len();
             if let Some(end_rel) = cursor[content_start..].find("```") {
                 let content = cursor[content_start..content_start + end_rel].trim();
-                if let Ok(v) = serde_json::from_str(content) {
+                // If it starts with "json" (redundant check for marker[0] but good for marker[1]),
+                // skip it.
+                let cleaned = if content.to_ascii_lowercase().starts_with("json") {
+                    content[4..].trim()
+                } else {
+                    content
+                };
+                if let Ok(v) = serde_json::from_str(cleaned) {
                     return Some(v);
                 }
                 // Move cursor past this block to find the next one
@@ -597,11 +605,17 @@ fn extract_fenced_json(text: &str) -> Option<Value> {
     None
 }
 
-fn extract_brace_json(text: &str) -> Option<Value> {
+fn extract_structural_json(text: &str) -> Option<Value> {
+    // Try braces { ... } then brackets [ ... ]
+    extract_wrapped_json(text, '{', '}')
+        .or_else(|| extract_wrapped_json(text, '[', ']'))
+}
+
+fn extract_wrapped_json(text: &str, open_ch: char, close_ch: char) -> Option<Value> {
     let mut cursor = text;
-    while let Some(open) = cursor.find('{') {
+    while let Some(open) = cursor.find(open_ch) {
         let mut close_search_cursor = &cursor[open..];
-        while let Some(close) = close_search_cursor.rfind('}') {
+        while let Some(close) = close_search_cursor.rfind(close_ch) {
             if close == 0 {
                 break;
             }
@@ -609,9 +623,10 @@ fn extract_brace_json(text: &str) -> Option<Value> {
             if let Ok(v) = serde_json::from_str(slice) {
                 return Some(v);
             }
+            // Shrink the search window from the right to find an inner balanced match
             close_search_cursor = &close_search_cursor[..close];
         }
-        // Try the next opening brace if this one didn't lead to valid JSON
+        // Try the next opening character if this one didn't lead to valid JSON
         if cursor.len() > open + 1 {
             cursor = &cursor[open + 1..];
         } else {
@@ -1537,46 +1552,46 @@ mod tests {
         assert!(val["second"].as_bool().unwrap());
     }
 
-    // -- extract_brace_json edge cases --
+    // -- extract_structural_json edge cases --
 
     #[test]
     fn brace_json_simple() {
-        let val = extract_brace_json("text {\"x\": 1} more").unwrap();
+        let val = extract_structural_json("text {\"x\": 1} more").unwrap();
         assert_eq!(val["x"], 1);
     }
 
     #[test]
     fn brace_json_nested() {
-        let val = extract_brace_json("prefix {\"a\": {\"b\": 2}} suffix").unwrap();
+        let val = extract_structural_json("prefix {\"a\": {\"b\": 2}} suffix").unwrap();
         assert_eq!(val["a"]["b"], 2);
     }
 
     #[test]
     fn brace_json_with_trailing_garbage_brace() {
         let val =
-            extract_brace_json("Here is JSON: {\"a\": 1} and also this trailing brace }").unwrap();
+            extract_structural_json("Here is JSON: {\"a\": 1} and also this trailing brace }").unwrap();
         assert_eq!(val["a"], 1);
     }
 
     #[test]
     fn brace_json_no_braces() {
-        assert!(extract_brace_json("no json here").is_none());
+        assert!(extract_structural_json("no json here").is_none());
     }
 
     #[test]
     fn brace_json_close_before_open() {
-        assert!(extract_brace_json("{not: valid json}").is_none());
+        assert!(extract_structural_json("{not: valid json}").is_none());
     }
 
     #[test]
     fn brace_json_single_brace_only() {
-        assert!(extract_brace_json("{").is_none());
-        assert!(extract_brace_json("}").is_none());
+        assert!(extract_structural_json("{").is_none());
+        assert!(extract_structural_json("}").is_none());
     }
 
     #[test]
     fn brace_json_invalid_content() {
-        assert!(extract_brace_json("{not: valid json}").is_none());
+        assert!(extract_structural_json("{not: valid json}").is_none());
     }
 
     // -- conformance_fixture_completion tests --
@@ -1602,7 +1617,7 @@ mod tests {
         assert!(!content.contains("```json"));
         assert!(content.contains("threads"));
         // Should parse via brace extraction
-        let val = extract_brace_json(&content).unwrap();
+        let val = extract_structural_json(&content).unwrap();
         assert!(val["aggregate"]["key_points"].is_array());
     }
 
@@ -1623,7 +1638,7 @@ mod tests {
             "digest across threads",
             "Digest these threads: T-1, T-2",
         );
-        let val = extract_brace_json(&content).unwrap();
+        let val = extract_structural_json(&content).unwrap();
         assert!(val["threads"].is_array());
         assert!(val["aggregate"]["top_mentions"].is_array());
         assert!(val["aggregate"]["action_items"].is_array());
