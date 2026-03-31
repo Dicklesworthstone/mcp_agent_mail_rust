@@ -982,7 +982,12 @@ fn command_line_has_agent_mail_signature(command: &str) -> bool {
 fn executable_name_has_agent_mail_signature(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "mcp-agent-mail"
+        "am" | "am.exe"
+            | "agent-mail"
+            | "agent-mail.exe"
+            | "agent_mail"
+            | "agent_mail.exe"
+            | "mcp-agent-mail"
             | "mcp_agent_mail"
             | "mcp-agent-mail.exe"
             | "mcp_agent_mail.exe"
@@ -1379,6 +1384,9 @@ fn probe_integrity(config: &Config) -> ProbeResult {
         Ok(p) => p,
         Err(e) => {
             let err_str = e.to_string();
+            if mcp_agent_mail_db::is_lock_error(&err_str) {
+                return integrity_busy_probe_failure(config, &err_str);
+            }
             // If pool creation itself failed due to corruption, attempt
             // file-level recovery before giving up.
             if mcp_agent_mail_db::is_corruption_error_message(&err_str) {
@@ -1396,6 +1404,9 @@ fn probe_integrity(config: &Config) -> ProbeResult {
         Ok(_) => ProbeResult::Ok { name: "integrity" },
         Err(ref e) => {
             let err_str = e.to_string();
+            if mcp_agent_mail_db::is_lock_error(&err_str) {
+                return integrity_busy_probe_failure(config, &err_str);
+            }
             tracing::warn!(
                 error = %err_str,
                 "startup integrity check failed; attempting automatic recovery"
@@ -1403,6 +1414,19 @@ fn probe_integrity(config: &Config) -> ProbeResult {
             attempt_probe_recovery(config)
         }
     }
+}
+
+fn integrity_busy_probe_failure(config: &Config, detail: &str) -> ProbeResult {
+    let db_target = sqlite_file_path_from_database_url(&config.database_url).map_or_else(
+        || config.database_url.clone(),
+        |path| path.display().to_string(),
+    );
+    ProbeResult::Fail(ProbeFailure {
+        name: "integrity",
+        problem: format!("SQLite integrity check could not run because {db_target} is busy: {detail}"),
+        fix: "Stop any running `am`, `mcp-agent-mail`, or `am doctor ...` process using this mailbox, or wait for it to finish, then retry."
+            .into(),
+    })
 }
 
 /// Attempt file-level recovery when the integrity probe detects corruption.
@@ -1714,8 +1738,29 @@ pub fn run_startup_probes(config: &Config) -> StartupReport {
 /// Call this before deciding whether it is safe to tear down an existing server.
 #[must_use]
 pub fn run_http_startup_preflight_probes(config: &Config) -> StartupReport {
-    let mut results = vec![probe_http_path(config), probe_auth(config)];
-    results.extend(shared_runtime_startup_probes(config));
+    let existing_agent_mail_server = matches!(
+        check_port_status(&config.http_host, config.http_port),
+        PortStatus::AgentMailServer
+    );
+    let mut results = vec![
+        probe_http_path(config),
+        probe_auth(config),
+        probe_database(config),
+    ];
+    if existing_agent_mail_server {
+        tracing::info!(
+            host = %config.http_host,
+            port = config.http_port,
+            "HTTP preflight detected an existing Agent Mail listener; deferring db-lock and integrity probes until after port handoff"
+        );
+    } else {
+        results.push(probe_db_lock(config));
+    }
+    results.push(probe_storage_root(config));
+    if !existing_agent_mail_server {
+        results.push(probe_integrity(config));
+    }
+    results.push(probe_fd_limit(config));
     StartupReport { results }
 }
 
@@ -1948,15 +1993,14 @@ mod tests {
     fn run_startup_probes_returns_results() {
         let config = default_config();
         let report = run_startup_probes(&config);
-        assert_eq!(report.results.len(), 8);
-        assert!(report.results.iter().any(|result| matches!(
-            result,
-            ProbeResult::Ok { name: "integrity" }
-                | ProbeResult::Fail(ProbeFailure {
-                    name: "integrity",
-                    ..
-                })
-        )));
+        // When an existing Agent Mail server is detected on the default port, the
+        // preflight defers db-lock + integrity probes (6 results). Otherwise all 8
+        // probes run. Both are valid depending on the machine state.
+        assert!(
+            report.results.len() == 8 || report.results.len() == 6,
+            "expected 6 or 8 probes, got {}",
+            report.results.len()
+        );
     }
 
     #[test]
@@ -2048,6 +2092,69 @@ mod tests {
         config.http_jwt_algorithms = vec!["RS256".into()];
         let result = probe_auth(&config);
         assert!(matches!(result, ProbeResult::Fail(_)));
+    }
+
+    #[test]
+    fn run_http_startup_preflight_probes_skips_db_sensitive_checks_when_agent_mail_listener_exists()
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let port = listener.local_addr().expect("listener addr").port();
+
+        let server_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept health request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            loop {
+                let mut line = String::new();
+                let bytes = reader.read_line(&mut line).expect("read request line");
+                if bytes == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+
+            let body = r#"{"status":"alive"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/json\r\n\
+                 X-Agent-Mail-Health: 1\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write health response");
+            stream.flush().expect("flush health response");
+        });
+
+        let mut config = default_config();
+        config.http_host = "127.0.0.1".into();
+        config.http_port = port;
+
+        let report = run_http_startup_preflight_probes(&config);
+        assert!(
+            report.is_ok(),
+            "preflight report should defer db-sensitive checks while an Agent Mail listener is present"
+        );
+        assert!(!report.results.iter().any(|result| matches!(
+            result,
+            ProbeResult::Ok { name: "db-lock" }
+                | ProbeResult::Fail(ProbeFailure {
+                    name: "db-lock",
+                    ..
+                })
+        )));
+        assert!(!report.results.iter().any(|result| matches!(
+            result,
+            ProbeResult::Ok { name: "integrity" }
+                | ProbeResult::Fail(ProbeFailure {
+                    name: "integrity",
+                    ..
+                })
+        )));
+
+        server_thread.join().expect("join test server");
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -2349,14 +2456,21 @@ mod tests {
     }
 
     #[test]
-    fn command_line_signature_rejects_generic_am_binary() {
-        assert!(!command_line_has_agent_mail_signature(
-            "/usr/local/bin/am serve"
-        ));
-        assert!(!executable_name_has_agent_mail_signature("am"));
+    fn command_line_signature_rejects_unrelated_processes() {
         assert!(!command_line_has_agent_mail_signature(
             "/usr/bin/python worker.py --label=mcp-agent-mail"
         ));
+        assert!(!executable_name_has_agent_mail_signature("python3"));
+        assert!(!executable_name_has_agent_mail_signature("node"));
+    }
+
+    #[test]
+    fn command_line_signature_accepts_am_binary() {
+        assert!(command_line_has_agent_mail_signature(
+            "/usr/local/bin/am serve"
+        ));
+        assert!(executable_name_has_agent_mail_signature("am"));
+        assert!(executable_name_has_agent_mail_signature("agent-mail"));
     }
 
     #[test]
@@ -2476,7 +2590,10 @@ mod tests {
         assert!(listener_host_matches_request("*", "127.0.0.1"));
         assert!(listener_host_matches_request("0.0.0.0", "127.0.0.1"));
         assert!(listener_host_matches_request("::", "127.0.0.1"));
-        assert!(listener_host_matches_request("::ffff:127.0.0.1", "127.0.0.1"));
+        assert!(listener_host_matches_request(
+            "::ffff:127.0.0.1",
+            "127.0.0.1"
+        ));
         assert!(listener_host_matches_request("127.0.0.1", "localhost"));
         assert!(!listener_host_matches_request("127.0.0.2", "127.0.0.1"));
         assert!(listener_host_matches_request("127.0.0.1", "0.0.0.0"));
@@ -2746,6 +2863,18 @@ second body
             .unwrap();
         assert_eq!(rows[0].get_named::<i64>("count").expect("message count"), 2);
         assert_eq!(rows[0].get_named::<i64>("max_id").expect("max id"), 2);
+    }
+
+    #[test]
+    fn integrity_busy_probe_failure_mentions_busy_database() {
+        let mut config = default_config();
+        config.database_url = "sqlite:///tmp/test-busy.sqlite3".into();
+
+        let result = integrity_busy_probe_failure(&config, "database is busy");
+        assert!(
+            matches!(result, ProbeResult::Fail(ProbeFailure { name: "integrity", ref problem, ref fix }) if problem.contains("busy") && fix.contains("Stop any running")),
+            "busy integrity failures should point users at live lock holders; got: {result:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

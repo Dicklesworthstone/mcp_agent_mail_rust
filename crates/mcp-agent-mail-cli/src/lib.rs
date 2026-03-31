@@ -4595,6 +4595,13 @@ fn is_resource_busy_cli_error(error: &CliError) -> bool {
     })
 }
 
+fn sqlite_doctor_busy_error(path: &Path, detail: &str) -> CliError {
+    CliError::Other(format!(
+        "Resource is temporarily busy. Wait a moment and try again. (database health probe could not access {} because another Agent Mail or doctor process is using it: {detail})",
+        path.display()
+    ))
+}
+
 fn is_snapshot_conflict_cli_error(error: &CliError) -> bool {
     match error {
         CliError::Other(message) => {
@@ -4655,7 +4662,6 @@ fn sqlite_file_is_healthy_canonical(path: &Path) -> CliResult<bool> {
 fn handle_sqlite_compatibility_probe_result(
     path: &Path,
     result: CliResult<bool>,
-    lock_fallback: bool,
 ) -> CliResult<bool> {
     match result {
         Ok(ok) => Ok(ok),
@@ -4670,11 +4676,11 @@ fn handle_sqlite_compatibility_probe_result(
                 // rusqlite cannot read frankensqlite's WAL, this is expected
                 return Ok(true);
             }
+            if mcp_agent_mail_db::is_lock_error(&msg) {
+                return Err(sqlite_doctor_busy_error(path, &msg));
+            }
             if is_sqlite_recovery_error_message(&msg) {
                 return Ok(false);
-            }
-            if mcp_agent_mail_db::is_lock_error(&msg) {
-                return Ok(lock_fallback);
             }
             Err(e)
         }
@@ -4702,8 +4708,12 @@ where
                 path.display(),
                 e
             );
-            if is_sqlite_recovery_error_message(&e.to_string())
-                || mcp_agent_mail_db::is_sqlite_snapshot_conflict_error_message(&e.to_string())
+            let err_text = e.to_string();
+            if mcp_agent_mail_db::is_lock_error(&err_text) {
+                return Err(sqlite_doctor_busy_error(path, &err_text));
+            }
+            if is_sqlite_recovery_error_message(&err_text)
+                || mcp_agent_mail_db::is_sqlite_snapshot_conflict_error_message(&err_text)
             {
                 return Ok(false);
             }
@@ -4719,17 +4729,13 @@ where
 
     if !is_healthy {
         if !has_live_sidecars {
-            return handle_sqlite_compatibility_probe_result(
-                path,
-                compatibility_probe(path),
-                false,
-            );
+            return handle_sqlite_compatibility_probe_result(path, compatibility_probe(path));
         }
         return Ok(false);
     }
 
     if has_live_sidecars {
-        return handle_sqlite_compatibility_probe_result(path, compatibility_probe(path), true);
+        return handle_sqlite_compatibility_probe_result(path, compatibility_probe(path));
     }
 
     Ok(true)
@@ -4807,7 +4813,10 @@ where
         Ok(v) => v,
         Err(e) => {
             let msg = e.to_string();
-            if is_sqlite_recovery_error_message(&msg) || is_snapshot_conflict_cli_error(&e) {
+            if mcp_agent_mail_db::is_lock_error(&msg) || is_snapshot_conflict_cli_error(&e) {
+                return Err(sqlite_doctor_busy_error(selected_path.as_path(), &msg));
+            }
+            if is_sqlite_recovery_error_message(&msg) {
                 false
             } else {
                 return Err(CliError::Other(format!(
@@ -4833,6 +4842,9 @@ where
             Ok(false) => {}
             Err(e) => {
                 let msg = e.to_string();
+                if mcp_agent_mail_db::is_lock_error(&msg) {
+                    return Err(sqlite_doctor_busy_error(selected_path.as_path(), &msg));
+                }
                 if !is_sqlite_recovery_error_message(&msg) {
                     return Err(CliError::Other(format!(
                         "database health probe failed for absolute fallback {}: {msg}",
@@ -18219,6 +18231,7 @@ mod mail_server_cli_bridge_tests {
         is_resource_busy_cli_error, mail_server_rejection_allows_local_fallback,
         product_inbox_row_to_json, server_inbox_payload_to_cli_json,
         server_message_payload_to_cli_json, sort_product_inbox_items_desc,
+        sqlite_doctor_sanity_with_health_probe,
     };
 
     #[test]
@@ -18288,6 +18301,22 @@ mod mail_server_cli_bridge_tests {
         assert!(!is_resource_busy_cli_error(&CliError::Other(
             "disk i/o error while opening sqlite file".to_string(),
         )));
+    }
+
+    #[test]
+    fn sqlite_doctor_sanity_reports_busy_database_as_resource_busy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("doctor-busy.sqlite3");
+        std::fs::write(&db_path, b"placeholder").expect("create placeholder db");
+
+        let error = sqlite_doctor_sanity_with_health_probe(&db_path.to_string_lossy(), |_| {
+            Err(CliError::Other("database is busy".to_string()))
+        })
+        .expect_err("doctor sanity should fail busy");
+        assert!(
+            is_resource_busy_cli_error(&error),
+            "doctor sanity busy error should be classified as resource busy: {error}"
+        );
     }
 
     #[test]
