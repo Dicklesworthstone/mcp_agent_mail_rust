@@ -4033,16 +4033,22 @@ async fn fetch_inbox_impl(
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
     };
 
-    match crate::sync::fetch_inbox_native_sqlite_by_ids(
-        pool.sqlite_path(),
-        project_id,
-        agent_id,
-        urgent_only,
-        unread_only,
-        ack_required_only,
-        since_ts,
-        limit,
-    ) {
+    let sqlite_path = pool.sqlite_path().to_string();
+    let result = asupersync::runtime::spawn_blocking(move || {
+        crate::sync::fetch_inbox_native_sqlite_by_ids(
+            &sqlite_path,
+            project_id,
+            agent_id,
+            urgent_only,
+            unread_only,
+            ack_required_only,
+            since_ts,
+            limit,
+        )
+    })
+    .await;
+
+    match result {
         Ok(rows) => Outcome::Ok(rows),
         Err(error) => Outcome::Err(error),
     }

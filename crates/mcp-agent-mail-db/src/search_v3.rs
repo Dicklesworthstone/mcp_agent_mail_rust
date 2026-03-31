@@ -823,6 +823,27 @@ fn choose_backfill_plan(
     Ok(BackfillPlan::FullRebuild)
 }
 
+/// Acquire an IndexWriter with retries. Tantivy acquires an exclusive directory lock
+/// for writers. In concurrent environments, this can fail. We retry a few times
+/// with exponential backoff to handle concurrent index updates.
+fn acquire_writer_with_retry(index: &tantivy::Index) -> Result<tantivy::IndexWriter, String> {
+    let mut retries = 5;
+    let mut delay = std::time::Duration::from_millis(50);
+    loop {
+        match index.writer(15_000_000) {
+            Ok(writer) => return Ok(writer),
+            Err(e) => {
+                if retries == 0 {
+                    return Err(format!("Tantivy writer error (after retries): {e}"));
+                }
+                retries -= 1;
+                std::thread::sleep(delay);
+                delay *= 2; // Exponential backoff
+            }
+        }
+    }
+}
+
 /// Index a single message into the global Tantivy bridge.
 ///
 /// Returns `Ok(true)` if the message was indexed, `Ok(false)` if the bridge
@@ -836,12 +857,7 @@ pub fn index_message(msg: &IndexableMessage) -> Result<bool, String> {
     };
 
     let handles = bridge.handles();
-    // Use minimum Tantivy arena (15MB) since we are only indexing a single
-    // message and immediately committing.
-    let mut writer = bridge
-        .index()
-        .writer(15_000_000)
-        .map_err(|e| format!("Tantivy writer error: {e}"))?;
+    let mut writer = acquire_writer_with_retry(bridge.index())?;
     upsert_indexable_message(&writer, handles, msg)?;
 
     writer
@@ -872,11 +888,7 @@ pub fn index_messages_batch(messages: &[IndexableMessage]) -> Result<usize, Stri
     };
 
     let handles = bridge.handles();
-    // Use 15MB for batches as there might be many documents.
-    let mut writer = bridge
-        .index()
-        .writer(15_000_000)
-        .map_err(|e| format!("Tantivy writer error: {e}"))?;
+    let mut writer = acquire_writer_with_retry(bridge.index())?;
 
     for msg in messages {
         upsert_indexable_message(&writer, handles, msg)?;
@@ -1200,6 +1212,15 @@ mod tests {
         writer.commit().unwrap();
 
         bridge
+    }
+
+    #[test]
+    fn concurrent_writer_behavior() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bridge = TantivyBridge::open(dir.path()).unwrap();
+        let _writer1 = bridge.index().writer::<TantivyDocument>(15_000_000).unwrap();
+        let writer2_res = bridge.index().writer::<TantivyDocument>(15_000_000);
+        assert!(writer2_res.is_err(), "second writer should fail with lock error");
     }
 
     #[test]
