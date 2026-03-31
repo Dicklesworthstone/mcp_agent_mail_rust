@@ -1199,11 +1199,6 @@ fn check_path_conflicts(
 
     for res in reservations {
         if res.exclusive && !res.agent_name.eq_ignore_ascii_case(self_agent) {
-            // Skip patterns that normalize to empty — they would match everything.
-            if res.normalized_pattern.is_empty() {
-                continue;
-            }
-
             let mut glob_builder = globset::GlobBuilder::new(&res.normalized_pattern);
             glob_builder.literal_separator(true);
             if ignorecase {
@@ -1237,11 +1232,6 @@ fn check_path_conflicts(
 
     for path in paths {
         let normalized = normalize_path(path, ignorecase);
-        // Skip degenerate paths that normalize to empty (e.g. "./", "/", "..")
-        // to avoid false-positive conflicts with every reservation pattern.
-        if normalized.is_empty() {
-            continue;
-        }
 
         // Check if path matches any reservation pattern
         let matches = glob_set.matches(&normalized);
@@ -1282,14 +1272,27 @@ fn check_path_conflicts(
                 break;
             }
 
-            // Also check the reverse: pattern's literal base is a prefix of the path
-            // (needed for non-glob patterns like "src/utils" matching "src/utils/file.rs")
-            if !res.has_glob
-                && normalized.starts_with(&res.normalized_pattern)
-                && (res.normalized_pattern.is_empty()
+            // Also check the reverse: pattern's literal base is a prefix of the path.
+            // This is needed for patterns like "src/*" matching "src/subdir/file.rs",
+            // because the globset above with literal_separator(true) won't match
+            // subdirectories unless it has a double star.
+            let literal_base = if res.has_glob {
+                if let Some(idx) = first_glob_index(&res.normalized_pattern) {
+                    let base = &res.normalized_pattern[..idx];
+                    // Trim trailing slash to normalize
+                    base.strip_suffix('/').unwrap_or(base)
+                } else {
+                    &res.normalized_pattern
+                }
+            } else {
+                &res.normalized_pattern
+            };
+
+            if normalized.starts_with(literal_base)
+                && (literal_base.is_empty()
                     || normalized
                         .as_bytes()
-                        .get(res.normalized_pattern.len())
+                        .get(literal_base.len())
                         .is_some_and(|&c| c == b'/'))
             {
                 conflicts.push(GuardConflict {
@@ -1348,6 +1351,23 @@ fn detect_core_ignorecase(repo_hint: &Path) -> bool {
 /// Returns true if the string contains glob metacharacters.
 fn contains_glob(s: &str) -> bool {
     s.contains('*') || s.contains('?') || s.contains('[') || s.contains('{')
+}
+
+fn first_glob_index(s: &str) -> Option<usize> {
+    let mut best = None;
+    for c in ['*', '?', '[', '{'] {
+        if let Some(idx) = s.find(c) {
+            match best {
+                None => best = Some(idx),
+                Some(current) => {
+                    if idx < current {
+                        best = Some(idx);
+                    }
+                }
+            }
+        }
+    }
+    best
 }
 
 fn is_real_directory(path: &Path) -> bool {
@@ -1449,9 +1469,6 @@ fn read_active_reservations_from_archive(
             .map(str::trim)
             .unwrap_or("")
             .to_string();
-        if pattern.is_empty() {
-            continue;
-        }
 
         let Some(exclusive) = val["exclusive"].as_bool() else {
             continue;
@@ -2339,6 +2356,56 @@ mod tests {
         let conflicts =
             check_path_conflicts(&paths, &reservations, "MyAgent", false).expect("conflicts");
         assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn check_path_conflicts_root_reservation_blocks_everything() {
+        let reservations = vec![FileReservationRecord {
+            path_pattern: "".to_string(),
+            agent_name: "OtherAgent".to_string(),
+            exclusive: true,
+            expires_ts: "2099-01-01T00:00:00Z".to_string(),
+            released_ts: None,
+            normalized_pattern: "".to_string(),
+            has_glob: false,
+        }];
+        
+        let conflicts = check_path_conflicts(
+            &["src/main.rs".to_string(), "any/path".to_string()],
+            &reservations,
+            "SelfAgent",
+            false,
+        ).unwrap();
+        
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(conflicts[0].path, "src/main.rs");
+        assert_eq!(conflicts[1].path, "any/path");
+    }
+
+    #[test]
+    fn check_path_conflicts_glob_prefix_blocks_subdirectories() {
+        let reservations = vec![FileReservationRecord {
+            path_pattern: "src/*".to_string(),
+            agent_name: "OtherAgent".to_string(),
+            exclusive: true,
+            expires_ts: "2099-01-01T00:00:00Z".to_string(),
+            released_ts: None,
+            normalized_pattern: "src/*".to_string(),
+            has_glob: true,
+        }];
+        
+        // "src/*" with literal_separator(true) normally wouldn't match "src/subdir/file.rs"
+        // but our literal_base prefix logic should catch it.
+        let conflicts = check_path_conflicts(
+            &["src/subdir/file.rs".to_string()],
+            &reservations,
+            "SelfAgent",
+            false,
+        ).unwrap();
+        
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, "src/subdir/file.rs");
+        assert_eq!(conflicts[0].pattern, "src/*");
     }
 
     #[test]

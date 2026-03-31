@@ -138,6 +138,16 @@ impl ReservationIndex {
             }
         }
 
+        // Always check root (empty string) ancestor
+        if !req_norm.is_empty() {
+            let route_root = routing_key("");
+            if let Some(entries) = self.exact_by_path.get(&route_root) {
+                for (_, rref) in entries {
+                    conflicts.push(rref);
+                }
+            }
+        }
+
         for slash_idx in req_norm.match_indices('/').map(|(idx, _)| idx) {
             let ancestor = &req_norm[..slash_idx];
             let route_ancestor = routing_key(ancestor);
@@ -191,15 +201,41 @@ impl ReservationIndex {
     ) {
         if let Some(prefix) = req_prefix {
             let route_prefix = routing_key(prefix);
-            // Scoped scan: only check the exact anchor (`src`) and its
-            // descendants (`src/...`) instead of every exact entry sharing the
-            // first path segment.
+
+            // Check ancestors of the prefix (including the prefix itself and root)
+            // against exact reservations.
             if let Some(entries) = self.exact_by_path.get(&route_prefix) {
                 for (exact_pat, rref) in entries {
                     if request_pat.matches(exact_pat.normalized())
                         || exact_pat.overlaps(request_pat)
                     {
                         conflicts.push(rref);
+                    }
+                }
+            }
+
+            // Always check root (empty string) ancestor
+            let route_root = routing_key("");
+            if let Some(entries) = self.exact_by_path.get(&route_root) {
+                for (exact_pat, rref) in entries {
+                    if request_pat.matches(exact_pat.normalized())
+                        || exact_pat.overlaps(request_pat)
+                    {
+                        conflicts.push(rref);
+                    }
+                }
+            }
+
+            for slash_idx in prefix.match_indices('/').map(|(idx, _)| idx) {
+                let ancestor = &prefix[..slash_idx];
+                let route_ancestor = routing_key(ancestor);
+                if let Some(entries) = self.exact_by_path.get(&route_ancestor) {
+                    for (exact_pat, rref) in entries {
+                        if request_pat.matches(exact_pat.normalized())
+                            || exact_pat.overlaps(request_pat)
+                        {
+                            conflicts.push(rref);
+                        }
                     }
                 }
             }
@@ -537,5 +573,22 @@ mod tests {
         assert_eq!(conflicts[0].agent_id, 42);
         assert!(conflicts[0].exclusive);
         assert_eq!(conflicts[0].expires_ts, 999_000);
+    }
+
+    #[test]
+    fn root_reservation_conflicts_with_everything() {
+        let idx = ReservationIndex::build(vec![("".to_string(), make_ref(1))].into_iter());
+        
+        // Exact request
+        let req_exact = CompiledPattern::new("src/main.rs");
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req_exact, &mut conflicts);
+        assert_eq!(conflicts.len(), 1, "Root reservation should conflict with exact request");
+        
+        // Glob request
+        let req_glob = CompiledPattern::new("src/**/*.rs");
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req_glob, &mut conflicts);
+        assert_eq!(conflicts.len(), 1, "Root reservation should conflict with glob request");
     }
 }
