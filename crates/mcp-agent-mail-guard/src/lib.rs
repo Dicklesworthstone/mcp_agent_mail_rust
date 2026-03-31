@@ -466,7 +466,8 @@ def slugify(value):
     out = []
     prev_dash = False
     for ch in value.strip().lower():
-        if ch.isalnum():
+        # Match Rust's is_ascii_alphanumeric() behavior
+        if (ord(ch) >= 97 and ord(ch) <= 122) or (ord(ch) >= 48 and ord(ch) <= 57):
             out.append(ch)
             prev_dash = False
         elif not prev_dash:
@@ -480,7 +481,19 @@ def default_storage_root():
         value = os.environ.get(key, "").strip()
         if value:
             return os.path.expanduser(value)
-    return os.path.expanduser("~/.mcp_agent_mail")
+    
+    # Match Rust core's default_storage_root_path logic
+    legacy = os.path.expanduser("~/.mcp_agent_mail_git_mailbox_repo")
+    if os.path.exists(legacy):
+        return legacy
+        
+    # XDG Data path fallback
+    xdg_data = os.environ.get("XDG_DATA_HOME")
+    if xdg_data:
+        root = os.path.join(xdg_data, "mcp-agent-mail", "git_mailbox_repo")
+    else:
+        root = os.path.expanduser("~/.local/share/mcp-agent-mail/git_mailbox_repo")
+    return root
 
 def get_repo_root():
     try:
