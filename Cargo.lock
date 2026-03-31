@@ -2082,6 +2082,7 @@ dependencies = [
  "frankensearch-embed",
  "frankensearch-index",
  "frankensearch-rerank",
+ "rayon",
  "serde",
  "serde_json",
  "sha2",
