@@ -1346,6 +1346,28 @@ fn resolve_storage_root(search_root: &Path, explicit: Option<&Path>) -> CliResul
     })
 }
 
+fn resolve_legacy_database_url_path(db_path: &Path, search_root: &Path) -> PathBuf {
+    let db_path_text = db_path.to_string_lossy();
+    if db_path.is_absolute() {
+        return db_path.to_path_buf();
+    }
+
+    let joined = normalize_input_path(&db_path_text, search_root);
+    if joined.exists() {
+        return joined;
+    }
+
+    let explicit_relative = db_path_text.starts_with("./") || db_path_text.starts_with("../");
+    if !explicit_relative {
+        let absolute_candidate = Path::new("/").join(db_path);
+        if absolute_candidate.exists() {
+            return absolute_candidate;
+        }
+    }
+
+    joined
+}
+
 fn parse_database_value(
     value: &str,
     search_root: &Path,
@@ -1357,19 +1379,15 @@ fn parse_database_value(
         ));
     }
 
-    let db_path = if value.contains("://") {
-        sqlite_file_path_from_database_url(value).ok_or_else(|| {
+    let path = if value.contains("://") {
+        let db_path = sqlite_file_path_from_database_url(value).ok_or_else(|| {
             CliError::InvalidArgument(format!(
                 "unsupported DATABASE_URL scheme for import: {value}"
             ))
-        })?
+        })?;
+        resolve_legacy_database_url_path(&db_path, search_root)
     } else {
-        PathBuf::from(value)
-    };
-    let path = if db_path.is_absolute() {
-        db_path
-    } else {
-        search_root.join(db_path)
+        normalize_input_path(value, search_root)
     };
     Ok(ResolvedPath {
         exists: path.exists(),
@@ -1736,6 +1754,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.path, tmp.path().join("legacy.db"));
+    }
+
+    #[test]
+    fn parse_database_value_prefers_absolute_candidate_for_missing_bare_relative_sqlite_url() {
+        let search_root = tempfile::tempdir().unwrap();
+        let db_home = tempfile::tempdir().unwrap();
+        let absolute_db = db_home.path().join("legacy-url.sqlite3");
+        fs::write(&absolute_db, b"sqlite").unwrap();
+
+        let relative_path = absolute_db
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .to_string();
+        assert!(
+            !search_root.path().join(&relative_path).exists(),
+            "search-root relative target should be absent so absolute candidate fallback is exercised"
+        );
+
+        let parsed = parse_database_value(
+            &format!("sqlite://{}", relative_path),
+            search_root.path(),
+            ResolvedSource::Default,
+        )
+        .unwrap();
+        assert_eq!(parsed.path, absolute_db);
     }
 
     #[test]

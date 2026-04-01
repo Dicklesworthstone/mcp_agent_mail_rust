@@ -310,26 +310,41 @@ impl CompiledPattern {
 
 /// Heuristic check for overlap between two glob patterns.
 ///
-/// This is conservative: it returns `true` (overlap) if it cannot prove disjointness.
+/// This is conservative for segment-vs-segment glob checks, but it still respects
+/// path depth: `*` only covers a single segment, while `**` can absorb arbitrary
+/// depth mismatches.
 fn segments_overlap(s1: &[PatternSegment], s2: &[PatternSegment]) -> bool {
-    let mut i1 = s1.iter();
-    let mut i2 = s2.iter();
-
-    loop {
-        match (i1.next(), i2.next()) {
-            (Some(seg1), Some(seg2)) => {
-                if matches!(seg1, PatternSegment::Recursive)
-                    || matches!(seg2, PatternSegment::Recursive)
-                {
-                    return true; // We reached a recursive glob, assume overlap from here on
-                }
-                if !seg1.overlaps(seg2) {
-                    return false;
-                }
-            }
-            _ => return true, // Ended or length mismatch: conservatively assume overlap
+    fn visit(
+        s1: &[PatternSegment],
+        s2: &[PatternSegment],
+        i: usize,
+        j: usize,
+        memo: &mut [Vec<Option<bool>>],
+    ) -> bool {
+        if let Some(cached) = memo[i][j] {
+            return cached;
         }
+
+        let overlaps = match (s1.get(i), s2.get(j)) {
+            (None, None) => true,
+            (Some(PatternSegment::Recursive), None) => visit(s1, s2, i + 1, j, memo),
+            (None, Some(PatternSegment::Recursive)) => visit(s1, s2, i, j + 1, memo),
+            (None, Some(_)) | (Some(_), None) => false,
+            (Some(PatternSegment::Recursive), Some(_)) => {
+                visit(s1, s2, i + 1, j, memo) || visit(s1, s2, i, j + 1, memo)
+            }
+            (Some(_), Some(PatternSegment::Recursive)) => {
+                visit(s1, s2, i, j + 1, memo) || visit(s1, s2, i + 1, j, memo)
+            }
+            (Some(seg1), Some(seg2)) => seg1.overlaps(seg2) && visit(s1, s2, i + 1, j + 1, memo),
+        };
+
+        memo[i][j] = Some(overlaps);
+        overlaps
     }
+
+    let mut memo = vec![vec![None; s2.len() + 1]; s1.len() + 1];
+    visit(s1, s2, 0, 0, &mut memo)
 }
 
 /// Returns true when two glob/literal patterns overlap under Agent Mail semantics.
@@ -574,6 +589,14 @@ mod tests {
         assert!(a.overlaps(&b));
     }
 
+    #[test]
+    fn overlaps_single_level_glob_does_not_hit_deeper_exact_path() {
+        let a = CompiledPattern::new("src/auth/*");
+        let b = CompiledPattern::new("src/auth/sub/file.rs");
+        assert!(!a.overlaps(&b));
+        assert!(!b.overlaps(&a));
+    }
+
     // ── segments_overlap tests ───────────────────────────────────────
 
     #[test]
@@ -609,6 +632,14 @@ mod tests {
         let a = CompiledPattern::new("src/*.rs");
         let b = CompiledPattern::new("src/*.txt");
         assert!(segments_overlap(a.segments(), b.segments()));
+    }
+
+    #[test]
+    fn segments_overlap_single_level_glob_does_not_match_deeper_exact_path() {
+        let a = CompiledPattern::new("src/auth/*");
+        let b = CompiledPattern::new("src/auth/sub/file.rs");
+        assert!(!segments_overlap(a.segments(), b.segments()));
+        assert!(!segments_overlap(b.segments(), a.segments()));
     }
 
     // ── segment_pair_overlaps tests ──────────────────────────────────
@@ -690,6 +721,12 @@ mod tests {
             assert!(!patterns_overlap("docs/*.md", "src/main.rs"));
             assert!(patterns_overlap("src", "src/main.rs"));
         }
+    }
+
+    #[test]
+    fn patterns_overlap_respects_single_level_glob_depth() {
+        assert!(!patterns_overlap("src/auth/*", "src/auth/sub/file.rs"));
+        assert!(patterns_overlap("src/*/foo.rs", "src/bar/*.rs"));
     }
 
     #[test]
