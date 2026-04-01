@@ -315,6 +315,15 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
         return Ok(stats);
     }
 
+    let projects_dir = storage_root.join("projects");
+    if !is_real_directory(&projects_dir) {
+        stats.warnings.push(format!(
+            "No projects directory found at {}",
+            projects_dir.display()
+        ));
+        return Ok(stats);
+    }
+
     let db_str = db_path.to_string_lossy();
     let conn = DbConn::open_file(db_str.as_ref()).map_err(|e| {
         DbError::Sqlite(format!(
@@ -338,169 +347,178 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
         .map_err(|e| DbError::Sqlite(format!("reconstruct: synchronous: {e}")))?;
     conn.execute_raw("PRAGMA busy_timeout=60000;")
         .map_err(|e| DbError::Sqlite(format!("reconstruct: busy_timeout: {e}")))?;
+    conn.execute_raw("BEGIN IMMEDIATE;")
+        .map_err(|e| DbError::Sqlite(format!("reconstruct: begin transaction: {e}")))?;
 
-    // Apply schema via the migration pipeline (base mode: no FTS5 virtual
-    // tables, which FrankenConnection doesn't support). First lay down the
-    // base DDL, then run each base migration individually. This keeps the
-    // reconstructed DB aligned with the same schema state the runtime expects.
-    let ddl = schema::init_schema_sql_base();
-    for stmt in ddl.split(';') {
-        let stmt = stmt.trim();
-        if stmt.is_empty() {
-            continue;
-        }
-        conn.execute_raw(&format!("{stmt};"))
-            .map_err(|e| DbError::Sqlite(format!("reconstruct: DDL: {e}")))?;
-    }
-
-    // Run base migrations so the migrations table records the correct state.
-    // This ensures the runtime won't re-run migrations on first open.
-    let base_migrations = schema::schema_migrations_base();
-    // Create the migrations tracking table first.
-    conn.execute_raw(&format!(
-        "CREATE TABLE IF NOT EXISTS {} (\
-            id TEXT PRIMARY KEY ON CONFLICT IGNORE,\
-            description TEXT NOT NULL,\
-            applied_at INTEGER NOT NULL\
-        )",
-        schema::MIGRATIONS_TABLE_NAME,
-    ))
-    .map_err(|e| DbError::Sqlite(format!("reconstruct: migrations table: {e}")))?;
-
-    let migration_ts = crate::now_micros();
-    for migration in &base_migrations {
-        // Execute migration SQL. We tolerate only duplicate/exists-style
-        // idempotency errors; anything else indicates a broken reconstruction.
-        if let Err(e) = conn.execute_raw(&migration.up) {
-            let err_text = e.to_string();
-            if is_reconstruct_benign_migration_error(&err_text) {
-                tracing::debug!(
-                    migration_id = %migration.id,
-                    error = %err_text,
-                    "reconstruct migration produced benign idempotency error; continuing"
-                );
-            } else {
-                return Err(DbError::Sqlite(format!(
-                    "reconstruct: apply migration {}: {e}",
-                    migration.id
-                )));
-            }
-        }
-        // Record it as applied.
-        conn.execute_sync(
-            &format!(
-                "INSERT OR IGNORE INTO {} (id, description, applied_at) VALUES (?, ?, ?)",
-                schema::MIGRATIONS_TABLE_NAME,
-            ),
-            &[
-                Value::Text(migration.id.clone()),
-                Value::Text(migration.description.clone()),
-                Value::BigInt(migration_ts),
-            ],
-        )
-        .map_err(|e| DbError::Sqlite(format!("reconstruct: record migration: {e}")))?;
-    }
-
-    // Clean up any FTS artifacts that may have been left by prior migrations.
-    // This mirrors `schema::enforce_runtime_fts_cleanup`, but uses canonical
-    // SQLite so reconstruction is not coupled to runtime connection type.
-    let cleanup_sql = [
-        "DROP TRIGGER IF EXISTS fts_messages_ai",
-        "DROP TRIGGER IF EXISTS fts_messages_ad",
-        "DROP TRIGGER IF EXISTS fts_messages_au",
-        "DROP TRIGGER IF EXISTS messages_ai",
-        "DROP TRIGGER IF EXISTS messages_ad",
-        "DROP TRIGGER IF EXISTS messages_au",
-        "DROP TRIGGER IF EXISTS agents_ai",
-        "DROP TRIGGER IF EXISTS agents_ad",
-        "DROP TRIGGER IF EXISTS agents_au",
-        "DROP TRIGGER IF EXISTS projects_ai",
-        "DROP TRIGGER IF EXISTS projects_ad",
-        "DROP TRIGGER IF EXISTS projects_au",
-        "DROP TABLE IF EXISTS fts_agents",
-        "DROP TABLE IF EXISTS fts_projects",
-        "DROP TABLE IF EXISTS fts_messages",
-    ];
-    for stmt in cleanup_sql {
-        conn.execute_raw(stmt)
-            .map_err(|e| DbError::Sqlite(format!("reconstruct: fts cleanup ({stmt}): {e}")))?;
-    }
-
-    // Maps for deduplication: ((project_id, name) → agent_id)
-    let mut agent_ids: HashMap<(i64, String), i64> = HashMap::new();
-
-    let projects_dir = storage_root.join("projects");
-    if !is_real_directory(&projects_dir) {
-        stats.warnings.push(format!(
-            "No projects directory found at {}",
-            projects_dir.display()
-        ));
-        return Ok(stats);
-    }
-
-    // Phase 1: Discover projects
-    let mut project_dirs: Vec<(String, PathBuf)> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&projects_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if !file_type.is_dir() || file_type.is_symlink() {
+    let rebuild_result = (|| -> DbResult<()> {
+        // Apply schema via the migration pipeline (base mode: no FTS5 virtual
+        // tables, which FrankenConnection doesn't support). First lay down the
+        // base DDL, then run each base migration individually. This keeps the
+        // reconstructed DB aligned with the same schema state the runtime expects.
+        let ddl = schema::init_schema_sql_base();
+        for stmt in ddl.split(';') {
+            let stmt = stmt.trim();
+            if stmt.is_empty() {
                 continue;
             }
-            let Some(slug) = path.file_name().and_then(|n| n.to_str()).map(String::from) else {
-                continue;
-            };
-            project_dirs.push((slug, path));
+            conn.execute_raw(&format!("{stmt};"))
+                .map_err(|e| DbError::Sqlite(format!("reconstruct: DDL: {e}")))?;
         }
+
+        // Run base migrations so the migrations table records the correct state.
+        // This ensures the runtime won't re-run migrations on first open.
+        let base_migrations = schema::schema_migrations_base();
+        // Create the migrations tracking table first.
+        conn.execute_raw(&format!(
+            "CREATE TABLE IF NOT EXISTS {} (\
+                id TEXT PRIMARY KEY ON CONFLICT IGNORE,\
+                description TEXT NOT NULL,\
+                applied_at INTEGER NOT NULL\
+            )",
+            schema::MIGRATIONS_TABLE_NAME,
+        ))
+        .map_err(|e| DbError::Sqlite(format!("reconstruct: migrations table: {e}")))?;
+
+        let migration_ts = crate::now_micros();
+        for migration in &base_migrations {
+            // Execute migration SQL. We tolerate only duplicate/exists-style
+            // idempotency errors; anything else indicates a broken reconstruction.
+            if let Err(e) = conn.execute_raw(&migration.up) {
+                let err_text = e.to_string();
+                if is_reconstruct_benign_migration_error(&err_text) {
+                    tracing::debug!(
+                        migration_id = %migration.id,
+                        error = %err_text,
+                        "reconstruct migration produced benign idempotency error; continuing"
+                    );
+                } else {
+                    return Err(DbError::Sqlite(format!(
+                        "reconstruct: apply migration {}: {e}",
+                        migration.id
+                    )));
+                }
+            }
+            // Record it as applied.
+            conn.execute_sync(
+                &format!(
+                    "INSERT OR IGNORE INTO {} (id, description, applied_at) VALUES (?, ?, ?)",
+                    schema::MIGRATIONS_TABLE_NAME,
+                ),
+                &[
+                    Value::Text(migration.id.clone()),
+                    Value::Text(migration.description.clone()),
+                    Value::BigInt(migration_ts),
+                ],
+            )
+            .map_err(|e| DbError::Sqlite(format!("reconstruct: record migration: {e}")))?;
+        }
+
+        // Clean up any FTS artifacts that may have been left by prior migrations.
+        // This mirrors `schema::enforce_runtime_fts_cleanup`, but uses canonical
+        // SQLite so reconstruction is not coupled to runtime connection type.
+        let cleanup_sql = [
+            "DROP TRIGGER IF EXISTS fts_messages_ai",
+            "DROP TRIGGER IF EXISTS fts_messages_ad",
+            "DROP TRIGGER IF EXISTS fts_messages_au",
+            "DROP TRIGGER IF EXISTS messages_ai",
+            "DROP TRIGGER IF EXISTS messages_ad",
+            "DROP TRIGGER IF EXISTS messages_au",
+            "DROP TRIGGER IF EXISTS agents_ai",
+            "DROP TRIGGER IF EXISTS agents_ad",
+            "DROP TRIGGER IF EXISTS agents_au",
+            "DROP TRIGGER IF EXISTS projects_ai",
+            "DROP TRIGGER IF EXISTS projects_ad",
+            "DROP TRIGGER IF EXISTS projects_au",
+            "DROP TABLE IF EXISTS fts_agents",
+            "DROP TABLE IF EXISTS fts_projects",
+            "DROP TABLE IF EXISTS fts_messages",
+        ];
+        for stmt in cleanup_sql {
+            conn.execute_raw(stmt)
+                .map_err(|e| DbError::Sqlite(format!("reconstruct: fts cleanup ({stmt}): {e}")))?;
+        }
+
+        // Maps for deduplication: ((project_id, name) → agent_id)
+        let mut agent_ids: HashMap<(i64, String), i64> = HashMap::new();
+
+        // Phase 1: Discover projects
+        let mut project_dirs: Vec<(String, PathBuf)> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&projects_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if !file_type.is_dir() || file_type.is_symlink() {
+                    continue;
+                }
+                let Some(slug) = path.file_name().and_then(|n| n.to_str()).map(String::from) else {
+                    continue;
+                };
+                project_dirs.push((slug, path));
+            }
+        }
+        project_dirs.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (slug, project_path) in &project_dirs {
+            let now = crate::now_micros();
+            let human_key = read_project_human_key(project_path, slug, &mut stats);
+
+            conn.execute_sync(
+                "INSERT OR IGNORE INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
+                &[
+                    Value::Text(slug.clone()),
+                    Value::Text(human_key.clone()),
+                    Value::BigInt(now),
+                ],
+            )
+            .map_err(|e| DbError::Sqlite(format!("reconstruct: insert project {slug}: {e}")))?;
+
+            let pid = query_last_insert_or_existing_id(&conn, "projects", "slug", slug)?;
+            stats.projects += 1;
+
+            // Phase 2: Discover agents for this project
+            let agents_dir = project_path.join("agents");
+            if is_real_directory(&agents_dir) {
+                discover_agents(&conn, &agents_dir, pid, &mut agent_ids, &mut stats)?;
+            }
+
+            // Phase 2b: Recover archived file reservations so robot/status reads can
+            // rebuild the same project-scoped lease view from the archive alone.
+            let reservations_dir = project_path.join("file_reservations");
+            if is_real_directory(&reservations_dir) {
+                discover_file_reservations(
+                    &conn,
+                    &reservations_dir,
+                    pid,
+                    &mut agent_ids,
+                    &mut stats,
+                )?;
+            }
+
+            // Phase 3: Discover messages for this project
+            let messages_dir = project_path.join("messages");
+            if is_real_directory(&messages_dir) {
+                discover_messages(&conn, &messages_dir, pid, slug, &mut agent_ids, &mut stats)?;
+            }
+        }
+
+        // Rebuild all index b-trees to ensure consistency after bulk inserts.
+        conn.execute_raw("REINDEX;")
+            .map_err(|e| DbError::Sqlite(format!("reconstruct: REINDEX: {e}")))?;
+
+        // Flush WAL (if any residual) and remove sidecar files so the DB is a
+        // single clean file ready for the runtime to open with its own settings.
+        let _ = conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE);");
+        Ok(())
+    })();
+
+    if let Err(err) = rebuild_result {
+        let _ = conn.execute_raw("ROLLBACK;");
+        return Err(err);
     }
-    project_dirs.sort_by(|a, b| a.0.cmp(&b.0));
-
-    for (slug, project_path) in &project_dirs {
-        let now = crate::now_micros();
-        let human_key = read_project_human_key(project_path, slug, &mut stats);
-
-        conn.execute_sync(
-            "INSERT OR IGNORE INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
-            &[
-                Value::Text(slug.clone()),
-                Value::Text(human_key.clone()),
-                Value::BigInt(now),
-            ],
-        )
-        .map_err(|e| DbError::Sqlite(format!("reconstruct: insert project {slug}: {e}")))?;
-
-        let pid = query_last_insert_or_existing_id(&conn, "projects", "slug", slug)?;
-        stats.projects += 1;
-
-        // Phase 2: Discover agents for this project
-        let agents_dir = project_path.join("agents");
-        if is_real_directory(&agents_dir) {
-            discover_agents(&conn, &agents_dir, pid, &mut agent_ids, &mut stats)?;
-        }
-
-        // Phase 2b: Recover archived file reservations so robot/status reads can
-        // rebuild the same project-scoped lease view from the archive alone.
-        let reservations_dir = project_path.join("file_reservations");
-        if is_real_directory(&reservations_dir) {
-            discover_file_reservations(&conn, &reservations_dir, pid, &mut agent_ids, &mut stats)?;
-        }
-
-        // Phase 3: Discover messages for this project
-        let messages_dir = project_path.join("messages");
-        if is_real_directory(&messages_dir) {
-            discover_messages(&conn, &messages_dir, pid, slug, &mut agent_ids, &mut stats)?;
-        }
-    }
-
-    // Rebuild all index b-trees to ensure consistency after bulk inserts.
-    conn.execute_raw("REINDEX;")
-        .map_err(|e| DbError::Sqlite(format!("reconstruct: REINDEX: {e}")))?;
-
-    // Flush WAL (if any residual) and remove sidecar files so the DB is a
-    // single clean file ready for the runtime to open with its own settings.
-    let _ = conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE);");
+    conn.execute_raw("COMMIT;")
+        .map_err(|e| DbError::Sqlite(format!("reconstruct: commit transaction: {e}")))?;
 
     stats.finalize_duplicate_warnings();
     tracing::info!(%stats, "database reconstruction from archive complete");

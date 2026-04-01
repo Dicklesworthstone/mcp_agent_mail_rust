@@ -2479,6 +2479,141 @@ fn quarantined_sidecar_path(
 }
 
 #[allow(clippy::result_large_err)]
+fn reconstruction_candidate_path(primary_path: &Path, timestamp: &str) -> PathBuf {
+    let base_name = primary_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("storage.sqlite3");
+    primary_path.with_file_name(format!("{base_name}.reconstructing-{timestamp}"))
+}
+
+#[allow(clippy::result_large_err)]
+fn quarantine_reconstruction_candidate_path(
+    candidate_path: &Path,
+    primary_path: &Path,
+    reason: &str,
+    timestamp: &str,
+) -> Result<Option<PathBuf>, SqlError> {
+    if !candidate_path.exists() {
+        return Ok(None);
+    }
+
+    let base_name = primary_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("storage.sqlite3");
+    let quarantined = primary_path.with_file_name(format!("{base_name}.{reason}-{timestamp}"));
+    std::fs::rename(candidate_path, &quarantined).map_err(|e| {
+        SqlError::Custom(format!(
+            "failed to quarantine reconstructed sqlite candidate {}: {e}",
+            candidate_path.display()
+        ))
+    })?;
+
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let mut source_os = candidate_path.as_os_str().to_os_string();
+        source_os.push(suffix);
+        let source = PathBuf::from(source_os);
+        if !source.exists() {
+            continue;
+        }
+        let mut target_os = quarantined.as_os_str().to_os_string();
+        target_os.push(suffix);
+        let target = PathBuf::from(target_os);
+        std::fs::rename(&source, &target).map_err(|e| {
+            SqlError::Custom(format!(
+                "failed to quarantine reconstructed sqlite sidecar {}: {e}",
+                source.display()
+            ))
+        })?;
+    }
+
+    Ok(Some(quarantined))
+}
+
+#[allow(clippy::result_large_err)]
+fn activate_reconstruction_candidate(
+    candidate_path: &Path,
+    primary_path: &Path,
+) -> Result<(), SqlError> {
+    if primary_path.exists() {
+        return Err(SqlError::Custom(format!(
+            "refusing to activate reconstructed candidate {} over existing live database {}",
+            candidate_path.display(),
+            primary_path.display()
+        )));
+    }
+
+    std::fs::rename(candidate_path, primary_path).map_err(|e| {
+        SqlError::Custom(format!(
+            "failed to activate reconstructed sqlite candidate {} into {}: {e}",
+            candidate_path.display(),
+            primary_path.display()
+        ))
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn reconstruct_archive_into_candidate(
+    primary_path: &Path,
+    storage_root: &Path,
+    salvage_db_path: Option<&Path>,
+    timestamp: &str,
+) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
+    let candidate_path = reconstruction_candidate_path(primary_path, timestamp);
+    let reconstruct_result = match salvage_db_path {
+        Some(salvage_db_path) => crate::reconstruct::reconstruct_from_archive_with_salvage(
+            &candidate_path,
+            storage_root,
+            Some(salvage_db_path),
+        ),
+        None => crate::reconstruct::reconstruct_from_archive(&candidate_path, storage_root),
+    };
+
+    match reconstruct_result {
+        Ok(stats) => match sqlite_file_is_healthy(&candidate_path) {
+            Ok(true) => {
+                activate_reconstruction_candidate(&candidate_path, primary_path)?;
+                Ok(stats)
+            }
+            Ok(false) => {
+                let _ = quarantine_reconstruction_candidate_path(
+                    &candidate_path,
+                    primary_path,
+                    "reconstruct-failed",
+                    timestamp,
+                );
+                Err(SqlError::Custom(format!(
+                    "archive reconstruction produced an unhealthy sqlite candidate for {}",
+                    primary_path.display()
+                )))
+            }
+            Err(e) => {
+                let _ = quarantine_reconstruction_candidate_path(
+                    &candidate_path,
+                    primary_path,
+                    "reconstruct-failed",
+                    timestamp,
+                );
+                Err(e)
+            }
+        },
+        Err(e) => {
+            let _ = quarantine_reconstruction_candidate_path(
+                &candidate_path,
+                primary_path,
+                "reconstruct-failed",
+                timestamp,
+            );
+            Err(SqlError::Custom(format!(
+                "archive reconstruction failed for {}: {e}",
+                primary_path.display()
+            )))
+        }
+    }
+}
+
+#[allow(clippy::result_large_err)]
 fn quarantine_sidecar_with_label(
     primary_path: &Path,
     suffix: &str,
@@ -2718,8 +2853,8 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
                 primary_path.display()
             )));
         }
-        return crate::reconstruct::reconstruct_from_archive(primary_path, storage_root)
-            .map_err(|e| SqlError::Custom(e.to_string()));
+        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+        return reconstruct_archive_into_candidate(primary_path, storage_root, None, &timestamp);
     }
 
     if let Ok(conn) = open_sqlite_file_with_recovery(primary_path.to_string_lossy().as_ref()) {
@@ -2748,46 +2883,16 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
         "archive reconciliation",
     )?;
 
-    match crate::reconstruct::reconstruct_from_archive_with_salvage(
+    match reconstruct_archive_into_candidate(
         primary_path,
         storage_root,
         Some(&quarantined),
+        &timestamp,
     ) {
-        Ok(stats) => match sqlite_file_is_healthy(primary_path) {
-            Ok(true) => Ok(stats),
-            Ok(false) => {
-                let _ = quarantine_reconstructed_candidate(
-                    primary_path,
-                    &timestamp,
-                    "archive-reconcile-failed",
-                );
-                restore_quarantined_primary(primary_path, &quarantined, &timestamp)?;
-                Err(SqlError::Custom(format!(
-                    "archive reconciliation produced an unhealthy database at {}",
-                    primary_path.display()
-                )))
-            }
-            Err(e) => {
-                let _ = quarantine_reconstructed_candidate(
-                    primary_path,
-                    &timestamp,
-                    "archive-reconcile-failed",
-                );
-                restore_quarantined_primary(primary_path, &quarantined, &timestamp)?;
-                Err(e)
-            }
-        },
+        Ok(stats) => Ok(stats),
         Err(e) => {
-            let _ = quarantine_reconstructed_candidate(
-                primary_path,
-                &timestamp,
-                "archive-reconcile-failed",
-            );
             restore_quarantined_primary(primary_path, &quarantined, &timestamp)?;
-            Err(SqlError::Custom(format!(
-                "archive reconciliation failed for {}: {e}",
-                primary_path.display()
-            )))
+            Err(e)
         }
     }
 }
@@ -3055,35 +3160,27 @@ pub fn ensure_sqlite_file_healthy_with_archive(
         )?;
     }
 
-    match crate::reconstruct::reconstruct_from_archive(primary_path, storage_root) {
+    match reconstruct_archive_into_candidate(primary_path, storage_root, None, &timestamp) {
         Ok(stats) => {
-            if sqlite_file_is_healthy(primary_path)? {
-                if had_primary && stats.agents == 0 && stats.messages == 0 {
-                    if let Some(quarantined) = quarantine_reconstructed_candidate(
-                        primary_path,
-                        &timestamp,
-                        "reconstruct-empty",
-                    )? {
-                        tracing::warn!(
-                            primary = %primary_path.display(),
-                            quarantined = %quarantined.display(),
-                            "quarantined empty reconstructed database candidate"
-                        );
-                    }
-                    return Err(SqlError::Custom(format!(
-                        "database file {} was quarantined for archive-aware recovery, but archive reconstruction restored no durable mail state; refusing blank reinitialization to avoid data loss",
-                        primary_path.display()
-                    )));
+            if had_primary && stats.agents == 0 && stats.messages == 0 {
+                if let Some(quarantined) = quarantine_reconstructed_candidate(
+                    primary_path,
+                    &timestamp,
+                    "reconstruct-empty",
+                )? {
+                    tracing::warn!(
+                        primary = %primary_path.display(),
+                        quarantined = %quarantined.display(),
+                        "quarantined empty reconstructed database candidate"
+                    );
                 }
-                tracing::warn!(
-                    %stats,
-                    "database successfully reconstructed from Git archive"
-                );
-                return Ok(());
+                return Err(SqlError::Custom(format!(
+                    "database file {} was quarantined for archive-aware recovery, but archive reconstruction restored no durable mail state; refusing blank reinitialization to avoid data loss",
+                    primary_path.display()
+                )));
             }
-            tracing::warn!(
-                "reconstructed database failed health probes; falling through to blank reinit"
-            );
+            tracing::warn!(%stats, "database successfully reconstructed from Git archive");
+            return Ok(());
         }
         Err(e) => {
             tracing::warn!(
@@ -4998,6 +5095,84 @@ mod tests {
                 .join("test.db.reconstruct-failed-20260218_120000_000")
                 .exists(),
             "quarantined primary should be rolled back on failure"
+        );
+    }
+
+    #[test]
+    fn quarantine_reconstruction_candidate_path_moves_candidate_and_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("test.db");
+        let candidate = dir
+            .path()
+            .join("test.db.reconstructing-20260218_120000_000");
+        let candidate_journal = dir
+            .path()
+            .join("test.db.reconstructing-20260218_120000_000-journal");
+
+        std::fs::write(&candidate, b"candidate").expect("write candidate");
+        std::fs::write(&candidate_journal, b"journal").expect("write candidate journal");
+
+        let quarantined = quarantine_reconstruction_candidate_path(
+            &candidate,
+            &primary,
+            "reconstruct-failed",
+            "20260218_120000_000",
+        )
+        .expect("quarantine candidate")
+        .expect("quarantined path");
+
+        assert_eq!(
+            quarantined,
+            dir.path()
+                .join("test.db.reconstruct-failed-20260218_120000_000")
+        );
+        assert!(!candidate.exists(), "candidate path should be gone");
+        assert!(quarantined.exists(), "quarantined candidate should exist");
+        assert_eq!(
+            std::fs::read(
+                dir.path()
+                    .join("test.db.reconstruct-failed-20260218_120000_000-journal")
+            )
+            .unwrap(),
+            b"journal"
+        );
+    }
+
+    #[test]
+    fn reconstruct_archive_into_candidate_preserves_existing_primary_on_activation_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("test.db");
+        std::fs::write(&primary, b"live").expect("write primary");
+
+        let storage_root = dir.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects/demo-project"))
+            .expect("create project archive");
+
+        let err = reconstruct_archive_into_candidate(
+            &primary,
+            &storage_root,
+            None,
+            "20260218_120000_000",
+        )
+        .expect_err("existing primary should block candidate activation");
+
+        assert!(
+            err.to_string()
+                .contains("archive reconstruction failed for"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), b"live");
+        assert!(
+            dir.path()
+                .join("test.db.reconstruct-failed-20260218_120000_000")
+                .exists(),
+            "candidate should be quarantined instead of replacing the live db"
+        );
+        assert!(
+            !dir.path()
+                .join("test.db.reconstructing-20260218_120000_000")
+                .exists(),
+            "temporary candidate path should not remain live after failure"
         );
     }
 

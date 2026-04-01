@@ -11063,6 +11063,93 @@ mod tests {
     }
 
     #[test]
+    fn create_file_reservations_allows_disjoint_simple_globs_with_same_prefix() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) =
+            setup_test_pool("reservation_no_conflict_disjoint_simple_globs.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-reservation-no-conflict-disjoint-simple-globs-{base}"),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let holder = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("holder"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register holder");
+            let holder_id = holder.id.expect("holder id");
+
+            let requester = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "RedHarbor",
+                "codex-cli",
+                "gpt-5",
+                Some("requester"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register requester");
+            let requester_id = requester.id.expect("requester id");
+
+            create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                holder_id,
+                &["src/*.rs"],
+                3600,
+                true,
+                "holder",
+            )
+            .await
+            .into_result()
+            .expect("create holder reservation");
+
+            let created = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                requester_id,
+                &["src/*.txt"],
+                3600,
+                true,
+                "requester",
+            )
+            .await
+            .into_result()
+            .expect("disjoint simple globs should not conflict");
+
+            assert_eq!(created.len(), 1);
+            assert_eq!(created[0].path_pattern, "src/*.txt");
+        });
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn release_reservations_by_ids_matching_expiry_skips_rows_renewed_after_scan() {
         use asupersync::runtime::RuntimeBuilder;
