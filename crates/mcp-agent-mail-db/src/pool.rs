@@ -1206,77 +1206,109 @@ async fn run_sqlite_init_once(
         cleanup_empty_wal_sidecar(sqlite_path);
     }
 
+    let missing_sqlite_file = sqlite_path != ":memory:" && !Path::new(sqlite_path).exists();
+
     if run_migrations {
-        let mig_conn = crate::guard_db_conn(
-            match open_sqlite_file_with_lock_retry(sqlite_path) {
+        if missing_sqlite_file {
+            let canonical_conn = match open_sqlite_file_with_lock_retry_canonical(sqlite_path) {
                 Ok(conn) => conn,
                 Err(err) => {
                     return Outcome::Err(SqlError::Custom(format!(
-                        "sqlite init stage=open_file failed: {err}"
+                        "sqlite init stage=open_canonical_missing_file failed: {err}"
                     )));
                 }
-            },
-            "sqlite init migration connection",
-        );
+            };
 
-        if let Err(err) = execute_sql_with_lock_retry(
-            &mig_conn,
-            sqlite_path,
-            schema::PRAGMA_DB_INIT_BASE_SQL,
-            "sqlite init base pragmas",
-        ) {
-            return Outcome::Err(SqlError::Custom(format!(
-                "sqlite init stage=base_pragmas failed: {err}"
-            )));
-        }
-
-        match schema::migrate_to_latest_base(cx, &*mig_conn).await {
-            Outcome::Ok(_) => {}
-            Outcome::Err(err) => {
+            if let Err(err) = canonical_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL) {
                 return Outcome::Err(SqlError::Custom(format!(
-                    "sqlite init stage=migrate_to_latest_base failed: {err}"
+                    "sqlite init stage=canonical_missing_file_pragmas failed: {err}"
                 )));
             }
-            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-        }
 
-        drop(mig_conn);
+            match schema::migrate_to_latest(cx, &canonical_conn).await {
+                Outcome::Ok(_) => {}
+                Outcome::Err(err) => {
+                    return Outcome::Err(SqlError::Custom(format!(
+                        "sqlite init stage=migrate_to_latest_missing_file failed: {err}"
+                    )));
+                }
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            }
 
-        // Run full migrations (including v10-v15) via canonical SQLite.
-        //
-        // Base-mode migrations intentionally skip migrations that require
-        // features unsupported by FrankenConnection (e.g. ALTER TABLE ADD
-        // COLUMN reparsing). Canonical SQLite handles these correctly, so we
-        // open a second connection to apply any remaining pending migrations
-        // such as v15 (recipients_json column addition).
-        let canonical_conn = match open_sqlite_file_with_lock_retry_canonical(sqlite_path) {
-            Ok(conn) => conn,
-            Err(err) => {
+            drop(canonical_conn);
+        } else {
+            let mig_conn = crate::guard_db_conn(
+                match open_sqlite_file_with_lock_retry(sqlite_path) {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        return Outcome::Err(SqlError::Custom(format!(
+                            "sqlite init stage=open_file failed: {err}"
+                        )));
+                    }
+                },
+                "sqlite init migration connection",
+            );
+
+            if let Err(err) = execute_sql_with_lock_retry(
+                &mig_conn,
+                sqlite_path,
+                schema::PRAGMA_DB_INIT_BASE_SQL,
+                "sqlite init base pragmas",
+            ) {
                 return Outcome::Err(SqlError::Custom(format!(
-                    "sqlite init stage=open_canonical_for_full_migrations failed: {err}"
+                    "sqlite init stage=base_pragmas failed: {err}"
                 )));
             }
-        };
 
-        if let Err(err) = canonical_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL) {
-            return Outcome::Err(SqlError::Custom(format!(
-                "sqlite init stage=canonical_pragmas failed: {err}"
-            )));
-        }
+            match schema::migrate_to_latest_base(cx, &*mig_conn).await {
+                Outcome::Ok(_) => {}
+                Outcome::Err(err) => {
+                    return Outcome::Err(SqlError::Custom(format!(
+                        "sqlite init stage=migrate_to_latest_base failed: {err}"
+                    )));
+                }
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            }
 
-        match schema::migrate_to_latest(cx, &canonical_conn).await {
-            Outcome::Ok(_) => {}
-            Outcome::Err(err) => {
+            drop(mig_conn);
+
+            // Run full migrations (including v10-v15) via canonical SQLite.
+            //
+            // Base-mode migrations intentionally skip migrations that require
+            // features unsupported by FrankenConnection (e.g. ALTER TABLE ADD
+            // COLUMN reparsing). Canonical SQLite handles these correctly, so we
+            // open a second connection to apply any remaining pending migrations
+            // such as v15 (recipients_json column addition).
+            let canonical_conn = match open_sqlite_file_with_lock_retry_canonical(sqlite_path) {
+                Ok(conn) => conn,
+                Err(err) => {
+                    return Outcome::Err(SqlError::Custom(format!(
+                        "sqlite init stage=open_canonical_for_full_migrations failed: {err}"
+                    )));
+                }
+            };
+
+            if let Err(err) = canonical_conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL) {
                 return Outcome::Err(SqlError::Custom(format!(
-                    "sqlite init stage=migrate_to_latest (full) failed: {err}"
+                    "sqlite init stage=canonical_pragmas failed: {err}"
                 )));
             }
-            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-        }
 
-        drop(canonical_conn);
+            match schema::migrate_to_latest(cx, &canonical_conn).await {
+                Outcome::Ok(_) => {}
+                Outcome::Err(err) => {
+                    return Outcome::Err(SqlError::Custom(format!(
+                        "sqlite init stage=migrate_to_latest (full) failed: {err}"
+                    )));
+                }
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            }
+
+            drop(canonical_conn);
+        }
     }
 
     let runtime_conn = crate::guard_db_conn(
@@ -5987,6 +6019,64 @@ mod tests {
         let conn = open_sqlite_file_with_recovery(db_path.to_str().unwrap()).unwrap();
         let rows = conn.query_sync("SELECT 1 AS val", &[]).unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn sqlite_init_missing_file_bootstraps_without_recovery_artifacts() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("fresh_bootstrap.sqlite3");
+        let db_path_str = db_path.to_str().expect("utf8 db path");
+
+        match rt.block_on(run_sqlite_init_once(&cx, db_path_str, true)) {
+            Outcome::Ok(()) => {}
+            Outcome::Err(err) => panic!("sqlite init should bootstrap fresh files: {err}"),
+            Outcome::Cancelled(reason) => panic!("sqlite init cancelled unexpectedly: {reason:?}"),
+            Outcome::Panicked(payload) => {
+                std::panic::panic_any(payload);
+            }
+        }
+
+        assert!(
+            db_path.exists(),
+            "bootstrap should create the sqlite file for a fresh database"
+        );
+        assert!(
+            sqlite_file_is_healthy(&db_path).expect("health check after fresh bootstrap"),
+            "fresh bootstrap should leave a healthy sqlite file"
+        );
+
+        let conn = open_sqlite_file_with_lock_retry(db_path_str)
+            .expect("runtime sqlite should open after fresh bootstrap");
+        let rows = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'projects'",
+                &[],
+            )
+            .expect("query sqlite_master");
+        assert_eq!(rows.len(), 1, "fresh bootstrap should apply migrations");
+
+        let mut recovery_artifacts = std::fs::read_dir(tmp.path())
+            .expect("read tempdir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                name.starts_with("fresh_bootstrap.sqlite3.corrupt-")
+                    || name.starts_with("fresh_bootstrap.sqlite3.reconstruct-")
+            })
+            .collect::<Vec<_>>();
+        recovery_artifacts.sort();
+        assert!(
+            recovery_artifacts.is_empty(),
+            "fresh bootstrap should not quarantine/reconstruct missing databases: {recovery_artifacts:?}"
+        );
     }
 
     #[test]

@@ -2540,8 +2540,8 @@ pub async fn flush_deferred_touches(cx: &Cx, pool: &DbPool) -> Outcome<(), DbErr
             }
         }
 
-        match map_sql_outcome(traw_execute(cx, &tracked, "COMMIT", &[]).await) {
-            Outcome::Ok(_) => Outcome::Ok(()),
+        match commit_tx(cx, &tracked).await {
+            Outcome::Ok(()) => Outcome::Ok(()),
             Outcome::Err(e) => {
                 let _ = map_sql_outcome(traw_execute(cx, &tracked, "ROLLBACK", &[]).await);
                 Outcome::Err(e)
@@ -6184,7 +6184,11 @@ async fn release_reservations_by_ids_with_expiry_constraint(
     }
     check_sql.push_str(" LIMIT 1");
 
-    // Insert into the release ledger (no RETURNING — frankensqlite compat).
+    // Record the release in both the base row and the sidecar ledger. The
+    // sidecar remains the audit source, while the base row keeps active
+    // reservation predicates correct on same-process readers that have already
+    // materialized file_reservations.
+    let update_sql = "UPDATE file_reservations SET released_ts = ? WHERE id = ?";
     let insert_sql = "INSERT OR IGNORE INTO file_reservation_releases (reservation_id, released_ts) \
          VALUES (?, ?)";
 
@@ -6209,7 +6213,15 @@ async fn release_reservations_by_ids_with_expiry_constraint(
             continue;
         }
 
-        // Step 2: Record the release.
+        // Step 2: Update the base reservation row first.
+        let update_params = [Value::BigInt(released_ts), Value::BigInt(*id)];
+        try_in_tx!(
+            cx,
+            &tracked,
+            map_sql_outcome(traw_execute(cx, &tracked, update_sql, &update_params).await)
+        );
+
+        // Step 3: Record the release in the sidecar ledger.
         let insert_params = [Value::BigInt(*id), Value::BigInt(released_ts)];
         try_in_tx!(
             cx,
@@ -10648,6 +10660,140 @@ mod tests {
     }
 
     #[test]
+    fn release_reservations_clear_same_process_reacquire_conflicts() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("release_clears_same_process_conflicts.db");
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 2,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-release-stale-snapshot-{base}"),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let holder = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "RedFox",
+                "codex-cli",
+                "gpt-5",
+                Some("holder"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register holder");
+            let holder_id = holder.id.expect("holder id");
+
+            let created = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                holder_id,
+                &["src/critical.rs"],
+                3600,
+                true,
+                "holder",
+            )
+            .await
+            .into_result()
+            .expect("create reservation");
+            let reservation_id = created[0].id.expect("reservation id");
+
+            let stale_conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire stale snapshot connection");
+            let stale_tracked = tracked(&*stale_conn);
+            map_sql_outcome(
+                traw_query(
+                    &cx,
+                    &stale_tracked,
+                    "SELECT id FROM file_reservations WHERE id = ?",
+                    &[Value::BigInt(reservation_id)],
+                )
+                .await,
+            )
+            .into_result()
+            .expect("seed stale snapshot");
+
+            let released = release_reservations(
+                &cx,
+                &pool,
+                project_id,
+                holder_id,
+                Some(&["src/critical.rs"]),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("release reservation");
+            assert_eq!(
+                released.len(),
+                1,
+                "release must target the held reservation"
+            );
+            assert_eq!(released[0].id, Some(reservation_id));
+            assert!(
+                released[0].released_ts.is_some(),
+                "release response must carry released_ts"
+            );
+
+            drop(stale_conn);
+
+            let active = get_active_reservations(&cx, &pool, project_id)
+                .await
+                .into_result()
+                .expect("read active reservations");
+            assert!(
+                active.is_empty(),
+                "released reservation must not remain visible to same-process reacquire checks"
+            );
+
+            let verify_conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire verification connection");
+            let verify_tracked = tracked(&*verify_conn);
+            let rows = map_sql_outcome(
+                traw_query(
+                    &cx,
+                    &verify_tracked,
+                    "SELECT released_ts FROM file_reservations WHERE id = ?",
+                    &[Value::BigInt(reservation_id)],
+                )
+                .await,
+            )
+            .into_result()
+            .expect("read released_ts");
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].get(0).and_then(value_as_i64).is_some());
+        });
+    }
+
+    #[test]
     fn create_file_reservations_rejects_exact_request_that_hits_existing_glob() {
         use asupersync::runtime::RuntimeBuilder;
 
@@ -10826,6 +10972,93 @@ mod tests {
                 }
                 other => panic!("expected ResourceBusy, got {other:?}"),
             }
+        });
+    }
+
+    #[test]
+    fn create_file_reservations_allows_single_level_glob_when_existing_exact_is_deeper() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) =
+            setup_test_pool("reservation_no_conflict_shallow_glob_to_deep_exact.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-reservation-no-conflict-shallow-glob-to-deep-exact-{base}"),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let holder = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("holder"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register holder");
+            let holder_id = holder.id.expect("holder id");
+
+            let requester = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "RedHarbor",
+                "codex-cli",
+                "gpt-5",
+                Some("requester"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register requester");
+            let requester_id = requester.id.expect("requester id");
+
+            create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                holder_id,
+                &["src/auth/sub/file.rs"],
+                3600,
+                true,
+                "holder",
+            )
+            .await
+            .into_result()
+            .expect("create holder reservation");
+
+            let created = create_file_reservations(
+                &cx,
+                &pool,
+                project_id,
+                requester_id,
+                &["src/auth/*"],
+                3600,
+                true,
+                "requester",
+            )
+            .await
+            .into_result()
+            .expect("single-level glob should not conflict with deeper exact path");
+
+            assert_eq!(created.len(), 1);
+            assert_eq!(created[0].path_pattern, "src/auth/*");
         });
     }
 
