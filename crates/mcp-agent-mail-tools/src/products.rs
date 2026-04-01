@@ -52,13 +52,7 @@ fn generate_product_uid(now_micros: i64) -> String {
     // Format directly into the output buffer
     #[allow(clippy::cast_sign_loss)]
     let time_component = now_micros as u64;
-    let _ = write!(
-        out,
-        "{:016x}{:08x}{:08x}",
-        time_component,
-        pid,
-        seq
-    );
+    let _ = write!(out, "{:016x}{:08x}{:08x}", time_component, pid, seq);
 
     if out.len() > 32 {
         // If it somehow exceeds 32 chars, we keep the rightmost 32 chars

@@ -120,7 +120,7 @@ fn sanitize_url_userinfo(value: &str) -> Option<String> {
 
     // The authority section ends at the first '/', '?', or '#'
     let authority_end = value[after_scheme..]
-        .find(|c| c == '/' || c == '?' || c == '#')
+        .find(['/', '?', '#'])
         .map(|i| i + after_scheme)
         .unwrap_or(value.len());
 

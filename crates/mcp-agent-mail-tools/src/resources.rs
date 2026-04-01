@@ -3652,7 +3652,8 @@ pub(crate) fn reservation_compute_pattern_activity(
                     format!("{normalized}/**")
                 };
                 if let Some(matcher) = reservation_glob_matcher(&pattern_with_glob) {
-                    let (_, latest) = reservation_glob_walk_latest_micros(workspace, &candidate, &matcher);
+                    let (_, latest) =
+                        reservation_glob_walk_latest_micros(workspace, &candidate, &matcher);
                     fs_latest = latest;
                 }
                 // Fallback to directory mtime if scan found nothing or failed

@@ -607,8 +607,7 @@ fn extract_fenced_json(text: &str) -> Option<Value> {
 
 fn extract_structural_json(text: &str) -> Option<Value> {
     // Try braces { ... } then brackets [ ... ]
-    extract_wrapped_json(text, '{', '}')
-        .or_else(|| extract_wrapped_json(text, '[', ']'))
+    extract_wrapped_json(text, '{', '}').or_else(|| extract_wrapped_json(text, '[', ']'))
 }
 
 fn extract_wrapped_json(text: &str, open_ch: char, close_ch: char) -> Option<Value> {
@@ -1569,7 +1568,8 @@ mod tests {
     #[test]
     fn brace_json_with_trailing_garbage_brace() {
         let val =
-            extract_structural_json("Here is JSON: {\"a\": 1} and also this trailing brace }").unwrap();
+            extract_structural_json("Here is JSON: {\"a\": 1} and also this trailing brace }")
+                .unwrap();
         assert_eq!(val["a"], 1);
     }
 

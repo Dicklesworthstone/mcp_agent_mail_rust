@@ -3351,9 +3351,11 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// TTL for cached project/message counts returned by the readiness endpoint.
 const HEALTH_COUNT_CACHE_TTL: Duration = Duration::from_secs(30);
 
+type HealthCountCacheValue = (Instant, Option<(u64, u64)>);
+
 /// Cached `(last_refresh, project_count, message_count)`.  Both counts are
 /// `Option` so we can distinguish "never fetched" from "fetch failed".
-static HEALTH_COUNT_CACHE: std::sync::LazyLock<Mutex<(Instant, Option<(u64, u64)>)>> =
+static HEALTH_COUNT_CACHE: std::sync::LazyLock<Mutex<HealthCountCacheValue>> =
     std::sync::LazyLock::new(|| {
         // Start with `None` — the read path checks `cached.is_some()` before
         // trusting the TTL, so the first call always refreshes regardless of
@@ -8534,27 +8536,24 @@ to skip auth for local requests.</p>
 
         // Admission control: reject early when the blocking pool is saturated
         // so timed-out threads don't accumulate unboundedly.
-        let permit = match DispatchPermit::try_acquire() {
-            Some(p) => p,
-            None => {
-                tracing::warn!(
-                    method = %method,
-                    inflight = MAX_CONCURRENT_DISPATCHES,
-                    "dispatch admission control: too many concurrent requests, rejecting",
-                );
-                return id.map(|req_id| {
-                    JsonRpcResponse::error(
-                        Some(req_id),
-                        JsonRpcError::from(McpError::new(
-                            McpErrorCode::InternalError,
-                            format!(
-                                "Server overloaded, too many concurrent requests \
-                                 (limit={MAX_CONCURRENT_DISPATCHES}, method={method})"
-                            ),
-                        )),
-                    )
-                });
-            }
+        let Some(permit) = DispatchPermit::try_acquire() else {
+            tracing::warn!(
+                method = %method,
+                inflight = MAX_CONCURRENT_DISPATCHES,
+                "dispatch admission control: too many concurrent requests, rejecting",
+            );
+            return id.map(|req_id| {
+                JsonRpcResponse::error(
+                    Some(req_id),
+                    JsonRpcError::from(McpError::new(
+                        McpErrorCode::InternalError,
+                        format!(
+                            "Server overloaded, too many concurrent requests \
+                             (limit={MAX_CONCURRENT_DISPATCHES}, method={method})"
+                        ),
+                    )),
+                )
+            });
         };
 
         let hard_timeout_secs = self.request_timeout_secs.saturating_add(5);

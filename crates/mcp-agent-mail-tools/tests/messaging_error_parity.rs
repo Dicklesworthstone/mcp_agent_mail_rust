@@ -229,17 +229,17 @@ fn test_invalid_importance_error() {
             vec!["RedPeak".to_string()],
             "Test subject".to_string(),
             "Test body".to_string(),
-            None, // cc
-            None, // bcc
-            None, // attachment_paths
-            None, // convert_images
+            None,                              // cc
+            None,                              // bcc
+            None,                              // attachment_paths
+            None,                              // convert_images
             Some("invalid_level".to_string()), // importance
-            None, // ack_required
-            None, // thread_id
-            None, // topic
-            None, // broadcast
-            None, // auto_contact_if_blocked
-            None, // sender_token
+            None,                              // ack_required
+            None,                              // thread_id
+            None,                              // topic
+            None,                              // broadcast
+            None,                              // auto_contact_if_blocked
+            None,                              // sender_token
         )
         .await
         .expect_err("invalid importance should fail");
@@ -424,17 +424,17 @@ fn test_broadcast_with_explicit_to_error() {
             vec!["RedPeak".to_string()],
             "Test subject".to_string(),
             "Test body".to_string(),
-            None, // cc
-            None, // bcc
-            None, // attachment_paths
-            None, // convert_images
-            None, // importance
-            None, // ack_required
-            None, // thread_id
-            None, // topic
+            None,       // cc
+            None,       // bcc
+            None,       // attachment_paths
+            None,       // convert_images
+            None,       // importance
+            None,       // ack_required
+            None,       // thread_id
+            None,       // topic
             Some(true), // broadcast
-            None, // auto_contact_if_blocked
-            None, // sender_token
+            None,       // auto_contact_if_blocked
+            None,       // sender_token
         )
         .await
         .expect_err("broadcast + explicit to should fail");

@@ -578,17 +578,25 @@ mod tests {
     #[test]
     fn root_reservation_conflicts_with_everything() {
         let idx = ReservationIndex::build(vec![("".to_string(), make_ref(1))].into_iter());
-        
+
         // Exact request
         let req_exact = CompiledPattern::new("src/main.rs");
         let mut conflicts = Vec::new();
         idx.find_conflicts(&req_exact, &mut conflicts);
-        assert_eq!(conflicts.len(), 1, "Root reservation should conflict with exact request");
-        
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "Root reservation should conflict with exact request"
+        );
+
         // Glob request
         let req_glob = CompiledPattern::new("src/**/*.rs");
         let mut conflicts = Vec::new();
         idx.find_conflicts(&req_glob, &mut conflicts);
-        assert_eq!(conflicts.len(), 1, "Root reservation should conflict with glob request");
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "Root reservation should conflict with glob request"
+        );
     }
 }

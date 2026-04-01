@@ -2296,10 +2296,7 @@ mod tests {
         // "MyAgent" should not conflict with its own reservation
         let conflicts =
             check_path_conflicts(&paths, &reservations, "MyAgent", false).expect("conflicts");
-        assert!(
-            conflicts.is_empty(),
-            "own reservations should be skipped"
-        );
+        assert!(conflicts.is_empty(), "own reservations should be skipped");
     }
 
     #[test]
@@ -2327,9 +2324,8 @@ mod tests {
         let paths = vec!["shared/README.md".to_string()];
 
         // SharedAgent's non-exclusive reservation should not block
-        let conflicts =
-            check_path_conflicts(&paths, &reservations, "SomeOtherAgent", false)
-                .expect("conflicts");
+        let conflicts = check_path_conflicts(&paths, &reservations, "SomeOtherAgent", false)
+            .expect("conflicts");
         assert!(
             conflicts.is_empty(),
             "non-exclusive reservations should not conflict"
@@ -2360,14 +2356,15 @@ mod tests {
             normalized_pattern: "".to_string(),
             has_glob: false,
         }];
-        
+
         let conflicts = check_path_conflicts(
             &["src/main.rs".to_string(), "any/path".to_string()],
             &reservations,
             "SelfAgent",
             false,
-        ).unwrap();
-        
+        )
+        .unwrap();
+
         assert_eq!(conflicts.len(), 2);
         assert_eq!(conflicts[0].path, "src/main.rs");
         assert_eq!(conflicts[1].path, "any/path");
@@ -2384,7 +2381,7 @@ mod tests {
             normalized_pattern: "src/*".to_string(),
             has_glob: true,
         }];
-        
+
         // "src/*" with literal_separator(true) normally wouldn't match "src/subdir/file.rs"
         // and we removed the literal_base prefix logic for globs.
         let conflicts = check_path_conflicts(
@@ -2392,8 +2389,9 @@ mod tests {
             &reservations,
             "SelfAgent",
             false,
-        ).unwrap();
-        
+        )
+        .unwrap();
+
         assert_eq!(conflicts.len(), 0);
     }
 

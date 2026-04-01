@@ -532,7 +532,12 @@ fn sanitize_thread_id(raw: &str, fallback: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
         .take(128)
         .collect();
-    if sanitized.is_empty() || !sanitized.chars().next().is_some_and(|c| c.is_ascii_alphanumeric()) {
+    if sanitized.is_empty()
+        || !sanitized
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+    {
         return fallback.to_string();
     }
     sanitized
