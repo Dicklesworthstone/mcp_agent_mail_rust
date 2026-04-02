@@ -59,6 +59,7 @@ legacy/
 *.sqlite3.bak-*
 *.sqlite3-wal.bak
 *.sqlite3.corrupt-*
+*.sqlite3.archive-*
 
 # Temporary directories
 tmp/
