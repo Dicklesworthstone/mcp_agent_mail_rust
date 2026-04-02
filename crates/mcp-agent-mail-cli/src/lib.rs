@@ -4353,7 +4353,13 @@ fn handle_list_projects_with_database_url(
     json: bool,
 ) -> CliResult<()> {
     let fmt = output::CliOutputFormat::resolve(format, json);
-    let conn = open_db_sync_with_database_url(database_url)?;
+    let config = Config::from_env();
+    let opened = open_db_sync_canonical_read_with_database_url(
+        database_url,
+        Some(&config.storage_root),
+        "list-projects",
+    )?;
+    let conn = opened.conn();
 
     let projects = conn
         .query_sync(
@@ -5421,7 +5427,12 @@ fn recover_sqlite_file_with_storage_root(
     path: &Path,
     storage_root_override: Option<&Path>,
 ) -> CliResult<()> {
-    if !path.exists() || sqlite_file_is_healthy(path)? {
+    let storage_root = resolve_mailbox_activity_storage_root(storage_root_override);
+    if !path.exists() {
+        return Ok(());
+    }
+    if sqlite_file_is_healthy(path)? {
+        reconcile_sqlite_file_with_archive(path, &storage_root)?;
         return Ok(());
     }
 
@@ -5449,14 +5460,12 @@ fn recover_sqlite_file_with_storage_root(
             )));
         }
         swap_validated_sqlite_artifact(path, &temp_restore, &timestamp)?;
+        reconcile_sqlite_file_with_archive(path, &storage_root)?;
     } else {
         // Fall back to archive reconstruction if no backup is available.
         // Safety (issue #59): reconstruct into a temp file first, validate it,
         // then quarantine the original and swap in the new one. The original DB
         // is NOT moved/modified until the new DB is proven healthy.
-        let storage_root = storage_root_override
-            .map(PathBuf::from)
-            .unwrap_or_else(|| Config::from_env().storage_root);
         if storage_root.is_dir() && path_is_real_directory(&storage_root.join("projects")) {
             ftui_runtime::ftui_println!(
                 "No backup found. Reconstructing database from archive at {}...",
@@ -5511,6 +5520,7 @@ fn recover_sqlite_file_with_storage_root(
                         )));
                     }
                     swap_validated_sqlite_artifact(path, &temp_reconstruct, &timestamp)?;
+                    reconcile_sqlite_file_with_archive(path, &storage_root)?;
                 }
                 Err(e) => {
                     // Clean up partial temp file; original is safe.
@@ -5528,6 +5538,15 @@ fn recover_sqlite_file_with_storage_root(
     }
 
     Ok(())
+}
+
+fn reconcile_sqlite_file_with_archive(path: &Path, storage_root: &Path) -> CliResult<()> {
+    mcp_agent_mail_db::ensure_sqlite_file_healthy_with_archive(path, storage_root).map_err(|e| {
+        CliError::Other(format!(
+            "archive-aware sqlite reconciliation failed for {}: {e}",
+            path.display()
+        ))
+    })
 }
 
 fn ensure_sqlite_parent_dir(path: &Path) -> CliResult<()> {
@@ -5857,7 +5876,13 @@ fn open_db_sync_with_database_url_and_storage_root_internal(
         }
 
         if !sqlite_conn_requires_canonical_init(&conn)? && sqlite_conn_is_healthy(&conn)? {
-            return Ok((conn, opened_path));
+            return maybe_reconcile_sync_opened_sqlite_archive_drift(
+                conn,
+                opened_path,
+                database_url,
+                storage_root_override,
+                acquire_mutation_locks,
+            );
         }
 
         drop(conn);
@@ -5875,7 +5900,13 @@ fn open_db_sync_with_database_url_and_storage_root_internal(
         open_sqlite_with_fallback_and_storage_root(&path, storage_root_override)?;
     if opened_path != ":memory:" {
         if !sqlite_conn_requires_canonical_init(&conn)? {
-            return Ok((conn, opened_path));
+            return maybe_reconcile_sync_opened_sqlite_archive_drift(
+                conn,
+                opened_path,
+                database_url,
+                storage_root_override,
+                false,
+            );
         }
 
         let mut conn_healthy = sqlite_conn_is_healthy(&conn)?;
@@ -5921,7 +5952,13 @@ fn open_db_sync_with_database_url_and_storage_root_internal(
             }
         }
         let (reopened, resolved_path) = open_sqlite_with_fallback(&opened_path)?;
-        return Ok((reopened, resolved_path));
+        return maybe_reconcile_sync_opened_sqlite_archive_drift(
+            reopened,
+            resolved_path,
+            database_url,
+            storage_root_override,
+            false,
+        );
     }
 
     // In-memory DBs keep the original Franken init path.
@@ -5931,9 +5968,43 @@ fn open_db_sync_with_database_url_and_storage_root_internal(
     Ok((conn, opened_path))
 }
 
-pub(crate) fn open_db_sync() -> CliResult<mcp_agent_mail_db::DbConn> {
-    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    open_db_sync_with_database_url(&cfg.database_url)
+fn maybe_reconcile_sync_opened_sqlite_archive_drift(
+    conn: mcp_agent_mail_db::DbConn,
+    opened_path: String,
+    database_url: &str,
+    storage_root_override: Option<&Path>,
+    acquire_mutation_locks: bool,
+) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
+    if opened_path == ":memory:" {
+        return Ok((conn, opened_path));
+    }
+
+    let storage_root = resolve_mailbox_activity_storage_root(storage_root_override);
+    if !path_is_real_directory(&storage_root.join("projects")) {
+        return Ok((conn, opened_path));
+    }
+
+    let archive = collect_doctor_archive_inventory(&storage_root);
+    if archive.counts() == DoctorInventoryCounts::default() {
+        return Ok((conn, opened_path));
+    }
+
+    let db = collect_doctor_db_inventory(&conn)?;
+    if doctor_archive_db_drift_detail(&archive, &db).is_none() {
+        return Ok((conn, opened_path));
+    }
+
+    drop(conn);
+    let _mailbox_mutation_locks = if acquire_mutation_locks {
+        Some(acquire_cli_mailbox_mutation_locks(
+            database_url,
+            Some(&storage_root),
+        )?)
+    } else {
+        None
+    };
+    reconcile_sqlite_file_with_archive(Path::new(&opened_path), &storage_root)?;
+    open_sqlite_with_fallback_and_storage_root(&opened_path, Some(&storage_root))
 }
 
 fn open_db_sync_while_holding_mailbox_lock() -> CliResult<mcp_agent_mail_db::DbConn> {
@@ -5980,12 +6051,368 @@ fn resolve_read_only_sqlite_source_path_with_database_url(
     Ok(PathBuf::from(opened_path))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanonicalSnapshotSourceKind {
+    LiveSqlite,
+    LiveSnapshot,
+    ArchiveSnapshot,
+}
+
+#[derive(Debug)]
+struct CanonicalSnapshotSource {
+    actual_path: PathBuf,
+    reported_path: PathBuf,
+    kind: CanonicalSnapshotSourceKind,
+    _snapshot_dir: Option<tempfile::TempDir>,
+}
+
+impl CanonicalSnapshotSource {
+    fn live(path: PathBuf) -> Self {
+        Self {
+            actual_path: path.clone(),
+            reported_path: path,
+            kind: CanonicalSnapshotSourceKind::LiveSqlite,
+            _snapshot_dir: None,
+        }
+    }
+
+    fn archive_snapshot(
+        reported_path: PathBuf,
+        storage_root: &Path,
+        salvage_db_path: Option<&Path>,
+        context: &str,
+    ) -> CliResult<Self> {
+        let snapshot_dir = tempfile::Builder::new()
+            .prefix("canonical-mailbox-snapshot-")
+            .tempdir()
+            .map_err(|e| {
+                CliError::Other(format!("{context} archive snapshot tempdir failed: {e}"))
+            })?;
+        let actual_path = snapshot_dir.path().join("mailbox.sqlite3");
+        let reconstruct = salvage_db_path
+            .filter(|path| path_is_real_file(path))
+            .map_or_else(
+                || mcp_agent_mail_db::reconstruct_from_archive(&actual_path, storage_root),
+                |salvage_db_path| {
+                    mcp_agent_mail_db::reconstruct_from_archive_with_salvage(
+                        &actual_path,
+                        storage_root,
+                        Some(salvage_db_path),
+                    )
+                },
+            );
+        reconstruct.map_err(|e| {
+            CliError::Other(format!(
+                "{context} archive snapshot reconstruction failed: {e}"
+            ))
+        })?;
+        Ok(Self {
+            actual_path,
+            reported_path,
+            kind: CanonicalSnapshotSourceKind::ArchiveSnapshot,
+            _snapshot_dir: Some(snapshot_dir),
+        })
+    }
+
+    fn live_snapshot(reported_path: PathBuf, source_path: &Path, context: &str) -> CliResult<Self> {
+        let snapshot_dir = tempfile::Builder::new()
+            .prefix("canonical-mailbox-live-snapshot-")
+            .tempdir()
+            .map_err(|e| CliError::Other(format!("{context} live snapshot tempdir failed: {e}")))?;
+        let actual_path = snapshot_dir.path().join("mailbox.sqlite3");
+        mcp_agent_mail_share::create_sqlite_snapshot(source_path, &actual_path, false)
+            .map_err(|e| CliError::Other(format!("{context} live sqlite snapshot failed: {e}")))?;
+        Ok(Self {
+            actual_path,
+            reported_path,
+            kind: CanonicalSnapshotSourceKind::LiveSnapshot,
+            _snapshot_dir: Some(snapshot_dir),
+        })
+    }
+
+    fn actual_path(&self) -> &Path {
+        &self.actual_path
+    }
+
+    fn reported_path(&self) -> &Path {
+        &self.reported_path
+    }
+
+    fn uses_archive_snapshot(&self) -> bool {
+        matches!(self.kind, CanonicalSnapshotSourceKind::ArchiveSnapshot)
+    }
+
+    fn materialize_for_async_read_pool(self, context: &str) -> CliResult<Self> {
+        if matches!(
+            self.kind,
+            CanonicalSnapshotSourceKind::ArchiveSnapshot
+                | CanonicalSnapshotSourceKind::LiveSnapshot
+        ) {
+            return Ok(self);
+        }
+        let reported_path = self.reported_path;
+        let actual_path = self.actual_path;
+        Self::live_snapshot(reported_path, &actual_path, context)
+    }
+}
+
+fn resolve_canonical_snapshot_source_path(
+    source_candidate: &Path,
+    storage_root: &Path,
+    context: &str,
+) -> CliResult<CanonicalSnapshotSource> {
+    let archive = collect_doctor_archive_inventory(storage_root);
+    let archive_has_state = archive.counts() != DoctorInventoryCounts::default();
+    let candidate_display = source_candidate.display().to_string();
+    let candidate_path = PathBuf::from(source_candidate);
+
+    if candidate_display == ":memory:" || !source_candidate.exists() {
+        if archive_has_state {
+            tracing::warn!(
+                operation = context,
+                source = candidate_display,
+                storage_root = %storage_root.display(),
+                "using canonical archive snapshot because the live sqlite source is unavailable"
+            );
+            return CanonicalSnapshotSource::archive_snapshot(
+                candidate_path,
+                storage_root,
+                None,
+                context,
+            );
+        }
+        return Err(CliError::Other(format!(
+            "database not found: {}",
+            source_candidate.display()
+        )));
+    }
+
+    match open_sqlite_read_only_with_fallback(&candidate_display) {
+        Ok((conn, opened_path)) => {
+            let opened_path = PathBuf::from(opened_path);
+            let db_inventory = collect_doctor_db_inventory(&conn);
+            drop(conn);
+
+            match db_inventory {
+                Ok(db_inventory) => {
+                    if archive_has_state
+                        && let Some(detail) =
+                            doctor_archive_db_drift_detail(&archive, &db_inventory)
+                    {
+                        tracing::warn!(
+                            operation = context,
+                            source = %opened_path.display(),
+                            storage_root = %storage_root.display(),
+                            drift = detail,
+                            "using canonical archive snapshot because the live sqlite index lags the Git archive"
+                        );
+                        let salvage_path = opened_path.clone();
+                        return CanonicalSnapshotSource::archive_snapshot(
+                            opened_path,
+                            storage_root,
+                            Some(salvage_path.as_path()),
+                            context,
+                        );
+                    }
+                    Ok(CanonicalSnapshotSource::live(opened_path))
+                }
+                Err(error) if archive_has_state => {
+                    tracing::warn!(
+                        operation = context,
+                        source = %opened_path.display(),
+                        storage_root = %storage_root.display(),
+                        error = %error,
+                        "using canonical archive snapshot because the live sqlite inventory probe failed"
+                    );
+                    let salvage_path = opened_path.clone();
+                    CanonicalSnapshotSource::archive_snapshot(
+                        opened_path,
+                        storage_root,
+                        Some(salvage_path.as_path()),
+                        context,
+                    )
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) if archive_has_state => {
+            tracing::warn!(
+                operation = context,
+                source = candidate_display,
+                storage_root = %storage_root.display(),
+                error = %error,
+                "using canonical archive snapshot because the live sqlite source could not be opened read-only"
+            );
+            let salvage_path = candidate_path.clone();
+            CanonicalSnapshotSource::archive_snapshot(
+                candidate_path,
+                storage_root,
+                Some(salvage_path.as_path()),
+                context,
+            )
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn resolve_canonical_snapshot_source_with_database_url(
+    database_url: &str,
+    storage_root: &Path,
+    context: &str,
+) -> CliResult<CanonicalSnapshotSource> {
+    let source_candidate = resolve_read_only_sqlite_source_path_with_database_url(database_url)?;
+    resolve_canonical_snapshot_source_path(&source_candidate, storage_root, context)
+}
+
+struct CanonicalReadDb {
+    conn: mcp_agent_mail_db::DbConn,
+    _source: CanonicalSnapshotSource,
+    _mailbox_read_locks: CliMailboxReadLocks,
+}
+
+impl CanonicalReadDb {
+    fn conn(&self) -> &mcp_agent_mail_db::DbConn {
+        &self.conn
+    }
+
+    fn actual_sqlite_path(&self) -> &Path {
+        self._source.actual_path()
+    }
+}
+
+struct CanonicalReadPool {
+    pool: mcp_agent_mail_db::DbPool,
+    _source: CanonicalSnapshotSource,
+    _mailbox_read_locks: CliMailboxReadLocks,
+}
+
+impl CanonicalReadPool {
+    fn pool(&self) -> &mcp_agent_mail_db::DbPool {
+        &self.pool
+    }
+}
+
+struct CanonicalReadDbPool {
+    conn: mcp_agent_mail_db::DbConn,
+    pool: mcp_agent_mail_db::DbPool,
+    _source: CanonicalSnapshotSource,
+    _mailbox_read_locks: CliMailboxReadLocks,
+}
+
+impl CanonicalReadDbPool {
+    fn conn(&self) -> &mcp_agent_mail_db::DbConn {
+        &self.conn
+    }
+
+    fn pool(&self) -> &mcp_agent_mail_db::DbPool {
+        &self.pool
+    }
+}
+
+fn open_canonical_async_read_source_with_database_url(
+    database_url: &str,
+    storage_root_override: Option<&Path>,
+    context: &str,
+) -> CliResult<(PathBuf, CliMailboxReadLocks, CanonicalSnapshotSource)> {
+    let storage_root = resolve_mailbox_activity_storage_root(storage_root_override);
+    let mailbox_read_locks = acquire_cli_mailbox_read_locks(database_url, Some(&storage_root))?;
+    let source =
+        resolve_canonical_snapshot_source_with_database_url(database_url, &storage_root, context)?
+            .materialize_for_async_read_pool(context)?;
+    Ok((storage_root, mailbox_read_locks, source))
+}
+
+fn open_db_sync_canonical_read_with_database_url(
+    database_url: &str,
+    storage_root_override: Option<&Path>,
+    context: &str,
+) -> CliResult<CanonicalReadDb> {
+    let storage_root = resolve_mailbox_activity_storage_root(storage_root_override);
+    let mailbox_read_locks = acquire_cli_mailbox_read_locks(database_url, Some(&storage_root))?;
+    let source =
+        resolve_canonical_snapshot_source_with_database_url(database_url, &storage_root, context)?;
+    let source_path = source.actual_path().display().to_string();
+    let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&source_path)?;
+    Ok(CanonicalReadDb {
+        conn,
+        _source: source,
+        _mailbox_read_locks: mailbox_read_locks,
+    })
+}
+
+fn open_db_async_canonical_read_with_database_url(
+    database_url: &str,
+    storage_root_override: Option<&Path>,
+    context: &str,
+) -> CliResult<CanonicalReadPool> {
+    let (storage_root, mailbox_read_locks, source) =
+        open_canonical_async_read_source_with_database_url(
+            database_url,
+            storage_root_override,
+            context,
+        )?;
+    let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
+    pool_cfg.storage_root = Some(storage_root);
+    let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
+        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?;
+    Ok(CanonicalReadPool {
+        pool,
+        _source: source,
+        _mailbox_read_locks: mailbox_read_locks,
+    })
+}
+
+fn open_db_sync_async_canonical_read_with_database_url(
+    database_url: &str,
+    storage_root_override: Option<&Path>,
+    context: &str,
+) -> CliResult<CanonicalReadDbPool> {
+    let (storage_root, mailbox_read_locks, source) =
+        open_canonical_async_read_source_with_database_url(
+            database_url,
+            storage_root_override,
+            context,
+        )?;
+    let source_path = source.actual_path().display().to_string();
+    let (conn, _opened_path) = open_sqlite_read_only_with_fallback(&source_path)?;
+    let mut pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    pool_cfg.database_url = format!("sqlite:///{}", source.actual_path().display());
+    pool_cfg.storage_root = Some(storage_root);
+    let pool = mcp_agent_mail_db::create_pool(&pool_cfg)
+        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?;
+    Ok(CanonicalReadDbPool {
+        conn,
+        pool,
+        _source: source,
+        _mailbox_read_locks: mailbox_read_locks,
+    })
+}
+
+struct CanonicalReadInboxDb {
+    read_db: CanonicalReadDb,
+}
+
+impl CanonicalReadInboxDb {
+    fn conn(&self) -> &mcp_agent_mail_db::DbConn {
+        self.read_db.conn()
+    }
+
+    fn actual_sqlite_path(&self) -> &Path {
+        self.read_db.actual_sqlite_path()
+    }
+}
+
 fn open_db_sync_mail_inbox_best_effort_with_database_url_and_path(
     database_url: &str,
-) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
-    let (conn, opened_path) = open_db_sync_read_only_with_database_url_and_path(database_url)?;
-    if sqlite_conn_supports_mail_inbox_reads(&conn)? {
-        return Ok((conn, opened_path));
+) -> CliResult<CanonicalReadInboxDb> {
+    let read_db = open_db_sync_canonical_read_with_database_url(
+        database_url,
+        None,
+        "mail inbox sqlite read",
+    )?;
+    if sqlite_conn_supports_mail_inbox_reads(read_db.conn())? {
+        return Ok(CanonicalReadInboxDb { read_db });
     }
     Err(CliError::Other(
         "mail inbox fallback requires the inbox read schema".to_string(),
@@ -5994,28 +6421,8 @@ fn open_db_sync_mail_inbox_best_effort_with_database_url_and_path(
 
 pub(crate) fn open_db_sync_mail_inbox_with_database_url_and_path(
     database_url: &str,
-) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
-    if let Ok((conn, opened_path)) =
-        open_db_sync_mail_inbox_best_effort_with_database_url_and_path(database_url)
-    {
-        return Ok((conn, opened_path));
-    }
-    match open_db_sync_with_database_url_with_path(database_url) {
-        Ok((conn, opened_path)) => Ok((conn, opened_path)),
-        Err(error) if is_resource_busy_cli_error(&error) => {
-            match open_db_sync_mail_inbox_best_effort_with_database_url_and_path(database_url) {
-                Ok((conn, opened_path)) => {
-                    tracing::warn!(
-                        database_url,
-                        "mail inbox falling back to best-effort sqlite read after busy init/recovery path"
-                    );
-                    Ok((conn, opened_path))
-                }
-                Err(_) => Err(error),
-            }
-        }
-        Err(error) => Err(error),
-    }
+) -> CliResult<CanonicalReadInboxDb> {
+    open_db_sync_mail_inbox_best_effort_with_database_url_and_path(database_url)
 }
 
 fn open_db_sync_robot_best_effort_with_database_url(
@@ -7287,21 +7694,26 @@ fn flake_triage_missing_artifact_hint(path: &Path) -> String {
 }
 
 fn handle_file_reservations(action: FileReservationsCommand) -> CliResult<()> {
-    let mut mailbox_mutation_locks = None;
-    let conn = if matches!(
+    if matches!(
         &action,
         FileReservationsCommand::Reserve { .. }
             | FileReservationsCommand::Renew { .. }
             | FileReservationsCommand::Release { .. }
     ) {
         let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-        mailbox_mutation_locks = Some(acquire_cli_mailbox_mutation_locks(&cfg.database_url, None)?);
-        open_db_sync_while_holding_mailbox_lock()?
-    } else {
-        open_db_sync()?
-    };
-    let _mailbox_mutation_locks = mailbox_mutation_locks;
-    handle_file_reservations_with_conn(&conn, action)
+        let _mailbox_mutation_locks = acquire_cli_mailbox_mutation_locks(&cfg.database_url, None)?;
+        let conn = open_db_sync_while_holding_mailbox_lock()?;
+        return handle_file_reservations_with_conn(&conn, action);
+    }
+
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let config = Config::from_env();
+    let opened = open_db_sync_canonical_read_with_database_url(
+        &cfg.database_url,
+        Some(&config.storage_root),
+        "file reservations",
+    )?;
+    handle_file_reservations_with_conn(opened.conn(), action)
 }
 
 fn active_reservation_predicate_sql(table_ref: &str) -> String {
@@ -7931,8 +8343,14 @@ fn handle_file_reservations_with_conn(
 }
 
 fn handle_acks(action: AcksCommand) -> CliResult<()> {
-    let conn = open_db_sync()?;
-    handle_acks_with_conn(&conn, action)
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let config = Config::from_env();
+    let opened = open_db_sync_canonical_read_with_database_url(
+        &cfg.database_url,
+        Some(&config.storage_root),
+        "acks",
+    )?;
+    handle_acks_with_conn(opened.conn(), action)
 }
 
 fn handle_acks_with_conn(conn: &mcp_agent_mail_db::DbConn, action: AcksCommand) -> CliResult<()> {
@@ -8093,21 +8511,26 @@ fn handle_acks_with_conn(conn: &mcp_agent_mail_db::DbConn, action: AcksCommand) 
 }
 
 fn handle_contacts(action: ContactsCommand) -> CliResult<()> {
-    let mut mailbox_mutation_locks = None;
-    let conn = if matches!(
+    if matches!(
         &action,
         ContactsCommand::Request { .. }
             | ContactsCommand::Respond { .. }
             | ContactsCommand::Policy { .. }
     ) {
         let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-        mailbox_mutation_locks = Some(acquire_cli_mailbox_mutation_locks(&cfg.database_url, None)?);
-        open_db_sync_while_holding_mailbox_lock()?
-    } else {
-        open_db_sync()?
-    };
-    let _mailbox_mutation_locks = mailbox_mutation_locks;
-    handle_contacts_with_conn(&conn, action)
+        let _mailbox_mutation_locks = acquire_cli_mailbox_mutation_locks(&cfg.database_url, None)?;
+        let conn = open_db_sync_while_holding_mailbox_lock()?;
+        return handle_contacts_with_conn(&conn, action);
+    }
+
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let config = Config::from_env();
+    let opened = open_db_sync_canonical_read_with_database_url(
+        &cfg.database_url,
+        Some(&config.storage_root),
+        "contacts",
+    )?;
+    handle_contacts_with_conn(opened.conn(), action)
 }
 
 fn handle_contacts_with_conn(
@@ -8730,8 +9153,14 @@ fn handle_beads_status(
 }
 
 fn handle_list_acks(project_key: &str, agent_name: &str, limit: i64) -> CliResult<()> {
-    let conn = open_db_sync()?;
-    handle_list_acks_with_conn(&conn, project_key, agent_name, limit)
+    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+    let config = Config::from_env();
+    let opened = open_db_sync_canonical_read_with_database_url(
+        &cfg.database_url,
+        Some(&config.storage_root),
+        "list-acks",
+    )?;
+    handle_list_acks_with_conn(opened.conn(), project_key, agent_name, limit)
 }
 
 fn handle_list_acks_with_conn(
@@ -11551,21 +11980,22 @@ fn handle_projects_adopt(
     dry_run: bool,
     apply: bool,
 ) -> CliResult<()> {
-    let mut mailbox_mutation_locks = None;
-    let conn = if apply {
-        mailbox_mutation_locks = Some(acquire_cli_mailbox_mutation_locks(
+    if apply {
+        let _mailbox_mutation_locks =
+            acquire_cli_mailbox_mutation_locks(database_url, Some(&config.storage_root))?;
+        let conn = open_db_sync_with_database_url_and_storage_root_locked(
             database_url,
             Some(&config.storage_root),
-        )?);
-        open_db_sync_with_database_url_and_storage_root_locked(
-            database_url,
-            Some(&config.storage_root),
-        )?
-    } else {
-        open_db_sync_read_only_with_database_url(database_url)?
-    };
-    let _mailbox_mutation_locks = mailbox_mutation_locks;
-    handle_projects_adopt_with_conn(&conn, config, source, target, dry_run, apply)
+        )?;
+        return handle_projects_adopt_with_conn(&conn, config, source, target, dry_run, apply);
+    }
+
+    let opened = open_db_sync_canonical_read_with_database_url(
+        database_url,
+        Some(&config.storage_root),
+        "projects adopt dry-run",
+    )?;
+    handle_projects_adopt_with_conn(opened.conn(), config, source, target, dry_run, apply)
 }
 
 fn handle_doctor_check(
@@ -16762,8 +17192,14 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
 fn handle_mail(action: MailCommand) -> CliResult<()> {
     match action {
         MailCommand::Status { .. } => {
-            let conn = open_db_sync()?;
-            handle_mail_status_sync(&conn, action)
+            let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+            let config = Config::from_env();
+            let opened = open_db_sync_canonical_read_with_database_url(
+                &cfg.database_url,
+                Some(&config.storage_root),
+                "mail status",
+            )?;
+            handle_mail_status_sync(opened.conn(), action)
         }
         _ => context::run_async(async move { handle_mail_async(action).await }),
     }
@@ -16811,6 +17247,7 @@ fn handle_mail_status_sync(conn: &mcp_agent_mail_db::DbConn, action: MailCommand
 #[allow(clippy::too_many_lines)]
 async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
     let server_config = mcp_agent_mail_core::config::Config::from_env();
+    let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
     let server_url = local_server_url_from_parts(
         &server_config.http_host,
         server_config.http_port,
@@ -17109,15 +17546,19 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             };
 
             let local_async_data = async {
-                let ctx = context::AsyncCliContext::open()?;
+                let read_pool = open_db_async_canonical_read_with_database_url(
+                    &database_url,
+                    Some(&server_config.storage_root),
+                    "mail inbox",
+                )?;
                 let cx = asupersync::Cx::for_request();
-                let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
+                let proj = resolve_project_async(&cx, read_pool.pool(), &project_key).await?;
                 let pid = proj.id.unwrap_or(0);
-                let agent = resolve_agent_async(&cx, &ctx.pool, pid, &agent_name).await?;
+                let agent = resolve_agent_async(&cx, read_pool.pool(), pid, &agent_name).await?;
                 let rows = outcome_to_result(
                     mcp_agent_mail_db::queries::fetch_inbox(
                         &cx,
-                        &ctx.pool,
+                        read_pool.pool(),
                         pid,
                         agent.id.unwrap_or(0),
                         urgent_only,
@@ -17136,7 +17577,6 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             let data = match local_async_data.await {
                 Ok(data) => data,
                 Err(error) if is_resource_busy_cli_error(&error) => {
-                    let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
                     tracing::warn!(
                         project_key = %project_key,
                         agent_name = %agent_name,
@@ -17381,9 +17821,13 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
-            let ctx = context::AsyncCliContext::open()?;
+            let read_pool = open_db_async_canonical_read_with_database_url(
+                &database_url,
+                Some(&server_config.storage_root),
+                "mail search",
+            )?;
             let cx = asupersync::Cx::for_request();
-            let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
+            let proj = resolve_project_async(&cx, read_pool.pool(), &project_key).await?;
             let pid = proj.id.unwrap_or(0);
 
             let mut search_query =
@@ -17393,7 +17837,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
             let response = outcome_to_result(
                 mcp_agent_mail_db::search_service::execute_search_simple(
                     &cx,
-                    &ctx.pool,
+                    read_pool.pool(),
                     &search_query,
                 )
                 .await,
@@ -18626,10 +19070,10 @@ fn server_inbox_payload_to_cli_json(
         .and_then(serde_json::Value::as_array)
     {
         rows
-    } else if let Some(rows) = payload.get("result").and_then(serde_json::Value::as_array) {
-        rows
     } else {
-        return None;
+        payload
+            .get("result")
+            .and_then(serde_json::Value::as_array)?
     };
     Some(
         rows.iter()
@@ -20008,6 +20452,17 @@ mod tests {
         extract_json_delimited(s, '[', ']')
     }
 
+    fn sqlite_message_count(sqlite_path: &Path) -> i64 {
+        let conn = mcp_agent_mail_db::DbConn::open_file(&sqlite_path.display().to_string())
+            .expect("open db");
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM messages", &[])
+            .expect("query message count");
+        rows.first()
+            .and_then(|row| row.get_named("cnt").ok())
+            .unwrap_or(0)
+    }
+
     /// Extract the first JSON object that looks like doctor-check output.
     fn extract_doctor_check_json(s: &str) -> Option<serde_json::Value> {
         let mut cursor = s;
@@ -20780,6 +21235,61 @@ http_headers = { Authorization = "Bearer secret" }
         assert_eq!(result.urgent_or_high_count, 1);
         assert_eq!(result.messages[0].subject, "hello");
         assert_eq!(result.messages[0].from, "Sender");
+    }
+
+    #[test]
+    fn check_inbox_direct_uses_archive_snapshot_when_live_db_is_stale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("check-inbox-stale.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = dir.path().join("storage-root");
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || handle_migrate_with_database_url(&db_url),
+        )
+        .expect("migrate stale sqlite db");
+
+        let message_dir = seed_archive_mailbox_project(&storage_root);
+        write_archive_mailbox_message(
+            &message_dir,
+            "msg-0001.md",
+            1,
+            "Alice",
+            "Archive direct inbox subject",
+            "urgent",
+            "2026-03-22T00:00:00Z",
+            "archive-only direct inbox body",
+        );
+
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || {
+                check_inbox_direct(&CheckInboxDirectConfig {
+                    project_key: "ahead-project".to_string(),
+                    agent_name: "Alice".to_string(),
+                    limit: 10,
+                })
+            },
+        )
+        .expect("direct inbox should use archive-backed snapshot");
+
+        assert_eq!(result.unread_count, 1);
+        assert_eq!(result.urgent_or_high_count, 1);
+        assert_eq!(result.messages[0].subject, "Archive direct inbox subject");
+        assert_eq!(
+            sqlite_message_count(&db_path),
+            0,
+            "check_inbox_direct should not mutate the live sqlite index"
+        );
     }
 
     #[test]
@@ -24134,6 +24644,75 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn archive_save_state_uses_archive_snapshot_when_live_db_is_stale() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        use std::io::Write;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+
+        let storage_root = root.path().join("storage_repo");
+        let source_db = root.path().join("mailbox.sqlite3");
+        let message_dir = seed_archive_mailbox_project(&storage_root);
+        write_archive_mailbox_message(
+            &message_dir,
+            "2026-03-22T12-00-00Z__first__1.md",
+            1,
+            "Bob",
+            "First",
+            "normal",
+            "2026-03-22T12:00:00Z",
+            "first body",
+        );
+
+        mcp_agent_mail_db::reconstruct_from_archive(&source_db, &storage_root)
+            .expect("seed stale archive-save db");
+        write_archive_mailbox_message(
+            &message_dir,
+            "2026-03-22T12-05-00Z__second__2.md",
+            2,
+            "Carol",
+            "Second",
+            "urgent",
+            "2026-03-22T12:05:00Z",
+            "second body",
+        );
+
+        let archive_path = archive_save_state(
+            &source_db,
+            &storage_root,
+            vec!["ahead-project".to_string()],
+            "archive".to_string(),
+            Some("archive-ahead".to_string()),
+        )
+        .expect("archive save should snapshot canonical archive state");
+
+        let extracted = tempfile::tempdir().unwrap();
+        let file = std::fs::File::open(&archive_path).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let mut snapshot_file =
+            std::fs::File::create(extracted.path().join("mailbox.sqlite3")).unwrap();
+        std::io::copy(
+            &mut zip.by_name(ARCHIVE_SNAPSHOT_RELATIVE).unwrap(),
+            &mut snapshot_file,
+        )
+        .unwrap();
+        snapshot_file.flush().unwrap();
+        let (count, max_id) = sqlite_message_stats(&extracted.path().join("mailbox.sqlite3"));
+        assert_eq!(
+            count, 2,
+            "archive save should include archive-ahead messages"
+        );
+        assert_eq!(
+            max_id, 2,
+            "archive save should capture the latest archive message id"
+        );
+    }
+
+    #[test]
     fn rollback_archive_restore_restores_backups_after_partial_restore() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("mailbox.sqlite3");
@@ -24651,13 +25230,44 @@ http_headers = { Authorization = "Bearer secret" }
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         let capture = StdioCapture::install().unwrap();
-        let res =
-            runtime.block_on(async { handle_products_with(cx, pool, None, None, action).await });
+        let res = runtime
+            .block_on(async { handle_products_with(cx, Some(pool), None, None, action).await });
         let mut sink = Vec::new();
         capture.drain(&mut sink).unwrap();
         drop(capture);
 
         (res, String::from_utf8_lossy(&sink).trim().to_string())
+    }
+
+    fn run_products_cmd_with_env_capture(
+        action: ProductsCommand,
+        database_url: &str,
+        storage_root: &str,
+    ) -> (CliResult<()>, String) {
+        use asupersync::runtime::RuntimeBuilder;
+        use ftui_runtime::stdio_capture::StdioCapture;
+
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _capture_lock = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let capture = StdioCapture::install().unwrap();
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url),
+                ("STORAGE_ROOT", storage_root),
+            ],
+            move || {
+                let runtime = RuntimeBuilder::current_thread().build().unwrap();
+                runtime.block_on(async move { handle_products_async(action).await })
+            },
+        );
+        let mut sink = Vec::new();
+        capture.drain(&mut sink).unwrap();
+        drop(capture);
+        (result, String::from_utf8_lossy(&sink).trim().to_string())
     }
 
     #[test]
@@ -24674,6 +25284,7 @@ http_headers = { Authorization = "Bearer secret" }
         let make_pool = || {
             mcp_agent_mail_db::DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
                 database_url: format!("sqlite:///{}", db_path.display()),
+                storage_root: Some(root.path().to_path_buf()),
                 min_connections: 1,
                 max_connections: 1,
                 acquire_timeout_ms: 5_000,
@@ -24907,6 +25518,130 @@ http_headers = { Authorization = "Bearer secret" }
         let err = res.unwrap_err();
         assert!(matches!(err, CliError::ExitCode(2)));
         assert!(out.contains("Server unavailable; summarization requires server tool."));
+    }
+
+    #[test]
+    fn products_inbox_uses_archive_snapshot_when_live_db_is_stale() {
+        use mcp_agent_mail_db::sqlmodel::Value;
+
+        let root = tempfile::tempdir().unwrap();
+        let (db_path, proj_alpha_key, _proj_beta_key, created_at_us) = seed_products_cli_db(&root);
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let project_slug = mcp_agent_mail_core::compute_project_slug(&proj_alpha_key);
+
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).unwrap();
+        conn.execute_sync(
+            "INSERT INTO products (id, product_uid, name, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                Value::BigInt(100),
+                Value::Text("prod-archive".to_string()),
+                Value::Text("Archive Product".to_string()),
+                Value::BigInt(created_at_us),
+            ],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO product_project_links (product_id, project_id, created_at) VALUES (?, ?, ?)",
+            &[
+                Value::BigInt(100),
+                Value::BigInt(1),
+                Value::BigInt(created_at_us),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let storage_root = root.path().join("storage");
+        let project_dir = storage_root.join("projects").join(&project_slug);
+        let agent_dir = project_dir.join("agents").join("BlueLake");
+        let canonical_dir = project_dir.join("messages").join("2026").join("04");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&canonical_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            format!(
+                "{{\"slug\":\"{project_slug}\",\"human_key\":{},\"created_at\":0}}",
+                serde_json::to_string(&proj_alpha_key).unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{
+                "name": "BlueLake",
+                "program": "codex-cli",
+                "model": "gpt-5",
+                "task_description": "products inbox archive snapshot",
+                "inception_ts": "2026-04-01T13:00:00Z",
+                "last_active_ts": "2026-04-01T13:00:00Z"
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            canonical_dir.join("2026-04-01T13-00-00Z__archive-product-hit__30.md"),
+            concat!(
+                "---json\n",
+                "{\"id\":30,\"from\":\"BlueLake\",\"to\":[\"GreenCastle\"],\"subject\":\"archive product hit\"}\n",
+                "---\n",
+                "body\n"
+            ),
+        )
+        .unwrap();
+
+        let (result, out) = run_products_cmd_with_env_capture(
+            ProductsCommand::Inbox {
+                product_key: "prod-archive".to_string(),
+                agent: "GreenCastle".to_string(),
+                limit: 20,
+                urgent_only: false,
+                all: false,
+                include_bodies: false,
+                no_bodies: false,
+                since_ts: None,
+                format: None,
+                json: true,
+            },
+            &db_url,
+            storage_root.to_string_lossy().as_ref(),
+        );
+        result.unwrap();
+
+        let payload: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let items = payload.as_array().expect("products inbox array");
+        assert!(
+            items.iter().any(|item| item["id"].as_i64() == Some(30)),
+            "expected archive-backed inbox item in output: {payload}"
+        );
+        assert_eq!(
+            sqlite_message_count(&db_path),
+            3,
+            "products inbox should not mutate the live sqlite index"
+        );
+    }
+
+    #[test]
+    fn products_summarize_thread_does_not_require_db_pool_when_server_unavailable() {
+        let storage_root = tempfile::tempdir().unwrap();
+        let bad_db_url = "not-a-sqlite-url";
+        let (result, out) = run_products_cmd_with_env_capture(
+            ProductsCommand::SummarizeThread {
+                product_key: "prod-any".to_string(),
+                thread_id: "thread-1".to_string(),
+                per_thread_limit: 50,
+                no_llm: true,
+                format: None,
+                json: false,
+            },
+            bad_db_url,
+            storage_root.path().to_string_lossy().as_ref(),
+        );
+
+        let err = result.unwrap_err();
+        assert!(matches!(err, CliError::ExitCode(2)));
+        assert!(
+            out.contains("Server unavailable; summarization requires server tool."),
+            "expected server-unavailable guidance, got: {out}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -29022,14 +29757,29 @@ COMMIT;\n";
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = dir.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
 
         // Migrate
-        let result = handle_migrate_with_database_url(&db_url);
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || handle_migrate_with_database_url(&db_url),
+        );
         assert!(result.is_ok(), "migrate failed: {result:?}");
 
         // list-projects should succeed with empty output
         let capture = ftui_runtime::StdioCapture::install().unwrap();
-        let result = handle_list_projects_with_database_url(&db_url, false, None, true);
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || handle_list_projects_with_database_url(&db_url, false, None, true),
+        );
         let output = capture.drain_to_string();
         assert!(result.is_ok(), "list-projects --json failed: {result:?}");
 
@@ -29040,6 +29790,65 @@ COMMIT;\n";
         let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
         assert!(parsed.is_array(), "expected JSON array, got: {parsed}");
         assert_eq!(parsed.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn integration_list_projects_uses_archive_snapshot_when_live_db_is_stale() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("stale.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = dir.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || handle_migrate_with_database_url(&db_url),
+        )
+        .expect("migrate stale sqlite db");
+
+        let message_dir = seed_archive_mailbox_project(&storage_root);
+        write_archive_mailbox_message(
+            &message_dir,
+            "msg-0001.md",
+            1,
+            "Alice",
+            "Archive project",
+            "normal",
+            "2026-03-22T00:00:00Z",
+            "archive-only project",
+        );
+
+        let capture = ftui_runtime::StdioCapture::install().expect("install stdio capture");
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || handle_list_projects_with_database_url(&db_url, false, None, true),
+        );
+        let output = capture.drain_to_string();
+
+        assert!(result.is_ok(), "list-projects failed: {result:?}");
+        let json_str = extract_json_array(output.trim()).expect("valid JSON array");
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_str).expect("parse list-projects json");
+        let projects = parsed
+            .as_array()
+            .expect("list-projects json output should be an array");
+        assert_eq!(
+            projects.len(),
+            1,
+            "expected single archive project: {parsed}"
+        );
+        assert_eq!(projects[0]["slug"], "ahead-project");
+        assert_eq!(projects[0]["human_key"], "/ahead-project");
     }
 
     #[test]
@@ -30769,6 +31578,69 @@ COMMIT;\n";
     }
 
     #[test]
+    fn integration_mail_status_uses_archive_snapshot_when_live_db_is_missing() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("missing.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = dir.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
+
+        let message_dir = seed_archive_mailbox_project(&storage_root);
+        write_archive_mailbox_message(
+            &message_dir,
+            "msg-0001.md",
+            1,
+            "Alice",
+            "Archive message one",
+            "normal",
+            "2026-03-22T00:00:00Z",
+            "first archive message",
+        );
+        write_archive_mailbox_message(
+            &message_dir,
+            "msg-0002.md",
+            2,
+            "Alice",
+            "Archive message two",
+            "urgent",
+            "2026-03-22T00:05:00Z",
+            "second archive message",
+        );
+
+        let capture = ftui_runtime::StdioCapture::install().expect("install stdio capture");
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || {
+                handle_mail(MailCommand::Status {
+                    project_path: PathBuf::from("/ahead-project"),
+                })
+            },
+        );
+        let output = capture.drain_to_string();
+
+        assert!(result.is_ok(), "mail status failed: {result:?}");
+        assert!(
+            output.contains("Project: ahead-project"),
+            "expected archive project slug in output, got: {output}"
+        );
+        assert!(
+            output.contains("Messages") && output.contains("2"),
+            "expected archive message count in output, got: {output}"
+        );
+        assert!(
+            output.contains("Agents") && output.contains("1"),
+            "expected archive agent count in output, got: {output}"
+        );
+    }
+
+    #[test]
     fn integration_projects_mark_identity_writes_marker_file() {
         let _guard = stdio_capture_lock()
             .lock()
@@ -32392,6 +33264,327 @@ COMMIT;\n";
         assert!(
             output.contains("RedFox"),
             "expected RedFox in contacts, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_contacts_list_uses_archive_snapshot_with_salvage_for_db_only_links() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("contacts-stale.sqlite3");
+        let storage_root = dir.path().join("storage-root");
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::Request {
+                project_key: "test-proj".to_string(),
+                from_agent: "BlueLake".to_string(),
+                to_agent: "RedFox".to_string(),
+                reason: "carry contact state".to_string(),
+                ttl_seconds: 3600,
+                format: None,
+                json: false,
+            },
+        )
+        .expect("seed db-only contact link");
+
+        let project_dir = storage_root.join("projects").join("test-proj");
+        let blue_dir = project_dir.join("agents").join("BlueLake");
+        let red_dir = project_dir.join("agents").join("RedFox");
+        let message_dir = project_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&blue_dir).expect("create BlueLake archive dir");
+        std::fs::create_dir_all(&red_dir).expect("create RedFox archive dir");
+        std::fs::create_dir_all(&message_dir).expect("create archive messages dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"test-proj","human_key":"/tmp/test-proj"}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            blue_dir.join("profile.json"),
+            r#"{"name":"BlueLake","program":"test","model":"test","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z"}"#,
+        )
+        .expect("write BlueLake profile");
+        std::fs::write(
+            red_dir.join("profile.json"),
+            r#"{"name":"RedFox","program":"test","model":"test","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z"}"#,
+        )
+        .expect("write RedFox profile");
+        for (id, file_name, subject, created_ts) in [
+            (
+                100_i64,
+                "2026-03-22T12-00-00Z__first__100.md",
+                "First",
+                "2026-03-22T12:00:00Z",
+            ),
+            (
+                101_i64,
+                "2026-03-22T12-05-00Z__second__101.md",
+                "Second",
+                "2026-03-22T12:05:00Z",
+            ),
+            (
+                102_i64,
+                "2026-03-22T12-10-00Z__third__102.md",
+                "Third",
+                "2026-03-22T12:10:00Z",
+            ),
+        ] {
+            std::fs::write(
+                message_dir.join(file_name),
+                format!(
+                    "---json\n{{\"id\":{id},\"from\":\"BlueLake\",\"to\":[\"RedFox\"],\"subject\":\"{subject}\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"{created_ts}\",\"attachments\":[]}}\n---\n\narchive body\n"
+                ),
+            )
+            .expect("write archive message");
+        }
+
+        let capture = ftui_runtime::StdioCapture::install().expect("install stdio capture");
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || {
+                handle_contacts(ContactsCommand::ListContacts {
+                    project_key: "test-proj".to_string(),
+                    agent_name: "BlueLake".to_string(),
+                    format: None,
+                    json: true,
+                })
+            },
+        );
+        let output = capture.drain_to_string();
+
+        assert!(result.is_ok(), "contacts list failed: {result:?}");
+        let json_str = extract_json_array(output.trim()).expect("valid JSON array");
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_str).expect("parse contacts list json");
+        let entries = parsed
+            .as_array()
+            .expect("contacts list output should be an array");
+        assert!(
+            entries.iter().any(|entry| {
+                entry.get("direction").and_then(|v| v.as_str()) == Some("outgoing")
+                    && entry.get("to").and_then(|v| v.as_str()) == Some("RedFox")
+                    && entry.get("reason").and_then(|v| v.as_str()) == Some("carry contact state")
+            }),
+            "expected salvaged outgoing contact entry, got: {parsed}"
+        );
+    }
+
+    #[test]
+    fn integration_mail_inbox_uses_archive_snapshot_when_live_db_is_stale() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("mail-inbox-stale.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = dir.path().join("storage-root");
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || handle_migrate_with_database_url(&db_url),
+        )
+        .expect("migrate stale sqlite db");
+
+        let message_dir = seed_archive_mailbox_project(&storage_root);
+        write_archive_mailbox_message(
+            &message_dir,
+            "msg-0001.md",
+            1,
+            "Alice",
+            "Archive inbox subject",
+            "normal",
+            "2026-03-22T00:00:00Z",
+            "archive-only inbox body",
+        );
+
+        let capture = ftui_runtime::StdioCapture::install().expect("install stdio capture");
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+                ("HTTP_PORT", "1"),
+            ],
+            || {
+                handle_mail(MailCommand::Inbox {
+                    project_key: "ahead-project".to_string(),
+                    agent_name: "Alice".to_string(),
+                    urgent_only: false,
+                    since: None,
+                    limit: 10,
+                    include_bodies: false,
+                    format: None,
+                    json: true,
+                })
+            },
+        );
+        let output = capture.drain_to_string();
+
+        assert!(result.is_ok(), "mail inbox failed: {result:?}");
+        let json_str = extract_json_array(output.trim()).expect("valid JSON array");
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_str).expect("parse mail inbox json");
+        let rows = parsed
+            .as_array()
+            .expect("mail inbox output should be an array");
+        assert!(
+            rows.iter().any(|row| {
+                row.get("subject").and_then(|v| v.as_str()) == Some("Archive inbox subject")
+            }),
+            "expected archive-backed inbox row, got: {parsed}"
+        );
+        assert_eq!(
+            sqlite_message_count(&db_path),
+            0,
+            "local mail inbox should not mutate the live sqlite index"
+        );
+    }
+
+    #[test]
+    fn integration_mail_search_uses_archive_snapshot_when_live_db_is_stale() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("mail-search-stale.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = dir.path().join("storage-root");
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || handle_migrate_with_database_url(&db_url),
+        )
+        .expect("migrate stale sqlite db");
+
+        let message_dir = seed_archive_mailbox_project(&storage_root);
+        write_archive_mailbox_message(
+            &message_dir,
+            "msg-0001.md",
+            1,
+            "Alice",
+            "Archive search subject",
+            "normal",
+            "2026-03-22T00:00:00Z",
+            "archive-only search body",
+        );
+
+        let capture = ftui_runtime::StdioCapture::install().expect("install stdio capture");
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+                ("HTTP_PORT", "1"),
+            ],
+            || {
+                handle_mail(MailCommand::Search {
+                    project_key: "ahead-project".to_string(),
+                    query: "Archive search subject".to_string(),
+                    limit: 10,
+                    format: None,
+                    json: true,
+                })
+            },
+        );
+        let output = capture.drain_to_string();
+
+        assert!(result.is_ok(), "mail search failed: {result:?}");
+        let json_str = extract_json_array(output.trim()).expect("valid JSON array");
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_str).expect("parse mail search json");
+        let rows = parsed
+            .as_array()
+            .expect("mail search output should be an array");
+        assert!(
+            rows.iter().any(|row| {
+                row.get("subject").and_then(|v| v.as_str()) == Some("Archive search subject")
+            }),
+            "expected archive-backed search result, got: {parsed}"
+        );
+        assert_eq!(
+            sqlite_message_count(&db_path),
+            0,
+            "local mail search should not mutate the live sqlite index"
+        );
+    }
+
+    #[test]
+    fn fetch_mail_inbox_direct_uses_archive_snapshot_when_live_db_is_stale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("mail-inbox-direct-stale.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = dir.path().join("storage-root");
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || handle_migrate_with_database_url(&db_url),
+        )
+        .expect("migrate stale sqlite db");
+
+        let message_dir = seed_archive_mailbox_project(&storage_root);
+        write_archive_mailbox_message(
+            &message_dir,
+            "msg-0001.md",
+            1,
+            "Alice",
+            "Archive direct fetch subject",
+            "normal",
+            "2026-03-22T00:00:00Z",
+            "archive-only direct fetch body",
+        );
+
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", db_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || {
+                fetch_mail_inbox_direct_with_database_url(
+                    &db_url,
+                    "ahead-project",
+                    "Alice",
+                    false,
+                    None,
+                    10,
+                    false,
+                )
+            },
+        )
+        .expect("direct inbox fetch should use archive-backed snapshot");
+
+        assert!(
+            result.iter().any(|row| {
+                row.get("subject").and_then(|value| value.as_str())
+                    == Some("Archive direct fetch subject")
+            }),
+            "expected archive-backed direct inbox row, got: {result:?}"
+        );
+        assert_eq!(
+            sqlite_message_count(&db_path),
+            0,
+            "direct inbox fetch should not mutate the live sqlite index"
         );
     }
 
@@ -34325,9 +35518,11 @@ COMMIT;\n";
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
         let open_url = db_url.clone();
         let open_thread = std::thread::spawn(move || {
-            let result = open_db_sync_mail_inbox_with_database_url_and_path(&open_url).and_then(
-                |(conn, _opened_path)| {
-                    conn.query_sync("SELECT COUNT(*) AS c FROM message_recipients", &[])
+            let result =
+                open_db_sync_mail_inbox_with_database_url_and_path(&open_url).and_then(|read_db| {
+                    read_db
+                        .conn()
+                        .query_sync("SELECT COUNT(*) AS c FROM message_recipients", &[])
                         .map_err(|e| {
                             CliError::Other(format!("message_recipients count failed: {e}"))
                         })
@@ -34336,8 +35531,7 @@ COMMIT;\n";
                                 .and_then(|row| row.get_named::<i64>("c").ok())
                                 .unwrap_or(0)
                         })
-                },
-            );
+                });
             result_tx.send(result).expect("send open result");
         });
 
@@ -34590,6 +35784,7 @@ COMMIT;\n";
     #[test]
     fn recover_sqlite_file_restores_timestamped_bak_backup() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage-root");
         let db_path = dir.path().join("storage.sqlite3");
         let db_path_str = db_path.to_string_lossy().into_owned();
 
@@ -34608,7 +35803,11 @@ COMMIT;\n";
         std::fs::copy(&db_path, &backup_path).expect("create timestamped .bak backup");
         std::fs::write(&db_path, b"THIS FILE IS CORRUPT").expect("corrupt primary");
 
-        recover_sqlite_file(&db_path).expect("recover from timestamped backup");
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", storage_root_text.as_str())],
+            || recover_sqlite_file(&db_path).expect("recover from timestamped backup"),
+        );
         let reopened =
             mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open restored db");
         let rows = reopened
@@ -34619,6 +35818,114 @@ COMMIT;\n";
             marker, "from-ts-backup",
             "should restore from .bak.<timestamp>"
         );
+    }
+
+    #[test]
+    fn recover_sqlite_file_reconciles_restored_backup_when_archive_is_ahead() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        let db_path = dir.path().join("storage.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+
+        let project_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let message_dir = project_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&message_dir).expect("create message dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project"}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            message_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"First\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:00:00Z\",\"attachments\":[]}\n---\n\nfirst body\n",
+        )
+        .expect("write first message");
+
+        mcp_agent_mail_db::reconstruct_from_archive(&db_path, &storage_root)
+            .expect("seed reconstructed db");
+        let _ = std::fs::remove_file(format!("{}-wal", db_path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", db_path.display()));
+        let backup_path = PathBuf::from(format!("{}.bak", db_path.display()));
+        std::fs::copy(&db_path, &backup_path).expect("create backup");
+
+        std::fs::write(
+            message_dir.join("2026-03-22T12-05-00Z__second__2.md"),
+            "---json\n{\"id\":2,\"from\":\"Alice\",\"to\":[\"Carol\"],\"subject\":\"Second\",\"importance\":\"urgent\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:05:00Z\",\"attachments\":[]}\n---\n\nsecond body\n",
+        )
+        .expect("write second message");
+        std::fs::write(&db_path, b"THIS FILE IS CORRUPT").expect("corrupt primary");
+
+        recover_sqlite_file_with_storage_root(&db_path, Some(&storage_root))
+            .expect("recover stale backup and reconcile archive drift");
+
+        let reopened =
+            mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open reconciled db");
+        let rows = reopened
+            .query_sync(
+                "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id FROM messages",
+                &[],
+            )
+            .expect("query messages");
+        let row = rows.first().expect("message aggregate row");
+        assert_eq!(row.get_named::<i64>("count").unwrap_or(0), 2);
+        assert_eq!(row.get_named::<i64>("max_id").unwrap_or(0), 2);
+    }
+
+    #[test]
+    fn open_db_sync_with_database_url_reconciles_healthy_db_when_archive_is_ahead() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        let db_path = dir.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        let project_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let message_dir = project_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&message_dir).expect("create message dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project"}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            message_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"First\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:00:00Z\",\"attachments\":[]}\n---\n\nfirst body\n",
+        )
+        .expect("write first message");
+
+        mcp_agent_mail_db::reconstruct_from_archive(&db_path, &storage_root)
+            .expect("seed reconstructed db");
+        std::fs::write(
+            message_dir.join("2026-03-22T12-05-00Z__second__2.md"),
+            "---json\n{\"id\":2,\"from\":\"Alice\",\"to\":[\"Carol\"],\"subject\":\"Second\",\"importance\":\"urgent\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:05:00Z\",\"attachments\":[]}\n---\n\nsecond body\n",
+        )
+        .expect("write second message");
+
+        let reopened =
+            open_db_sync_with_database_url_and_storage_root(&db_url, Some(&storage_root))
+                .expect("reopen stale healthy db");
+        let rows = reopened
+            .query_sync(
+                "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id FROM messages",
+                &[],
+            )
+            .expect("query messages");
+        let row = rows.first().expect("message aggregate row");
+        assert_eq!(row.get_named::<i64>("count").unwrap_or(0), 2);
+        assert_eq!(row.get_named::<i64>("max_id").unwrap_or(0), 2);
     }
 
     #[test]
@@ -36192,22 +37499,20 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
 
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let config = Config::from_env();
-    let source_candidate = resolve_mailbox_activity_sqlite_path(&cfg.database_url)?;
-    let source_path = source_candidate.display().to_string();
-
-    if !source_candidate.exists() {
-        return Err(CliError::Other(format!(
-            "database not found: {source_path}"
-        )));
-    }
-
     let _mailbox_read_locks =
         acquire_cli_mailbox_read_locks(&cfg.database_url, Some(&config.storage_root))?;
-    let source = resolve_read_only_sqlite_source_path_with_database_url(&cfg.database_url)?;
-    let source_path = source.display().to_string();
-    let source = source.as_path();
+    let source = resolve_canonical_snapshot_source_with_database_url(
+        &cfg.database_url,
+        &config.storage_root,
+        "share export",
+    )?;
+    let source_path = source.reported_path().display().to_string();
+    let source_db = source.actual_path();
 
     ftui_runtime::ftui_println!("Source database: {source_path}");
+    if source.uses_archive_snapshot() {
+        ftui_runtime::ftui_println!("Source mode:     canonical archive snapshot");
+    }
     ftui_runtime::ftui_println!("Scrub preset:   {}", params.scrub_preset);
 
     // Dry run: create snapshot in temp dir and print summary only (no output artifacts).
@@ -36217,7 +37522,7 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
         let tmp = tempfile::tempdir()?;
         let snapshot_path = tmp.path().join("_snapshot.sqlite3");
         let snap_ctx = share::create_snapshot_context(
-            source,
+            source_db,
             &snapshot_path,
             &params.projects,
             params.scrub_preset,
@@ -36278,7 +37583,7 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
     }
     let mut snapshot_cleanup = SnapshotCleanupGuard::new(snapshot_path.clone());
     let snap_ctx = share::create_snapshot_context(
-        source,
+        source_db,
         &snapshot_path,
         &params.projects,
         params.scrub_preset,
@@ -36388,14 +37693,6 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
 
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let config = Config::from_env();
-    let source_candidate = resolve_mailbox_activity_sqlite_path(&cfg.database_url)?;
-    let source_path = source_candidate.display().to_string();
-    if !source_candidate.exists() {
-        return Err(CliError::Other(format!(
-            "database not found: {source_path}"
-        )));
-    }
-
     share_update_require_real_directory(&params.bundle, "bundle path")?;
     let existing_signature = share_update_optional_real_file_exists(
         &params.bundle.join("manifest.sig.json"),
@@ -36403,11 +37700,18 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
     )?;
     let _mailbox_read_locks =
         acquire_cli_mailbox_read_locks(&cfg.database_url, Some(&config.storage_root))?;
-    let source = resolve_read_only_sqlite_source_path_with_database_url(&cfg.database_url)?;
-    let source_path = source.display().to_string();
-    let source = source.as_path();
+    let source = resolve_canonical_snapshot_source_with_database_url(
+        &cfg.database_url,
+        &config.storage_root,
+        "share update",
+    )?;
+    let source_path = source.reported_path().display().to_string();
+    let source_db = source.actual_path();
 
     ftui_runtime::ftui_println!("Source database: {source_path}");
+    if source.uses_archive_snapshot() {
+        ftui_runtime::ftui_println!("Source mode:     canonical archive snapshot");
+    }
     ftui_runtime::ftui_println!("Updating bundle: {}", params.bundle.display());
     ftui_runtime::ftui_println!("Scrub preset:   {}", params.scrub_preset);
 
@@ -36431,7 +37735,7 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
         std::fs::remove_file(&snapshot_path)?;
     }
     let snap_ctx = share::create_snapshot_context(
-        source,
+        source_db,
         &snapshot_path,
         &params.projects,
         params.scrub_preset,
@@ -37082,12 +38386,6 @@ fn archive_save_state_internal(
     use chrono::Timelike;
     use std::io::Write;
 
-    if source_db.to_string_lossy() == ":memory:" {
-        return Err(CliError::Other(
-            "cannot archive an in-memory database (:memory:)".to_string(),
-        ));
-    }
-
     let source_db = PathBuf::from(resolve_sqlite_path_with_absolute_candidate(
         &source_db.to_string_lossy(),
     ));
@@ -37104,12 +38402,6 @@ fn archive_save_state_internal(
     };
     let preset_str = preset.as_str().to_string();
 
-    if !source_db.exists() {
-        return Err(CliError::Other(format!(
-            "database not found: {}",
-            source_db.display()
-        )));
-    }
     if !storage_root.exists() {
         return Err(CliError::Other(format!(
             "Storage root {} does not exist; cannot archive.",
@@ -37125,6 +38417,7 @@ fn archive_save_state_internal(
     } else {
         None
     };
+    let source = resolve_canonical_snapshot_source_path(&source_db, storage_root, "archive save")?;
     let archive_dir = archive_states_dir(true)?;
     let timestamp = Utc::now();
     let timestamp = timestamp.with_nanosecond(0).unwrap_or(timestamp);
@@ -37137,7 +38430,8 @@ fn archive_save_state_internal(
     let snapshot_path = temp_dir.path().join("mailbox.sqlite3");
 
     ftui_runtime::ftui_println!("Creating mailbox archive...");
-    let context = share::create_snapshot_context(&source_db, &snapshot_path, &projects, preset)?;
+    let context =
+        share::create_snapshot_context(source.actual_path(), &snapshot_path, &projects, preset)?;
 
     let snapshot_size = std::fs::metadata(&snapshot_path)?.len();
     let destination_name = destination
@@ -37161,7 +38455,7 @@ fn archive_save_state_internal(
 
     let projects_requested = projects.clone();
     let label_value = label.clone().unwrap_or_default();
-    let source_path = source_db.display().to_string();
+    let source_path = source.reported_path().display().to_string();
 
     let metadata = serde_json::json!({
         "version": 1,
@@ -39983,10 +41277,11 @@ pub fn check_inbox_direct(config: &CheckInboxDirectConfig) -> CliResult<CheckInb
     }
 
     let database_url = mcp_agent_mail_db::DbPoolConfig::from_env().database_url;
-    let (conn, sqlite_path) = open_db_sync_mail_inbox_with_database_url_and_path(&database_url)?;
-    let conn = mcp_agent_mail_db::guard_db_conn(conn, "check_inbox_direct metadata connection");
-    let project_id = crate::context::resolve_project(&conn, &config.project_key)?.id;
-    let agent_id = resolve_agent_id_for_inbox_check(&conn, project_id, &config.agent_name)?;
+    let read_db = open_db_sync_mail_inbox_with_database_url_and_path(&database_url)?;
+    let sqlite_path = read_db.actual_sqlite_path().display().to_string();
+    let project_id = crate::context::resolve_project(read_db.conn(), &config.project_key)?.id;
+    let agent_id =
+        resolve_agent_id_for_inbox_check(read_db.conn(), project_id, &config.agent_name)?;
     let rows = mcp_agent_mail_db::sync::fetch_inbox_native_sqlite_by_ids(
         &sqlite_path,
         project_id,
@@ -40050,11 +41345,10 @@ fn fetch_mail_inbox_direct_with_database_url(
     include_bodies: bool,
 ) -> CliResult<Vec<serde_json::Value>> {
     let validated_limit = validate_mail_inbox_limit(limit)?;
-    let (conn, sqlite_path) = open_db_sync_mail_inbox_with_database_url_and_path(database_url)?;
-    let conn =
-        mcp_agent_mail_db::guard_db_conn(conn, "fetch_mail_inbox_direct metadata connection");
-    let project = crate::context::resolve_project(&conn, project_key)?;
-    let agent = crate::context::resolve_agent(&conn, project.id, agent_name)?;
+    let read_db = open_db_sync_mail_inbox_with_database_url_and_path(database_url)?;
+    let sqlite_path = read_db.actual_sqlite_path().display().to_string();
+    let project = crate::context::resolve_project(read_db.conn(), project_key)?;
+    let agent = crate::context::resolve_agent(read_db.conn(), project.id, agent_name)?;
     let rows = mcp_agent_mail_db::sync::fetch_inbox_native_sqlite_by_ids(
         &sqlite_path,
         project.id,
@@ -40735,16 +42029,62 @@ async fn handle_products_async(action: ProductsCommand) -> CliResult<()> {
     let bearer = config.http_bearer_token.as_deref();
 
     let cx = asupersync::Cx::for_request();
-    let pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    let pool = mcp_agent_mail_db::get_or_create_pool(&pool_cfg)
-        .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?;
+    let canonical_read_pool;
+    let live_pool;
+    let pool = match classify_products_pool_mode(&action) {
+        ProductsPoolMode::None => None,
+        ProductsPoolMode::CanonicalRead(context) => {
+            canonical_read_pool = Some(open_db_async_canonical_read_with_database_url(
+                &config.database_url,
+                Some(config.storage_root.as_path()),
+                context,
+            )?);
+            Some(
+                canonical_read_pool
+                    .as_ref()
+                    .expect("canonical read pool")
+                    .pool(),
+            )
+        }
+        ProductsPoolMode::Live => {
+            let pool_cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+            live_pool = Some(
+                mcp_agent_mail_db::get_or_create_pool(&pool_cfg)
+                    .map_err(|e| CliError::Other(format!("db pool init failed: {e}")))?,
+            );
+            Some(live_pool.as_ref().expect("live pool"))
+        }
+    };
 
-    handle_products_with(&cx, &pool, Some(server_url.as_str()), bearer, action).await
+    handle_products_with(&cx, pool, Some(server_url.as_str()), bearer, action).await
+}
+
+enum ProductsPoolMode {
+    None,
+    CanonicalRead(&'static str),
+    Live,
+}
+
+fn classify_products_pool_mode(action: &ProductsCommand) -> ProductsPoolMode {
+    match action {
+        ProductsCommand::Ensure { .. } | ProductsCommand::Link { .. } => ProductsPoolMode::Live,
+        ProductsCommand::Status { .. } => ProductsPoolMode::CanonicalRead("products status"),
+        ProductsCommand::Search { .. } => ProductsPoolMode::CanonicalRead("products search"),
+        ProductsCommand::Inbox { .. } => ProductsPoolMode::CanonicalRead("products inbox"),
+        ProductsCommand::SummarizeThread { .. } => ProductsPoolMode::None,
+    }
+}
+
+fn require_products_pool<'a>(
+    pool: Option<&'a mcp_agent_mail_db::DbPool>,
+    command: &str,
+) -> CliResult<&'a mcp_agent_mail_db::DbPool> {
+    pool.ok_or_else(|| CliError::Other(format!("internal error: missing db pool for {command}")))
 }
 
 async fn handle_products_with(
     cx: &asupersync::Cx,
-    pool: &mcp_agent_mail_db::DbPool,
+    pool: Option<&mcp_agent_mail_db::DbPool>,
     server_url: Option<&str>,
     bearer: Option<&str>,
     action: ProductsCommand,
@@ -40767,6 +42107,7 @@ async fn handle_products_with(
                 ftui_runtime::ftui_eprintln!("Provide a product_key or --name.");
                 return Err(CliError::ExitCode(2));
             }
+            let pool = require_products_pool(pool, "products ensure")?;
 
             // Prefer server tool to ensure strict uid policy (legacy behavior).
             let mut args = serde_json::Map::new();
@@ -40854,6 +42195,7 @@ async fn handle_products_with(
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
+            let pool = require_products_pool(pool, "products link")?;
             let prod = get_product_by_key(cx, pool, product_key.trim())
                 .await?
                 .ok_or_else(|| CliError::Other(format!("Product '{product_key}' not found")))?;
@@ -40909,6 +42251,7 @@ async fn handle_products_with(
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
+            let pool = require_products_pool(pool, "products status")?;
             let prod = get_product_by_key(cx, pool, product_key.trim())
                 .await?
                 .ok_or_else(|| {
@@ -41019,6 +42362,7 @@ async fn handle_products_with(
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
+            let pool = require_products_pool(pool, "products search")?;
             let prod = get_product_by_key(cx, pool, product_key.trim())
                 .await?
                 .ok_or_else(|| {
@@ -41104,6 +42448,7 @@ async fn handle_products_with(
             let fmt = output::CliOutputFormat::resolve(format, json);
             let urgent_only = resolve_bool(urgent_only, all, false);
             let include_bodies = resolve_bool(include_bodies, no_bodies, false);
+            let pool = require_products_pool(pool, "products inbox")?;
 
             let mut server_answered = false;
             let mut items: Vec<serde_json::Value> = if let Some(url) = server_url {
@@ -43121,6 +44466,63 @@ fn seed_share_export_source_db(path: &Path) {
 }
 
 #[cfg(test)]
+fn seed_archive_mailbox_project(storage_root: &Path) -> PathBuf {
+    let project_dir = storage_root.join("projects").join("ahead-project");
+    let agent_dir = project_dir.join("agents").join("Alice");
+    let message_dir = project_dir.join("messages").join("2026").join("03");
+    std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+    std::fs::create_dir_all(&message_dir).expect("create message dir");
+    std::fs::write(
+        project_dir.join("project.json"),
+        r#"{"slug":"ahead-project","human_key":"/ahead-project"}"#,
+    )
+    .expect("write project metadata");
+    std::fs::write(
+        agent_dir.join("profile.json"),
+        r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z"}"#,
+    )
+    .expect("write agent profile");
+    message_dir
+}
+
+#[cfg(test)]
+fn write_archive_mailbox_message(
+    message_dir: &Path,
+    file_name: &str,
+    id: i64,
+    to_agent: &str,
+    subject: &str,
+    importance: &str,
+    created_ts: &str,
+    body: &str,
+) {
+    std::fs::write(
+        message_dir.join(file_name),
+        format!(
+            "---json\n{{\"id\":{id},\"from\":\"Alice\",\"to\":[\"{to_agent}\"],\"subject\":\"{subject}\",\"importance\":\"{importance}\",\"ack_required\":false,\"created_ts\":\"{created_ts}\",\"attachments\":[]}}\n---\n\n{body}\n"
+        ),
+    )
+    .expect("write archive message");
+}
+
+#[cfg(test)]
+fn sqlite_message_stats(path: &Path) -> (i64, i64) {
+    let conn = mcp_agent_mail_db::DbConn::open_file(path.display().to_string())
+        .expect("open sqlite message stats db");
+    let rows = conn
+        .query_sync(
+            "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id FROM messages",
+            &[],
+        )
+        .expect("query sqlite message stats");
+    let row = rows.first().expect("sqlite message aggregate row");
+    (
+        row.get_named::<i64>("count").unwrap_or(0),
+        row.get_named::<i64>("max_id").unwrap_or(0),
+    )
+}
+
+#[cfg(test)]
 fn try_generate_age_recipient(dir: &Path) -> Option<String> {
     let identity_path = dir.join("age_identity.txt");
     let output = std::process::Command::new("age-keygen")
@@ -43422,6 +44824,137 @@ fn run_share_update_reports_busy_before_rewriting_bundle_when_mailbox_locked() {
     assert!(
         !bundle.join("_snapshot.sqlite3").exists(),
         "busy share update should fail before creating bundle snapshots"
+    );
+}
+
+#[test]
+fn run_share_export_uses_archive_snapshot_when_live_db_is_stale() {
+    let _lock = SHARE_EXPORT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source_db = temp.path().join("share-export-source.sqlite3");
+    let storage_root = temp.path().join("storage");
+    let output = temp.path().join("bundle");
+    let message_dir = seed_archive_mailbox_project(&storage_root);
+    write_archive_mailbox_message(
+        &message_dir,
+        "2026-03-22T12-00-00Z__first__1.md",
+        1,
+        "Bob",
+        "First",
+        "normal",
+        "2026-03-22T12:00:00Z",
+        "first body",
+    );
+
+    mcp_agent_mail_db::reconstruct_from_archive(&source_db, &storage_root)
+        .expect("seed stale source db from archive");
+    write_archive_mailbox_message(
+        &message_dir,
+        "2026-03-22T12-05-00Z__second__2.md",
+        2,
+        "Carol",
+        "Second",
+        "urgent",
+        "2026-03-22T12:05:00Z",
+        "second body",
+    );
+
+    let database_url = format!("sqlite:///{}", source_db.display());
+    let storage_root_text = storage_root.to_string_lossy().to_string();
+    mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        &[
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root_text.as_str()),
+        ],
+        || {
+            run_share_export(ShareExportParams {
+                output: output.clone(),
+                projects: vec![],
+                inline_threshold: share::INLINE_ATTACHMENT_THRESHOLD,
+                detach_threshold: share::DETACH_ATTACHMENT_THRESHOLD,
+                scrub_preset: share::ScrubPreset::Standard,
+                chunk_threshold: share::DEFAULT_CHUNK_THRESHOLD,
+                chunk_size: share::DEFAULT_CHUNK_SIZE,
+                dry_run: false,
+                zip: false,
+                signing_key: None,
+                signing_public_out: None,
+                age_recipients: vec![],
+            })
+        },
+    )
+    .expect("share export should fall back to a canonical archive snapshot");
+
+    let (count, max_id) = sqlite_message_stats(&output.join("mailbox.sqlite3"));
+    assert_eq!(
+        count, 2,
+        "exported bundle should include archive-ahead messages"
+    );
+    assert_eq!(
+        max_id, 2,
+        "exported bundle should include the latest archive message id"
+    );
+}
+
+#[test]
+fn run_share_update_uses_archive_snapshot_when_live_db_is_missing() {
+    let _lock = SHARE_EXPORT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source_db = temp.path().join("missing-share-source.sqlite3");
+    let storage_root = temp.path().join("storage");
+    let bundle = temp.path().join("bundle");
+    std::fs::create_dir_all(&bundle).expect("create bundle dir");
+    let message_dir = seed_archive_mailbox_project(&storage_root);
+    write_archive_mailbox_message(
+        &message_dir,
+        "2026-03-22T12-00-00Z__first__1.md",
+        1,
+        "Bob",
+        "First",
+        "normal",
+        "2026-03-22T12:00:00Z",
+        "first body",
+    );
+
+    let database_url = format!("sqlite:///{}", source_db.display());
+    let storage_root_text = storage_root.to_string_lossy().to_string();
+    mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        &[
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root_text.as_str()),
+        ],
+        || {
+            run_share_update(ShareUpdateParams {
+                bundle: bundle.clone(),
+                projects: vec![],
+                inline_threshold: share::INLINE_ATTACHMENT_THRESHOLD,
+                detach_threshold: share::DETACH_ATTACHMENT_THRESHOLD,
+                scrub_preset: share::ScrubPreset::Standard,
+                chunk_threshold: share::DEFAULT_CHUNK_THRESHOLD,
+                chunk_size: share::DEFAULT_CHUNK_SIZE,
+                zip: false,
+                signing_key: None,
+                signing_public_out: None,
+                age_recipients: vec![],
+            })
+        },
+    )
+    .expect("share update should fall back to the canonical archive when the live db is missing");
+
+    let (count, max_id) = sqlite_message_stats(&bundle.join("mailbox.sqlite3"));
+    assert_eq!(
+        count, 1,
+        "updated bundle should be rebuilt from the archive snapshot"
+    );
+    assert_eq!(
+        max_id, 1,
+        "updated bundle should preserve archive message ids"
     );
 }
 

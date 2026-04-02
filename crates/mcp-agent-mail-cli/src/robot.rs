@@ -1766,6 +1766,41 @@ impl RobotDbHandle {
     }
 }
 
+fn prefer_archive_snapshot_when_local_db_lags_archive(
+    local: RobotDbHandle,
+    storage_root: &Path,
+    context: &str,
+) -> Result<RobotDbHandle, CliError> {
+    let archive = crate::collect_doctor_archive_inventory(storage_root);
+    if archive.counts() == crate::DoctorInventoryCounts::default() {
+        return Ok(local);
+    }
+
+    match crate::collect_doctor_db_inventory(&local.conn) {
+        Ok(db) => {
+            if let Some(detail) = crate::doctor_archive_db_drift_detail(&archive, &db) {
+                tracing::warn!(
+                    operation = context,
+                    storage_root = %storage_root.display(),
+                    drift = detail,
+                    "robot command using archive snapshot because the local sqlite index lags the Git archive"
+                );
+                return RobotDbHandle::open_archive_snapshot(storage_root);
+            }
+            Ok(local)
+        }
+        Err(error) => {
+            tracing::warn!(
+                operation = context,
+                storage_root = %storage_root.display(),
+                error = %error,
+                "robot command using archive snapshot because the local sqlite inventory probe failed"
+            );
+            RobotDbHandle::open_archive_snapshot(storage_root)
+        }
+    }
+}
+
 struct ResolvedRobotScope {
     db: RobotDbHandle,
     project_id: i64,
@@ -2002,6 +2037,8 @@ fn resolve_robot_scope(
 ) -> Result<ResolvedRobotScope, CliError> {
     let local = RobotDbHandle::open_local()?;
     let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
+    let local =
+        prefer_archive_snapshot_when_local_db_lags_archive(local, &storage_root, "robot scope")?;
     resolve_robot_scope_with_archive_fallback(local, &storage_root, project_flag, agent_flag)
 }
 
@@ -2010,6 +2047,11 @@ fn resolve_robot_project_scope(
 ) -> Result<ResolvedRobotProjectScope, CliError> {
     let local = RobotDbHandle::open_local()?;
     let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
+    let local = prefer_archive_snapshot_when_local_db_lags_archive(
+        local,
+        &storage_root,
+        "robot project scope",
+    )?;
     resolve_robot_project_scope_with_archive_fallback(local, &storage_root, project_flag)
 }
 
@@ -2018,6 +2060,11 @@ fn resolve_robot_attachments_project_scope(
 ) -> Result<ResolvedRobotProjectScope, CliError> {
     let local = RobotDbHandle::open_local_attachments()?;
     let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
+    let local = prefer_archive_snapshot_when_local_db_lags_archive(
+        local,
+        &storage_root,
+        "robot attachments project scope",
+    )?;
     resolve_robot_project_scope_with_archive_fallback(local, &storage_root, project_flag)
 }
 
@@ -3079,6 +3126,7 @@ struct SearchData {
 
 fn build_search(
     conn: &DbConn,
+    pool: &mcp_agent_mail_db::DbPool,
     project_id: i64,
     query: &str,
     kind_filter: Option<&str>,
@@ -3121,7 +3169,7 @@ fn build_search(
     }
 
     let recipient_kind = kind_filter.map(str::trim).filter(|s| !s.is_empty());
-    let search_rows = collect_search_rows(conn, &search_query, recipient_kind, limit)?;
+    let search_rows = collect_search_rows(conn, pool, &search_query, recipient_kind, limit)?;
 
     // Build results and facets
     let mut results = Vec::new();
@@ -3200,13 +3248,11 @@ fn build_search(
 
 fn collect_search_rows(
     conn: &DbConn,
+    pool: &mcp_agent_mail_db::DbPool,
     query: &mcp_agent_mail_db::search_planner::SearchQuery,
     recipient_kind: Option<&str>,
     limit: usize,
 ) -> Result<Vec<mcp_agent_mail_db::search_planner::SearchResult>, CliError> {
-    let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    let pool = mcp_agent_mail_db::create_pool(&cfg)
-        .map_err(|e| CliError::Other(format!("failed to initialize DB pool for search: {e}")))?;
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .map_err(|e| CliError::Other(format!("failed to build async runtime for search: {e}")))?;
@@ -3220,7 +3266,7 @@ fn collect_search_rows(
         paged_query,
         recipient_kind,
         requested_limit,
-        |query| execute_robot_search_query(&runtime, &pool, query),
+        |query| execute_robot_search_query(&runtime, pool, query),
     )
 }
 
@@ -6563,12 +6609,17 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             importance,
             since,
         } => {
-            // Search executes via the async search service and its full DB pool, so it
-            // cannot safely rely on the reduced best-effort robot fallback path.
-            let conn = crate::open_db_sync()?;
-            let (project_id, project_slug) = resolve_project(&conn, args.project.as_deref())?;
+            let config = mcp_agent_mail_core::Config::from_env();
+            let read_db = crate::open_db_sync_async_canonical_read_with_database_url(
+                &config.database_url,
+                Some(config.storage_root.as_path()),
+                "robot search",
+            )?;
+            let (project_id, project_slug) =
+                resolve_project(read_db.conn(), args.project.as_deref())?;
             let data = build_search(
-                &conn,
+                read_db.conn(),
+                read_db.pool(),
                 project_id,
                 &query,
                 kind.as_deref(),
@@ -11122,6 +11173,96 @@ mod tests {
     }
 
     #[test]
+    fn prefer_archive_snapshot_when_local_db_lags_archive_uses_archive_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let local_db_path = temp_dir.path().join("robot_archive_drift.sqlite3");
+        let local_db_url = format!("sqlite:///{}", local_db_path.display());
+        crate::handle_migrate_with_database_url(&local_db_url).expect("migrate local db");
+
+        let local_conn = mcp_agent_mail_db::DbConn::open_file(local_db_path.display().to_string())
+            .expect("open local sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+        local_conn
+            .query_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (1, 'demo-project', '/tmp/demo-project', 0)",
+                &empty,
+            )
+            .expect("insert local project");
+        local_conn
+            .query_sync(
+                "INSERT INTO agents (
+                    id, project_id, name, program, model, task_description,
+                    created_at, updated_at, contact_policy, attachments_policy, last_active_ts
+                 ) VALUES (
+                    1, 1, 'BlueLake', 'codex-cli', 'gpt-5', 'robot',
+                    0, 0, 'auto', 'inline', 0
+                 )",
+                &empty,
+            )
+            .expect("insert local agent");
+        drop(local_conn);
+
+        let storage_root = tempfile::tempdir().expect("storage root");
+        let project_dir = storage_root.path().join("projects").join("demo-project");
+        let agent_dir = project_dir.join("agents").join("BlueLake");
+        let canonical_dir = project_dir.join("messages").join("2026").join("04");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&canonical_dir).expect("create canonical dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"demo-project","human_key":"/tmp/demo-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{
+                "name": "BlueLake",
+                "program": "codex-cli",
+                "model": "gpt-5",
+                "task_description": "archive snapshot",
+                "inception_ts": "2026-03-13T21:21:02Z",
+                "last_active_ts": "2026-03-13T21:21:02Z"
+            }"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            canonical_dir.join("2026-04-01T13-00-00Z__hello__7.md"),
+            "---json\n{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"Hello\"}\n---\nbody\n",
+        )
+        .expect("write canonical message");
+
+        let handle = prefer_archive_snapshot_when_local_db_lags_archive(
+            RobotDbHandle::from_conn(
+                mcp_agent_mail_db::DbConn::open_file(local_db_path.display().to_string())
+                    .expect("reopen local sqlite db"),
+            ),
+            storage_root.path(),
+            "robot scope",
+        )
+        .expect("archive drift should prefer archive snapshot");
+
+        let rows = handle
+            .conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM messages", &[])
+            .expect("query archive snapshot messages");
+        let count = rows[0].get_named::<i64>("cnt").unwrap_or(0);
+        assert_eq!(
+            count, 1,
+            "archive snapshot should contain canonical message"
+        );
+
+        let scope =
+            resolve_robot_scope_with_handle(handle, Some("/tmp/demo-project"), Some("BlueLake"))
+                .expect("archive-backed handle should resolve robot scope");
+        assert_eq!(scope.project_slug, "demo-project");
+        assert_eq!(
+            scope.agent.as_ref().map(|(_, name)| name.as_str()),
+            Some("BlueLake")
+        );
+    }
+
+    #[test]
     fn soften_implicit_missing_agent_error_drops_missing_env_agent() {
         let result = soften_implicit_missing_agent_error(
             None,
@@ -11662,6 +11803,78 @@ mod tests {
     }
 
     #[test]
+    fn robot_search_uses_archive_snapshot_when_live_db_is_stale() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_search_stale.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        crate::handle_migrate_with_database_url(&db_url).expect("migrate");
+
+        let storage_root = temp_dir.path().join("storage");
+        let project_dir = storage_root.join("projects").join("demo-project");
+        let agent_dir = project_dir.join("agents").join("BlueLake");
+        let canonical_dir = project_dir.join("messages").join("2026").join("04");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&canonical_dir).expect("create canonical dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"demo-project","human_key":"/tmp/demo-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{
+                "name": "BlueLake",
+                "program": "codex-cli",
+                "model": "gpt-5",
+                "task_description": "robot search",
+                "inception_ts": "2026-04-01T13:00:00Z",
+                "last_active_ts": "2026-04-01T13:00:00Z"
+            }"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            canonical_dir.join("2026-04-01T13-00-00Z__archive-hit__7.md"),
+            concat!(
+                "---json\n",
+                "{\"id\":7,\"from\":\"BlueLake\",\"to\":[],\"subject\":\"archive-only hit\"}\n",
+                "---\n",
+                "body\n"
+            ),
+        )
+        .expect("write canonical message");
+
+        let value = run_robot_json_capture(
+            RobotArgs {
+                format: Some(OutputFormat::Json),
+                project: Some("/tmp/demo-project".to_string()),
+                agent: None,
+                command: RobotSubcommand::Search {
+                    query: "archive-only".to_string(),
+                    kind: None,
+                    importance: None,
+                    since: None,
+                },
+            },
+            &db_url,
+            storage_root.to_string_lossy().as_ref(),
+        );
+
+        assert_eq!(value["total_results"], 1);
+        assert_eq!(value["results"][0]["subject"], "archive-only hit");
+
+        let live_conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("reopen live sqlite db");
+        let rows = live_conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM messages", &[])
+            .expect("count live messages");
+        let live_count = rows[0].get_named::<i64>("cnt").unwrap_or(-1);
+        assert_eq!(
+            live_count, 0,
+            "robot search should not mutate the live sqlite index"
+        );
+    }
+
+    #[test]
     fn build_reservations_scopes_conflicts_and_expiring_to_selected_agent() {
         let (_temp_dir, conn) = setup_robot_thread_message_test_db();
         let now_us = mcp_agent_mail_db::now_micros();
@@ -11768,9 +11981,28 @@ mod tests {
 
     #[test]
     fn test_build_search_invalid_importance_errors() {
-        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
-        let err = build_search(&conn, 1, "auth", None, Some("totally-invalid"), None, 20)
-            .expect_err("invalid importance should error");
+        let (temp_dir, conn) = setup_robot_thread_message_test_db();
+        let db_path = temp_dir.path().join("robot_thread_message_test.sqlite3");
+        let pool = mcp_agent_mail_db::create_pool(&mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 2,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..mcp_agent_mail_db::DbPoolConfig::default()
+        })
+        .expect("create search test pool");
+        let err = build_search(
+            &conn,
+            &pool,
+            1,
+            "auth",
+            None,
+            Some("totally-invalid"),
+            None,
+            20,
+        )
+        .expect_err("invalid importance should error");
 
         assert!(
             matches!(err, CliError::InvalidArgument(msg) if msg.contains("invalid importance filter"))
