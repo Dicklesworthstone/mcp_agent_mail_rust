@@ -197,7 +197,7 @@ pub struct EphemeralSignals {
     pub path_ntm_dir: bool,
     /// Path matches `ntm-session-*` pattern.
     pub path_ntm_session: bool,
-    /// `NTM_SESSION_DIR` or other `NTM_` env var set.
+    /// `NTM_SESSION_DIR` or `NTM_SESSION` env var set.
     pub env_ntm: bool,
 
     // ---- Tier 4: CI/CD ----
@@ -445,7 +445,7 @@ pub fn classify_ephemeral(
     // ---- Tier 3: NTM/swarm ----
     signals.path_ntm_dir = normalized.contains("/.ntm/");
     signals.path_ntm_session = normalized.contains("/ntm-session-");
-    signals.env_ntm = env("NTM_SESSION_DIR").is_some();
+    signals.env_ntm = env("NTM_SESSION_DIR").is_some() || env("NTM_SESSION").is_some();
 
     // ---- Tier 4: CI/CD ----
     signals.env_ci =

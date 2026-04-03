@@ -5780,6 +5780,9 @@ pub fn canary_mailbox_destroyed() {
     let m = &mcp_agent_mail_core::global_metrics().canary;
     m.canary_mailboxes_destroyed_total.inc();
     // Saturating decrement: active = max(0, active - 1).
+    // Note: load-then-set is not atomic. GaugeU64 lacks fetch_sub, so
+    // concurrent destroy calls can under-decrement by one. This is a
+    // metrics-only imprecision, not a correctness bug.
     let current = m.canary_mailboxes_active.load();
     if current > 0 {
         m.canary_mailboxes_active.set(current.saturating_sub(1));

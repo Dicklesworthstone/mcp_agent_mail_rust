@@ -624,7 +624,15 @@ fn file_locks_for_paths(paths: &[(&str, PathBuf)]) -> Vec<ForensicFileLock> {
         if fields.len() < 8 {
             continue;
         }
-        let parts: Vec<&str> = fields[5].split(':').collect();
+        // Blocking lock lines have "->" at fields[1], shifting all
+        // subsequent field indices by 1:
+        //   Normal:   "1: POSIX  ADVISORY  WRITE 12345 fd:01:123456 0 EOF"
+        //   Blocking: "2: -> FLOCK  ADVISORY  WRITE 12345 fd:01:123456 0 EOF"
+        let offset: usize = if fields.get(1) == Some(&"->") { 1 } else { 0 };
+        if fields.len() < 8 + offset {
+            continue;
+        }
+        let parts: Vec<&str> = fields[5 + offset].split(':').collect();
         if parts.len() != 3 {
             continue;
         }
@@ -637,7 +645,7 @@ fn file_locks_for_paths(paths: &[(&str, PathBuf)]) -> Vec<ForensicFileLock> {
         let Ok(ino) = parts[2].parse::<u64>() else {
             continue;
         };
-        let Ok(pid) = fields[4].parse::<u32>() else {
+        let Ok(pid) = fields[4 + offset].parse::<u32>() else {
             continue;
         };
         for (role, identity) in &identities {
@@ -645,10 +653,10 @@ fn file_locks_for_paths(paths: &[(&str, PathBuf)]) -> Vec<ForensicFileLock> {
                 locks.push(ForensicFileLock {
                     role: role.clone(),
                     pid,
-                    lock_type: fields[1].to_string(),
-                    access: fields[3].to_string(),
-                    range_start: fields[6].to_string(),
-                    range_end: fields[7].to_string(),
+                    lock_type: fields[1 + offset].to_string(),
+                    access: fields[3 + offset].to_string(),
+                    range_start: fields[6 + offset].to_string(),
+                    range_end: fields[7 + offset].to_string(),
                 });
             }
         }

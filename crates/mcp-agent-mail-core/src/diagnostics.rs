@@ -103,30 +103,30 @@ pub struct Recommendation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArchiveScanSeverityBucket {
-    /// Immediate operator attention is required before trusting recovery or promotion.
-    Critical,
-    /// Actionable hygiene debt that should be scheduled and remediated.
-    Warning,
     /// Low-risk oddities that belong in artifacts rather than loud terminal output.
     Info,
+    /// Actionable hygiene debt that should be scheduled and remediated.
+    Warning,
+    /// Immediate operator attention is required before trusting recovery or promotion.
+    Critical,
 }
 
 impl ArchiveScanSeverityBucket {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Critical => "critical",
-            Self::Warning => "warning",
             Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Critical => "critical",
         }
     }
 
     #[must_use]
     pub const fn priority(self) -> u8 {
         match self {
-            Self::Critical => 3,
-            Self::Warning => 2,
             Self::Info => 1,
+            Self::Warning => 2,
+            Self::Critical => 3,
         }
     }
 }

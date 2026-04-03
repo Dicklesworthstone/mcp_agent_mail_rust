@@ -16527,12 +16527,12 @@ fn handle_doctor_check_with(
     // Output — enrich each check with its category before building the payload.
     for check in &mut checks {
         if let Some(name) = check.get("check").and_then(|v| v.as_str()).map(String::from) {
-            check.as_object_mut().map(|obj| {
+            if let Some(obj) = check.as_object_mut() {
                 obj.insert(
                     "category".to_string(),
                     serde_json::Value::String(doctor_check_category(&name).to_string()),
-                )
-            });
+                );
+            }
         }
     }
 
