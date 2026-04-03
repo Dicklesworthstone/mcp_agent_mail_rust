@@ -416,7 +416,15 @@ impl Harness {
     }
 
     /// Generate N deterministic agent names (guaranteed unique within the batch).
+    ///
+    /// Panics if `n` exceeds the total name space (`VALID_ADJECTIVES.len() *
+    /// VALID_NOUNS.len()`), since uniqueness would be impossible.
     pub fn agent_names(&self, n: usize) -> Vec<String> {
+        let max_unique = crate::VALID_ADJECTIVES.len() * crate::VALID_NOUNS.len();
+        assert!(
+            n <= max_unique,
+            "requested {n} unique agent names but only {max_unique} are possible"
+        );
         let mut names = Vec::with_capacity(n);
         let mut seen = std::collections::HashSet::with_capacity(n);
         while names.len() < n {
