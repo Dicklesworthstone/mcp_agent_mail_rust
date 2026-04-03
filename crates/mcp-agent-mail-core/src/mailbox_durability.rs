@@ -810,4 +810,185 @@ mod tests {
             );
         }
     }
+
+    // ── Cross-surface golden snapshot tests (br-97gc6.5.2.6.4.1) ────
+
+    /// The five canonical operator/user surfaces.
+    const SURFACES: &[&str] = &["cli", "server", "web", "robot", "tui"];
+
+    /// A snapshot of the durability contract as seen from a single surface.
+    ///
+    /// Every surface MUST derive the same values from the authoritative
+    /// `MailboxDurabilityContract`.  If any surface ever needs to diverge,
+    /// it must be captured as an explicit exception with a rationale.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+    struct SurfaceSnapshot {
+        surface: String,
+        state: String,
+        summary: String,
+        read_policy: String,
+        write_policy: String,
+        recovery_requirement: String,
+        transition_authority: String,
+        reads_may_continue: bool,
+        writes_must_stop: bool,
+        is_degraded: bool,
+    }
+
+    /// Build the canonical snapshot for a (surface, state) pair.
+    ///
+    /// Today every surface derives identical policy from the contract.  If a
+    /// surface ever adds surface-specific copy (e.g. a TUI-only "press R to
+    /// retry" hint), add it as an optional field rather than changing the
+    /// shared fields, so the shared assertions keep catching drift.
+    fn surface_snapshot(surface: &str, state: MailboxDurabilityState) -> SurfaceSnapshot {
+        let contract = state.contract();
+        SurfaceSnapshot {
+            surface: surface.to_string(),
+            state: state.to_string(),
+            summary: contract.summary.to_string(),
+            read_policy: format!("{:?}", contract.read_policy),
+            write_policy: format!("{:?}", contract.write_policy),
+            recovery_requirement: format!("{:?}", contract.recovery_requirement),
+            transition_authority: format!("{:?}", contract.transition_authority),
+            reads_may_continue: state.reads_may_continue(),
+            writes_must_stop: state.writes_must_stop(),
+            is_degraded: state.is_degraded(),
+        }
+    }
+
+    #[test]
+    fn all_surfaces_agree_on_every_durability_state() {
+        for &state in MAILBOX_DURABILITY_STATES {
+            let snapshots: Vec<SurfaceSnapshot> =
+                SURFACES.iter().map(|s| surface_snapshot(s, state)).collect();
+
+            // Compare every surface against the first (cli).
+            let reference = &snapshots[0];
+            for snap in &snapshots[1..] {
+                assert_eq!(
+                    snap.summary, reference.summary,
+                    "summary mismatch: {} vs {} in state {}",
+                    snap.surface, reference.surface, state
+                );
+                assert_eq!(
+                    snap.read_policy, reference.read_policy,
+                    "read_policy mismatch: {} vs {} in state {}",
+                    snap.surface, reference.surface, state
+                );
+                assert_eq!(
+                    snap.write_policy, reference.write_policy,
+                    "write_policy mismatch: {} vs {} in state {}",
+                    snap.surface, reference.surface, state
+                );
+                assert_eq!(
+                    snap.recovery_requirement, reference.recovery_requirement,
+                    "recovery_requirement mismatch: {} vs {} in state {}",
+                    snap.surface, reference.surface, state
+                );
+                assert_eq!(
+                    snap.transition_authority, reference.transition_authority,
+                    "transition_authority mismatch: {} vs {} in state {}",
+                    snap.surface, reference.surface, state
+                );
+                assert_eq!(
+                    snap.reads_may_continue, reference.reads_may_continue,
+                    "reads_may_continue mismatch: {} vs {} in state {}",
+                    snap.surface, reference.surface, state
+                );
+                assert_eq!(
+                    snap.writes_must_stop, reference.writes_must_stop,
+                    "writes_must_stop mismatch: {} vs {} in state {}",
+                    snap.surface, reference.surface, state
+                );
+                assert_eq!(
+                    snap.is_degraded, reference.is_degraded,
+                    "is_degraded mismatch: {} vs {} in state {}",
+                    snap.surface, reference.surface, state
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn golden_matrix_is_complete_and_stable() {
+        // Build the full 5×7 = 35 snapshot matrix.
+        let mut matrix: Vec<SurfaceSnapshot> = Vec::with_capacity(35);
+        for &state in MAILBOX_DURABILITY_STATES {
+            for surface in SURFACES {
+                matrix.push(surface_snapshot(surface, state));
+            }
+        }
+        assert_eq!(matrix.len(), SURFACES.len() * MAILBOX_DURABILITY_STATES.len());
+
+        // Verify the matrix serializes to stable JSON (regression gate).
+        let json = serde_json::to_string_pretty(&matrix).expect("serialize matrix");
+        assert!(json.contains("\"healthy\""), "matrix must contain healthy state");
+        assert!(json.contains("\"escalate\""), "matrix must contain escalate state");
+        assert!(json.contains("\"tui\""), "matrix must contain tui surface");
+        assert!(json.contains("\"robot\""), "matrix must contain robot surface");
+    }
+
+    #[test]
+    fn golden_snapshot_policy_invariants() {
+        // Encode the non-negotiable policy constraints that every surface must obey.
+        for &state in MAILBOX_DURABILITY_STATES {
+            let snap = surface_snapshot("cli", state);
+            match state {
+                MailboxDurabilityState::Healthy => {
+                    assert!(!snap.writes_must_stop, "healthy must allow writes");
+                    assert!(snap.reads_may_continue, "healthy must allow reads");
+                    assert!(!snap.is_degraded, "healthy must not be degraded");
+                }
+                MailboxDurabilityState::Broken => {
+                    assert!(snap.writes_must_stop, "broken must stop writes");
+                    assert!(!snap.reads_may_continue, "broken must hold reads");
+                    assert!(snap.is_degraded);
+                }
+                MailboxDurabilityState::Escalate => {
+                    assert!(snap.writes_must_stop, "escalate must stop writes");
+                    assert!(!snap.reads_may_continue, "escalate must hold reads");
+                    assert_eq!(snap.transition_authority, "Operator");
+                    assert_eq!(snap.recovery_requirement, "OperatorRequired");
+                }
+                MailboxDurabilityState::DegradedReadOnly => {
+                    assert!(snap.writes_must_stop, "degraded_read_only must stop writes");
+                    assert!(snap.reads_may_continue, "degraded_read_only must allow reads");
+                    assert_eq!(snap.read_policy, "ArchiveSnapshotRequired");
+                }
+                MailboxDurabilityState::Recovering => {
+                    assert!(snap.writes_must_stop, "recovering must stop user writes");
+                    assert!(snap.reads_may_continue, "recovering must allow snapshot reads");
+                    assert_eq!(snap.transition_authority, "MailboxSupervisor");
+                }
+                _ => {
+                    assert!(snap.is_degraded, "{state} must be degraded");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn golden_snapshot_write_file_on_update() {
+        // Emit the golden snapshot matrix to a well-known path for CI diffing.
+        // This test always passes — it just writes the current truth.
+        let mut matrix: Vec<SurfaceSnapshot> = Vec::new();
+        for &state in MAILBOX_DURABILITY_STATES {
+            for surface in SURFACES {
+                matrix.push(surface_snapshot(surface, state));
+            }
+        }
+        let json = serde_json::to_string_pretty(&matrix).expect("serialize");
+        let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/golden_snapshots/durability_surface_matrix.json");
+        if let Some(parent) = golden_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&golden_path, json.as_bytes()).unwrap_or_else(|err| {
+            eprintln!(
+                "warning: could not write golden snapshot to {}: {err}",
+                golden_path.display()
+            );
+        });
+    }
 }

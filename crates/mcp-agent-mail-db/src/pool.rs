@@ -762,6 +762,95 @@ pub struct ReplayResult {
     pub total: usize,
 }
 
+/// Record of a single deferred write that failed during replay.
+///
+/// These are accumulated in a [`ReplayCompensationLog`] so the system can:
+/// 1. Surface the exact failure to operators (which writes were lost).
+/// 2. Emit structured diagnostics for the forensic bundle.
+/// 3. Attempt targeted follow-up actions (e.g. re-archive, notify sender).
+///
+/// **Compensation strategy**: failed replay writes are *not* silently dropped.
+/// The replay loop logs each failure, records it in the compensation log, and
+/// continues replaying subsequent entries. After all entries are attempted, the
+/// compensation log is persisted to the forensic bundle directory and surfaced
+/// through doctor/robot/TUI output. Callers that submitted deferred writes can
+/// query the compensation log by `seq` to learn whether their write succeeded
+/// or failed. If a write fails with a constraint violation (duplicate key), it
+/// is treated as an idempotent no-op (the data already exists). All other
+/// failures are logged as compensation records.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplayCompensationRecord {
+    /// Sequence number of the deferred write (correlates with `DeferredWrite::seq`).
+    pub seq: u64,
+    /// The SQL that failed.
+    pub sql: String,
+    /// The operation type that originated this write.
+    pub operation: &'static str,
+    /// The error message from the failed replay attempt.
+    pub error: String,
+    /// When the write was originally deferred (microseconds since epoch).
+    pub deferred_at_us: i64,
+    /// When the replay attempt failed (microseconds since epoch).
+    pub failed_at_us: i64,
+}
+
+/// Accumulates [`ReplayCompensationRecord`]s during a replay pass.
+///
+/// Thread-safe (uses interior `Mutex`) so replay can proceed concurrently
+/// if needed, though current replay is sequential.
+pub struct ReplayCompensationLog {
+    entries: Mutex<Vec<ReplayCompensationRecord>>,
+}
+
+impl ReplayCompensationLog {
+    /// Create an empty compensation log.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            entries: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Record a failed replay attempt.
+    pub fn record(&self, record: ReplayCompensationRecord) {
+        self.entries
+            .lock()
+            .expect("ReplayCompensationLog poisoned")
+            .push(record);
+    }
+
+    /// Number of recorded failures.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .expect("ReplayCompensationLog poisoned")
+            .len()
+    }
+
+    /// Whether the log is empty (all replays succeeded).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Drain all records from the log for persistence or reporting.
+    pub fn drain(&self) -> Vec<ReplayCompensationRecord> {
+        std::mem::take(
+            &mut *self
+                .entries
+                .lock()
+                .expect("ReplayCompensationLog poisoned"),
+        )
+    }
+}
+
+impl Default for ReplayCompensationLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Bounded FIFO queue for writes deferred during `Recovering` state.
 ///
 /// **Lifecycle:**
@@ -9147,5 +9236,274 @@ mod tests {
         seqs.sort_unstable();
         seqs.dedup();
         assert_eq!(seqs.len(), 500);
+    }
+
+    // ── Overload shedding tests (br-97gc6.5.2.1.19) ─────────────────
+
+    #[test]
+    fn overload_policy_default_values() {
+        let p = OverloadPolicy::default();
+        assert_eq!(p.max_entries, 1024);
+        assert_eq!(p.max_age_secs, 300);
+        assert_eq!(p.max_bytes, 64 * 1024 * 1024);
+        assert_eq!(p.fairness_limit_pct, 60);
+        assert_eq!(p.fairness_limit(), 614); // floor(1024 * 60 / 100)
+    }
+
+    #[test]
+    fn overload_fairness_limit_zero_disables() {
+        let p = OverloadPolicy {
+            fairness_limit_pct: 0,
+            max_entries: 100,
+            ..Default::default()
+        };
+        assert_eq!(p.fairness_limit(), 100, "0% should disable fairness limit");
+    }
+
+    #[test]
+    fn overload_hard_stop_age_rejects_when_oldest_stale() {
+        let q = DeferredWriteQueue::with_policy(OverloadPolicy {
+            max_entries: 100,
+            max_age_secs: 0, // immediate hard-stop on any age
+            ..Default::default()
+        });
+        q.activate();
+        // First write succeeds (no oldest entry to check).
+        let out = q.enqueue("INSERT INTO t VALUES(1)".into(), vec![], "op");
+        assert!(matches!(out, DeferralOutcome::Queued { .. }));
+        // Second write sees the first entry aged > 0 seconds.
+        // Since max_age_secs=0, the next enqueue should hard-stop.
+        // We need the first entry to have a non-zero age, which it does
+        // because now_micros() moves forward. With max_age=0 any age > 0 triggers.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let out = q.enqueue("INSERT INTO t VALUES(2)".into(), vec![], "op");
+        assert!(
+            matches!(out, DeferralOutcome::HardStopAge { .. }),
+            "expected HardStopAge, got: {out:?}"
+        );
+        assert_eq!(q.shed_count(), 1);
+    }
+
+    #[test]
+    fn overload_hard_stop_bytes_rejects_when_budget_exceeded() {
+        let q = DeferredWriteQueue::with_policy(OverloadPolicy {
+            max_entries: 1000,
+            max_bytes: 300, // very small byte budget
+            max_age_secs: 300,
+            fairness_limit_pct: 0,
+        });
+        q.activate();
+        // Each entry is ~128 overhead + SQL length + params.
+        let out = q.enqueue("INSERT INTO t VALUES(1)".into(), vec![], "op");
+        assert!(matches!(out, DeferralOutcome::Queued { .. }));
+        // Second write should push past the 300 byte budget.
+        let out = q.enqueue("INSERT INTO t VALUES(2)".into(), vec![], "op");
+        assert!(
+            matches!(out, DeferralOutcome::HardStopBytes { .. }),
+            "expected HardStopBytes, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn overload_fairness_limit_caps_per_operation() {
+        let q = DeferredWriteQueue::with_policy(OverloadPolicy {
+            max_entries: 100,
+            fairness_limit_pct: 10, // 10 entries per operation
+            max_age_secs: 300,
+            max_bytes: 64 * 1024 * 1024,
+        });
+        q.activate();
+
+        // Fill up 10 entries for "send_message"
+        for i in 0..10 {
+            let out = q.enqueue(format!("INSERT INTO m VALUES({i})"), vec![], "send_message");
+            assert!(
+                matches!(out, DeferralOutcome::Queued { .. }),
+                "entry {i} should be queued"
+            );
+        }
+
+        // 11th should hit fairness limit
+        let out = q.enqueue("INSERT INTO m VALUES(10)".into(), vec![], "send_message");
+        assert!(
+            matches!(
+                out,
+                DeferralOutcome::FairnessLimitReached {
+                    operation: "send_message",
+                    count: 10,
+                    limit: 10,
+                }
+            ),
+            "expected FairnessLimitReached, got: {out:?}"
+        );
+
+        // Different operation type should still be accepted
+        let out = q.enqueue("UPDATE agents SET name='x'".into(), vec![], "register_agent");
+        assert!(
+            matches!(out, DeferralOutcome::Queued { .. }),
+            "different operation should not be affected by send_message fairness limit"
+        );
+    }
+
+    #[test]
+    fn overload_pressure_tiers_reflect_queue_state() {
+        let q = DeferredWriteQueue::with_policy(OverloadPolicy {
+            max_entries: 100,
+            max_age_secs: 300,
+            max_bytes: 64 * 1024 * 1024,
+            fairness_limit_pct: 0,
+        });
+
+        // Inactive: Normal
+        assert_eq!(q.pressure(), BacklogPressure::Normal);
+
+        q.activate();
+
+        // Empty active: Normal
+        assert_eq!(q.pressure(), BacklogPressure::Normal);
+
+        // Fill to 50%: still Normal
+        for i in 0..50 {
+            q.enqueue(format!("INSERT INTO t VALUES({i})"), vec![], "op");
+        }
+        assert_eq!(q.pressure(), BacklogPressure::Normal);
+
+        // Fill to 76%: Elevated (above 75% warn threshold)
+        for i in 50..76 {
+            q.enqueue(format!("INSERT INTO t VALUES({i})"), vec![], "op");
+        }
+        assert_eq!(q.pressure(), BacklogPressure::Elevated);
+
+        // Fill to 100%: Critical
+        for i in 76..100 {
+            q.enqueue(format!("INSERT INTO t VALUES({i})"), vec![], "op");
+        }
+        assert_eq!(q.pressure(), BacklogPressure::Critical);
+
+        // Sealed: HardStop
+        q.seal_and_drain();
+        assert_eq!(q.pressure(), BacklogPressure::HardStop);
+
+        // Reset: Normal
+        q.reset();
+        assert_eq!(q.pressure(), BacklogPressure::Normal);
+    }
+
+    #[test]
+    fn overload_status_includes_bytes_and_age() {
+        let q = DeferredWriteQueue::with_policy(OverloadPolicy {
+            max_entries: 100,
+            max_age_secs: 300,
+            max_bytes: 64 * 1024 * 1024,
+            fairness_limit_pct: 0,
+        });
+        q.activate();
+        q.enqueue("INSERT INTO t VALUES(1)".into(), vec![], "op");
+
+        let status = q.status();
+        assert_eq!(status.queued, 1);
+        assert!(status.estimated_bytes > 0, "should track estimated bytes");
+        assert_eq!(status.shed_count, 0);
+        assert_eq!(status.pressure, BacklogPressure::Normal);
+    }
+
+    #[test]
+    fn overload_shed_count_is_lifetime() {
+        let q = DeferredWriteQueue::with_policy(OverloadPolicy {
+            max_entries: 1,
+            max_age_secs: 300,
+            max_bytes: 64 * 1024 * 1024,
+            fairness_limit_pct: 0,
+        });
+        q.activate();
+        q.enqueue("INSERT INTO t VALUES(1)".into(), vec![], "op");
+        // Second write is rejected (capacity 1).
+        let out = q.enqueue("INSERT INTO t VALUES(2)".into(), vec![], "op");
+        assert!(matches!(out, DeferralOutcome::BackpressureFull { .. }));
+        assert_eq!(q.shed_count(), 1);
+
+        // Reset and activate again — shed_count persists.
+        q.reset();
+        q.activate();
+        q.enqueue("INSERT INTO t VALUES(3)".into(), vec![], "op");
+        let out = q.enqueue("INSERT INTO t VALUES(4)".into(), vec![], "op");
+        assert!(matches!(out, DeferralOutcome::BackpressureFull { .. }));
+        assert_eq!(q.shed_count(), 2, "shed_count should be lifetime across resets");
+    }
+
+    #[test]
+    fn overload_estimated_bytes_resets_on_drain() {
+        let q = DeferredWriteQueue::with_policy(OverloadPolicy {
+            max_entries: 100,
+            max_age_secs: 300,
+            max_bytes: 64 * 1024 * 1024,
+            fairness_limit_pct: 0,
+        });
+        q.activate();
+        q.enqueue("INSERT INTO large_table VALUES(1, 'data')".into(), vec![], "op");
+        assert!(q.estimated_bytes() > 0);
+
+        q.seal_and_drain();
+        assert_eq!(q.estimated_bytes(), 0, "seal_and_drain should reset estimated bytes");
+    }
+
+    // ── Replay compensation tests (br-97gc6.5.2.1.14) ───────────────
+
+    #[test]
+    fn replay_result_tracks_success_and_failure_counts() {
+        let result = ReplayResult {
+            replayed: 8,
+            failed: 2,
+            total: 10,
+        };
+        assert_eq!(result.replayed, 8);
+        assert_eq!(result.failed, 2);
+        assert_eq!(result.total, 10);
+    }
+
+    #[test]
+    fn replay_compensation_record_captures_failure_context() {
+        let record = ReplayCompensationRecord {
+            seq: 42,
+            sql: "INSERT INTO messages (body) VALUES ('hello')".to_string(),
+            operation: "send_message",
+            error: "UNIQUE constraint failed: messages.id".to_string(),
+            deferred_at_us: 1_700_000_000_000_000,
+            failed_at_us: 1_700_000_005_000_000,
+        };
+        assert_eq!(record.seq, 42);
+        assert_eq!(record.operation, "send_message");
+        assert!(record.error.contains("UNIQUE constraint"));
+        assert!(record.failed_at_us > record.deferred_at_us);
+    }
+
+    #[test]
+    fn replay_compensation_log_accumulates_failures() {
+        let log = ReplayCompensationLog::new();
+        assert!(log.is_empty());
+
+        log.record(ReplayCompensationRecord {
+            seq: 0,
+            sql: "INSERT INTO t VALUES(1)".into(),
+            operation: "op_a",
+            error: "constraint".into(),
+            deferred_at_us: 100,
+            failed_at_us: 200,
+        });
+        log.record(ReplayCompensationRecord {
+            seq: 1,
+            sql: "INSERT INTO t VALUES(2)".into(),
+            operation: "op_b",
+            error: "locked".into(),
+            deferred_at_us: 100,
+            failed_at_us: 300,
+        });
+
+        assert_eq!(log.len(), 2);
+        let entries = log.drain();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].operation, "op_a");
+        assert_eq!(entries[1].operation, "op_b");
+        assert!(log.is_empty(), "drain should empty the log");
     }
 }

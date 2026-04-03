@@ -124,6 +124,7 @@ pub use pool::{
     BacklogPressure, DbPool, DbPoolConfig, MailboxDbInventory, MailboxRecoveryLockState,
     MailboxSidecarState, DeferralOutcome, DeferredWriteQueue, DeferredWriteQueueStatus,
     MutatingSurface, OverloadPolicy, RecoveryAction, RecoveryApproval,
+    ReplayCompensationLog, ReplayCompensationRecord, ReplayResult,
     ResolvedMailboxSqlitePath, WriteRouteDisposition,
     auto_pool_size, create_pool, deferred_write_queue, evaluate_write_route,
     ensure_sqlite_file_healthy, ensure_sqlite_file_healthy_with_archive, get_or_create_pool,
