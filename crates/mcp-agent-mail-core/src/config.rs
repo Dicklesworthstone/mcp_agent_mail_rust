@@ -712,6 +712,10 @@ pub fn is_default_storage_root(path: &Path) -> bool {
     path == default_storage_root_path()
 }
 
+fn default_database_url_for_storage_root(storage_root: &Path) -> String {
+    format!("sqlite:///{}", storage_root.join("storage.sqlite3").display())
+}
+
 // ── Ephemeral auto-reroute ──────────────────────────────────────────────
 
 /// Default base directory for ephemeral storage isolation.
@@ -868,6 +872,7 @@ fn resolve_data_path(legacy_base: &Path, subdir: &str) -> PathBuf {
 impl Default for Config {
     #[allow(clippy::too_many_lines)]
     fn default() -> Self {
+        let storage_root = default_storage_root_path();
         Self {
             // Interface mode: MCP by default (per ADR-001)
             interface_mode: InterfaceMode::Mcp,
@@ -879,8 +884,7 @@ impl Default for Config {
             project_identity_remote: "origin".to_string(),
 
             // Database
-            // Match legacy Python default (SQLAlchemy async URL).
-            database_url: "sqlite+aiosqlite:///./storage.sqlite3".to_string(),
+            database_url: default_database_url_for_storage_root(&storage_root),
             database_echo: false,
             database_pool_size: None,
             database_max_overflow: None,
@@ -894,7 +898,7 @@ impl Default for Config {
             fsqlite_concurrent_retries: 5,
 
             // Storage
-            storage_root: default_storage_root_path(),
+            storage_root,
             git_author_name: "mcp-agent".to_string(),
             git_author_email: "mcp-agent@example.com".to_string(),
             inline_image_max_bytes: 65536,
@@ -1259,9 +1263,17 @@ impl Config {
             config.project_identity_remote = v;
         }
 
+        // Storage location must be stable across arbitrary working directories.
+        // Do not allow a repo-local `.env` to repoint Agent Mail's own archive.
+        if let Some(v) = infra_env_value("STORAGE_ROOT") {
+            config.storage_root = PathBuf::from(shellexpand::tilde(&v).into_owned());
+        }
+
         // Database
-        if let Some(v) = env_value("DATABASE_URL") {
+        if let Some(v) = infra_env_value("DATABASE_URL") {
             config.database_url = v;
+        } else {
+            config.database_url = default_database_url_for_storage_root(&config.storage_root);
         }
         config.database_echo = env_bool("DATABASE_ECHO", config.database_echo);
         config.database_pool_size = env_usize_opt("DATABASE_POOL_SIZE");
@@ -1290,9 +1302,6 @@ impl Config {
         );
 
         // Storage
-        if let Some(v) = env_value("STORAGE_ROOT") {
-            config.storage_root = PathBuf::from(shellexpand::tilde(&v).into_owned());
-        }
         if let Some(v) = env_value("GIT_AUTHOR_NAME") {
             config.git_author_name = v;
         }
@@ -2302,6 +2311,9 @@ pub fn detect_source(key: &str) -> ConfigSource {
     if user_env_value(key).is_some() {
         return ConfigSource::UserEnvFile;
     }
+    if !project_dotenv_allowed(key) {
+        return ConfigSource::Default;
+    }
     if dotenv_value(key).is_some() {
         return ConfigSource::ProjectDotenv;
     }
@@ -2463,6 +2475,21 @@ fn layered_env_value(
     process_value
         .or(user_envfile_value)
         .or(project_dotenv_value)
+}
+
+fn project_dotenv_allowed(key: &str) -> bool {
+    !matches!(key, "DATABASE_URL" | "STORAGE_ROOT")
+}
+
+fn infra_env_value(key: &str) -> Option<String> {
+    #[cfg(test)]
+    if let Some(v) = test_env_override_value(key) {
+        return Some(v);
+    }
+    if let Some(v) = process_env_override_value(key) {
+        return Some(v);
+    }
+    layered_env_value(env::var(key).ok(), user_env_value(key), None)
 }
 
 /// Read a value from the real environment first, then the user-global env file,
@@ -2892,7 +2919,7 @@ mod tests {
         assert!(config.database_pool_timeout.is_none());
         assert_eq!(
             config.database_url,
-            "sqlite+aiosqlite:///./storage.sqlite3".to_string()
+            default_database_url_for_storage_root(&config.storage_root)
         );
         assert!(config.contact_enforcement_enabled);
         assert!(!config.allow_absolute_attachment_paths);
@@ -3845,6 +3872,12 @@ mod tests {
         // PATH is always set in process environment
         let source = detect_source("PATH");
         assert_eq!(source, ConfigSource::ProcessEnv);
+    }
+
+    #[test]
+    fn detect_source_ignores_project_dotenv_for_agent_mail_storage_keys() {
+        assert_eq!(detect_source("DATABASE_URL"), ConfigSource::Default);
+        assert_eq!(detect_source("STORAGE_ROOT"), ConfigSource::Default);
     }
 
     // -----------------------------------------------------------------------

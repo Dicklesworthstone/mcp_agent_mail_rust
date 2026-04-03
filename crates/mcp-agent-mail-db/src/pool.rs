@@ -1575,8 +1575,8 @@ impl DbPoolConfig {
     ///    restore the legacy Python defaults (not recommended for production).
     #[must_use]
     pub fn from_env() -> Self {
-        let database_url =
-            env_value("DATABASE_URL").unwrap_or_else(|| "sqlite:///./storage.sqlite3".to_string());
+        let core_config = mcp_agent_mail_core::Config::from_env();
+        let database_url = core_config.database_url.clone();
 
         let pool_timeout = env_value("DATABASE_POOL_TIMEOUT")
             .and_then(|s| s.parse().ok())
@@ -1614,7 +1614,7 @@ impl DbPoolConfig {
 
         Self {
             database_url,
-            storage_root: Some(mcp_agent_mail_core::Config::from_env().storage_root),
+            storage_root: Some(core_config.storage_root),
             min_connections: min_conn,
             max_connections: max_conn,
             acquire_timeout_ms: pool_timeout,
@@ -9354,6 +9354,26 @@ mod tests {
         assert!(!config.database_url.is_empty() || config.database_url.is_empty()); // just ensure it doesn't panic
         assert!(config.min_connections > 0);
         assert!(config.max_connections >= config.min_connections);
+    }
+
+    #[test]
+    fn pool_config_from_env_defaults_database_into_storage_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage_root = tmp.path().join("mailbox");
+        let storage_root_str = storage_root.to_string_lossy().to_string();
+        let expected_database_url = format!(
+            "sqlite:///{}",
+            storage_root.join("storage.sqlite3").display()
+        );
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", storage_root_str.as_str())],
+            || {
+                let config = DbPoolConfig::from_env();
+                assert_eq!(config.database_url, expected_database_url);
+                assert_eq!(config.storage_root.as_deref(), Some(storage_root.as_path()));
+            },
+        );
     }
 
     // ── RecoveryAction / RecoveryApproval policy tests ─────────────────

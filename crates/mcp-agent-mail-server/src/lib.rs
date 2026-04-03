@@ -2511,9 +2511,12 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     let _ = theme::init_console_theme_from_config(config.console_theme);
     // Pre-intern well-known strings to avoid first-request contention.
     mcp_agent_mail_core::pre_intern_policies();
-    let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
-
+    // Run startup probes before taking the long-lived runtime mailbox locks.
+    // The integrity probe opens a dedicated SQLite connection, and running it
+    // after we already hold the runtime activity locks makes the server trip
+    // over its own lock and abort startup.
     prepare_http_runtime_startup(config)?;
+    let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
     log_active_database(config);
     let _ = startup_checks::write_listener_pid_hint(&config.http_host, config.http_port);
     heal_storage_lock_artifacts(config);
@@ -2581,7 +2584,6 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     // ── 1. Pre-flight: theme, probes, instrumentation ──────────────
     let _ = theme::init_console_theme_from_config(config.console_theme);
     mcp_agent_mail_core::pre_intern_policies();
-    let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
 
     let probe_report = startup_checks::run_startup_probes(config);
     if !probe_report.is_ok() {
@@ -2590,6 +2592,9 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }
+    // See run_http(): keep runtime mailbox locks out of the integrity probe's
+    // way so the service does not reject its own startup sequence.
+    let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
     let _ = startup_checks::write_listener_pid_hint(&config.http_host, config.http_port);
     log_active_database(config);
 
@@ -10585,12 +10590,13 @@ fn readiness_check_semantic_status(
         .into_iter()
         .filter_map(|row| row.get_named::<String>("name").ok())
         .collect::<std::collections::BTreeSet<_>>();
+    // `threads` is a logical concept derived from message thread ids, not a
+    // required physical SQLite table in the Rust implementation.
     let missing_tables = [
         "projects",
         "agents",
         "messages",
         "message_recipients",
-        "threads",
     ]
     .into_iter()
     .filter(|name| !present.contains(*name))
