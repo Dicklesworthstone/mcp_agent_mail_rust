@@ -673,6 +673,82 @@ pub enum DeferralOutcome {
     NotRecovering,
     /// Queue has been sealed — no new writes accepted (drain in progress).
     Sealed,
+    /// Hard-stop: oldest entry exceeded max age — recovery is stalled.
+    HardStopAge {
+        oldest_age_secs: u64,
+        max_age_secs: u64,
+    },
+    /// Hard-stop: total estimated bytes exceeded budget.
+    HardStopBytes {
+        estimated_bytes: usize,
+        max_bytes: usize,
+    },
+    /// Fairness limit: this operation type has consumed its share of the queue.
+    FairnessLimitReached {
+        operation: &'static str,
+        count: usize,
+        limit: usize,
+    },
+}
+
+/// Configurable overload shedding policy for the deferred write queue.
+///
+/// Controls admission thresholds, age-based hard-stop, byte budgets, and
+/// per-operation fairness limits. The defaults are safe for typical
+/// multi-agent workloads; override via environment variables if needed.
+#[derive(Debug, Clone)]
+pub struct OverloadPolicy {
+    /// Maximum number of entries before backpressure (hard capacity).
+    pub max_entries: usize,
+    /// Maximum age (seconds) of the oldest entry before hard-stop.
+    pub max_age_secs: u64,
+    /// Maximum estimated total bytes before hard-stop.
+    pub max_bytes: usize,
+    /// Per-operation fairness limit as percentage of max_entries.
+    /// 0 = disabled (no per-operation limit).
+    pub fairness_limit_pct: u8,
+}
+
+impl Default for OverloadPolicy {
+    fn default() -> Self {
+        Self {
+            max_entries: DEFAULT_DEFERRED_WRITE_CAPACITY,
+            max_age_secs: DEFAULT_DEFERRED_WRITE_MAX_AGE_SECS,
+            max_bytes: DEFAULT_DEFERRED_WRITE_MAX_BYTES,
+            fairness_limit_pct: DEFAULT_DEFERRED_WRITE_FAIRNESS_LIMIT_PCT,
+        }
+    }
+}
+
+impl OverloadPolicy {
+    /// Per-operation entry limit derived from capacity and fairness percentage.
+    fn fairness_limit(&self) -> usize {
+        if self.fairness_limit_pct == 0 || self.fairness_limit_pct > 100 {
+            return self.max_entries;
+        }
+        (self.max_entries as u64 * u64::from(self.fairness_limit_pct) / 100).max(1) as usize
+    }
+}
+
+/// Backlog pressure tier — reflects how close the queue is to overload.
+///
+/// Operators and surfaces should use this to decide whether to surface
+/// warnings or hard-refuse writes. The tiers are:
+///
+/// - `Normal`: queue is healthy, no action needed.
+/// - `Elevated`: above 75% capacity — surface advisory warnings.
+/// - `Critical`: at capacity or oldest entry approaching max age.
+/// - `HardStop`: system refuses all new writes (stalled recovery).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum BacklogPressure {
+    /// Queue is healthy.
+    Normal,
+    /// Above warn threshold — surface advisory to operators.
+    Elevated,
+    /// At capacity or oldest entry nearing max age.
+    Critical,
+    /// Hard-stop: new writes refused. Stalled recovery or budget exhaustion.
+    HardStop,
 }
 
 /// Outcome of replaying deferred writes after recovery completes.
@@ -722,8 +798,14 @@ struct DeferredWriteQueueInner {
     next_seq: u64,
     /// The actual FIFO buffer.
     entries: Vec<DeferredWrite>,
-    /// Hard capacity limit (backpressure threshold).
-    capacity: usize,
+    /// Overload shedding policy.
+    policy: OverloadPolicy,
+    /// Per-operation entry counts for fairness enforcement.
+    per_operation_counts: HashMap<&'static str, usize>,
+    /// Running estimated total bytes of all queued entries.
+    estimated_bytes: usize,
+    /// Counter: total writes shed due to overload (lifetime of this queue instance).
+    shed_count: u64,
 }
 
 /// Default capacity: 1024 deferred writes before backpressure kicks in.
@@ -733,17 +815,51 @@ struct DeferredWriteQueueInner {
 /// preventing unbounded memory growth if recovery stalls.
 pub const DEFAULT_DEFERRED_WRITE_CAPACITY: usize = 1024;
 
+/// Default maximum age (seconds) for the oldest deferred write before the
+/// queue triggers a hard-stop. If the oldest entry is older than this, no
+/// new writes are accepted — the system is stalled and needs operator
+/// attention rather than quiet indefinite queuing.
+pub const DEFAULT_DEFERRED_WRITE_MAX_AGE_SECS: u64 = 300;
+
+/// Default estimated byte budget for the entire deferred queue. This is a
+/// soft limit — individual enqueue calls estimate their contribution and
+/// reject when the running total exceeds this threshold. Prevents memory
+/// exhaustion from large SQL payloads (e.g. multi-MB message bodies).
+pub const DEFAULT_DEFERRED_WRITE_MAX_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+
+/// Default per-operation fairness limit. No single operation type may
+/// consume more than this fraction of the queue capacity. Prevents a
+/// chatty tool (e.g. `send_message` in a broadcast loop) from starving
+/// other operation types.
+pub const DEFAULT_DEFERRED_WRITE_FAIRNESS_LIMIT_PCT: u8 = 60;
+
+/// Pressure threshold: above this percentage of capacity, the queue is in
+/// elevated pressure and surfaces warnings to operators.
+pub const DEFERRED_WRITE_WARN_THRESHOLD_PCT: u8 = 75;
+
 impl DeferredWriteQueue {
     /// Create a new inactive queue with the given capacity.
     #[must_use]
     pub fn new(capacity: usize) -> Self {
+        Self::with_policy(OverloadPolicy {
+            max_entries: capacity,
+            ..Default::default()
+        })
+    }
+
+    /// Create a new inactive queue with a custom overload policy.
+    #[must_use]
+    pub fn with_policy(policy: OverloadPolicy) -> Self {
         Self {
             state: Mutex::new(DeferredWriteQueueInner {
                 active: false,
                 sealed: false,
                 next_seq: 0,
                 entries: Vec::new(),
-                capacity,
+                policy,
+                per_operation_counts: HashMap::new(),
+                estimated_bytes: 0,
+                shed_count: 0,
             }),
         }
     }
@@ -751,7 +867,7 @@ impl DeferredWriteQueue {
     /// Create a new inactive queue with [`DEFAULT_DEFERRED_WRITE_CAPACITY`].
     #[must_use]
     pub fn with_default_capacity() -> Self {
-        Self::new(DEFAULT_DEFERRED_WRITE_CAPACITY)
+        Self::with_policy(OverloadPolicy::default())
     }
 
     /// Activate the queue to begin accepting writes.
@@ -788,7 +904,13 @@ impl DeferredWriteQueue {
     ///
     /// Returns the outcome indicating whether the write was accepted,
     /// rejected due to backpressure, or refused because the queue is
-    /// not in the right state.
+    /// not in the right state. Enforces the full overload policy:
+    ///
+    /// 1. Queue must be active and not sealed.
+    /// 2. Oldest entry must not exceed `max_age_secs` (hard-stop).
+    /// 3. Estimated bytes must not exceed `max_bytes` (hard-stop).
+    /// 4. Per-operation fairness limit must not be exceeded.
+    /// 5. Total entry count must not exceed `max_entries` (backpressure).
     pub fn enqueue(
         &self,
         sql: String,
@@ -803,19 +925,61 @@ impl DeferredWriteQueue {
         if inner.sealed {
             return DeferralOutcome::Sealed;
         }
-        if inner.entries.len() >= inner.capacity {
+
+        let now_us = crate::now_micros();
+
+        // Hard-stop: oldest entry exceeded max age → recovery is stalled.
+        if let Some(oldest) = inner.entries.first() {
+            let age_us = now_us.saturating_sub(oldest.deferred_at_us);
+            let age_secs = (age_us / 1_000_000) as u64;
+            if age_secs > inner.policy.max_age_secs {
+                inner.shed_count = inner.shed_count.saturating_add(1);
+                return DeferralOutcome::HardStopAge {
+                    oldest_age_secs: age_secs,
+                    max_age_secs: inner.policy.max_age_secs,
+                };
+            }
+        }
+
+        // Hard-stop: estimated bytes exceeded budget.
+        let entry_bytes = estimate_deferred_write_bytes(&sql, &params);
+        if inner.estimated_bytes.saturating_add(entry_bytes) > inner.policy.max_bytes {
+            inner.shed_count = inner.shed_count.saturating_add(1);
+            return DeferralOutcome::HardStopBytes {
+                estimated_bytes: inner.estimated_bytes.saturating_add(entry_bytes),
+                max_bytes: inner.policy.max_bytes,
+            };
+        }
+
+        // Fairness: per-operation limit.
+        let fairness_limit = inner.policy.fairness_limit();
+        let op_count = inner.per_operation_counts.get(operation).copied().unwrap_or(0);
+        if op_count >= fairness_limit {
+            inner.shed_count = inner.shed_count.saturating_add(1);
+            return DeferralOutcome::FairnessLimitReached {
+                operation,
+                count: op_count,
+                limit: fairness_limit,
+            };
+        }
+
+        // Backpressure: capacity limit.
+        if inner.entries.len() >= inner.policy.max_entries {
+            inner.shed_count = inner.shed_count.saturating_add(1);
             return DeferralOutcome::BackpressureFull {
-                capacity: inner.capacity,
+                capacity: inner.policy.max_entries,
             };
         }
 
         let seq = inner.next_seq;
         inner.next_seq = seq.wrapping_add(1);
+        inner.estimated_bytes = inner.estimated_bytes.saturating_add(entry_bytes);
+        *inner.per_operation_counts.entry(operation).or_insert(0) += 1;
         inner.entries.push(DeferredWrite {
             seq,
             sql,
             params,
-            deferred_at_us: crate::now_micros(),
+            deferred_at_us: now_us,
             operation,
         });
 
@@ -834,6 +998,8 @@ impl DeferredWriteQueue {
         let mut inner = self.state.lock().expect("DeferredWriteQueue poisoned");
         inner.sealed = true;
         inner.active = false;
+        inner.estimated_bytes = 0;
+        inner.per_operation_counts.clear();
         let mut entries = std::mem::take(&mut inner.entries);
         entries.sort_by_key(|e| e.seq);
         entries
@@ -848,20 +1014,139 @@ impl DeferredWriteQueue {
         inner.sealed = false;
         inner.next_seq = 0;
         inner.entries.clear();
+        inner.per_operation_counts.clear();
+        inner.estimated_bytes = 0;
+        // Note: shed_count is NOT reset — it is a lifetime counter for
+        // observability across recovery cycles.
+    }
+
+    /// Current backlog pressure tier.
+    ///
+    /// Surfaces use this to decide how urgently to report queue state:
+    /// - `Normal`: no action.
+    /// - `Elevated`: log/surface advisory warnings.
+    /// - `Critical`: surface prominent warnings, consider operator alert.
+    /// - `HardStop`: system is refusing writes — operator must intervene.
+    #[must_use]
+    pub fn pressure(&self) -> BacklogPressure {
+        let inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        if !inner.active && !inner.sealed {
+            return BacklogPressure::Normal;
+        }
+        if inner.sealed {
+            return BacklogPressure::HardStop;
+        }
+        compute_backlog_pressure(&inner)
+    }
+
+    /// Age of the oldest deferred entry in seconds, or 0 if the queue is empty.
+    #[must_use]
+    pub fn oldest_age_secs(&self) -> u64 {
+        let inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        oldest_entry_age_secs(&inner)
+    }
+
+    /// Running estimated bytes of all queued entries.
+    #[must_use]
+    pub fn estimated_bytes(&self) -> usize {
+        let inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        inner.estimated_bytes
+    }
+
+    /// Lifetime count of writes shed (rejected) due to overload.
+    #[must_use]
+    pub fn shed_count(&self) -> u64 {
+        let inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        inner.shed_count
     }
 
     /// Snapshot for diagnostics.
     #[must_use]
     pub fn status(&self) -> DeferredWriteQueueStatus {
         let inner = self.state.lock().expect("DeferredWriteQueue poisoned");
+        let pressure = if !inner.active && !inner.sealed {
+            BacklogPressure::Normal
+        } else if inner.sealed {
+            BacklogPressure::HardStop
+        } else {
+            compute_backlog_pressure(&inner)
+        };
         DeferredWriteQueueStatus {
             active: inner.active,
             sealed: inner.sealed,
             queued: inner.entries.len(),
-            capacity: inner.capacity,
+            capacity: inner.policy.max_entries,
             next_seq: inner.next_seq,
+            estimated_bytes: inner.estimated_bytes,
+            oldest_age_secs: oldest_entry_age_secs(&inner),
+            pressure,
+            shed_count: inner.shed_count,
         }
     }
+}
+
+/// Estimate the byte footprint of a single deferred write entry.
+fn estimate_deferred_write_bytes(sql: &str, params: &[Value]) -> usize {
+    let mut bytes = sql.len();
+    for param in params {
+        bytes += match param {
+            Value::Null => 0,
+            Value::Bool(_) => 1,
+            Value::Int(_) | Value::BigInt(_) => 8,
+            Value::Float(_) | Value::Double(_) => 8,
+            Value::Text(s) => s.len(),
+            Value::Bytes(b) => b.len(),
+            _ => 16, // conservative estimate for other types
+        };
+    }
+    // Overhead for the DeferredWrite struct, operation string, Vec allocator
+    bytes + 128
+}
+
+/// Compute the oldest entry age in seconds from queue internals.
+fn oldest_entry_age_secs(inner: &DeferredWriteQueueInner) -> u64 {
+    match inner.entries.first() {
+        Some(oldest) => {
+            let now_us = crate::now_micros();
+            let age_us = now_us.saturating_sub(oldest.deferred_at_us);
+            (age_us / 1_000_000) as u64
+        }
+        None => 0,
+    }
+}
+
+/// Compute the current backlog pressure from queue internals.
+fn compute_backlog_pressure(inner: &DeferredWriteQueueInner) -> BacklogPressure {
+    // Hard-stop: oldest entry exceeded max age.
+    let age_secs = oldest_entry_age_secs(inner);
+    if age_secs > inner.policy.max_age_secs {
+        return BacklogPressure::HardStop;
+    }
+
+    // Hard-stop: byte budget exceeded.
+    if inner.estimated_bytes > inner.policy.max_bytes {
+        return BacklogPressure::HardStop;
+    }
+
+    // Critical: at or above capacity.
+    if inner.entries.len() >= inner.policy.max_entries {
+        return BacklogPressure::Critical;
+    }
+
+    // Critical: age above 90% of max.
+    if inner.policy.max_age_secs > 0 && age_secs > inner.policy.max_age_secs * 9 / 10 {
+        return BacklogPressure::Critical;
+    }
+
+    // Elevated: above warn threshold.
+    let warn_threshold =
+        (inner.policy.max_entries as u64 * u64::from(DEFERRED_WRITE_WARN_THRESHOLD_PCT) / 100)
+            as usize;
+    if inner.entries.len() >= warn_threshold {
+        return BacklogPressure::Elevated;
+    }
+
+    BacklogPressure::Normal
 }
 
 /// Diagnostic snapshot of the deferred write queue.
@@ -872,6 +1157,14 @@ pub struct DeferredWriteQueueStatus {
     pub queued: usize,
     pub capacity: usize,
     pub next_seq: u64,
+    /// Running estimated bytes of all queued entries.
+    pub estimated_bytes: usize,
+    /// Age (seconds) of the oldest entry, or 0 if empty.
+    pub oldest_age_secs: u64,
+    /// Current backlog pressure tier.
+    pub pressure: BacklogPressure,
+    /// Lifetime count of writes shed (rejected) due to overload.
+    pub shed_count: u64,
 }
 
 /// Global singleton deferred write queue.
@@ -883,6 +1176,207 @@ static DEFERRED_WRITE_QUEUE: OnceLock<DeferredWriteQueue> = OnceLock::new();
 #[must_use]
 pub fn deferred_write_queue() -> &'static DeferredWriteQueue {
     DEFERRED_WRITE_QUEUE.get_or_init(DeferredWriteQueue::with_default_capacity)
+}
+
+// ============================================================================
+// Owner-broker routing: every mutating surface routes through the mailbox owner
+// ============================================================================
+
+/// The surface (entry-point) that initiated a mutating operation.
+///
+/// Every write path must declare which surface it originated from so the
+/// owner-broker routing logic can enforce the single-owner invariant and
+/// produce audit-quality logs when writes are refused or deferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutatingSurface {
+    /// MCP server tool call (stdio or HTTP transport).
+    McpServer,
+    /// CLI command (`am send`, `am ack`, etc.).
+    Cli,
+    /// Robot sub-command (`am robot ack`, `am robot release`, etc.).
+    Robot,
+    /// Background supervisor (recovery, rebuild, checkpoint).
+    Supervisor,
+    /// Internal migration or schema upgrade path.
+    Migration,
+    /// Test harness (E2E, integration, chaos).
+    Test,
+}
+
+impl MutatingSurface {
+    /// Short label for structured logs and metrics.
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::McpServer => "mcp_server",
+            Self::Cli => "cli",
+            Self::Robot => "robot",
+            Self::Supervisor => "supervisor",
+            Self::Migration => "migration",
+            Self::Test => "test",
+        }
+    }
+
+    /// Whether this surface has authority to bypass ownership checks.
+    ///
+    /// Supervisor and Migration are the recovery and upgrade authorities
+    /// respectively — they must be able to write even when the mailbox is
+    /// in a degraded or contested state.
+    #[must_use]
+    pub const fn is_authority(&self) -> bool {
+        matches!(self, Self::Supervisor | Self::Migration)
+    }
+}
+
+impl std::fmt::Display for MutatingSurface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Disposition of a write request after owner-broker routing evaluation.
+///
+/// When a mutating surface attempts a write, the broker evaluates the current
+/// mailbox ownership and durability state and returns one of these outcomes.
+/// Callers must respect the disposition — `Permitted` means proceed,
+/// `Deferred` means the caller should enqueue the SQL into the deferred-write
+/// queue, and `Refused` means the write must not proceed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "disposition")]
+pub enum WriteRouteDisposition {
+    /// Write may proceed — caller is (or is delegating through) the current
+    /// mailbox owner and the durability state allows writes.
+    Permitted,
+
+    /// Write should be deferred into the deferred-write queue. The caller
+    /// should accept the write (returning success to the user) and enqueue
+    /// the actual SQL for replay after recovery completes.
+    Deferred,
+
+    /// Write is refused because the mailbox is in a state that does not allow
+    /// mutation. The `reason` is a human-readable explanation suitable for
+    /// operator-facing error messages.
+    Refused { reason: String },
+}
+
+impl WriteRouteDisposition {
+    /// Whether this disposition allows the caller to proceed with the write.
+    #[must_use]
+    pub const fn is_permitted(&self) -> bool {
+        matches!(self, Self::Permitted)
+    }
+
+    /// Whether the write should be deferred (accepted but not yet applied).
+    #[must_use]
+    pub const fn is_deferred(&self) -> bool {
+        matches!(self, Self::Deferred)
+    }
+
+    /// Whether the write was refused outright.
+    #[must_use]
+    pub const fn is_refused(&self) -> bool {
+        matches!(self, Self::Refused { .. })
+    }
+}
+
+/// Evaluate whether a mutating surface is allowed to proceed with a write.
+///
+/// This is the single chokepoint through which every write request should pass
+/// before touching the database. It inspects:
+///
+/// 1. **Durability state** — does the current state allow writes?
+/// 2. **Ownership** — is this process the current mailbox owner?
+/// 3. **Recovery lock** — is a recovery operation in flight?
+///
+/// Authority surfaces ([`MutatingSurface::Supervisor`] and
+/// [`MutatingSurface::Migration`]) bypass ownership and deferral checks
+/// because they *are* the recovery/upgrade authority.
+pub fn evaluate_write_route(
+    surface: MutatingSurface,
+    ownership: &MailboxOwnershipState,
+    durability: crate::mailbox_verdict::DurabilityState,
+    recovery_lock: &MailboxRecoveryLockState,
+) -> WriteRouteDisposition {
+    let is_authority = surface.is_authority();
+
+    // 1. Durability gate: if writes are not allowed, non-authority surfaces
+    //    are either deferred (if the queue is active) or refused.
+    if !durability.allows_writes() {
+        if is_authority {
+            return WriteRouteDisposition::Permitted;
+        }
+
+        let q_status = deferred_write_queue().status();
+        if q_status.active && !q_status.sealed && q_status.queued < q_status.capacity {
+            return WriteRouteDisposition::Deferred;
+        }
+
+        return WriteRouteDisposition::Refused {
+            reason: format!(
+                "Mailbox is {durability} and writes are not permitted. \
+                 Run `am doctor repair` to attempt recovery."
+            ),
+        };
+    }
+
+    // 2. Ownership gate: refuse if another active process owns the mailbox.
+    if ownership.blocks_mutation() && !is_authority {
+        let owner_detail = match ownership.disposition {
+            MailboxOwnershipDisposition::ActiveOtherOwner => {
+                let pids: Vec<String> =
+                    ownership.processes.iter().map(|p| p.pid.to_string()).collect();
+                format!(
+                    "Another active process owns this mailbox (pid {}). \
+                     Route writes through that process or stop it first.",
+                    pids.join(", ")
+                )
+            }
+            MailboxOwnershipDisposition::SplitBrain => {
+                format!(
+                    "Split-brain detected: {} competing processes hold locks. \
+                     Stop all competing processes and run `am doctor repair`.",
+                    ownership.competing_pids.len()
+                )
+            }
+            MailboxOwnershipDisposition::StaleLiveProcess => {
+                "A stale process appears to hold the mailbox lock. \
+                 Run `am doctor repair` to clean up stale locks."
+                    .to_string()
+            }
+            MailboxOwnershipDisposition::DeletedExecutable => {
+                "A process with a deleted executable holds the mailbox lock. \
+                 Kill the orphan process or run `am doctor repair`."
+                    .to_string()
+            }
+            MailboxOwnershipDisposition::Unowned => {
+                // blocks_mutation() is false for Unowned — unreachable.
+                return WriteRouteDisposition::Permitted;
+            }
+        };
+        return WriteRouteDisposition::Refused {
+            reason: owner_detail,
+        };
+    }
+
+    // 3. Recovery lock gate: if recovery is in flight, defer non-authority writes.
+    if recovery_lock.active && !is_authority {
+        let q_status = deferred_write_queue().status();
+        if q_status.active && !q_status.sealed && q_status.queued < q_status.capacity {
+            return WriteRouteDisposition::Deferred;
+        }
+
+        let holder = recovery_lock
+            .pid
+            .map_or("unknown".to_string(), |pid| format!("pid {pid}"));
+        return WriteRouteDisposition::Refused {
+            reason: format!(
+                "Recovery lock held by {holder}; writes are blocked until recovery completes."
+            ),
+        };
+    }
+
+    WriteRouteDisposition::Permitted
 }
 
 // ============================================================================

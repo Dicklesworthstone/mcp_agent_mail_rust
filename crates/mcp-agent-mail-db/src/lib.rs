@@ -121,10 +121,11 @@ pub use migrate::{
 };
 pub use models::*;
 pub use pool::{
-    DbPool, DbPoolConfig, MailboxDbInventory, MailboxRecoveryLockState, MailboxSidecarState,
-    DeferralOutcome, DeferredWriteQueue, DeferredWriteQueueStatus, RecoveryAction,
-    RecoveryApproval, ResolvedMailboxSqlitePath, auto_pool_size, create_pool,
-    deferred_write_queue,
+    BacklogPressure, DbPool, DbPoolConfig, MailboxDbInventory, MailboxRecoveryLockState,
+    MailboxSidecarState, DeferralOutcome, DeferredWriteQueue, DeferredWriteQueueStatus,
+    MutatingSurface, OverloadPolicy, RecoveryAction, RecoveryApproval,
+    ResolvedMailboxSqlitePath, WriteRouteDisposition,
+    auto_pool_size, create_pool, deferred_write_queue, evaluate_write_route,
     ensure_sqlite_file_healthy, ensure_sqlite_file_healthy_with_archive, get_or_create_pool,
     inspect_mailbox_db_inventory, inspect_mailbox_recovery_lock, inspect_mailbox_sidecar_state,
     is_corruption_error_message, is_sqlite_recovery_error_message,
