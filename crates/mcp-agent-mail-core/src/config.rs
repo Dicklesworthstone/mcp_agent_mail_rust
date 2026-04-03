@@ -4322,4 +4322,173 @@ mod tests {
         );
         assert!(result.is_some(), "/dev/shm path should trigger reroute");
     }
+
+    // ── Ephemeral contamination prevention tests (br-97gc6.5.2.2.5) ──
+
+    #[test]
+    fn ephemeral_projects_get_distinct_isolated_roots() {
+        let mut config = Config::default();
+        config.storage_root = default_storage_root_path();
+        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Auto;
+
+        let root_a = compute_ephemeral_storage_root_with_env(
+            Path::new("/tmp/ci-run-1234"),
+            &config,
+            &no_env,
+        )
+        .expect("ci project should reroute");
+        let root_b = compute_ephemeral_storage_root_with_env(
+            Path::new("/tmp/ci-run-5678"),
+            &config,
+            &no_env,
+        )
+        .expect("ci project should reroute");
+        assert_ne!(
+            root_a, root_b,
+            "distinct ephemeral projects must get distinct storage roots"
+        );
+    }
+
+    #[test]
+    fn ephemeral_reroute_never_returns_default_storage_root() {
+        let mut config = Config::default();
+        config.storage_root = default_storage_root_path();
+        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Auto;
+        let default_root = default_storage_root_path();
+
+        for path in &["/tmp/test", "/dev/shm/smoke", "/tmp/.cache/agent"] {
+            let result = compute_ephemeral_storage_root_with_env(
+                Path::new(path),
+                &config,
+                &no_env,
+            );
+            if let Some(isolated) = &result {
+                assert_ne!(
+                    isolated, &default_root,
+                    "ephemeral root for {path} must NOT be the default archive"
+                );
+                assert!(
+                    !isolated.starts_with(&default_root),
+                    "ephemeral root for {path} must NOT be inside the default archive"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn production_paths_never_rerouted_in_auto_mode() {
+        let mut config = Config::default();
+        config.storage_root = default_storage_root_path();
+        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Auto;
+
+        let production_paths = [
+            "/data/projects/my-app",
+            "/home/ubuntu/work/project",
+            "/opt/services/mail",
+            "/var/lib/agent-mail",
+        ];
+        for path in &production_paths {
+            let result = compute_ephemeral_storage_root_with_env(
+                Path::new(path),
+                &config,
+                &no_env,
+            );
+            assert!(
+                result.is_none(),
+                "production path {path} must NOT trigger ephemeral reroute"
+            );
+        }
+    }
+
+    #[test]
+    fn force_mode_reroutes_even_production_paths() {
+        let mut config = Config::default();
+        config.storage_root = default_storage_root_path();
+        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Force;
+
+        let result = compute_ephemeral_storage_root_with_env(
+            Path::new("/data/projects/real-production"),
+            &config,
+            &no_env,
+        );
+        assert!(
+            result.is_some(),
+            "force mode should reroute even production paths"
+        );
+        let isolated = result.unwrap();
+        assert!(
+            isolated.to_string_lossy().contains(".am-ephemeral"),
+            "force mode should use ephemeral base, got: {isolated:?}"
+        );
+    }
+
+    #[test]
+    fn deny_mode_prevents_reroute_for_all_paths() {
+        let mut config = Config::default();
+        config.storage_root = default_storage_root_path();
+        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Deny;
+
+        let ephemeral_paths = [
+            "/tmp/test-project",
+            "/dev/shm/ci",
+            "/tmp/.cache/agent-work",
+        ];
+        for path in &ephemeral_paths {
+            let result = compute_ephemeral_storage_root_with_env(
+                Path::new(path),
+                &config,
+                &no_env,
+            );
+            assert!(
+                result.is_none(),
+                "deny mode must prevent reroute for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_config_blocks_ephemeral_in_default_storage() {
+        let config = Config::default();
+        assert!(
+            !config.allow_ephemeral_projects_in_default_storage,
+            "default config must block ephemeral projects in default storage"
+        );
+    }
+
+    #[test]
+    fn allow_ephemeral_in_default_storage_switches_to_deny_mode() {
+        let mut config = Config::default();
+        config.allow_ephemeral_projects_in_default_storage = true;
+        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Auto;
+        // The env-reading path does this conversion, so simulate it:
+        if config.allow_ephemeral_projects_in_default_storage
+            && config.ephemeral_mode == crate::ephemeral::EphemeralMode::Auto
+        {
+            config.ephemeral_mode = crate::ephemeral::EphemeralMode::Deny;
+        }
+        let result = compute_ephemeral_storage_root_with_env(
+            Path::new("/tmp/test-project"),
+            &config,
+            &no_env,
+        );
+        assert!(
+            result.is_none(),
+            "allow_ephemeral_projects_in_default_storage=true should prevent reroute"
+        );
+    }
+
+    #[test]
+    fn ephemeral_isolated_root_is_deterministic_across_calls() {
+        let mut config = Config::default();
+        config.storage_root = default_storage_root_path();
+        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Auto;
+
+        let path = Path::new("/tmp/deterministic-test");
+        let root_a = compute_ephemeral_storage_root_with_env(path, &config, &no_env);
+        let root_b = compute_ephemeral_storage_root_with_env(path, &config, &no_env);
+        assert_eq!(
+            root_a, root_b,
+            "same ephemeral path must always produce the same isolated root"
+        );
+    }
 }

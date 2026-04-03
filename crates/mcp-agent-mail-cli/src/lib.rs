@@ -23,7 +23,7 @@ pub mod legacy;
 pub mod output;
 pub mod robot;
 
-use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -1540,6 +1540,12 @@ pub enum DoctorCommand {
         json: bool,
     },
     /// Normalize safe archive hygiene issues non-destructively.
+    ///
+    /// Apply mode controls how anomalous files are handled:
+    ///   quarantine — move to a timestamped quarantine directory (default)
+    ///   annotate   — leave in place, write a .normalization.json sidecar
+    ///
+    /// No archive files are ever deleted.
     #[command(name = "archive-normalize")]
     ArchiveNormalize {
         /// Preview changes without writing or moving archive files.
@@ -1551,6 +1557,9 @@ pub enum DoctorCommand {
         /// Output JSON (shorthand for machine-readable output).
         #[arg(long)]
         json: bool,
+        /// How to handle anomalous files: quarantine (move) or annotate (sidecar).
+        #[arg(long, value_enum, default_value_t = NormalizeApplyMode::Quarantine)]
+        apply_mode: NormalizeApplyMode,
     },
     /// Attempt automatic remediation for detected issues.
     ///
@@ -4163,9 +4172,12 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             handle_doctor_reconstruct(dry_run, yes, json)
         }
         DoctorCommand::ArchiveScan { format, json } => handle_doctor_archive_scan(format, json),
-        DoctorCommand::ArchiveNormalize { dry_run, yes, json } => {
-            handle_doctor_archive_normalize(dry_run, yes, json)
-        }
+        DoctorCommand::ArchiveNormalize {
+            dry_run,
+            yes,
+            json,
+            apply_mode,
+        } => handle_doctor_archive_normalize(dry_run, yes, json, apply_mode),
         DoctorCommand::Fix { dry_run, yes, json } => handle_doctor_fix(dry_run, yes, json),
     }
 }
@@ -13151,6 +13163,37 @@ fn doctor_archive_scan_summary(report: &DoctorArchiveAuditReport) -> ArchiveScan
     )
 }
 
+/// How archive normalization apply mode handles anomalous files.
+///
+/// Both modes are non-destructive — no archive file is ever deleted.
+///
+/// - **Quarantine** moves the file to a timestamped quarantine directory under
+///   `<storage_root>/doctor/archive-quarantine/`.  The original location is
+///   recorded in the action log and the normalization report so the file can be
+///   restored later.
+/// - **Annotate** leaves the file in place and writes a JSON sidecar file
+///   (`<original_path>.normalization.json`) next to it.  The sidecar records
+///   what was found, the recommended action, and a timestamp so operators (or a
+///   future undo pass) can act on the annotation without the file ever having
+///   moved.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+pub enum NormalizeApplyMode {
+    /// Move anomalous files to a quarantine directory (default).
+    #[default]
+    Quarantine,
+    /// Leave files in place and write a `.normalization.json` sidecar.
+    Annotate,
+}
+
+impl std::fmt::Display for NormalizeApplyMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Quarantine => write!(f, "quarantine"),
+            Self::Annotate => write!(f, "annotate"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 struct DoctorArchiveNormalizeAction {
     kind: String,
@@ -13161,9 +13204,11 @@ struct DoctorArchiveNormalizeAction {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 struct DoctorArchiveNormalizeResult {
     dry_run: bool,
+    apply_mode: String,
     storage_root: String,
     metadata_files_written: usize,
     duplicate_files_quarantined: usize,
+    duplicate_files_annotated: usize,
     unresolved_project_metadata_files: usize,
     unresolved_malformed_message_files: usize,
     unresolved_suspicious_projects: usize,
@@ -41363,6 +41408,43 @@ fn doctor_archive_quarantine_destination(
         .join(relative))
 }
 
+/// Compute the sidecar annotation path for a given archive file.
+///
+/// The sidecar is placed next to the original file with a `.normalization.json`
+/// suffix, e.g. `foo.md` -> `foo.md.normalization.json`.
+fn normalization_annotation_sidecar_path(original: &Path) -> PathBuf {
+    let mut sidecar = original.as_os_str().to_os_string();
+    sidecar.push(".normalization.json");
+    PathBuf::from(sidecar)
+}
+
+/// Write a normalization annotation sidecar next to `original`.
+///
+/// The sidecar is a JSON file recording the anomaly kind, the recommended
+/// action, which file would be kept, and a timestamp.  The original file is
+/// never moved or deleted.
+fn write_normalization_annotation_sidecar(
+    original: &Path,
+    kind: &str,
+    detail: &str,
+    timestamp: &str,
+) -> CliResult<()> {
+    let sidecar = normalization_annotation_sidecar_path(original);
+    let payload = serde_json::json!({
+        "normalization_annotation": true,
+        "kind": kind,
+        "detail": detail,
+        "annotated_file": original.display().to_string(),
+        "annotated_at": timestamp,
+        "action": "annotate_only",
+        "note": "This file was flagged by archive normalization but left in place. Review and resolve manually or re-run with --apply-mode quarantine to move it."
+    });
+    let contents = serde_json::to_vec_pretty(&payload)
+        .map_err(|err| CliError::Other(format!("failed to serialize annotation sidecar: {err}")))?;
+    std::fs::write(&sidecar, contents)?;
+    Ok(())
+}
+
 fn doctor_archive_report_path(storage_root: &Path, label: &str, timestamp: &str) -> PathBuf {
     storage_root
         .join("doctor")
@@ -41554,7 +41636,12 @@ fn handle_doctor_archive_scan(
     Ok(())
 }
 
-fn handle_doctor_archive_normalize(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
+fn handle_doctor_archive_normalize(
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+    apply_mode: NormalizeApplyMode,
+) -> CliResult<()> {
     let config = Config::from_env();
     let storage_root = config.storage_root;
     let _mailbox_storage_root_lock =
@@ -41562,6 +41649,7 @@ fn handle_doctor_archive_normalize(dry_run: bool, yes: bool, json: bool) -> CliR
     let report = audit_doctor_archive(&storage_root);
     let mut result = DoctorArchiveNormalizeResult {
         dry_run,
+        apply_mode: apply_mode.to_string(),
         storage_root: storage_root.display().to_string(),
         unresolved_project_metadata_files: report.missing_project_metadata.len()
             + report
@@ -41611,11 +41699,15 @@ fn handle_doctor_archive_normalize(dry_run: bool, yes: bool, json: bool) -> CliR
         return Ok(());
     }
 
-    if !confirm_mutating_doctor_action(
-        "Proceed with archive normalization? This can rewrite safely-normalizable project.json files and quarantine duplicate canonical message files without deleting them.",
-        dry_run,
-        yes,
-    )? {
+    let confirm_msg = match apply_mode {
+        NormalizeApplyMode::Quarantine => {
+            "Proceed with archive normalization (quarantine mode)? This can rewrite safely-normalizable project.json files and move duplicate canonical message files to a quarantine directory without deleting them."
+        }
+        NormalizeApplyMode::Annotate => {
+            "Proceed with archive normalization (annotate mode)? This can rewrite safely-normalizable project.json files and annotate duplicate canonical message files with sidecar metadata without moving or deleting them."
+        }
+    };
+    if !confirm_mutating_doctor_action(confirm_msg, dry_run, yes)? {
         ftui_runtime::ftui_println!("Archive normalization cancelled.");
         return Ok(());
     }
@@ -41653,28 +41745,55 @@ fn handle_doctor_archive_normalize(dry_run: bool, yes: bool, json: bool) -> CliR
     for group in &report.duplicate_canonical_groups {
         for duplicate in &group.duplicates {
             let duplicate_path = PathBuf::from(duplicate);
-            let quarantine_path = doctor_archive_quarantine_destination(
-                &storage_root,
-                &duplicate_path,
-                &timestamp,
-                "duplicate-canonical",
-            )?;
-            result.actions.push(DoctorArchiveNormalizeAction {
-                kind: "quarantine_duplicate_canonical_message".to_string(),
-                path: duplicate_path.display().to_string(),
-                detail: format!(
-                    "keep {}; quarantine to {}",
-                    group.keep,
-                    quarantine_path.display()
-                ),
-            });
-            if !dry_run {
-                if let Some(parent) = quarantine_path.parent() {
-                    std::fs::create_dir_all(parent)?;
+            match apply_mode {
+                NormalizeApplyMode::Quarantine => {
+                    let quarantine_path = doctor_archive_quarantine_destination(
+                        &storage_root,
+                        &duplicate_path,
+                        &timestamp,
+                        "duplicate-canonical",
+                    )?;
+                    result.actions.push(DoctorArchiveNormalizeAction {
+                        kind: "quarantine_duplicate_canonical_message".to_string(),
+                        path: duplicate_path.display().to_string(),
+                        detail: format!(
+                            "keep {}; quarantine to {}",
+                            group.keep,
+                            quarantine_path.display()
+                        ),
+                    });
+                    if !dry_run {
+                        if let Some(parent) = quarantine_path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::rename(&duplicate_path, &quarantine_path)?;
+                    }
+                    result.duplicate_files_quarantined += 1;
                 }
-                std::fs::rename(&duplicate_path, &quarantine_path)?;
+                NormalizeApplyMode::Annotate => {
+                    let sidecar_path =
+                        normalization_annotation_sidecar_path(&duplicate_path);
+                    let annotation_detail = format!(
+                        "keep {}; annotate duplicate at {}",
+                        group.keep,
+                        sidecar_path.display()
+                    );
+                    result.actions.push(DoctorArchiveNormalizeAction {
+                        kind: "annotate_duplicate_canonical_message".to_string(),
+                        path: duplicate_path.display().to_string(),
+                        detail: annotation_detail.clone(),
+                    });
+                    if !dry_run {
+                        write_normalization_annotation_sidecar(
+                            &duplicate_path,
+                            "duplicate_canonical_message",
+                            &format!("canonical winner: {}", group.keep),
+                            &timestamp,
+                        )?;
+                    }
+                    result.duplicate_files_annotated += 1;
+                }
             }
-            result.duplicate_files_quarantined += 1;
         }
     }
 
@@ -41700,12 +41819,24 @@ fn handle_doctor_archive_normalize(dry_run: bool, yes: bool, json: bool) -> CliR
             })
         );
     } else {
-        ftui_runtime::ftui_println!(
-            "{} archive normalization planned/applied: metadata written={}, duplicate files quarantined={}",
-            if dry_run { "Dry-run" } else { "Archive" },
-            result.metadata_files_written,
-            result.duplicate_files_quarantined
-        );
+        match apply_mode {
+            NormalizeApplyMode::Quarantine => {
+                ftui_runtime::ftui_println!(
+                    "{} archive normalization planned/applied (mode=quarantine): metadata written={}, duplicate files quarantined={}",
+                    if dry_run { "Dry-run" } else { "Archive" },
+                    result.metadata_files_written,
+                    result.duplicate_files_quarantined
+                );
+            }
+            NormalizeApplyMode::Annotate => {
+                ftui_runtime::ftui_println!(
+                    "{} archive normalization planned/applied (mode=annotate): metadata written={}, duplicate files annotated={}",
+                    if dry_run { "Dry-run" } else { "Archive" },
+                    result.metadata_files_written,
+                    result.duplicate_files_annotated
+                );
+            }
+        }
         if result.unresolved_project_metadata_files > 0
             || result.unresolved_malformed_message_files > 0
             || result.unresolved_suspicious_projects > 0

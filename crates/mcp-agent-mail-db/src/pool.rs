@@ -1653,6 +1653,70 @@ impl DbPoolConfig {
             .clone()
             .unwrap_or_else(|| mcp_agent_mail_core::Config::from_env().storage_root)
     }
+
+    /// Apply ephemeral-root rerouting if the given project root is classified
+    /// as ephemeral (tmp, dev/shm, test harness, CI runner, etc.).
+    ///
+    /// When the project root is ephemeral and the current `storage_root` is
+    /// the default global mailbox, this method replaces it with an isolated
+    /// hash-derived directory under the configured ephemeral base. This
+    /// prevents transient test/CI/NTM runs from contaminating the operator's
+    /// production mail archive.
+    ///
+    /// If the storage root is already non-default (operator explicitly set
+    /// `STORAGE_ROOT`) or the project root is classified as production, the
+    /// config is returned unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let config = DbPoolConfig::from_env()
+    ///     .with_ephemeral_reroute(Path::new("/tmp/test-project"));
+    /// // config.storage_root now points to /tmp/.am-ephemeral/<hash>/
+    /// ```
+    #[must_use]
+    pub fn with_ephemeral_reroute(mut self, project_root: &Path) -> Self {
+        let core_config = mcp_agent_mail_core::Config::from_env();
+        if let Some(isolated) =
+            mcp_agent_mail_core::compute_ephemeral_storage_root(project_root, &core_config)
+        {
+            tracing::info!(
+                project_root = %project_root.display(),
+                isolated_root = %isolated.display(),
+                "DbPoolConfig: auto-rerouting ephemeral project to isolated storage root",
+            );
+            self.storage_root = Some(isolated);
+        }
+        self
+    }
+
+    /// Create config from environment with ephemeral-root rerouting applied.
+    ///
+    /// This is a convenience constructor combining [`from_env()`](Self::from_env)
+    /// with [`with_ephemeral_reroute()`](Self::with_ephemeral_reroute).
+    /// Background workers and server startup code should prefer this over bare
+    /// `from_env()` when they know the project root directory.
+    ///
+    /// # Arguments
+    ///
+    /// * `project_root` - Absolute path to the project's working directory.
+    ///   Ephemeral classification is performed against this path.
+    #[must_use]
+    pub fn from_env_for_project(project_root: &Path) -> Self {
+        Self::from_env().with_ephemeral_reroute(project_root)
+    }
+
+    /// Check whether the resolved storage root would be rerouted for a given
+    /// project root. Returns the isolated path if rerouting would occur, or
+    /// `None` if the project is classified as production or the storage root
+    /// is already non-default.
+    ///
+    /// This is a read-only query; it does not modify the config.
+    #[must_use]
+    pub fn would_reroute_for_project(&self, project_root: &Path) -> Option<PathBuf> {
+        let core_config = mcp_agent_mail_core::Config::from_env();
+        mcp_agent_mail_core::compute_ephemeral_storage_root(project_root, &core_config)
+    }
 }
 
 #[derive(Debug)]

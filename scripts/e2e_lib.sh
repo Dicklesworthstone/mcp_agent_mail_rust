@@ -3110,6 +3110,205 @@ e2e_save_db_snapshot() {
 }
 
 # ---------------------------------------------------------------------------
+# Standardized Transcript & State Capture (br-aazao.8.4)
+# ---------------------------------------------------------------------------
+#
+# These functions provide a uniform forensic surface contract across all E2E
+# suites. A failed run should expose the same core artifacts regardless of
+# which suite triggered the failure:
+#
+#   1. Server stderr / logs
+#   2. curl request/response transcripts
+#   3. Final DB state snapshot
+#   4. Storage tree listing
+#
+# Rich suites (those that source e2e_lib.sh directly) get these automatically
+# via e2e_summary. Thin wrappers can use test_helpers.sh for equivalent
+# coverage.
+
+# e2e_forensic_curl: Curl wrapper that captures verbose transcript to artifacts.
+#
+# This wraps an arbitrary curl invocation, capturing --trace-ascii output
+# alongside stdout/stderr. Use this for ad-hoc curl calls that don't go
+# through e2e_rpc_call (which already captures transcripts).
+#
+# Args:
+#   $1: transcript_label - Label for the transcript file (e.g. "health_check")
+#   $2+: Remaining arguments are passed directly to curl
+#
+# Artifacts saved:
+#   ${E2E_ARTIFACT_DIR}/transcript/${label}_curl_trace.txt
+#   ${E2E_ARTIFACT_DIR}/transcript/${label}_curl_stderr.txt
+#
+# Example:
+#   e2e_forensic_curl "health_probe" -sS http://127.0.0.1:8765/health
+#   e2e_forensic_curl "raw_post" -X POST -d '{"foo":1}' http://127.0.0.1:8765/mcp/
+
+e2e_forensic_curl() {
+    local label="$1"
+    shift
+
+    local trace_dir="${E2E_ARTIFACT_DIR}/transcript"
+    mkdir -p "$trace_dir"
+
+    local trace_file="${trace_dir}/${label}_curl_trace.txt"
+    local stderr_file="${trace_dir}/${label}_curl_stderr.txt"
+
+    set +e
+    curl --trace-ascii "$trace_file" "$@" 2>"$stderr_file"
+    local rc=$?
+    set -e
+
+    _e2e_record_case_artifact_paths "${_E2E_MARKER_ACTIVE_CASE:-}" \
+        "$trace_file" "$stderr_file"
+
+    return $rc
+}
+
+# e2e_snapshot_all_tables: Snapshot all user tables from a SQLite DB to artifacts.
+#
+# Iterates over every non-internal table and saves each as a separate artifact
+# file under diagnostics/db_snapshot_<table>.txt.
+#
+# Args:
+#   $1: db_path - Path to SQLite database file
+#   $2: prefix (optional) - Artifact filename prefix (default: "final")
+#
+# Example:
+#   e2e_snapshot_all_tables "/tmp/db.sqlite3"
+#   e2e_snapshot_all_tables "/tmp/db.sqlite3" "pre_crash"
+
+e2e_snapshot_all_tables() {
+    local db_path="$1"
+    local prefix="${2:-final}"
+
+    if [ ! -f "$db_path" ]; then
+        e2e_save_artifact "diagnostics/db_snapshot_${prefix}_error.txt" \
+            "DB file not found: ${db_path}"
+        return 0
+    fi
+
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        e2e_save_artifact "diagnostics/db_snapshot_${prefix}_error.txt" \
+            "(sqlite3 not found)"
+        return 0
+    fi
+
+    # List all user tables
+    local tables
+    tables="$(sqlite3 -batch "$db_path" \
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name" \
+        2>/dev/null || echo "")"
+
+    if [ -z "$tables" ]; then
+        e2e_save_artifact "diagnostics/db_snapshot_${prefix}_tables.txt" \
+            "(no user tables found)"
+        return 0
+    fi
+
+    # Schema overview
+    local schema_content
+    schema_content="$(sqlite3 -batch "$db_path" ".schema" 2>&1)"
+    e2e_save_artifact "diagnostics/db_snapshot_${prefix}_schema.txt" "$schema_content"
+
+    # Per-table row counts + first 50 rows
+    local table
+    while IFS= read -r table; do
+        [ -z "$table" ] && continue
+        local content
+        content="$(sqlite3 -batch -header -column "$db_path" \
+            "SELECT * FROM [${table}] LIMIT 50" 2>&1)"
+        local row_count
+        row_count="$(sqlite3 -batch "$db_path" \
+            "SELECT COUNT(*) FROM [${table}]" 2>/dev/null || echo "?")"
+        e2e_save_artifact "diagnostics/db_snapshot_${prefix}_${table}.txt" \
+            "-- Table: ${table} (${row_count} rows total, showing first 50)
+${content}"
+    done <<< "$tables"
+
+    # Table summary
+    local summary=""
+    while IFS= read -r table; do
+        [ -z "$table" ] && continue
+        local count
+        count="$(sqlite3 -batch "$db_path" \
+            "SELECT COUNT(*) FROM [${table}]" 2>/dev/null || echo "?")"
+        summary="${summary}${table}: ${count} rows
+"
+    done <<< "$tables"
+    e2e_save_artifact "diagnostics/db_snapshot_${prefix}_summary.txt" "$summary"
+}
+
+# e2e_snapshot_storage_tree: Capture a file tree listing of the storage root.
+#
+# Args:
+#   $1: storage_root - Path to the storage directory
+#   $2: prefix (optional) - Artifact label prefix (default: "final")
+#
+# Example:
+#   e2e_snapshot_storage_tree "/tmp/e2e_storage"
+
+e2e_snapshot_storage_tree() {
+    local storage_root="$1"
+    local prefix="${2:-final}"
+
+    if [ ! -d "$storage_root" ]; then
+        e2e_save_artifact "diagnostics/storage_tree_${prefix}.txt" \
+            "(directory not found: ${storage_root})"
+        return 0
+    fi
+
+    local tree_content
+    if command -v tree >/dev/null 2>&1; then
+        tree_content="$(tree -a --noreport "$storage_root" 2>&1 | head -500)"
+    else
+        tree_content="$(find "$storage_root" -type f | sort | head -500)"
+    fi
+
+    e2e_save_artifact "diagnostics/storage_tree_${prefix}.txt" "$tree_content"
+}
+
+# e2e_capture_final_state: One-call forensic capture of all final state.
+#
+# Call this before e2e_summary to ensure maximum forensic surface is captured.
+# It snapshots:
+#   1. All DB tables (if DB_PATH or _E2E_SERVER_DB_PATH is set)
+#   2. Storage tree (if STORAGE_ROOT or _E2E_SERVER_STORAGE_ROOT is set)
+#   3. Environment dump
+#   4. Server log tail (if server was running)
+#
+# This function is safe to call multiple times (idempotent artifact writes).
+#
+# Args: (none -- uses environment variables)
+#
+# Example:
+#   e2e_capture_final_state
+
+e2e_capture_final_state() {
+    # 1. DB snapshot
+    local db_path="${DB_PATH:-${_E2E_SERVER_DB_PATH:-}}"
+    if [ -n "$db_path" ] && [ -f "$db_path" ]; then
+        e2e_snapshot_all_tables "$db_path" "final"
+    fi
+
+    # 2. Storage tree
+    local storage_root="${STORAGE_ROOT:-${_E2E_SERVER_STORAGE_ROOT:-}}"
+    if [ -n "$storage_root" ] && [ -d "$storage_root" ]; then
+        e2e_snapshot_storage_tree "$storage_root" "final"
+    fi
+
+    # 3. Environment dump
+    e2e_save_artifact "diagnostics/env_final.txt" "$(e2e_dump_env 2>&1)"
+
+    # 4. Server log tail (last 200 lines)
+    if [ -n "${_E2E_SERVER_LOG:-}" ] && [ -f "${_E2E_SERVER_LOG}" ]; then
+        local tail_content
+        tail_content="$(tail -n 200 "$_E2E_SERVER_LOG" 2>/dev/null || echo "(unable to read)")"
+        e2e_save_artifact "diagnostics/server_log_tail.txt" "$tail_content"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
@@ -3117,6 +3316,9 @@ e2e_summary() {
     if [ -n "${_E2E_MARKER_ACTIVE_CASE:-}" ]; then
         e2e_mark_case_end "${_E2E_MARKER_ACTIVE_CASE}"
     fi
+
+    # Capture final forensic state before stopping server (br-aazao.8.4)
+    e2e_capture_final_state 2>/dev/null || true
 
     # Stop server before generating summary (ensures logs are complete)
     e2e_stop_server 2>/dev/null || true

@@ -123,7 +123,7 @@ pub use models::*;
 pub use pool::{
     BacklogPressure, DbPool, DbPoolConfig, MailboxDbInventory, MailboxRecoveryLockState,
     MailboxSidecarState, DeferralOutcome, DeferredWriteQueue, DeferredWriteQueueStatus,
-    MutatingSurface, OverloadPolicy, RecoveryAction, RecoveryApproval,
+    MutatingSurface, OverloadPolicy, RecoveryAction, RecoveryAdmissionStatus, RecoveryApproval,
     ReplayCompensationLog, ReplayCompensationRecord, ReplayResult,
     ResolvedMailboxSqlitePath, WriteRouteDisposition,
     auto_pool_size, create_pool, deferred_write_queue, evaluate_write_route,
@@ -131,7 +131,7 @@ pub use pool::{
     inspect_mailbox_db_inventory, inspect_mailbox_recovery_lock, inspect_mailbox_sidecar_state,
     is_corruption_error_message, is_sqlite_recovery_error_message,
     is_sqlite_snapshot_conflict_error_message, open_sqlite_file_with_recovery,
-    reconstruct_sqlite_file_with_archive_salvage, resolve_mailbox_sqlite_path,
+    reconstruct_sqlite_file_with_archive_salvage, recovery_admission, resolve_mailbox_sqlite_path,
 };
 pub use queries::{MvccRetryMetrics, mvcc_retry_metrics};
 pub use reconstruct::{

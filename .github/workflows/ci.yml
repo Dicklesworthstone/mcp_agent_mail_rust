@@ -764,13 +764,320 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+  # ── Durability unit tests (br-97gc6.5.2.6.5.1) ─────────────────────
+  # Exercises the mailbox durability state machine, verdict engine,
+  # forensic bundle capture, and archive reconstruction logic.
+  durability-unit:
+    name: Durability Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Durability state machine tests (core)
+        run: cargo test -p mcp-agent-mail-core --lib mailbox_durability -- --nocapture
+        env:
+          DATABASE_URL: "sqlite:///tmp/ci_durability.sqlite3"
+          STORAGE_ROOT: "/tmp/ci_storage"
+          AGENT_NAME: "CiTestAgent"
+          HTTP_HOST: "127.0.0.1"
+          HTTP_PORT: "1"
+          HTTP_PATH: "/mcp/"
+
+      - name: Verdict engine tests (db)
+        run: cargo test -p mcp-agent-mail-db --lib mailbox_verdict -- --nocapture
+        env:
+          DATABASE_URL: "sqlite:///tmp/ci_durability.sqlite3"
+          STORAGE_ROOT: "/tmp/ci_storage"
+          AGENT_NAME: "CiTestAgent"
+          HTTP_HOST: "127.0.0.1"
+          HTTP_PORT: "1"
+          HTTP_PATH: "/mcp/"
+
+      - name: Forensic bundle tests (db)
+        run: cargo test -p mcp-agent-mail-db --lib forensics -- --nocapture
+        env:
+          DATABASE_URL: "sqlite:///tmp/ci_durability.sqlite3"
+          STORAGE_ROOT: "/tmp/ci_storage"
+          AGENT_NAME: "CiTestAgent"
+          HTTP_HOST: "127.0.0.1"
+          HTTP_PORT: "1"
+          HTTP_PATH: "/mcp/"
+
+      - name: Reconstruction tests (db)
+        run: cargo test -p mcp-agent-mail-db --lib reconstruct -- --nocapture
+        env:
+          DATABASE_URL: "sqlite:///tmp/ci_durability.sqlite3"
+          STORAGE_ROOT: "/tmp/ci_storage"
+          AGENT_NAME: "CiTestAgent"
+          HTTP_HOST: "127.0.0.1"
+          HTTP_PORT: "1"
+          HTTP_PATH: "/mcp/"
+
+      - name: Durability probe tests (db queries)
+        run: cargo test -p mcp-agent-mail-db --lib durability_probe -- --nocapture
+        env:
+          DATABASE_URL: "sqlite:///tmp/ci_durability.sqlite3"
+          STORAGE_ROOT: "/tmp/ci_storage"
+          AGENT_NAME: "CiTestAgent"
+          HTTP_HOST: "127.0.0.1"
+          HTTP_PORT: "1"
+          HTTP_PATH: "/mcp/"
+
+      - name: Verify durability test count floor
+        if: always()
+        run: |
+          set -euo pipefail
+          TOTAL=0
+          for module in mailbox_durability mailbox_verdict forensics reconstruct durability_probe; do
+            COUNT="$(cargo test -p mcp-agent-mail-db --lib "${module}" -- --list 2>/dev/null | grep -c '::.*: test$' || true)"
+            if [ "${COUNT}" -eq 0 ]; then
+              COUNT="$(cargo test -p mcp-agent-mail-core --lib "${module}" -- --list 2>/dev/null | grep -c '::.*: test$' || true)"
+            fi
+            echo "${module}: ${COUNT} tests"
+            TOTAL=$((TOTAL + COUNT))
+          done
+          echo "Total durability unit tests: ${TOTAL}"
+          if [ "${TOTAL}" -lt 50 ]; then
+            echo "FAIL: expected at least 50 durability unit tests, got ${TOTAL}"
+            exit 1
+          fi
+
+      - name: Upload durability unit artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: durability-unit-artifacts
+          path: |
+            tests/artifacts/durability/
+            /tmp/ci_durability.sqlite3
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ── Durability E2E tests (br-97gc6.5.2.6.5.1) ─────────────────────
+  # Runs end-to-end durability scenarios: crash-restart recovery,
+  # database corruption handling, and failure/fault injection.
+  durability-e2e:
+    name: Durability E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build both binaries
+        run: |
+          cargo build -p mcp-agent-mail-cli
+          cargo build -p mcp-agent-mail
+
+      - name: E2E crash-restart recovery
+        id: crash_restart
+        if: always()
+        run: am e2e run --project . crash_restart
+        env:
+          DATABASE_URL: "sqlite:///tmp/ci_dur_e2e.sqlite3"
+          STORAGE_ROOT: "/tmp/ci_dur_storage"
+          AGENT_NAME: "CiTestAgent"
+          HTTP_HOST: "127.0.0.1"
+          HTTP_PORT: "1"
+          HTTP_PATH: "/mcp/"
+
+      - name: E2E database corruption handling
+        id: db_corruption
+        if: always()
+        run: am e2e run --project . db_corruption
+        env:
+          DATABASE_URL: "sqlite:///tmp/ci_dur_e2e.sqlite3"
+          STORAGE_ROOT: "/tmp/ci_dur_storage"
+          AGENT_NAME: "CiTestAgent"
+          HTTP_HOST: "127.0.0.1"
+          HTTP_PORT: "1"
+          HTTP_PATH: "/mcp/"
+
+      - name: E2E failure injection
+        id: failure_injection
+        if: always()
+        run: am e2e run --project . failure_injection
+        env:
+          DATABASE_URL: "sqlite:///tmp/ci_dur_e2e.sqlite3"
+          STORAGE_ROOT: "/tmp/ci_dur_storage"
+          AGENT_NAME: "CiTestAgent"
+          HTTP_HOST: "127.0.0.1"
+          HTTP_PORT: "1"
+          HTTP_PATH: "/mcp/"
+
+      - name: E2E fault injection
+        id: fault_injection
+        if: always()
+        run: am e2e run --project . fault_injection
+        env:
+          DATABASE_URL: "sqlite:///tmp/ci_dur_e2e.sqlite3"
+          STORAGE_ROOT: "/tmp/ci_dur_storage"
+          AGENT_NAME: "CiTestAgent"
+          HTTP_HOST: "127.0.0.1"
+          HTTP_PORT: "1"
+          HTTP_PATH: "/mcp/"
+
+      - name: Summarize durability E2E results
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p tests/artifacts/durability_e2e_ci
+          FAILED=0
+          for suite in crash_restart db_corruption failure_injection fault_injection; do
+            SUMMARY="$(command find tests/artifacts -path "*/${suite}/*/summary.json" -print -quit 2>/dev/null || true)"
+            if [ -z "${SUMMARY}" ]; then
+              echo "WARN: no summary.json found for ${suite}"
+              FAILED=1
+              continue
+            fi
+            FAIL_COUNT="$(python3 -c "import json,pathlib; d=json.loads(pathlib.Path('${SUMMARY}').read_text()); print(d.get('fail',0))")"
+            TOTAL="$(python3 -c "import json,pathlib; d=json.loads(pathlib.Path('${SUMMARY}').read_text()); print(d.get('total',0))")"
+            echo "${suite}: ${TOTAL} total, ${FAIL_COUNT} failed"
+            if [ "${FAIL_COUNT}" -ne 0 ]; then
+              FAILED=1
+            fi
+          done
+          if [ "${FAILED}" -ne 0 ]; then
+            echo "Durability E2E failures detected."
+            exit 1
+          fi
+          echo "All durability E2E suites passed."
+
+      - name: Validate artifact bundles
+        if: always()
+        run: |
+          set -euo pipefail
+          source scripts/e2e_lib.sh
+          e2e_validate_bundle_tree tests/artifacts
+
+      - name: Upload durability E2E artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: durability-e2e-artifacts
+          path: |
+            tests/artifacts/crash_restart/
+            tests/artifacts/db_corruption/
+            tests/artifacts/failure_injection/
+            tests/artifacts/fault_injection/
+            tests/artifacts/durability_e2e_ci/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # ── Chaos tests (br-97gc6.5.2.6.5.1) ──────────────────────────────
+  # Circuit breaker fault injection, concurrent failure recovery, and
+  # data integrity under chaos conditions.
+  chaos:
+    name: Chaos Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace
+        run: cargo build --workspace
+
+      - name: Chaos circuit-breaker tests
+        run: cargo test -p mcp-agent-mail-db --test stress chaos_ -- --nocapture
+        env:
+          DATABASE_URL: "sqlite:///tmp/ci_chaos.sqlite3"
+          STORAGE_ROOT: "/tmp/ci_chaos_storage"
+          AGENT_NAME: "CiTestAgent"
+          HTTP_HOST: "127.0.0.1"
+          HTTP_PORT: "1"
+          HTTP_PATH: "/mcp/"
+
+      - name: Fault injection integration tests
+        run: cargo test -p mcp-agent-mail-db --test fault_injection -- --nocapture
+        env:
+          DATABASE_URL: "sqlite:///tmp/ci_chaos.sqlite3"
+          STORAGE_ROOT: "/tmp/ci_chaos_storage"
+          AGENT_NAME: "CiTestAgent"
+          HTTP_HOST: "127.0.0.1"
+          HTTP_PORT: "1"
+          HTTP_PATH: "/mcp/"
+
+      - name: Stress + pool exhaustion under failure
+        run: |
+          set -euo pipefail
+          cargo test -p mcp-agent-mail-db --test stress -- --nocapture 2>&1 | tee /tmp/chaos_stress.log
+          cargo test -p mcp-agent-mail-db --test pool_exhaustion -- --nocapture 2>&1 | tee /tmp/chaos_pool.log
+        env:
+          DATABASE_URL: "sqlite:///tmp/ci_chaos.sqlite3"
+          STORAGE_ROOT: "/tmp/ci_chaos_storage"
+          AGENT_NAME: "CiTestAgent"
+          HTTP_HOST: "127.0.0.1"
+          HTTP_PORT: "1"
+          HTTP_PATH: "/mcp/"
+
+      - name: Verify chaos test count floor
+        if: always()
+        run: |
+          set -euo pipefail
+          CHAOS_COUNT="$(cargo test -p mcp-agent-mail-db --test stress chaos_ -- --list 2>/dev/null | grep -c '::.*: test$' || echo 0)"
+          echo "Chaos circuit-breaker tests: ${CHAOS_COUNT}"
+          if [ "${CHAOS_COUNT}" -lt 5 ]; then
+            echo "FAIL: expected at least 5 chaos tests, got ${CHAOS_COUNT}"
+            exit 1
+          fi
+
+      - name: Collect chaos failure digest
+        if: failure()
+        run: |
+          set -euo pipefail
+          DIGEST_DIR="tests/artifacts/chaos_ci"
+          mkdir -p "${DIGEST_DIR}"
+          for logfile in /tmp/chaos_stress.log /tmp/chaos_pool.log; do
+            if [ -f "${logfile}" ]; then
+              BASENAME="$(basename "${logfile}")"
+              cp "${logfile}" "${DIGEST_DIR}/${BASENAME}"
+              # Extract failure lines for terse summary
+              grep -E 'FAIL|panicked|error\[' "${logfile}" > "${DIGEST_DIR}/${BASENAME%.log}_failures.txt" 2>/dev/null || true
+            fi
+          done
+          # Write a terse failure digest
+          python3 <<'PY'
+          import json
+          from pathlib import Path
+          digest_dir = Path("tests/artifacts/chaos_ci")
+          failures = []
+          for f in sorted(digest_dir.glob("*_failures.txt")):
+              lines = f.read_text(encoding="utf-8").strip().splitlines()
+              if lines:
+                  failures.append({"file": f.name, "count": len(lines), "first_5": lines[:5]})
+          digest = {"chaos_failure_count": sum(f["count"] for f in failures), "files": failures}
+          (digest_dir / "failure_digest.json").write_text(json.dumps(digest, indent=2) + "\n", encoding="utf-8")
+          print(json.dumps(digest, indent=2))
+          PY
+
+      - name: Upload chaos test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-test-artifacts
+          path: |
+            tests/artifacts/chaos_ci/
+            /tmp/chaos_stress.log
+            /tmp/chaos_pool.log
+          retention-days: 14
+          if-no-files-found: ignore
+
   # ── Skip guard ──────────────────────────────────────────────────────
   # Prevents silent test-skip regressions by asserting non-zero test counts.
   skip-guard:
     name: Skip Guard
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [test, mode-matrix, native-command-matrix, conformance, perf-security, e2e-dual-mode, search-v3-e2e, incident-regression-gates, snapshots]
+    needs: [test, mode-matrix, native-command-matrix, conformance, perf-security, e2e-dual-mode, search-v3-e2e, incident-regression-gates, snapshots, durability-unit, durability-e2e, chaos]
     if: always()
     steps:
       - name: Verify all required jobs passed
@@ -785,6 +1092,9 @@ jobs:
           echo "  search-v3-e2e: ${{ needs.search-v3-e2e.result }}"
           echo "  incident-regression-gates: ${{ needs.incident-regression-gates.result }}"
           echo "  snapshots: ${{ needs.snapshots.result }}"
+          echo "  durability-unit: ${{ needs.durability-unit.result }}"
+          echo "  durability-e2e: ${{ needs.durability-e2e.result }}"
+          echo "  chaos: ${{ needs.chaos.result }}"
 
           FAILED=0
           for result in \
@@ -796,7 +1106,10 @@ jobs:
             "${{ needs.e2e-dual-mode.result }}" \
             "${{ needs.search-v3-e2e.result }}" \
             "${{ needs.incident-regression-gates.result }}" \
-            "${{ needs.snapshots.result }}"; do
+            "${{ needs.snapshots.result }}" \
+            "${{ needs.durability-unit.result }}" \
+            "${{ needs.durability-e2e.result }}" \
+            "${{ needs.chaos.result }}"; do
             if [ "$result" != "success" ]; then
               echo "FAIL: job result = $result"
               FAILED=1

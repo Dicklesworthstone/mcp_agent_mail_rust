@@ -1007,6 +1007,94 @@ impl StorageMetrics {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Canary metrics — isolated counters for synthetic durability canaries
+// ---------------------------------------------------------------------------
+
+/// Metrics surface for synthetic durability canaries.
+///
+/// These counters are intentionally separate from the production `DbMetrics`
+/// and `StorageMetrics` so that canary traffic never pollutes operator
+/// dashboards, aggregate health signals, or alert streams.
+///
+/// Every counter is prefixed with `canary_` to make structured-log queries
+/// trivially filterable even if logs are co-mingled.
+#[derive(Debug)]
+pub struct CanaryMetrics {
+    /// Total canary probe executions (success + failure).
+    pub canary_probes_total: Counter,
+    /// Canary probes that completed successfully.
+    pub canary_probes_ok: Counter,
+    /// Canary probes that failed (assertion mismatch, timeout, I/O error).
+    pub canary_probes_failed: Counter,
+    /// Canary probe latency in microseconds.
+    pub canary_probe_latency_us: Log2Histogram,
+    /// Number of canary mailboxes currently active (gauge).
+    pub canary_mailboxes_active: GaugeU64,
+    /// Total canary mailboxes created over process lifetime.
+    pub canary_mailboxes_created_total: Counter,
+    /// Total canary mailboxes torn down over process lifetime.
+    pub canary_mailboxes_destroyed_total: Counter,
+    /// Canary-specific integrity check failures (never increments
+    /// `DbMetrics::integrity_failures_total`).
+    pub canary_integrity_failures_total: Counter,
+    /// Canary recovery attempts (exercises the recovery path on disposable
+    /// mailboxes without affecting production recovery admission control).
+    pub canary_recovery_attempts_total: Counter,
+    /// Canary recovery successes.
+    pub canary_recovery_successes_total: Counter,
+}
+
+impl Default for CanaryMetrics {
+    fn default() -> Self {
+        Self {
+            canary_probes_total: Counter::new(),
+            canary_probes_ok: Counter::new(),
+            canary_probes_failed: Counter::new(),
+            canary_probe_latency_us: Log2Histogram::new(),
+            canary_mailboxes_active: GaugeU64::new(),
+            canary_mailboxes_created_total: Counter::new(),
+            canary_mailboxes_destroyed_total: Counter::new(),
+            canary_integrity_failures_total: Counter::new(),
+            canary_recovery_attempts_total: Counter::new(),
+            canary_recovery_successes_total: Counter::new(),
+        }
+    }
+}
+
+/// Snapshot of [`CanaryMetrics`] for JSON serialization.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CanaryMetricsSnapshot {
+    pub canary_probes_total: u64,
+    pub canary_probes_ok: u64,
+    pub canary_probes_failed: u64,
+    pub canary_probe_latency_us: HistogramSnapshot,
+    pub canary_mailboxes_active: u64,
+    pub canary_mailboxes_created_total: u64,
+    pub canary_mailboxes_destroyed_total: u64,
+    pub canary_integrity_failures_total: u64,
+    pub canary_recovery_attempts_total: u64,
+    pub canary_recovery_successes_total: u64,
+}
+
+impl CanaryMetrics {
+    #[must_use]
+    pub fn snapshot(&self) -> CanaryMetricsSnapshot {
+        CanaryMetricsSnapshot {
+            canary_probes_total: self.canary_probes_total.load(),
+            canary_probes_ok: self.canary_probes_ok.load(),
+            canary_probes_failed: self.canary_probes_failed.load(),
+            canary_probe_latency_us: self.canary_probe_latency_us.snapshot(),
+            canary_mailboxes_active: self.canary_mailboxes_active.load(),
+            canary_mailboxes_created_total: self.canary_mailboxes_created_total.load(),
+            canary_mailboxes_destroyed_total: self.canary_mailboxes_destroyed_total.load(),
+            canary_integrity_failures_total: self.canary_integrity_failures_total.load(),
+            canary_recovery_attempts_total: self.canary_recovery_attempts_total.load(),
+            canary_recovery_successes_total: self.canary_recovery_successes_total.load(),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct GlobalMetrics {
     pub http: HttpMetrics,
@@ -1015,6 +1103,7 @@ pub struct GlobalMetrics {
     pub storage: StorageMetrics,
     pub system: SystemMetrics,
     pub search: SearchMetrics,
+    pub canary: CanaryMetrics,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -1025,6 +1114,7 @@ pub struct GlobalMetricsSnapshot {
     pub storage: StorageMetricsSnapshot,
     pub system: SystemMetricsSnapshot,
     pub search: SearchMetricsSnapshot,
+    pub canary: CanaryMetricsSnapshot,
 }
 
 impl GlobalMetrics {
@@ -1037,6 +1127,7 @@ impl GlobalMetrics {
             storage: self.storage.snapshot(),
             system: self.system.snapshot(),
             search: self.search.snapshot(),
+            canary: self.canary.snapshot(),
         }
     }
 }
