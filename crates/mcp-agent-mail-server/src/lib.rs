@@ -1212,9 +1212,12 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     let _ = theme::init_console_theme_from_config(config.console_theme);
     // Pre-intern well-known strings to avoid first-request contention.
     mcp_agent_mail_core::pre_intern_policies();
-    let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
 
-    // Check for resource collisions (e.g. another am process holding locks)
+    // Check for resource collisions (e.g. another am process holding locks).
+    // IMPORTANT: probes must run BEFORE acquiring runtime locks because
+    // `probe_integrity` takes an exclusive flock on the activity lockfile.
+    // If we already hold a shared flock (from `acquire_runtime_mailbox_activity_locks`),
+    // the exclusive attempt will fail with EAGAIN, deadlocking startup.
     let probe_report = startup_checks::run_stdio_startup_probes(config);
     if !probe_report.is_ok() {
         ftui_runtime::ftui_eprintln!(
@@ -1222,6 +1225,11 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
             probe_report.format_errors()
         );
     }
+
+    // Now that probes have confirmed no other process holds the locks,
+    // acquire our runtime shared lock for the duration of the process.
+    let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
+
     // Enable global query tracker if instrumentation is on.
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
@@ -2511,9 +2519,18 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     let _ = theme::init_console_theme_from_config(config.console_theme);
     // Pre-intern well-known strings to avoid first-request contention.
     mcp_agent_mail_core::pre_intern_policies();
+
+    // IMPORTANT: startup probes (inside `prepare_http_runtime_startup`) must
+    // run BEFORE acquiring runtime activity locks.  The probes take an
+    // exclusive flock on the activity lockfile to verify no other process
+    // is running; if we already hold a shared flock from
+    // `acquire_runtime_mailbox_activity_locks`, the exclusive attempt
+    // deadlocks (EAGAIN) against our own process.
+    prepare_http_runtime_startup(config)?;
+
+    // Safe to acquire now -- probes have confirmed we are the sole owner.
     let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
 
-    prepare_http_runtime_startup(config)?;
     log_active_database(config);
     let _ = startup_checks::write_listener_pid_hint(&config.http_host, config.http_port);
     heal_storage_lock_artifacts(config);
@@ -2581,12 +2598,20 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     // ── 1. Pre-flight: theme, probes, instrumentation ──────────────
     let _ = theme::init_console_theme_from_config(config.console_theme);
     mcp_agent_mail_core::pre_intern_policies();
-    let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
 
+    // IMPORTANT: probes must run BEFORE acquiring runtime activity locks.
+    // `probe_integrity` takes an exclusive flock on the activity lockfile;
+    // if we already hold a shared flock the exclusive attempt deadlocks
+    // (EAGAIN) against our own process.
     let probe_report = startup_checks::run_startup_probes(config);
     if !probe_report.is_ok() {
         return Err(std::io::Error::other(probe_report.format_errors()));
     }
+
+    // Now that probes have confirmed we are the sole owner, acquire the
+    // runtime shared lock for the lifetime of the process.
+    let _runtime_mailbox_locks = acquire_runtime_mailbox_activity_locks(config)?;
+
     if config.instrumentation_enabled {
         mcp_agent_mail_db::QUERY_TRACKER.enable(Some(config.instrumentation_slow_query_ms));
     }

@@ -10,7 +10,7 @@ use asupersync::sync::OnceCell;
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_core::{
     ConsistencyMessageRef, LockLevel, OrderedRwLock,
-    config::env_value,
+    config::{env_value, infra_env_value},
     disk::{is_sqlite_memory_database_url, sqlite_file_path_from_database_url},
 };
 use serde::{Deserialize, Serialize};
@@ -1575,8 +1575,12 @@ impl DbPoolConfig {
     ///    restore the legacy Python defaults (not recommended for production).
     #[must_use]
     pub fn from_env() -> Self {
-        let database_url =
-            env_value("DATABASE_URL").unwrap_or_else(|| "sqlite:///./storage.sqlite3".to_string());
+        // Use infra_env_value so a project-local .env cannot hijack the
+        // database path.  When no explicit DATABASE_URL is set, derive it
+        // from the resolved storage_root via Config (which handles the
+        // storage-root-relative default).
+        let database_url = infra_env_value("DATABASE_URL")
+            .unwrap_or_else(|| mcp_agent_mail_core::Config::get().database_url.clone());
 
         let pool_timeout = env_value("DATABASE_POOL_TIMEOUT")
             .and_then(|s| s.parse().ok())

@@ -865,6 +865,12 @@ fn resolve_data_path(legacy_base: &Path, subdir: &str) -> PathBuf {
     xdg_data_dir().map_or_else(|| legacy_base.join(subdir), |d| d.join(subdir))
 }
 
+/// Legacy default DATABASE_URL inherited from the Python implementation.
+/// Used as a sentinel in `Config::default()` so that `from_env()` can detect
+/// when no explicit DATABASE_URL was provided and derive the path from
+/// `storage_root` instead.
+const DEFAULT_LEGACY_DATABASE_URL: &str = "sqlite+aiosqlite:///./storage.sqlite3";
+
 impl Default for Config {
     #[allow(clippy::too_many_lines)]
     fn default() -> Self {
@@ -880,7 +886,9 @@ impl Default for Config {
 
             // Database
             // Match legacy Python default (SQLAlchemy async URL).
-            database_url: "sqlite+aiosqlite:///./storage.sqlite3".to_string(),
+            // This sentinel value is replaced in `from_env()` with a path
+            // derived from `storage_root` when no explicit DATABASE_URL is set.
+            database_url: DEFAULT_LEGACY_DATABASE_URL.to_string(),
             database_echo: false,
             database_pool_size: None,
             database_max_overflow: None,
@@ -1260,7 +1268,9 @@ impl Config {
         }
 
         // Database
-        if let Some(v) = env_value("DATABASE_URL") {
+        // Use infra_env_value to prevent a project-local .env from
+        // hijacking the database path -- DATABASE_URL is infra-level.
+        if let Some(v) = infra_env_value("DATABASE_URL") {
             config.database_url = v;
         }
         config.database_echo = env_bool("DATABASE_ECHO", config.database_echo);
@@ -1290,7 +1300,9 @@ impl Config {
         );
 
         // Storage
-        if let Some(v) = env_value("STORAGE_ROOT") {
+        // Use infra_env_value to prevent a project-local .env from
+        // hijacking the storage directory -- STORAGE_ROOT is infra-level.
+        if let Some(v) = infra_env_value("STORAGE_ROOT") {
             config.storage_root = PathBuf::from(shellexpand::tilde(&v).into_owned());
         }
         if let Some(v) = env_value("GIT_AUTHOR_NAME") {
@@ -2000,6 +2012,17 @@ impl Config {
             config.storage_root = canonical;
         }
 
+        // If no explicit DATABASE_URL was provided (still the legacy default),
+        // derive the SQLite path from the resolved storage_root so that the
+        // database lives alongside the storage directory rather than relative
+        // to an arbitrary CWD.
+        if config.database_url == DEFAULT_LEGACY_DATABASE_URL {
+            config.database_url = format!(
+                "sqlite:///{}",
+                config.storage_root.join("storage.sqlite3").display()
+            );
+        }
+
         config
     }
 
@@ -2477,6 +2500,28 @@ pub fn env_value(key: &str) -> Option<String> {
         return Some(v);
     }
     layered_env_value(env::var(key).ok(), user_env_value(key), dotenv_value(key))
+}
+
+/// Read an **infrastructure-level** environment value.
+///
+/// Like [`env_value`], but deliberately skips the project-local `.env` file.
+/// This prevents a random project's `.env` from hijacking core AM infra keys
+/// such as `DATABASE_URL` and `STORAGE_ROOT`, which would silently redirect
+/// the server to the wrong database or storage directory.
+///
+/// Precedence: process env -> user-global env file (only).
+#[must_use]
+pub fn infra_env_value(key: &str) -> Option<String> {
+    #[cfg(test)]
+    if let Some(v) = test_env_override_value(key) {
+        return Some(v);
+    }
+    if let Some(v) = process_env_override_value(key) {
+        return Some(v);
+    }
+    // Intentionally pass `None` for the project dotenv layer so that a
+    // project-local `.env` can never override infrastructure keys.
+    layered_env_value(env::var(key).ok(), user_env_value(key), None)
 }
 
 fn normalize_http_path(raw: &str) -> String {
