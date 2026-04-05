@@ -5846,7 +5846,13 @@ pub async fn create_file_reservations(
     Outcome::Ok(out)
 }
 
-/// Get active file reservations for a project
+/// Get active file reservations for a project.
+///
+/// Uses `BEGIN IMMEDIATE` to acquire a fresh WAL snapshot, ensuring the
+/// caller always sees the latest committed reservation state.  Without an
+/// explicit transaction the pooled connection may re-use a stale read
+/// snapshot which causes phantom conflicts after release (Bug #85) and
+/// missed conflicts before insert (Bug #86).
 pub async fn get_active_reservations(
     cx: &Cx,
     pool: &DbPool,
@@ -5864,6 +5870,9 @@ pub async fn get_active_reservations(
 
     let tracked = tracked(&*conn);
 
+    // Force a fresh WAL snapshot so we never read stale reservation state.
+    try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
+
     let sql = format!(
         "SELECT fr.id, fr.project_id, fr.agent_id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
                 fr.created_ts, fr.expires_ts, COALESCE(rr.released_ts, fr.released_ts) AS released_ts \
@@ -5873,21 +5882,37 @@ pub async fn get_active_reservations(
     );
     let params = [Value::BigInt(project_id), Value::BigInt(now)];
 
-    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+    let result = match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
                 match decode_file_reservation_row(&row) {
                     Ok(decoded) => out.push(decoded),
-                    Err(e) => return Outcome::Err(e),
+                    Err(e) => {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(e);
+                    }
                 }
             }
             Outcome::Ok(out)
         }
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
-    }
+        Outcome::Err(e) => {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Err(e);
+        }
+        Outcome::Cancelled(r) => {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Cancelled(r);
+        }
+        Outcome::Panicked(p) => {
+            rollback_tx(cx, &tracked).await;
+            return Outcome::Panicked(p);
+        }
+    };
+
+    // Commit the read-only IMMEDIATE tx to release the write lock promptly.
+    try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+    result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

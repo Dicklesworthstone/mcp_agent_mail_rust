@@ -607,23 +607,121 @@ pub async fn file_reservation_paths(
             .collect()
     };
 
-    // Grant non-conflicting reservations
-    let granted_rows = if paths_to_grant.is_empty() {
-        vec![]
+    // Grant non-conflicting reservations.
+    //
+    // The DB layer performs its own conflict check inside an IMMEDIATE
+    // transaction.  If it detects a conflict that the tool-layer index
+    // missed (e.g. due to a stale WAL read snapshot — Bug #86), convert
+    // the ResourceBusy error into a structured conflict response instead
+    // of propagating an opaque MCP error.
+    let (granted_rows, conflicts) = if paths_to_grant.is_empty() {
+        (vec![], conflicts)
     } else {
-        db_outcome_to_mcp_result(
-            mcp_agent_mail_db::queries::create_file_reservations(
-                ctx.cx(),
-                &pool,
-                project_id,
-                agent_id,
-                &paths_to_grant,
-                ttl,
-                is_exclusive,
-                &reason_str,
-            )
-            .await,
-        )?
+        match mcp_agent_mail_db::queries::create_file_reservations(
+            ctx.cx(),
+            &pool,
+            project_id,
+            agent_id,
+            &paths_to_grant,
+            ttl,
+            is_exclusive,
+            &reason_str,
+        )
+        .await
+        {
+            asupersync::Outcome::Ok(rows) => (rows, conflicts),
+            asupersync::Outcome::Err(mcp_agent_mail_db::DbError::ResourceBusy(msg)) => {
+                // The DB layer detected a conflict that the tool layer's
+                // index check missed.  Re-read active reservations to
+                // build a fresh, accurate conflict response.
+                tracing::warn!(
+                    "DB-layer conflict detected after tool-layer index check passed \
+                     (stale read likely): {msg}"
+                );
+
+                let fresh_active = db_outcome_to_mcp_result(
+                    mcp_agent_mail_db::queries::get_active_reservations(
+                        ctx.cx(),
+                        &pool,
+                        project_id,
+                    )
+                    .await,
+                )?;
+
+                let fresh_index = ReservationIndex::build(
+                    fresh_active
+                        .iter()
+                        .filter(|res| {
+                            if res.agent_id == agent_id {
+                                return false;
+                            }
+                            if is_exclusive {
+                                true
+                            } else {
+                                res.exclusive != 0
+                            }
+                        })
+                        .map(|res| {
+                            (
+                                res.path_pattern.clone(),
+                                ReservationRef {
+                                    agent_id: res.agent_id,
+                                    path_pattern: res.path_pattern.clone(),
+                                    exclusive: res.exclusive != 0,
+                                    expires_ts: res.expires_ts,
+                                },
+                            )
+                        }),
+                );
+
+                let agent_rows = db_outcome_to_mcp_result(
+                    mcp_agent_mail_db::queries::list_agents(ctx.cx(), &pool, project_id)
+                        .await,
+                )?;
+                let agent_names: HashMap<i64, String> = agent_rows
+                    .into_iter()
+                    .filter_map(|row| row.id.map(|id| (id, row.name)))
+                    .collect();
+
+                let mut db_conflict_refs = Vec::new();
+                let mut db_conflicts = conflicts;
+                for path in &paths_to_grant {
+                    let path_pat = CompiledPattern::cached(path);
+                    fresh_index.find_conflicts(path_pat.as_ref(), &mut db_conflict_refs);
+                    if !db_conflict_refs.is_empty() {
+                        let mut holders: Vec<ConflictHolder> =
+                            std::mem::take(&mut db_conflict_refs)
+                                .into_iter()
+                                .map(|rref| ConflictHolder {
+                                    agent: agent_names
+                                        .get(&rref.agent_id)
+                                        .cloned()
+                                        .unwrap_or_else(|| {
+                                            format!("agent_{}", rref.agent_id)
+                                        }),
+                                    path_pattern: rref.path_pattern.clone(),
+                                    exclusive: rref.exclusive,
+                                    expires_ts: micros_to_iso(rref.expires_ts),
+                                })
+                                .collect();
+                        holders.sort_unstable_by(|a, b| {
+                            a.agent.cmp(&b.agent)
+                                .then_with(|| a.path_pattern.cmp(&b.path_pattern))
+                        });
+                        db_conflicts.push(ReservationConflict {
+                            path: path.to_string(),
+                            holders,
+                        });
+                    }
+                }
+                (vec![], db_conflicts)
+            }
+            other => {
+                // All other errors propagate normally.
+                db_outcome_to_mcp_result(other)?;
+                unreachable!()
+            }
+        }
     };
 
     let granted: Vec<GrantedReservation> = granted_rows
