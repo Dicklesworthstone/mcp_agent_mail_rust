@@ -665,7 +665,7 @@ pub fn agent_mail_pids_all_stopped(pids: &[u32]) -> bool {
 
 /// Check if all the given PIDs have exited (macOS/BSD version).
 ///
-/// Uses `kill -0` via `ps` to probe whether each process is still alive.
+/// Uses `ps -p <pid>` to probe whether each process is still alive.
 /// Returns `true` when every PID is gone.
 #[cfg(not(target_os = "linux"))]
 #[must_use]
