@@ -1109,12 +1109,16 @@ fn build_detect_report(
     // (ELF, Mach-O, PE) rather than a Python script, the markers we collected
     // are artefacts of the *Rust* installation, not a legacy Python one.
     // Clear the markers so we don't falsely offer a migration prompt.
+    //
+    // Important: only clear when we *positively find* a native binary.
+    // If no binary is found at all, keep markers — there may be orphaned
+    // Python artifacts (database, pyproject.toml) worth migrating even
+    // though the Python binary itself was removed.
     if !markers.is_empty() {
-        let has_python_binary = find_installed_am_binary()
-            .map(|p| is_likely_python_binary(&p))
-            .unwrap_or(false);
-        if !has_python_binary {
-            markers.clear();
+        if let Some(binary_path) = find_installed_am_binary() {
+            if !is_likely_python_binary(&binary_path) {
+                markers.clear();
+            }
         }
     }
 
