@@ -4729,6 +4729,7 @@ dependencies = [
  "clap",
  "crossterm 0.28.1",
  "fastmcp-rust",
+ "fs2",
  "ftui",
  "ftui-runtime",
  "glob",

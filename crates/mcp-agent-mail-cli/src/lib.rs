@@ -2672,11 +2672,17 @@ fn auto_clear_db_blockers(config: &Config) -> CliResult<()> {
     };
 
     if !db_path.exists() {
+        // Even if the main DB doesn't exist, clean up stale lock/WAL artifacts.
+        cleanup_stale_db_artifacts(&db_path);
         return Ok(());
     }
 
     let am_pids = agent_mail_pids_holding_file(&db_path);
     if am_pids.is_empty() {
+        // No Agent Mail processes holding the DB, but still clean up stale
+        // lock files and corrupt WAL sidecars that previous crashes may have
+        // left behind.
+        cleanup_stale_db_artifacts(&db_path);
         return Ok(());
     }
 
@@ -2698,7 +2704,7 @@ fn auto_clear_db_blockers(config: &Config) -> CliResult<()> {
     loop {
         std::thread::sleep(Duration::from_millis(50));
         if agent_mail_pids_holding_file(&db_path).is_empty() {
-            return Ok(());
+            break;
         }
         if Instant::now() >= deadline {
             break;
@@ -2707,38 +2713,35 @@ fn auto_clear_db_blockers(config: &Config) -> CliResult<()> {
 
     // Phase 2: SIGKILL remaining holders
     let remaining = agent_mail_pids_holding_file(&db_path);
-    if remaining.is_empty() {
-        return Ok(());
-    }
-    eprintln!(
-        "[info] SIGTERM did not stop PIDs {:?} — sending SIGKILL",
-        remaining
-    );
-    for &pid in &remaining {
-        send_sigkill(pid);
-    }
-
-    let kill_deadline = Instant::now() + KILL_GRACE;
-    loop {
-        std::thread::sleep(Duration::from_millis(25));
-        if agent_mail_pids_holding_file(&db_path).is_empty() {
-            return Ok(());
+    if !remaining.is_empty() {
+        eprintln!(
+            "[info] SIGTERM did not stop PIDs {:?} — sending SIGKILL",
+            remaining
+        );
+        for &pid in &remaining {
+            send_sigkill(pid);
         }
-        if Instant::now() >= kill_deadline {
-            break;
+
+        let kill_deadline = Instant::now() + KILL_GRACE;
+        loop {
+            std::thread::sleep(Duration::from_millis(25));
+            if agent_mail_pids_holding_file(&db_path).is_empty() {
+                break;
+            }
+            if Instant::now() >= kill_deadline {
+                break;
+            }
         }
     }
 
     // Final check: are there still holders?
     let still_holding = pids_holding_file(&db_path);
-    if still_holding.is_empty() {
-        return Ok(());
-    }
-
-    // If only non-Agent-Mail processes remain, warn but don't fail — the
-    // preflight integrity probe will catch genuine lock contention.
     let am_still = agent_mail_pids_holding_file(&db_path);
+
     if !am_still.is_empty() {
+        // Attempt cleanup anyway — the integrity probe may still succeed
+        // after lock files are cleaned.
+        cleanup_stale_db_artifacts(&db_path);
         return Err(CliError::Other(format!(
             "Failed to stop Agent Mail process(es) holding {}: PIDs {:?}",
             db_path.display(),
@@ -2746,12 +2749,98 @@ fn auto_clear_db_blockers(config: &Config) -> CliResult<()> {
         )));
     }
 
-    eprintln!(
-        "[warn] Non-Agent-Mail process(es) holding {}: PIDs {:?} — not killing",
-        db_path.display(),
-        still_holding,
-    );
+    if !still_holding.is_empty() {
+        eprintln!(
+            "[warn] Non-Agent-Mail process(es) holding {}: PIDs {:?} — not killing",
+            db_path.display(),
+            still_holding,
+        );
+    }
+
+    // Always clean up stale artifacts after killing old processes.
+    cleanup_stale_db_artifacts(&db_path);
     Ok(())
+}
+
+/// Remove stale lock files and corrupt WAL/SHM sidecars that prevent startup.
+///
+/// This is called after killing old Agent Mail processes (or when none are
+/// running) to ensure the integrity probe and pool open succeed cleanly.
+fn cleanup_stale_db_artifacts(db_path: &Path) {
+    // Remove stale .activity.lock files.  The flock-based lock logic will
+    // re-create a fresh lock file when it acquires the lock.
+    let mut lock_os = db_path.as_os_str().to_os_string();
+    lock_os.push(".activity.lock");
+    let lock_path = PathBuf::from(lock_os);
+    if lock_path.exists() {
+        // Only remove if we can verify no process holds the flock.
+        // Try opening and locking — if it succeeds, the file is stale.
+        let should_remove = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .and_then(|f| {
+                fs2::FileExt::try_lock_exclusive(&f)?;
+                fs2::FileExt::unlock(&f)?;
+                Ok(true)
+            })
+            .unwrap_or(false);
+        if should_remove {
+            tracing::debug!(path = %lock_path.display(), "removing stale activity lock file");
+            let _ = std::fs::remove_file(&lock_path);
+        }
+    }
+
+    // Also clean up the deprecated .mailbox.activity.lock path (legacy).
+    if let Some(parent) = db_path.parent() {
+        let legacy_lock = parent.join(".mailbox.activity.lock");
+        if legacy_lock.exists() {
+            let should_remove = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&legacy_lock)
+                .and_then(|f| {
+                    fs2::FileExt::try_lock_exclusive(&f)?;
+                    fs2::FileExt::unlock(&f)?;
+                    Ok(true)
+                })
+                .unwrap_or(false);
+            if should_remove {
+                tracing::debug!(path = %legacy_lock.display(), "removing stale legacy activity lock file");
+                let _ = std::fs::remove_file(&legacy_lock);
+            }
+        }
+    }
+
+    // Remove truncated/corrupt WAL and orphaned SHM sidecars.
+    // A WAL < 32 bytes (the header size) is definitely corrupt.
+    const WAL_HEADER_BYTES: u64 = 32;
+    let mut wal_removed = false;
+    {
+        let mut wal_os = db_path.as_os_str().to_os_string();
+        wal_os.push("-wal");
+        let wal_path = PathBuf::from(wal_os);
+        if let Ok(meta) = std::fs::metadata(&wal_path) {
+            if meta.len() < WAL_HEADER_BYTES {
+                eprintln!(
+                    "[info] Removing truncated WAL file {} ({} bytes)",
+                    wal_path.display(),
+                    meta.len()
+                );
+                let _ = std::fs::remove_file(&wal_path);
+                wal_removed = true;
+            }
+        }
+    }
+    if wal_removed {
+        let mut shm_os = db_path.as_os_str().to_os_string();
+        shm_os.push("-shm");
+        let shm_path = PathBuf::from(shm_os);
+        if shm_path.exists() {
+            eprintln!("[info] Removing orphaned SHM file {}", shm_path.display());
+            let _ = std::fs::remove_file(&shm_path);
+        }
+    }
 }
 
 /// If an Agent Mail server is already listening on `host:port`, stop it so we can start fresh.
@@ -3546,15 +3635,18 @@ fn handle_serve_http(
             "Agent setup self-heal encountered an issue (non-fatal): {e}"
         ));
     }
-    // Kill any stale Agent Mail processes holding the database file BEFORE
-    // running preflight probes — otherwise the db-lock probe will fail.
+    // Kill any existing Agent Mail server on the port FIRST — on macOS
+    // we can't find processes by DB file handle (no /proc), but we CAN
+    // find them by port.  This also handles Codex-spawned `am serve-http`.
+    auto_clear_port(&config.http_host, config.http_port)?;
+    // Kill any remaining stale Agent Mail processes holding the database
+    // file and clean up stale lock/WAL artifacts.
     auto_clear_db_blockers(&config)?;
     let preflight_report =
         mcp_agent_mail_server::startup_checks::run_http_startup_preflight_probes(&config);
     if !preflight_report.is_ok() {
         return Err(CliError::Other(preflight_report.format_errors()));
     }
-    auto_clear_port(&config.http_host, config.http_port)?;
     if config.tui_enabled {
         emit_pre_tui_startup_banner(&config);
     }

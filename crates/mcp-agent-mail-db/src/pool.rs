@@ -3551,34 +3551,63 @@ fn sqlite_canonical_incremental_check_is_ok(
     sqlite_pragma_check_is_ok_canonical(conn, "PRAGMA integrity_check(1)")
 }
 
-/// Remove empty WAL/SHM sidecars that cause "WAL file too small for header"
-/// errors during SQLite open.
+/// Remove corrupt or truncated WAL/SHM sidecars that cause "WAL file too
+/// small for header" errors during SQLite open.
 ///
-/// A 0-byte `-wal` file is pathological: SQLite expects either no WAL (so it
-/// creates a fresh one) or a WAL with at least a 32-byte header. A zero-length
-/// WAL can be left behind when:
+/// The SQLite WAL header is 32 bytes.  Any WAL file shorter than that is
+/// pathological and cannot be used.  A truncated WAL can be left behind when:
 /// - A crash occurs during the `DELETE` -> `WAL` journal mode transition
 /// - A `PRAGMA journal_size_limit` triggers truncation racing with a reader
 /// - The process is killed between WAL creation and first header write
+/// - SIGKILL terminates a writer mid-checkpoint
 ///
-/// Removing the empty file is always safe because SQLite recreates the WAL
-/// on the next write. We also remove empty SHM files for consistency.
+/// Removing a sub-header WAL is always safe because SQLite recreates the WAL
+/// on the next write.  We also remove SHM files whose companion WAL was
+/// removed, since the SHM is meaningless without a WAL.
 fn cleanup_empty_wal_sidecar(sqlite_path: &str) {
+    /// Minimum size for a valid SQLite WAL file (32-byte header).
+    const WAL_HEADER_BYTES: u64 = 32;
+
     let db_path = Path::new(sqlite_path);
     if !db_path.exists() {
         return;
     }
-    for suffix in ["-wal", "-shm"] {
-        let mut sidecar_os = db_path.as_os_str().to_os_string();
-        sidecar_os.push(suffix);
-        let sidecar_path = PathBuf::from(sidecar_os);
-        match std::fs::metadata(&sidecar_path) {
-            Ok(meta) if meta.len() == 0 => {
+
+    let mut wal_removed = false;
+
+    // Check WAL first.
+    {
+        let mut wal_os = db_path.as_os_str().to_os_string();
+        wal_os.push("-wal");
+        let wal_path = PathBuf::from(wal_os);
+        match std::fs::metadata(&wal_path) {
+            Ok(meta) if meta.len() < WAL_HEADER_BYTES => {
                 tracing::warn!(
-                    path = %sidecar_path.display(),
-                    "removing empty WAL/SHM sidecar (prevents 'WAL file too small for header' errors)"
+                    path = %wal_path.display(),
+                    size = meta.len(),
+                    "removing truncated WAL sidecar (<{WAL_HEADER_BYTES} bytes; prevents 'WAL file too small for header' errors)"
                 );
-                let _ = std::fs::remove_file(&sidecar_path);
+                let _ = std::fs::remove_file(&wal_path);
+                wal_removed = true;
+            }
+            _ => {}
+        }
+    }
+
+    // Remove SHM when it's empty OR when we just removed the WAL (the SHM
+    // is meaningless without a companion WAL).
+    {
+        let mut shm_os = db_path.as_os_str().to_os_string();
+        shm_os.push("-shm");
+        let shm_path = PathBuf::from(shm_os);
+        match std::fs::metadata(&shm_path) {
+            Ok(meta) if meta.len() == 0 || wal_removed => {
+                tracing::warn!(
+                    path = %shm_path.display(),
+                    reason = if wal_removed { "companion WAL removed" } else { "empty" },
+                    "removing orphaned SHM sidecar"
+                );
+                let _ = std::fs::remove_file(&shm_path);
             }
             _ => {}
         }

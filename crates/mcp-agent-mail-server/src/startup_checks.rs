@@ -1846,16 +1846,42 @@ fn probe_integrity(config: &Config) -> ProbeResult {
             if mcp_agent_mail_db::is_lock_error(&err_str) {
                 return integrity_busy_probe_failure(config, &err_str);
             }
-            // If pool creation itself failed due to corruption, attempt
-            // file-level recovery before giving up.
+            // If pool creation failed due to corruption (often a corrupt WAL),
+            // try removing the WAL/SHM sidecars and retrying once.  A corrupt
+            // WAL with a valid main DB file is the most common crash artifact
+            // and removing it lets SQLite fall back to the main file cleanly.
             if mcp_agent_mail_db::is_corruption_error_message(&err_str) {
-                return attempt_probe_recovery(config);
+                if let Some(db_path) =
+                    resolve_server_database_url_sqlite_path(&config.database_url)
+                {
+                    if try_remove_corrupt_wal(&db_path) {
+                        tracing::info!(
+                            path = %db_path.display(),
+                            "removed corrupt WAL/SHM sidecars; retrying pool open"
+                        );
+                        // Retry pool open after WAL removal.
+                        if let Ok(p) = mcp_agent_mail_db::DbPool::new(&pool_config) {
+                            // Fall through to integrity check below with the
+                            // new pool.
+                            tracing::info!("pool open succeeded after WAL removal");
+                            p
+                        } else {
+                            return attempt_probe_recovery(config);
+                        }
+                    } else {
+                        return attempt_probe_recovery(config);
+                    }
+                } else {
+                    return attempt_probe_recovery(config);
+                }
+            } else {
+                return ProbeResult::Fail(ProbeFailure {
+                    name: "integrity",
+                    problem: format!("Cannot create pool for integrity check: {e}"),
+                    fix: "Check DATABASE_URL or set INTEGRITY_CHECK_ON_STARTUP=false to skip"
+                        .into(),
+                });
             }
-            return ProbeResult::Fail(ProbeFailure {
-                name: "integrity",
-                problem: format!("Cannot create pool for integrity check: {e}"),
-                fix: "Check DATABASE_URL or set INTEGRITY_CHECK_ON_STARTUP=false to skip".into(),
-            });
         }
     };
 
@@ -1873,6 +1899,26 @@ fn probe_integrity(config: &Config) -> ProbeResult {
             attempt_probe_recovery(config)
         }
     }
+}
+
+/// Try to remove corrupt WAL/SHM sidecars so SQLite can fall back to the
+/// main database file.  Returns `true` if at least one sidecar was removed.
+fn try_remove_corrupt_wal(db_path: &std::path::Path) -> bool {
+    let mut removed = false;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar_os = db_path.as_os_str().to_os_string();
+        sidecar_os.push(suffix);
+        let sidecar = std::path::PathBuf::from(sidecar_os);
+        if sidecar.exists() {
+            tracing::warn!(
+                path = %sidecar.display(),
+                "removing corrupt/stale WAL/SHM sidecar during startup recovery"
+            );
+            let _ = std::fs::remove_file(&sidecar);
+            removed = true;
+        }
+    }
+    removed
 }
 
 fn integrity_busy_probe_failure(config: &Config, detail: &str) -> ProbeResult {

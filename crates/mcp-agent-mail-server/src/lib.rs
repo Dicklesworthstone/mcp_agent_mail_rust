@@ -1109,26 +1109,63 @@ fn acquire_mailbox_activity_lock_for_subject(
         fs::create_dir_all(parent)?;
     }
 
-    let lock_file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)?;
+    let try_acquire = |path: &Path| -> std::io::Result<fs::File> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
 
-    let lock_result = match mode {
-        MailboxActivityLockMode::Shared => fs2::FileExt::try_lock_shared(&lock_file),
-        MailboxActivityLockMode::Exclusive => fs2::FileExt::try_lock_exclusive(&lock_file),
+        let result = match mode {
+            MailboxActivityLockMode::Shared => fs2::FileExt::try_lock_shared(&file),
+            MailboxActivityLockMode::Exclusive => fs2::FileExt::try_lock_exclusive(&file),
+        };
+        result.map(|()| file)
     };
-    if let Err(err) = lock_result {
-        return Err(mailbox_activity_lock_contention_error(
-            subject_path,
-            subject_kind,
-            &lock_path,
-            mode,
-            &err,
-        ));
-    }
+
+    let lock_file = match try_acquire(&lock_path) {
+        Ok(file) => file,
+        Err(first_err)
+            if first_err.kind() == std::io::ErrorKind::WouldBlock
+                && lock_path.exists() =>
+        {
+            // The lock file exists but we can't acquire it.  On macOS this can
+            // happen after a process was killed: the kernel released the flock
+            // but the file descriptor lingers until the zombie is reaped.
+            // Delete the stale lock file and create a fresh one — flock is
+            // per-fd, so the old holder (if any) keeps its lock on the
+            // now-unlinked inode while we get a clean new inode.
+            tracing::warn!(
+                path = %lock_path.display(),
+                "activity lock contended; removing stale lock file and retrying"
+            );
+            let _ = fs::remove_file(&lock_path);
+            // Brief pause to let any zombie fd release propagate.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            match try_acquire(&lock_path) {
+                Ok(file) => file,
+                Err(retry_err) => {
+                    return Err(mailbox_activity_lock_contention_error(
+                        subject_path,
+                        subject_kind,
+                        &lock_path,
+                        mode,
+                        &retry_err,
+                    ));
+                }
+            }
+        }
+        Err(err) => {
+            return Err(mailbox_activity_lock_contention_error(
+                subject_path,
+                subject_kind,
+                &lock_path,
+                mode,
+                &err,
+            ));
+        }
+    };
 
     Ok(Some(MailboxActivityLockGuard {
         _mode: mode,
