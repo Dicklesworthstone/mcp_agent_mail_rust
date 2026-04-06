@@ -2006,10 +2006,12 @@ impl Config {
         // database lives alongside the storage directory rather than relative
         // to an arbitrary CWD.
         if config.database_url == DEFAULT_LEGACY_DATABASE_URL {
-            config.database_url = format!(
-                "sqlite:///{}",
-                config.storage_root.join("storage.sqlite3").display()
-            );
+            let db_file = config.storage_root.join("storage.sqlite3");
+            // Use `sqlite://` (2 slashes) so that an absolute storage_root
+            // (starting with `/`) produces the standard 3-slash form
+            // `sqlite:///abs/path` rather than the ugly 4-slash
+            // `sqlite:////abs/path`.
+            config.database_url = format!("sqlite://{}", db_file.display());
         }
 
         config
