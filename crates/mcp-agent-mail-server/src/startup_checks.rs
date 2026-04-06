@@ -163,10 +163,25 @@ fn identify_lock_holder_via_proc(db_path: &std::path::Path) -> Option<LockHolder
     None
 }
 
+/// macOS/BSD fallback: use `lsof` to find the process holding the DB file.
 #[cfg(not(target_os = "linux"))]
-fn identify_lock_holder_via_proc(_db_path: &std::path::Path) -> Option<LockHolder> {
-    // /proc/locks is Linux-specific; gracefully return None elsewhere.
-    None
+fn identify_lock_holder_via_proc(db_path: &std::path::Path) -> Option<LockHolder> {
+    let pids = pids_holding_file(db_path);
+    let pid = *pids.first()?;
+    let cmdline = pid_command_line(pid).unwrap_or_else(|| format!("<PID {pid}>"));
+    let is_python = cmdline
+        .split_whitespace()
+        .next()
+        .map(|argv0| {
+            let basename = argv0.rsplit(['/', '\\']).next().unwrap_or(argv0);
+            basename.starts_with("python")
+        })
+        .unwrap_or(false);
+    Some(LockHolder {
+        pid,
+        cmdline,
+        is_python,
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -228,10 +243,30 @@ pub fn pids_holding_file(path: &std::path::Path) -> Vec<u32> {
     holders
 }
 
+/// Find all PIDs that have the given file open (via `lsof`).
+///
+/// macOS has no `/proc` filesystem, so we shell out to `lsof` and parse the
+/// output.  Automatically excludes the current process.
 #[cfg(not(target_os = "linux"))]
 #[must_use]
-pub fn pids_holding_file(_path: &std::path::Path) -> Vec<u32> {
-    Vec::new()
+pub fn pids_holding_file(path: &std::path::Path) -> Vec<u32> {
+    let my_pid = std::process::id();
+    let Ok(output) = std::process::Command::new("lsof")
+        .args(["-t", "-w"])
+        .arg(path)
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .split_whitespace()
+        .filter_map(|s| s.parse::<u32>().ok())
+        .filter(|&pid| pid != my_pid)
+        .collect()
 }
 
 /// Find Agent Mail PIDs that have the given database file open.
@@ -628,10 +663,23 @@ pub fn agent_mail_pids_all_stopped(pids: &[u32]) -> bool {
     !pids.is_empty() && pids.iter().all(|pid| pid_is_stopped(*pid))
 }
 
+/// Check if all the given PIDs have exited (macOS/BSD version).
+///
+/// Uses `kill -0` via `ps` to probe whether each process is still alive.
+/// Returns `true` when every PID is gone.
 #[cfg(not(target_os = "linux"))]
 #[must_use]
-pub fn agent_mail_pids_all_stopped(_pids: &[u32]) -> bool {
-    false
+pub fn agent_mail_pids_all_stopped(pids: &[u32]) -> bool {
+    !pids.is_empty()
+        && pids.iter().all(|&pid| {
+            // `ps -p <pid>` exits 0 if alive, 1 if gone.
+            !std::process::Command::new("ps")
+                .args(["-p", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        })
 }
 
 fn listener_pid_hint_path(host: &str, port: u16) -> PathBuf {
