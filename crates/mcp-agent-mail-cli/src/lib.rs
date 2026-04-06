@@ -2842,7 +2842,8 @@ fn cleanup_stale_db_artifacts(db_path: &Path) {
             let holders =
                 mcp_agent_mail_server::startup_checks::pids_holding_file(db_path);
             if holders.is_empty() {
-                // No process holds the file — try a PASSIVE checkpoint.
+                // No process holds the file — try a TRUNCATE checkpoint
+                // to merge the WAL into the main file and clear it.
                 let checkpoint_ok = db_path
                     .to_str()
                     .and_then(|path_str| {
@@ -2858,6 +2859,12 @@ fn cleanup_stale_db_artifacts(db_path: &Path) {
                         wal_path.display(),
                         meta.len()
                     );
+                    // Also remove the SHM after a successful checkpoint —
+                    // SQLite recreates it on next open, and a stale SHM can
+                    // confuse FrankenSQLite.
+                    let mut shm_os2 = db_path.as_os_str().to_os_string();
+                    shm_os2.push("-shm");
+                    let _ = std::fs::remove_file(PathBuf::from(shm_os2));
                 } else {
                     // Checkpoint failed — remove the WAL to unblock startup.
                     eprintln!(
