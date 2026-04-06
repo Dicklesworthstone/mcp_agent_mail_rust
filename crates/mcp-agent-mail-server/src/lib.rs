@@ -10615,7 +10615,6 @@ fn readiness_check_semantic_status(
         "agents",
         "messages",
         "message_recipients",
-        "threads",
     ]
     .into_iter()
     .filter(|name| !present.contains(*name))

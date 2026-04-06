@@ -191,7 +191,6 @@ const HEALTH_CHECK_REQUIRED_TABLES: &[&str] = &[
     "agents",
     "messages",
     "message_recipients",
-    "threads",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

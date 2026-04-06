@@ -14230,7 +14230,6 @@ fn doctor_required_tables(conn: &mcp_agent_mail_db::DbConn) -> CliResult<Vec<Str
         "agents",
         "messages",
         "message_recipients",
-        "threads",
     ];
     let rows = conn
         .query_sync(
@@ -27523,10 +27522,6 @@ startup_timeout_sec = 42
             "CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, kind TEXT)",
         )
         .expect("create message_recipients");
-        conn.execute_raw(
-            "CREATE TABLE threads (id INTEGER PRIMARY KEY, project_id INTEGER, thread_key TEXT)",
-        )
-        .expect("create threads");
         conn.execute_raw(
             "INSERT INTO projects (slug, human_key, created_at) VALUES ('proj-alpha', '/tmp/proj-alpha', 0)",
         )

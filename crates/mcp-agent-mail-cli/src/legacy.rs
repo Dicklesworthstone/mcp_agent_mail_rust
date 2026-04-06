@@ -20,7 +20,7 @@ use mcp_agent_mail_db::schema;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Args, Debug)]
@@ -1105,6 +1105,19 @@ fn build_detect_report(
         }
     }
 
+    // Bug #87: If the installed `am` binary is a compiled native executable
+    // (ELF, Mach-O, PE) rather than a Python script, the markers we collected
+    // are artefacts of the *Rust* installation, not a legacy Python one.
+    // Clear the markers so we don't falsely offer a migration prompt.
+    if !markers.is_empty() {
+        let has_python_binary = find_installed_am_binary()
+            .map(|p| is_likely_python_binary(&p))
+            .unwrap_or(false);
+        if !has_python_binary {
+            markers.clear();
+        }
+    }
+
     let score: u32 = markers
         .iter()
         .map(|m| match m.severity {
@@ -1158,6 +1171,91 @@ fn build_detect_report(
         db_signature,
         recommended_action,
     })
+}
+
+/// Check whether a binary at `path` is likely a Python script (shebang with
+/// "python") rather than a compiled native binary (ELF, Mach-O, PE).
+///
+/// Returns `true` only when positive evidence of Python is found.  For native
+/// executables or any unreadable/missing file the function returns `false`.
+fn is_likely_python_binary(path: &Path) -> bool {
+    let mut file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut header = [0u8; 64];
+    let n = match file.read(&mut header) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    if n < 2 {
+        return false;
+    }
+
+    // Shebang — check if the interpreter line references Python.
+    if header[0] == b'#' && header[1] == b'!' {
+        let line = std::str::from_utf8(&header[..n]).unwrap_or("");
+        return line.to_ascii_lowercase().contains("python");
+    }
+
+    // ELF magic: 0x7f 'E' 'L' 'F'
+    if n >= 4 && header[..4] == [0x7f, b'E', b'L', b'F'] {
+        return false;
+    }
+
+    // PE (Windows) magic: 'M' 'Z'
+    if header[0] == b'M' && header[1] == b'Z' {
+        return false;
+    }
+
+    // Mach-O magic (32-bit and 64-bit, both endiannesses)
+    if n >= 4 {
+        let magic = &header[..4];
+        if magic == [0xcf, 0xfa, 0xed, 0xfe]   // MH_MAGIC_64 (little-endian)
+            || magic == [0xfe, 0xed, 0xfa, 0xcf] // MH_MAGIC_64 (big-endian)
+            || magic == [0xce, 0xfa, 0xed, 0xfe] // MH_MAGIC (little-endian)
+            || magic == [0xfe, 0xed, 0xfa, 0xce] // MH_MAGIC (big-endian)
+        {
+            return false;
+        }
+    }
+
+    // Unknown format — assume not Python.
+    false
+}
+
+/// Find the installed `am` binary.
+///
+/// We first check whether the currently-running process IS the `am` CLI
+/// (by looking at the executable's file name).  If it is, we return its
+/// path directly.  Otherwise we fall back to a PATH lookup via `which`.
+fn find_installed_am_binary() -> Option<PathBuf> {
+    // If the currently-running executable is `am`, use it directly.
+    if let Ok(exe) = std::env::current_exe() {
+        if exe
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name == "am")
+        {
+            return Some(exe);
+        }
+    }
+    // Fallback: look up `am` in PATH via `which`.
+    if let Ok(output) = std::process::Command::new("which")
+        .arg("am")
+        .output()
+    {
+        if output.status.success() {
+            let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path_str.is_empty() {
+                let p = PathBuf::from(path_str);
+                if p.exists() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn detect_pyproject_marker(search_root: &Path) -> Option<LegacyMarker> {
