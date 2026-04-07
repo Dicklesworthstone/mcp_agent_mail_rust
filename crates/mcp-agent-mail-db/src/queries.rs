@@ -823,10 +823,27 @@ fn tracked(conn: &crate::DbConn) -> TrackedConnection<'_> {
 /// Read once from `FSQLITE_CONCURRENT_MODE` env var; defaults to `false`.
 /// When `false`, all transactions use `BEGIN IMMEDIATE` (single-writer).
 /// Set `FSQLITE_CONCURRENT_MODE=true` to opt in to `BEGIN CONCURRENT`.
+///
+/// **Warning:** Concurrent mode is known to cause snapshot drift
+/// (`fcw_base_drift`) under sustained write load, where `snapshot_high`
+/// lags behind `commit_seq` and all writes eventually fail.  See
+/// <https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/65>.
+/// The underlying frankensqlite MVCC snapshot-advance bug has not yet
+/// been fixed.  Single-writer mode (`BEGIN IMMEDIATE`) is recommended
+/// for all deployments.
 static CONCURRENT_MODE_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    std::env::var("FSQLITE_CONCURRENT_MODE")
+    let enabled = std::env::var("FSQLITE_CONCURRENT_MODE")
         .ok()
-        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+    if enabled {
+        tracing::warn!(
+            "FSQLITE_CONCURRENT_MODE=true: BEGIN CONCURRENT is enabled. \
+             This mode has a known snapshot-drift bug (GH#65) that causes \
+             all writes to fail after ~10-20 operations. Single-writer mode \
+             (FSQLITE_CONCURRENT_MODE=false) is strongly recommended."
+        );
+    }
+    enabled
 });
 
 fn should_fallback_begin_concurrent(err_msg: &str) -> bool {
@@ -1487,6 +1504,13 @@ fn is_plain_write_contention_error(e: &DbError) -> bool {
 /// retries plain `SQLite` busy/locked contention for the same reason: once a
 /// write transaction has failed mid-flight, retrying a single statement is not
 /// sufficient to guarantee a coherent outcome.
+///
+/// **IMPORTANT (GH#65):** Each retry *must* issue a fresh `BEGIN CONCURRENT`
+/// (or `BEGIN IMMEDIATE`) so that the new transaction obtains a current
+/// snapshot from `load_consistent_snapshot()`.  Reusing a connection's
+/// stale snapshot across retries causes `fcw_base_drift` rejection where
+/// `snapshot_high` permanently lags behind `commit_seq`.  Callers achieve
+/// this by placing `begin_concurrent_tx` inside the closure passed here.
 async fn run_with_mvcc_retry<T, F, Fut>(
     cx: &Cx,
     operation: &'static str,

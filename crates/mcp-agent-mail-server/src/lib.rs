@@ -1254,6 +1254,19 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     spawn_startup_search_backfill(config);
 
     log_active_database(config);
+
+    // Surface a prominent warning when MVCC concurrent mode is enabled so
+    // operators are aware of the known snapshot-drift limitation (GH#65).
+    if config.fsqlite_concurrent_mode {
+        tracing::warn!(
+            "fsqlite_concurrent_mode=true: MVCC concurrent writes enabled. \
+             This mode has a known snapshot-drift issue (GH#65) that can cause \
+             all writes to fail after ~10-20 operations under sustained load. \
+             Set FSQLITE_CONCURRENT_MODE=false (the default) to use reliable \
+             single-writer mode."
+        );
+    }
+
     tracing::info!("MCP Agent Mail server (stdio) starting transport loop");
     build_server(config).run_stdio();
 

@@ -298,10 +298,20 @@ use crate::sqlmodel::Value;
 ///
 /// Controlled by `FSQLITE_CONCURRENT_MODE` (default: disabled).
 /// Set `FSQLITE_CONCURRENT_MODE=true` to opt in.
+///
+/// See queries.rs `CONCURRENT_MODE_ENABLED` for the known snapshot-drift
+/// limitation (GH#65).
 static SYNC_CONCURRENT_MODE_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    std::env::var("FSQLITE_CONCURRENT_MODE")
+    let enabled = std::env::var("FSQLITE_CONCURRENT_MODE")
         .ok()
-        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
+    if enabled {
+        tracing::warn!(
+            "FSQLITE_CONCURRENT_MODE=true (search_recipes): BEGIN CONCURRENT enabled \
+             for sync write helpers. See GH#65 for known snapshot-drift limitations."
+        );
+    }
+    enabled
 });
 
 fn begin_sync_write_tx(conn: &DbConn) -> Result<(), String> {

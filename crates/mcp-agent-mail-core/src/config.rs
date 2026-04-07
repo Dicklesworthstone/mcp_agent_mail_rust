@@ -63,7 +63,13 @@ pub struct Config {
     pub integrity_check_interval_hours: u64,
 
     // FrankenSQLite MVCC / RaptorQ
-    /// Auto-promote bare `BEGIN` to `BEGIN CONCURRENT` (default: true).
+    /// Use `BEGIN CONCURRENT` for write transactions (default: **false**).
+    ///
+    /// Disabled by default due to known MVCC snapshot-drift bug (GH#65):
+    /// under sustained write load, `snapshot_high` lags behind `commit_seq`
+    /// and all writes fail with `fcw_base_drift`.  Use `BEGIN IMMEDIATE`
+    /// (single-writer) unless you have a specific need for concurrent
+    /// writers and have tested your workload.
     pub fsqlite_concurrent_mode: bool,
     /// Enable `RaptorQ` erasure-coded self-healing on WAL + DB files (default: true).
     pub fsqlite_raptorq_enabled: bool,
