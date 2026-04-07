@@ -2884,33 +2884,103 @@ TOMLEOF
 
     BEGIN {
       in_section = 0
+      in_subtable = 0
       saw_section = 0
       saw_url_in_section = 0
       saw_startup_timeout_in_section = 0
       saw_http_headers_in_section = 0
+      duplicate_section = 0
     }
 
-    /^\[mcp_servers\.mcp_agent_mail\]([[:space:]]*#.*)?[[:space:]]*$/ || /^\[mcp_servers\."mcp-agent-mail"\]([[:space:]]*#.*)?[[:space:]]*$/ {
-      if (in_section) {
+    # Match the canonical section header (underscore form).
+    /^\[mcp_servers\.mcp_agent_mail\]([[:space:]]*#.*)?[[:space:]]*$/ {
+      if (in_section || in_subtable) {
         flush_section()
       }
+      if (saw_section) {
+        # Duplicate section — skip it entirely.  The first occurrence
+        # already has all the desired keys.
+        duplicate_section = 1
+        in_section = 0
+        in_subtable = 0
+        next
+      }
       in_section = 1
+      in_subtable = 0
       saw_section = 1
       saw_url_in_section = 0
       saw_startup_timeout_in_section = 0
       saw_http_headers_in_section = 0
+      duplicate_section = 0
       print
       next
     }
 
+    # Match the hyphenated variant — bare or quoted (normalize to underscore).
+    /^\[mcp_servers\.(mcp-agent-mail|"mcp-agent-mail")\]([[:space:]]*#.*)?[[:space:]]*$/ {
+      if (in_section || in_subtable) {
+        flush_section()
+      }
+      if (saw_section) {
+        duplicate_section = 1
+        in_section = 0
+        in_subtable = 0
+        next
+      }
+      in_section = 1
+      in_subtable = 0
+      saw_section = 1
+      saw_url_in_section = 0
+      saw_startup_timeout_in_section = 0
+      saw_http_headers_in_section = 0
+      duplicate_section = 0
+      # Normalize hyphenated form to underscore
+      print section_header
+      next
+    }
+
+    # Match sub-tables like [mcp_servers.mcp_agent_mail.http_headers].
+    # These are part of the mcp_agent_mail section and must be absorbed
+    # (our output uses inline table syntax instead).
+    /^\[mcp_servers\.mcp_agent_mail\./ || /^\[mcp_servers\.(mcp-agent-mail|"mcp-agent-mail")\./ {
+      in_subtable = 1
+      in_section = 0
+      # Do not print the sub-table header — we use inline form.
+      # Mark http_headers as seen so flush_section does not re-emit it.
+      if ($0 ~ /http_headers/) {
+        saw_http_headers_in_section = 1
+        if (desired_auth_header != "") {
+          # Emit the inline form instead (will appear at the end of
+          # the main section via flush_section if not already emitted).
+        }
+      }
+      next
+    }
+
+    # Any other [section] header ends our section/subtable.
     /^\[/ {
       if (in_section) {
         flush_section()
       }
       in_section = 0
+      in_subtable = 0
+      duplicate_section = 0
     }
 
     {
+      # Skip lines belonging to a duplicate section.
+      if (duplicate_section) {
+        next
+      }
+      # Skip lines belonging to a sub-table we are absorbing.
+      if (in_subtable) {
+        # Capture Authorization value from the sub-table if present.
+        if ($0 ~ /^[[:space:]]*Authorization[[:space:]]*=/) {
+          # Already handled via desired_auth_header
+        }
+        next
+      }
+
       if (in_section && $0 ~ /^[[:space:]]*(url|httpUrl)[[:space:]]*=/) {
         print "url = \"" desired_url "\""
         saw_url_in_section = 1
