@@ -21,7 +21,7 @@ against the legacy Python MCP Agent Mail behavior.
               "environment": "development",
               "http_host": "127.0.0.1",
               "http_port": 8765,
-              "database_url": "sqlite+aiosqlite:///./storage.sqlite3"
+              "database_url": "sqlite:///./storage.sqlite3"
             }
           }
         }
@@ -37,7 +37,7 @@ against the legacy Python MCP Agent Mail behavior.
           "expect": {
             "ok": {
               "environment": "development",
-              "database_url": "sqlite+aiosqlite:///./storage.sqlite3",
+              "database_url": "sqlite:///./storage.sqlite3",
               "http": { "host": "127.0.0.1", "port": 8765, "path": "/api/" }
             }
           }

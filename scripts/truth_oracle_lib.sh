@@ -6,6 +6,53 @@
 #   VERBOSE=0|1
 #   TRUTH_ORACLE_LOG_PREFIX=<label>
 
+truth_oracle_sqlite3_compat_bin() {
+    local tmp_root="${TMPDIR:-/tmp}"
+    local target_dir="${CARGO_TARGET_DIR:-${tmp_root%/}/cargo-target}"
+    local bin="${target_dir}/debug/test_db"
+    if [ -x "${bin}" ]; then
+        printf '%s\n' "${bin}"
+        return 0
+    fi
+
+    mkdir -p "${target_dir}" >/dev/null 2>&1 || true
+    if ! CARGO_TARGET_DIR="${target_dir}" cargo build -q -p mcp-agent-mail-cli --bin test_db >/dev/null 2>&1; then
+        return 127
+    fi
+    if [ ! -x "${bin}" ]; then
+        return 127
+    fi
+    printf '%s\n' "${bin}"
+}
+
+sqlite3() {
+    local bin
+    bin="$(truth_oracle_sqlite3_compat_bin)" || return 127
+    "${bin}" "$@"
+}
+
+truth_oracle_db_query_first() {
+    local db_path="$1"
+    local sql="$2"
+    AM_INTERFACE_MODE=cli am tooling db-query --db "${db_path}" --sql "${sql}" --first
+}
+
+truth_oracle_db_query_json() {
+    local db_path="$1"
+    local sql="$2"
+    AM_INTERFACE_MODE=cli am tooling db-query --db "${db_path}" --sql "${sql}" --json
+}
+
+truth_oracle_db_exec() {
+    local db_path="$1"
+    local sql="${2:-}"
+    if [ -n "${sql}" ]; then
+        AM_INTERFACE_MODE=cli am tooling db-exec --db "${db_path}" --sql "${sql}"
+    else
+        AM_INTERFACE_MODE=cli am tooling db-exec --db "${db_path}"
+    fi
+}
+
 log() {
     if [ "${VERBOSE:-0}" -eq 1 ]; then
         printf '[%s] %s\n' "${TRUTH_ORACLE_LOG_PREFIX:-truth-oracle}" "$*" >&2

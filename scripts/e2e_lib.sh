@@ -81,6 +81,32 @@ e2e_run_cargo() {
     cargo "$@"
 }
 
+e2e_sqlite3_compat_bin() {
+    local bin="${CARGO_TARGET_DIR}/debug/test_db"
+    if [ -x "${bin}" ]; then
+        printf '%s\n' "${bin}"
+        return 0
+    fi
+
+    if ! e2e_run_cargo build -q -p mcp-agent-mail-cli --bin test_db >/dev/null 2>&1; then
+        return 127
+    fi
+    if [ ! -x "${bin}" ]; then
+        return 127
+    fi
+    printf '%s\n' "${bin}"
+}
+
+sqlite3() {
+    local bin
+    bin="$(e2e_sqlite3_compat_bin)" || return 127
+    "${bin}" "$@"
+}
+
+e2e_has_sqlite_compat() {
+    e2e_sqlite3_compat_bin >/dev/null 2>&1
+}
+
 # Root of the project
 E2E_PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -2877,7 +2903,7 @@ e2e_db_query() {
     local db_path="$1"
     local sql="$2"
 
-    if ! command -v sqlite3 >/dev/null 2>&1; then
+    if ! e2e_has_sqlite_compat; then
         echo "(sqlite3 not found)"
         return 1
     fi
@@ -2907,7 +2933,7 @@ e2e_assert_db_row_count() {
     local expected_count="$3"
     local label="${4:-DB row count: ${table}}"
 
-    if ! command -v sqlite3 >/dev/null 2>&1; then
+    if ! e2e_has_sqlite_compat; then
         e2e_skip "${label} (sqlite3 not available)"
         return 0
     fi
@@ -2940,7 +2966,7 @@ e2e_assert_db_value() {
     local expected_value="$3"
     local label="${4:-DB value assertion}"
 
-    if ! command -v sqlite3 >/dev/null 2>&1; then
+    if ! e2e_has_sqlite_compat; then
         e2e_skip "${label} (sqlite3 not available)"
         return 0
     fi
@@ -2976,7 +3002,7 @@ e2e_assert_db_contains() {
     local value="$4"
     local label="${5:-DB contains: ${table}.${column}='${value}'}"
 
-    if ! command -v sqlite3 >/dev/null 2>&1; then
+    if ! e2e_has_sqlite_compat; then
         e2e_skip "${label} (sqlite3 not available)"
         return 0
     fi
@@ -3015,7 +3041,7 @@ e2e_assert_db_not_contains() {
     local value="$4"
     local label="${5:-DB not contains: ${table}.${column}='${value}'}"
 
-    if ! command -v sqlite3 >/dev/null 2>&1; then
+    if ! e2e_has_sqlite_compat; then
         e2e_skip "${label} (sqlite3 not available)"
         return 0
     fi
@@ -3052,7 +3078,7 @@ e2e_db_dump_table() {
     local table="$2"
     local limit="${3:-10}"
 
-    if ! command -v sqlite3 >/dev/null 2>&1; then
+    if ! e2e_has_sqlite_compat; then
         echo "(sqlite3 not found)"
         return 1
     fi
@@ -3076,7 +3102,7 @@ e2e_db_schema() {
     local db_path="$1"
     local table="$2"
 
-    if ! command -v sqlite3 >/dev/null 2>&1; then
+    if ! e2e_has_sqlite_compat; then
         echo "(sqlite3 not found)"
         return 1
     fi
@@ -3099,7 +3125,7 @@ e2e_save_db_snapshot() {
     local table="$2"
     local artifact_name="${3:-db_${table}.txt}"
 
-    if ! command -v sqlite3 >/dev/null 2>&1; then
+    if ! e2e_has_sqlite_compat; then
         e2e_save_artifact "$artifact_name" "(sqlite3 not found)"
         return 0
     fi
@@ -3188,7 +3214,7 @@ e2e_snapshot_all_tables() {
         return 0
     fi
 
-    if ! command -v sqlite3 >/dev/null 2>&1; then
+    if ! e2e_has_sqlite_compat; then
         e2e_save_artifact "diagnostics/db_snapshot_${prefix}_error.txt" \
             "(sqlite3 not found)"
         return 0

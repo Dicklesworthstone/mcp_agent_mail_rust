@@ -841,47 +841,57 @@ detect_python_binary() {
   if [ "$PYTHON_BINARY_FOUND" -eq 0 ]; then verbose "detect_python_binary:not_found"; fi
 }
 
+# Internal FrankenSQLite-backed DB helpers. These intentionally route through
+# the freshly installed `am` binary so installer repair logic uses the same
+# runtime stack as the shipped product.
+installed_am_db_query_scalar() {
+  local db_path="$1"
+  local sql="$2"
+  local cli_bin="${DEST:-}/${BIN_CLI:-am}"
+
+  [ -x "$cli_bin" ] || return 1
+  "$cli_bin" tooling db-query --db "$db_path" --sql "$sql" --first
+}
+
+installed_am_db_exec() {
+  local db_path="$1"
+  local sql="${2:-}"
+  local cli_bin="${DEST:-}/${BIN_CLI:-am}"
+
+  [ -x "$cli_bin" ] || return 1
+  if [ -n "$sql" ]; then
+    "$cli_bin" tooling db-exec --db "$db_path" --sql "$sql" >/dev/null
+  else
+    "$cli_bin" tooling db-exec --db "$db_path" >/dev/null
+  fi
+}
+
+installed_am_db_backup() {
+  local db_path="$1"
+  local output_path="$2"
+  local cli_bin="${DEST:-}/${BIN_CLI:-am}"
+
+  [ -x "$cli_bin" ] || return 1
+  "$cli_bin" tooling db-backup --db "$db_path" --output "$output_path" >/dev/null
+}
+
 # Copy a SQLite database as a consistent snapshot.
-# Prefer sqlite3 .backup to safely include WAL content and avoid torn copies.
+# Prefer the FrankenSQLite-backed CLI helper so WAL content is checkpointed
+# before copying and the snapshot is coherent.
 copy_sqlite_snapshot() {
   local src_db="$1"
   local dest_db="$2"
 
   rm -f "$dest_db" "${dest_db}-wal" "${dest_db}-shm" 2>/dev/null || true
 
-  if command -v sqlite3 >/dev/null 2>&1; then
-    local tmp_db escaped_tmp
-    tmp_db="${dest_db}.tmp.$$"
-    escaped_tmp=$(printf "%s" "$tmp_db" | sed "s/'/''/g")
-    rm -f "$tmp_db" 2>/dev/null || true
-    if sqlite3 "$src_db" ".timeout 5000" ".backup '$escaped_tmp'" >/dev/null 2>&1; then
-      mv -f "$tmp_db" "$dest_db"
-      return 0
-    fi
-    verbose "copy_sqlite_snapshot:fallback_copy reason=sqlite3_backup_failed src=${src_db} dest=${dest_db}"
-    rm -f "$tmp_db" 2>/dev/null || true
-  fi
-
-  # WAL checkpoint MUST succeed before a raw cp — otherwise pages in the WAL
-  # are lost and FrankenSQLite gets a BusySnapshot error for the missing pages.
-  if command -v sqlite3 >/dev/null 2>&1; then
-    if ! sqlite3 "$src_db" "PRAGMA busy_timeout = 10000; PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1; then
-      warn "WAL checkpoint failed on $src_db (database may be locked by running server)"
-      warn "Stop the Python server first, then re-run the installer"
-      return 1
-    fi
-  else
-    # Without sqlite3, we cannot safely checkpoint the WAL. Copy the WAL
-    # sidecar along with the main file so the Rust migration can replay it.
-    warn "sqlite3 not found; copying WAL sidecar to preserve uncheckpointed pages"
-    cp -p "$src_db" "$dest_db"
-    [ -f "${src_db}-wal" ] && cp -p "${src_db}-wal" "${dest_db}-wal"
-    [ -f "${src_db}-shm" ] && cp -p "${src_db}-shm" "${dest_db}-shm"
+  if installed_am_db_backup "$src_db" "$dest_db"; then
     return 0
   fi
 
+  warn "FrankenSQLite backup helper unavailable; copying DB file and sidecars directly"
   cp -p "$src_db" "$dest_db"
-  rm -f "${dest_db}-wal" "${dest_db}-shm" 2>/dev/null || true
+  [ -f "${src_db}-wal" ] && cp -p "${src_db}-wal" "${dest_db}-wal"
+  [ -f "${src_db}-shm" ] && cp -p "${src_db}-shm" "${dest_db}-shm"
 }
 
 count_matching_backup_files() {
@@ -985,19 +995,19 @@ probe_database_format_with_sqlite() {
   local type_query=""
   local row_query=""
 
-  command -v sqlite3 >/dev/null 2>&1 || return 1
   [ -f "$db_path" ] || return 1
+  installed_am_db_query_scalar "$db_path" "SELECT 1;" >/dev/null 2>&1 || return 1
 
   while IFS=: read -r table column; do
-    sqlite3 "$db_path" "SELECT 1 FROM sqlite_master WHERE type='table' AND name='${table}' LIMIT 1;" >/dev/null 2>&1 || continue
-    sqlite3 "$db_path" "SELECT 1 FROM pragma_table_info('${table}') WHERE name='${column}' LIMIT 1;" >/dev/null 2>&1 || continue
+    installed_am_db_query_scalar "$db_path" "SELECT 1 FROM sqlite_master WHERE type='table' AND name='${table}' LIMIT 1;" >/dev/null 2>&1 || continue
+    installed_am_db_query_scalar "$db_path" "SELECT 1 FROM pragma_table_info('${table}') WHERE name='${column}' LIMIT 1;" >/dev/null 2>&1 || continue
 
     row_query="SELECT 1 FROM ${table} LIMIT 1;"
-    row_present=$(sqlite3 "$db_path" "$row_query" 2>/dev/null | head -1 || true)
+    row_present=$(installed_am_db_query_scalar "$db_path" "$row_query" 2>/dev/null || true)
     [ -n "$row_present" ] && saw_rows=1
 
     type_query="SELECT typeof(${column}) FROM ${table} WHERE ${column} IS NOT NULL LIMIT 1;"
-    type_str=$(sqlite3 "$db_path" "$type_query" 2>/dev/null | head -1 || true)
+    type_str=$(installed_am_db_query_scalar "$db_path" "$type_query" 2>/dev/null || true)
     case "$type_str" in
       integer|real)
         saw_integer=1
@@ -1034,7 +1044,7 @@ project_sibling_suggestions:dismissed_ts
 EOF
 
   if [ "$saw_text" -eq 1 ] && [ "$saw_integer" -eq 0 ]; then
-    PYTHON_DB_FORMAT="TEXT timestamps (installer sqlite fallback, needs migration)"
+    PYTHON_DB_FORMAT="TEXT timestamps (installer fallback, needs migration)"
     return 0
   fi
   if [ "$saw_text" -eq 1 ] && [ "$saw_integer" -eq 1 ]; then
@@ -1042,7 +1052,7 @@ EOF
     return 0
   fi
   if [ "$saw_integer" -eq 1 ]; then
-    PYTHON_DB_FORMAT="i64 microseconds (installer sqlite fallback)"
+    PYTHON_DB_FORMAT="i64 microseconds (installer fallback)"
     return 0
   fi
   if [ "$saw_rows" -eq 1 ]; then
@@ -4912,8 +4922,8 @@ fi
 
 collect_migration_counts() {
   local db_path="$1"
-  if ! command -v sqlite3 >/dev/null 2>&1 || [ ! -f "$db_path" ]; then
-    echo "sqlite3_unavailable"
+  if [ ! -f "$db_path" ]; then
+    echo "db_helper_unavailable"
     return 0
   fi
   local tables=(
@@ -4928,7 +4938,7 @@ collect_migration_counts() {
   )
   local table count summary=""
   for table in "${tables[@]}"; do
-    count=$(sqlite3 "$db_path" "SELECT COUNT(*) FROM ${table};" 2>/dev/null || echo "na")
+    count=$(installed_am_db_query_scalar "$db_path" "SELECT COUNT(*) FROM ${table};" 2>/dev/null || echo "na")
     summary+="${table}=${count};"
   done
   echo "$summary"
@@ -4937,7 +4947,7 @@ collect_migration_counts() {
 migration_count_value_from_summary() {
   local summary="$1"
   local table="$2"
-  if [ -z "$summary" ] || [ "$summary" = "sqlite3_unavailable" ]; then
+  if [ -z "$summary" ] || [ "$summary" = "db_helper_unavailable" ]; then
     echo "na"
     return 0
   fi
@@ -5026,7 +5036,7 @@ sqlite_table_exists() {
   local db_path="$1"
   local table="$2"
   local exists
-  exists=$(sqlite3 "$db_path" "SELECT 1 FROM sqlite_master WHERE type='table' AND name='${table}' LIMIT 1;" 2>/dev/null || true)
+  exists=$(installed_am_db_query_scalar "$db_path" "SELECT 1 FROM sqlite_master WHERE type='table' AND name='${table}' LIMIT 1;" 2>/dev/null || true)
   [ "$exists" = "1" ]
 }
 
@@ -5035,7 +5045,7 @@ sqlite_column_exists() {
   local table="$2"
   local column="$3"
   local exists
-  exists=$(sqlite3 "$db_path" "SELECT 1 FROM pragma_table_info('${table}') WHERE name='${column}' LIMIT 1;" 2>/dev/null || true)
+  exists=$(installed_am_db_query_scalar "$db_path" "SELECT 1 FROM pragma_table_info('${table}') WHERE name='${column}' LIMIT 1;" 2>/dev/null || true)
   [ "$exists" = "1" ]
 }
 
@@ -5059,7 +5069,7 @@ sqlite_text_timestamp_columns_remaining() {
   )
   local remaining="" pair table column detected
 
-  if ! command -v sqlite3 >/dev/null 2>&1 || [ ! -f "$db_path" ]; then
+  if [ ! -f "$db_path" ]; then
     printf ''
     return 0
   fi
@@ -5069,7 +5079,7 @@ sqlite_text_timestamp_columns_remaining() {
     column="${pair##*:}"
     sqlite_table_exists "$db_path" "$table" || continue
     sqlite_column_exists "$db_path" "$table" "$column" || continue
-    detected=$(sqlite3 "$db_path" "SELECT 1 FROM ${table} WHERE typeof(${column}) = 'text' LIMIT 1;" 2>/dev/null | head -1 || true)
+    detected=$(installed_am_db_query_scalar "$db_path" "SELECT 1 FROM ${table} WHERE typeof(${column}) = 'text' LIMIT 1;" 2>/dev/null || true)
     if [ "$detected" = "1" ]; then
       if [ -n "$remaining" ]; then
         remaining="${remaining}, "
@@ -5093,8 +5103,8 @@ sqlite_pragma_reports_ok() {
 
   SQLITE_LAST_PRAGMA_FAILURE=""
 
-  if ! command -v sqlite3 >/dev/null 2>&1; then
-    SQLITE_LAST_PRAGMA_FAILURE="sqlite3 unavailable"
+  if ! installed_am_db_query_scalar "$db_path" "SELECT 1;" >/dev/null 2>&1; then
+    SQLITE_LAST_PRAGMA_FAILURE="db helper unavailable"
     return 1
   fi
   if [ ! -f "$db_path" ]; then
@@ -5102,7 +5112,7 @@ sqlite_pragma_reports_ok() {
     return 1
   fi
 
-  output=$(sqlite3 "$db_path" "PRAGMA ${pragma};" 2>/dev/null || true)
+  output=$(installed_am_db_query_scalar "$db_path" "PRAGMA ${pragma};" 2>/dev/null || true)
 
   while IFS= read -r line; do
     trimmed=$(printf '%s' "$line" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
@@ -5166,8 +5176,8 @@ sqlite_lightweight_self_heal() {
   local db_path="$1"
   local output=""
 
-  if ! command -v sqlite3 >/dev/null 2>&1; then
-    warn "sqlite3 is unavailable; cannot run installer structural self-heal."
+  if ! installed_am_db_query_scalar "$db_path" "SELECT 1;" >/dev/null 2>&1; then
+    warn "FrankenSQLite DB helper is unavailable; cannot run installer structural self-heal."
     return 1
   fi
   if [ ! -f "$db_path" ]; then
@@ -5175,7 +5185,7 @@ sqlite_lightweight_self_heal() {
     return 1
   fi
 
-  if output=$(sqlite3 "$db_path" <<'SQL' 2>&1
+  if output=$(installed_am_db_exec "$db_path" <<'SQL' 2>&1
 PRAGMA busy_timeout=60000;
 PRAGMA wal_checkpoint(TRUNCATE);
 REINDEX;
@@ -5183,14 +5193,14 @@ PRAGMA optimize;
 SQL
 ); then
     while IFS= read -r line; do
-      [ -n "$line" ] && verbose "migration:self_heal_sqlite ${line}"
+      [ -n "$line" ] && verbose "migration:self_heal_db ${line}"
     done <<< "$output"
-    ok "Applied SQLite checkpoint/reindex/optimize self-heal"
+    ok "Applied DB checkpoint/reindex/optimize self-heal"
     return 0
   else
-    warn "SQLite structural self-heal failed: $(printf '%s\n' "$output" | sed -n '1p')"
+    warn "DB structural self-heal failed: $(printf '%s\n' "$output" | sed -n '1p')"
     while IFS= read -r line; do
-      [ -n "$line" ] && verbose "migration:self_heal_sqlite ${line}"
+      [ -n "$line" ] && verbose "migration:self_heal_db ${line}"
     done <<< "$output"
     return 1
   fi
@@ -5341,8 +5351,8 @@ sqlite_timestamp_fallback_migration() {
   local post_heal_failure=""
   SQLITE_FALLBACK_BACKUP_PATH=""
 
-  if ! command -v sqlite3 >/dev/null 2>&1; then
-    warn "sqlite3 is unavailable; cannot run installer fallback timestamp migration."
+  if ! installed_am_db_query_scalar "$db_path" "SELECT 1;" >/dev/null 2>&1; then
+    warn "FrankenSQLite DB helper is unavailable; cannot run installer fallback timestamp migration."
     return 1
   fi
   if [ ! -f "$db_path" ]; then
@@ -5428,8 +5438,8 @@ SQL
 
   echo "COMMIT;" >> "$sql_file"
 
-  if ! sqlite3 "$db_path" < "$sql_file" >/dev/null 2>&1; then
-    warn "sqlite3 fallback timestamp migration failed."
+  if ! installed_am_db_exec "$db_path" < "$sql_file" >/dev/null 2>&1; then
+    warn "installer fallback timestamp migration failed."
     rm -f "$sql_file" 2>/dev/null || true
     return 1
   fi
@@ -5440,13 +5450,13 @@ SQL
 
   if ! sqlite_pragma_reports_ok "$db_path" "integrity_check"; then
     integrity_failure="${SQLITE_LAST_PRAGMA_FAILURE:-<empty>}"
-    warn "sqlite3 fallback migration produced integrity_check='${integrity_failure}'"
-    warn "Attempting sqlite3 fallback self-heal before escalating to archive-backed recovery."
+    warn "installer fallback migration produced integrity_check='${integrity_failure}'"
+    warn "Attempting installer fallback self-heal before escalating to archive-backed recovery."
     if sqlite_lightweight_self_heal "$db_path" && sqlite_pragma_reports_ok "$db_path" "integrity_check"; then
-      ok "sqlite3 fallback self-heal cleared post-migration integrity failures"
+      ok "installer fallback self-heal cleared post-migration integrity failures"
     else
       post_heal_failure="${SQLITE_LAST_PRAGMA_FAILURE:-$integrity_failure}"
-      warn "sqlite3 fallback self-heal could not clear integrity_check='${post_heal_failure}'"
+      warn "installer fallback self-heal could not clear integrity_check='${post_heal_failure}'"
       return 1
     fi
   fi
@@ -5454,12 +5464,12 @@ SQL
   local remaining_text_columns
   remaining_text_columns=$(sqlite_text_timestamp_columns_remaining "$db_path")
   if [ -n "$remaining_text_columns" ]; then
-    warn "sqlite3 fallback left TEXT timestamps in: ${remaining_text_columns}"
+    warn "installer fallback left TEXT timestamps in: ${remaining_text_columns}"
     return 1
   fi
 
   verbose "migration:fallback_sqlite ok db=${db_path} update_statements=${updates} backup=${SQLITE_FALLBACK_BACKUP_PATH:-<none>}"
-  ok "Database timestamps normalized (sqlite3 fallback)"
+  ok "Database timestamps normalized (installer fallback)"
   return 0
 }
 
@@ -5585,7 +5595,7 @@ if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ] && [ -n "$PYTHON_DB_MIGRATED_PATH" ]
         warn "Restored database from pristine snapshot after failed am migrate."
       else
         migration_restore_ok=1
-        warn "Failed to restore pristine snapshot after am migrate failure; attempting sqlite3 fallback in-place."
+        warn "Failed to restore pristine snapshot after am migrate failure; attempting installer fallback in-place."
       fi
     fi
 
@@ -5616,27 +5626,27 @@ if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ] && [ -n "$PYTHON_DB_MIGRATED_PATH" ]
     if ! sqlite_pragma_reports_ok "$PYTHON_DB_MIGRATED_PATH" "integrity_check"; then
       migration_requires_fallback=1
       migration_integrity="${SQLITE_LAST_PRAGMA_FAILURE:-<empty>}"
-      warn "am migrate produced integrity_check='${migration_integrity}'; forcing sqlite3 fallback."
+      warn "am migrate produced integrity_check='${migration_integrity}'; forcing installer fallback."
     fi
     if ! migration_core_counts_preserved "$migration_before_counts" "$migration_after_counts"; then
       migration_requires_fallback=1
-      warn "am migrate reduced core legacy row counts; forcing sqlite3 fallback."
+      warn "am migrate reduced core legacy row counts; forcing installer fallback."
     fi
   fi
 
   if [ "$migration_succeeded" -eq 1 ] && [ "$migration_requires_fallback" -eq 1 ]; then
-    warn "Reverting to pristine snapshot and running sqlite3 fallback migration."
+    warn "Reverting to pristine snapshot and running installer fallback migration."
     if [ -n "$migration_pristine_backup" ] && [ -f "$migration_pristine_backup" ]; then
       if copy_sqlite_snapshot "$migration_pristine_backup" "$PYTHON_DB_MIGRATED_PATH"; then
         migration_restore_ok=1
-        warn "Restored pristine migration snapshot before sqlite3 fallback."
+        warn "Restored pristine migration snapshot before installer fallback."
       else
         migration_restore_ok=1
-        warn "Failed to restore pristine snapshot prior to sqlite3 fallback migration; attempting sqlite3 fallback in-place."
+        warn "Failed to restore pristine snapshot prior to installer fallback migration; attempting installer fallback in-place."
       fi
     else
       migration_restore_ok=1
-      warn "Pristine migration snapshot missing; running sqlite3 fallback migration in-place."
+      warn "Pristine migration snapshot missing; running installer fallback migration in-place."
     fi
 
     if [ "$migration_restore_ok" -eq 1 ] && sqlite_timestamp_fallback_migration "$PYTHON_DB_MIGRATED_PATH"; then
@@ -5656,7 +5666,7 @@ if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ] && [ -n "$PYTHON_DB_MIGRATED_PATH" ]
       migration_succeeded=0
       migration_fallback_ok=0
       migration_recovery_needed=1
-      warn "sqlite3 fallback migration could not fully verify the database; escalating to automatic repair/reconstruction."
+      warn "installer fallback migration could not fully verify the database; escalating to automatic repair/reconstruction."
     fi
   fi
 

@@ -481,36 +481,7 @@ function Ensure-SqliteDll {
         [string]$InstallDir,
         [string]$ResolvedVersion
     )
-    $sqliteDest = Join-Path $InstallDir "sqlite3.dll"
-    if (Test-Path -LiteralPath $sqliteDest) {
-        return
-    }
-
-    $sqliteInArchive = Get-ChildItem -LiteralPath $ExtractDir -Filter "sqlite3.dll" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -ne $sqliteInArchive) {
-        Copy-Item -LiteralPath $sqliteInArchive.FullName -Destination $sqliteDest -Force
-        Write-Ok "Bundled sqlite3.dll installed"
-        return
-    }
-
-    $candidateAssets = @(
-        "https://github.com/$Owner/$Repo/releases/download/$ResolvedVersion/sqlite3.dll",
-        "https://github.com/$Owner/$Repo/releases/download/$ResolvedVersion/mcp-agent-mail-$Target-sqlite3.dll"
-    )
-
-    foreach ($assetUrl in $candidateAssets) {
-        try {
-            Download-File -Url $assetUrl -OutFile $sqliteDest
-            Write-Ok "Downloaded sqlite3.dll from release assets"
-            return
-        } catch {
-            if (Test-Path -LiteralPath $sqliteDest) {
-                Remove-Item -LiteralPath $sqliteDest -Force -ErrorAction SilentlyContinue
-            }
-        }
-    }
-
-    Write-WarnText "sqlite3.dll was not found in release assets. If startup reports a missing sqlite3.dll, place sqlite3.dll next to am.exe."
+    Write-Verbose "Ensure-SqliteDll: no-op; current Windows binaries do not require sqlite3.dll."
 }
 
 function Verify-Install {

@@ -5,7 +5,7 @@
 # (br-2k3qx.1.1 / Track A1).
 #
 # This script:
-# 1) Initializes a fresh agent-mail SQLite schema via headless server startup
+# 1) Initializes a fresh agent-mail SQLite schema via the canonical DB pool init path
 # 2) Bulk-seeds deterministic projects/agents/messages/threads directly in SQLite
 # 3) Emits a machine-readable validation report proving fixture integrity
 #
@@ -81,60 +81,22 @@ require_cmd() {
     command -v "$cmd" >/dev/null 2>&1 || die "missing required command: ${cmd}"
 }
 
-pick_port() {
-    python3 - <<'PY'
-import socket
-s = socket.socket()
-s.bind(("127.0.0.1", 0))
-print(s.getsockname()[1])
-s.close()
-PY
-}
-
-wait_for_health() {
-    local port="$1"
-    local attempts="${2:-100}"
-    local delay="${3:-0.1}"
-    local url="http://127.0.0.1:${port}/health"
-    local i
-    for i in $(seq 1 "${attempts}"); do
-        if curl -sS -o /dev/null --connect-timeout 1 "${url}" 2>/dev/null; then
-            return 0
-        fi
-        sleep "${delay}"
-    done
-    return 1
-}
-
 initialize_schema() {
     local db_path="$1"
     local storage_root="$2"
-    local port
-    local pid
     local log_path
 
-    port="$(pick_port)"
-    log_path="$(mktemp "${TMPDIR:-/tmp}/seed_fixture_server.XXXXXX.log")"
-    log "initializing schema using mcp-agent-mail serve on port ${port}"
+    log_path="$(mktemp "${TMPDIR:-/tmp}/seed_fixture_db_init.XXXXXX.log")"
+    log "initializing schema using am tooling db-init"
 
-    DATABASE_URL="sqlite:///${db_path}" \
-    STORAGE_ROOT="${storage_root}" \
-    HTTP_HOST="127.0.0.1" \
-    HTTP_PORT="${port}" \
-    TUI_ENABLED=false \
-    mcp-agent-mail serve --no-tui >"${log_path}" 2>&1 &
-    pid=$!
-
-    if ! wait_for_health "${port}" 150 0.1; then
-        kill "${pid}" >/dev/null 2>&1 || true
-        wait "${pid}" >/dev/null 2>&1 || true
+    if ! AM_INTERFACE_MODE=cli \
+        am tooling db-init --db "${db_path}" --storage-root "${storage_root}" \
+        >"${log_path}" 2>&1; then
         sed -n '1,200p' "${log_path}" >&2 || true
         rm -f "${log_path}" >/dev/null 2>&1 || true
-        die "failed to initialize schema (server did not become healthy)"
+        die "failed to initialize schema via am tooling db-init"
     fi
 
-    kill "${pid}" >/dev/null 2>&1 || true
-    wait "${pid}" >/dev/null 2>&1 || true
     rm -f "${log_path}" >/dev/null 2>&1 || true
 }
 
@@ -212,10 +174,8 @@ case "${SEED}" in (*[!0-9]*|"") die "--seed must be an integer >= 0" ;; esac
 [ "${SEED}" -ge 0 ] || die "--seed must be >= 0"
 [ "${MESSAGE_COUNT}" -ge "${THREAD_COUNT}" ] || die "--messages must be >= --threads"
 
-require_cmd mcp-agent-mail
+require_cmd am
 require_cmd python3
-require_cmd sqlite3
-require_cmd curl
 
 mkdir -p "$(dirname "${DB_PATH}")" "${STORAGE_ROOT}"
 
@@ -225,8 +185,6 @@ if [ -f "${DB_PATH}" ] || [ -f "${DB_PATH}-wal" ] || [ -f "${DB_PATH}-shm" ]; th
     fi
     rm -f "${DB_PATH}" "${DB_PATH}-wal" "${DB_PATH}-shm"
 fi
-
-touch "${DB_PATH}"
 
 if [ -z "${REPORT_PATH}" ]; then
     REPORT_PATH="${DB_PATH}.truth_fixture_report.json"
@@ -240,8 +198,8 @@ log "schema initialized at ${DB_PATH}"
 python3 - "${DB_PATH}" "${REPORT_PATH}" "${SEED}" "${PROJECT_COUNT}" "${AGENT_COUNT}" "${MESSAGE_COUNT}" "${THREAD_COUNT}" <<'PY'
 import hashlib
 import json
-import random
-import sqlite3
+import os
+import subprocess
 import sys
 from datetime import datetime, timezone
 
@@ -344,35 +302,71 @@ def split_even(total: int, buckets: int) -> list[int]:
     return [base + (1 if i < rem else 0) for i in range(buckets)]
 
 
-conn = sqlite3.connect(db_path)
-conn.execute("PRAGMA journal_mode=WAL")
-conn.execute("PRAGMA synchronous=NORMAL")
-cur = conn.cursor()
+def sql_quote(value):
+    if value is None:
+        return "NULL"
+    if isinstance(value, str):
+        return "'" + value.replace("'", "''") + "'"
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    return str(value)
 
-# Reset core fixture tables for deterministic reruns on an initialized schema.
-cur.execute("PRAGMA foreign_keys=OFF")
-cur.execute("DELETE FROM message_recipients")
-cur.execute("DELETE FROM messages")
-cur.execute("DELETE FROM agents")
-cur.execute("DELETE FROM projects")
-cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'")
-if cur.fetchone() is not None:
-    cur.execute("DELETE FROM sqlite_sequence WHERE name IN ('projects','agents','messages')")
-cur.execute("PRAGMA foreign_keys=ON")
-conn.commit()
+
+def run_am(args: list[str], *, stdin_text: str | None = None) -> str:
+    env = dict(os.environ)
+    env["AM_INTERFACE_MODE"] = "cli"
+    proc = subprocess.run(
+        ["am", *args],
+        input=stdin_text,
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"command failed ({proc.returncode}): {' '.join(args)}\n"
+            f"stdout:\n{proc.stdout}\n"
+            f"stderr:\n{proc.stderr}"
+        )
+    return proc.stdout
+
+
+def db_exec(script: str) -> None:
+    run_am(["tooling", "db-exec", "--db", db_path], stdin_text=script)
+
+
+def db_query_first(sql: str) -> str:
+    return run_am(
+        ["tooling", "db-query", "--db", db_path, "--sql", sql, "--first"]
+    ).strip()
+
+sql_lines = [
+    "PRAGMA journal_mode=WAL",
+    "PRAGMA synchronous=NORMAL",
+    "PRAGMA foreign_keys=OFF",
+    "DELETE FROM message_recipients",
+    "DELETE FROM messages",
+    "DELETE FROM agents",
+    "DELETE FROM projects",
+    "DELETE FROM sqlite_sequence WHERE name IN ('projects','agents','messages')",
+    "PRAGMA foreign_keys=ON",
+    "BEGIN IMMEDIATE",
+]
 
 # Projects
 project_ids: list[int] = []
 project_slugs: list[str] = []
 for p_idx in range(project_count):
+    project_id = p_idx + 1
     slug = f"truth-proj-{p_idx:03d}"
     human_key = f"/data/e2e/truth-fixture/project-{p_idx:03d}"
     created_at = base_ts + (p_idx * 10_000)
-    cur.execute(
-        "INSERT INTO projects (slug, human_key, created_at) VALUES (?, ?, ?)",
-        (slug, human_key, created_at),
+    sql_lines.append(
+        "INSERT INTO projects (id, slug, human_key, created_at) VALUES "
+        f"({project_id}, {sql_quote(slug)}, {sql_quote(human_key)}, {created_at})"
     )
-    project_ids.append(int(cur.lastrowid))
+    project_ids.append(project_id)
     project_slugs.append(slug)
 project_slug_by_id = dict(zip(project_ids, project_slugs))
 
@@ -380,6 +374,7 @@ project_slug_by_id = dict(zip(project_ids, project_slugs))
 agents_by_project: dict[int, list[tuple[int, str]]] = {pid: [] for pid in project_ids}
 agents_per_project = split_even(agent_count, project_count)
 agent_global = 0
+agent_id_counter = 1
 for p_idx, pid in enumerate(project_ids):
     for local_idx in range(agents_per_project[p_idx]):
         adjective = adjectives[(agent_global + seed) % len(adjectives)]
@@ -388,12 +383,15 @@ for p_idx, pid in enumerate(project_ids):
         program = programs[agent_global % len(programs)]
         model = models[agent_global % len(models)]
         ts = base_ts + 1_000_000 + (agent_global * 1_000)
-        cur.execute(
-            "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 'auto', 'auto')",
-            (pid, name, program, model, "truth fixture seed", ts, ts),
+        sql_lines.append(
+            "INSERT INTO agents "
+            "(id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) "
+            "VALUES "
+            f"({agent_id_counter}, {pid}, {sql_quote(name)}, {sql_quote(program)}, {sql_quote(model)}, "
+            f"{sql_quote('truth fixture seed')}, {ts}, {ts}, 'auto', 'auto')"
         )
-        agents_by_project[pid].append((int(cur.lastrowid), name))
+        agents_by_project[pid].append((agent_id_counter, name))
+        agent_id_counter += 1
         agent_global += 1
 
 # Thread plan
@@ -409,6 +407,7 @@ messages_per_thread = split_even(message_count, thread_count)
 
 # Messages + recipients
 message_global = 0
+message_id_counter = 1
 importance_cycle = ["normal", "high", "urgent", "low"]
 for thread_idx, (pid, thread_id) in enumerate(thread_plan):
     project_slug = project_slug_by_id[pid]
@@ -435,12 +434,14 @@ for thread_idx, (pid, thread_id) in enumerate(thread_plan):
         importance = importance_cycle[message_global % len(importance_cycle)]
         ack_required = 1 if message_global % 6 == 0 else 0
         created_ts = base_ts + 10_000_000 + (message_global * 10_000)
-        cur.execute(
-            "INSERT INTO messages (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]')",
-            (pid, sender_id, thread_id, subject, body, importance, ack_required, created_ts),
+        message_id = message_id_counter
+        sql_lines.append(
+            "INSERT INTO messages "
+            "(id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) "
+            "VALUES "
+            f"({message_id}, {pid}, {sender_id}, {sql_quote(thread_id)}, {sql_quote(subject)}, {sql_quote(body)}, "
+            f"{sql_quote(importance)}, {ack_required}, {created_ts}, '[]')"
         )
-        message_id = int(cur.lastrowid)
 
         read_ts = created_ts + 2_000 if (message_global % 3) != 0 else None
         ack_ts = None
@@ -450,23 +451,22 @@ for thread_idx, (pid, thread_id) in enumerate(thread_plan):
             ack_ts = created_ts + 3_000
 
         kind = "to" if (message_global % 11) else "cc"
-        cur.execute(
-            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES (?, ?, ?, ?, ?)",
-            (message_id, recipient_id, kind, read_ts, ack_ts),
+        sql_lines.append(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) VALUES "
+            f"({message_id}, {recipient_id}, {sql_quote(kind)}, {sql_quote(read_ts)}, {sql_quote(ack_ts)})"
         )
 
+        message_id_counter += 1
         message_global += 1
 
-conn.commit()
+sql_lines.append("COMMIT")
+db_exec(";\n".join(sql_lines) + ";\n")
 
 # Validation report
 validation_results = {}
 for key, sql in validation_queries.items():
-    cur.execute(sql)
-    value = cur.fetchone()[0]
-    if value is None:
-        value = 0
-    validation_results[key] = int(value)
+    value = db_query_first(sql)
+    validation_results[key] = int(value or 0)
 
 summary = {
     "seed": seed,

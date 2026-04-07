@@ -7,7 +7,7 @@
 # 1. Seeds high-cardinality fixture via seed_truth_incident_fixture.sh
 # 2. Launches headless server in deterministic mode
 # 3. Captures key surface snapshots (dashboard/messages/threads/agents/projects/health)
-# 4. Queries SQLite directly for DB truth diagnostics
+# 4. Queries DB truth diagnostics via FrankenSQLite-backed CLI helpers
 # 5. Emits context + manifest metadata
 # 6. Bundles everything as a CI-consumable artifact
 #
@@ -48,6 +48,7 @@ SKIP_HTTP_SERVER=0
 SERVER_PID=""
 SERVER_LOG=""
 PROJECT_KEY=""
+PROJECT_SLUG=""
 AGENT_NAME=""
 THREAD_ID=""
 MESSAGE_ID=""
@@ -63,7 +64,7 @@ Usage: scripts/incident_capture_harness.sh [options]
 
 Options:
   --output-dir <path>       Artifact output directory
-  --db <path>               SQLite DB path (default: <output-dir>/incident_capture.sqlite3)
+  --db <path>               Mailbox DB path (default: <output-dir>/incident_capture.sqlite3)
   --storage-root <path>     Storage root path (default: <output-dir>/storage_root)
   --seed <n>                Deterministic seed (default: 20260302)
   --projects <n>            Project count (default: 15)
@@ -86,7 +87,7 @@ Outputs:
     context.json                       # Harness metadata (paths, IDs, seed)
     repro.sh                           # One-liner to reproduce this exact capture
     diagnostics/
-      db_counts.tsv                    # Raw SQLite counts
+      db_counts.tsv                    # Raw DB counts
       db_truth.json                    # Structured DB truth (counts + per-project)
       truth_comparison.json            # DB truth vs surface truth comparison
     logs/
@@ -183,8 +184,8 @@ run_robot_capture() {
         if [[ "${output_path}" == *.md ]]; then
             {
                 printf '# Capture Failure: %s\n\n' "${label}"
-                printf '- command: `am robot --project %s --agent %s %s`\n' "${PROJECT_KEY}" "${AGENT_NAME}" "$*"
-                printf '- exit_code: %d\n\n' "${exit_code}"
+                printf -- '- command: `am robot --project %s --agent %s %s`\n' "${PROJECT_KEY}" "${AGENT_NAME}" "$*"
+                printf -- '- exit_code: %d\n\n' "${exit_code}"
                 printf '```\n'
                 sed -n '1,120p' "${stderr_path}" 2>/dev/null || true
                 printf '\n```\n'
@@ -271,7 +272,7 @@ done
 require_int_vars SEED PROJECT_COUNT AGENT_COUNT MESSAGE_COUNT THREAD_COUNT ROBOT_TIMEOUT_SECS
 require_port_or_empty PORT "${PORT}"
 
-require_cmds mcp-agent-mail am sqlite3 python3 jq curl
+require_cmds mcp-agent-mail am python3 jq curl
 [ -x "${SEED_SCRIPT}" ] || die "seed script not found/executable: ${SEED_SCRIPT}"
 
 mkdir -p "${OUTPUT_DIR}" "${OUTPUT_DIR}/snapshots" "${OUTPUT_DIR}/logs" "${OUTPUT_DIR}/diagnostics"
@@ -348,11 +349,13 @@ PY
     [ "${DET_FINGERPRINT}" = "${FIXTURE_FINGERPRINT}" ] || die "determinism check failed (fingerprint mismatch)"
 fi
 
-PROJECT_KEY="$(sqlite3 "${DB_PATH}" "SELECT human_key FROM projects ORDER BY id LIMIT 1;")"
-AGENT_NAME="$(sqlite3 "${DB_PATH}" "SELECT name FROM agents WHERE project_id = (SELECT id FROM projects ORDER BY id LIMIT 1) ORDER BY id LIMIT 1;")"
-THREAD_ID="$(sqlite3 "${DB_PATH}" "SELECT thread_id FROM messages WHERE thread_id IS NOT NULL AND thread_id != '' ORDER BY id LIMIT 1;")"
-MESSAGE_ID="$(sqlite3 "${DB_PATH}" "SELECT id FROM messages ORDER BY id LIMIT 1;")"
+PROJECT_KEY="$(truth_oracle_db_query_first "${DB_PATH}" "SELECT human_key FROM projects ORDER BY id LIMIT 1;")"
+PROJECT_SLUG="$(truth_oracle_db_query_first "${DB_PATH}" "SELECT slug FROM projects ORDER BY id LIMIT 1;")"
+AGENT_NAME="$(truth_oracle_db_query_first "${DB_PATH}" "SELECT name FROM agents WHERE project_id = (SELECT id FROM projects ORDER BY id LIMIT 1) ORDER BY id LIMIT 1;")"
+THREAD_ID="$(truth_oracle_db_query_first "${DB_PATH}" "SELECT thread_id FROM messages WHERE thread_id IS NOT NULL AND thread_id != '' ORDER BY id LIMIT 1;")"
+MESSAGE_ID="$(truth_oracle_db_query_first "${DB_PATH}" "SELECT id FROM messages ORDER BY id LIMIT 1;")"
 require_non_empty "seeded project key" "${PROJECT_KEY}"
+require_non_empty "seeded project slug" "${PROJECT_SLUG}"
 require_non_empty "seeded agent name" "${AGENT_NAME}"
 require_non_empty "seeded thread id" "${THREAD_ID}"
 require_non_empty "seeded message id" "${MESSAGE_ID}"
@@ -417,7 +420,7 @@ run_robot_capture "${OUTPUT_DIR}/snapshots/search_results_since.json" search "tr
 run_robot_capture "${OUTPUT_DIR}/snapshots/search_results_kind_message.json" search "truth-fixture" --kind message --format json
 
 # Track 3b: Navigation (resource:// URI resolution)
-run_robot_capture "${OUTPUT_DIR}/snapshots/navigate.json"           navigate "resource://agents/${PROJECT_KEY}" --format json
+run_robot_capture "${OUTPUT_DIR}/snapshots/navigate.json"           navigate "resource://agents/${PROJECT_SLUG}" --format json
 
 # Track 4: Monitoring & Analytics
 run_robot_capture "${OUTPUT_DIR}/snapshots/reservations.json"      reservations --all --format json
@@ -438,20 +441,18 @@ log "robot snapshots: ${CAPTURE_SUCCESSES} succeeded, ${CAPTURE_FAILURES} failed
 # ---------------------------------------------------------------------------
 log "extracting DB truth"
 
-if ! sqlite3 "${DB_PATH}" > "${OUTPUT_DIR}/diagnostics/db_counts.tsv" <<'SQL'
-.mode tabs
-SELECT 'projects', COUNT(*) FROM projects;
-SELECT 'agents', COUNT(*) FROM agents;
-SELECT 'messages', COUNT(*) FROM messages;
-SELECT 'threads', COUNT(DISTINCT thread_id) FROM messages WHERE thread_id IS NOT NULL AND thread_id != '';
-SELECT 'ack_required_messages', COUNT(*) FROM messages WHERE ack_required = 1;
-SELECT 'recipient_rows', COUNT(*) FROM message_recipients;
-SELECT 'recipient_reads', COUNT(*) FROM message_recipients WHERE read_ts IS NOT NULL;
-SELECT 'recipient_acks', COUNT(*) FROM message_recipients WHERE ack_ts IS NOT NULL;
-SQL
-then
+if ! {
+    printf 'projects\t%s\n' "$(truth_oracle_db_query_first "${DB_PATH}" "SELECT COUNT(*) FROM projects;")"
+    printf 'agents\t%s\n' "$(truth_oracle_db_query_first "${DB_PATH}" "SELECT COUNT(*) FROM agents;")"
+    printf 'messages\t%s\n' "$(truth_oracle_db_query_first "${DB_PATH}" "SELECT COUNT(*) FROM messages;")"
+    printf 'threads\t%s\n' "$(truth_oracle_db_query_first "${DB_PATH}" "SELECT COUNT(DISTINCT thread_id) FROM messages WHERE thread_id IS NOT NULL AND thread_id != '';")"
+    printf 'ack_required_messages\t%s\n' "$(truth_oracle_db_query_first "${DB_PATH}" "SELECT COUNT(*) FROM messages WHERE ack_required = 1;")"
+    printf 'recipient_rows\t%s\n' "$(truth_oracle_db_query_first "${DB_PATH}" "SELECT COUNT(*) FROM message_recipients;")"
+    printf 'recipient_reads\t%s\n' "$(truth_oracle_db_query_first "${DB_PATH}" "SELECT COUNT(*) FROM message_recipients WHERE read_ts IS NOT NULL;")"
+    printf 'recipient_acks\t%s\n' "$(truth_oracle_db_query_first "${DB_PATH}" "SELECT COUNT(*) FROM message_recipients WHERE ack_ts IS NOT NULL;")"
+} > "${OUTPUT_DIR}/diagnostics/db_counts.tsv"; then
     CAPTURE_FAILURES=$((CAPTURE_FAILURES + 1))
-    log "WARN: sqlite3 db_counts query failed; writing fallback counts from fixture report"
+    log "WARN: DB counts query failed; writing fallback counts from fixture report"
     python3 - "${OUTPUT_DIR}/fixture_report.json" "${OUTPUT_DIR}/diagnostics/db_counts.tsv" <<'PY'
 import json
 import sys
@@ -483,12 +484,40 @@ fi
 # ---------------------------------------------------------------------------
 log "building structured db_truth.json"
 
-python3 - "${DB_PATH}" "${OUTPUT_DIR}/diagnostics/db_truth.json" "${OUTPUT_DIR}/fixture_report.json" <<'DBTRUTH'
+DB_TRUTH_GLOBAL_JSON="${OUTPUT_DIR}/diagnostics/db_truth_global_rows.json"
+DB_TRUTH_PROJECT_JSON="${OUTPUT_DIR}/diagnostics/db_truth_project_rows.json"
+
+if ! truth_oracle_db_query_json "${DB_PATH}" \
+    "SELECT
+        (SELECT COUNT(*) FROM projects) AS projects,
+        (SELECT COUNT(*) FROM agents) AS agents,
+        (SELECT COUNT(*) FROM messages) AS messages,
+        (SELECT COUNT(DISTINCT thread_id) FROM messages WHERE thread_id IS NOT NULL AND thread_id != '') AS threads,
+        (SELECT COUNT(*) FROM messages WHERE ack_required = 1) AS ack_required,
+        (SELECT COUNT(*) FROM message_recipients) AS recipients,
+        (SELECT COUNT(*) FROM message_recipients WHERE read_ts IS NOT NULL) AS recipient_reads,
+        (SELECT COUNT(*) FROM message_recipients WHERE ack_ts IS NOT NULL) AS recipient_acks,
+        (SELECT COUNT(*) FROM file_reservations) AS file_reservations;" \
+    > "${DB_TRUTH_GLOBAL_JSON}"; then
+    printf '{"_query_error":true}\n' > "${DB_TRUTH_GLOBAL_JSON}"
+fi
+
+if ! truth_oracle_db_query_json "${DB_PATH}" \
+    "SELECT p.human_key AS human_key,
+            (SELECT COUNT(*) FROM agents a WHERE a.project_id = p.id) AS agents,
+            (SELECT COUNT(*) FROM messages m WHERE m.project_id = p.id) AS messages,
+            (SELECT COUNT(DISTINCT m.thread_id) FROM messages m WHERE m.project_id = p.id AND m.thread_id IS NOT NULL AND m.thread_id != '') AS threads
+     FROM projects p
+     ORDER BY p.id;" \
+    > "${DB_TRUTH_PROJECT_JSON}"; then
+    printf '{"_query_error":true}\n' > "${DB_TRUTH_PROJECT_JSON}"
+fi
+
+python3 - "${DB_TRUTH_GLOBAL_JSON}" "${DB_TRUTH_PROJECT_JSON}" "${OUTPUT_DIR}/diagnostics/db_truth.json" "${OUTPUT_DIR}/fixture_report.json" <<'DBTRUTH'
 import json
-import sqlite3
 import sys
 
-db_path, out_path, fixture_report_path = sys.argv[1:4]
+global_rows_path, project_rows_path, out_path, fixture_report_path = sys.argv[1:5]
 
 def as_int(value, default=0):
     try:
@@ -526,44 +555,56 @@ try:
 except Exception:
     fixture_report = {}
 
-conn = sqlite3.connect(db_path)
-conn.row_factory = sqlite3.Row
-
-# Global counts
-global_counts = {}
-for table, query in [
-    ("projects",       "SELECT COUNT(*) AS n FROM projects"),
-    ("agents",         "SELECT COUNT(*) AS n FROM agents"),
-    ("messages",       "SELECT COUNT(*) AS n FROM messages"),
-    ("threads",        "SELECT COUNT(DISTINCT thread_id) AS n FROM messages WHERE thread_id IS NOT NULL AND thread_id != ''"),
-    ("ack_required",   "SELECT COUNT(*) AS n FROM messages WHERE ack_required = 1"),
-    ("recipients",     "SELECT COUNT(*) AS n FROM message_recipients"),
-    ("recipient_reads","SELECT COUNT(*) AS n FROM message_recipients WHERE read_ts IS NOT NULL"),
-    ("recipient_acks", "SELECT COUNT(*) AS n FROM message_recipients WHERE ack_ts IS NOT NULL"),
-    ("file_reservations", "SELECT COUNT(*) AS n FROM file_reservations"),
-]:
+def load_json(path):
     try:
-        global_counts[table] = conn.execute(query).fetchone()[0]
-    except Exception as exc:
-        global_counts[table] = f"error: {exc}"
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"_query_error": True}
 
-# Per-project breakdown (project_key → {agents, messages, threads})
+global_rows = load_json(global_rows_path)
+project_rows = load_json(project_rows_path)
+
+global_counts = {}
+if isinstance(global_rows, list) and global_rows:
+    row = global_rows[0]
+    global_counts = {
+        "projects": row.get("projects", 0),
+        "agents": row.get("agents", 0),
+        "messages": row.get("messages", 0),
+        "threads": row.get("threads", 0),
+        "ack_required": row.get("ack_required", 0),
+        "recipients": row.get("recipients", 0),
+        "recipient_reads": row.get("recipient_reads", 0),
+        "recipient_acks": row.get("recipient_acks", 0),
+        "file_reservations": row.get("file_reservations", 0),
+    }
+else:
+    global_counts = {
+        "projects": "error: query failed",
+        "agents": "error: query failed",
+        "messages": "error: query failed",
+        "threads": "error: query failed",
+        "ack_required": "error: query failed",
+        "recipients": "error: query failed",
+        "recipient_reads": "error: query failed",
+        "recipient_acks": "error: query failed",
+        "file_reservations": "error: query failed",
+    }
+
 per_project = {}
-try:
-    rows = conn.execute("""
-        SELECT p.human_key,
-               (SELECT COUNT(*) FROM agents a WHERE a.project_id = p.id) AS agents,
-               (SELECT COUNT(*) FROM messages m WHERE m.project_id = p.id) AS messages,
-               (SELECT COUNT(DISTINCT m.thread_id) FROM messages m
-                WHERE m.project_id = p.id AND m.thread_id IS NOT NULL AND m.thread_id != '') AS threads
-        FROM projects p ORDER BY p.id
-    """).fetchall()
-    for r in rows:
-        per_project[r[0]] = {"agents": r[1], "messages": r[2], "threads": r[3]}
-except Exception as exc:
-    per_project["_error"] = str(exc)
-
-conn.close()
+if isinstance(project_rows, list):
+    for row in project_rows:
+        human_key = row.get("human_key")
+        if not human_key:
+            continue
+        per_project[human_key] = {
+            "agents": row.get("agents", 0),
+            "messages": row.get("messages", 0),
+            "threads": row.get("threads", 0),
+        }
+else:
+    per_project["_error"] = "query failed"
 
 fallback_active = False
 fallback_reason = ""
