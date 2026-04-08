@@ -3552,77 +3552,70 @@ pub fn is_corruption_error_message(message: &str) -> bool {
 }
 
 #[allow(clippy::result_large_err)]
-fn sqlite_pragma_check_details_from_rows(rows: &[sqlmodel_core::Row]) -> Vec<String> {
-    let mut details: Vec<String> = Vec::with_capacity(rows.len());
-    for row in rows {
-        if let Ok(v) = row.get_named::<String>("quick_check") {
-            details.push(v);
-        } else if let Ok(v) = row.get_named::<String>("integrity_check") {
-            details.push(v);
-        } else if let Some(Value::Text(v)) = row.values().next() {
-            details.push(v.clone());
-        }
-    }
-    if details.is_empty() {
-        details.push("ok".to_string());
-    }
-    details
+fn sqlite_check_rows_with<F>(
+    mut query: F,
+    kind: integrity::CheckKind,
+) -> Result<Vec<sqlmodel_core::Row>, SqlError>
+where
+    F: FnMut(&str) -> Result<Vec<sqlmodel_core::Row>, SqlError>,
+{
+    integrity::probe_check_rows(|sql| query(sql).map_err(|error| error.to_string()), kind)
+        .map_err(|error| SqlError::Custom(format!("{kind} failed: {error}")))
 }
 
 #[allow(clippy::result_large_err)]
-fn sqlite_pragma_check_details(conn: &DbConn, pragma_sql: &str) -> Result<Vec<String>, SqlError> {
-    let rows = conn.query_sync(pragma_sql, &[])?;
-    Ok(sqlite_pragma_check_details_from_rows(&rows))
+fn sqlite_pragma_check_details(
+    conn: &DbConn,
+    kind: integrity::CheckKind,
+) -> Result<Vec<String>, SqlError> {
+    let rows = sqlite_check_rows_with(|sql| conn.query_sync(sql, &[]), kind)?;
+    Ok(integrity::extract_check_details(&rows, kind))
 }
 
 #[allow(clippy::result_large_err)]
-fn sqlite_pragma_check_is_ok(conn: &DbConn, pragma_sql: &str) -> Result<bool, SqlError> {
-    let details = sqlite_pragma_check_details(conn, pragma_sql)?;
-    Ok(details
-        .iter()
-        .all(|detail| detail.trim().eq_ignore_ascii_case("ok")))
+fn sqlite_pragma_check_is_ok(conn: &DbConn, kind: integrity::CheckKind) -> Result<bool, SqlError> {
+    let details = sqlite_pragma_check_details(conn, kind)?;
+    Ok(integrity::details_indicate_ok(&details))
 }
 
 #[allow(clippy::result_large_err)]
 fn sqlite_quick_check_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
-    sqlite_pragma_check_is_ok(conn, "PRAGMA quick_check")
+    sqlite_pragma_check_is_ok(conn, integrity::CheckKind::Quick)
 }
 
 #[allow(clippy::result_large_err)]
 fn sqlite_incremental_check_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
-    sqlite_pragma_check_is_ok(conn, "PRAGMA integrity_check(1)")
+    sqlite_pragma_check_is_ok(conn, integrity::CheckKind::Incremental)
 }
 
 #[allow(clippy::result_large_err)]
 fn sqlite_pragma_check_details_canonical(
     conn: &crate::CanonicalDbConn,
-    pragma_sql: &str,
+    kind: integrity::CheckKind,
 ) -> Result<Vec<String>, SqlError> {
-    let rows = conn.query_sync(pragma_sql, &[])?;
-    Ok(sqlite_pragma_check_details_from_rows(&rows))
+    let rows = sqlite_check_rows_with(|sql| conn.query_sync(sql, &[]), kind)?;
+    Ok(integrity::extract_check_details(&rows, kind))
 }
 
 #[allow(clippy::result_large_err)]
 fn sqlite_pragma_check_is_ok_canonical(
     conn: &crate::CanonicalDbConn,
-    pragma_sql: &str,
+    kind: integrity::CheckKind,
 ) -> Result<bool, SqlError> {
-    let details = sqlite_pragma_check_details_canonical(conn, pragma_sql)?;
-    Ok(details
-        .iter()
-        .all(|detail| detail.trim().eq_ignore_ascii_case("ok")))
+    let details = sqlite_pragma_check_details_canonical(conn, kind)?;
+    Ok(integrity::details_indicate_ok(&details))
 }
 
 #[allow(clippy::result_large_err)]
 fn sqlite_canonical_quick_check_is_ok(conn: &crate::CanonicalDbConn) -> Result<bool, SqlError> {
-    sqlite_pragma_check_is_ok_canonical(conn, "PRAGMA quick_check")
+    sqlite_pragma_check_is_ok_canonical(conn, integrity::CheckKind::Quick)
 }
 
 #[allow(clippy::result_large_err)]
 fn sqlite_canonical_incremental_check_is_ok(
     conn: &crate::CanonicalDbConn,
 ) -> Result<bool, SqlError> {
-    sqlite_pragma_check_is_ok_canonical(conn, "PRAGMA integrity_check(1)")
+    sqlite_pragma_check_is_ok_canonical(conn, integrity::CheckKind::Incremental)
 }
 
 /// Remove corrupt or truncated WAL/SHM sidecars that cause "WAL file too
@@ -3811,27 +3804,25 @@ where
         }
     }
 
-    // FrankenConnection can miss schema faults present in active WAL sidecars.
-    // When sidecars exist, run a canonical sqlite probe to avoid false healthy
-    // verdicts (e.g. duplicate-index malformed schema in WAL state).
-    if sqlite_file_has_live_sidecars(path) {
-        match compatibility_probe(path) {
-            Ok(true) => {}
-            Ok(false) => return Ok(false),
-            Err(e) => {
-                let msg = e.to_string();
-                if is_corruption_error_message(&msg) || is_sqlite_recovery_error_message(&msg) {
-                    return Ok(false);
-                }
-                if is_lock_error(&msg) {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "sqlite canonical health probe hit lock/busy error; preserving primary health verdict"
-                    );
-                } else {
-                    return Err(e);
-                }
+    // Confirm the primary verdict through a separate canonical connection too.
+    // Keeping this as an independent reopen/probe still catches sidecar and
+    // reopen-path issues even though the canonical path now uses FrankenSQLite.
+    match compatibility_probe(path) {
+        Ok(true) => {}
+        Ok(false) => return Ok(false),
+        Err(e) => {
+            let msg = e.to_string();
+            if is_corruption_error_message(&msg) || is_sqlite_recovery_error_message(&msg) {
+                return Ok(false);
+            }
+            if is_lock_error(&msg) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "sqlite canonical health probe hit lock/busy error; preserving primary health verdict"
+                );
+            } else {
+                return Err(e);
             }
         }
     }
@@ -3946,11 +3937,8 @@ fn try_repair_index_only_corruption(primary_path: &Path) -> Result<bool, SqlErro
     }
     let path_str = primary_path.to_string_lossy();
     let conn = open_sqlite_file_with_lock_retry_canonical(path_str.as_ref())?;
-    let quick_details = sqlite_pragma_check_details_canonical(&conn, "PRAGMA quick_check")?;
-    if quick_details
-        .iter()
-        .all(|detail| detail.trim().eq_ignore_ascii_case("ok"))
-    {
+    let quick_details = sqlite_pragma_check_details_canonical(&conn, integrity::CheckKind::Quick)?;
+    if integrity::details_indicate_ok(&quick_details) {
         return Ok(false);
     }
     if !details_are_index_only_issues(&quick_details) {
@@ -3966,11 +3954,8 @@ fn try_repair_index_only_corruption(primary_path: &Path) -> Result<bool, SqlErro
     conn.execute_raw("REINDEX;")?;
     let _ = conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE);");
 
-    let post_quick = sqlite_pragma_check_details_canonical(&conn, "PRAGMA quick_check")?;
-    if !post_quick
-        .iter()
-        .all(|detail| detail.trim().eq_ignore_ascii_case("ok"))
-    {
+    let post_quick = sqlite_pragma_check_details_canonical(&conn, integrity::CheckKind::Quick)?;
+    if !integrity::details_indicate_ok(&post_quick) {
         tracing::warn!(
             path = %primary_path.display(),
             details = ?post_quick,
@@ -3980,11 +3965,8 @@ fn try_repair_index_only_corruption(primary_path: &Path) -> Result<bool, SqlErro
     }
 
     let post_incremental =
-        sqlite_pragma_check_details_canonical(&conn, "PRAGMA integrity_check(1)")?;
-    if !post_incremental
-        .iter()
-        .all(|detail| detail.trim().eq_ignore_ascii_case("ok"))
-    {
+        sqlite_pragma_check_details_canonical(&conn, integrity::CheckKind::Incremental)?;
+    if !integrity::details_indicate_ok(&post_incremental) {
         tracing::warn!(
             path = %primary_path.display(),
             details = ?post_incremental,
@@ -4845,10 +4827,21 @@ fn reconstruct_archive_into_candidate(
 
     match reconstruct_result {
         Ok(stats) => match sqlite_file_is_healthy(&candidate_path) {
-            Ok(true) => {
-                activate_reconstruction_candidate(&candidate_path, primary_path)?;
-                Ok(stats)
-            }
+            Ok(true) => match activate_reconstruction_candidate(&candidate_path, primary_path) {
+                Ok(()) => Ok(stats),
+                Err(error) => {
+                    let _ = quarantine_reconstruction_candidate_path(
+                        &candidate_path,
+                        primary_path,
+                        "reconstruct-failed",
+                        timestamp,
+                    );
+                    Err(SqlError::Custom(format!(
+                        "archive reconstruction failed for {}: candidate activation failed: {error}",
+                        primary_path.display()
+                    )))
+                }
+            },
             Ok(false) => {
                 let _ = quarantine_reconstruction_candidate_path(
                     &candidate_path,
@@ -7660,6 +7653,55 @@ mod tests {
         assert!(
             !healthy,
             "compatibility probe failure should mark file unhealthy"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn sqlite_file_is_healthy_invokes_compat_probe_without_sidecars() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("compat_probe_no_sidecars.db");
+        let path_str = path.to_string_lossy();
+        let conn = DbConn::open_file(path_str.as_ref()).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create");
+        drop(conn);
+
+        let mut probe_called = false;
+        let healthy = sqlite_file_is_healthy_with_compat_probe(&path, |_| {
+            probe_called = true;
+            Ok(true)
+        })
+        .expect("health check");
+        assert!(healthy, "compat probe true should preserve healthy verdict");
+        assert!(
+            probe_called,
+            "compatibility probe must run even when sidecars are absent"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)]
+    fn sqlite_file_is_healthy_canonical_accepts_valid_live_wal_sidecars() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("canonical_live_wal.db");
+        let path_str = path.to_string_lossy();
+        let conn = DbConn::open_file(path_str.as_ref()).expect("open");
+        conn.execute_raw("PRAGMA journal_mode=WAL;")
+            .expect("enable wal");
+        conn.execute_raw("CREATE TABLE t (x BLOB)").expect("create");
+        conn.execute_raw("INSERT INTO t(x) VALUES (zeroblob(65536))")
+            .expect("insert blob to force wal activity");
+
+        assert!(
+            sqlite_file_has_live_sidecars(&path),
+            "test setup should produce live WAL/SHM sidecars"
+        );
+
+        let healthy = sqlite_file_is_healthy_canonical(&path).expect("canonical health check");
+        assert!(
+            healthy,
+            "canonical health probe should accept a healthy WAL-backed database"
         );
     }
 

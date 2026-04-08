@@ -41,8 +41,9 @@ where
     common::block_on(f)
 }
 
-/// Create a file-backed `SqliteConnection` in a temporary directory.
-/// Uses C-backed `SQLite` so tests can query `sqlite_master` for schema verification.
+/// Create a file-backed migration test connection in a temporary directory.
+/// Uses the FrankenSQLite-backed `DbConn` runtime path, including `sqlite_master`
+/// introspection, so schema verification exercises the same engine as production.
 fn open_temp_db() -> (SqliteConnection, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("create tempdir");
     let db_path = dir

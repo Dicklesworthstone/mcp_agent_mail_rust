@@ -165,17 +165,17 @@ Replaces the legacy 4,000-line bash installer entirely. Built into `am` binary.
 - Write-behind cache with dual indexing and deferred touch batching (30s flush)
 - Async git commit coalescer (batches writes to avoid commit storms)
 
-### frankensqlite Integration (In Progress)
+### frankensqlite Integration (Implemented, Hardening Ongoing)
 
-**Current state:** `sqlmodel-frankensqlite` adapter crate exists (62 tests passing), but `DbConn` stays as C SQLite because frankensqlite lacks `CREATE TRIGGER` execution and `sqlite_master` queries.
+**Current state:** `DbConn` and canonical verification/recovery paths now use `sqlmodel-frankensqlite`, and the Rust binaries no longer link `libsqlite3`.
 
-**Target state:** Once frankensqlite implements triggers and schema introspection:
-- Switch `DbConn` to `FrankenConnection`
+**Next hardening work:**
+- Keep closing any remaining engine feature gaps directly in FrankenSQLite rather than reintroducing C SQLite
 - Replace all `BEGIN IMMEDIATE` with `BEGIN CONCURRENT` for page-level MVCC (128 concurrent writers)
 - Enable RaptorQ erasure-coded WAL self-healing for automatic corruption recovery
 - MVCC conflict detection already wired (`is_mvcc_conflict()` in error.rs)
 
-**Non-negotiable:** Never revert DbConn changes that other agents intentionally made toward frankensqlite migration. The direction is forward — toward frankensqlite — blocked only by missing trigger support.
+**Non-negotiable:** Never reintroduce a production/runtime dependency on C SQLite. The direction is forward — toward full FrankenSQLite ownership and hardening.
 
 ### asupersync Everywhere
 

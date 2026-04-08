@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn naive_to_micros_epoch_is_zero() {
-        let epoch = NaiveDateTime::UNIX_EPOCH;
+        let epoch = chrono::DateTime::<Utc>::UNIX_EPOCH.naive_utc();
         assert_eq!(naive_to_micros(epoch), 0);
     }
 
@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn micros_to_naive_zero_is_epoch() {
         let dt = micros_to_naive(0);
-        assert_eq!(dt, NaiveDateTime::UNIX_EPOCH);
+        assert_eq!(dt, chrono::DateTime::<Utc>::UNIX_EPOCH.naive_utc());
     }
 
     #[test]
@@ -239,8 +239,9 @@ mod tests {
         let max_dt = micros_to_naive(i64::MAX);
         let min_dt = micros_to_naive(i64::MIN);
         // Should return boundary datetimes, not panic.
-        assert!(max_dt > NaiveDateTime::UNIX_EPOCH);
-        assert!(min_dt < NaiveDateTime::UNIX_EPOCH);
+        let epoch = chrono::DateTime::<Utc>::UNIX_EPOCH.naive_utc();
+        assert!(max_dt > epoch);
+        assert!(min_dt < epoch);
     }
 
     #[test]
@@ -290,7 +291,7 @@ mod tests {
 
         // Verify format always has 6 fractional digits and trailing Z
         let s = micros_to_iso(MICROS_PER_SECOND); // exactly 1s, no sub-micros
-        assert!(s.ends_with("Z"), "should end with Z: {s}");
+        assert!(s.ends_with('Z'), "should end with Z: {s}");
         assert!(s.contains('.'), "should have fractional separator: {s}");
     }
 

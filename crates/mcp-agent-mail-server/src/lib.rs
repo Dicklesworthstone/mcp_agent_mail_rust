@@ -1885,8 +1885,12 @@ fn open_sync_db_connection_with_busy_timeout(
     busy_timeout_ms: u32,
 ) -> std::io::Result<DbConn> {
     let path = resolve_server_sync_sqlite_path(path);
-    let conn = DbConn::open_file(&path)
-        .map_err(|err| std::io::Error::other(format!("open sqlite file {path}: {err}")))?;
+    let conn = if path == ":memory:" {
+        DbConn::open_memory()
+    } else {
+        DbConn::open_file(&path)
+    }
+    .map_err(|err| std::io::Error::other(format!("open sqlite file {path}: {err}")))?;
     conn.execute_raw(&format!("PRAGMA busy_timeout = {busy_timeout_ms};"))
         .map_err(|err| {
             std::io::Error::other(format!(

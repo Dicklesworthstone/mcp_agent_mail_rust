@@ -55,10 +55,8 @@ pub fn update_message_thread_id(
     Ok(true)
 }
 
-/// Fetch inbox rows using synchronous FrankenSQLite reads.
-#[allow(clippy::too_many_arguments)]
-pub fn fetch_inbox_native_sqlite_by_ids(
-    sqlite_path: &str,
+pub fn fetch_inbox_rows_from_conn(
+    conn: &DbConn,
     project_id: i64,
     agent_id: i64,
     urgent_only: bool,
@@ -67,13 +65,6 @@ pub fn fetch_inbox_native_sqlite_by_ids(
     since_ts: Option<i64>,
     limit: usize,
 ) -> Result<Vec<InboxRow>, DbError> {
-    let conn = if sqlite_path == ":memory:" {
-        DbConn::open_memory()
-    } else {
-        DbConn::open_file(sqlite_path)
-    }
-    .map_err(|e| DbError::Sqlite(e.to_string()))?;
-
     let _ = conn.execute_raw("PRAGMA busy_timeout = 250");
 
     let mut sql = String::from(
@@ -180,6 +171,40 @@ pub fn fetch_inbox_native_sqlite_by_ids(
     }
 
     Ok(out)
+}
+
+/// Fetch inbox rows using a short-lived synchronous FrankenSQLite connection.
+#[allow(clippy::too_many_arguments)]
+pub fn fetch_inbox_sync_by_ids(
+    sqlite_path: &str,
+    project_id: i64,
+    agent_id: i64,
+    urgent_only: bool,
+    unread_only: bool,
+    ack_required_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+) -> Result<Vec<InboxRow>, DbError> {
+    let conn = if sqlite_path == ":memory:" {
+        DbConn::open_memory()
+    } else {
+        DbConn::open_file(sqlite_path)
+    }
+    .map_err(|e| DbError::Sqlite(e.to_string()))?;
+
+    let result = fetch_inbox_rows_from_conn(
+        &conn,
+        project_id,
+        agent_id,
+        urgent_only,
+        unread_only,
+        ack_required_only,
+        since_ts,
+        limit,
+    );
+
+    crate::close_db_conn(conn, "fetch_inbox_sync_by_ids connection");
+    result
 }
 
 fn open_sync_conn(sqlite_path: &str) -> Result<DbConn, DbError> {

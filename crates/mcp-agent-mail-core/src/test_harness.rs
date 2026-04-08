@@ -484,16 +484,16 @@ fn capitalize(s: &str) -> String {
 /// ```
 #[must_use]
 pub fn seed_from_env_or_random(test_name: &str) -> u64 {
-    if let Ok(val) = std::env::var("HARNESS_SEED") {
-        if let Ok(s) = val.parse::<u64>() {
-            eprintln!("[rerun] {test_name}: using HARNESS_SEED={s} (from environment)");
-            return s;
-        }
+    if let Ok(val) = std::env::var("HARNESS_SEED")
+        && let Ok(s) = val.parse::<u64>()
+    {
+        eprintln!("[rerun] {test_name}: using HARNESS_SEED={s} (from environment)");
+        return s;
     }
     let mut buf = [0u8; 8];
     if getrandom::getrandom(&mut buf).is_err() {
         // Fallback: combine PID + timestamp bits
-        let fallback = (std::process::id() as u64)
+        let fallback = u64::from(std::process::id())
             .wrapping_mul(0x517c_c1b7_2722_0a95)
             .wrapping_add(
                 std::time::SystemTime::now()

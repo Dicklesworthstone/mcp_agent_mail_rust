@@ -161,15 +161,7 @@ pub fn inspect_mailbox_integrity(db_path: &Path, kind: CheckKind) -> MailboxInte
         }
     };
 
-    match run_check(
-        &conn,
-        match kind {
-            CheckKind::Quick => "PRAGMA quick_check",
-            CheckKind::Incremental => "PRAGMA integrity_check(1)",
-            CheckKind::Full => "PRAGMA integrity_check",
-        },
-        kind,
-    ) {
+    match run_check(&conn, kind) {
         Ok(check) => MailboxIntegrityVerdict {
             status: MailboxIntegrityStatus::Healthy,
             metrics: integrity_metrics(),
@@ -221,7 +213,7 @@ pub fn integrity_details_are_suspect(details: &[String]) -> bool {
 /// This is fast (typically <100ms) and catches most common corruption.
 /// Suitable for startup validation.
 pub fn quick_check(conn: &DbConn) -> DbResult<IntegrityCheckResult> {
-    run_check(conn, "PRAGMA quick_check", CheckKind::Quick)
+    run_check(conn, CheckKind::Quick)
 }
 
 /// Run `PRAGMA integrity_check(1)` — stops after the first error.
@@ -229,7 +221,7 @@ pub fn quick_check(conn: &DbConn) -> DbResult<IntegrityCheckResult> {
 /// Faster than a full check but provides less detail. Suitable for
 /// periodic connection-recycle checks.
 pub fn incremental_check(conn: &DbConn) -> DbResult<IntegrityCheckResult> {
-    run_check(conn, "PRAGMA integrity_check(1)", CheckKind::Incremental)
+    run_check(conn, CheckKind::Incremental)
 }
 
 /// Run a full `PRAGMA integrity_check`.
@@ -237,15 +229,104 @@ pub fn incremental_check(conn: &DbConn) -> DbResult<IntegrityCheckResult> {
 /// This scans the entire database and can take seconds on large databases.
 /// Run on a dedicated connection, not from the pool hot path.
 pub fn full_check(conn: &DbConn) -> DbResult<IntegrityCheckResult> {
-    run_check(conn, "PRAGMA integrity_check", CheckKind::Full)
+    run_check(conn, CheckKind::Full)
 }
 
-fn run_check(conn: &DbConn, pragma: &str, kind: CheckKind) -> DbResult<IntegrityCheckResult> {
-    let start = std::time::Instant::now();
+#[must_use]
+pub const fn preferred_check_sql(kind: CheckKind) -> &'static str {
+    match kind {
+        CheckKind::Quick => "SELECT quick_check FROM pragma_quick_check()",
+        CheckKind::Incremental => "SELECT integrity_check FROM pragma_integrity_check() LIMIT 1",
+        CheckKind::Full => "SELECT integrity_check FROM pragma_integrity_check()",
+    }
+}
 
-    let rows: Vec<Row> = conn
-        .query_sync(pragma, &[])
-        .map_err(|e| DbError::Sqlite(format!("{kind} failed: {e}")))?;
+#[must_use]
+pub const fn fallback_check_sql(kind: CheckKind) -> &'static str {
+    match kind {
+        CheckKind::Quick => "PRAGMA quick_check",
+        CheckKind::Incremental => "PRAGMA integrity_check(1)",
+        CheckKind::Full => "PRAGMA integrity_check",
+    }
+}
+
+/// Run an integrity probe with a best-effort fallback from the table-valued
+/// pragma form to the classic PRAGMA statement form.
+///
+/// Some SQLite-compatible engines in this workspace still do not implement the
+/// table-valued `pragma_*` functions. Callers should use this helper instead of
+/// hardcoding the preferred SQL so runtime probes, doctor flows, and recovery
+/// all behave consistently.
+pub fn probe_check_rows<F>(mut query: F, kind: CheckKind) -> Result<Vec<Row>, String>
+where
+    F: FnMut(&str) -> Result<Vec<Row>, String>,
+{
+    let preferred_sql = preferred_check_sql(kind);
+    let fallback_sql = fallback_check_sql(kind);
+
+    match query(preferred_sql) {
+        Ok(rows) if !rows.is_empty() || preferred_sql == fallback_sql => Ok(rows),
+        Ok(_) => query(fallback_sql).map_err(|fallback_error| {
+            format!("preferred probe returned no rows and fallback probe errored: {fallback_error}")
+        }),
+        Err(preferred_error) => query(fallback_sql).map_err(|fallback_error| {
+            format!(
+                "preferred probe error: {preferred_error}; fallback probe error: {fallback_error}"
+            )
+        }),
+    }
+}
+
+#[must_use]
+pub fn extract_check_details(rows: &[Row], kind: CheckKind) -> Vec<String> {
+    let primary_column = match kind {
+        CheckKind::Quick => "quick_check",
+        CheckKind::Incremental | CheckKind::Full => "integrity_check",
+    };
+
+    let mut details: Vec<String> = rows
+        .iter()
+        .filter_map(|row| {
+            if let Some(Value::Text(text)) = row.get_by_name(primary_column) {
+                Some(text.clone())
+            } else if let Some(Value::Text(text)) = row.get_by_name("integrity_check") {
+                Some(text.clone())
+            } else if let Some(Value::Text(text)) = row.get_by_name("quick_check") {
+                Some(text.clone())
+            } else if let Some(Value::Text(text)) = row.values().next() {
+                Some(text.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if details.is_empty() {
+        if rows.is_empty() {
+            details.push(format!("{kind} returned no rows"));
+        } else {
+            details.push(format!(
+                "{kind} returned {} row(s) but none had extractable text values",
+                rows.len()
+            ));
+        }
+    }
+
+    details
+}
+
+#[must_use]
+pub fn details_indicate_ok(details: &[String]) -> bool {
+    details.len() == 1 && details[0].trim().eq_ignore_ascii_case("ok")
+}
+
+fn run_check(conn: &DbConn, kind: CheckKind) -> DbResult<IntegrityCheckResult> {
+    let start = std::time::Instant::now();
+    let rows: Vec<Row> = probe_check_rows(
+        |sql| conn.query_sync(sql, &[]).map_err(|error| error.to_string()),
+        kind,
+    )
+    .map_err(|error| DbError::Sqlite(format!("{kind} failed: {error}")))?;
 
     let duration_us =
         u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
@@ -261,40 +342,8 @@ pub fn evaluate_check_rows(
     kind: CheckKind,
     duration_us: u64,
 ) -> DbResult<IntegrityCheckResult> {
-    let mut details: Vec<String> = rows
-        .iter()
-        .filter_map(|r| {
-            // PRAGMA integrity_check returns a column named "integrity_check",
-            // quick_check returns "quick_check". Try both, fall back to index 0.
-            if let Some(Value::Text(s)) = r.get_by_name("integrity_check") {
-                Some(s.clone())
-            } else if let Some(Value::Text(s)) = r.get_by_name("quick_check") {
-                Some(s.clone())
-            } else if let Some(Value::Text(s)) = r.values().next() {
-                Some(s.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    // Some SQLite backends surface PRAGMA check success with an empty
-    // rowset instead of a single "ok" row; normalize that to preserve semantics.
-    // But if rows were returned and ALL were non-Text (dropped by filter_map),
-    // treat that as suspicious rather than silently reporting "ok".
-    if details.is_empty() {
-        if rows.is_empty() {
-            details.push("ok".to_string());
-        } else {
-            details.push(format!(
-                "warning: {} integrity check rows returned but none had extractable text values",
-                rows.len()
-            ));
-        }
-    }
-
-    // SQLite returns "ok" as the single row when no corruption is found.
-    let ok = details.len() == 1 && details[0] == "ok";
+    let details = extract_check_details(rows, kind);
+    let ok = details_indicate_ok(&details);
 
     // Update global state.
     let s = state();
@@ -522,6 +571,80 @@ mod tests {
         assert_eq!(cloned.ok, result.ok);
         assert_eq!(cloned.details, result.details);
         assert_eq!(cloned.kind, result.kind);
+    }
+
+    #[test]
+    fn extract_check_details_empty_rows_are_not_ok() {
+        let details = extract_check_details(&[], CheckKind::Quick);
+        assert_eq!(details, vec!["quick_check returned no rows"]);
+        assert!(
+            !details_indicate_ok(&details),
+            "empty integrity probes must not be normalized to success"
+        );
+    }
+
+    #[test]
+    fn evaluate_check_rows_empty_rows_reports_corruption() {
+        let err = evaluate_check_rows(&[], CheckKind::Incremental, 0)
+            .expect_err("empty integrity rows should fail");
+        assert!(
+            err.to_string().contains("returned no rows"),
+            "unexpected empty-row verdict: {err}"
+        );
+    }
+
+    #[test]
+    fn probe_check_rows_falls_back_after_preferred_error() {
+        let mut calls = Vec::new();
+        let rows = probe_check_rows(
+            |sql| {
+                calls.push(sql.to_string());
+                if sql == preferred_check_sql(CheckKind::Quick) {
+                    Err("table-valued pragma unsupported".to_string())
+                } else {
+                    Ok(Vec::new())
+                }
+            },
+            CheckKind::Quick,
+        )
+        .expect("fallback probe should succeed");
+
+        assert!(
+            rows.is_empty(),
+            "test fallback intentionally returns empty rows"
+        );
+        assert_eq!(
+            calls,
+            vec![
+                preferred_check_sql(CheckKind::Quick).to_string(),
+                fallback_check_sql(CheckKind::Quick).to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn probe_check_rows_falls_back_after_empty_preferred_rows() {
+        let mut calls = Vec::new();
+        let rows = probe_check_rows(
+            |sql| {
+                calls.push(sql.to_string());
+                Ok(Vec::new())
+            },
+            CheckKind::Incremental,
+        )
+        .expect("fallback probe should succeed");
+
+        assert!(
+            rows.is_empty(),
+            "test fallback intentionally returns empty rows"
+        );
+        assert_eq!(
+            calls,
+            vec![
+                preferred_check_sql(CheckKind::Incremental).to_string(),
+                fallback_check_sql(CheckKind::Incremental).to_string()
+            ]
+        );
     }
 
     #[test]

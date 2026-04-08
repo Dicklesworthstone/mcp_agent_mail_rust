@@ -250,6 +250,14 @@ struct DbSnapshot {
     agent_links: Vec<(i64, String, String, String)>,
 }
 
+fn table_has_column(conn: &mcp_agent_mail_db::DbConn, table: &str, column: &str) -> bool {
+    conn.query_sync(&format!("PRAGMA table_info({table})"), &[])
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| row.get_named::<String>("name").ok())
+        .any(|name| name == column)
+}
+
 fn snapshot_db(db_path: &Path) -> DbSnapshot {
     let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_str().expect("valid path"))
         .expect("open reconstructed db");
@@ -320,16 +328,22 @@ fn snapshot_db(db_path: &Path) -> DbSnapshot {
         .collect();
 
     // agent_links may not exist in archive-only reconstructions
-    let link_rows = conn
-        .query_sync(
-            "SELECT al.id, fa.name AS from_agent, ta.name AS to_agent, al.status
-             FROM agent_links al
-             JOIN agents fa ON fa.id = al.from_agent_id
-             JOIN agents ta ON ta.id = al.to_agent_id
-             ORDER BY al.id",
-            &[],
-        )
-        .unwrap_or_default();
+    let link_query = if table_has_column(&conn, "agent_links", "a_agent_id")
+        && table_has_column(&conn, "agent_links", "b_agent_id")
+    {
+        "SELECT al.id, fa.name AS from_agent, ta.name AS to_agent, al.status
+         FROM agent_links al
+         JOIN agents fa ON fa.id = al.a_agent_id
+         JOIN agents ta ON ta.id = al.b_agent_id
+         ORDER BY al.id"
+    } else {
+        "SELECT al.id, fa.name AS from_agent, ta.name AS to_agent, al.status
+         FROM agent_links al
+         JOIN agents fa ON fa.id = al.from_agent_id
+         JOIN agents ta ON ta.id = al.to_agent_id
+         ORDER BY al.id"
+    };
+    let link_rows = conn.query_sync(link_query, &[]).unwrap_or_default();
     let agent_links: Vec<(i64, String, String, String)> = link_rows
         .iter()
         .map(|row| {

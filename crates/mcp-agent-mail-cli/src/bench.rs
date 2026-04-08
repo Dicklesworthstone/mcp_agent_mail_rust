@@ -571,14 +571,14 @@ fn insert_message(
     Ok(())
 }
 
-/// Seed the benchmark fixture dataset directly through native SQLite writes.
+/// Seed the benchmark fixture dataset directly through SQLite writes.
 ///
 /// This removes the benchmark setup bottleneck caused by repeatedly spawning
 /// CLI subprocesses for project/agent/message creation.
 pub fn seed_bench_database(conn: &DbConn, reseed: bool) -> Result<BenchSeedReport, BenchSeedError> {
     let started = Instant::now();
-    // Use base schema (no FTS5) since FrankenConnection cannot create
-    // virtual tables.
+    // Use the base schema (no FTS5) to keep benchmark seeding deterministic
+    // and avoid paying the virtual-table setup cost in the benchmark harness.
     conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
         .map_err(|e| db_error("initializing schema for benchmark seed", e))?;
     conn.execute_raw("BEGIN IMMEDIATE")

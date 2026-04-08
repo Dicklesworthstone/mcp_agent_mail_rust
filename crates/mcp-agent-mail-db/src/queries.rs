@@ -1125,6 +1125,62 @@ async fn verify_message_recipients_visible_after_commit(
     Outcome::Ok(())
 }
 
+async fn fetch_durable_atc_experience_by_decision_effect(
+    cx: &Cx,
+    pool: &DbPool,
+    decision_id: i64,
+    effect_id: i64,
+) -> Outcome<ExperienceRow, DbError> {
+    let sql = format!(
+        "{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE decision_id = ? AND effect_id = ? LIMIT 1"
+    );
+    let params = [Value::BigInt(decision_id), Value::BigInt(effect_id)];
+    match durability_probe_query(cx, pool, &sql, &params).await {
+        Outcome::Ok(rows) => rows.first().map_or_else(
+            || {
+                Outcome::Err(DbError::Internal(format!(
+                    "ATC experience row not visible after commit for decision_id={decision_id} effect_id={effect_id}"
+                )))
+            },
+            |row| match decode_atc_experience_row(row) {
+                Ok(decoded) => Outcome::Ok(decoded),
+                Err(error) => Outcome::Err(error),
+            },
+        ),
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
+async fn fetch_durable_atc_experience_by_id(
+    cx: &Cx,
+    pool: &DbPool,
+    experience_id: i64,
+) -> Outcome<Option<ExperienceRow>, DbError> {
+    let sql = format!("{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE experience_id = ? LIMIT 1");
+    let params = [Value::BigInt(experience_id)];
+    match durability_probe_query(cx, pool, &sql, &params).await {
+        Outcome::Ok(rows) => rows.first().map_or(Outcome::Ok(None), |row| {
+            match decode_atc_experience_row(row) {
+                Ok(decoded) => Outcome::Ok(Some(decoded)),
+                Err(error) => Outcome::Err(error),
+            }
+        }),
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
+fn open_fresh_file_backed_conn(pool: &DbPool) -> std::result::Result<crate::DbConn, DbError> {
+    let conn = crate::DbConn::open_file(pool.sqlite_path())
+        .map_err(|error| DbError::Sqlite(error.to_string()))?;
+    conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL)
+        .map_err(|error| DbError::Sqlite(format!("fresh connection init failed: {error}")))?;
+    Ok(conn)
+}
+
 fn is_hard_post_commit_probe_error(_error: &DbError) -> bool {
     // Post-commit durability probes exist to prove that a write is query-visible
     // from an independent handle before we report success. Any probe error means
@@ -4098,7 +4154,7 @@ pub async fn fetch_inbox_ack_required(
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn fetch_inbox_impl(
-    _cx: &Cx,
+    cx: &Cx,
     pool: &DbPool,
     project_id: i64,
     agent_id: i64,
@@ -4112,22 +4168,23 @@ async fn fetch_inbox_impl(
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
     };
 
-    let sqlite_path = pool.sqlite_path().to_string();
-    let result = asupersync::runtime::spawn_blocking(move || {
-        crate::sync::fetch_inbox_native_sqlite_by_ids(
-            &sqlite_path,
-            project_id,
-            agent_id,
-            urgent_only,
-            unread_only,
-            ack_required_only,
-            since_ts,
-            limit,
-        )
-    })
-    .await;
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
 
-    match result {
+    match crate::sync::fetch_inbox_rows_from_conn(
+        &conn,
+        project_id,
+        agent_id,
+        urgent_only,
+        unread_only,
+        ack_required_only,
+        since_ts,
+        limit,
+    ) {
         Ok(rows) => Outcome::Ok(rows),
         Err(error) => Outcome::Err(error),
     }
@@ -8222,113 +8279,280 @@ pub async fn append_atc_experience(
         Err(error) => return Outcome::Err(error),
     };
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-
-    let tracked = tracked(&*conn);
-    let stored = match run_with_mvcc_retry(cx, "append_atc_experience", || async {
-        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
-
-        let insert_sql = "INSERT INTO atc_experiences \
-            (decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem, decision_class, subject, project_key, policy_id, effect_kind, action, posterior_json, expected_loss, runner_up_action, runner_up_loss, evidence_summary, calibration_healthy, safe_mode_active, non_execution_json, outcome_json, features_json, feature_ext_json, created_ts, dispatched_ts, executed_ts, resolved_ts, context_json) \
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-            ON CONFLICT(decision_id, effect_id) DO NOTHING";
-        let insert_params = [
-            Value::BigInt(decision_id),
-            Value::BigInt(effect_id),
-            Value::Text(row.trace_id.clone()),
-            Value::Text(row.claim_id.clone()),
-            Value::Text(row.evidence_id.clone()),
-            Value::Text(row.state.to_string()),
-            Value::Text(row.subsystem.to_string()),
-            Value::Text(row.decision_class.clone()),
-            Value::Text(row.subject.clone()),
-            row.project_key
-                .as_ref()
-                .map_or(Value::Null, |value| Value::Text(value.clone())),
-            row.policy_id
-                .as_ref()
-                .map_or(Value::Null, |value| Value::Text(value.clone())),
-            Value::Text(row.effect_kind.to_string()),
-            Value::Text(row.action.clone()),
-            Value::Text(posterior_json.clone()),
-            Value::Double(row.expected_loss),
-            row.runner_up_action
-                .as_ref()
-                .map_or(Value::Null, |value| Value::Text(value.clone())),
-            row.runner_up_loss
-                .map_or(Value::Null, Value::Double),
-            Value::Text(row.evidence_summary.clone()),
-            Value::BigInt(i64::from(row.calibration_healthy)),
-            Value::BigInt(i64::from(row.safe_mode_active)),
-            non_execution_json
-                .as_ref()
-                .map_or(Value::Null, |value| Value::Text(value.clone())),
-            outcome_json
-                .as_ref()
-                .map_or(Value::Null, |value| Value::Text(value.clone())),
-            features_json
-                .as_ref()
-                .map_or(Value::Null, |value| Value::Text(value.clone())),
-            feature_ext_json
-                .as_ref()
-                .map_or(Value::Null, |value| Value::Text(value.clone())),
-            Value::BigInt(row.created_ts_micros),
-            row.dispatched_ts_micros
-                .map_or(Value::Null, Value::BigInt),
-            row.executed_ts_micros
-                .map_or(Value::Null, Value::BigInt),
-            row.resolved_ts_micros
-                .map_or(Value::Null, Value::BigInt),
-            context_json
-                .as_ref()
-                .map_or(Value::Null, |value| Value::Text(value.clone())),
-        ];
-        try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
-        );
-
-        let select_sql = format!(
-            "{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE decision_id = ? AND effect_id = ? LIMIT 1"
-        );
-        let select_params = [Value::BigInt(decision_id), Value::BigInt(effect_id)];
-        let rows = try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_query(cx, &tracked, &select_sql, &select_params).await)
-        );
-        let Some(stored) = rows.first() else {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(DbError::Internal(format!(
-                "ATC experience append succeeded but re-select failed for decision_id={decision_id} effect_id={effect_id}"
-            )));
+    {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
-        let stored = match decode_atc_experience_row(stored) {
-            Ok(value) => value,
-            Err(error) => {
+
+        let tracked = tracked(&*conn);
+        match run_with_mvcc_retry(cx, "append_atc_experience", || async {
+            try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+            let insert_sql = "INSERT INTO atc_experiences \
+                (decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem, decision_class, subject, project_key, policy_id, effect_kind, action, posterior_json, expected_loss, runner_up_action, runner_up_loss, evidence_summary, calibration_healthy, safe_mode_active, non_execution_json, outcome_json, features_json, feature_ext_json, created_ts, dispatched_ts, executed_ts, resolved_ts, context_json) \
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                ON CONFLICT(decision_id, effect_id) DO NOTHING";
+            let insert_params = [
+                Value::BigInt(decision_id),
+                Value::BigInt(effect_id),
+                Value::Text(row.trace_id.clone()),
+                Value::Text(row.claim_id.clone()),
+                Value::Text(row.evidence_id.clone()),
+                Value::Text(row.state.to_string()),
+                Value::Text(row.subsystem.to_string()),
+                Value::Text(row.decision_class.clone()),
+                Value::Text(row.subject.clone()),
+                row.project_key
+                    .as_ref()
+                    .map_or(Value::Null, |value| Value::Text(value.clone())),
+                row.policy_id
+                    .as_ref()
+                    .map_or(Value::Null, |value| Value::Text(value.clone())),
+                Value::Text(row.effect_kind.to_string()),
+                Value::Text(row.action.clone()),
+                Value::Text(posterior_json.clone()),
+                Value::Double(row.expected_loss),
+                row.runner_up_action
+                    .as_ref()
+                    .map_or(Value::Null, |value| Value::Text(value.clone())),
+                row.runner_up_loss
+                    .map_or(Value::Null, Value::Double),
+                Value::Text(row.evidence_summary.clone()),
+                Value::BigInt(i64::from(row.calibration_healthy)),
+                Value::BigInt(i64::from(row.safe_mode_active)),
+                non_execution_json
+                    .as_ref()
+                    .map_or(Value::Null, |value| Value::Text(value.clone())),
+                outcome_json
+                    .as_ref()
+                    .map_or(Value::Null, |value| Value::Text(value.clone())),
+                features_json
+                    .as_ref()
+                    .map_or(Value::Null, |value| Value::Text(value.clone())),
+                feature_ext_json
+                    .as_ref()
+                    .map_or(Value::Null, |value| Value::Text(value.clone())),
+                Value::BigInt(row.created_ts_micros),
+                row.dispatched_ts_micros
+                    .map_or(Value::Null, Value::BigInt),
+                row.executed_ts_micros
+                    .map_or(Value::Null, Value::BigInt),
+                row.resolved_ts_micros
+                    .map_or(Value::Null, Value::BigInt),
+                context_json
+                    .as_ref()
+                    .map_or(Value::Null, |value| Value::Text(value.clone())),
+            ];
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
+            );
+
+            let select_sql = format!(
+                "{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE decision_id = ? AND effect_id = ? LIMIT 1"
+            );
+            let select_params = [Value::BigInt(decision_id), Value::BigInt(effect_id)];
+            let rows = try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_query(cx, &tracked, &select_sql, &select_params).await)
+            );
+            let Some(stored) = rows.first() else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "ATC experience append succeeded but re-select failed for decision_id={decision_id} effect_id={effect_id}"
+                )));
+            };
+            if let Err(error) = decode_atc_experience_row(stored) {
                 rollback_tx(cx, &tracked).await;
                 return Outcome::Err(error);
             }
-        };
 
-        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-        Outcome::Ok(stored)
-    })
-    .await
-    {
-        Outcome::Ok(value) => value,
-        Outcome::Err(error) => return Outcome::Err(error),
-        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+            Outcome::Ok(())
+        })
+        .await
+        {
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+    }
+
+    fetch_durable_atc_experience_by_decision_effect(cx, pool, decision_id, effect_id).await
+}
+
+async fn transition_atc_experience_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    experience_id: u64,
+    sql_experience_id: i64,
+    new_state: ExperienceState,
+    ts_micros: i64,
+    non_execution_reason: Option<&NonExecutionReason>,
+    context_patch: Option<&serde_json::Value>,
+) -> Outcome<(), DbError> {
+    try_in_tx!(cx, tracked, begin_concurrent_tx(cx, tracked).await);
+
+    let select_sql = format!("{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE experience_id = ? LIMIT 1");
+    let rows = try_in_tx!(
+        cx,
+        tracked,
+        map_sql_outcome(
+            traw_query(
+                cx,
+                tracked,
+                &select_sql,
+                &[Value::BigInt(sql_experience_id)]
+            )
+            .await
+        )
+    );
+    let Some(stored) = rows.first() else {
+        rollback_tx(cx, tracked).await;
+        return Outcome::Err(DbError::not_found(
+            "AtcExperience",
+            experience_id.to_string(),
+        ));
+    };
+    let mut experience = match decode_atc_experience_row(stored) {
+        Ok(value) => value,
+        Err(error) => {
+            rollback_tx(cx, tracked).await;
+            return Outcome::Err(error);
+        }
     };
 
-    Outcome::Ok(stored)
+    if experience.state != new_state
+        && let Err(reason) = validate_transition(experience.state, new_state)
+    {
+        rollback_tx(cx, tracked).await;
+        return Outcome::Err(DbError::invalid(
+            "state",
+            format!(
+                "experience {experience_id} cannot transition from {} to {}: {reason}",
+                experience.state, new_state
+            ),
+        ));
+    }
+
+    if non_execution_reason.is_some() && !new_state.is_non_execution() {
+        rollback_tx(cx, tracked).await;
+        return Outcome::Err(DbError::invalid(
+            "non_execution_reason",
+            format!(
+                "non_execution_reason is only valid for throttled/suppressed/skipped states, got {new_state}"
+            ),
+        ));
+    }
+    if new_state.is_non_execution()
+        && experience.state != new_state
+        && non_execution_reason.is_none()
+    {
+        rollback_tx(cx, tracked).await;
+        return Outcome::Err(DbError::invalid(
+            "non_execution_reason",
+            format!("non_execution_reason is required when transitioning to {new_state}"),
+        ));
+    }
+
+    if let Err(reason) = experience.transition_to(new_state) {
+        rollback_tx(cx, tracked).await;
+        return Outcome::Err(DbError::invalid(
+            "state",
+            format!("experience {experience_id} transition failed: {reason}"),
+        ));
+    }
+
+    match new_state {
+        ExperienceState::Planned => {}
+        ExperienceState::Dispatched => {
+            if experience.dispatched_ts_micros.is_none() {
+                experience.dispatched_ts_micros = Some(ts_micros);
+            }
+        }
+        ExperienceState::Executed
+        | ExperienceState::Failed
+        | ExperienceState::Throttled
+        | ExperienceState::Suppressed
+        | ExperienceState::Skipped => {
+            if experience.executed_ts_micros.is_none() {
+                experience.executed_ts_micros = Some(ts_micros);
+            }
+        }
+        ExperienceState::Open => {}
+        ExperienceState::Resolved | ExperienceState::Censored | ExperienceState::Expired => {
+            if experience.resolved_ts_micros.is_none() {
+                experience.resolved_ts_micros = Some(ts_micros);
+            }
+        }
+    }
+
+    if new_state.is_non_execution() {
+        if let Some(reason) = non_execution_reason {
+            experience.non_execution_reason = Some(reason.clone());
+        }
+    } else {
+        experience.non_execution_reason = None;
+    }
+    experience.context = match merge_context_patch(experience.context.take(), context_patch) {
+        Ok(value) => value,
+        Err(error) => {
+            rollback_tx(cx, tracked).await;
+            return Outcome::Err(error);
+        }
+    };
+
+    let non_exec_json =
+        match encode_json_optional(&experience.non_execution_reason, "non_execution_json") {
+            Ok(value) => value,
+            Err(error) => {
+                rollback_tx(cx, tracked).await;
+                return Outcome::Err(error);
+            }
+        };
+    let context_json = match encode_json_optional(&experience.context, "context_json") {
+        Ok(value) => value,
+        Err(error) => {
+            rollback_tx(cx, tracked).await;
+            return Outcome::Err(error);
+        }
+    };
+
+    let update_sql = "UPDATE atc_experiences SET state = ?, non_execution_json = ?, dispatched_ts = ?, \
+         executed_ts = ?, resolved_ts = ?, context_json = ? WHERE experience_id = ?";
+    let update_params = [
+        Value::Text(experience.state.to_string()),
+        non_exec_json
+            .as_ref()
+            .map_or(Value::Null, |value| Value::Text(value.clone())),
+        experience
+            .dispatched_ts_micros
+            .map_or(Value::Null, Value::BigInt),
+        experience
+            .executed_ts_micros
+            .map_or(Value::Null, Value::BigInt),
+        experience
+            .resolved_ts_micros
+            .map_or(Value::Null, Value::BigInt),
+        context_json
+            .as_ref()
+            .map_or(Value::Null, |value| Value::Text(value.clone())),
+        Value::BigInt(sql_experience_id),
+    ];
+    try_in_tx!(
+        cx,
+        tracked,
+        map_sql_outcome(traw_execute(cx, tracked, update_sql, &update_params).await)
+    );
+
+    try_in_tx!(cx, tracked, commit_tx(cx, tracked).await);
+    Outcome::Ok(())
 }
 
 /// Transition an ATC experience row to a new lifecycle state with optional
@@ -8361,7 +8585,7 @@ pub async fn transition_atc_experience(
     non_execution_reason: Option<&NonExecutionReason>,
     context_patch: Option<&serde_json::Value>,
 ) -> Outcome<(), DbError> {
-    let id = match i64::try_from(experience_id) {
+    let sql_experience_id = match i64::try_from(experience_id) {
         Ok(value) => value,
         Err(_) => {
             return Outcome::Err(DbError::Internal(format!(
@@ -8370,168 +8594,72 @@ pub async fn transition_atc_experience(
         }
     };
 
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    let pooled_outcome = {
+        let conn = match acquire_conn(cx, pool).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        let tracked = tracked(&*conn);
+        run_with_mvcc_retry(cx, "transition_atc_experience", || async {
+            transition_atc_experience_tx(
+                cx,
+                &tracked,
+                experience_id,
+                sql_experience_id,
+                new_state,
+                ts_micros,
+                non_execution_reason,
+                context_patch,
+            )
+            .await
+        })
+        .await
     };
 
-    let tracked = tracked(&*conn);
-    match run_with_mvcc_retry(cx, "transition_atc_experience", || async {
-        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
-
-        let select_sql =
-            format!("{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE experience_id = ? LIMIT 1");
-        let rows = try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_query(cx, &tracked, &select_sql, &[Value::BigInt(id)]).await)
-        );
-        let Some(stored) = rows.first() else {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(DbError::not_found("AtcExperience", experience_id.to_string()));
-        };
-        let mut experience = match decode_atc_experience_row(stored) {
-            Ok(value) => value,
-            Err(error) => {
-                rollback_tx(cx, &tracked).await;
-                return Outcome::Err(error);
-            }
-        };
-
-        if experience.state != new_state
-            && let Err(reason) = validate_transition(experience.state, new_state)
-        {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(DbError::invalid(
-                "state",
-                format!(
-                    "experience {experience_id} cannot transition from {} to {}: {reason}",
-                    experience.state, new_state
-                ),
-            ));
-        }
-
-        if non_execution_reason.is_some() && !new_state.is_non_execution() {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(DbError::invalid(
-                "non_execution_reason",
-                format!(
-                    "non_execution_reason is only valid for throttled/suppressed/skipped states, got {new_state}"
-                ),
-            ));
-        }
-        if new_state.is_non_execution()
-            && experience.state != new_state
-            && non_execution_reason.is_none()
-        {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(DbError::invalid(
-                "non_execution_reason",
-                format!(
-                    "non_execution_reason is required when transitioning to {new_state}"
-                ),
-            ));
-        }
-
-        if let Err(reason) = experience.transition_to(new_state) {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(DbError::invalid(
-                "state",
-                format!("experience {experience_id} transition failed: {reason}"),
-            ));
-        }
-
-        match new_state {
-            ExperienceState::Planned => {}
-            ExperienceState::Dispatched => {
-                if experience.dispatched_ts_micros.is_none() {
-                    experience.dispatched_ts_micros = Some(ts_micros);
+    match pooled_outcome {
+        Outcome::Err(DbError::NotFound {
+            entity: "AtcExperience",
+            ..
+        }) if pool.sqlite_path() != ":memory:" => {
+            match fetch_durable_atc_experience_by_id(cx, pool, sql_experience_id).await {
+                Outcome::Ok(Some(_)) => {
+                    tracing::warn!(
+                        experience_id,
+                        "pooled connection missed ATC experience visible from fresh connection; retrying transition on fresh direct handle"
+                    );
+                    run_with_mvcc_retry(cx, "transition_atc_experience_fresh_handle", || async {
+                        let direct = match open_fresh_file_backed_conn(pool) {
+                            Ok(conn) => conn,
+                            Err(error) => return Outcome::Err(error),
+                        };
+                        let tracked = tracked(&direct);
+                        transition_atc_experience_tx(
+                            cx,
+                            &tracked,
+                            experience_id,
+                            sql_experience_id,
+                            new_state,
+                            ts_micros,
+                            non_execution_reason,
+                            context_patch,
+                        )
+                        .await
+                    })
+                    .await
                 }
-            }
-            ExperienceState::Executed
-            | ExperienceState::Failed
-            | ExperienceState::Throttled
-            | ExperienceState::Suppressed
-            | ExperienceState::Skipped => {
-                if experience.executed_ts_micros.is_none() {
-                    experience.executed_ts_micros = Some(ts_micros);
-                }
-            }
-            ExperienceState::Open => {}
-            ExperienceState::Resolved | ExperienceState::Censored | ExperienceState::Expired => {
-                if experience.resolved_ts_micros.is_none() {
-                    experience.resolved_ts_micros = Some(ts_micros);
-                }
+                Outcome::Ok(None) => Outcome::Err(DbError::not_found(
+                    "AtcExperience",
+                    experience_id.to_string(),
+                )),
+                Outcome::Err(error) => Outcome::Err(error),
+                Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => Outcome::Panicked(payload),
             }
         }
-
-        if new_state.is_non_execution() {
-            if let Some(reason) = non_execution_reason {
-                experience.non_execution_reason = Some(reason.clone());
-            }
-        } else {
-            experience.non_execution_reason = None;
-        }
-        experience.context = match merge_context_patch(experience.context.take(), context_patch) {
-            Ok(value) => value,
-            Err(error) => {
-                rollback_tx(cx, &tracked).await;
-                return Outcome::Err(error);
-            }
-        };
-
-        let non_exec_json = match encode_json_optional(
-            &experience.non_execution_reason,
-            "non_execution_json",
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                rollback_tx(cx, &tracked).await;
-                return Outcome::Err(error);
-            }
-        };
-        let context_json = match encode_json_optional(&experience.context, "context_json") {
-            Ok(value) => value,
-            Err(error) => {
-                rollback_tx(cx, &tracked).await;
-                return Outcome::Err(error);
-            }
-        };
-
-        let update_sql =
-            "UPDATE atc_experiences SET state = ?, non_execution_json = ?, dispatched_ts = ?, \
-             executed_ts = ?, resolved_ts = ?, context_json = ? WHERE experience_id = ?";
-        let update_params = [
-            Value::Text(experience.state.to_string()),
-            non_exec_json
-                .as_ref()
-                .map_or(Value::Null, |value| Value::Text(value.clone())),
-            experience
-                .dispatched_ts_micros
-                .map_or(Value::Null, Value::BigInt),
-            experience.executed_ts_micros.map_or(Value::Null, Value::BigInt),
-            experience.resolved_ts_micros.map_or(Value::Null, Value::BigInt),
-            context_json
-                .as_ref()
-                .map_or(Value::Null, |value| Value::Text(value.clone())),
-            Value::BigInt(id),
-        ];
-        try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(traw_execute(cx, &tracked, update_sql, &update_params).await)
-        );
-
-        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-        Outcome::Ok(())
-    })
-    .await {
-        Outcome::Ok(()) => Outcome::Ok(()),
-        Outcome::Err(error) => Outcome::Err(error),
-        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+        other => other,
     }
 }
 
@@ -9526,6 +9654,157 @@ mod tests {
                     ..
                 }))
             ));
+        });
+    }
+
+    #[test]
+    fn transition_atc_experience_recovers_from_stale_pooled_snapshot() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join("transition_atc_experience_stale_snapshot.db");
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let stale_pool = crate::create_pool(&cfg).expect("create stale pool");
+        let writer_pool = crate::create_pool(&cfg).expect("create writer pool");
+
+        rt.block_on(async {
+            let seed = ExperienceRow {
+                experience_id: 0,
+                decision_id: 900,
+                effect_id: 900,
+                trace_id: "trc-transition-stale-seed".to_string(),
+                claim_id: "clm-transition-stale-seed".to_string(),
+                evidence_id: "evi-transition-stale-seed".to_string(),
+                state: ExperienceState::Planned,
+                subsystem: ExperienceSubsystem::Liveness,
+                decision_class: "liveness_transition".to_string(),
+                subject: "BlueLake".to_string(),
+                project_key: Some("/tmp/transition-atc-experience-stale".to_string()),
+                policy_id: Some("liveness-incumbent-r1".to_string()),
+                effect_kind: EffectKind::Probe,
+                action: "ProbeAgent".to_string(),
+                posterior: vec![
+                    ("Alive".to_string(), 0.60),
+                    ("Flaky".to_string(), 0.25),
+                    ("Dead".to_string(), 0.15),
+                ],
+                expected_loss: 0.7,
+                runner_up_action: Some("DeferProbe".to_string()),
+                runner_up_loss: Some(1.2),
+                evidence_summary: "seed experience".to_string(),
+                calibration_healthy: true,
+                safe_mode_active: false,
+                non_execution_reason: None,
+                outcome: None,
+                created_ts_micros: 1_700_000_000_010_000,
+                dispatched_ts_micros: None,
+                executed_ts_micros: None,
+                resolved_ts_micros: None,
+                features: Some(FeatureVector::zeroed()),
+                feature_ext: None,
+                context: None,
+            };
+            append_atc_experience(&cx, &writer_pool, &seed)
+                .await
+                .into_result()
+                .expect("append seed experience");
+
+            let stale_conn = acquire_conn(&cx, &stale_pool)
+                .await
+                .into_result()
+                .expect("acquire stale snapshot connection");
+            let stale_tracked = tracked(&*stale_conn);
+            map_sql_outcome(
+                traw_query(
+                    &cx,
+                    &stale_tracked,
+                    "SELECT experience_id FROM atc_experiences WHERE decision_id = ? AND effect_id = ?",
+                    &[Value::BigInt(900), Value::BigInt(900)],
+                )
+                .await,
+            )
+            .into_result()
+            .expect("seed stale snapshot");
+            drop(stale_conn);
+
+            let target = ExperienceRow {
+                experience_id: 0,
+                decision_id: 901,
+                effect_id: 901,
+                trace_id: "trc-transition-stale-target".to_string(),
+                claim_id: "clm-transition-stale-target".to_string(),
+                evidence_id: "evi-transition-stale-target".to_string(),
+                state: ExperienceState::Planned,
+                subsystem: ExperienceSubsystem::Liveness,
+                decision_class: "liveness_transition".to_string(),
+                subject: "BlueLake".to_string(),
+                project_key: Some("/tmp/transition-atc-experience-stale".to_string()),
+                policy_id: Some("liveness-incumbent-r1".to_string()),
+                effect_kind: EffectKind::Probe,
+                action: "ProbeAgent".to_string(),
+                posterior: vec![
+                    ("Alive".to_string(), 0.25),
+                    ("Flaky".to_string(), 0.50),
+                    ("Dead".to_string(), 0.25),
+                ],
+                expected_loss: 1.1,
+                runner_up_action: Some("DeferProbe".to_string()),
+                runner_up_loss: Some(1.5),
+                evidence_summary: "target experience".to_string(),
+                calibration_healthy: true,
+                safe_mode_active: false,
+                non_execution_reason: None,
+                outcome: None,
+                created_ts_micros: 1_700_000_000_011_000,
+                dispatched_ts_micros: None,
+                executed_ts_micros: None,
+                resolved_ts_micros: None,
+                features: Some(FeatureVector::zeroed()),
+                feature_ext: None,
+                context: None,
+            };
+            let stored = append_atc_experience(&cx, &writer_pool, &target)
+                .await
+                .into_result()
+                .expect("append target experience");
+
+            transition_atc_experience(
+                &cx,
+                &stale_pool,
+                stored.experience_id,
+                ExperienceState::Dispatched,
+                1_700_000_000_011_500,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("stale pooled snapshot should recover via fresh-handle retry");
+
+            let durable = fetch_durable_atc_experience_by_id(
+                &cx,
+                &writer_pool,
+                i64::try_from(stored.experience_id).expect("experience id"),
+            )
+            .await
+            .into_result()
+            .expect("probe durable ATC experience")
+            .expect("durable row");
+            assert_eq!(durable.state, ExperienceState::Dispatched);
+            assert_eq!(durable.dispatched_ts_micros, Some(1_700_000_000_011_500));
         });
     }
 

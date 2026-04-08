@@ -154,6 +154,7 @@ pub use pool::{
     canary_storage_root,
     classify_canary_outcome,
     create_pool,
+    create_pool_without_startup_init,
     deferred_write_queue,
     ensure_sqlite_file_healthy,
     ensure_sqlite_file_healthy_with_archive,
@@ -216,8 +217,10 @@ pub use sqlmodel_sqlite;
 /// `BEGIN CONCURRENT` write paths.
 pub type DbConn = sqlmodel_frankensqlite::FrankenConnection;
 
-/// The canonical C-SQLite connection type used for verification and one-shot
-/// recovery flows that must not rely on FrankenSQLite behavior.
+/// The connection type used by canonical verification and recovery flows.
+///
+/// Canonical verification and recovery use native SQLite so corruption verdicts
+/// are not self-referential with the runtime FrankenSQLite path.
 pub type CanonicalDbConn = sqlmodel_sqlite::SqliteConnection;
 
 pub fn close_db_conn(conn: DbConn, context: &'static str) {

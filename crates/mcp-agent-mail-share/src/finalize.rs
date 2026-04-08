@@ -11,6 +11,7 @@ use crate::ShareError;
 type Conn = DbConn;
 
 #[cfg(test)]
+// Historical alias name retained in tests; this still uses FrankenSQLite `DbConn`.
 type SqliteConnection = DbConn;
 
 /// Result of the full finalization pipeline.

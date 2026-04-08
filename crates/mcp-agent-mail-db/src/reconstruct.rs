@@ -23,6 +23,7 @@ use crate::error::{DbError, DbResult};
 use crate::schema;
 use serde::Serialize;
 use sqlmodel_core::{Error as SqlError, Value};
+use sqlmodel_schema::Migration;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -40,6 +41,112 @@ fn is_real_file(path: &Path) -> bool {
 }
 
 const DUPLICATE_CANONICAL_WARNING_SAMPLE_LIMIT: usize = 5;
+
+fn trim_sql_identifier(token: &str) -> &str {
+    token.trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '[' | ']' | ';'))
+}
+
+fn parse_alter_table_add_column(sql: &str) -> Option<(String, String)> {
+    let tokens: Vec<&str> = sql.split_whitespace().collect();
+    if tokens.len() < 5
+        || !tokens[0].eq_ignore_ascii_case("alter")
+        || !tokens[1].eq_ignore_ascii_case("table")
+        || !tokens[3].eq_ignore_ascii_case("add")
+    {
+        return None;
+    }
+
+    let table = trim_sql_identifier(tokens[2]);
+    if table.is_empty() {
+        return None;
+    }
+
+    let column_idx = if tokens
+        .get(4)
+        .is_some_and(|token| token.eq_ignore_ascii_case("column"))
+    {
+        5
+    } else {
+        4
+    };
+    let column = trim_sql_identifier(tokens.get(column_idx)?);
+    if column.is_empty() {
+        return None;
+    }
+
+    Some((table.to_string(), column.to_string()))
+}
+
+fn reconstruct_migration_preflight_already_satisfied(
+    conn: &DbConn,
+    migration: &Migration,
+) -> DbResult<bool> {
+    let Some((table, column)) = parse_alter_table_add_column(&migration.up) else {
+        return Ok(false);
+    };
+    Ok(table_columns(conn, &table)?.contains(&column))
+}
+
+fn apply_base_migrations_after_snapshot(conn: &DbConn) -> DbResult<()> {
+    conn.execute_raw(&format!(
+        "CREATE TABLE IF NOT EXISTS {} (\
+            id TEXT PRIMARY KEY ON CONFLICT IGNORE,\
+            description TEXT NOT NULL,\
+            applied_at INTEGER NOT NULL\
+        )",
+        schema::MIGRATIONS_TABLE_NAME,
+    ))
+    .map_err(|e| DbError::Sqlite(format!("reconstruct: migrations table: {e}")))?;
+
+    let applied_rows = conn
+        .query_sync(
+            &format!("SELECT id FROM {}", schema::MIGRATIONS_TABLE_NAME),
+            &[],
+        )
+        .map_err(|e| DbError::Sqlite(format!("reconstruct: read migration set: {e}")))?;
+    let mut applied_ids = applied_rows
+        .into_iter()
+        .filter_map(|row| row.get_named::<String>("id").ok())
+        .collect::<HashSet<_>>();
+
+    for migration in schema::schema_migrations_base() {
+        if applied_ids.contains(&migration.id) {
+            continue;
+        }
+
+        let already_satisfied =
+            reconstruct_migration_preflight_already_satisfied(conn, &migration)?;
+        if !already_satisfied {
+            conn.execute_raw(&migration.up).map_err(|e| {
+                DbError::Sqlite(format!(
+                    "reconstruct: apply base migration {} ({}): {e}",
+                    migration.id, migration.description
+                ))
+            })?;
+        }
+
+        conn.execute_sync(
+            &format!(
+                "INSERT OR IGNORE INTO {} (id, description, applied_at) VALUES (?, ?, ?)",
+                schema::MIGRATIONS_TABLE_NAME,
+            ),
+            &[
+                Value::Text(migration.id.clone()),
+                Value::Text(migration.description.clone()),
+                Value::BigInt(crate::now_micros()),
+            ],
+        )
+        .map_err(|e| {
+            DbError::Sqlite(format!(
+                "reconstruct: record base migration {}: {e}",
+                migration.id
+            ))
+        })?;
+        applied_ids.insert(migration.id);
+    }
+
+    Ok(())
+}
 
 /// Statistics returned after a reconstruction attempt.
 #[derive(Debug, Clone, Default)]
@@ -542,6 +649,14 @@ fn compute_identity_mismatches(
 ) -> Vec<ProjectIdentityMismatch> {
     let mut mismatches = Vec::new();
 
+    // No archive project identities means there is no durable archive-side
+    // identity state to compare against yet. Treating DB-only identities as
+    // drift in that case creates false positives for empty/new mailboxes and
+    // can incorrectly steer doctor flows toward reconstruction.
+    if archive_identities.is_empty() {
+        return mismatches;
+    }
+
     // Archive identities not matched in DB.
     for archive_id in archive_identities {
         if !mailbox_project_identity_matches_db(archive_id, db_identities) {
@@ -949,36 +1064,13 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
                 .map_err(|e| DbError::Sqlite(format!("reconstruct: DDL: {e}")))?;
         }
 
-        // Record base migrations as already applied so the runtime will not try
-        // to replay them on first open. The schema above is already current.
-        let base_migrations = schema::schema_migrations_base();
-        // Create the migrations tracking table first.
-        conn.execute_raw(&format!(
-            "CREATE TABLE IF NOT EXISTS {} (\
-                id TEXT PRIMARY KEY ON CONFLICT IGNORE,\
-                description TEXT NOT NULL,\
-                applied_at INTEGER NOT NULL\
-            )",
-            schema::MIGRATIONS_TABLE_NAME,
-        ))
-        .map_err(|e| DbError::Sqlite(format!("reconstruct: migrations table: {e}")))?;
-
-        let migration_ts = crate::now_micros();
-        for migration in &base_migrations {
-            // Record it as applied.
-            conn.execute_sync(
-                &format!(
-                    "INSERT OR IGNORE INTO {} (id, description, applied_at) VALUES (?, ?, ?)",
-                    schema::MIGRATIONS_TABLE_NAME,
-                ),
-                &[
-                    Value::Text(migration.id.clone()),
-                    Value::Text(migration.description.clone()),
-                    Value::BigInt(migration_ts),
-                ],
-            )
-            .map_err(|e| DbError::Sqlite(format!("reconstruct: record migration: {e}")))?;
-        }
+        // Follow the snapshot DDL with a synchronous replay of base migrations.
+        // The snapshot is intentionally ahead of many legacy mail tables, but it
+        // can still lag newer archive-independent runtime tables such as the ATC
+        // experience store. Replaying the base migrations here keeps rebuilt DBs
+        // aligned with the live server schema while preflighting `ALTER TABLE`
+        // additions so latest-schema columns are not duplicated.
+        apply_base_migrations_after_snapshot(&conn)?;
 
         // Clean up any FTS artifacts that may have been left by prior migrations.
         // This mirrors `schema::enforce_runtime_fts_cleanup`, but uses canonical
@@ -1896,6 +1988,69 @@ fn build_salvage_select(
     Some(selected.join(", "))
 }
 
+fn build_salvage_agent_links_select(
+    columns: &HashSet<String>,
+    stats: &mut ReconstructStats,
+    salvage_db_path: &Path,
+) -> Option<String> {
+    const CURRENT_REQUIRED: [&str; 4] =
+        ["a_project_id", "a_agent_id", "b_project_id", "b_agent_id"];
+    const LEGACY_REQUIRED: [&str; 3] = ["project_id", "from_agent_id", "to_agent_id"];
+    const OPTIONAL: [&str; 5] = ["status", "reason", "created_ts", "updated_ts", "expires_ts"];
+
+    if CURRENT_REQUIRED
+        .iter()
+        .all(|column| columns.contains(*column))
+    {
+        return build_salvage_select(
+            "agent_links",
+            columns,
+            &CURRENT_REQUIRED,
+            &OPTIONAL,
+            stats,
+            salvage_db_path,
+        );
+    }
+
+    if LEGACY_REQUIRED
+        .iter()
+        .all(|column| columns.contains(*column))
+    {
+        let mut selected = vec![
+            "project_id AS a_project_id".to_string(),
+            "from_agent_id AS a_agent_id".to_string(),
+            "project_id AS b_project_id".to_string(),
+            "to_agent_id AS b_agent_id".to_string(),
+        ];
+        selected.extend(
+            OPTIONAL
+                .iter()
+                .copied()
+                .filter(|column| columns.contains(*column))
+                .map(str::to_string),
+        );
+        return Some(selected.join(", "));
+    }
+
+    let missing_current = CURRENT_REQUIRED
+        .iter()
+        .copied()
+        .filter(|column| !columns.contains(*column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let missing_legacy = LEGACY_REQUIRED
+        .iter()
+        .copied()
+        .filter(|column| !columns.contains(*column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    stats.warnings.push(format!(
+        "Salvage database {} table agent_links missing required columns for both current schema ({missing_current}) and legacy schema ({missing_legacy})",
+        salvage_db_path.display()
+    ));
+    None
+}
+
 fn merge_salvaged_created_at(current_created_at: i64, salvaged_created_at: i64) -> i64 {
     if salvaged_created_at <= 0 {
         current_created_at
@@ -2619,14 +2774,9 @@ fn merge_salvaged_database(
             ));
         } else {
             let agent_link_columns = table_columns(&salvage_conn, "agent_links")?;
-            if let Some(agent_link_select) = build_salvage_select(
-                "agent_links",
-                &agent_link_columns,
-                &["a_project_id", "a_agent_id", "b_project_id", "b_agent_id"],
-                &["status", "reason", "created_ts", "updated_ts", "expires_ts"],
-                stats,
-                salvage_db_path,
-            ) {
+            if let Some(agent_link_select) =
+                build_salvage_agent_links_select(&agent_link_columns, stats, salvage_db_path)
+            {
                 let agent_link_rows = salvage_conn
                     .query_sync(
                         &format!(
@@ -3654,6 +3804,44 @@ mod tests {
                 .expect("canonical sqlite health check should succeed"),
             "reconstructed database should be healthy for canonical sqlite",
         );
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open rebuilt db");
+        let atc_tables = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'table' AND name IN ('atc_experiences', 'atc_experience_rollups') \
+                 ORDER BY name",
+                &[],
+            )
+            .expect("query ATC tables")
+            .into_iter()
+            .filter_map(|row| row.get_named::<String>("name").ok())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            atc_tables,
+            vec![
+                "atc_experience_rollups".to_string(),
+                "atc_experiences".to_string()
+            ],
+            "reconstruct should materialize ATC base tables required by the live server"
+        );
+        let rollup_columns = conn
+            .query_sync("PRAGMA table_info(atc_experience_rollups)", &[])
+            .expect("query ATC rollup columns")
+            .into_iter()
+            .filter_map(|row| row.get_named::<String>("name").ok())
+            .collect::<HashSet<_>>();
+        for required in [
+            "ewma_loss",
+            "ewma_weight",
+            "delay_sum_micros",
+            "delay_count",
+            "delay_max_micros",
+        ] {
+            assert!(
+                rollup_columns.contains(required),
+                "reconstruct should preserve ATC rollup column {required}"
+            );
+        }
     }
 
     #[test]

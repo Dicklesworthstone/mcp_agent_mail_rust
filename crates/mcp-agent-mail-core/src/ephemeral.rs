@@ -6,10 +6,10 @@
 //!
 //! # Tiers
 //!
-//! - **Tier 1 (SystemTemp)**: `/tmp`, `/var/tmp`, `/dev/shm`, `$TMPDIR`
-//! - **Tier 2 (TestRepro)**: test harnesses, repro dirs, `AM_TEST_MODE`
-//! - **Tier 3 (NtmSwarm)**: NTM/swarm session directories
-//! - **Tier 4 (CiCd)**: CI/CD environments (`CI=true`, GitHub Actions, etc.)
+//! - **Tier 1 (`SystemTemp`)**: `/tmp`, `/var/tmp`, `/dev/shm`, `$TMPDIR`
+//! - **Tier 2 (`TestRepro`)**: test harnesses, repro dirs, `AM_TEST_MODE`
+//! - **Tier 3 (`NtmSwarm`)**: NTM/swarm session directories
+//! - **Tier 4 (`CiCd`)**: CI/CD environments (`CI=true`, GitHub Actions, etc.)
 //!
 //! # Classification
 //!
@@ -165,6 +165,7 @@ impl std::fmt::Display for EphemeralMode {
 
 /// Individual signals that contributed to ephemeral classification.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct EphemeralSignals {
     // ---- Tier 1: System temp (path-based) ----
     /// Path starts with `/tmp` or `/tmp/`.
@@ -212,7 +213,7 @@ pub struct EphemeralSignals {
 impl EphemeralSignals {
     /// Whether any high-confidence signal is active.
     #[must_use]
-    pub fn has_high_confidence(&self) -> bool {
+    pub const fn has_high_confidence(&self) -> bool {
         // Tier 1 path signals are all high confidence
         self.path_tmp
             || self.path_var_tmp
@@ -233,7 +234,7 @@ impl EphemeralSignals {
 
     /// Whether any medium-confidence signal is active.
     #[must_use]
-    pub fn has_medium_confidence(&self) -> bool {
+    pub const fn has_medium_confidence(&self) -> bool {
         self.path_contains_test
             || self.path_contains_repro
             || self.path_contains_dot_tmp
@@ -243,13 +244,13 @@ impl EphemeralSignals {
 
     /// Whether any signal is active.
     #[must_use]
-    pub fn has_any(&self) -> bool {
+    pub const fn has_any(&self) -> bool {
         self.has_high_confidence() || self.has_medium_confidence()
     }
 
     /// Return the highest-priority tier, if any signals are active.
     #[must_use]
-    pub fn primary_tier(&self) -> Option<EphemeralTier> {
+    pub const fn primary_tier(&self) -> Option<EphemeralTier> {
         if self.path_tmp
             || self.path_var_tmp
             || self.path_dev_shm
@@ -340,6 +341,7 @@ impl EphemeralSignals {
 // ============================================================================
 
 /// Standard environment variable lookup via `std::env::var`.
+#[must_use]
 pub fn std_env_lookup(key: &str) -> Option<String> {
     std::env::var(key).ok()
 }
@@ -439,8 +441,8 @@ pub fn classify_ephemeral(
     }
 
     // ---- Tier 2: Test/repro (path + env) ----
-    signals.path_contains_test = normalized.split('/').any(|comp| has_test_pattern(comp));
-    signals.path_contains_repro = normalized.split('/').any(|comp| has_repro_pattern(comp));
+    signals.path_contains_test = normalized.split('/').any(has_test_pattern);
+    signals.path_contains_repro = normalized.split('/').any(has_repro_pattern);
     signals.path_contains_dot_tmp = path_has_dot_tmp_component(&normalized);
 
     signals.env_am_test_mode = env("AM_TEST_MODE")
@@ -497,7 +499,10 @@ pub fn path_has_ephemeral_root(path: &Path) -> bool {
 /// - `Deny` → always `Production`
 /// - `Auto` → use detected class
 #[must_use]
-pub fn resolve_ephemeral_class(mode: EphemeralMode, detected: EphemeralClass) -> EphemeralClass {
+pub const fn resolve_ephemeral_class(
+    mode: EphemeralMode,
+    detected: EphemeralClass,
+) -> EphemeralClass {
     match mode {
         EphemeralMode::Force => EphemeralClass::Ephemeral,
         EphemeralMode::Deny => EphemeralClass::Production,
@@ -746,7 +751,7 @@ mod tests {
 
     #[test]
     fn classify_home_dir_as_production() {
-        let (class, signals) =
+        let (class, _signals) =
             classify_ephemeral(Path::new("/home/ubuntu/projects/my-project"), &empty_env);
         assert_eq!(class, EphemeralClass::Production);
     }

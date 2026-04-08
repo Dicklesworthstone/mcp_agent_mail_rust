@@ -687,8 +687,21 @@ const XDG_APP_DIR: &str = "mcp-agent-mail";
 ///
 /// The caller is responsible for backward-compat checks (i.e. preferring a
 /// legacy path when it already exists on disk).
+fn config_path_override(key: &str) -> Option<PathBuf> {
+    real_env_value(key)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| PathBuf::from(shellexpand::tilde(&value).into_owned()))
+}
+
+fn configured_home_dir() -> Option<PathBuf> {
+    config_path_override("HOME").or_else(dirs::home_dir)
+}
+
 fn xdg_config_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join(XDG_APP_DIR))
+    config_path_override("XDG_CONFIG_HOME")
+        .or_else(|| configured_home_dir().map(|home| home.join(".config")))
+        .or_else(dirs::config_dir)
+        .map(|d| d.join(XDG_APP_DIR))
 }
 
 /// Return the XDG-compliant data directory for this application.
@@ -696,12 +709,15 @@ fn xdg_config_dir() -> Option<PathBuf> {
 /// Resolution order:
 ///   1. `$XDG_DATA_HOME/mcp-agent-mail/` (or `~/.local/share/mcp-agent-mail/`)
 fn xdg_data_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join(XDG_APP_DIR))
+    config_path_override("XDG_DATA_HOME")
+        .or_else(|| configured_home_dir().map(|home| home.join(".local").join("share")))
+        .or_else(dirs::data_dir)
+        .map(|d| d.join(XDG_APP_DIR))
 }
 
 #[must_use]
 pub fn default_storage_root_path() -> PathBuf {
-    let legacy = dirs::home_dir()
+    let legacy = configured_home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".mcp_agent_mail_git_mailbox_repo");
     if legacy.exists() {
@@ -792,11 +808,16 @@ pub fn compute_ephemeral_storage_root_with_env(
 /// collisions among concurrent test/CI runs.
 fn ephemeral_path_hash(path: &str) -> String {
     use sha1::{Digest, Sha1};
+    use std::fmt::Write as _;
     let mut hasher = Sha1::new();
     hasher.update(path.as_bytes());
     let digest = hasher.finalize();
     // Take first 6 bytes → 12 hex chars
-    digest.iter().take(6).map(|b| format!("{b:02x}")).collect()
+    let mut hex = String::with_capacity(12);
+    for byte in digest.iter().take(6) {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// Resolve `storage_root` to a canonical (symlink-free) path.
@@ -860,9 +881,9 @@ fn resolve_data_path(legacy_base: &Path, subdir: &str) -> PathBuf {
     xdg_data_dir().map_or_else(|| legacy_base.join(subdir), |d| d.join(subdir))
 }
 
-/// Legacy default DATABASE_URL inherited from the Python implementation.
+/// Legacy default `DATABASE_URL` inherited from the Python implementation.
 /// Used as a sentinel in `Config::default()` so that `from_env()` can detect
-/// when no explicit DATABASE_URL was provided and derive the path from
+/// when no explicit `DATABASE_URL` was provided and derive the path from
 /// `storage_root` instead.
 const DEFAULT_LEGACY_DATABASE_URL: &str = "sqlite+aiosqlite:///./storage.sqlite3";
 
@@ -1180,14 +1201,17 @@ fn global_config_cache_get() -> Config {
             return c.clone();
         }
     }
-    // Slow path: write lock, initialize from env
+    // Slow path: build outside the write lock so recursive `Config::get()`
+    // calls during `from_env()` cannot deadlock on this cache.
+    let fresh = Config::from_env();
     let mut guard = CONFIG_CACHE
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if guard.is_none() {
-        *guard = Some(Config::from_env());
+    if let Some(ref cached) = *guard {
+        return cached.clone();
     }
-    guard.as_ref().cloned().unwrap_or_else(Config::from_env)
+    *guard = Some(fresh.clone());
+    fresh
 }
 
 fn global_config_cache_reset() {
@@ -2451,7 +2475,7 @@ fn user_env_file_path_from(home: &Path, xdg_config_dir: Option<&Path>) -> Option
 }
 
 fn user_env_file_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
+    let home = configured_home_dir()?;
     let xdg = xdg_config_dir();
     user_env_file_path_from(&home, xdg.as_deref())
 }
@@ -3870,6 +3894,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn default_storage_root_path_respects_overridden_xdg_data_home() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let xdg_data = tmp.path().join("xdg-data");
+        std::fs::create_dir_all(&home).expect("create home");
+        std::fs::create_dir_all(&xdg_data).expect("create xdg data");
+        let home_text = home.to_string_lossy().into_owned();
+        let xdg_data_text = xdg_data.to_string_lossy().into_owned();
+
+        let resolved = with_process_env_overrides_for_test(
+            &[
+                ("HOME", home_text.as_str()),
+                ("XDG_DATA_HOME", xdg_data_text.as_str()),
+            ],
+            default_storage_root_path,
+        );
+
+        assert_eq!(
+            resolved,
+            xdg_data.join(XDG_APP_DIR).join("git_mailbox_repo")
+        );
+    }
+
+    #[test]
+    fn default_storage_root_path_prefers_overridden_home_legacy_repo_when_present() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let legacy = home.join(".mcp_agent_mail_git_mailbox_repo");
+        let xdg_data = tmp.path().join("xdg-data");
+        std::fs::create_dir_all(&legacy).expect("create legacy repo");
+        std::fs::create_dir_all(&xdg_data).expect("create xdg data");
+        let home_text = home.to_string_lossy().into_owned();
+        let xdg_data_text = xdg_data.to_string_lossy().into_owned();
+
+        let resolved = with_process_env_overrides_for_test(
+            &[
+                ("HOME", home_text.as_str()),
+                ("XDG_DATA_HOME", xdg_data_text.as_str()),
+            ],
+            default_storage_root_path,
+        );
+
+        assert_eq!(resolved, legacy);
+    }
+
     // -----------------------------------------------------------------------
     // detect_source
     // -----------------------------------------------------------------------
@@ -4267,9 +4337,11 @@ mod tests {
 
     #[test]
     fn compute_ephemeral_storage_root_returns_isolated_path_for_tmp() {
-        let mut config = Config::default();
-        config.storage_root = default_storage_root_path();
-        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Auto;
+        let config = Config {
+            storage_root: default_storage_root_path(),
+            ephemeral_mode: crate::ephemeral::EphemeralMode::Auto,
+            ..Config::default()
+        };
 
         let result = compute_ephemeral_storage_root_with_env(
             Path::new("/tmp/test-project"),
@@ -4289,9 +4361,11 @@ mod tests {
 
     #[test]
     fn compute_ephemeral_storage_root_returns_none_for_production_path() {
-        let mut config = Config::default();
-        config.storage_root = default_storage_root_path();
-        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Auto;
+        let config = Config {
+            storage_root: default_storage_root_path(),
+            ephemeral_mode: crate::ephemeral::EphemeralMode::Auto,
+            ..Config::default()
+        };
 
         let result = compute_ephemeral_storage_root_with_env(
             Path::new("/data/projects/real-project"),
@@ -4306,9 +4380,11 @@ mod tests {
 
     #[test]
     fn compute_ephemeral_storage_root_returns_none_for_custom_storage_root() {
-        let mut config = Config::default();
-        config.storage_root = PathBuf::from("/custom/storage");
-        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Auto;
+        let config = Config {
+            storage_root: PathBuf::from("/custom/storage"),
+            ephemeral_mode: crate::ephemeral::EphemeralMode::Auto,
+            ..Config::default()
+        };
 
         let result = compute_ephemeral_storage_root_with_env(
             Path::new("/tmp/test-project"),
@@ -4323,9 +4399,11 @@ mod tests {
 
     #[test]
     fn compute_ephemeral_storage_root_respects_deny_mode() {
-        let mut config = Config::default();
-        config.storage_root = default_storage_root_path();
-        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Deny;
+        let config = Config {
+            storage_root: default_storage_root_path(),
+            ephemeral_mode: crate::ephemeral::EphemeralMode::Deny,
+            ..Config::default()
+        };
 
         let result = compute_ephemeral_storage_root_with_env(
             Path::new("/tmp/test-project"),
@@ -4337,10 +4415,12 @@ mod tests {
 
     #[test]
     fn compute_ephemeral_storage_root_uses_custom_ephemeral_root() {
-        let mut config = Config::default();
-        config.storage_root = default_storage_root_path();
-        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Auto;
-        config.ephemeral_root = Some(PathBuf::from("/dev/shm/custom-eph"));
+        let config = Config {
+            storage_root: default_storage_root_path(),
+            ephemeral_mode: crate::ephemeral::EphemeralMode::Auto,
+            ephemeral_root: Some(PathBuf::from("/dev/shm/custom-eph")),
+            ..Config::default()
+        };
 
         let result = compute_ephemeral_storage_root_with_env(
             Path::new("/tmp/test-project"),
@@ -4357,9 +4437,11 @@ mod tests {
 
     #[test]
     fn compute_ephemeral_storage_root_dev_shm_path() {
-        let mut config = Config::default();
-        config.storage_root = default_storage_root_path();
-        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Auto;
+        let config = Config {
+            storage_root: default_storage_root_path(),
+            ephemeral_mode: crate::ephemeral::EphemeralMode::Auto,
+            ..Config::default()
+        };
 
         let result = compute_ephemeral_storage_root_with_env(
             Path::new("/dev/shm/agent-session"),
@@ -4373,9 +4455,11 @@ mod tests {
 
     #[test]
     fn ephemeral_projects_get_distinct_isolated_roots() {
-        let mut config = Config::default();
-        config.storage_root = default_storage_root_path();
-        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Auto;
+        let config = Config {
+            storage_root: default_storage_root_path(),
+            ephemeral_mode: crate::ephemeral::EphemeralMode::Auto,
+            ..Config::default()
+        };
 
         let root_a = compute_ephemeral_storage_root_with_env(
             Path::new("/tmp/ci-run-1234"),
@@ -4397,9 +4481,11 @@ mod tests {
 
     #[test]
     fn ephemeral_reroute_never_returns_default_storage_root() {
-        let mut config = Config::default();
-        config.storage_root = default_storage_root_path();
-        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Auto;
+        let config = Config {
+            storage_root: default_storage_root_path(),
+            ephemeral_mode: crate::ephemeral::EphemeralMode::Auto,
+            ..Config::default()
+        };
         let default_root = default_storage_root_path();
 
         for path in &["/tmp/test", "/dev/shm/smoke", "/tmp/.cache/agent"] {
@@ -4419,9 +4505,11 @@ mod tests {
 
     #[test]
     fn production_paths_never_rerouted_in_auto_mode() {
-        let mut config = Config::default();
-        config.storage_root = default_storage_root_path();
-        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Auto;
+        let config = Config {
+            storage_root: default_storage_root_path(),
+            ephemeral_mode: crate::ephemeral::EphemeralMode::Auto,
+            ..Config::default()
+        };
 
         let production_paths = [
             "/data/projects/my-app",
@@ -4440,9 +4528,11 @@ mod tests {
 
     #[test]
     fn force_mode_reroutes_even_production_paths() {
-        let mut config = Config::default();
-        config.storage_root = default_storage_root_path();
-        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Force;
+        let config = Config {
+            storage_root: default_storage_root_path(),
+            ephemeral_mode: crate::ephemeral::EphemeralMode::Force,
+            ..Config::default()
+        };
 
         let result = compute_ephemeral_storage_root_with_env(
             Path::new("/data/projects/real-production"),
@@ -4462,9 +4552,11 @@ mod tests {
 
     #[test]
     fn deny_mode_prevents_reroute_for_all_paths() {
-        let mut config = Config::default();
-        config.storage_root = default_storage_root_path();
-        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Deny;
+        let config = Config {
+            storage_root: default_storage_root_path(),
+            ephemeral_mode: crate::ephemeral::EphemeralMode::Deny,
+            ..Config::default()
+        };
 
         let ephemeral_paths = ["/tmp/test-project", "/dev/shm/ci", "/tmp/.cache/agent-work"];
         for path in &ephemeral_paths {
@@ -4487,9 +4579,11 @@ mod tests {
 
     #[test]
     fn allow_ephemeral_in_default_storage_switches_to_deny_mode() {
-        let mut config = Config::default();
-        config.allow_ephemeral_projects_in_default_storage = true;
-        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Auto;
+        let mut config = Config {
+            allow_ephemeral_projects_in_default_storage: true,
+            ephemeral_mode: crate::ephemeral::EphemeralMode::Auto,
+            ..Config::default()
+        };
         // The env-reading path does this conversion, so simulate it:
         if config.allow_ephemeral_projects_in_default_storage
             && config.ephemeral_mode == crate::ephemeral::EphemeralMode::Auto
@@ -4509,9 +4603,11 @@ mod tests {
 
     #[test]
     fn ephemeral_isolated_root_is_deterministic_across_calls() {
-        let mut config = Config::default();
-        config.storage_root = default_storage_root_path();
-        config.ephemeral_mode = crate::ephemeral::EphemeralMode::Auto;
+        let config = Config {
+            storage_root: default_storage_root_path(),
+            ephemeral_mode: crate::ephemeral::EphemeralMode::Auto,
+            ..Config::default()
+        };
 
         let path = Path::new("/tmp/deterministic-test");
         let root_a = compute_ephemeral_storage_root_with_env(path, &config, &no_env);

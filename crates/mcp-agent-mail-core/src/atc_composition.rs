@@ -152,7 +152,7 @@ impl ControllerId {
     }
 
     /// All controller IDs in canonical evaluation order.
-    pub const ALL: [ControllerId; 14] = [
+    pub const ALL: [Self; 14] = [
         Self::EProcess,
         Self::Cusum,
         Self::CalibrationGuard,
@@ -442,7 +442,7 @@ pub struct VetoChainResult {
 impl VetoChainResult {
     /// True if any controller vetoed this action.
     #[must_use]
-    pub fn is_vetoed(&self) -> bool {
+    pub const fn is_vetoed(&self) -> bool {
         !self.permitted
     }
 
@@ -469,15 +469,15 @@ pub fn evaluate_veto_chain(
 ) -> VetoChainResult {
     let mut vetoes = Vec::new();
     for boundary in &AUTHORITY_BOUNDARIES {
-        if boundary.can_veto.contains(&action) {
-            if let Some(reason) = check_veto(boundary.controller) {
-                vetoes.push(ControllerVeto {
-                    source: boundary.controller,
-                    action: action.to_string(),
-                    reason,
-                    timestamp_micros,
-                });
-            }
+        if boundary.can_veto.contains(&action)
+            && let Some(reason) = check_veto(boundary.controller)
+        {
+            vetoes.push(ControllerVeto {
+                source: boundary.controller,
+                action: action.to_string(),
+                reason,
+                timestamp_micros,
+            });
         }
     }
     VetoChainResult {
@@ -643,7 +643,7 @@ impl HysteresisGuard {
 
     /// Whether a state change is pending.
     #[must_use]
-    pub fn has_pending(&self) -> bool {
+    pub const fn has_pending(&self) -> bool {
         self.pending.is_some()
     }
 
@@ -655,19 +655,19 @@ impl HysteresisGuard {
 
     /// Number of suppressed oscillations.
     #[must_use]
-    pub fn suppressed_count(&self) -> u64 {
+    pub const fn suppressed_count(&self) -> u64 {
         self.suppressed_count
     }
 
     /// Number of committed transitions.
     #[must_use]
-    pub fn committed_count(&self) -> u64 {
+    pub const fn committed_count(&self) -> u64 {
         self.committed_count
     }
 
     /// Microseconds since the last committed transition.
     #[must_use]
-    pub fn micros_since_last_transition(&self, now_micros: i64) -> i64 {
+    pub const fn micros_since_last_transition(&self, now_micros: i64) -> i64 {
         if self.last_transition_micros == 0 {
             return i64::MAX;
         }
@@ -1123,7 +1123,7 @@ pub enum TickPhase {
 
 impl TickPhase {
     /// All phases in execution order.
-    pub const ALL: [TickPhase; 13] = [
+    pub const ALL: [Self; 13] = [
         Self::SensorIngestion,
         Self::FastGuardEvaluation,
         Self::ActionGating,
@@ -1141,9 +1141,12 @@ impl TickPhase {
 
     /// Which controllers are active during this phase.
     #[must_use]
-    pub fn active_controllers(self) -> &'static [ControllerId] {
+    pub const fn active_controllers(self) -> &'static [ControllerId] {
         match self {
-            Self::SensorIngestion => &[],
+            Self::SensorIngestion
+            | Self::LivenessEvaluation
+            | Self::DeadlockDetection
+            | Self::SummarySnapshot => &[],
             Self::FastGuardEvaluation => &[
                 ControllerId::EProcess,
                 ControllerId::Cusum,
@@ -1154,8 +1157,6 @@ impl TickPhase {
                 ControllerId::EffectSemantics,
                 ControllerId::AdmissibilityGates,
             ],
-            Self::LivenessEvaluation => &[],
-            Self::DeadlockDetection => &[],
             Self::FairnessAssessment => &[ControllerId::FairnessGuards],
             Self::ProbeScheduling => &[ControllerId::VoIControl],
             Self::ConformalWithholding => &[ControllerId::ConformalRiskBudget],
@@ -1170,7 +1171,6 @@ impl TickPhase {
                 ControllerId::AdaptationEngine,
                 ControllerId::PolicyCertificates,
             ],
-            Self::SummarySnapshot => &[],
         }
     }
 }
@@ -1179,8 +1179,10 @@ impl TickPhase {
 // Stress-mode veto precedence
 // ---------------------------------------------------------------------------
 
-/// Under system stress (safe mode, regime transition, high regret, budget
-/// debt), multiple controllers may issue conflicting signals.  This table
+/// Under system stress, multiple controllers may issue conflicting signals.
+///
+/// Safe mode, regime transition, high regret, and budget debt can all surface
+/// at once. This table
 /// defines the precedence order: higher-precedence vetoes override lower
 /// ones.  The engine never needs to "break ties" because the precedence
 /// is strict.
@@ -1212,16 +1214,16 @@ pub enum VetoPrecedence {
 impl VetoPrecedence {
     /// Map a controller to its veto precedence when it vetoes an action.
     #[must_use]
-    pub fn for_controller(id: ControllerId) -> Self {
+    pub const fn for_controller(id: ControllerId) -> Self {
         match id {
             ControllerId::CalibrationGuard => Self::SafeMode,
             ControllerId::ConformalRiskBudget => Self::RiskBudgetExhaustion,
             ControllerId::FairnessGuards => Self::BurdenConcentration,
-            ControllerId::AdmissibilityGates => Self::AdmissibilityComposite,
             ControllerId::EffectSemantics => Self::Cooldown,
             ControllerId::RegimeManager => Self::RegimeInstability,
             ControllerId::VoIControl => Self::ExperimentBudget,
-            // Controllers that don't veto get AdmissibilityComposite as fallback.
+            // AdmissibilityGates and all controllers without a stronger
+            // precedence mapping fall back to the composite admissibility tier.
             _ => Self::AdmissibilityComposite,
         }
     }
@@ -1375,7 +1377,6 @@ mod tests {
     fn hysteresis_guard_pending_then_committed() {
         let mut guard = HysteresisGuard::new(ControllerId::CalibrationGuard, "nominal");
         let hold_off = Timescale::Fast.hysteresis_hold_off_micros();
-        let min_ticks = 2u64; // fast controllers need 2 stable ticks
 
         // First proposal: enters pending.
         assert_eq!(
@@ -1517,9 +1518,7 @@ mod tests {
             for controller in phase.active_controllers() {
                 assert!(
                     ControllerId::ALL.contains(controller),
-                    "phase {:?} references unknown controller {:?}",
-                    phase,
-                    controller
+                    "phase {phase:?} references unknown controller {controller:?}"
                 );
             }
         }
@@ -1593,7 +1592,7 @@ mod tests {
     fn controller_id_as_str_round_trip() {
         for controller in ControllerId::ALL {
             let s = controller.as_str();
-            assert!(!s.is_empty(), "empty as_str for {:?}", controller);
+            assert!(!s.is_empty(), "empty as_str for {controller:?}");
         }
     }
 

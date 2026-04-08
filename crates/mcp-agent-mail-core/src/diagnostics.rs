@@ -708,10 +708,10 @@ impl DiagnosticPayload {
             generated_at: chrono::Utc::now().to_rfc3339(),
             status: status.to_string(),
             headline: headline.to_string(),
-            next_action: if status != "ok" {
-                Some("Run `am doctor fix --dry-run` to preview remediation.".to_string())
-            } else {
+            next_action: if status == "ok" {
                 None
+            } else {
+                Some("Run `am doctor fix --dry-run` to preview remediation.".to_string())
             },
             finding_counts: DiagnosticFindingCounts {
                 critical: fail_count,
@@ -893,7 +893,7 @@ impl WarningFloodGate {
 
     /// Total number of warnings across all categories.
     #[must_use]
-    pub fn total(&self) -> usize {
+    pub const fn total(&self) -> usize {
         self.all_warnings.len()
     }
 

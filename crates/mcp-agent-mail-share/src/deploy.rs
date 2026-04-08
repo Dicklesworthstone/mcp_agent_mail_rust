@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::{ShareError, ShareResult};
 
 #[cfg(test)]
+// Historical alias name retained in tests; this still uses FrankenSQLite `DbConn`.
 type SqliteConnection = DbConn;
 
 // ── Deployment report ───────────────────────────────────────────────────

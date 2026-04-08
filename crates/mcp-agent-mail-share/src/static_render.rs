@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::{ExportRedactionPolicy, RedactionAuditLog, RedactionReason, ShareError, ShareResult};
 
 #[cfg(test)]
+// Historical alias name retained in tests; this still uses FrankenSQLite `DbConn`.
 type SqliteConnection = DbConn;
 
 // ── Configuration ───────────────────────────────────────────────────────
