@@ -1572,6 +1572,7 @@ mod tests {
     fn test_state() -> std::sync::Arc<TuiSharedState> {
         let config = Config {
             database_url: "sqlite:///:memory:".to_string(),
+            storage_root: std::path::PathBuf::from("/tmp/mcp_test_empty_root"),
             ..Config::default()
         };
         TuiSharedState::new(&config)

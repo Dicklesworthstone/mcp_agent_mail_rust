@@ -910,11 +910,25 @@ fn is_static_export_request(query: &str) -> bool {
     extract_query_str(query, "__static_export").is_some()
 }
 
+fn is_synthetic_project_identifier(slug: &str) -> bool {
+    let Some(rest) = slug.strip_prefix("[unknown-project-") else {
+        return false;
+    };
+    let Some(project_id) = rest.strip_suffix(']') else {
+        return false;
+    };
+    !project_id.is_empty() && project_id.bytes().all(|b| b.is_ascii_digit())
+}
+
 fn is_valid_project_slug(slug: &str) -> bool {
     !slug.is_empty()
         && slug
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+fn is_valid_project_identifier(slug: &str) -> bool {
+    is_valid_project_slug(slug) || is_synthetic_project_identifier(slug)
 }
 
 fn is_valid_archive_agent_name(name: &str) -> bool {
@@ -1200,9 +1214,20 @@ mod utility_tests {
         assert!(is_valid_project_slug("alpha"));
         assert!(is_valid_project_slug("alpha-beta_01"));
         assert!(!is_valid_project_slug("alpha-beta_01.v2"));
+        assert!(!is_valid_project_slug("[unknown-project-7]"));
         assert!(!is_valid_project_slug(""));
         assert!(!is_valid_project_slug("../etc/passwd"));
         assert!(!is_valid_project_slug("project with spaces"));
+    }
+
+    #[test]
+    fn project_identifier_validation_accepts_synthetic_placeholder_projects() {
+        assert!(is_valid_project_identifier("alpha"));
+        assert!(is_valid_project_identifier("alpha-beta_01"));
+        assert!(is_valid_project_identifier("[unknown-project-7]"));
+        assert!(!is_valid_project_identifier("[unknown-project-]"));
+        assert!(!is_valid_project_identifier("[unknown-project-seven]"));
+        assert!(!is_valid_project_identifier("../etc/passwd"));
     }
 
     #[test]
@@ -1346,6 +1371,17 @@ mod route_hardening_tests {
         // Should not be a 400 — either Ok or a different error from DB lookup.
         if let Err((400, _)) = result {
             panic!("valid slug should not be rejected as 400");
+        }
+    }
+
+    #[test]
+    fn dispatch_project_accepts_synthetic_placeholder_identifier_format() {
+        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool();
+        let result =
+            dispatch_project_route("/[unknown-project-77]", "GET", "", &cx, &pool, &pool, "");
+        if let Err((400, _)) = result {
+            panic!("synthetic placeholder should not be rejected as 400");
         }
     }
 
@@ -1548,6 +1584,142 @@ mod auth_route_hardening_regression_suite {
                 "is_valid_project_slug({input:?}) mismatch"
             );
         }
+    }
+
+    #[test]
+    fn regression_placeholder_project_route_uses_db_fallback() {
+        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool();
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-placeholder-project-{}", unique_nonce()),
+        )));
+        let project_id = project.id.unwrap_or(0);
+
+        outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+        )));
+
+        let conn = match block_on(pool.acquire(&cx)) {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(err) => panic!("acquire pooled conn: {err}"),
+            Outcome::Cancelled(reason) => panic!("acquire pooled conn cancelled: {reason}"),
+            Outcome::Panicked(payload) => {
+                panic!("acquire pooled conn panicked: {}", payload.message())
+            }
+        };
+        conn.execute_sync(
+            "DELETE FROM projects WHERE id = ?",
+            &[sqlmodel_core::Value::BigInt(project_id)],
+        )
+        .expect("orphan project row");
+        drop(conn);
+
+        let route = format!("/[unknown-project-{project_id}]");
+        let html = dispatch_project_route(&route, "GET", "", &cx, &pool, &pool, "")
+            .expect("placeholder route should succeed")
+            .expect("placeholder route should render html");
+        assert!(html.contains("[unknown-project-"));
+        assert!(html.contains("BlueLake"));
+    }
+
+    #[test]
+    fn regression_archive_default_skips_placeholder_projects() {
+        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool();
+        let placeholder_project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-archive-placeholder-{}", unique_nonce()),
+        )));
+        let placeholder_id = placeholder_project.id.unwrap_or(0);
+        outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            placeholder_id,
+            "BlueLake",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+
+        let real_project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-archive-real-{}", unique_nonce()),
+        )));
+
+        let conn = match block_on(pool.acquire(&cx)) {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(err) => panic!("acquire pooled conn: {err}"),
+            Outcome::Cancelled(reason) => panic!("acquire pooled conn cancelled: {reason}"),
+            Outcome::Panicked(payload) => {
+                panic!("acquire pooled conn panicked: {}", payload.message())
+            }
+        };
+        conn.execute_sync(
+            "DELETE FROM projects WHERE id = ?",
+            &[sqlmodel_core::Value::BigInt(placeholder_id)],
+        )
+        .expect("orphan placeholder project");
+        drop(conn);
+
+        let (slug, _) =
+            resolve_project_slug(&cx, &pool, None).expect("archive default should resolve");
+        assert_eq!(slug, real_project.slug);
+    }
+
+    #[test]
+    fn regression_archive_time_travel_filters_placeholder_projects() {
+        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool();
+        let placeholder_project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-archive-picker-placeholder-{}", unique_nonce()),
+        )));
+        let placeholder_id = placeholder_project.id.unwrap_or(0);
+        outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            placeholder_id,
+            "BlueLake",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+
+        let real_project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-archive-picker-real-{}", unique_nonce()),
+        )));
+
+        let conn = match block_on(pool.acquire(&cx)) {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(err) => panic!("acquire pooled conn: {err}"),
+            Outcome::Cancelled(reason) => panic!("acquire pooled conn cancelled: {reason}"),
+            Outcome::Panicked(payload) => {
+                panic!("acquire pooled conn panicked: {}", payload.message())
+            }
+        };
+        conn.execute_sync(
+            "DELETE FROM projects WHERE id = ?",
+            &[sqlmodel_core::Value::BigInt(placeholder_id)],
+        )
+        .expect("orphan placeholder project");
+        drop(conn);
+
+        let html = render_archive_time_travel(&cx, &pool)
+            .expect("archive time travel should succeed")
+            .expect("archive time travel should render html");
+        assert!(html.contains(&real_project.slug));
+        assert!(!html.contains(&format!("[unknown-project-{placeholder_id}]")));
     }
 
     // -- Cross-project route scoping (F1 scope) --
@@ -3266,8 +3438,8 @@ fn dispatch_project_route(
         return Ok(None);
     }
 
-    // F2: Reject malformed project slugs early (before any DB/archive access).
-    if !is_valid_project_slug(project_slug) {
+    // F2: Reject malformed project identifiers early (before any DB/archive access).
+    if !is_valid_project_identifier(project_slug) {
         return Err((400, "Invalid project identifier".to_string()));
     }
 
@@ -3713,10 +3885,13 @@ fn resolve_project_slug(
         let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, slug))?;
         Ok((p.slug.clone(), p.human_key))
     } else {
-        let projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
+        let projects: Vec<ProjectRow> = block_on_outcome(cx, queries::list_projects(cx, pool))?
+            .into_iter()
+            .filter(|project| is_valid_project_slug(&project.slug))
+            .collect();
         let first = projects
             .first()
-            .ok_or_else(|| (404, "No projects found".to_string()))?;
+            .ok_or_else(|| (404, "No archive projects found".to_string()))?;
         Ok((first.slug.clone(), first.human_key.clone()))
     }
 }
@@ -3843,7 +4018,11 @@ struct ArchiveTimeTravelCtx {
 
 fn render_archive_time_travel(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, String)> {
     let projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
-    let slugs: Vec<String> = projects.iter().map(|p| p.slug.clone()).collect();
+    let slugs: Vec<String> = projects
+        .iter()
+        .filter(|project| is_valid_project_slug(&project.slug))
+        .map(|p| p.slug.clone())
+        .collect();
     render(
         "archive_time_travel.html",
         ArchiveTimeTravelCtx { projects: slugs },

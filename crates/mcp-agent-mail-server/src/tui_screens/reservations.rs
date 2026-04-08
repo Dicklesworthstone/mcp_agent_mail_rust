@@ -2690,6 +2690,7 @@ mod tests {
     fn tick_sets_fallback_issue_when_snapshot_rows_are_missing_for_memory_url() {
         let cfg = Config {
             database_url: "sqlite:///:memory:".to_string(),
+            storage_root: std::path::PathBuf::from("/tmp/mcp_test_empty_root"),
             ..Config::default()
         };
         let state = TuiSharedState::new(&cfg);
@@ -2716,6 +2717,7 @@ mod tests {
     fn empty_view_includes_fallback_issue_context_when_rows_mismatch() {
         let cfg = Config {
             database_url: "sqlite:///:memory:".to_string(),
+            storage_root: std::path::PathBuf::from("/tmp/mcp_test_empty_root"),
             ..Config::default()
         };
         let state = TuiSharedState::new(&cfg);

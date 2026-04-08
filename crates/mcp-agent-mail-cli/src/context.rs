@@ -128,6 +128,17 @@ pub struct ResolvedProject {
     pub id: i64,
     pub slug: String,
     pub human_key: String,
+    pub created_at: i64,
+}
+
+fn orphaned_project_placeholder(project_id: i64, created_at: i64) -> ResolvedProject {
+    let placeholder = format!("[unknown-project-{project_id}]");
+    ResolvedProject {
+        id: project_id,
+        slug: placeholder.clone(),
+        human_key: placeholder,
+        created_at,
+    }
 }
 
 fn query_project_by_slug(
@@ -147,6 +158,7 @@ fn query_project_by_slug(
                 id: require_i64_column(row, "id", "projects")?,
                 slug: require_text_column(row, "slug", "projects")?,
                 human_key: require_text_column(row, "human_key", "projects")?,
+                created_at: 0,
             })
         })
         .transpose()
@@ -169,9 +181,115 @@ fn query_project_by_human_key(
                 id: require_i64_column(row, "id", "projects")?,
                 slug: require_text_column(row, "slug", "projects")?,
                 human_key: require_text_column(row, "human_key", "projects")?,
+                created_at: 0,
             })
         })
         .transpose()
+}
+
+fn list_project_inventory(conn: &mcp_agent_mail_db::DbConn) -> CliResult<Vec<ResolvedProject>> {
+    let project_rows = conn
+        .query_sync(
+            "SELECT id, slug, human_key, created_at FROM projects ORDER BY created_at ASC, id ASC",
+            &[],
+        )
+        .map_err(|e| CliError::Other(format!("project inventory query failed: {e}")))?;
+    let mut out = Vec::with_capacity(project_rows.len());
+    for row in project_rows {
+        out.push(ResolvedProject {
+            id: require_i64_column(&row, "id", "projects")?,
+            slug: require_text_column(&row, "slug", "projects")?,
+            human_key: require_text_column(&row, "human_key", "projects")?,
+            created_at: require_i64_column(&row, "created_at", "projects")?,
+        });
+    }
+
+    let now_us = mcp_agent_mail_core::timestamps::now_micros();
+    let orphan_sources: Vec<(String, Vec<sqlmodel_core::Value>)> = vec![
+        (
+            "SELECT DISTINCT m.project_id AS project_id \
+             FROM messages m \
+             LEFT JOIN projects p ON p.id = m.project_id \
+             WHERE p.id IS NULL"
+                .to_string(),
+            vec![],
+        ),
+        (
+            "SELECT DISTINCT a.project_id AS project_id \
+             FROM agents a \
+             LEFT JOIN projects p ON p.id = a.project_id \
+             WHERE p.id IS NULL"
+                .to_string(),
+            vec![],
+        ),
+        (
+            format!(
+                "SELECT DISTINCT file_reservations.project_id AS project_id \
+                 FROM file_reservations \
+                 LEFT JOIN projects p ON p.id = file_reservations.project_id \
+                 WHERE p.id IS NULL \
+                   AND ({}) \
+                   AND file_reservations.expires_ts > ?",
+                mcp_agent_mail_db::queries::ACTIVE_RESERVATION_PREDICATE
+            ),
+            vec![sqlmodel_core::Value::BigInt(now_us)],
+        ),
+        (
+            "SELECT DISTINCT ppl.project_id AS project_id \
+             FROM product_project_links ppl \
+             LEFT JOIN projects p ON p.id = ppl.project_id \
+             WHERE p.id IS NULL"
+                .to_string(),
+            vec![],
+        ),
+    ];
+    let mut orphan_project_ids = std::collections::BTreeSet::new();
+    for (sql, params) in orphan_sources {
+        let rows = conn
+            .query_sync(&sql, &params)
+            .map_err(|e| CliError::Other(format!("project inventory query failed: {e}")))?;
+        for row in rows {
+            if let Ok(project_id) = row.get_named::<i64>("project_id") {
+                orphan_project_ids.insert(project_id);
+            }
+        }
+    }
+
+    let orphan_created_at_sql = format!(
+        "SELECT COALESCE( \
+             (SELECT MIN(m.created_ts) FROM messages m WHERE m.project_id = ?), \
+             (SELECT MIN(a.inception_ts) FROM agents a WHERE a.project_id = ?), \
+             (SELECT MIN(fr.created_ts) FROM file_reservations fr \
+              WHERE fr.project_id = ? \
+                AND ({}) \
+                AND fr.expires_ts > ?), \
+             (SELECT MIN(ppl.created_at) FROM product_project_links ppl WHERE ppl.project_id = ?), \
+             0 \
+         ) AS created_at",
+        mcp_agent_mail_db::queries::active_reservation_predicate_for("fr")
+    );
+    for project_id in orphan_project_ids {
+        let created_at_rows = conn
+            .query_sync(
+                &orphan_created_at_sql,
+                &[
+                    sqlmodel_core::Value::BigInt(project_id),
+                    sqlmodel_core::Value::BigInt(project_id),
+                    sqlmodel_core::Value::BigInt(project_id),
+                    sqlmodel_core::Value::BigInt(now_us),
+                    sqlmodel_core::Value::BigInt(project_id),
+                ],
+            )
+            .map_err(|e| CliError::Other(format!("project inventory query failed: {e}")))?;
+        let created_at = created_at_rows
+            .first()
+            .and_then(|row| row.get_named::<i64>("created_at").ok())
+            .unwrap_or(0);
+        out.push(orphaned_project_placeholder(project_id, created_at));
+    }
+
+    out.sort_by_key(|project| (project.created_at, project.id));
+    Ok(out)
 }
 
 fn project_matches_absolute_lookup(
@@ -209,6 +327,12 @@ pub fn resolve_project(conn: &mcp_agent_mail_db::DbConn, key: &str) -> CliResult
             return Ok(project);
         }
         if let Some(project) = query_project_by_human_key(conn, key)? {
+            return Ok(project);
+        }
+        if let Some(project) = list_project_inventory(conn)?
+            .into_iter()
+            .find(|project| project.slug.eq_ignore_ascii_case(key) || project.human_key == key)
+        {
             return Ok(project);
         }
     }
@@ -562,6 +686,70 @@ mod tests {
         let proj = ctx.resolve_project("/data/myproj").unwrap();
         assert_eq!(proj.slug, "my-slug");
         assert_eq!(proj.human_key, "/data/myproj");
+    }
+
+    #[test]
+    fn resolve_project_by_slug_falls_back_to_orphaned_placeholder_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let url = format!("sqlite:///{}", db_path.display());
+        let ctx = CliContext::open_with_url(&url).unwrap();
+
+        ctx.conn
+            .execute_raw(
+                "INSERT INTO projects (slug, human_key, created_at) VALUES ('my-slug', '/data/myproj', 1000000)",
+            )
+            .unwrap();
+        let project_id = ctx.resolve_project("my-slug").unwrap().id;
+        ctx.conn
+            .execute_raw(&format!(
+                "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy) \
+                 VALUES ({project_id}, 'RedFox', 'test', 'test-model', '', 1000000, 1000000, 'auto')",
+            ))
+            .unwrap();
+        ctx.conn
+            .execute_raw(&format!("DELETE FROM projects WHERE id = {project_id}"))
+            .unwrap();
+
+        let placeholder = format!("[unknown-project-{project_id}]");
+        let proj = ctx.resolve_project(&placeholder).unwrap();
+        assert_eq!(proj.id, project_id);
+        assert_eq!(proj.slug, placeholder);
+        assert_eq!(proj.human_key, format!("[unknown-project-{project_id}]"));
+    }
+
+    #[test]
+    fn resolve_project_by_human_key_falls_back_to_orphaned_placeholder_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let url = format!("sqlite:///{}", db_path.display());
+        let ctx = CliContext::open_with_url(&url).unwrap();
+
+        ctx.conn
+            .execute_raw(
+                "INSERT INTO projects (slug, human_key, created_at) VALUES ('my-slug', '/data/myproj', 1000000)",
+            )
+            .unwrap();
+        let project_id = ctx.resolve_project("my-slug").unwrap().id;
+        ctx.conn
+            .execute_raw(
+                "INSERT INTO products (id, product_uid, name, created_at) VALUES (3, 'prod-3', 'prod-3', 1000000)",
+            )
+            .unwrap();
+        ctx.conn
+            .execute_raw(&format!(
+                "INSERT INTO product_project_links (product_id, project_id, created_at) VALUES (3, {project_id}, 1000000)"
+            ))
+            .unwrap();
+        ctx.conn
+            .execute_raw(&format!("DELETE FROM projects WHERE id = {project_id}"))
+            .unwrap();
+
+        let placeholder = format!("[unknown-project-{project_id}]");
+        let proj = ctx.resolve_project(&placeholder).unwrap();
+        assert_eq!(proj.id, project_id);
+        assert_eq!(proj.slug, placeholder);
+        assert_eq!(proj.human_key, format!("[unknown-project-{project_id}]"));
     }
 
     #[test]

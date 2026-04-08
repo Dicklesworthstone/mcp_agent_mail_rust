@@ -4688,7 +4688,39 @@ fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
     );
 
     let rows = conn
-        .query_sync("SELECT id, slug FROM projects ORDER BY slug ASC", &[])
+        .query_sync(
+            &format!(
+                "WITH live_projects AS (
+                 SELECT p.id AS project_id, p.slug
+                 FROM projects p
+             ), orphan_project_ids AS (
+                 SELECT DISTINCT m.project_id AS raw_project_id
+                 FROM messages m
+                 LEFT JOIN projects p ON p.id = m.project_id
+                 WHERE p.id IS NULL
+                 UNION
+                 SELECT DISTINCT a.project_id AS raw_project_id
+                 FROM agents a
+                 LEFT JOIN projects p ON p.id = a.project_id
+                 WHERE p.id IS NULL
+                 UNION
+                     SELECT DISTINCT fr.project_id AS raw_project_id
+                     FROM file_reservations fr{active_reservation_join}
+                     LEFT JOIN projects p ON p.id = fr.project_id
+                     WHERE p.id IS NULL
+                       AND ({active_reservation_predicate})
+                       AND fr.expires_ts > ?
+             )
+             SELECT project_id AS id, slug
+             FROM live_projects
+             UNION ALL
+             SELECT o.raw_project_id AS id,
+                    '[unknown-project-' || o.raw_project_id || ']' AS slug
+             FROM orphan_project_ids o
+             ORDER BY slug ASC"
+            ),
+            &[Value::BigInt(now_us)],
+        )
         .map_err(|e| CliError::Other(format!("overview projects query: {e}")))?;
 
     let mut projects = Vec::new();
@@ -5139,15 +5171,49 @@ fn build_projects(conn: &DbConn) -> Result<Vec<ProjectRow>, CliError> {
     let rows = conn
         .query_sync(
             &format!(
-                "SELECT p.id, p.slug, p.human_key, p.created_at,
-                        (SELECT COUNT(*) FROM agents a WHERE a.project_id = p.id) AS agent_count,
-                        (SELECT COUNT(*) FROM messages m WHERE m.project_id = p.id) AS msg_count,
+                "WITH live_projects AS (
+                     SELECT p.id AS project_id, p.slug, p.human_key, p.created_at
+                     FROM projects p
+                 ), orphan_project_ids AS (
+                     SELECT DISTINCT m.project_id AS raw_project_id
+                     FROM messages m
+                     LEFT JOIN projects p ON p.id = m.project_id
+                     WHERE p.id IS NULL
+                     UNION
+                     SELECT DISTINCT a.project_id AS raw_project_id
+                     FROM agents a
+                     LEFT JOIN projects p ON p.id = a.project_id
+                     WHERE p.id IS NULL
+                 UNION
+                     SELECT DISTINCT fr.project_id AS raw_project_id
+                     FROM file_reservations fr{active_reservation_join}
+                     LEFT JOIN projects p ON p.id = fr.project_id
+                     WHERE p.id IS NULL
+                       AND ({active_reservation_predicate})
+                       AND fr.expires_ts > ?
+                 ), project_inventory AS (
+                     SELECT project_id, slug, human_key, created_at
+                     FROM live_projects
+                     UNION ALL
+                     SELECT o.raw_project_id AS project_id,
+                            '[unknown-project-' || o.raw_project_id || ']' AS slug,
+                            '[unknown-project-' || o.raw_project_id || ']' AS human_key,
+                            COALESCE(
+                                (SELECT MIN(m.created_ts) FROM messages m WHERE m.project_id = o.raw_project_id),
+                                (SELECT MIN(fr.created_ts) FROM file_reservations fr WHERE fr.project_id = o.raw_project_id),
+                                0
+                            ) AS created_at
+                     FROM orphan_project_ids o
+                 )
+                 SELECT pi.project_id AS id, pi.slug, pi.human_key, pi.created_at,
+                        (SELECT COUNT(*) FROM agents a WHERE a.project_id = pi.project_id) AS agent_count,
+                        (SELECT COUNT(*) FROM messages m WHERE m.project_id = pi.project_id) AS msg_count,
                         (SELECT COUNT(*) FROM file_reservations fr{active_reservation_join}
-                         WHERE fr.project_id = p.id AND ({active_reservation_predicate}) AND fr.expires_ts > ?) AS res_count
-                 FROM projects p
-                 ORDER BY p.slug ASC"
+                         WHERE fr.project_id = pi.project_id AND ({active_reservation_predicate}) AND fr.expires_ts > ?) AS res_count
+                 FROM project_inventory pi
+                 ORDER BY pi.slug ASC"
             ),
-            &[Value::BigInt(now_us)],
+            &[Value::BigInt(now_us), Value::BigInt(now_us)],
         )
         .map_err(|e| CliError::Other(format!("projects query: {e}")))?;
 
@@ -9399,6 +9465,143 @@ mod tests {
         assert_eq!(contacts[0].from, "Alice");
         assert_eq!(contacts[0].to, "[unknown-agent-2]");
         assert_eq!(contacts[0].policy, "unknown");
+    }
+
+    #[test]
+    fn build_projects_keeps_orphaned_project_rows_visible() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (7, 'drifted', '/tmp/drifted', ?)",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(
+                now_us - 60_000_000,
+            )],
+        )
+        .expect("insert drifted project");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, program, model)
+             VALUES (7, 7, 'DriftedAgent', 'codex-cli', 'gpt-5')",
+            &empty,
+        )
+        .expect("insert drifted agent");
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (7, 7, 7, 'Drifted project message', 'THREAD-DRIFT', 'high', 0, ?, 'body', '[]')",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - 30_000_000)],
+        )
+        .expect("insert drifted message");
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES (7, 7, 7, 'src/**', 1, 'drift', ?, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - 20_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
+            ],
+        )
+        .expect("insert drifted reservation");
+        conn.query_sync("DELETE FROM projects WHERE id = 7", &empty)
+            .expect("delete drifted project row");
+
+        let projects = build_projects(&conn).expect("build projects");
+        let drifted_project = projects
+            .iter()
+            .find(|project| project.slug == "[unknown-project-7]")
+            .expect("orphaned project remains visible");
+
+        assert_eq!(drifted_project.path, "[unknown-project-7]");
+        assert_eq!(drifted_project.agents, 1);
+        assert_eq!(drifted_project.messages, 1);
+        assert_eq!(drifted_project.reservations, 1);
+    }
+
+    #[test]
+    fn build_overview_keeps_orphaned_project_rows_visible() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (7, 'drifted', '/tmp/drifted', ?)",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(
+                now_us - 60_000_000,
+            )],
+        )
+        .expect("insert drifted project");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, program, model)
+             VALUES (7, 7, 'DriftedAgent', 'codex-cli', 'gpt-5')",
+            &empty,
+        )
+        .expect("insert drifted agent");
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (7, 7, 7, 'Drifted overview message', 'THREAD-OVERVIEW-DRIFT', 'high', 1, ?, 'body', '[]')",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - ACK_OVERDUE_THRESHOLD_US - 1)],
+        )
+        .expect("insert drifted overview message");
+        conn.query_sync(
+            "INSERT INTO message_recipients
+             (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (7, 7, 7, 'to', NULL, NULL)",
+            &empty,
+        )
+        .expect("insert drifted overview recipient");
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES (7, 7, 7, 'src/**', 1, 'drift', ?, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - 20_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
+            ],
+        )
+        .expect("insert drifted overview reservation");
+        conn.query_sync("DELETE FROM projects WHERE id = 7", &empty)
+            .expect("delete drifted project row");
+
+        let overview = build_overview(&conn).expect("build overview");
+        let drifted_project = overview
+            .iter()
+            .find(|project| project.slug == "[unknown-project-7]")
+            .expect("orphaned project overview remains visible");
+
+        assert_eq!(drifted_project.unread, 1);
+        assert_eq!(drifted_project.urgent, 1);
+        assert_eq!(drifted_project.ack_overdue, 1);
+        assert_eq!(drifted_project.reservations, 1);
+    }
+
+    #[test]
+    fn build_projects_ignores_orphaned_projects_with_only_expired_reservations() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES (9, 9, 1, 'src/**', 1, 'expired-drift', ?, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - 120_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us - 60_000_000),
+            ],
+        )
+        .expect("insert expired orphaned reservation");
+
+        let projects = build_projects(&conn).expect("build projects");
+
+        assert!(
+            !projects
+                .iter()
+                .any(|project| project.slug == "[unknown-project-9]"),
+            "expired orphaned reservation should not synthesize a ghost project"
+        );
     }
 
     #[test]

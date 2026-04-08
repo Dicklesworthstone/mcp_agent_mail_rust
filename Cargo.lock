@@ -2450,6 +2450,7 @@ dependencies = [
  "libc",
  "nix 0.29.0",
  "pollster",
+ "smallvec",
  "tracing",
 ]
 

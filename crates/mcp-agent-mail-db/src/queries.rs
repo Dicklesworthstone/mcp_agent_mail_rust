@@ -336,6 +336,16 @@ fn decode_project_row(row: &SqlRow) -> std::result::Result<ProjectRow, DbError> 
     ProjectRow::from_row(row).map_err(|e| map_sql_error(&e))
 }
 
+fn orphaned_project_placeholder(project_id: i64, created_at: i64) -> ProjectRow {
+    let placeholder = format!("[unknown-project-{project_id}]");
+    ProjectRow {
+        id: Some(project_id),
+        slug: placeholder.clone(),
+        human_key: placeholder,
+        created_at,
+    }
+}
+
 fn decode_file_reservation_row(row: &SqlRow) -> std::result::Result<FileReservationRow, DbError> {
     FileReservationRow::from_row(row).map_err(|e| map_sql_error(&e))
 }
@@ -2528,16 +2538,32 @@ pub async fn get_project_by_slug(
     let params = [Value::Text(slug.to_string())];
 
     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
-        Outcome::Ok(rows) => rows.first().map_or_else(
-            || Outcome::Err(DbError::not_found("Project", slug)),
-            |r| match decode_project_row(r) {
-                Ok(row) => {
-                    crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
-                    Outcome::Ok(row)
+        Outcome::Ok(rows) => {
+            if let Some(row) = rows.first() {
+                match decode_project_row(row) {
+                    Ok(row) => {
+                        crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
+                        Outcome::Ok(row)
+                    }
+                    Err(e) => Outcome::Err(e),
                 }
-                Err(e) => Outcome::Err(e),
-            },
-        ),
+            } else {
+                match find_project_in_inventory(cx, &tracked, |project| {
+                    project.slug.eq_ignore_ascii_case(slug)
+                })
+                .await
+                {
+                    Outcome::Ok(Some(row)) => {
+                        crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
+                        Outcome::Ok(row)
+                    }
+                    Outcome::Ok(None) => Outcome::Err(DbError::not_found("Project", slug)),
+                    Outcome::Err(e) => Outcome::Err(e),
+                    Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => Outcome::Panicked(p),
+                }
+            }
+        }
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -2570,16 +2596,32 @@ pub async fn get_project_by_human_key(
     let params = [Value::Text(human_key.to_string())];
 
     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
-        Outcome::Ok(rows) => rows.first().map_or_else(
-            || Outcome::Err(DbError::not_found("Project", human_key)),
-            |r| match decode_project_row(r) {
-                Ok(row) => {
-                    crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
-                    Outcome::Ok(row)
+        Outcome::Ok(rows) => {
+            if let Some(row) = rows.first() {
+                match decode_project_row(row) {
+                    Ok(row) => {
+                        crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
+                        Outcome::Ok(row)
+                    }
+                    Err(e) => Outcome::Err(e),
                 }
-                Err(e) => Outcome::Err(e),
-            },
-        ),
+            } else {
+                match find_project_in_inventory(cx, &tracked, |project| {
+                    project.human_key == human_key
+                })
+                .await
+                {
+                    Outcome::Ok(Some(row)) => {
+                        crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
+                        Outcome::Ok(row)
+                    }
+                    Outcome::Ok(None) => Outcome::Err(DbError::not_found("Project", human_key)),
+                    Outcome::Err(e) => Outcome::Err(e),
+                    Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => Outcome::Panicked(p),
+                }
+            }
+        }
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -2592,6 +2634,7 @@ pub async fn get_project_by_id(
     pool: &DbPool,
     project_id: i64,
 ) -> Outcome<ProjectRow, DbError> {
+    let cache_scope = cache_scope_for_pool(pool);
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -2604,13 +2647,165 @@ pub async fn get_project_by_id(
     let sql = "SELECT id, slug, human_key, created_at FROM projects WHERE id = ? LIMIT 1";
     let params = [Value::BigInt(project_id)];
     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
-        Outcome::Ok(rows) => rows.first().map_or_else(
-            || Outcome::Err(DbError::not_found("Project", project_id.to_string())),
-            |r| match decode_project_row(r) {
-                Ok(row) => Outcome::Ok(row),
-                Err(e) => Outcome::Err(e),
-            },
-        ),
+        Outcome::Ok(rows) => {
+            if let Some(row) = rows.first() {
+                match decode_project_row(row) {
+                    Ok(row) => {
+                        crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
+                        Outcome::Ok(row)
+                    }
+                    Err(e) => Outcome::Err(e),
+                }
+            } else {
+                match find_project_in_inventory(cx, &tracked, |project| {
+                    project.id == Some(project_id)
+                })
+                .await
+                {
+                    Outcome::Ok(Some(row)) => {
+                        crate::cache::read_cache().put_project_scoped(&cache_scope, &row);
+                        Outcome::Ok(row)
+                    }
+                    Outcome::Ok(None) => {
+                        Outcome::Err(DbError::not_found("Project", project_id.to_string()))
+                    }
+                    Outcome::Err(e) => Outcome::Err(e),
+                    Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => Outcome::Panicked(p),
+                }
+            }
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+async fn find_project_in_inventory<F>(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    mut predicate: F,
+) -> Outcome<Option<ProjectRow>, DbError>
+where
+    F: FnMut(&ProjectRow) -> bool,
+{
+    match list_projects_with_tracked(cx, tracked).await {
+        Outcome::Ok(projects) => {
+            Outcome::Ok(projects.into_iter().find(|project| predicate(project)))
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+async fn list_projects_with_tracked(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+) -> Outcome<Vec<ProjectRow>, DbError> {
+    let now_us = now_micros();
+    match map_sql_outcome(traw_query(cx, tracked, PROJECT_SELECT_ALL_SQL, &[]).await) {
+        Outcome::Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for r in &rows {
+                match decode_project_row(r) {
+                    Ok(row) => out.push(row),
+                    Err(e) => return Outcome::Err(e),
+                }
+            }
+
+            let mut orphan_project_ids = std::collections::BTreeSet::new();
+            let orphan_sources: Vec<(String, Vec<Value>)> = vec![
+                (
+                    "SELECT DISTINCT m.project_id AS project_id \
+                     FROM messages m \
+                     LEFT JOIN projects p ON p.id = m.project_id \
+                     WHERE p.id IS NULL"
+                        .to_string(),
+                    vec![],
+                ),
+                (
+                    "SELECT DISTINCT a.project_id AS project_id \
+                     FROM agents a \
+                     LEFT JOIN projects p ON p.id = a.project_id \
+                     WHERE p.id IS NULL"
+                        .to_string(),
+                    vec![],
+                ),
+                (
+                    format!(
+                        "SELECT DISTINCT file_reservations.project_id AS project_id \
+                         FROM file_reservations \
+                         LEFT JOIN projects p ON p.id = file_reservations.project_id \
+                         WHERE p.id IS NULL \
+                           AND ({ACTIVE_RESERVATION_PREDICATE}) \
+                           AND file_reservations.expires_ts > ?"
+                    ),
+                    vec![Value::BigInt(now_us)],
+                ),
+                (
+                    "SELECT DISTINCT ppl.project_id AS project_id \
+                     FROM product_project_links ppl \
+                     LEFT JOIN projects p ON p.id = ppl.project_id \
+                     WHERE p.id IS NULL"
+                        .to_string(),
+                    vec![],
+                ),
+            ];
+            for (sql, params) in &orphan_sources {
+                let orphan_rows = match map_sql_outcome(traw_query(cx, tracked, sql, params).await)
+                {
+                    Outcome::Ok(rows) => rows,
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                };
+                for row in &orphan_rows {
+                    if let Some(project_id) = row.get(0).and_then(value_as_i64) {
+                        orphan_project_ids.insert(project_id);
+                    }
+                }
+            }
+
+            let orphan_created_at_sql = format!(
+                "SELECT COALESCE( \
+                     (SELECT MIN(m.created_ts) FROM messages m WHERE m.project_id = ?), \
+                     (SELECT MIN(a.inception_ts) FROM agents a WHERE a.project_id = ?), \
+                     (SELECT MIN(fr.created_ts) FROM file_reservations fr \
+                      WHERE fr.project_id = ? \
+                        AND ({}) \
+                        AND fr.expires_ts > ?), \
+                     (SELECT MIN(ppl.created_at) FROM product_project_links ppl WHERE ppl.project_id = ?), \
+                     0 \
+                 ) AS created_at",
+                active_reservation_predicate_for("fr")
+            );
+
+            for project_id in orphan_project_ids {
+                let created_params = [
+                    Value::BigInt(project_id),
+                    Value::BigInt(project_id),
+                    Value::BigInt(project_id),
+                    Value::BigInt(now_us),
+                    Value::BigInt(project_id),
+                ];
+                let created_at_rows = match map_sql_outcome(
+                    traw_query(cx, tracked, &orphan_created_at_sql, &created_params).await,
+                ) {
+                    Outcome::Ok(rows) => rows,
+                    Outcome::Err(e) => return Outcome::Err(e),
+                    Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                    Outcome::Panicked(p) => return Outcome::Panicked(p),
+                };
+                let created_at = created_at_rows
+                    .first()
+                    .and_then(|row| row.get(0).and_then(value_as_i64))
+                    .unwrap_or(0);
+                out.push(orphaned_project_placeholder(project_id, created_at));
+            }
+            out.sort_by_key(|project| (project.created_at, project.id.unwrap_or_default()));
+            Outcome::Ok(out)
+        }
         Outcome::Err(e) => Outcome::Err(e),
         Outcome::Cancelled(r) => Outcome::Cancelled(r),
         Outcome::Panicked(p) => Outcome::Panicked(p),
@@ -2626,23 +2821,7 @@ pub async fn list_projects(cx: &Cx, pool: &DbPool) -> Outcome<Vec<ProjectRow>, D
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
-    let tracked = tracked(&*conn);
-
-    match map_sql_outcome(traw_query(cx, &tracked, PROJECT_SELECT_ALL_SQL, &[]).await) {
-        Outcome::Ok(rows) => {
-            let mut out = Vec::with_capacity(rows.len());
-            for r in &rows {
-                match decode_project_row(r) {
-                    Ok(row) => out.push(row),
-                    Err(e) => return Outcome::Err(e),
-                }
-            }
-            Outcome::Ok(out)
-        }
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
-    }
+    list_projects_with_tracked(cx, &tracked(&*conn)).await
 }
 
 // =============================================================================
@@ -8438,8 +8617,12 @@ pub async fn list_product_projects(
 
     let tracked = tracked(&*conn);
 
-    let sql = "SELECT p.id, p.slug, p.human_key, p.created_at FROM projects p \
-               JOIN product_project_links ppl ON ppl.project_id = p.id \
+    let sql = "SELECT ppl.project_id AS id, \
+                      COALESCE(NULLIF(TRIM(p.slug), ''), '[unknown-project-' || ppl.project_id || ']') AS slug, \
+                      COALESCE(NULLIF(TRIM(p.human_key), ''), '[unknown-project-' || ppl.project_id || ']') AS human_key, \
+                      COALESCE(p.created_at, ppl.created_at) AS created_at \
+               FROM product_project_links ppl \
+               LEFT JOIN projects p ON p.id = ppl.project_id \
                WHERE ppl.product_id = ?";
     let params = [Value::BigInt(product_id)];
 
@@ -16174,6 +16357,293 @@ mod tests {
     }
 
     #[test]
+    fn list_product_projects_keeps_orphaned_project_rows_visible() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, dir) = setup_test_pool("product_list_orphaned_project.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project =
+                ensure_project(&cx, &pool, &format!("/tmp/am-product-list-orphaned-{base}"))
+                    .await
+                    .into_result()
+                    .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let uid = format!("prod_list_orphaned_{base}");
+            let product = ensure_product(&cx, &pool, Some(uid.as_str()), Some(uid.as_str()))
+                .await
+                .into_result()
+                .expect("ensure product");
+            let product_id = product.id.expect("product id");
+
+            link_product_to_projects(&cx, &pool, product_id, &[project_id])
+                .await
+                .into_result()
+                .expect("link product");
+
+            let db_path = dir.path().join("product_list_orphaned_project.db");
+            let repair_conn = crate::DbConn::open_file(db_path.display().to_string())
+                .expect("open direct project cleanup connection");
+            repair_conn
+                .execute_sync(
+                    "DELETE FROM projects WHERE id = ?",
+                    &[Value::BigInt(project_id)],
+                )
+                .expect("orphan project row");
+
+            let projects = list_product_projects(&cx, &pool, product_id)
+                .await
+                .into_result()
+                .expect("list product projects");
+            let orphaned_project = projects
+                .iter()
+                .find(|row| row.id == Some(project_id))
+                .expect("orphaned project link remains visible");
+
+            assert_eq!(
+                orphaned_project.slug,
+                format!("[unknown-project-{project_id}]")
+            );
+            assert_eq!(
+                orphaned_project.human_key,
+                format!("[unknown-project-{project_id}]")
+            );
+        });
+    }
+
+    #[test]
+    fn list_projects_keeps_product_link_only_orphaned_rows_visible() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, dir) = setup_test_pool("list_projects_product_orphaned.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-list-projects-product-orphaned-{base}"),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let uid = format!("prod_list_projects_orphaned_{base}");
+            let product = ensure_product(&cx, &pool, Some(uid.as_str()), Some(uid.as_str()))
+                .await
+                .into_result()
+                .expect("ensure product");
+            let product_id = product.id.expect("product id");
+
+            link_product_to_projects(&cx, &pool, product_id, &[project_id])
+                .await
+                .into_result()
+                .expect("link product");
+
+            let db_path = dir.path().join("list_projects_product_orphaned.db");
+            let repair_conn = crate::DbConn::open_file(db_path.display().to_string())
+                .expect("open direct project cleanup connection");
+            repair_conn
+                .execute_sync(
+                    "DELETE FROM projects WHERE id = ?",
+                    &[Value::BigInt(project_id)],
+                )
+                .expect("orphan project row");
+
+            let projects = list_projects(&cx, &pool)
+                .await
+                .into_result()
+                .expect("list projects");
+            let orphaned_project = projects
+                .iter()
+                .find(|row| row.id == Some(project_id))
+                .expect("orphaned project remains visible");
+
+            assert_eq!(
+                orphaned_project.slug,
+                format!("[unknown-project-{project_id}]")
+            );
+            assert_eq!(
+                orphaned_project.human_key,
+                format!("[unknown-project-{project_id}]")
+            );
+        });
+    }
+
+    #[test]
+    fn get_project_by_slug_falls_back_to_orphaned_placeholder_inventory() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, dir) = setup_test_pool("get_project_by_slug_orphaned.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-get-project-by-slug-orphaned-{base}"),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let uid = format!("prod_get_project_slug_orphaned_{base}");
+            let product = ensure_product(&cx, &pool, Some(uid.as_str()), Some(uid.as_str()))
+                .await
+                .into_result()
+                .expect("ensure product");
+            let product_id = product.id.expect("product id");
+
+            link_product_to_projects(&cx, &pool, product_id, &[project_id])
+                .await
+                .into_result()
+                .expect("link product");
+
+            let db_path = dir.path().join("get_project_by_slug_orphaned.db");
+            let repair_conn = crate::DbConn::open_file(db_path.display().to_string())
+                .expect("open direct project cleanup connection");
+            repair_conn
+                .execute_sync(
+                    "DELETE FROM projects WHERE id = ?",
+                    &[Value::BigInt(project_id)],
+                )
+                .expect("orphan project row");
+
+            let lookup =
+                get_project_by_slug(&cx, &pool, &format!("[unknown-project-{project_id}]"))
+                    .await
+                    .into_result()
+                    .expect("lookup orphaned placeholder slug");
+
+            assert_eq!(lookup.id, Some(project_id));
+            assert_eq!(lookup.slug, format!("[unknown-project-{project_id}]"));
+            assert_eq!(lookup.human_key, format!("[unknown-project-{project_id}]"));
+        });
+    }
+
+    #[test]
+    fn get_project_by_human_key_falls_back_to_orphaned_placeholder_inventory() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, dir) = setup_test_pool("get_project_by_human_key_orphaned.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-get-project-by-human-key-orphaned-{base}"),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let uid = format!("prod_get_project_human_key_orphaned_{base}");
+            let product = ensure_product(&cx, &pool, Some(uid.as_str()), Some(uid.as_str()))
+                .await
+                .into_result()
+                .expect("ensure product");
+            let product_id = product.id.expect("product id");
+
+            link_product_to_projects(&cx, &pool, product_id, &[project_id])
+                .await
+                .into_result()
+                .expect("link product");
+
+            let db_path = dir.path().join("get_project_by_human_key_orphaned.db");
+            let repair_conn = crate::DbConn::open_file(db_path.display().to_string())
+                .expect("open direct project cleanup connection");
+            repair_conn
+                .execute_sync(
+                    "DELETE FROM projects WHERE id = ?",
+                    &[Value::BigInt(project_id)],
+                )
+                .expect("orphan project row");
+
+            let lookup =
+                get_project_by_human_key(&cx, &pool, &format!("[unknown-project-{project_id}]"))
+                    .await
+                    .into_result()
+                    .expect("lookup orphaned placeholder human_key");
+
+            assert_eq!(lookup.id, Some(project_id));
+            assert_eq!(lookup.slug, format!("[unknown-project-{project_id}]"));
+            assert_eq!(lookup.human_key, format!("[unknown-project-{project_id}]"));
+        });
+    }
+
+    #[test]
+    fn get_project_by_id_falls_back_to_orphaned_placeholder_inventory() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, dir) = setup_test_pool("get_project_by_id_orphaned.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-get-project-by-id-orphaned-{base}"),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let uid = format!("prod_get_project_id_orphaned_{base}");
+            let product = ensure_product(&cx, &pool, Some(uid.as_str()), Some(uid.as_str()))
+                .await
+                .into_result()
+                .expect("ensure product");
+            let product_id = product.id.expect("product id");
+
+            link_product_to_projects(&cx, &pool, product_id, &[project_id])
+                .await
+                .into_result()
+                .expect("link product");
+
+            let db_path = dir.path().join("get_project_by_id_orphaned.db");
+            let repair_conn = crate::DbConn::open_file(db_path.display().to_string())
+                .expect("open direct project cleanup connection");
+            repair_conn
+                .execute_sync(
+                    "DELETE FROM projects WHERE id = ?",
+                    &[Value::BigInt(project_id)],
+                )
+                .expect("orphan project row");
+
+            let lookup = get_project_by_id(&cx, &pool, project_id)
+                .await
+                .into_result()
+                .expect("lookup orphaned placeholder id");
+
+            assert_eq!(lookup.id, Some(project_id));
+            assert_eq!(lookup.slug, format!("[unknown-project-{project_id}]"));
+            assert_eq!(lookup.human_key, format!("[unknown-project-{project_id}]"));
+        });
+    }
+
+    #[test]
     #[allow(clippy::similar_names)]
     #[allow(clippy::too_many_lines)]
     fn search_messages_for_product_ranks_across_projects() {
@@ -17361,13 +17831,15 @@ mod tests {
                 .into_result()
                 .expect("count unread global");
 
-            assert_eq!(counts.len(), 1);
-            assert_eq!(counts[0].project_id, project_id);
+            let orphaned_project = counts
+                .iter()
+                .find(|count| count.project_id == project_id)
+                .expect("orphaned project unread count remains visible");
             assert_eq!(
-                counts[0].project_slug,
+                orphaned_project.project_slug,
                 format!("[unknown-project-{project_id}]")
             );
-            assert_eq!(counts[0].unread_count, 1);
+            assert_eq!(orphaned_project.unread_count, 1);
         });
     }
 

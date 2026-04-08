@@ -7865,68 +7865,13 @@ fn cli_reservation_target_matches(
         && cli_reservation_path_filter_matches(row_path_pattern, filter_paths)
 }
 
-/// Resolve a project identifier (slug or human_key path) to the canonical
-/// slug stored in the database.  This mirrors the dual-lookup that
-/// `resolve_project` in the MCP tool layer performs: if the identifier
-/// looks like an absolute path we first try matching by `human_key`, then
-/// fall back to slugifying the path and matching by slug.
-fn resolve_project_slug_for_cli(
+fn resolve_project_for_cli_best_effort(
     conn: &mcp_agent_mail_db::DbConn,
     identifier: &str,
-) -> CliResult<String> {
-    // Fast path: try direct slug match first.
-    let slug_rows = conn
-        .query_sync(
-            "SELECT slug FROM projects WHERE slug = ?",
-            &[sqlmodel_core::Value::Text(identifier.to_string())],
-        )
-        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-    if let Some(row) = slug_rows.first()
-        && let Ok(slug) = row.get_named::<String>("slug")
-    {
-        return Ok(slug);
-    }
-
-    // If the identifier looks like an absolute path, try matching by human_key.
-    if std::path::Path::new(identifier).is_absolute() {
-        let hk_rows = conn
-            .query_sync(
-                "SELECT slug FROM projects WHERE human_key = ?",
-                &[sqlmodel_core::Value::Text(identifier.to_string())],
-            )
-            .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-        if let Some(row) = hk_rows.first()
-            && let Ok(slug) = row.get_named::<String>("slug")
-        {
-            return Ok(slug);
-        }
-        // Last resort: slugify the path and try again.
-        let slugified = mcp_agent_mail_core::slugify(identifier);
-        let slug_rows = conn
-            .query_sync(
-                "SELECT slug FROM projects WHERE slug = ?",
-                &[sqlmodel_core::Value::Text(slugified.clone())],
-            )
-            .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-        if let Some(row) = slug_rows.first()
-            && let Ok(slug) = row.get_named::<String>("slug")
-        {
-            return Ok(slug);
-        }
-    }
-
-    Err(CliError::InvalidArgument(format!(
-        "project not found: {identifier}"
-    )))
-}
-
-fn resolve_project_slug_for_cli_best_effort(
-    conn: &mcp_agent_mail_db::DbConn,
-    identifier: &str,
-) -> CliResult<String> {
-    match resolve_project_slug_for_cli(conn, identifier) {
-        Ok(slug) => Ok(slug),
-        Err(err) if is_project_not_found_error(&err) => Ok(identifier.to_string()),
+) -> CliResult<Option<crate::context::ResolvedProject>> {
+    match crate::context::resolve_project(conn, identifier) {
+        Ok(project) => Ok(Some(project)),
+        Err(err) if is_project_not_found_error(&err) => Ok(None),
         Err(err) => Err(err),
     }
 }
@@ -7943,7 +7888,10 @@ fn handle_file_reservations_with_conn(
             active_only,
             all,
         } => {
-            let project = resolve_project_slug_for_cli_best_effort(conn, &project)?;
+            let Some(project) = resolve_project_for_cli_best_effort(conn, &project)? else {
+                output::empty_result(false, "No file reservations found.");
+                return Ok(());
+            };
             let active_reservation_predicate =
                 active_reservation_predicate_sql("file_reservations");
             let sql = if active_only {
@@ -7953,8 +7901,7 @@ fn handle_file_reservations_with_conn(
                             COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || file_reservations.agent_id || ']') AS agent_name \
                      FROM file_reservations \
                      LEFT JOIN agents a ON a.id = file_reservations.agent_id \
-                     JOIN projects p ON p.id = file_reservations.project_id \
-                     WHERE p.slug = ? AND ({active_reservation_predicate}) AND file_reservations.expires_ts > ? \
+                     WHERE file_reservations.project_id = ? AND ({active_reservation_predicate}) AND file_reservations.expires_ts > ? \
                      ORDER BY file_reservations.id"
                 )
             } else if all {
@@ -7963,8 +7910,7 @@ fn handle_file_reservations_with_conn(
                         COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || fr.agent_id || ']') AS agent_name \
                  FROM file_reservations fr \
                  LEFT JOIN agents a ON a.id = fr.agent_id \
-                 JOIN projects p ON p.id = fr.project_id \
-                 WHERE p.slug = ? \
+                 WHERE fr.project_id = ? \
                  ORDER BY fr.id"
             } else {
                 // Default: active (not released, not expired)
@@ -7974,18 +7920,17 @@ fn handle_file_reservations_with_conn(
                             COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || file_reservations.agent_id || ']') AS agent_name \
                      FROM file_reservations \
                      LEFT JOIN agents a ON a.id = file_reservations.agent_id \
-                     JOIN projects p ON p.id = file_reservations.project_id \
-                     WHERE p.slug = ? AND ({active_reservation_predicate}) AND file_reservations.expires_ts > ? \
+                     WHERE file_reservations.project_id = ? AND ({active_reservation_predicate}) AND file_reservations.expires_ts > ? \
                      ORDER BY file_reservations.id"
                 )
             };
             let params: Vec<sqlmodel_core::Value> = if active_only || (!all) {
                 vec![
-                    sqlmodel_core::Value::Text(project),
+                    sqlmodel_core::Value::BigInt(project.id),
                     sqlmodel_core::Value::BigInt(now_us),
                 ]
             } else {
-                vec![sqlmodel_core::Value::Text(project)]
+                vec![sqlmodel_core::Value::BigInt(project.id)]
             };
             let rows = conn
                 .query_sync(sql, &params)
@@ -8017,7 +7962,10 @@ fn handle_file_reservations_with_conn(
             Ok(())
         }
         FileReservationsCommand::Active { project, limit } => {
-            let project = resolve_project_slug_for_cli_best_effort(conn, &project)?;
+            let Some(project) = resolve_project_for_cli_best_effort(conn, &project)? else {
+                ftui_runtime::ftui_println!("No active reservations.");
+                return Ok(());
+            };
             let limit = limit.unwrap_or(50);
             let active_reservation_predicate =
                 active_reservation_predicate_sql("file_reservations");
@@ -8027,8 +7975,7 @@ fn handle_file_reservations_with_conn(
                         COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || file_reservations.agent_id || ']') AS agent_name \
                  FROM file_reservations \
                  LEFT JOIN agents a ON a.id = file_reservations.agent_id \
-                 JOIN projects p ON p.id = file_reservations.project_id \
-                 WHERE p.slug = ? AND ({active_reservation_predicate}) AND file_reservations.expires_ts > ? \
+                 WHERE file_reservations.project_id = ? AND ({active_reservation_predicate}) AND file_reservations.expires_ts > ? \
                  ORDER BY file_reservations.expires_ts ASC \
                  LIMIT ?"
             );
@@ -8036,7 +7983,7 @@ fn handle_file_reservations_with_conn(
                 .query_sync(
                     &sql,
                     &[
-                        sqlmodel_core::Value::Text(project),
+                        sqlmodel_core::Value::BigInt(project.id),
                         sqlmodel_core::Value::BigInt(now_us),
                         sqlmodel_core::Value::BigInt(limit),
                     ],
@@ -8057,7 +8004,13 @@ fn handle_file_reservations_with_conn(
             Ok(())
         }
         FileReservationsCommand::Soon { project, minutes } => {
-            let project = resolve_project_slug_for_cli_best_effort(conn, &project)?;
+            let Some(project) = resolve_project_for_cli_best_effort(conn, &project)? else {
+                ftui_runtime::ftui_println!(
+                    "No reservations expiring within {} minutes.",
+                    minutes.unwrap_or(30)
+                );
+                return Ok(());
+            };
             let minutes = minutes.unwrap_or(30);
             let threshold_us = now_us.saturating_add(minutes.saturating_mul(60_000_000));
             let active_reservation_predicate =
@@ -8067,8 +8020,7 @@ fn handle_file_reservations_with_conn(
                         COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || file_reservations.agent_id || ']') AS agent_name \
                  FROM file_reservations \
                  LEFT JOIN agents a ON a.id = file_reservations.agent_id \
-                 JOIN projects p ON p.id = file_reservations.project_id \
-                 WHERE p.slug = ? AND ({active_reservation_predicate}) \
+                 WHERE file_reservations.project_id = ? AND ({active_reservation_predicate}) \
                    AND file_reservations.expires_ts > ? AND file_reservations.expires_ts <= ? \
                  ORDER BY file_reservations.expires_ts ASC"
             );
@@ -8076,7 +8028,7 @@ fn handle_file_reservations_with_conn(
                 .query_sync(
                     &sql,
                     &[
-                        sqlmodel_core::Value::Text(project),
+                        sqlmodel_core::Value::BigInt(project.id),
                         sqlmodel_core::Value::BigInt(now_us),
                         sqlmodel_core::Value::BigInt(threshold_us),
                     ],
@@ -8111,24 +8063,11 @@ fn handle_file_reservations_with_conn(
             shared,
             reason,
         } => {
-            let project = resolve_project_slug_for_cli(conn, &project)?;
+            let project = crate::context::resolve_project(conn, &project)?;
             let exclusive_val = if shared { false } else { exclusive };
             let ttl = ttl.max(60); // Min 60s
 
-            // Resolve project_id and agent_id.
-            let proj_rows = conn
-                .query_sync(
-                    "SELECT id FROM projects WHERE slug = ?",
-                    &[sqlmodel_core::Value::Text(project.clone())],
-                )
-                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let project_id: i64 = proj_rows
-                .first()
-                .and_then(|r| r.get_named("id").ok())
-                .ok_or_else(|| {
-                    CliError::InvalidArgument(format!("project not found: {project}"))
-                })?;
-
+            let project_id = project.id;
             let agent_id = crate::context::resolve_agent(conn, project_id, &agent)?.id;
 
             // Check conflicts: find active exclusive reservations that overlap.
@@ -8234,24 +8173,11 @@ fn handle_file_reservations_with_conn(
             paths,
             ids,
         } => {
-            let project = resolve_project_slug_for_cli(conn, &project)?;
+            let project = crate::context::resolve_project(conn, &project)?;
             let extend = extend_seconds.max(60);
             let extend_us = extend.saturating_mul(1_000_000);
 
-            // Resolve project_id and agent_id.
-            let proj_rows = conn
-                .query_sync(
-                    "SELECT id FROM projects WHERE slug = ?",
-                    &[sqlmodel_core::Value::Text(project.clone())],
-                )
-                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let project_id: i64 = proj_rows
-                .first()
-                .and_then(|r| r.get_named("id").ok())
-                .ok_or_else(|| {
-                    CliError::InvalidArgument(format!("project not found: {project}"))
-                })?;
-
+            let project_id = project.id;
             let agent_id = crate::context::resolve_agent(conn, project_id, &agent)?.id;
 
             // Build WHERE clause for renewal.
@@ -8324,20 +8250,8 @@ fn handle_file_reservations_with_conn(
             paths,
             ids,
         } => {
-            let project = resolve_project_slug_for_cli(conn, &project)?;
-            let proj_rows = conn
-                .query_sync(
-                    "SELECT id FROM projects WHERE slug = ?",
-                    &[sqlmodel_core::Value::Text(project.clone())],
-                )
-                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let project_id: i64 = proj_rows
-                .first()
-                .and_then(|r| r.get_named("id").ok())
-                .ok_or_else(|| {
-                    CliError::InvalidArgument(format!("project not found: {project}"))
-                })?;
-
+            let project = crate::context::resolve_project(conn, &project)?;
+            let project_id = project.id;
             let agent_id = crate::context::resolve_agent(conn, project_id, &agent)?.id;
 
             let active_reservation_predicate =
@@ -8364,7 +8278,7 @@ fn handle_file_reservations_with_conn(
             if target_ids.is_empty() {
                 output::success(&format!(
                     "Released 0 reservation(s) for {} in {}.",
-                    agent, project
+                    agent, project.slug
                 ));
                 return Ok(());
             }
@@ -8390,22 +8304,16 @@ fn handle_file_reservations_with_conn(
             let released_count = rows.len();
             output::success(&format!(
                 "Released {} reservation(s) for {} in {}.",
-                released_count, agent, project
+                released_count, agent, project.slug
             ));
             Ok(())
         }
         FileReservationsCommand::Conflicts { project, paths } => {
-            let project = resolve_project_slug_for_cli_best_effort(conn, &project)?;
-            let proj_rows = conn
-                .query_sync(
-                    "SELECT id FROM projects WHERE slug = ?",
-                    &[sqlmodel_core::Value::Text(project.clone())],
-                )
-                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let Some(project_id) = proj_rows.first().and_then(|r| r.get_named("id").ok()) else {
+            let Some(project) = resolve_project_for_cli_best_effort(conn, &project)? else {
                 output::success("No conflicts detected.");
                 return Ok(());
             };
+            let project_id = project.id;
 
             let mut conflicts: Vec<serde_json::Value> = Vec::new();
             let active_reservation_predicate = active_reservation_predicate_sql("fr");
@@ -32489,6 +32397,37 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn integration_file_reservations_list_keeps_orphaned_project_visible() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+        conn.execute_sync(
+            "DELETE FROM projects WHERE id = ?",
+            &[sqlmodel_core::Value::BigInt(1)],
+        )
+        .expect("delete project row");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::List {
+                project: "[unknown-project-1]".to_string(),
+                active_only: false,
+                all: false,
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "file_reservations list failed: {result:?}");
+        assert!(
+            output.contains("src/api/*.rs") && output.contains("BlueLake"),
+            "expected reservation for orphaned project, got: {output}"
+        );
+    }
+
+    #[test]
     fn integration_file_reservations_list_accepts_human_key() {
         let _guard = stdio_capture_lock()
             .lock()
@@ -32610,6 +32549,56 @@ startup_timeout_sec = 42
         assert!(
             rows.len() >= 2,
             "expected at least 2 reservations for RedFox"
+        );
+    }
+
+    #[test]
+    fn integration_file_reservations_reserve_accepts_orphaned_project_placeholder() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+        conn.execute_sync(
+            "DELETE FROM projects WHERE id = ?",
+            &[sqlmodel_core::Value::BigInt(1)],
+        )
+        .expect("delete project row");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::Reserve {
+                project: "[unknown-project-1]".to_string(),
+                agent: "RedFox".to_string(),
+                paths: vec!["orphaned/**".to_string()],
+                ttl: 7200,
+                exclusive: true,
+                shared: false,
+                reason: "br-orphan".to_string(),
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "reserve failed: {result:?}");
+        assert!(
+            output.contains("\"granted\"") && output.contains("orphaned/**"),
+            "expected granted output for orphaned project, got: {output}"
+        );
+
+        let rows = conn
+            .query_sync(
+                "SELECT path_pattern FROM file_reservations WHERE project_id = 1 AND agent_id = 2 AND released_ts IS NULL",
+                &[],
+            )
+            .unwrap();
+        assert!(
+            rows.iter().any(|row| {
+                row.get_named::<String>("path_pattern")
+                    .ok()
+                    .is_some_and(|pattern| pattern == "orphaned/**")
+            }),
+            "expected orphaned reservation to be inserted"
         );
     }
 
