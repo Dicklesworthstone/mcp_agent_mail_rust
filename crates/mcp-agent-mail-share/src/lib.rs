@@ -272,6 +272,37 @@ pub enum ShareError {
 
 pub type ShareResult<T> = Result<T, ShareError>;
 
+pub(crate) fn is_real_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+pub(crate) fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+pub(crate) fn load_bundle_manifest_json(bundle_dir: &Path) -> ShareResult<Value> {
+    if !is_real_dir(bundle_dir) {
+        return Err(ShareError::BundleNotFound {
+            path: bundle_dir.display().to_string(),
+        });
+    }
+
+    let manifest_path = bundle_dir.join("manifest.json");
+    if !is_real_file(&manifest_path) {
+        return Err(ShareError::ManifestNotFound {
+            path: bundle_dir.display().to_string(),
+        });
+    }
+
+    let manifest_text =
+        std::fs::read_to_string(&manifest_path).map_err(|e| ShareError::ManifestParse {
+            message: e.to_string(),
+        })?;
+    serde_json::from_str(&manifest_text).map_err(|e| ShareError::ManifestParse {
+        message: e.to_string(),
+    })
+}
+
 /// Normalize and validate a scrub preset string (case-insensitive).
 pub fn normalize_scrub_preset(input: &str) -> ShareResult<ScrubPreset> {
     let preset = input.trim().to_ascii_lowercase();
@@ -439,20 +470,7 @@ fn get_str_list(value: Option<&Value>) -> Vec<String> {
 
 /// Load export configuration defaults from an existing bundle.
 pub fn load_bundle_export_config(bundle_dir: &Path) -> ShareResult<StoredExportConfig> {
-    let manifest_path = bundle_dir.join("manifest.json");
-    if !manifest_path.exists() {
-        return Err(ShareError::ManifestNotFound {
-            path: bundle_dir.display().to_string(),
-        });
-    }
-    let manifest_text =
-        std::fs::read_to_string(&manifest_path).map_err(|e| ShareError::ManifestParse {
-            message: e.to_string(),
-        })?;
-    let manifest: Value =
-        serde_json::from_str(&manifest_text).map_err(|e| ShareError::ManifestParse {
-            message: e.to_string(),
-        })?;
+    let manifest = load_bundle_manifest_json(bundle_dir)?;
 
     let export_config = get_object(&manifest, "export_config");
     let attachments_section = get_object(&manifest, "attachments");
@@ -849,5 +867,37 @@ mod tests {
         let cfg = load_bundle_export_config(dir.path()).expect("manifest should parse");
         assert_eq!(cfg.chunk_size, 7_000);
         assert_eq!(cfg.chunk_threshold, 8_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_bundle_export_config_rejects_symlinked_bundle_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().expect("tempdir");
+        let bundle = dir.path().join("bundle");
+        std::fs::create_dir_all(&bundle).expect("bundle dir");
+        std::fs::write(bundle.join("manifest.json"), "{}").expect("write manifest");
+
+        let linked = dir.path().join("linked-bundle");
+        symlink(&bundle, &linked).expect("symlink bundle");
+
+        let err = load_bundle_export_config(&linked).expect_err("symlinked bundle should fail");
+        assert!(matches!(err, ShareError::BundleNotFound { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_bundle_export_config_rejects_symlinked_manifest() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().expect("tempdir");
+        let real_manifest = dir.path().join("real-manifest.json");
+        std::fs::write(&real_manifest, "{}").expect("write manifest");
+        symlink(&real_manifest, dir.path().join("manifest.json")).expect("symlink manifest");
+
+        let err =
+            load_bundle_export_config(dir.path()).expect_err("symlinked manifest should fail");
+        assert!(matches!(err, ShareError::ManifestNotFound { .. }));
     }
 }

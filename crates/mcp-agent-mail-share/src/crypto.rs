@@ -34,17 +34,37 @@ pub fn sign_manifest(
 ) -> ShareResult<ManifestSignature> {
     use ed25519_dalek::{Signer, SigningKey};
 
-    if !manifest_path.exists() {
+    if !crate::is_real_file(manifest_path) {
         return Err(ShareError::ManifestNotFound {
             path: manifest_path.display().to_string(),
         });
     }
 
-    if output_path.exists() && !overwrite {
-        return Err(ShareError::Io(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("signature file already exists: {}", output_path.display()),
-        )));
+    if let Ok(metadata) = std::fs::symlink_metadata(output_path) {
+        if metadata.file_type().is_symlink() {
+            return Err(ShareError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "signature output path must not be a symlink: {}",
+                    output_path.display()
+                ),
+            )));
+        }
+        if !metadata.file_type().is_file() {
+            return Err(ShareError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "signature output path must be a regular file: {}",
+                    output_path.display()
+                ),
+            )));
+        }
+        if !overwrite {
+            return Err(ShareError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("signature file already exists: {}", output_path.display()),
+            )));
+        }
     }
 
     // Read signing key (32-byte seed or 64-byte expanded — use first 32)
@@ -98,8 +118,14 @@ pub fn verify_bundle(
 ) -> ShareResult<VerifyResult> {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
+    if !crate::is_real_dir(bundle_root) {
+        return Err(ShareError::ManifestNotFound {
+            path: bundle_root.display().to_string(),
+        });
+    }
+
     let manifest_path = bundle_root.join("manifest.json");
-    if !manifest_path.exists() {
+    if !crate::is_real_file(&manifest_path) {
         return Err(ShareError::ManifestNotFound {
             path: bundle_root.display().to_string(),
         });
@@ -201,47 +227,75 @@ pub fn verify_bundle(
     let mut signature_verified = false;
     let mut key_source: Option<String> = None;
 
-    if sig_path.exists() {
-        signature_checked = true;
+    match std::fs::symlink_metadata(&sig_path) {
+        Ok(metadata) => {
+            signature_checked = true;
 
-        let sig_json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&sig_path)?).map_err(|e| {
-                ShareError::ManifestParse {
-                    message: e.to_string(),
+            if metadata.file_type().is_symlink() {
+                return Ok(VerifyResult {
+                    bundle: bundle_root.display().to_string(),
+                    sri_checked,
+                    sri_valid: sri_checked && sri_files_verified > 0,
+                    signature_checked: true,
+                    signature_verified: false,
+                    key_source: None,
+                    error: Some("signature file must not be a symlink".to_string()),
+                });
+            }
+            if !metadata.file_type().is_file() {
+                return Ok(VerifyResult {
+                    bundle: bundle_root.display().to_string(),
+                    sri_checked,
+                    sri_valid: sri_checked && sri_files_verified > 0,
+                    signature_checked: true,
+                    signature_verified: false,
+                    key_source: None,
+                    error: Some("signature file must be a regular file".to_string()),
+                });
+            }
+
+            let sig_json: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&sig_path)?).map_err(|e| {
+                    ShareError::ManifestParse {
+                        message: e.to_string(),
+                    }
+                })?;
+
+            // Explicit public key takes precedence over the one embedded in the sig file.
+            // NOTE: When falling back to the embedded key, verification only proves internal
+            // consistency (the manifest matches *some* key), not authenticity. An attacker
+            // can re-sign with their own key. Callers requiring trust should pass an explicit
+            // public_key_b64.
+            let (pub_key_str, ks) = if let Some(explicit) = public_key_b64 {
+                (Some(explicit.to_string()), Some("explicit".to_string()))
+            } else {
+                let embedded = sig_json
+                    .get("public_key")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let source = embedded.as_ref().map(|_| "embedded".to_string());
+                (embedded, source)
+            };
+            key_source = ks;
+
+            let sig_str = sig_json.get("signature").and_then(|v| v.as_str());
+
+            if let (Some(pk_b64), Some(sig_b64)) = (pub_key_str, sig_str)
+                && let (Ok(pk_bytes), Ok(sig_bytes)) =
+                    (base64_decode(&pk_b64), base64_decode(sig_b64))
+                && pk_bytes.len() == 32
+                && sig_bytes.len() == 64
+            {
+                let pk: [u8; 32] = pk_bytes.try_into().unwrap_or_else(|_| unreachable!());
+                let sig: [u8; 64] = sig_bytes.try_into().unwrap_or_else(|_| unreachable!());
+                if let Ok(verifying_key) = VerifyingKey::from_bytes(&pk) {
+                    let signature = Signature::from_bytes(&sig);
+                    signature_verified = verifying_key.verify(&manifest_bytes, &signature).is_ok();
                 }
-            })?;
-
-        // Explicit public key takes precedence over the one embedded in the sig file.
-        // NOTE: When falling back to the embedded key, verification only proves internal
-        // consistency (the manifest matches *some* key), not authenticity. An attacker
-        // can re-sign with their own key. Callers requiring trust should pass an explicit
-        // public_key_b64.
-        let (pub_key_str, ks) = if let Some(explicit) = public_key_b64 {
-            (Some(explicit.to_string()), Some("explicit".to_string()))
-        } else {
-            let embedded = sig_json
-                .get("public_key")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let source = embedded.as_ref().map(|_| "embedded".to_string());
-            (embedded, source)
-        };
-        key_source = ks;
-
-        let sig_str = sig_json.get("signature").and_then(|v| v.as_str());
-
-        if let (Some(pk_b64), Some(sig_b64)) = (pub_key_str, sig_str)
-            && let (Ok(pk_bytes), Ok(sig_bytes)) = (base64_decode(&pk_b64), base64_decode(sig_b64))
-            && pk_bytes.len() == 32
-            && sig_bytes.len() == 64
-        {
-            let pk: [u8; 32] = pk_bytes.try_into().unwrap_or_else(|_| unreachable!());
-            let sig: [u8; 64] = sig_bytes.try_into().unwrap_or_else(|_| unreachable!());
-            if let Ok(verifying_key) = VerifyingKey::from_bytes(&pk) {
-                let signature = Signature::from_bytes(&sig);
-                signature_verified = verifying_key.verify(&manifest_bytes, &signature).is_ok();
             }
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ShareError::Io(error)),
     }
 
     Ok(VerifyResult {
@@ -269,7 +323,7 @@ fn resolve_sri_file_path(bundle_root: &Path, relative_path: &str) -> Result<Path
     // Historical manifests store SRI paths relative to `viewer/` (e.g. `vendor/foo.js`),
     // while some tooling may emit bundle-root relative paths. Accept either.
     let direct = bundle_root.join(relative_path);
-    if direct.exists() {
+    if std::fs::symlink_metadata(&direct).is_ok() {
         return validate_sri_resolved_path(bundle_root, direct, relative_path);
     }
     validate_sri_resolved_path(
@@ -284,8 +338,23 @@ fn validate_sri_resolved_path(
     candidate: PathBuf,
     relative_path: &str,
 ) -> Result<PathBuf, String> {
-    if !candidate.exists() {
-        return Ok(candidate);
+    let metadata = match std::fs::symlink_metadata(&candidate) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+        Err(error) => {
+            return Err(format!("failed to inspect '{relative_path}': {error}"));
+        }
+    };
+
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "SRI-referenced path must not be a symlink: '{relative_path}'"
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "SRI-referenced path must be a regular file: '{relative_path}'"
+        ));
     }
 
     let canonical_root = bundle_root
@@ -666,6 +735,55 @@ mod tests {
         assert!(matches!(result, Err(ShareError::ManifestNotFound { .. })));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn sign_rejects_symlinked_manifest() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_manifest = dir.path().join("real-manifest.json");
+        std::fs::write(&real_manifest, r#"{"test": true}"#).unwrap();
+        let linked_manifest = dir.path().join("manifest.json");
+        symlink(&real_manifest, &linked_manifest).unwrap();
+
+        let key_path = dir.path().join("test.key");
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+
+        let result = sign_manifest(
+            &linked_manifest,
+            &key_path,
+            &dir.path().join("sig.json"),
+            false,
+        );
+        assert!(matches!(result, Err(ShareError::ManifestNotFound { .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sign_rejects_symlinked_signature_output() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, r#"{"test": true}"#).unwrap();
+
+        let key_path = dir.path().join("test.key");
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+
+        let real_sig = dir.path().join("real.sig.json");
+        std::fs::write(&real_sig, "{}").unwrap();
+        let linked_sig = dir.path().join("manifest.sig.json");
+        symlink(&real_sig, &linked_sig).unwrap();
+
+        let result = sign_manifest(&manifest_path, &key_path, &linked_sig, true);
+        assert!(matches!(
+            result,
+            Err(ShareError::Io(error))
+                if error.kind() == std::io::ErrorKind::InvalidInput
+                    && error.to_string().contains("must not be a symlink")
+        ));
+    }
+
     #[test]
     fn sign_short_key_errors() {
         let dir = tempfile::tempdir().unwrap();
@@ -688,6 +806,48 @@ mod tests {
     fn verify_missing_bundle_errors() {
         let result = verify_bundle(Path::new("/nonexistent"), None);
         assert!(matches!(result, Err(ShareError::ManifestNotFound { .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_rejects_symlinked_bundle_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("manifest.json"), r#"{"test": true}"#).unwrap();
+
+        let linked = dir.path().join("linked-bundle");
+        symlink(&bundle, &linked).unwrap();
+
+        let result = verify_bundle(&linked, None);
+        assert!(matches!(result, Err(ShareError::ManifestNotFound { .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_rejects_symlinked_signature_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, r#"{"test": true}"#).unwrap();
+
+        let real_sig = dir.path().join("real.sig.json");
+        std::fs::write(&real_sig, r#"{"signature":"fake"}"#).unwrap();
+        symlink(&real_sig, dir.path().join("manifest.sig.json")).unwrap();
+
+        let result = verify_bundle(dir.path(), None).unwrap();
+        assert!(result.signature_checked);
+        assert!(!result.signature_verified);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("must not be a symlink")
+        );
     }
 
     #[test]
@@ -770,9 +930,77 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("outside bundle root"),
-            "expected bundle-root containment failure, got {:?}",
+                .contains("must not be a symlink"),
+            "expected symlink rejection, got {:?}",
             result.error
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_sri_rejects_symlinked_file_inside_bundle() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("viewer").join("vendor");
+        std::fs::create_dir_all(&vendor_dir).unwrap();
+
+        let real_js = vendor_dir.join("real.js");
+        std::fs::write(&real_js, b"console.log('inside bundle')").unwrap();
+        let linked_js = vendor_dir.join("app.js");
+        symlink(&real_js, &linked_js).unwrap();
+
+        let expected_sri = format!(
+            "sha256-{}",
+            base64_encode(&sha256_bytes(b"console.log('inside bundle')"))
+        );
+        let manifest = serde_json::json!({
+            "viewer": {
+                "sri": {
+                    "vendor/app.js": expected_sri
+                }
+            }
+        });
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+        let result = verify_bundle(dir.path(), None).unwrap();
+        assert!(result.sri_checked);
+        assert!(!result.sri_valid);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("must not be a symlink")
+        );
+    }
+
+    #[test]
+    fn verify_sri_rejects_non_file_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let vendor_dir = dir.path().join("viewer").join("vendor");
+        std::fs::create_dir_all(vendor_dir.join("nested")).unwrap();
+
+        let manifest = serde_json::json!({
+            "viewer": {
+                "sri": {
+                    "vendor/nested": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                }
+            }
+        });
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+        let result = verify_bundle(dir.path(), None).unwrap();
+        assert!(result.sri_checked);
+        assert!(!result.sri_valid);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("regular file")
         );
     }
 

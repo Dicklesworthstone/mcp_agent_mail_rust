@@ -415,19 +415,32 @@ fn validate_bundle_path(path: &Path) -> Result<bool, WizardError> {
         eprintln!("Path does not exist: {}", path.display());
         return Ok(false);
     }
-    if !path.is_dir() {
-        eprintln!("Path is not a directory: {}", path.display());
+    if !crate::is_real_dir(path) {
+        eprintln!("Path is not a real directory: {}", path.display());
         return Ok(false);
     }
-    let manifest = path.join("manifest.json");
-    if !manifest.exists() {
-        eprintln!(
-            "Not a valid bundle (missing manifest.json): {}",
-            path.display()
-        );
-        return Ok(false);
+    match crate::load_bundle_manifest_json(path) {
+        Ok(_) => Ok(true),
+        Err(crate::ShareError::ManifestNotFound { .. }) => {
+            eprintln!(
+                "Not a valid bundle (missing manifest.json): {}",
+                path.display()
+            );
+            Ok(false)
+        }
+        Err(crate::ShareError::ManifestParse { message }) => {
+            eprintln!("Not a valid bundle (invalid manifest.json): {message}");
+            Ok(false)
+        }
+        Err(crate::ShareError::BundleNotFound { .. }) => {
+            eprintln!("Path is not a real bundle directory: {}", path.display());
+            Ok(false)
+        }
+        Err(other) => Err(WizardError::new(
+            WizardErrorCode::InternalError,
+            format!("Failed to validate bundle path {}: {other}", path.display()),
+        )),
     }
-    Ok(true)
 }
 
 // ── Provider-Specific Options ───────────────────────────────────────────
@@ -911,6 +924,34 @@ mod tests {
         let result = validate_bundle_path(dir.path());
         assert!(result.is_ok());
         assert!(result.unwrap(), "should accept dir with manifest.json");
+    }
+
+    #[test]
+    fn validate_bundle_path_rejects_invalid_manifest_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("manifest.json"), "{not json").unwrap();
+
+        let result = validate_bundle_path(dir.path());
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "should reject invalid manifest json");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_bundle_path_rejects_symlinked_bundle_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("manifest.json"), "{}").unwrap();
+
+        let linked = dir.path().join("linked-bundle");
+        symlink(&bundle, &linked).unwrap();
+
+        let result = validate_bundle_path(&linked);
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "should reject symlinked bundle root");
     }
 
     #[test]

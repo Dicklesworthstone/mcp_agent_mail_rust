@@ -133,27 +133,7 @@ pub fn generate_plan(
 pub fn validate_inputs(inputs: &WizardInputs) -> PlanResult<()> {
     // Check bundle path if provided
     if let Some(ref path) = inputs.bundle_path {
-        if !path.exists() {
-            return Err(WizardError::new(
-                WizardErrorCode::BundleNotFound,
-                format!("Bundle path does not exist: {}", path.display()),
-            )
-            .with_hint("Run 'am share export' to create a bundle first"));
-        }
-        if !path.is_dir() {
-            return Err(WizardError::new(
-                WizardErrorCode::BundleInvalid,
-                format!("Bundle path is not a directory: {}", path.display()),
-            ));
-        }
-        let manifest = path.join("manifest.json");
-        if !manifest.exists() {
-            return Err(WizardError::new(
-                WizardErrorCode::BundleInvalid,
-                format!("Bundle is missing manifest.json: {}", path.display()),
-            )
-            .with_hint("Ensure the bundle was created with 'am share export'"));
-        }
+        validate_bundle_path(path)?;
     }
 
     // Validate provider-specific options
@@ -167,27 +147,29 @@ pub fn validate_inputs(inputs: &WizardInputs) -> PlanResult<()> {
 // ── Provider Resolution ─────────────────────────────────────────────────
 
 fn resolve_bundle_path(inputs: &WizardInputs) -> PlanResult<PathBuf> {
-    if let Some(ref path) = inputs.bundle_path {
-        return Ok(path.clone());
-    }
-
-    // Try default locations
     let cwd = std::env::current_dir().map_err(|e| {
         WizardError::new(
             WizardErrorCode::InternalError,
             format!("Failed to get cwd: {e}"),
         )
     })?;
+    resolve_bundle_path_from(inputs, &cwd)
+}
+
+fn resolve_bundle_path_from(inputs: &WizardInputs, cwd: &Path) -> PlanResult<PathBuf> {
+    if let Some(ref path) = inputs.bundle_path {
+        return Ok(path.clone());
+    }
 
     // Check cwd/bundle
     let default_bundle = cwd.join("bundle");
-    if default_bundle.is_dir() && default_bundle.join("manifest.json").exists() {
+    if crate::load_bundle_manifest_json(&default_bundle).is_ok() {
         return Ok(default_bundle);
     }
 
     // Check cwd/agent-mail-bundle
     let alt_bundle = cwd.join("agent-mail-bundle");
-    if alt_bundle.is_dir() && alt_bundle.join("manifest.json").exists() {
+    if crate::load_bundle_manifest_json(&alt_bundle).is_ok() {
         return Ok(alt_bundle);
     }
 
@@ -196,6 +178,43 @@ fn resolve_bundle_path(inputs: &WizardInputs) -> PlanResult<PathBuf> {
         "No bundle path specified and no default bundle found",
     )
     .with_hint("Specify --bundle or run 'am share export' in the current directory"))
+}
+
+fn validate_bundle_path(path: &Path) -> PlanResult<()> {
+    if !path.exists() {
+        return Err(WizardError::new(
+            WizardErrorCode::BundleNotFound,
+            format!("Bundle path does not exist: {}", path.display()),
+        )
+        .with_hint("Run 'am share export' to create a bundle first"));
+    }
+    if !crate::is_real_dir(path) {
+        return Err(WizardError::new(
+            WizardErrorCode::BundleInvalid,
+            format!("Bundle path is not a real directory: {}", path.display()),
+        ));
+    }
+    match crate::load_bundle_manifest_json(path) {
+        Ok(_) => Ok(()),
+        Err(crate::ShareError::ManifestNotFound { .. }) => Err(WizardError::new(
+            WizardErrorCode::BundleInvalid,
+            format!("Bundle is missing manifest.json: {}", path.display()),
+        )
+        .with_hint("Ensure the bundle was created with 'am share export'")),
+        Err(crate::ShareError::ManifestParse { message }) => Err(WizardError::new(
+            WizardErrorCode::BundleInvalid,
+            format!("Bundle manifest.json is invalid: {message}"),
+        )
+        .with_hint("Re-export the bundle so manifest.json is regenerated")),
+        Err(crate::ShareError::BundleNotFound { .. }) => Err(WizardError::new(
+            WizardErrorCode::BundleInvalid,
+            format!("Bundle path is not a real directory: {}", path.display()),
+        )),
+        Err(other) => Err(WizardError::new(
+            WizardErrorCode::BundleInvalid,
+            format!("Failed to read bundle metadata: {other}"),
+        )),
+    }
 }
 
 pub(crate) fn resolve_detection_root(bundle_path: &Path, shell_cwd: &Path) -> PathBuf {
@@ -1086,6 +1105,58 @@ mod tests {
         };
         let result = validate_inputs(&inputs);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_inputs_rejects_invalid_manifest_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("manifest.json"), "{not json").unwrap();
+
+        let inputs = WizardInputs {
+            bundle_path: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let err = validate_inputs(&inputs).expect_err("invalid manifest should fail");
+        assert_eq!(err.code, WizardErrorCode::BundleInvalid);
+        assert!(err.message.contains("invalid"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_inputs_rejects_symlinked_bundle_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("manifest.json"), "{}").unwrap();
+
+        let linked = dir.path().join("linked-bundle");
+        symlink(&bundle, &linked).unwrap();
+
+        let inputs = WizardInputs {
+            bundle_path: Some(linked),
+            ..Default::default()
+        };
+        let err = validate_inputs(&inputs).expect_err("symlinked bundle should fail");
+        assert_eq!(err.code, WizardErrorCode::BundleInvalid);
+        assert!(err.message.contains("real directory"));
+    }
+
+    #[test]
+    fn resolve_bundle_path_skips_invalid_default_bundle_in_favor_of_valid_alternative() {
+        let cwd = tempfile::tempdir().unwrap();
+        let default_bundle = cwd.path().join("bundle");
+        std::fs::create_dir_all(&default_bundle).unwrap();
+        std::fs::write(default_bundle.join("manifest.json"), "{not json").unwrap();
+
+        let alt_bundle = cwd.path().join("agent-mail-bundle");
+        std::fs::create_dir_all(&alt_bundle).unwrap();
+        std::fs::write(alt_bundle.join("manifest.json"), "{}").unwrap();
+
+        let resolved =
+            resolve_bundle_path_from(&WizardInputs::default(), cwd.path()).expect("resolve path");
+        assert_eq!(resolved, alt_bundle);
     }
 
     #[test]

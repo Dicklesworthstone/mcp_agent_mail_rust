@@ -585,6 +585,7 @@ pub fn export_bundle_from_snapshot_context(
     config: &BundleExportConfig,
 ) -> ShareResult<BundleExportResult> {
     ensure_output_directory(output_dir)?;
+    clear_export_bundle_owned_outputs(output_dir)?;
     let detach_attachment_threshold = crate::adjust_detach_threshold(
         config.inline_attachment_threshold,
         config.detach_attachment_threshold,
@@ -747,6 +748,65 @@ pub fn package_directory_as_zip(source_dir: &Path, destination: &Path) -> ShareR
 }
 
 // === Internal helpers ===
+
+const BUNDLE_EXPORT_OWNED_DIRECTORIES: &[&str] = &["viewer", "attachments", "chunks"];
+
+const BUNDLE_EXPORT_OWNED_FILES: &[&str] = &[
+    "manifest.json",
+    "manifest.sig.json",
+    "README.md",
+    "HOW_TO_DEPLOY.md",
+    "index.html",
+    ".nojekyll",
+    "_headers",
+    "mailbox.sqlite3",
+    "mailbox.sqlite3-wal",
+    "mailbox.sqlite3-shm",
+    "chunks.sha256",
+    "mailbox.sqlite3.config.json",
+];
+
+fn clear_export_bundle_owned_outputs(output_dir: &Path) -> std::io::Result<()> {
+    for relative_path in BUNDLE_EXPORT_OWNED_DIRECTORIES {
+        remove_owned_output_path_if_exists(output_dir, relative_path)?;
+    }
+    for relative_path in BUNDLE_EXPORT_OWNED_FILES {
+        remove_owned_output_path_if_exists(output_dir, relative_path)?;
+    }
+    Ok(())
+}
+
+fn remove_owned_output_path_if_exists(
+    output_dir: &Path,
+    relative_path: &str,
+) -> std::io::Result<()> {
+    let relative_path = Path::new(relative_path);
+    validate_relative_output_path(relative_path)?;
+    let target = output_dir.join(relative_path);
+    match std::fs::symlink_metadata(&target) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(std::io::Error::other(format!(
+                    "refusing to remove symlinked bundle path {}",
+                    target.display()
+                )));
+            }
+            if metadata.is_dir() {
+                std::fs::remove_dir_all(&target)?;
+            } else if metadata.is_file() {
+                std::fs::remove_file(&target)?;
+            } else {
+                return Err(std::io::Error::other(format!(
+                    "refusing to remove non-file, non-directory bundle path {}",
+                    target.display()
+                )));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
 
 fn resolve_attachment_path(
     storage_root: &Path,

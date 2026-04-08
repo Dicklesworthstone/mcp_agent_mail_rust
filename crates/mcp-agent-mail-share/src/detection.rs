@@ -45,8 +45,7 @@ pub fn detect_environment(bundle_path: Option<&Path>, cwd: &Path) -> DetectedEnv
 
     // Check for existing bundle
     if let Some(path) = bundle_path
-        && path.is_dir()
-        && path.join("manifest.json").exists()
+        && crate::load_bundle_manifest_json(path).is_ok()
     {
         env.existing_bundle = Some(path.to_path_buf());
         env.signals.push(DetectedSignal {
@@ -715,6 +714,46 @@ mod tests {
                 .iter()
                 .any(|signal| signal.detail.contains("Bundle found at")),
             "expected bundle-detected signal"
+        );
+    }
+
+    #[test]
+    fn detect_environment_ignores_bundle_with_invalid_manifest_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = dir.path().join("bundle");
+        std::fs::create_dir_all(&bundle).expect("create bundle dir");
+        std::fs::write(bundle.join("manifest.json"), "{not json").expect("write manifest");
+
+        let env = detect_environment(Some(&bundle), dir.path());
+        assert_eq!(env.existing_bundle, None);
+        assert!(
+            env.signals
+                .iter()
+                .all(|signal| !signal.detail.contains("Bundle found at")),
+            "invalid manifests should not count as existing bundles"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_environment_ignores_symlinked_bundle_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = dir.path().join("bundle");
+        std::fs::create_dir_all(&bundle).expect("create bundle dir");
+        std::fs::write(bundle.join("manifest.json"), "{}").expect("write manifest");
+
+        let linked = dir.path().join("linked-bundle");
+        symlink(&bundle, &linked).expect("symlink bundle");
+
+        let env = detect_environment(Some(&linked), dir.path());
+        assert_eq!(env.existing_bundle, None);
+        assert!(
+            env.signals
+                .iter()
+                .all(|signal| !signal.detail.contains("Bundle found at")),
+            "symlinked bundle roots should not count as existing bundles"
         );
     }
 

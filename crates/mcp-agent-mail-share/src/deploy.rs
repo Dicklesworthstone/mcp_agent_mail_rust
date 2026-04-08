@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use mcp_agent_mail_db::DbConn;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{ShareError, ShareResult};
@@ -1795,6 +1796,8 @@ fn validate_database_artifacts(
                 checks.extend(validate_chunk_artifacts(bundle_dir, None));
             }
         }
+    } else {
+        checks.extend(validate_unchunked_database_artifacts(bundle_dir, database));
     }
 
     checks
@@ -2018,6 +2021,9 @@ fn validate_chunk_artifacts(
     };
 
     if let (Some(expected_chunk_count), Some(checksum_map)) = (expected_chunk_count, checksum_map) {
+        let expected_chunk_paths = (0..expected_chunk_count)
+            .map(|index| format!("chunks/{index:05}.bin"))
+            .collect::<std::collections::BTreeSet<_>>();
         checks.push(DeployCheck {
             name: "database_chunk_count_matches_manifest".to_string(),
             passed: checksum_map.len() == expected_chunk_count,
@@ -2051,6 +2057,34 @@ fn validate_chunk_artifacts(
                 Err(err) => issues.push(format!("{rel} could not be hashed: {err}")),
             }
         }
+
+        let chunks_dir = bundle_dir.join("chunks");
+        if let Ok(entries) = std::fs::read_dir(&chunks_dir) {
+            for entry in entries {
+                match entry {
+                    Ok(entry) => {
+                        let rel = format!("chunks/{}", entry.file_name().to_string_lossy());
+                        match std::fs::symlink_metadata(entry.path()) {
+                            Ok(metadata) if metadata.file_type().is_file() => {
+                                if !expected_chunk_paths.contains(&rel) {
+                                    issues.push(format!("{rel} is unexpected"));
+                                }
+                            }
+                            Ok(metadata) if metadata.file_type().is_dir() => {
+                                issues.push(format!("{rel}/ is unexpected"));
+                            }
+                            Ok(_) => {
+                                issues.push(format!("{rel} is not a regular chunk file"));
+                            }
+                            Err(err) => {
+                                issues.push(format!("{rel} could not be inspected: {err}"));
+                            }
+                        }
+                    }
+                    Err(err) => issues.push(format!("cannot read chunks directory entry: {err}")),
+                }
+            }
+        }
         checks.push(DeployCheck {
             name: "database_chunk_artifacts_valid".to_string(),
             passed: issues.is_empty(),
@@ -2076,6 +2110,47 @@ fn validate_chunk_artifacts(
     }
 
     checks
+}
+
+fn validate_unchunked_database_artifacts(
+    bundle_dir: &Path,
+    database: Option<&Value>,
+) -> Vec<DeployCheck> {
+    let mut unexpected = Vec::new();
+
+    if database
+        .and_then(|value| value.get("chunk_manifest"))
+        .is_some_and(|value| !value.is_null())
+    {
+        unexpected.push("manifest database.chunk_manifest".to_string());
+    }
+
+    for (label, path) in [
+        ("chunks/", bundle_dir.join("chunks")),
+        ("chunks.sha256", bundle_dir.join("chunks.sha256")),
+        (
+            "mailbox.sqlite3.config.json",
+            bundle_dir.join("mailbox.sqlite3.config.json"),
+        ),
+    ] {
+        if bundle_path_exists(&path) {
+            unexpected.push(label.to_string());
+        }
+    }
+
+    vec![DeployCheck {
+        name: "database_chunk_artifacts_absent_for_unchunked_database".to_string(),
+        passed: unexpected.is_empty(),
+        message: if unexpected.is_empty() {
+            "unchunked database has no chunk manifests or chunk artifacts".to_string()
+        } else {
+            format!(
+                "manifest.json marks the database as unchunked but found unexpected chunk state: {}",
+                unexpected.join(", ")
+            )
+        },
+        severity: CheckSeverity::Error,
+    }]
 }
 
 fn parse_chunk_checksums(path: &Path) -> Result<BTreeMap<String, String>, String> {
@@ -2273,6 +2348,10 @@ fn is_real_file(path: &Path) -> bool {
 
 fn is_real_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+fn bundle_path_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
 }
 
 // ── Rollback guidance ──────────────────────────────────────────────────
@@ -3071,6 +3150,79 @@ mod tests {
     }
 
     #[test]
+    fn validate_bundle_rejects_stale_chunk_artifacts_for_unchunked_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        create_minimal_bundle(&bundle);
+
+        let db_path = bundle.join("mailbox.sqlite3");
+        create_test_agent_mail_sqlite_file(&db_path);
+        let db_sha = sha256_file_streaming(&db_path).unwrap();
+        let _chunk_manifest = crate::maybe_chunk_database(&db_path, &bundle, 1, 128)
+            .unwrap()
+            .unwrap();
+        write_manifest_with_database(&bundle, &db_sha, None);
+
+        let report = validate_bundle(&bundle).unwrap();
+        assert!(!report.ready);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "database_chunk_artifacts_absent_for_unchunked_database")
+            .expect("unchunked chunk-artifact check present");
+        assert!(!check.passed);
+        assert!(check.message.contains("chunks/"));
+        assert!(check.message.contains("chunks.sha256"));
+        assert!(check.message.contains("mailbox.sqlite3.config.json"));
+    }
+
+    #[test]
+    fn validate_bundle_rejects_manifest_chunk_metadata_for_unchunked_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        create_minimal_bundle(&bundle);
+
+        let db_path = bundle.join("mailbox.sqlite3");
+        create_test_agent_mail_sqlite_file(&db_path);
+        let db_sha = sha256_file_streaming(&db_path).unwrap();
+        let chunk_manifest = crate::ChunkManifest {
+            version: 1,
+            chunk_size: 128,
+            chunk_count: 2,
+            pattern: "chunks/{index:05d}.bin".to_string(),
+            original_bytes: 256,
+            threshold_bytes: 1,
+        };
+        let manifest = serde_json::json!({
+            "schema_version": "0.1.0",
+            "generated_at": "2024-01-01T00:00:00Z",
+            "database": {
+                "path": "mailbox.sqlite3",
+                "size_bytes": std::fs::metadata(&db_path).unwrap().len(),
+                "sha256": db_sha,
+                "chunked": false,
+                "chunk_manifest": chunk_manifest,
+                "fts_enabled": false,
+            }
+        });
+        std::fs::write(
+            bundle.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let report = validate_bundle(&bundle).unwrap();
+        assert!(!report.ready);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "database_chunk_artifacts_absent_for_unchunked_database")
+            .expect("unchunked chunk-artifact check present");
+        assert!(!check.passed);
+        assert!(check.message.contains("manifest database.chunk_manifest"));
+    }
+
+    #[test]
     fn validate_bundle_rejects_duplicate_chunk_checksum_entries() {
         let dir = tempfile::tempdir().unwrap();
         let bundle = dir.path().join("bundle");
@@ -3137,6 +3289,33 @@ mod tests {
                 .iter()
                 .any(|check| check.name == "database_chunk_checksums_valid" && !check.passed)
         );
+    }
+
+    #[test]
+    fn validate_bundle_rejects_unexpected_extra_chunk_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        create_minimal_bundle(&bundle);
+
+        let db_path = bundle.join("mailbox.sqlite3");
+        create_test_agent_mail_sqlite_file(&db_path);
+        let db_sha = sha256_file_streaming(&db_path).unwrap();
+        let chunk_manifest = crate::maybe_chunk_database(&db_path, &bundle, 1, 128)
+            .unwrap()
+            .unwrap();
+        write_manifest_with_database(&bundle, &db_sha, Some(&chunk_manifest));
+
+        std::fs::write(bundle.join("chunks/99999.bin"), b"stale-extra-chunk").unwrap();
+
+        let report = validate_bundle(&bundle).unwrap();
+        assert!(!report.ready);
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "database_chunk_artifacts_valid")
+            .expect("chunk artifacts check present");
+        assert!(!check.passed);
+        assert!(check.message.contains("chunks/99999.bin is unexpected"));
     }
 
     #[test]

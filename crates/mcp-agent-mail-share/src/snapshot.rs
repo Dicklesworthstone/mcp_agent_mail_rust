@@ -1010,4 +1010,146 @@ mod tests {
         assert!(verify.signature_checked);
         assert!(verify.signature_verified);
     }
+
+    #[test]
+    fn export_bundle_replaces_stale_owned_outputs_but_preserves_unrelated_files() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let source = dir.path().join("source.sqlite3");
+        let conn = DbConn::open_file(source.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at TEXT DEFAULT '')",
+        ).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, \
+             program TEXT DEFAULT '', model TEXT DEFAULT '', task_description TEXT DEFAULT '', \
+             inception_ts TEXT DEFAULT '', last_active_ts TEXT DEFAULT '', \
+             attachments_policy TEXT DEFAULT 'auto', contact_policy TEXT DEFAULT 'auto')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, \
+             thread_id TEXT, subject TEXT DEFAULT '', body_md TEXT DEFAULT '', \
+             importance TEXT DEFAULT 'normal', ack_required INTEGER DEFAULT 0, \
+             created_ts TEXT DEFAULT '', attachments TEXT DEFAULT '[]')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, \
+             kind TEXT DEFAULT 'to', read_ts TEXT, ack_ts TEXT, PRIMARY KEY(message_id, agent_id))",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE file_reservations (id INTEGER PRIMARY KEY, project_id INTEGER, \
+             agent_id INTEGER, path_pattern TEXT, exclusive INTEGER DEFAULT 1, \
+             reason TEXT DEFAULT '', created_ts TEXT DEFAULT '', expires_ts TEXT DEFAULT '', \
+             released_ts TEXT)",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE agent_links (id INTEGER PRIMARY KEY, a_project_id INTEGER, \
+             a_agent_id INTEGER, b_project_id INTEGER, b_agent_id INTEGER, \
+             status TEXT DEFAULT 'pending', reason TEXT DEFAULT '', \
+             created_ts TEXT DEFAULT '', updated_ts TEXT DEFAULT '', expires_ts TEXT)",
+        )
+        .unwrap();
+        conn.execute_raw("INSERT INTO projects VALUES (1, 'myproj', '/test/proj', '')")
+            .unwrap();
+        conn.execute_raw(
+            "INSERT INTO agents VALUES (1, 1, 'Alice', 'claude-code', 'opus', 'testing', '', '', 'auto', 'auto')",
+        ).unwrap();
+        conn.execute_raw(
+            "INSERT INTO messages VALUES (1, 1, 1, 'T1', 'Hello', 'Body text', \
+             'normal', 0, '2026-01-01', '[{\"type\":\"file\",\"path\":\"test.txt\",\"media_type\":\"text/plain\"}]')",
+        ).unwrap();
+        conn.execute_raw("INSERT INTO message_recipients VALUES (1, 1, 'to', NULL, NULL)")
+            .unwrap();
+        drop(conn);
+
+        let storage = dir.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        std::fs::write(storage.join("test.txt"), b"attachment content").unwrap();
+
+        let snapshot = dir.path().join("snapshot.sqlite3");
+        let context =
+            create_snapshot_context(&source, &snapshot, &[], crate::ScrubPreset::Archive).unwrap();
+
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(output.join("viewer/data")).unwrap();
+        std::fs::create_dir_all(output.join("viewer/pages/messages")).unwrap();
+        std::fs::create_dir_all(output.join("attachments")).unwrap();
+        std::fs::create_dir_all(output.join("chunks")).unwrap();
+        std::fs::write(output.join("viewer/obsolete.js"), "stale viewer asset").unwrap();
+        std::fs::write(
+            output.join("viewer/data/redaction_audit.json"),
+            "{\"stale\":true}",
+        )
+        .unwrap();
+        std::fs::write(
+            output.join("viewer/pages/messages/999.html"),
+            "<html>stale page</html>",
+        )
+        .unwrap();
+        std::fs::write(output.join("attachments/stale.bin"), "stale attachment").unwrap();
+        std::fs::write(output.join("chunks/00000.bin"), "stale chunk").unwrap();
+        std::fs::write(output.join("chunks.sha256"), "stale checksum").unwrap();
+        std::fs::write(
+            output.join("mailbox.sqlite3.config.json"),
+            "{\"stale\":true}",
+        )
+        .unwrap();
+        std::fs::write(output.join("manifest.sig.json"), "{\"stale\":true}").unwrap();
+        std::fs::write(output.join("mailbox.sqlite3-wal"), "stale wal").unwrap();
+        std::fs::write(output.join("mailbox.sqlite3-shm"), "stale shm").unwrap();
+        std::fs::write(output.join("keep.txt"), "preserve me").unwrap();
+
+        let export = crate::export_bundle_from_snapshot_context(
+            &context,
+            &output,
+            &storage,
+            &crate::BundleExportConfig {
+                allow_absolute_attachment_paths: true,
+                inline_attachment_threshold: 1,
+                detach_attachment_threshold: 1024,
+                chunk_threshold: usize::MAX,
+                ..crate::BundleExportConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert!(export.chunk_manifest.is_none());
+        assert!(output.join("viewer/index.html").exists());
+        assert!(output.join("viewer/data/messages.json").exists());
+        assert!(output.join("viewer/pages/messages/1.html").exists());
+        assert!(output.join("attachments").exists());
+        assert!(
+            !output.join("viewer/obsolete.js").exists(),
+            "stale viewer assets must be removed"
+        );
+        assert!(
+            !output.join("viewer/data/redaction_audit.json").exists(),
+            "stale optional data files must be removed when not regenerated"
+        );
+        assert!(
+            !output.join("viewer/pages/messages/999.html").exists(),
+            "stale rendered pages must be removed"
+        );
+        assert!(
+            !output.join("attachments/stale.bin").exists(),
+            "stale attachment files must be removed"
+        );
+        assert!(
+            !output.join("chunks").exists(),
+            "stale chunk directories must be removed when chunking is disabled"
+        );
+        assert!(!output.join("chunks.sha256").exists());
+        assert!(!output.join("mailbox.sqlite3.config.json").exists());
+        assert!(!output.join("manifest.sig.json").exists());
+        assert!(!output.join("mailbox.sqlite3-wal").exists());
+        assert!(!output.join("mailbox.sqlite3-shm").exists());
+        assert_eq!(
+            std::fs::read_to_string(output.join("keep.txt")).unwrap(),
+            "preserve me"
+        );
+    }
 }
