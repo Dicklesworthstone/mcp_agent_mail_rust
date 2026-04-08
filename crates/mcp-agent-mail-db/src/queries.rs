@@ -5532,11 +5532,12 @@ pub async fn fetch_inbox_global(
         "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
                 m.importance, m.ack_required, m.created_ts, m.recipients_json, \
                 m.attachments, \
-                r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') as sender_name, r.ack_ts, p.slug as project_slug \
+                r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') as sender_name, r.ack_ts, \
+                COALESCE(NULLIF(TRIM(p.slug), ''), '[unknown-project-' || m.project_id || ']') as project_slug \
          FROM message_recipients r \
          JOIN messages m ON m.id = r.message_id \
          LEFT JOIN agents s ON s.id = m.sender_id \
-         JOIN projects p ON p.id = m.project_id \
+         LEFT JOIN projects p ON p.id = m.project_id \
          WHERE r.agent_id IN (SELECT id FROM agents WHERE name = ? COLLATE NOCASE)"
     );
 
@@ -5632,13 +5633,15 @@ pub async fn count_unread_global(
 
     let tracked = tracked(&*conn);
 
-    let sql = "SELECT p.id as project_id, p.slug as project_slug, COUNT(*) as unread_count \
+    let sql = "SELECT m.project_id as project_id, \
+               COALESCE(NULLIF(TRIM(p.slug), ''), '[unknown-project-' || m.project_id || ']') as project_slug, \
+               COUNT(*) as unread_count \
                FROM message_recipients r \
                JOIN messages m ON m.id = r.message_id \
-               JOIN projects p ON p.id = m.project_id \
+               LEFT JOIN projects p ON p.id = m.project_id \
                WHERE r.agent_id IN (SELECT id FROM agents WHERE name = ? COLLATE NOCASE) \
                AND r.read_ts IS NULL \
-               GROUP BY p.id, p.slug \
+               GROUP BY m.project_id, project_slug \
                ORDER BY unread_count DESC";
 
     let params = [Value::Text(agent_name.to_string())];
@@ -5780,10 +5783,10 @@ async fn run_like_fallback_global(
     let sql = format!(
         "SELECT m.id, m.sender_id, m.subject, m.importance, m.ack_required, m.created_ts, \
                 m.thread_id, COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') as from_name, m.body_md, \
-                m.project_id, p.slug as project_slug \
+                m.project_id, COALESCE(NULLIF(TRIM(p.slug), ''), '[unknown-project-' || m.project_id || ']') as project_slug \
          FROM messages m \
          LEFT JOIN agents a ON a.id = m.sender_id \
-         JOIN projects p ON p.id = m.project_id \
+         LEFT JOIN projects p ON p.id = m.project_id \
          WHERE {} \
          ORDER BY m.created_ts DESC \
          LIMIT ?",
@@ -16671,6 +16674,97 @@ mod tests {
     }
 
     #[test]
+    fn fetch_inbox_global_keeps_orphaned_project_rows_visible() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, dir) = setup_test_pool("global_inbox_orphaned_project.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-global-inbox-orphaned-project-{base}"),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("sender"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let recipient = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.expect("sender id"),
+                "Global inbox survives project drift",
+                "Body",
+                Some("global-inbox-orphaned-project-thread"),
+                "normal",
+                false,
+                "[]",
+                &[(recipient.id.expect("recipient id"), "to")],
+            )
+            .await
+            .into_result()
+            .expect("create message");
+
+            let db_path = dir.path().join("global_inbox_orphaned_project.db");
+            let repair_conn = crate::DbConn::open_file(db_path.display().to_string())
+                .expect("open direct project cleanup connection");
+            repair_conn
+                .execute_sync(
+                    "DELETE FROM projects WHERE id = ?",
+                    &[Value::BigInt(project_id)],
+                )
+                .expect("orphan project row");
+
+            let rows = fetch_inbox_global(&cx, &pool, "BlueLake", false, None, 25)
+                .await
+                .into_result()
+                .expect("fetch global inbox");
+
+            let row = rows
+                .iter()
+                .find(|row| row.message.subject == "Global inbox survives project drift")
+                .expect("find orphaned-project global inbox row");
+            assert_eq!(row.project_id, project_id);
+            assert_eq!(row.project_slug, format!("[unknown-project-{project_id}]"));
+        });
+    }
+
+    #[test]
     fn fetch_unacked_for_agent_keeps_orphaned_sender_rows_visible() {
         use asupersync::runtime::RuntimeBuilder;
 
@@ -17186,6 +17280,98 @@ mod tests {
     }
 
     #[test]
+    fn count_unread_global_keeps_orphaned_project_rows_visible() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, dir) = setup_test_pool("global_unread_orphaned_project.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-unread-orphaned-project-{base}"),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let recipient = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.expect("sender id"),
+                "Unread count survives project drift",
+                "Body",
+                Some("global-unread-orphaned-project-thread"),
+                "high",
+                false,
+                "[]",
+                &[(recipient.id.expect("recipient id"), "to")],
+            )
+            .await
+            .into_result()
+            .expect("create message");
+
+            let db_path = dir.path().join("global_unread_orphaned_project.db");
+            let repair_conn = crate::DbConn::open_file(db_path.display().to_string())
+                .expect("open direct project cleanup connection");
+            repair_conn
+                .execute_sync(
+                    "DELETE FROM projects WHERE id = ?",
+                    &[Value::BigInt(project_id)],
+                )
+                .expect("orphan project row");
+
+            let counts = count_unread_global(&cx, &pool, "BlueLake")
+                .await
+                .into_result()
+                .expect("count unread global");
+
+            assert_eq!(counts.len(), 1);
+            assert_eq!(counts[0].project_id, project_id);
+            assert_eq!(
+                counts[0].project_slug,
+                format!("[unknown-project-{project_id}]")
+            );
+            assert_eq!(counts[0].unread_count, 1);
+        });
+    }
+
+    #[test]
     fn search_messages_global_empty_corpus_returns_empty() {
         use asupersync::runtime::RuntimeBuilder;
         use tempfile::tempdir;
@@ -17345,6 +17531,82 @@ mod tests {
                 .expect("find orphaned global search row");
             assert_eq!(row.from, UNKNOWN_SENDER_DISPLAY);
             assert_eq!(row.project_id, project_id);
+        });
+    }
+
+    #[test]
+    fn search_messages_global_keeps_orphaned_project_rows_visible() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, dir) = setup_test_pool("global_search_orphaned_project.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-global-search-orphaned-project-{base}"),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "e2e-test",
+                "test-model",
+                Some("orphaned global search project sender"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create sender");
+
+            create_message(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.expect("sender id"),
+                "needle global project subject",
+                "needle global project body",
+                Some("THREAD-ORPHANED-GLOBAL-PROJECT-SEARCH"),
+                "normal",
+                false,
+                "[]",
+            )
+            .await
+            .into_result()
+            .expect("create message");
+
+            let db_path = dir.path().join("global_search_orphaned_project.db");
+            let repair_conn = crate::DbConn::open_file(db_path.display().to_string())
+                .expect("open direct project cleanup connection");
+            repair_conn
+                .execute_sync(
+                    "DELETE FROM projects WHERE id = ?",
+                    &[Value::BigInt(project_id)],
+                )
+                .expect("orphan project row");
+
+            let rows = search_messages_global(&cx, &pool, "needle", 25)
+                .await
+                .into_result()
+                .expect("search global");
+
+            let row = rows
+                .iter()
+                .find(|row| row.subject == "needle global project subject")
+                .expect("find orphaned-project global search row");
+            assert_eq!(row.project_id, project_id);
+            assert_eq!(row.project_slug, format!("[unknown-project-{project_id}]"));
+            assert_eq!(row.from, "BlueLake");
         });
     }
 

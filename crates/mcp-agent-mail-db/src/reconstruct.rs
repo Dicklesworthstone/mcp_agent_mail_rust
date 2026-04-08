@@ -3709,10 +3709,14 @@ mod tests {
             .unwrap();
         conn.execute_raw("INSERT INTO agents (id, project_id, name) VALUES (2, 1, '   ')")
             .unwrap();
-        conn.execute_raw("INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (1, 1, 'to')")
-            .unwrap();
-        conn.execute_raw("INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (1, 2, 'cc')")
-            .unwrap();
+        conn.execute_raw(
+            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (1, 1, 'to')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (1, 2, 'cc')",
+        )
+        .unwrap();
 
         sync_reconstructed_message_recipients_json(&conn, 1).expect("sync recipients_json");
 
