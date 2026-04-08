@@ -1678,7 +1678,8 @@ fn sync_reconstructed_message_recipients_json(conn: &DbConn, message_id: i64) ->
              JOIN agents a ON a.id = mr.agent_id \
              WHERE mr.message_id = ? \
              ORDER BY CASE mr.kind WHEN 'to' THEN 0 WHEN 'cc' THEN 1 WHEN 'bcc' THEN 2 ELSE 3 END, \
-                      a.name COLLATE NOCASE",
+                     TRIM(a.name) COLLATE NOCASE, \
+                     a.name COLLATE NOCASE",
             &[Value::BigInt(message_id)],
         )
         .map_err(|e| {
@@ -1692,11 +1693,14 @@ fn sync_reconstructed_message_recipients_json(conn: &DbConn, message_id: i64) ->
     let mut bcc_names = Vec::new();
 
     for row in rows {
-        let name = row.get_named::<String>("name").map_err(|e| {
+        let raw_name = row.get_named::<String>("name").map_err(|e| {
             DbError::Sqlite(format!(
                 "reconstruct salvage: decode recipient name for message {message_id}: {e}"
             ))
         })?;
+        let Some(name) = normalized_archive_agent_name(Some(raw_name.as_str())) else {
+            continue;
+        };
         let kind = row.get_named::<String>("kind").map_err(|e| {
             DbError::Sqlite(format!(
                 "reconstruct salvage: decode recipient kind for message {message_id}: {e}"
@@ -3681,6 +3685,49 @@ mod tests {
         );
         assert_eq!(normalized_archive_agent_name(Some("   ")), None);
         assert_eq!(normalized_archive_agent_name(None), None);
+    }
+
+    #[test]
+    fn sync_reconstructed_message_recipients_json_trims_and_drops_blank_names() {
+        let conn = SqliteDbConn::open_memory().expect("open in-memory db");
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, recipients_json TEXT NOT NULL DEFAULT '{}')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts INTEGER, ack_ts INTEGER)",
+        )
+        .unwrap();
+
+        conn.execute_raw("INSERT INTO messages (id, recipients_json) VALUES (1, '{}')")
+            .unwrap();
+        conn.execute_raw("INSERT INTO agents (id, project_id, name) VALUES (1, 1, '  Bob  ')")
+            .unwrap();
+        conn.execute_raw("INSERT INTO agents (id, project_id, name) VALUES (2, 1, '   ')")
+            .unwrap();
+        conn.execute_raw("INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (1, 1, 'to')")
+            .unwrap();
+        conn.execute_raw("INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (1, 2, 'cc')")
+            .unwrap();
+
+        sync_reconstructed_message_recipients_json(&conn, 1).expect("sync recipients_json");
+
+        let rows = conn
+            .query_sync("SELECT recipients_json FROM messages WHERE id = 1", &[])
+            .unwrap();
+        let recipients_json: String = rows[0].get_named("recipients_json").unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recipients_json).unwrap(),
+            serde_json::json!({
+                "to": ["Bob"],
+                "cc": [],
+                "bcc": [],
+            })
+        );
     }
 
     #[test]
