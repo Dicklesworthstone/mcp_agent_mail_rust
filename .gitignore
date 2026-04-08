@@ -283,3 +283,8 @@ release-artifacts/
 
 # Codex temp directory
 .codex-tmp/
+
+# Ephemeral test/runtime artifacts
+storage.sqlite3.activity.lock
+test_bug
+test_dotenv
