@@ -1435,6 +1435,7 @@ mod route_hardening_tests {
 mod auth_route_hardening_regression_suite {
     use super::*;
     use asupersync::Outcome;
+    use mcp_agent_mail_db::sqlmodel_core::Value;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn outcome_ok<T>(outcome: Outcome<T, mcp_agent_mail_db::DbError>) -> T {
@@ -1611,7 +1612,7 @@ mod auth_route_hardening_regression_suite {
         };
         conn.execute_sync(
             "DELETE FROM projects WHERE id = ?",
-            &[sqlmodel_core::Value::BigInt(project_id)],
+            &[Value::BigInt(project_id)],
         )
         .expect("orphan project row");
         drop(conn);
@@ -1662,7 +1663,7 @@ mod auth_route_hardening_regression_suite {
         };
         conn.execute_sync(
             "DELETE FROM projects WHERE id = ?",
-            &[sqlmodel_core::Value::BigInt(placeholder_id)],
+            &[Value::BigInt(placeholder_id)],
         )
         .expect("orphan placeholder project");
         drop(conn);
@@ -1710,7 +1711,7 @@ mod auth_route_hardening_regression_suite {
         };
         conn.execute_sync(
             "DELETE FROM projects WHERE id = ?",
-            &[sqlmodel_core::Value::BigInt(placeholder_id)],
+            &[Value::BigInt(placeholder_id)],
         )
         .expect("orphan placeholder project");
         drop(conn);
