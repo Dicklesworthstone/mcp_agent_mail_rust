@@ -11991,7 +11991,7 @@ first body
 
         let mut config = mcp_agent_mail_core::Config::default();
         config.database_url = format!("sqlite:///{}", db_path.display());
-        config.storage_root = storage_root.clone();
+        config.storage_root = storage_root;
         config.integrity_check_on_startup = false;
 
         let error = readiness_check_quick(&config)
@@ -20396,7 +20396,7 @@ first body
             .expect("tmpdir override utf-8")
             .to_string();
         let database_url = format!("sqlite:///{}", db_path.display());
-        let err = match mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        let Err(err) = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
             &[("TMPDIR", tmpdir.as_str())],
             || {
                 open_observability_sync_db_connection(
@@ -20405,9 +20405,8 @@ first body
                     "observability snapshot failure test",
                 )
             },
-        ) {
-            Ok(_) => panic!("snapshot setup failure should be surfaced"),
-            Err(err) => err,
+        ) else {
+            panic!("snapshot setup failure should be surfaced");
         };
 
         assert!(

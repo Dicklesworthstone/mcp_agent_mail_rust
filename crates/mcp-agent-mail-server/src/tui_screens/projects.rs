@@ -65,10 +65,10 @@ fn assert_projects_list_cardinality(total_db_projects: u64, rendered_count: usiz
     }
 }
 
-fn unique_previous_project_row<'a, F>(
-    previous_rows: &'a [ProjectSummary],
+fn unique_previous_project_row<F>(
+    previous_rows: &[ProjectSummary],
     mut predicate: F,
-) -> Option<&'a ProjectSummary>
+) -> Option<&ProjectSummary>
 where
     F: FnMut(&ProjectSummary) -> bool,
 {
@@ -340,7 +340,7 @@ impl ProjectsScreen {
             {
                 // Keep the last good project roster instead of publishing a false-empty
                 // screen when the richer sqlite recovery path is temporarily unavailable.
-                rows = previous_rows.clone();
+                rows = previous_rows;
             }
         }
 
@@ -543,15 +543,11 @@ impl MailScreen for ProjectsScreen {
             match key.code {
                 KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
                 KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-                KeyCode::Char('G') | KeyCode::End => {
-                    if !self.projects.is_empty() {
-                        self.table_state.selected = Some(self.projects.len() - 1);
-                    }
+                KeyCode::Char('G') | KeyCode::End if !self.projects.is_empty() => {
+                    self.table_state.selected = Some(self.projects.len() - 1);
                 }
-                KeyCode::Char('g') | KeyCode::Home => {
-                    if !self.projects.is_empty() {
-                        self.table_state.selected = Some(0);
-                    }
+                KeyCode::Char('g') | KeyCode::Home if !self.projects.is_empty() => {
+                    self.table_state.selected = Some(0);
                 }
                 KeyCode::Char('/') => {
                     self.filter_active = true;
@@ -575,11 +571,9 @@ impl MailScreen for ProjectsScreen {
                 KeyCode::Char('K') => {
                     self.detail_scroll = self.detail_scroll.saturating_sub(1);
                 }
-                KeyCode::Escape => {
-                    if !self.filter.is_empty() {
-                        self.filter.clear();
-                        self.rebuild_from_state(state);
-                    }
+                KeyCode::Escape if !self.filter.is_empty() => {
+                    self.filter.clear();
+                    self.rebuild_from_state(state);
                 }
                 _ => {}
             }

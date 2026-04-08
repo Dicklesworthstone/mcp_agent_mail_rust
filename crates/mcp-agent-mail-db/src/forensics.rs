@@ -64,6 +64,13 @@ struct FileIdentity {
     minor: u32,
 }
 
+#[cfg(target_os = "linux")]
+fn linux_device_numbers(dev: u64) -> (u32, u32) {
+    let major = u32::try_from((dev >> 8) & 0xfff).unwrap_or(u32::MAX);
+    let minor = u32::try_from((dev & 0xff) | ((dev >> 12) & 0xfff00)).unwrap_or(u32::MAX);
+    (major, minor)
+}
+
 // ============================================================================
 // Pre-recovery snapshot
 // ============================================================================
@@ -164,9 +171,8 @@ pub fn capture_pre_recovery_snapshot(db_path: &Path, trigger: &str) -> ForensicP
     let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
     let wal_bytes = std::fs::metadata(&wal_path).ok().map(|m| m.len());
     let shm_bytes = std::fs::metadata(&shm_path).ok().map(|m| m.len());
-    let (page_size, page_count) = read_sqlite_header_fields(db_path)
-        .map(|(ps, pc)| (Some(ps), Some(pc)))
-        .unwrap_or((None, None));
+    let (page_size, page_count) =
+        read_sqlite_header_fields(db_path).map_or((None, None), |(ps, pc)| (Some(ps), Some(pc)));
 
     let family_paths: Vec<(&str, PathBuf)> = vec![
         ("db", db_path.to_path_buf()),
@@ -379,13 +385,15 @@ fn build_archive_drift_reference(capture: MailboxForensicCapture<'_>) -> serde_j
             let labels =
                 archive_missing_project_identities(&archive, &inventory.project_identities);
             let mut reasons = Vec::new();
+            let archive_message_count = archive.unique_message_ids;
+            let db_message_count = inventory.messages;
             if archive.projects > inventory.projects {
                 reasons.push("archive_projects_ahead".to_string());
             }
             if archive.agents > inventory.agents {
                 reasons.push("archive_agents_ahead".to_string());
             }
-            if archive.unique_message_ids > inventory.messages {
+            if archive_message_count > db_message_count {
                 reasons.push("archive_messages_ahead".to_string());
             }
             if archive.latest_message_id.unwrap_or(0) > inventory.max_message_id {
@@ -520,8 +528,7 @@ fn build_live_db_reference(capture: MailboxForensicCapture<'_>) -> serde_json::V
 fn file_identity(path: &Path) -> Option<FileIdentity> {
     let metadata = std::fs::metadata(path).ok()?;
     let dev = metadata.dev();
-    let major = ((dev >> 8) & 0xfff) as u32;
-    let minor = ((dev & 0xff) | ((dev >> 12) & 0xfff00)) as u32;
+    let (major, minor) = linux_device_numbers(dev);
     Some(FileIdentity {
         dev,
         ino: metadata.ino(),
@@ -565,11 +572,12 @@ fn process_holders_for_paths(paths: &[(&str, PathBuf)]) -> Vec<ForensicProcessHo
             let Ok(target_meta) = std::fs::metadata(&target) else {
                 continue;
             };
+            let (major, minor) = linux_device_numbers(target_meta.dev());
             let target_identity = FileIdentity {
                 dev: target_meta.dev(),
                 ino: target_meta.ino(),
-                major: ((target_meta.dev() >> 8) & 0xfff) as u32,
-                minor: ((target_meta.dev() & 0xff) | ((target_meta.dev() >> 12) & 0xfff00)) as u32,
+                major,
+                minor,
             };
             for (role, identity) in &identities {
                 if target_identity.dev == identity.dev && target_identity.ino == identity.ino {

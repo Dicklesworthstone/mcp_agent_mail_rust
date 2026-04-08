@@ -482,7 +482,7 @@ pub mod tool_util {
         }
     }
 
-    /// Check whether the live SQLite database is suspect (DegradedReadOnly or
+    /// Check whether the live `SQLite` database is suspect (`DegradedReadOnly` or
     /// worse) according to a fast mailbox verdict. Returns `true` when read
     /// surfaces should fall back to archive snapshots instead of the
     /// potentially corrupt live file.

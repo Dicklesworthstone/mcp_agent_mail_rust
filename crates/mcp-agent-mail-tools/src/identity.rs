@@ -21,7 +21,7 @@ use crate::tool_util::{
     legacy_tool_error, resolve_project,
 };
 
-/// Build recovery status for the health_check response.
+/// Build recovery status for the `health_check` response.
 ///
 /// Returns `Some(RecoveryStatusResponse)` when the mailbox is not fully healthy,
 /// so operators immediately see the current mode, owner, next action, and bundle path.
@@ -62,27 +62,18 @@ fn build_recovery_status(config: &Config) -> Option<RecoveryStatusResponse> {
 
     let owner = match ownership.disposition {
         MailboxOwnershipDisposition::Unowned => "none".to_string(),
-        MailboxOwnershipDisposition::ActiveOtherOwner => {
-            if let Some(proc) = ownership.processes.first() {
-                format!("pid {} (active)", proc.pid)
-            } else {
-                "active (unknown pid)".to_string()
-            }
-        }
-        MailboxOwnershipDisposition::StaleLiveProcess => {
-            if let Some(proc) = ownership.processes.first() {
-                format!("pid {} (stale)", proc.pid)
-            } else {
-                "stale (unknown pid)".to_string()
-            }
-        }
-        MailboxOwnershipDisposition::DeletedExecutable => {
-            if let Some(proc) = ownership.processes.first() {
-                format!("pid {} (deleted executable)", proc.pid)
-            } else {
-                "deleted executable".to_string()
-            }
-        }
+        MailboxOwnershipDisposition::ActiveOtherOwner => ownership.processes.first().map_or_else(
+            || "active (unknown pid)".to_string(),
+            |proc| format!("pid {} (active)", proc.pid),
+        ),
+        MailboxOwnershipDisposition::StaleLiveProcess => ownership.processes.first().map_or_else(
+            || "stale (unknown pid)".to_string(),
+            |proc| format!("pid {} (stale)", proc.pid),
+        ),
+        MailboxOwnershipDisposition::DeletedExecutable => ownership.processes.first().map_or_else(
+            || "deleted executable".to_string(),
+            |proc| format!("pid {} (deleted executable)", proc.pid),
+        ),
         MailboxOwnershipDisposition::SplitBrain => format!(
             "split-brain ({} competing pids)",
             ownership.competing_pids.len()
@@ -99,13 +90,10 @@ fn build_recovery_status(config: &Config) -> Option<RecoveryStatusResponse> {
                 "Run `am doctor repair` to attempt automatic recovery".to_string()
             }
         }
-        DurabilityState::Recovering => {
-            if let Some(pid) = recovery_lock.pid {
-                format!("Recovery active (pid {pid}); wait for completion or investigate stall")
-            } else {
-                "Recovery lock held but PID unknown; check for stale lock files".to_string()
-            }
-        }
+        DurabilityState::Recovering => recovery_lock.pid.map_or_else(
+            || "Recovery lock held but PID unknown; check for stale lock files".to_string(),
+            |pid| format!("Recovery active (pid {pid}); wait for completion or investigate stall"),
+        ),
         DurabilityState::Corrupt => {
             "Run `am doctor repair --yes` or restore from archive backup".to_string()
         }
@@ -526,10 +514,10 @@ pub struct HealthCheckResponse {
     pub recovery: Option<RecoveryStatusResponse>,
 }
 
-/// Active recovery state surfaced in health_check when the mailbox is degraded or recovering.
+/// Active recovery state surfaced in `health_check` when the mailbox is degraded or recovering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryStatusResponse {
-    /// Current durability mode: "healthy", "degraded_read_only", "recovering", or "corrupt".
+    /// Current durability mode: "healthy", "`degraded_read_only`", "recovering", or "corrupt".
     pub mode: String,
     /// Mailbox ownership disposition: who holds the lock.
     pub owner: String,
@@ -909,10 +897,8 @@ Check that all parameters have valid values."
     }
 
     let base_config = Config::get();
-    let config = match maybe_reroute_ephemeral_storage(&base_config, &human_key) {
-        Some(rerouted) => rerouted,
-        None => base_config,
-    };
+    let config = maybe_reroute_ephemeral_storage(&base_config, &human_key)
+        .map_or(base_config, |rerouted| rerouted);
     let config = &config;
     let pool = get_db_pool()?;
 

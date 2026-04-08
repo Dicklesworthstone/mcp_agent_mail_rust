@@ -190,15 +190,16 @@ impl AnalyticsScreen {
     #[must_use]
     pub fn new() -> Self {
         let mut feed = quick_insight_feed();
-        let mut feed_source = AnalyticsFeedSource::Quick;
-        if feed.cards.is_empty() {
+        let feed_source = if feed.cards.is_empty() {
             feed = InsightFeed {
                 cards: vec![build_bootstrap_card()],
                 alerts_processed: 0,
                 cards_produced: 1,
             };
-            feed_source = AnalyticsFeedSource::Bootstrap;
-        }
+            AnalyticsFeedSource::Bootstrap
+        } else {
+            AnalyticsFeedSource::Quick
+        };
         let this = Self {
             feed,
             feed_source,
@@ -238,10 +239,7 @@ impl AnalyticsScreen {
         runtime_preserved_previous: bool,
     ) {
         let quick = quick_insight_feed();
-        if !quick.cards.is_empty() {
-            self.feed = quick;
-            self.feed_source = AnalyticsFeedSource::Quick;
-        } else {
+        if quick.cards.is_empty() {
             let persisted = build_persisted_insight_feed(state);
             if !persisted.cards.is_empty() {
                 self.feed = persisted;
@@ -258,6 +256,9 @@ impl AnalyticsScreen {
             } else {
                 self.set_bootstrap_feed();
             }
+        } else {
+            self.feed = quick;
+            self.feed_source = AnalyticsFeedSource::Quick;
         }
         if self.feed.cards.is_empty() {
             self.set_bootstrap_feed();

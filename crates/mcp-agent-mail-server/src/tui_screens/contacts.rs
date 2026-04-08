@@ -454,15 +454,11 @@ impl ContactsScreen {
                     self.move_selection(-1);
                 }
             }
-            KeyCode::Left => {
-                if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
-                    self.move_graph_selection(-1);
-                }
+            KeyCode::Left if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel => {
+                self.move_graph_selection(-1);
             }
-            KeyCode::Right => {
-                if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {
-                    self.move_graph_selection(1);
-                }
+            KeyCode::Right if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel => {
+                self.move_graph_selection(1);
             }
             KeyCode::Char('G') | KeyCode::End => {
                 if self.view_mode == ViewMode::Graph && !self.show_mermaid_panel {

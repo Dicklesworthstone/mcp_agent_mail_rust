@@ -2309,13 +2309,12 @@ fn build_recovery_status_for_robot() -> Option<RecoveryStatus> {
     let mut stall_detected = false;
     let mut stall_reasons: Vec<&str> = Vec::new();
 
-    if recovery_lock.active {
-        if let Some(age) = elapsed_secs {
-            if age >= RECOVERY_STALL_THRESHOLD_SECS {
-                stall_detected = true;
-                stall_reasons.push("recovery lock held beyond stall threshold");
-            }
-        }
+    if recovery_lock.active
+        && let Some(age) = elapsed_secs
+        && age >= RECOVERY_STALL_THRESHOLD_SECS
+    {
+        stall_detected = true;
+        stall_reasons.push("recovery lock held beyond stall threshold");
     }
     if adm.suppressed {
         stall_detected = true;

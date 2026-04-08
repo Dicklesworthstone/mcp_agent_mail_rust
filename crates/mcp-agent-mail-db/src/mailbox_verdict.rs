@@ -901,14 +901,18 @@ fn probe_db_file_exists(db_path: &Path) -> ProbeResult {
 
 /// Probe: DB file passes quick_check.
 fn probe_db_file_sanity(db_path: &Path) -> ProbeResult {
+    fn probe_duration_micros(start: std::time::Instant) -> u64 {
+        u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
+
     let start = std::time::Instant::now();
     match sqlite_file_is_healthy(db_path) {
         Ok(true) => ProbeResult::ok("db_sanity", "SQLite quick_check passed")
-            .with_duration(start.elapsed().as_micros() as u64),
+            .with_duration(probe_duration_micros(start)),
         Ok(false) => ProbeResult::error("db_sanity", "SQLite quick_check failed")
-            .with_duration(start.elapsed().as_micros() as u64),
+            .with_duration(probe_duration_micros(start)),
         Err(e) => ProbeResult::error("db_sanity", format!("Cannot run quick_check: {e}"))
-            .with_duration(start.elapsed().as_micros() as u64),
+            .with_duration(probe_duration_micros(start)),
     }
 }
 
@@ -1028,14 +1032,23 @@ fn inspect_archive_drift(db_path: &Path, archive_root: &Path) -> MailboxArchiveD
     };
     let missing_projects =
         archive_missing_project_identities(&archive_inventory, &db_inventory.project_identities);
-    let archive_ahead = archive_inventory.projects > db_inventory.projects
-        || archive_inventory.agents > db_inventory.agents
-        || archive_inventory.unique_message_ids > db_inventory.messages
-        || archive_inventory.latest_message_id.unwrap_or(0) > db_inventory.max_message_id
-        || !missing_projects.is_empty();
-    let db_ahead = db_inventory.projects > archive_inventory.projects
-        || db_inventory.agents > archive_inventory.agents
-        || db_inventory.messages > archive_inventory.unique_message_ids;
+    let archive_projects_ahead = archive_inventory.projects > db_inventory.projects;
+    let archive_agents_ahead = archive_inventory.agents > db_inventory.agents;
+    let archive_message_count = archive_inventory.unique_message_ids;
+    let db_message_count = db_inventory.messages;
+    let archive_messages_ahead = archive_message_count > db_message_count;
+    let archive_latest_id_ahead =
+        archive_inventory.latest_message_id.unwrap_or(0) > db_inventory.max_message_id;
+    let archive_identity_ahead = !missing_projects.is_empty();
+    let archive_ahead = archive_projects_ahead
+        || archive_agents_ahead
+        || archive_messages_ahead
+        || archive_latest_id_ahead
+        || archive_identity_ahead;
+    let db_projects_ahead = db_inventory.projects > archive_inventory.projects;
+    let db_agents_ahead = db_inventory.agents > archive_inventory.agents;
+    let db_messages_ahead = db_message_count > archive_message_count;
+    let db_ahead = db_projects_ahead || db_agents_ahead || db_messages_ahead;
     let state = if archive_inventory.projects == 0
         && archive_inventory.agents == 0
         && archive_inventory.unique_message_ids == 0
@@ -1187,8 +1200,7 @@ fn probe_schema_populated(db_path: &Path, archive_count: usize) -> ProbeResult {
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'",
             &[],
         )
-        .map(|rows| !rows.is_empty())
-        .unwrap_or(false);
+        .is_ok_and(|rows| !rows.is_empty());
 
     match (table_count, archive_count, has_messages_table) {
         (0, 0, _) => ProbeResult::ok(
@@ -1426,7 +1438,7 @@ impl DurabilityTestArtifact {
         self.mailbox_state_before = verdict.state;
         self.durability_state_before = DurabilityState::from_mailbox_state(verdict.state);
         self.owner_disposition_before = Some(verdict.ownership.disposition);
-        self.probes_before = verdict.probes.clone();
+        self.probes_before.clone_from(&verdict.probes);
     }
 
     /// Record the "after" snapshot from a health verdict.
@@ -1435,7 +1447,7 @@ impl DurabilityTestArtifact {
         self.durability_state_after = DurabilityState::from_mailbox_state(verdict.state);
         self.owner_disposition_after = Some(verdict.ownership.disposition);
         self.archive_drift_after = Some(verdict.archive_drift.state);
-        self.probes_after = verdict.probes.clone();
+        self.probes_after.clone_from(&verdict.probes);
     }
 
     /// Mark the artifact as finished with a pass/fail outcome.

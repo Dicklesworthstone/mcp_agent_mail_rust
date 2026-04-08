@@ -869,17 +869,13 @@ impl ArchiveBrowserScreen {
                 self.move_selection(-20);
                 self.load_preview();
             }
-            KeyCode::Home | KeyCode::Char('g') => {
-                if !self.entries.is_empty() {
-                    self.tree_state.selected = Some(0);
-                    self.load_preview();
-                }
+            KeyCode::Home | KeyCode::Char('g') if !self.entries.is_empty() => {
+                self.tree_state.selected = Some(0);
+                self.load_preview();
             }
-            KeyCode::End | KeyCode::Char('G') => {
-                if !self.entries.is_empty() {
-                    self.tree_state.selected = Some(self.entries.len() - 1);
-                    self.load_preview();
-                }
+            KeyCode::End | KeyCode::Char('G') if !self.entries.is_empty() => {
+                self.tree_state.selected = Some(self.entries.len() - 1);
+                self.load_preview();
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                 if let Some(sel) = self.tree_state.selected

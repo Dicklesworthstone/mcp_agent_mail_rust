@@ -4693,6 +4693,34 @@ fn path_is_real_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
 }
 
+fn doctor_legacy_fts_tables(conn: &mcp_agent_mail_db::DbConn) -> Vec<String> {
+    let mut names = conn
+        .query_sync(
+            "SELECT name \
+             FROM sqlite_master \
+             WHERE type='table' AND ( \
+                 name IN ('fts_messages', 'fts_agents', 'fts_projects', \
+                          'messages_fts', 'agents_fts', 'projects_fts') \
+                 OR lower(COALESCE(sql, '')) LIKE '%using fts5%' \
+             )",
+            &[],
+        )
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row.get_named::<String>("name").ok())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn guard_status_missing_repo(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("could not find repository")
+        || (lower.contains("repository") && lower.contains("notfound"))
+}
+
 fn sqlite_pragma_check_rows_ok(
     rows: &[mcp_agent_mail_db::sqlmodel_core::Row],
     kind: mcp_agent_mail_db::CheckKind,
@@ -5648,9 +5676,9 @@ fn open_sqlite_with_fallback_internal(
 ) -> CliResult<(mcp_agent_mail_db::DbConn, String)> {
     let open_conn = |candidate: &str| {
         if candidate == ":memory:" {
-            mcp_agent_mail_db::DbConn::open_memory()
+            mcp_agent_mail_db::DbConn::open_memory().map_err(Box::new)
         } else {
-            mcp_agent_mail_db::DbConn::open_file(candidate)
+            mcp_agent_mail_db::DbConn::open_file(candidate).map_err(Box::new)
         }
     };
 
@@ -9347,6 +9375,8 @@ fn handle_migrate_with_database_url_locked(database_url: &str) -> CliResult<()> 
         asupersync::Outcome::Ok(_) => {
             schema::enforce_runtime_fts_cleanup(&conn)
                 .map_err(|e| CliError::Other(format!("runtime FTS cleanup failed: {e}")))?;
+            conn.execute_raw(&schema::schema_user_version_sql())
+                .map_err(|e| CliError::Other(format!("failed to set schema user_version: {e}")))?;
             if let Err(e) = conn.execute_raw("PRAGMA journal_mode = WAL;") {
                 ftui_runtime::ftui_eprintln!(
                     "Warning: failed to switch journal_mode to WAL after migration: {e}"
@@ -12446,12 +12476,16 @@ fn storage_root_write_probe(storage_root: &Path) -> Result<(), std::io::Error> {
 }
 
 fn discover_archive_git_repos(storage_root: &Path) -> Vec<PathBuf> {
-    let projects_root = storage_root.join("projects");
     let mut repos = Vec::new();
+    if storage_root.join(".git").exists() {
+        repos.push(storage_root.to_path_buf());
+    }
+
+    let projects_root = storage_root.join("projects");
     if let Ok(entries) = std::fs::read_dir(&projects_root) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() && path.join(".git").exists() {
+            if path.is_dir() && path.join(".git").exists() && !repos.contains(&path) {
                 repos.push(path);
             }
         }
@@ -13467,7 +13501,7 @@ fn doctor_check_priority(check_name: &str) -> usize {
         .unwrap_or(DOCTOR_PRIMARY_CHECK_PRIORITY.len())
 }
 
-fn doctor_primary_check<'a>(checks: &'a [serde_json::Value]) -> Option<&'a serde_json::Value> {
+fn doctor_primary_check(checks: &[serde_json::Value]) -> Option<&serde_json::Value> {
     checks
         .iter()
         .filter(|check| {
@@ -15817,11 +15851,22 @@ fn handle_doctor_check_with(
                     "detail": detail,
                 }));
             }
-            Err(err) => checks.push(serde_json::json!({
-                "check": "guard_hooks",
-                "status": "warn",
-                "detail": format!("Guard status unavailable: {err}"),
-            })),
+            Err(err) => {
+                let detail = err.to_string();
+                let (status, detail) = if guard_status_missing_repo(&detail) {
+                    (
+                        "ok",
+                        "Skipped: current directory is not inside a Git repository".to_string(),
+                    )
+                } else {
+                    ("warn", format!("Guard status unavailable: {detail}"))
+                };
+                checks.push(serde_json::json!({
+                    "check": "guard_hooks",
+                    "status": status,
+                    "detail": detail,
+                }));
+            }
         },
         Err(err) => checks.push(serde_json::json!({
             "check": "guard_hooks",
@@ -16537,32 +16582,21 @@ fn handle_doctor_check_with(
 
         // 4d-iv: FTS5 virtual tables
         if let Ok(ref conn) = conn_result {
-            let fts_ok = conn
-                .query_sync(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_fts%'",
-                    &[],
-                )
-                .ok()
-                .map(|rows| !rows.is_empty())
-                .unwrap_or(false);
-            let fts_query_ok = if fts_ok {
-                conn.query_sync(
-                    "SELECT COUNT(*) AS cnt FROM messages_fts WHERE messages_fts MATCH 'test' LIMIT 1",
-                    &[],
-                )
-                .is_ok()
-            } else {
-                false
-            };
-            let (fts_status, fts_detail) = if fts_ok && fts_query_ok {
+            let legacy_fts_tables = doctor_legacy_fts_tables(conn);
+            let (fts_status, fts_detail) = if legacy_fts_tables.is_empty() {
                 (
                     "ok",
-                    "FTS5 virtual tables present and queryable".to_string(),
+                    "No legacy SQLite FTS5 tables found (expected; Search V3/Tantivy is authoritative)"
+                        .to_string(),
                 )
-            } else if fts_ok {
-                ("warn", "FTS5 tables exist but query failed".to_string())
             } else {
-                ("warn", "No FTS5 virtual tables found".to_string())
+                (
+                    "warn",
+                    format!(
+                        "Legacy SQLite FTS5 tables still present: {}",
+                        legacy_fts_tables.join(", ")
+                    ),
+                )
             };
             checks.push(serde_json::json!({
                 "check": "fts5",
@@ -16653,13 +16687,12 @@ fn handle_doctor_check_with(
             .get("check")
             .and_then(|v| v.as_str())
             .map(String::from)
+            && let Some(obj) = check.as_object_mut()
         {
-            if let Some(obj) = check.as_object_mut() {
-                obj.insert(
-                    "category".to_string(),
-                    serde_json::Value::String(doctor_check_category(&name).to_string()),
-                );
-            }
+            obj.insert(
+                "category".to_string(),
+                serde_json::Value::String(doctor_check_category(&name).to_string()),
+            );
         }
     }
 
@@ -21218,7 +21251,7 @@ mod tests {
     }
 
     fn sqlite_message_count(sqlite_path: &Path) -> i64 {
-        let conn = mcp_agent_mail_db::DbConn::open_file(&sqlite_path.display().to_string())
+        let conn = mcp_agent_mail_db::DbConn::open_file(sqlite_path.display().to_string())
             .expect("open db");
         let rows = conn
             .query_sync("SELECT COUNT(*) AS cnt FROM messages", &[])
@@ -25315,7 +25348,7 @@ http_headers = { Authorization = "Bearer secret" }
 
         // Restored DB should contain only the scoped project.
         let restored_conn =
-            mcp_agent_mail_db::DbConn::open_file(&restore_db.display().to_string()).unwrap();
+            mcp_agent_mail_db::DbConn::open_file(restore_db.display().to_string()).unwrap();
         let rows = restored_conn
             .query_sync("SELECT slug FROM projects ORDER BY id", &[])
             .unwrap();
@@ -27766,6 +27799,20 @@ startup_timeout_sec = 42
             handle_doctor_reconstruct_with(Some(&db_path), Some(storage), false, true, true);
         assert!(result.is_ok(), "reconstruct failed: {result:?}");
         assert!(db_path.exists(), "reconstructed DB file should exist");
+
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open reconstructed db");
+        let user_version = conn
+            .query_sync("PRAGMA user_version", &[])
+            .expect("query user_version")
+            .first()
+            .and_then(|row| row.get_named::<i64>("user_version").ok())
+            .unwrap_or_default();
+        assert_eq!(
+            user_version,
+            i64::from(mcp_agent_mail_db::schema::SCHEMA_VERSION),
+            "reconstruct should stamp the current schema user_version"
+        );
     }
 
     #[test]
@@ -28430,7 +28477,7 @@ startup_timeout_sec = 42
     fn attempt_readable_sqlite_salvage_source_accepts_readable_db() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("readable-salvage.sqlite3");
-        let conn = mcp_agent_mail_db::DbConn::open_file(&db_path.display().to_string())
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
             .expect("open sqlite db");
         conn.execute_raw("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)")
             .expect("create users table");
@@ -28575,7 +28622,7 @@ startup_timeout_sec = 42
         let storage_root = tmp.path().join("storage");
         let backup_dir = tmp.path().join("backups");
         std::fs::create_dir_all(&storage_root).unwrap();
-        mcp_agent_mail_db::DbConn::open_file(&db_path.display().to_string())
+        mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
             .expect("create empty valid sqlite db");
 
         let storage_root_text = storage_root.to_string_lossy().to_string();
@@ -35658,6 +35705,92 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn doctor_check_accepts_storage_root_repo_and_base_runtime_schema() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let git_init = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(dir.path())
+            .status()
+            .expect("git init");
+        assert!(git_init.success(), "git init should succeed");
+
+        let db_path = dir.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        handle_migrate_with_database_url(&db_url).expect("migrate");
+        let parsed = run_doctor_check_json(&db_url, dir.path());
+        let checks = parsed["checks"].as_array().expect("checks array");
+
+        let storage_git_repo = checks
+            .iter()
+            .find(|c| c["check"].as_str() == Some("storage_root_git_repo"))
+            .expect("storage_root_git_repo check");
+        assert_eq!(storage_git_repo["status"], "ok");
+
+        let storage_git_lock = checks
+            .iter()
+            .find(|c| c["check"].as_str() == Some("storage_root_git_index_lock"))
+            .expect("storage_root_git_index_lock check");
+        assert_eq!(storage_git_lock["status"], "ok");
+
+        let schema_version = checks
+            .iter()
+            .find(|c| c["check"].as_str() == Some("schema_version"))
+            .expect("schema_version check");
+        assert_eq!(schema_version["status"], "ok");
+        assert_eq!(
+            schema_version["detail"],
+            format!(
+                "user_version = {}",
+                mcp_agent_mail_db::schema::SCHEMA_VERSION
+            )
+        );
+
+        let fts5 = checks
+            .iter()
+            .find(|c| c["check"].as_str() == Some("fts5"))
+            .expect("fts5 check");
+        assert_eq!(fts5["status"], "ok");
+        assert!(
+            fts5["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Search V3/Tantivy"),
+            "unexpected fts5 detail: {}",
+            fts5["detail"]
+        );
+    }
+
+    #[test]
+    fn doctor_check_skips_guard_hooks_outside_git_repo() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let _cwd = CwdGuard::chdir(cwd_dir.path());
+
+        let storage_dir = tempfile::tempdir().unwrap();
+        let db_path = storage_dir.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        handle_migrate_with_database_url(&db_url).expect("migrate");
+        let parsed = run_doctor_check_json(&db_url, storage_dir.path());
+        let checks = parsed["checks"].as_array().expect("checks array");
+        let guard_hooks = checks
+            .iter()
+            .find(|c| c["check"].as_str() == Some("guard_hooks"))
+            .expect("guard_hooks check");
+        assert_eq!(guard_hooks["status"], "ok");
+        assert_eq!(
+            guard_hooks["detail"],
+            "Skipped: current directory is not inside a Git repository"
+        );
+    }
+
+    #[test]
     fn doctor_check_summary_separates_archive_hygiene_from_primary_incident() {
         let _guard = stdio_capture_lock()
             .lock()
@@ -41286,7 +41419,7 @@ fn doctor_salvage_artifact_candidates(current_db: &Path) -> Vec<(String, PathBuf
                 group.push((modified, path));
             }
         }
-        group.sort_by(|a, b| b.0.cmp(&a.0));
+        group.sort_by_key(|entry| std::cmp::Reverse(entry.0));
         for (_, path) in group {
             push_candidate(label, path);
         }
@@ -41872,16 +42005,16 @@ fn handle_doctor_archive_scan(
             database_url: db_cfg.database_url.clone(),
             ..Default::default()
         };
-        if let Ok(db_path) = db_pool_cfg.sqlite_path() {
-            if db_path != ":memory:" {
-                let resolved = resolve_sqlite_path_with_absolute_candidate(&db_path);
-                if Path::new(&resolved).exists() {
-                    scan_artifacts.push(ArtifactPointer::referenced(
-                        "sqlite_db",
-                        &resolved,
-                        "SQLite database (archive cross-reference)",
-                    ));
-                }
+        if let Ok(db_path) = db_pool_cfg.sqlite_path()
+            && db_path != ":memory:"
+        {
+            let resolved = resolve_sqlite_path_with_absolute_candidate(&db_path);
+            if Path::new(&resolved).exists() {
+                scan_artifacts.push(ArtifactPointer::referenced(
+                    "sqlite_db",
+                    &resolved,
+                    "SQLite database (archive cross-reference)",
+                ));
             }
         }
     }

@@ -708,30 +708,22 @@ impl MailScreen for AtcScreen {
                 FocusPanel::Decisions => self.decision_table.selected = Some(0),
             },
             // Agent table sort
-            KeyCode::Char('s') => {
-                if self.focus == FocusPanel::Agents {
-                    self.agent_sort_col = (self.agent_sort_col + 1) % AGENT_SORT_LABELS.len();
-                }
+            KeyCode::Char('s') if self.focus == FocusPanel::Agents => {
+                self.agent_sort_col = (self.agent_sort_col + 1) % AGENT_SORT_LABELS.len();
             }
-            KeyCode::Char('S') => {
-                if self.focus == FocusPanel::Agents {
-                    self.agent_sort_asc = !self.agent_sort_asc;
-                }
+            KeyCode::Char('S') if self.focus == FocusPanel::Agents => {
+                self.agent_sort_asc = !self.agent_sort_asc;
             }
             // Detail toggle
             KeyCode::Char('i') => {
                 self.detail_visible = !self.detail_visible;
             }
             // Detail scroll
-            KeyCode::Char('J') => {
-                if self.detail_visible {
-                    self.detail_scroll = self.detail_scroll.saturating_add(3);
-                }
+            KeyCode::Char('J') if self.detail_visible => {
+                self.detail_scroll = self.detail_scroll.saturating_add(3);
             }
-            KeyCode::Char('K') => {
-                if self.detail_visible {
-                    self.detail_scroll = self.detail_scroll.saturating_sub(3);
-                }
+            KeyCode::Char('K') if self.detail_visible => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(3);
             }
             _ => {}
         }

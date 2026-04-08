@@ -102,7 +102,7 @@ fn make_pool() -> (DbPool, tempfile::TempDir) {
 
     // Pre-initialize the DB file with the same FrankenSQLite connection type the
     // pool uses at runtime, then run base migrations before constructing the pool.
-    let init_conn = mcp_agent_mail_db::DbConn::open_file(&db_path.display().to_string())
+    let init_conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
         .expect("open connection for test pool");
     init_conn
         .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_BASE_SQL)

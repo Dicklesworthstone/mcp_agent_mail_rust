@@ -424,7 +424,7 @@ first body
 
     #[test]
     fn parse_attachment_views_preserves_malformed_entries_with_placeholder_labels() {
-        let attachments = parse_attachment_views(r#"[{},null,17]"#);
+        let attachments = parse_attachment_views(r"[{},null,17]");
         assert_eq!(attachments.len(), 3);
         assert_eq!(
             attachments[0].name.as_deref(),

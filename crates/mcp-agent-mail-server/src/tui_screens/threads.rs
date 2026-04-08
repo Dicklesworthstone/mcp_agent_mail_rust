@@ -1493,10 +1493,10 @@ impl MailScreen for ThreadExplorerScreen {
                         return Cmd::None;
                     }
                 }
-                MouseEventKind::Up(MouseButton::Left) => {
-                    if !matches!(self.message_drag, MessageDragState::Idle) {
-                        return self.finish_message_drag(state);
-                    }
+                MouseEventKind::Up(MouseButton::Left)
+                    if !matches!(self.message_drag, MessageDragState::Idle) =>
+                {
+                    return self.finish_message_drag(state);
                 }
                 _ => {}
             }
@@ -1552,24 +1552,20 @@ impl MailScreen for ThreadExplorerScreen {
                             self.detail_visible = !self.detail_visible;
                         }
                         // Cursor navigation
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            if !self.threads.is_empty() {
-                                self.cursor = (self.cursor + 1).min(self.threads.len() - 1);
-                                self.detail_scroll = 0;
-                                self.refresh_detail_if_needed(Some(state));
-                            }
+                        KeyCode::Char('j') | KeyCode::Down if !self.threads.is_empty() => {
+                            self.cursor = (self.cursor + 1).min(self.threads.len() - 1);
+                            self.detail_scroll = 0;
+                            self.refresh_detail_if_needed(Some(state));
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
                             self.cursor = self.cursor.saturating_sub(1);
                             self.detail_scroll = 0;
                             self.refresh_detail_if_needed(Some(state));
                         }
-                        KeyCode::Char('G') | KeyCode::End => {
-                            if !self.threads.is_empty() {
-                                self.cursor = self.threads.len() - 1;
-                                self.detail_scroll = 0;
-                                self.refresh_detail_if_needed(Some(state));
-                            }
+                        KeyCode::Char('G') | KeyCode::End if !self.threads.is_empty() => {
+                            self.cursor = self.threads.len() - 1;
+                            self.detail_scroll = 0;
+                            self.refresh_detail_if_needed(Some(state));
                         }
                         KeyCode::Home => {
                             self.cursor = 0;
@@ -1580,12 +1576,10 @@ impl MailScreen for ThreadExplorerScreen {
                             self.show_mermaid_panel = !self.show_mermaid_panel;
                         }
                         // Page navigation
-                        KeyCode::Char('d') | KeyCode::PageDown => {
-                            if !self.threads.is_empty() {
-                                self.cursor = (self.cursor + 20).min(self.threads.len() - 1);
-                                self.detail_scroll = 0;
-                                self.refresh_detail_if_needed(Some(state));
-                            }
+                        KeyCode::Char('d') | KeyCode::PageDown if !self.threads.is_empty() => {
+                            self.cursor = (self.cursor + 20).min(self.threads.len() - 1);
+                            self.detail_scroll = 0;
+                            self.refresh_detail_if_needed(Some(state));
                         }
                         KeyCode::Char('u') | KeyCode::PageUp => {
                             self.cursor = self.cursor.saturating_sub(20);
@@ -1622,10 +1616,8 @@ impl MailScreen for ThreadExplorerScreen {
                             self.filter_text.clear();
                             self.list_dirty = true;
                         }
-                        KeyCode::Escape => {
-                            if self.show_mermaid_panel {
-                                self.show_mermaid_panel = false;
-                            }
+                        KeyCode::Escape if self.show_mermaid_panel => {
+                            self.show_mermaid_panel = false;
                         }
                         _ => {}
                     }
@@ -1657,10 +1649,10 @@ impl MailScreen for ThreadExplorerScreen {
                         }
                         _ if self.detail_tree_focus => match key.code {
                             // Tree navigation
-                            KeyCode::Char('j') | KeyCode::Down => {
-                                if self.detail_cursor + 1 < tree_rows.len() {
-                                    self.detail_cursor += 1;
-                                }
+                            KeyCode::Char('j') | KeyCode::Down
+                                if self.detail_cursor + 1 < tree_rows.len() =>
+                            {
+                                self.detail_cursor += 1;
                             }
                             KeyCode::Char('k') | KeyCode::Up => {
                                 self.detail_cursor = self.detail_cursor.saturating_sub(1);
@@ -1700,11 +1692,9 @@ impl MailScreen for ThreadExplorerScreen {
                                 self.detail_tree_focus = false;
                             }
                             // Load more history
-                            KeyCode::Char('o') => {
-                                if self.has_older_messages() {
-                                    self.load_older_messages(state);
-                                    self.clamp_detail_cursor_to_tree_rows();
-                                }
+                            KeyCode::Char('o') if self.has_older_messages() => {
+                                self.load_older_messages(state);
+                                self.clamp_detail_cursor_to_tree_rows();
                             }
                             // Expand/collapse all selected-message previews.
                             KeyCode::Char('e') => self.expand_all(),
@@ -1743,11 +1733,9 @@ impl MailScreen for ThreadExplorerScreen {
                             KeyCode::Enter | KeyCode::Char(' ') => {
                                 self.toggle_selected_expansion();
                             }
-                            KeyCode::Char('o') => {
-                                if self.has_older_messages() {
-                                    self.load_older_messages(state);
-                                    self.clamp_detail_cursor_to_tree_rows();
-                                }
+                            KeyCode::Char('o') if self.has_older_messages() => {
+                                self.load_older_messages(state);
+                                self.clamp_detail_cursor_to_tree_rows();
                             }
                             KeyCode::Char('e') => self.expand_all(),
                             KeyCode::Char('c') => self.collapse_all(),
@@ -2533,7 +2521,7 @@ fn participant_names_by_thread(
                     continue;
                 };
                 let names = participants.entry(thread_id).or_default();
-                if let Some(sender_id) = row.get_named::<i64>("sender_id").ok() {
+                if let Ok(sender_id) = row.get_named::<i64>("sender_id") {
                     let sender_name = sender_name_map
                         .get(&sender_id)
                         .cloned()
@@ -6485,7 +6473,7 @@ mod tests {
     #[test]
     fn activity_lens_compact_labels() {
         // Activity lens now uses compact "m" and "a" labels
-        let meta = format!("{}m  {}a  {:.1}/hr", 10, 3, 2.5_f64,);
+        let meta = format!("{}m  {}a  {:.1}/hr", 10, 3, 2.5_f64);
         assert_eq!(meta, "10m  3a  2.5/hr");
     }
 

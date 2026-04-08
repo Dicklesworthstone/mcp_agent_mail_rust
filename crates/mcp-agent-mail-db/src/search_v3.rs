@@ -409,6 +409,7 @@ pub fn init_bridge(index_dir: &Path) -> Result<(), String> {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(existing) = guard.as_ref() {
         if same_index_dir(existing.index_dir(), index_dir) {
+            drop(guard);
             record_warmup(WarmResource::LexicalIndex, warmup_timer.elapsed());
             return Ok(());
         }
@@ -417,10 +418,12 @@ pub fn init_bridge(index_dir: &Path) -> Result<(), String> {
             existing.index_dir().display(),
             index_dir.display()
         );
+        drop(guard);
         record_warmup_failure(WarmResource::LexicalIndex, &error);
         return Err(error);
     }
     *guard = Some(Arc::new(bridge));
+    drop(guard);
     record_warmup(WarmResource::LexicalIndex, warmup_timer.elapsed());
     Ok(())
 }
@@ -455,10 +458,12 @@ pub fn init_or_switch_bridge(index_dir: &Path) -> Result<(), String> {
     if let Some(existing) = guard.as_ref()
         && same_index_dir(existing.index_dir(), index_dir)
     {
+        drop(guard);
         record_warmup(WarmResource::LexicalIndex, warmup_timer.elapsed());
         return Ok(());
     }
     *guard = Some(Arc::new(bridge));
+    drop(guard);
     record_warmup(WarmResource::LexicalIndex, warmup_timer.elapsed());
     Ok(())
 }

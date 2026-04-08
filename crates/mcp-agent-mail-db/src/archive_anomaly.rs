@@ -703,7 +703,7 @@ impl ArchiveAnomalyReport {
     /// Highest severity in the report, or `None` if empty.
     #[must_use]
     pub fn max_severity(&self) -> Option<AnomalySeverity> {
-        self.anomalies.iter().map(|a| a.severity()).max()
+        self.anomalies.iter().map(ArchiveAnomaly::severity).max()
     }
 
     /// Sort anomalies by severity (highest first), then by tag for stability.
@@ -809,12 +809,12 @@ fn suspicious_project_reason(slug: &str, human_key: Option<&str>) -> Option<Stri
         }
     }
 
-    if let Some(hk) = human_key {
-        if mcp_agent_mail_core::ephemeral::path_has_ephemeral_root(Path::new(hk)) {
-            return Some(format!(
-                "human_key '{hk}' resolves into a temporary filesystem root"
-            ));
-        }
+    if let Some(hk) = human_key
+        && mcp_agent_mail_core::ephemeral::path_has_ephemeral_root(Path::new(hk))
+    {
+        return Some(format!(
+            "human_key '{hk}' resolves into a temporary filesystem root"
+        ));
     }
 
     None
@@ -1215,15 +1215,12 @@ fn scan_message_file(
     file_path: &Path,
     global_message_ids: &mut BTreeMap<i64, (PathBuf, Vec<PathBuf>)>,
 ) {
-    let content = match std::fs::read_to_string(file_path) {
-        Ok(c) => c,
-        Err(_) => {
-            // Unreadable file — treat as missing frontmatter.
-            report.record(ArchiveAnomalyKind::MissingFrontmatter {
-                path: file_path.to_path_buf(),
-            });
-            return;
-        }
+    let Ok(content) = std::fs::read_to_string(file_path) else {
+        // Unreadable file — treat as missing frontmatter.
+        report.record(ArchiveAnomalyKind::MissingFrontmatter {
+            path: file_path.to_path_buf(),
+        });
+        return;
     };
 
     let Some(frontmatter_text) = extract_json_frontmatter(&content) else {
@@ -1322,10 +1319,7 @@ pub fn scan_archive_anomalies_with_db(storage_root: &Path, db_path: &Path) -> Ar
     let archive_inventory = crate::reconstruct::scan_archive_message_inventory(storage_root);
 
     // Try to get DB inventory for cross-checks.
-    let db_inventory = match crate::pool::inspect_mailbox_db_inventory(db_path) {
-        Ok(inv) => Some(inv),
-        Err(_) => None,
-    };
+    let db_inventory = crate::pool::inspect_mailbox_db_inventory(db_path).ok();
 
     if let Some(ref inv) = db_inventory {
         // Check for archive/DB project identity mismatches.
@@ -1624,7 +1618,7 @@ mod tests {
     fn all_anomaly_tags_sorted_and_complete() {
         // Verify the constant is sorted.
         let mut sorted = ALL_ANOMALY_TAGS.to_vec();
-        sorted.sort();
+        sorted.sort_unstable();
         assert_eq!(ALL_ANOMALY_TAGS, sorted.as_slice());
 
         // Verify every tag is represented.

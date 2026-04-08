@@ -1180,11 +1180,9 @@ impl MailScreen for DashboardScreen {
                     KeyCode::Char('/') => {
                         self.begin_query_edit();
                     }
-                    KeyCode::Escape => {
-                        if !self.quick_query().is_empty() {
-                            self.quick_query_input.clear();
-                            self.clamp_scroll_offset();
-                        }
+                    KeyCode::Escape if !self.quick_query().is_empty() => {
+                        self.quick_query_input.clear();
+                        self.clamp_scroll_offset();
                     }
                     // Scroll
                     KeyCode::Char('j') | KeyCode::Down => {
@@ -2927,7 +2925,7 @@ fn render_insight_rail(
             }
             let row_slots = &INSIGHT_MEGAGRID_LAYOUT[start..end];
             let columns = split_columns_with_gap(*row_area, row_slots.len(), 1);
-            for (slot, cell) in row_slots.iter().zip(columns.into_iter()) {
+            for (slot, cell) in row_slots.iter().zip(columns) {
                 render_insight_panel_slot(
                     frame,
                     cell,

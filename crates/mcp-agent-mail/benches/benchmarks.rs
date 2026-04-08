@@ -370,8 +370,7 @@ fn run_archive_harness_once() {
                         .expect("ensure_archive");
 
                     let t0 = Instant::now();
-                    let mut msg_id: i64 = 1;
-                    for _ in 0..batch_size {
+                    for (msg_id, _) in (1_i64..).zip(0..batch_size) {
                         let message_json = serde_json::json!({
                             "id": msg_id,
                             "project": project_slug,
@@ -389,7 +388,6 @@ fn run_archive_harness_once() {
                             None,
                         )
                         .expect("write_message_bundle");
-                        msg_id += 1;
                     }
                     mcp_agent_mail_storage::flush_async_commits();
 

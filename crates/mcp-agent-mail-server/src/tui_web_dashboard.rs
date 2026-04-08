@@ -92,16 +92,16 @@ fn parse_dashboard_query(query: Option<&str>) -> DashboardQuery {
                     .ok()
                     .map(|wait_ms| wait_ms.clamp(MIN_STREAM_WAIT_MS, MAX_STREAM_WAIT_MS));
             }
-            "client" => {
+            "client"
                 if !value.is_empty()
                     && value.len() <= 64
-                    && value
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-                {
-                    out.client_id = Some(value.to_string());
-                }
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+                    }) =>
+            {
+                out.client_id = Some(value.to_string());
             }
+            "client" => {}
             _ => {}
         }
     }

@@ -1063,17 +1063,13 @@ impl MailScreen for AttachmentExplorerScreen {
             match key.code {
                 KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
                 KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-                KeyCode::Char('G') | KeyCode::End => {
-                    if !self.display_indices.is_empty() {
-                        self.table_state.selected = Some(self.display_indices.len() - 1);
-                        self.detail_scroll = 0;
-                    }
+                KeyCode::Char('G') | KeyCode::End if !self.display_indices.is_empty() => {
+                    self.table_state.selected = Some(self.display_indices.len() - 1);
+                    self.detail_scroll = 0;
                 }
-                KeyCode::Char('g') | KeyCode::Home => {
-                    if !self.display_indices.is_empty() {
-                        self.table_state.selected = Some(0);
-                        self.detail_scroll = 0;
-                    }
+                KeyCode::Char('g') | KeyCode::Home if !self.display_indices.is_empty() => {
+                    self.table_state.selected = Some(0);
+                    self.detail_scroll = 0;
                 }
                 KeyCode::Char('/') => {
                     self.text_filter_active = true;
@@ -1118,11 +1114,9 @@ impl MailScreen for AttachmentExplorerScreen {
                         )));
                     }
                 }
-                KeyCode::Escape => {
-                    if !self.text_filter.is_empty() {
-                        self.text_filter.clear();
-                        self.rebuild_display();
-                    }
+                KeyCode::Escape if !self.text_filter.is_empty() => {
+                    self.text_filter.clear();
+                    self.rebuild_display();
                 }
                 _ => {}
             }

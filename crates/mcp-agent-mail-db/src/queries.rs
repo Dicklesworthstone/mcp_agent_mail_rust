@@ -569,6 +569,7 @@ fn decode_atc_experience_row(row: &SqlRow) -> std::result::Result<ExperienceRow,
 
 const PROJECT_SELECT_ALL_SQL: &str =
     "SELECT id, slug, human_key, created_at FROM projects ORDER BY id ASC";
+pub type AtcRollupRow = (String, i64, i64, i64, i64, i64, i64, f64, f64, f64, f64);
 const ATC_EXPERIENCE_SELECT_COLUMNS_SQL: &str = "SELECT experience_id, decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem, decision_class, subject, project_key, policy_id, effect_kind, action, posterior_json, expected_loss, runner_up_action, runner_up_loss, evidence_summary, calibration_healthy, safe_mode_active, non_execution_json, outcome_json, features_json, feature_ext_json, created_ts, dispatched_ts, executed_ts, resolved_ts, context_json FROM atc_experiences";
 const FILE_RESERVATION_SELECT_COLUMNS_SQL: &str = "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts \
      FROM file_reservations";
@@ -810,6 +811,48 @@ async fn acquire_conn(
     map_sql_outcome(pool.acquire(cx).await)
 }
 
+fn canonical_table_exists(pool: &DbPool, table_name: &str) -> std::result::Result<bool, DbError> {
+    let conn = open_canonical_atc_conn(pool, "inspect canonical ATC table presence")?;
+    let result = (|| {
+        let rows = canonical_query_atc_rows(
+            &conn,
+            "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+            &[Value::Text(table_name.to_string())],
+            "inspect canonical ATC table presence",
+        )?;
+        Ok(!rows.is_empty())
+    })();
+    close_canonical_db_conn(conn, "canonical ATC table presence connection");
+    result
+}
+
+async fn ensure_file_backed_atc_pool_initialized(cx: &Cx, pool: &DbPool) -> Outcome<(), DbError> {
+    if pool.sqlite_path() == ":memory:" {
+        return Outcome::Ok(());
+    }
+    match canonical_table_exists(pool, "atc_experiences") {
+        Ok(true) => return Outcome::Ok(()),
+        Ok(false) => {}
+        Err(error) => return Outcome::Err(error),
+    }
+    match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => {
+            drop(conn);
+            match canonical_table_exists(pool, "atc_experiences") {
+                Ok(true) => Outcome::Ok(()),
+                Ok(false) => Outcome::Err(DbError::Internal(
+                    "ATC schema initialization completed but atc_experiences is still missing"
+                        .to_string(),
+                )),
+                Err(error) => Outcome::Err(error),
+            }
+        }
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
 fn tracked(conn: &crate::DbConn) -> TrackedConnection<'_> {
     TrackedConnection::new(conn)
 }
@@ -967,7 +1010,7 @@ async fn durability_probe_query(
         }
         let probe_tracked = tracked(&probe_conn);
         let out = map_sql_outcome(traw_query(cx, &probe_tracked, sql, params).await);
-        drop(probe_conn);
+        crate::close_db_conn(probe_conn, "durability_probe_query connection");
 
         match &out {
             Outcome::Err(e)
@@ -980,7 +1023,6 @@ async fn durability_probe_query(
                     "durability probe hit transient busy, retrying"
                 );
                 durability_probe_backoff(attempt).await;
-                continue;
             }
             _ => return out,
         }
@@ -1131,6 +1173,17 @@ async fn fetch_durable_atc_experience_by_decision_effect(
     decision_id: i64,
     effect_id: i64,
 ) -> Outcome<ExperienceRow, DbError> {
+    if pool.sqlite_path() != ":memory:" {
+        return match canonical_fetch_atc_experience_by_decision_effect(pool, decision_id, effect_id)
+        {
+            Ok(Some(row)) => Outcome::Ok(row),
+            Ok(None) => Outcome::Err(DbError::Internal(format!(
+                "ATC experience row not visible after commit for decision_id={decision_id} effect_id={effect_id}"
+            ))),
+            Err(error) => Outcome::Err(error),
+        };
+    }
+
     let sql = format!(
         "{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE decision_id = ? AND effect_id = ? LIMIT 1"
     );
@@ -1158,6 +1211,13 @@ async fn fetch_durable_atc_experience_by_id(
     pool: &DbPool,
     experience_id: i64,
 ) -> Outcome<Option<ExperienceRow>, DbError> {
+    if pool.sqlite_path() != ":memory:" {
+        return match canonical_fetch_atc_experience_by_id(pool, experience_id) {
+            Ok(row) => Outcome::Ok(row),
+            Err(error) => Outcome::Err(error),
+        };
+    }
+
     let sql = format!("{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE experience_id = ? LIMIT 1");
     let params = [Value::BigInt(experience_id)];
     match durability_probe_query(cx, pool, &sql, &params).await {
@@ -1179,6 +1239,574 @@ fn open_fresh_file_backed_conn(pool: &DbPool) -> std::result::Result<crate::DbCo
     conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL)
         .map_err(|error| DbError::Sqlite(format!("fresh connection init failed: {error}")))?;
     Ok(conn)
+}
+
+// ATC raw experience rows are the only runtime table family still observed
+// corrupting file-backed mailboxes under FrankenConnection writes. Route
+// file-backed ATC experience IO through canonical SQLite until the upstream
+// page-ordering/runtime bug is fixed.
+fn close_canonical_db_conn(conn: crate::CanonicalDbConn, context: &'static str) {
+    let _ = context;
+    drop(conn);
+}
+
+fn open_canonical_atc_conn(
+    pool: &DbPool,
+    purpose: &'static str,
+) -> std::result::Result<crate::CanonicalDbConn, DbError> {
+    let conn = crate::CanonicalDbConn::open_file(pool.sqlite_path())
+        .map_err(|error| DbError::Sqlite(format!("{purpose}: open failed: {error}")))?;
+    conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL)
+        .map_err(|error| DbError::Sqlite(format!("{purpose}: init pragmas failed: {error}")))?;
+    Ok(conn)
+}
+
+fn begin_canonical_atc_write_tx(conn: &crate::CanonicalDbConn) -> std::result::Result<(), DbError> {
+    conn.execute_sync("BEGIN IMMEDIATE", &[])
+        .map(|_| ())
+        .map_err(|error| DbError::Sqlite(error.to_string()))
+}
+
+fn commit_canonical_atc_write_tx(
+    conn: &crate::CanonicalDbConn,
+) -> std::result::Result<(), DbError> {
+    conn.execute_sync("COMMIT", &[])
+        .map(|_| ())
+        .map_err(|error| DbError::Sqlite(error.to_string()))
+}
+
+fn rollback_canonical_atc_write_tx(conn: &crate::CanonicalDbConn) {
+    let _ = conn.execute_sync("ROLLBACK", &[]);
+}
+
+fn canonical_query_atc_rows(
+    conn: &crate::CanonicalDbConn,
+    sql: &str,
+    params: &[Value],
+    purpose: &'static str,
+) -> std::result::Result<Vec<SqlRow>, DbError> {
+    conn.query_sync(sql, params)
+        .map_err(|error| DbError::Sqlite(format!("{purpose}: {error}")))
+}
+
+fn canonical_execute_atc(
+    conn: &crate::CanonicalDbConn,
+    sql: &str,
+    params: &[Value],
+    purpose: &'static str,
+) -> std::result::Result<u64, DbError> {
+    conn.execute_sync(sql, params)
+        .map_err(|error| DbError::Sqlite(format!("{purpose}: {error}")))
+}
+
+fn canonical_fetch_atc_experience_by_decision_effect(
+    pool: &DbPool,
+    decision_id: i64,
+    effect_id: i64,
+) -> std::result::Result<Option<ExperienceRow>, DbError> {
+    let conn = open_canonical_atc_conn(pool, "fetch durable ATC experience by decision/effect")?;
+    let result = (|| {
+        let sql = format!(
+            "{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE decision_id = ? AND effect_id = ? LIMIT 1"
+        );
+        let params = [Value::BigInt(decision_id), Value::BigInt(effect_id)];
+        let rows = canonical_query_atc_rows(
+            &conn,
+            &sql,
+            &params,
+            "fetch durable ATC experience by decision/effect",
+        )?;
+        rows.first().map(decode_atc_experience_row).transpose()
+    })();
+    close_canonical_db_conn(conn, "canonical ATC decision/effect fetch connection");
+    result
+}
+
+fn canonical_fetch_atc_experience_by_id(
+    pool: &DbPool,
+    experience_id: i64,
+) -> std::result::Result<Option<ExperienceRow>, DbError> {
+    let conn = open_canonical_atc_conn(pool, "fetch durable ATC experience by id")?;
+    let result = (|| {
+        let sql = format!("{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE experience_id = ? LIMIT 1");
+        let params = [Value::BigInt(experience_id)];
+        let rows =
+            canonical_query_atc_rows(&conn, &sql, &params, "fetch durable ATC experience by id")?;
+        rows.first().map(decode_atc_experience_row).transpose()
+    })();
+    close_canonical_db_conn(conn, "canonical ATC id fetch connection");
+    result
+}
+
+fn append_atc_experience_file_backed(
+    pool: &DbPool,
+    row: &ExperienceRow,
+) -> std::result::Result<ExperienceRow, DbError> {
+    fn sql_i64_id(field: &str, value: u64) -> std::result::Result<i64, DbError> {
+        i64::try_from(value).map_err(|_| {
+            DbError::Internal(format!("{field} exceeds SQLite INTEGER range: {value}"))
+        })
+    }
+
+    let decision_id = sql_i64_id("decision_id", row.decision_id)?;
+    let effect_id = sql_i64_id("effect_id", row.effect_id)?;
+    let posterior_json = encode_json(&row.posterior, "posterior_json")?;
+    let non_execution_json = encode_json_optional(&row.non_execution_reason, "non_execution_json")?;
+    let outcome_json = encode_json_optional(&row.outcome, "outcome_json")?;
+    let features_json = encode_json_optional(&row.features, "features_json")?;
+    let feature_ext_json = encode_json_optional(&row.feature_ext, "feature_ext_json")?;
+    let context_json = encode_json_optional(&row.context, "context_json")?;
+
+    let conn = open_canonical_atc_conn(pool, "append_atc_experience")?;
+    let write_result = (|| {
+        begin_canonical_atc_write_tx(&conn)?;
+        let insert_sql = "INSERT INTO atc_experiences \
+            (decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem, decision_class, subject, project_key, policy_id, effect_kind, action, posterior_json, expected_loss, runner_up_action, runner_up_loss, evidence_summary, calibration_healthy, safe_mode_active, non_execution_json, outcome_json, features_json, feature_ext_json, created_ts, dispatched_ts, executed_ts, resolved_ts, context_json) \
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+            ON CONFLICT(decision_id, effect_id) DO NOTHING";
+        let insert_params = [
+            Value::BigInt(decision_id),
+            Value::BigInt(effect_id),
+            Value::Text(row.trace_id.clone()),
+            Value::Text(row.claim_id.clone()),
+            Value::Text(row.evidence_id.clone()),
+            Value::Text(row.state.to_string()),
+            Value::Text(row.subsystem.to_string()),
+            Value::Text(row.decision_class.clone()),
+            Value::Text(row.subject.clone()),
+            row.project_key
+                .as_ref()
+                .map_or(Value::Null, |value| Value::Text(value.clone())),
+            row.policy_id
+                .as_ref()
+                .map_or(Value::Null, |value| Value::Text(value.clone())),
+            Value::Text(row.effect_kind.to_string()),
+            Value::Text(row.action.clone()),
+            Value::Text(posterior_json),
+            Value::Double(row.expected_loss),
+            row.runner_up_action
+                .as_ref()
+                .map_or(Value::Null, |value| Value::Text(value.clone())),
+            row.runner_up_loss.map_or(Value::Null, Value::Double),
+            Value::Text(row.evidence_summary.clone()),
+            Value::BigInt(if row.calibration_healthy { 1 } else { 0 }),
+            Value::BigInt(if row.safe_mode_active { 1 } else { 0 }),
+            non_execution_json.map_or(Value::Null, Value::Text),
+            outcome_json.map_or(Value::Null, Value::Text),
+            features_json.map_or(Value::Null, Value::Text),
+            feature_ext_json.map_or(Value::Null, Value::Text),
+            Value::BigInt(row.created_ts_micros),
+            row.dispatched_ts_micros.map_or(Value::Null, Value::BigInt),
+            row.executed_ts_micros.map_or(Value::Null, Value::BigInt),
+            row.resolved_ts_micros.map_or(Value::Null, Value::BigInt),
+            context_json.map_or(Value::Null, Value::Text),
+        ];
+        canonical_execute_atc(
+            &conn,
+            insert_sql,
+            &insert_params,
+            "append_atc_experience insert",
+        )?;
+        commit_canonical_atc_write_tx(&conn)
+    })();
+    if write_result.is_err() {
+        rollback_canonical_atc_write_tx(&conn);
+    }
+    close_canonical_db_conn(conn, "canonical ATC append connection");
+    write_result?;
+
+    canonical_fetch_atc_experience_by_decision_effect(pool, decision_id, effect_id)?.ok_or_else(
+        || {
+            DbError::Internal(format!(
+                "ATC experience append succeeded but re-select failed for decision_id={decision_id} effect_id={effect_id}"
+            ))
+        },
+    )
+}
+
+fn transition_atc_experience_file_backed(
+    pool: &DbPool,
+    experience_id: u64,
+    new_state: ExperienceState,
+    ts_micros: i64,
+    non_execution_reason: Option<&NonExecutionReason>,
+    context_patch: Option<&serde_json::Value>,
+) -> std::result::Result<(), DbError> {
+    let sql_experience_id = i64::try_from(experience_id).map_err(|_| {
+        DbError::Internal(format!(
+            "experience_id exceeds SQLite INTEGER range: {experience_id}"
+        ))
+    })?;
+
+    let conn = open_canonical_atc_conn(pool, "transition_atc_experience")?;
+    let result = (|| {
+        begin_canonical_atc_write_tx(&conn)?;
+        let select_sql =
+            format!("{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} WHERE experience_id = ? LIMIT 1");
+        let rows = canonical_query_atc_rows(
+            &conn,
+            &select_sql,
+            &[Value::BigInt(sql_experience_id)],
+            "transition_atc_experience select",
+        )?;
+        let Some(stored) = rows.first() else {
+            return Err(DbError::not_found(
+                "AtcExperience",
+                experience_id.to_string(),
+            ));
+        };
+        let mut experience = decode_atc_experience_row(stored)?;
+
+        if experience.state != new_state
+            && let Err(reason) = validate_transition(experience.state, new_state)
+        {
+            return Err(DbError::invalid(
+                "state",
+                format!(
+                    "experience {experience_id} cannot transition from {} to {}: {reason}",
+                    experience.state, new_state
+                ),
+            ));
+        }
+
+        if non_execution_reason.is_some() && !new_state.is_non_execution() {
+            return Err(DbError::invalid(
+                "non_execution_reason",
+                format!(
+                    "non_execution_reason is only valid for throttled/suppressed/skipped states, got {new_state}"
+                ),
+            ));
+        }
+        if new_state.is_non_execution()
+            && experience.state != new_state
+            && non_execution_reason.is_none()
+        {
+            return Err(DbError::invalid(
+                "non_execution_reason",
+                format!("non_execution_reason is required when transitioning to {new_state}"),
+            ));
+        }
+
+        if let Err(reason) = experience.transition_to(new_state) {
+            return Err(DbError::invalid(
+                "state",
+                format!("experience {experience_id} transition rejected: {reason}"),
+            ));
+        }
+
+        match new_state {
+            ExperienceState::Planned => {}
+            ExperienceState::Dispatched => {
+                if experience.dispatched_ts_micros.is_none() {
+                    experience.dispatched_ts_micros = Some(ts_micros);
+                }
+            }
+            ExperienceState::Executed
+            | ExperienceState::Failed
+            | ExperienceState::Throttled
+            | ExperienceState::Suppressed
+            | ExperienceState::Skipped => {
+                if experience.executed_ts_micros.is_none() {
+                    experience.executed_ts_micros = Some(ts_micros);
+                }
+            }
+            ExperienceState::Open => {}
+            ExperienceState::Resolved | ExperienceState::Censored | ExperienceState::Expired => {
+                if experience.resolved_ts_micros.is_none() {
+                    experience.resolved_ts_micros = Some(ts_micros);
+                }
+            }
+        }
+
+        if new_state.is_non_execution() {
+            if let Some(reason) = non_execution_reason {
+                experience.non_execution_reason = Some(reason.clone());
+            }
+        } else {
+            experience.non_execution_reason = None;
+        }
+        experience.context = merge_context_patch(experience.context.take(), context_patch)?;
+
+        let non_exec_json =
+            encode_json_optional(&experience.non_execution_reason, "non_execution_json")?;
+        let context_json = encode_json_optional(&experience.context, "context_json")?;
+        let update_sql = "UPDATE atc_experiences SET state = ?, non_execution_json = ?, dispatched_ts = ?, \
+             executed_ts = ?, resolved_ts = ?, context_json = ? WHERE experience_id = ?";
+        let update_params = [
+            Value::Text(experience.state.to_string()),
+            non_exec_json.map_or(Value::Null, Value::Text),
+            experience
+                .dispatched_ts_micros
+                .map_or(Value::Null, Value::BigInt),
+            experience
+                .executed_ts_micros
+                .map_or(Value::Null, Value::BigInt),
+            experience
+                .resolved_ts_micros
+                .map_or(Value::Null, Value::BigInt),
+            context_json.map_or(Value::Null, Value::Text),
+            Value::BigInt(sql_experience_id),
+        ];
+        canonical_execute_atc(
+            &conn,
+            update_sql,
+            &update_params,
+            "transition_atc_experience update",
+        )?;
+        commit_canonical_atc_write_tx(&conn)
+    })();
+    if result.is_err() {
+        rollback_canonical_atc_write_tx(&conn);
+    }
+    close_canonical_db_conn(conn, "canonical ATC transition connection");
+    result
+}
+
+fn fetch_open_atc_experiences_file_backed(
+    pool: &DbPool,
+    subject: Option<&str>,
+    limit: u32,
+) -> std::result::Result<Vec<ExperienceRow>, DbError> {
+    let conn = open_canonical_atc_conn(pool, "fetch_open_atc_experiences")?;
+    let result = (|| {
+        let (sql, params) = if let Some(agent) = subject {
+            (
+                format!(
+                    "{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} \
+                     WHERE state IN ('executed', 'open') AND subject = ? COLLATE NOCASE \
+                     ORDER BY created_ts ASC LIMIT ?"
+                ),
+                vec![
+                    Value::Text(agent.to_string()),
+                    Value::BigInt(i64::from(limit)),
+                ],
+            )
+        } else {
+            (
+                format!(
+                    "{ATC_EXPERIENCE_SELECT_COLUMNS_SQL} \
+                     WHERE state IN ('executed', 'open') \
+                     ORDER BY created_ts ASC LIMIT ?"
+                ),
+                vec![Value::BigInt(i64::from(limit))],
+            )
+        };
+        let rows =
+            canonical_query_atc_rows(&conn, &sql, &params, "fetch_open_atc_experiences query")?;
+        let mut experiences = Vec::with_capacity(rows.len());
+        for row in &rows {
+            match decode_atc_experience_row(row) {
+                Ok(experience) => experiences.push(experience),
+                Err(error) => {
+                    tracing::warn!(%error, "skipping malformed atc_experience row");
+                }
+            }
+        }
+        Ok(experiences)
+    })();
+    close_canonical_db_conn(conn, "canonical ATC open-experiences connection");
+    result
+}
+
+fn resolve_atc_experience_file_backed(
+    pool: &DbPool,
+    experience_id: u64,
+    outcome: &ExperienceOutcome,
+) -> std::result::Result<(), DbError> {
+    let id = i64::try_from(experience_id).map_err(|_| {
+        DbError::Internal(format!(
+            "experience_id exceeds SQLite INTEGER range: {experience_id}"
+        ))
+    })?;
+    let outcome_json = encode_json(outcome, "outcome_json")?;
+
+    let conn = open_canonical_atc_conn(pool, "resolve_atc_experience")?;
+    let result = (|| {
+        begin_canonical_atc_write_tx(&conn)?;
+        let sql = "UPDATE atc_experiences \
+                   SET state = 'resolved', resolved_ts = ?, outcome_json = ? \
+                   WHERE experience_id = ? AND state = 'open'";
+        let params = [
+            Value::BigInt(outcome.observed_ts_micros),
+            Value::Text(outcome_json),
+            Value::BigInt(id),
+        ];
+        canonical_execute_atc(&conn, sql, &params, "resolve_atc_experience update")?;
+        commit_canonical_atc_write_tx(&conn)
+    })();
+    if result.is_err() {
+        rollback_canonical_atc_write_tx(&conn);
+    }
+    close_canonical_db_conn(conn, "canonical ATC resolve connection");
+    result
+}
+
+fn update_atc_experience_rollup_file_backed(
+    pool: &DbPool,
+    stratum_key: &str,
+    subsystem: &str,
+    effect_kind: &str,
+    risk_tier: i32,
+    resolution_state: ExperienceState,
+    correct: bool,
+    actual_loss: f64,
+    regret: f64,
+    delay_micros: i64,
+    ts_micros: i64,
+) -> std::result::Result<(), DbError> {
+    const EWMA_LAMBDA: f64 = 0.95;
+
+    let (resolved_inc, censored_inc, expired_inc) = match resolution_state {
+        ExperienceState::Resolved => (1, 0, 0),
+        ExperienceState::Censored => (0, 1, 0),
+        ExperienceState::Expired => (0, 0, 1),
+        _ => (0, 0, 0),
+    };
+
+    let correct_inc: i64 = if correct { 1 } else { 0 };
+    let incorrect_inc: i64 = if correct { 0 } else { 1 };
+    let one_minus_lambda = 1.0 - EWMA_LAMBDA;
+
+    let conn = open_canonical_atc_conn(pool, "update_atc_experience_rollup")?;
+    let result = (|| {
+        begin_canonical_atc_write_tx(&conn)?;
+        let sql = "\
+            INSERT INTO atc_experience_rollups \
+                (stratum_key, subsystem, effect_kind, risk_tier, \
+                 total_count, resolved_count, censored_count, expired_count, \
+                 correct_count, incorrect_count, total_regret, total_loss, \
+                 ewma_loss, ewma_weight, delay_sum_micros, delay_count, delay_max_micros, \
+                 last_updated_ts) \
+            VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, 1.0, ?, 1, ?, ?) \
+            ON CONFLICT(stratum_key) DO UPDATE SET \
+                total_count = total_count + 1, \
+                resolved_count = resolved_count + ?, \
+                censored_count = censored_count + ?, \
+                expired_count = expired_count + ?, \
+                correct_count = correct_count + ?, \
+                incorrect_count = incorrect_count + ?, \
+                total_regret = total_regret + ?, \
+                total_loss = total_loss + ?, \
+                ewma_loss = ? * ewma_loss + ? * ?, \
+                ewma_weight = ? * ewma_weight + 1.0, \
+                delay_sum_micros = delay_sum_micros + ?, \
+                delay_count = delay_count + 1, \
+                delay_max_micros = MAX(delay_max_micros, ?), \
+                last_updated_ts = ?";
+        let params = vec![
+            Value::Text(stratum_key.to_string()),
+            Value::Text(subsystem.to_string()),
+            Value::Text(effect_kind.to_string()),
+            Value::Int(risk_tier),
+            Value::BigInt(resolved_inc),
+            Value::BigInt(censored_inc),
+            Value::BigInt(expired_inc),
+            Value::BigInt(correct_inc),
+            Value::BigInt(incorrect_inc),
+            Value::Double(regret),
+            Value::Double(actual_loss),
+            Value::Double(actual_loss),
+            Value::BigInt(delay_micros),
+            Value::BigInt(delay_micros),
+            Value::BigInt(ts_micros),
+            Value::BigInt(resolved_inc),
+            Value::BigInt(censored_inc),
+            Value::BigInt(expired_inc),
+            Value::BigInt(correct_inc),
+            Value::BigInt(incorrect_inc),
+            Value::Double(regret),
+            Value::Double(actual_loss),
+            Value::Double(EWMA_LAMBDA),
+            Value::Double(one_minus_lambda),
+            Value::Double(actual_loss),
+            Value::Double(EWMA_LAMBDA),
+            Value::BigInt(delay_micros),
+            Value::BigInt(delay_micros),
+            Value::BigInt(ts_micros),
+        ];
+        canonical_execute_atc(&conn, sql, &params, "update_atc_experience_rollup upsert")?;
+        commit_canonical_atc_write_tx(&conn)
+    })();
+    if result.is_err() {
+        rollback_canonical_atc_write_tx(&conn);
+    }
+    close_canonical_db_conn(conn, "canonical ATC rollup update connection");
+    result
+}
+
+fn fetch_atc_rollups_file_backed(pool: &DbPool) -> std::result::Result<Vec<AtcRollupRow>, DbError> {
+    let conn = open_canonical_atc_conn(pool, "fetch_atc_rollups")?;
+    let result = (|| {
+        let sql = "SELECT stratum_key, total_count, resolved_count, censored_count, \
+                   expired_count, correct_count, incorrect_count, total_regret, total_loss, \
+                   ewma_loss, ewma_weight \
+                   FROM atc_experience_rollups ORDER BY stratum_key";
+        let rows = canonical_query_atc_rows(&conn, sql, &[], "fetch_atc_rollups query")?;
+        let mut results = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let stratum_key = row
+                .get(0)
+                .and_then(|v| match v {
+                    Value::Text(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let total = row.get(1).and_then(value_as_i64).unwrap_or(0);
+            let resolved = row.get(2).and_then(value_as_i64).unwrap_or(0);
+            let censored = row.get(3).and_then(value_as_i64).unwrap_or(0);
+            let expired = row.get(4).and_then(value_as_i64).unwrap_or(0);
+            let correct = row.get(5).and_then(value_as_i64).unwrap_or(0);
+            let incorrect = row.get(6).and_then(value_as_i64).unwrap_or(0);
+            let regret = row
+                .get(7)
+                .and_then(|v| match v {
+                    Value::Double(f) => Some(*f),
+                    Value::Float(f) => Some(f64::from(*f)),
+                    _ => None,
+                })
+                .unwrap_or(0.0);
+            let loss = row
+                .get(8)
+                .and_then(|v| match v {
+                    Value::Double(f) => Some(*f),
+                    Value::Float(f) => Some(f64::from(*f)),
+                    _ => None,
+                })
+                .unwrap_or(0.0);
+            let ewma = row
+                .get(9)
+                .and_then(|v| match v {
+                    Value::Double(f) => Some(*f),
+                    Value::Float(f) => Some(f64::from(*f)),
+                    _ => None,
+                })
+                .unwrap_or(0.0);
+            let weight = row
+                .get(10)
+                .and_then(|v| match v {
+                    Value::Double(f) => Some(*f),
+                    Value::Float(f) => Some(f64::from(*f)),
+                    _ => None,
+                })
+                .unwrap_or(0.0);
+            results.push((
+                stratum_key,
+                total,
+                resolved,
+                censored,
+                expired,
+                correct,
+                incorrect,
+                regret,
+                loss,
+                ewma,
+                weight,
+            ));
+        }
+        Ok(results)
+    })();
+    close_canonical_db_conn(conn, "canonical ATC rollups fetch connection");
+    result
 }
 
 fn is_hard_post_commit_probe_error(_error: &DbError) -> bool {
@@ -8239,6 +8867,19 @@ pub async fn append_atc_experience(
     pool: &DbPool,
     row: &ExperienceRow,
 ) -> Outcome<ExperienceRow, DbError> {
+    if pool.sqlite_path() != ":memory:" {
+        match ensure_file_backed_atc_pool_initialized(cx, pool).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+        return match append_atc_experience_file_backed(pool, row) {
+            Ok(value) => Outcome::Ok(value),
+            Err(error) => Outcome::Err(error),
+        };
+    }
+
     fn sql_i64_id(field: &str, value: u64) -> std::result::Result<i64, DbError> {
         i64::try_from(value).map_err(|_| {
             DbError::Internal(format!("{field} exceeds SQLite INTEGER range: {value}"))
@@ -8381,7 +9022,7 @@ pub async fn append_atc_experience(
             Outcome::Err(error) => return Outcome::Err(error),
             Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-        };
+        }
     }
 
     fetch_durable_atc_experience_by_decision_effect(cx, pool, decision_id, effect_id).await
@@ -8585,6 +9226,26 @@ pub async fn transition_atc_experience(
     non_execution_reason: Option<&NonExecutionReason>,
     context_patch: Option<&serde_json::Value>,
 ) -> Outcome<(), DbError> {
+    if pool.sqlite_path() != ":memory:" {
+        match ensure_file_backed_atc_pool_initialized(cx, pool).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+        return match transition_atc_experience_file_backed(
+            pool,
+            experience_id,
+            new_state,
+            ts_micros,
+            non_execution_reason,
+            context_patch,
+        ) {
+            Ok(()) => Outcome::Ok(()),
+            Err(error) => Outcome::Err(error),
+        };
+    }
+
     let sql_experience_id = match i64::try_from(experience_id) {
         Ok(value) => value,
         Err(_) => {
@@ -8680,6 +9341,19 @@ pub async fn fetch_open_atc_experiences(
     subject: Option<&str>,
     limit: u32,
 ) -> Outcome<Vec<ExperienceRow>, DbError> {
+    if pool.sqlite_path() != ":memory:" {
+        match ensure_file_backed_atc_pool_initialized(cx, pool).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+        return match fetch_open_atc_experiences_file_backed(pool, subject, limit) {
+            Ok(rows) => Outcome::Ok(rows),
+            Err(error) => Outcome::Err(error),
+        };
+    }
+
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -8750,6 +9424,19 @@ pub async fn resolve_atc_experience(
     experience_id: u64,
     outcome: &ExperienceOutcome,
 ) -> Outcome<(), DbError> {
+    if pool.sqlite_path() != ":memory:" {
+        match ensure_file_backed_atc_pool_initialized(cx, pool).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+        return match resolve_atc_experience_file_backed(pool, experience_id, outcome) {
+            Ok(()) => Outcome::Ok(()),
+            Err(error) => Outcome::Err(error),
+        };
+    }
+
     let id = match i64::try_from(experience_id) {
         Ok(value) => value,
         Err(_) => {
@@ -8823,6 +9510,31 @@ pub async fn update_atc_experience_rollup(
     delay_micros: i64,
     ts_micros: i64,
 ) -> Outcome<(), DbError> {
+    if pool.sqlite_path() != ":memory:" {
+        match ensure_file_backed_atc_pool_initialized(cx, pool).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+        return match update_atc_experience_rollup_file_backed(
+            pool,
+            stratum_key,
+            subsystem,
+            effect_kind,
+            risk_tier,
+            resolution_state,
+            correct,
+            actual_loss,
+            regret,
+            delay_micros,
+            ts_micros,
+        ) {
+            Ok(()) => Outcome::Ok(()),
+            Err(error) => Outcome::Err(error),
+        };
+    }
+
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -8920,10 +9632,20 @@ pub async fn update_atc_experience_rollup(
 }
 
 /// Fetch rollup statistics for all strata.
-pub async fn fetch_atc_rollups(
-    cx: &Cx,
-    pool: &DbPool,
-) -> Outcome<Vec<(String, i64, i64, i64, i64, i64, i64, f64, f64, f64, f64)>, DbError> {
+pub async fn fetch_atc_rollups(cx: &Cx, pool: &DbPool) -> Outcome<Vec<AtcRollupRow>, DbError> {
+    if pool.sqlite_path() != ":memory:" {
+        match ensure_file_backed_atc_pool_initialized(cx, pool).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+        return match fetch_atc_rollups_file_backed(pool) {
+            Ok(rows) => Outcome::Ok(rows),
+            Err(error) => Outcome::Err(error),
+        };
+    }
+
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -9806,6 +10528,143 @@ mod tests {
             assert_eq!(durable.state, ExperienceState::Dispatched);
             assert_eq!(durable.dispatched_ts_micros, Some(1_700_000_000_011_500));
         });
+    }
+
+    #[test]
+    fn file_backed_atc_writes_preserve_sqlite_quick_check() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, dir) = setup_test_pool("file_backed_atc_quick_check.db");
+        let db_path = dir.path().join("file_backed_atc_quick_check.db");
+        let large_context_blob = "atc-context-".repeat(160);
+
+        rt.block_on(async {
+            for idx in 0_u64..256 {
+                let base_ts = 1_700_000_100_000_000_i64
+                    .saturating_add(i64::try_from(idx).expect("idx fits i64") * 10_000);
+                let row = ExperienceRow {
+                    experience_id: 0,
+                    decision_id: 10_000 + idx,
+                    effect_id: 20_000 + idx,
+                    trace_id: format!("trc-atc-quick-check-{idx}"),
+                    claim_id: format!("clm-atc-quick-check-{idx}"),
+                    evidence_id: format!("evi-atc-quick-check-{idx}"),
+                    state: ExperienceState::Planned,
+                    subsystem: ExperienceSubsystem::Liveness,
+                    decision_class: "liveness_transition".to_string(),
+                    subject: format!("Agent-{idx:03}"),
+                    project_key: Some("/tmp/atc-quick-check".to_string()),
+                    policy_id: Some("liveness-incumbent-r1".to_string()),
+                    effect_kind: EffectKind::Probe,
+                    action: "ProbeAgent".to_string(),
+                    posterior: vec![
+                        ("Alive".to_string(), 0.20),
+                        ("Flaky".to_string(), 0.55),
+                        ("Dead".to_string(), 0.25),
+                    ],
+                    expected_loss: 1.3,
+                    runner_up_action: Some("DeferProbe".to_string()),
+                    runner_up_loss: Some(1.9),
+                    evidence_summary: format!("probe candidate {idx}"),
+                    calibration_healthy: true,
+                    safe_mode_active: false,
+                    non_execution_reason: None,
+                    outcome: None,
+                    created_ts_micros: base_ts,
+                    dispatched_ts_micros: None,
+                    executed_ts_micros: None,
+                    resolved_ts_micros: None,
+                    features: Some(FeatureVector {
+                        posterior_alive_bp: 2000,
+                        posterior_flaky_bp: 5500,
+                        expected_loss_bp: 130,
+                        loss_gap_bp: 60,
+                        risk_tier: FeatureVector::risk_tier_for(EffectKind::Probe),
+                        ..FeatureVector::zeroed()
+                    }),
+                    feature_ext: None,
+                    context: Some(serde_json::json!({
+                        "large_blob": large_context_blob.clone(),
+                        "sequence": idx,
+                        "effect_family": {
+                            "kind": "probe_agent",
+                            "category": "probe"
+                        }
+                    })),
+                };
+
+                let stored = append_atc_experience(&cx, &pool, &row)
+                    .await
+                    .into_result()
+                    .expect("append ATC experience");
+                transition_atc_experience(
+                    &cx,
+                    &pool,
+                    stored.experience_id,
+                    ExperienceState::Dispatched,
+                    base_ts + 2_000,
+                    None,
+                    Some(&serde_json::json!({
+                        "execution": {
+                            "status": "dispatched",
+                            "attempt": idx + 1,
+                        }
+                    })),
+                )
+                .await
+                .into_result()
+                .expect("dispatch ATC experience");
+                transition_atc_experience(
+                    &cx,
+                    &pool,
+                    stored.experience_id,
+                    ExperienceState::Executed,
+                    base_ts + 4_000,
+                    None,
+                    Some(&serde_json::json!({
+                        "execution": {
+                            "status": "executed",
+                            "result": "probe_ok",
+                        }
+                    })),
+                )
+                .await
+                .into_result()
+                .expect("execute ATC experience");
+            }
+        });
+
+        pool.wal_checkpoint()
+            .expect("checkpoint ATC quick-check database");
+
+        let conn = crate::CanonicalDbConn::open_file(db_path.display().to_string())
+            .expect("open canonical quick-check connection");
+        conn.execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL)
+            .expect("apply canonical quick-check pragmas");
+        let rows = conn
+            .query_sync("PRAGMA quick_check", &[])
+            .expect("run quick_check");
+        let detail = rows
+            .first()
+            .and_then(|row| row.get_named::<String>("quick_check").ok())
+            .or_else(|| {
+                rows.first().and_then(|row| {
+                    row.get(0).and_then(|value| match value {
+                        Value::Text(text) => Some(text.clone()),
+                        _ => None,
+                    })
+                })
+            })
+            .expect("quick_check detail");
+        close_canonical_db_conn(conn, "ATC quick-check verification connection");
+
+        assert_eq!(
+            detail, "ok",
+            "file-backed ATC writes must preserve canonical sqlite integrity"
+        );
     }
 
     #[test]

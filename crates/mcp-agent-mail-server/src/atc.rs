@@ -5261,7 +5261,7 @@ impl AtcEngine {
     ) -> AtcEffectPlan {
         let semantics =
             self.effect_semantics_for(record, family, kind, &agent, project_key.as_deref());
-        let mut effect_seed = format!("{}:{kind}:{category}:{family}:{agent}", record.trace_id,);
+        let mut effect_seed = format!("{}:{kind}:{category}:{family}:{agent}", record.trace_id);
         if let Some(project_key) = project_key.as_deref() {
             effect_seed.push(':');
             effect_seed.push_str(project_key);
@@ -9490,6 +9490,7 @@ pub enum TrendDirection {
 
 /// Stable delta hint: tells consumers what materially changed since the
 /// last snapshot without requiring a full diff.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct SummaryDelta {
     /// Whether the execution posture changed.

@@ -1702,10 +1702,8 @@ impl SearchCockpitScreen {
         let names = self.preset_names();
         match key.code {
             KeyCode::Escape => self.preset_dialog_mode = PresetDialogMode::None,
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !names.is_empty() {
-                    self.load_preset_cursor = (self.load_preset_cursor + 1).min(names.len() - 1);
-                }
+            KeyCode::Char('j') | KeyCode::Down if !names.is_empty() => {
+                self.load_preset_cursor = (self.load_preset_cursor + 1).min(names.len() - 1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.load_preset_cursor = self.load_preset_cursor.saturating_sub(1);
@@ -3013,11 +3011,11 @@ impl MailScreen for SearchCockpitScreen {
                             return Cmd::None;
                         }
                     }
-                    MouseEventKind::Drag(MouseButton::Left) => {
-                        if self.dock_drag == DockDragState::Dragging {
-                            self.dock.drag_to(split_area, mouse.x, mouse.y);
-                            return Cmd::None;
-                        }
+                    MouseEventKind::Drag(MouseButton::Left)
+                        if self.dock_drag == DockDragState::Dragging =>
+                    {
+                        self.dock.drag_to(split_area, mouse.x, mouse.y);
+                        return Cmd::None;
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
                         self.dock_drag = DockDragState::Idle;
@@ -3193,31 +3191,25 @@ impl MailScreen for SearchCockpitScreen {
                             self.query_input.set_focused(true);
                         }
                         KeyCode::Tab | KeyCode::Char('f') => self.focus = Focus::FacetRail,
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            if !self.results.is_empty() {
-                                self.cursor = (self.cursor + 1).min(self.results.len() - 1);
-                                self.detail_scroll.set(0);
-                            }
+                        KeyCode::Char('j') | KeyCode::Down if !self.results.is_empty() => {
+                            self.cursor = (self.cursor + 1).min(self.results.len() - 1);
+                            self.detail_scroll.set(0);
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
                             self.cursor = self.cursor.saturating_sub(1);
                             self.detail_scroll.set(0);
                         }
-                        KeyCode::Char('G') | KeyCode::End => {
-                            if !self.results.is_empty() {
-                                self.cursor = self.results.len() - 1;
-                                self.detail_scroll.set(0);
-                            }
+                        KeyCode::Char('G') | KeyCode::End if !self.results.is_empty() => {
+                            self.cursor = self.results.len() - 1;
+                            self.detail_scroll.set(0);
                         }
                         KeyCode::Char('g') | KeyCode::Home => {
                             self.cursor = 0;
                             self.detail_scroll.set(0);
                         }
-                        KeyCode::Char('d') | KeyCode::PageDown => {
-                            if !self.results.is_empty() {
-                                self.cursor = (self.cursor + 20).min(self.results.len() - 1);
-                                self.detail_scroll.set(0);
-                            }
+                        KeyCode::Char('d') | KeyCode::PageDown if !self.results.is_empty() => {
+                            self.cursor = (self.cursor + 20).min(self.results.len() - 1);
+                            self.detail_scroll.set(0);
                         }
                         KeyCode::Char('u') | KeyCode::PageUp => {
                             self.cursor = self.cursor.saturating_sub(20);

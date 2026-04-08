@@ -24,6 +24,7 @@ use mcp_agent_mail_db::reconstruct::{
 };
 use serde_json::json;
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::path::Path;
 
 // ============================================================================
@@ -77,7 +78,7 @@ impl ReplayDiffReport {
         });
     }
 
-    fn is_clean(&self) -> bool {
+    const fn is_clean(&self) -> bool {
         self.mismatches.is_empty()
     }
 
@@ -88,12 +89,12 @@ impl ReplayDiffReport {
                 self.scenario
             );
             for mismatch in &self.mismatches {
-                report.push_str(&format!("  {mismatch}\n"));
+                let _ = writeln!(report, "  {mismatch}");
             }
             if !self.warnings.is_empty() {
                 report.push_str("Warnings:\n");
                 for warning in &self.warnings {
-                    report.push_str(&format!("  {warning}\n"));
+                    let _ = writeln!(report, "  {warning}");
                 }
             }
             panic!("{report}");
@@ -817,19 +818,19 @@ fn replay_salvage_merge_reconstruction() {
     if !bob_recipient.is_empty() {
         let read_ts = bob_recipient[0].get_named::<i64>("read_ts").ok();
         let ack_ts = bob_recipient[0].get_named::<i64>("ack_ts").ok();
-        if read_ts != Some(100000) {
+        if read_ts != Some(100_000) {
             report.add_mismatch(
                 "recipients",
                 "Bob read_ts for msg 1",
-                "100000",
+                "100_000",
                 &format!("{read_ts:?}"),
             );
         }
-        if ack_ts != Some(200000) {
+        if ack_ts != Some(200_000) {
             report.add_mismatch(
                 "recipients",
                 "Bob ack_ts for msg 1",
-                "200000",
+                "200_000",
                 &format!("{ack_ts:?}"),
             );
         }
@@ -1598,7 +1599,7 @@ fn replay_interrupted_bundle_still_has_valid_metadata() {
             let path = entry.path();
             if path.is_file() {
                 // Truncate to 10 bytes (corrupt the bundle's SQLite copy)
-                std::fs::write(&path, &[0u8; 10]).expect("truncate sqlite copy");
+                std::fs::write(&path, [0u8; 10]).expect("truncate sqlite copy");
             }
         }
     }

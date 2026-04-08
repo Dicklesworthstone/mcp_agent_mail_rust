@@ -1038,10 +1038,10 @@ fn restore_missing_detail_lists_from_previous(
     );
 }
 
-fn unique_previous_project_summary<'a, F>(
-    previous_rows: &'a [ProjectSummary],
+fn unique_previous_project_summary<F>(
+    previous_rows: &[ProjectSummary],
     mut predicate: F,
-) -> Option<&'a ProjectSummary>
+) -> Option<&ProjectSummary>
 where
     F: FnMut(&ProjectSummary) -> bool,
 {
@@ -1576,7 +1576,7 @@ fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
     .ok()
     .map(|rows| {
         rows.into_iter()
-            .filter_map(|row| {
+            .map(|row| {
                 let read_raw_id = |name: &str, index: usize| {
                     row.get_named::<i64>(name)
                         .ok()
@@ -1594,7 +1594,7 @@ fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
                         .filter(|value| !value.is_empty())
                         .unwrap_or(fallback)
                 };
-                Some(ContactSummary {
+                ContactSummary {
                     from_agent: read_text("from_agent", format!("[unknown-agent-{from_agent_id}]")),
                     to_agent: read_text("to_agent", format!("[unknown-agent-{to_agent_id}]")),
                     from_project_slug: read_text(
@@ -1609,7 +1609,7 @@ fn fetch_contacts_list(conn: &DbConn) -> Vec<ContactSummary> {
                     reason: row.get_named::<String>("reason").ok().unwrap_or_default(),
                     updated_ts: parse_raw_ts(&row, "updated_ts"),
                     expires_ts: parse_optional_raw_ts(&row, "expires_ts"),
-                })
+                }
             })
             .collect()
     })

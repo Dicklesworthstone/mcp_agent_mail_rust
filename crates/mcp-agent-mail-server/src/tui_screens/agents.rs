@@ -294,10 +294,7 @@ fn assert_agents_list_cardinality(total_db_agents: u64, rendered_count: usize, f
     }
 }
 
-fn unique_previous_agent_row<'a, F>(
-    previous_rows: &'a [AgentRow],
-    mut predicate: F,
-) -> Option<&'a AgentRow>
+fn unique_previous_agent_row<F>(previous_rows: &[AgentRow], mut predicate: F) -> Option<&AgentRow>
 where
     F: FnMut(&AgentRow) -> bool,
 {
@@ -550,7 +547,7 @@ impl AgentsScreen {
             {
                 // Keep the last good roster instead of surfacing a false empty state or
                 // collapsing project-scoped rows into blank placeholder identities.
-                rows = previous_rows.clone();
+                rows = previous_rows;
             }
         }
 
@@ -663,18 +660,16 @@ impl AgentsScreen {
                 }
                 MailEvent::MessageReceived {
                     from, to, project, ..
-                } => {
-                    if !self.reduced_motion {
+                } if !self.reduced_motion => {
+                    self.message_flash_ticks.insert(
+                        AgentIdentity::new(project.clone(), from.clone()),
+                        MESSAGE_FLASH_TICKS,
+                    );
+                    for recipient in to {
                         self.message_flash_ticks.insert(
-                            AgentIdentity::new(project.clone(), from.clone()),
+                            AgentIdentity::new(project.clone(), recipient.clone()),
                             MESSAGE_FLASH_TICKS,
                         );
-                        for recipient in to {
-                            self.message_flash_ticks.insert(
-                                AgentIdentity::new(project.clone(), recipient.clone()),
-                                MESSAGE_FLASH_TICKS,
-                            );
-                        }
                     }
                 }
                 MailEvent::AgentRegistered {
@@ -898,15 +893,11 @@ impl MailScreen for AgentsScreen {
             match key.code {
                 KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
                 KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-                KeyCode::Char('G') | KeyCode::End => {
-                    if !self.agents.is_empty() {
-                        self.table_state.selected = Some(self.agents.len() - 1);
-                    }
+                KeyCode::Char('G') | KeyCode::End if !self.agents.is_empty() => {
+                    self.table_state.selected = Some(self.agents.len() - 1);
                 }
-                KeyCode::Char('g') | KeyCode::Home => {
-                    if !self.agents.is_empty() {
-                        self.table_state.selected = Some(0);
-                    }
+                KeyCode::Char('g') | KeyCode::Home if !self.agents.is_empty() => {
+                    self.table_state.selected = Some(0);
                 }
                 KeyCode::Char('/') => {
                     self.filter_active = true;
@@ -930,11 +921,9 @@ impl MailScreen for AgentsScreen {
                 KeyCode::Char('K') => {
                     self.detail_scroll = self.detail_scroll.saturating_sub(1);
                 }
-                KeyCode::Escape => {
-                    if !self.filter.is_empty() {
-                        self.filter.clear();
-                        self.rebuild_from_state(state);
-                    }
+                KeyCode::Escape if !self.filter.is_empty() => {
+                    self.filter.clear();
+                    self.rebuild_from_state(state);
                 }
                 _ => {}
             }

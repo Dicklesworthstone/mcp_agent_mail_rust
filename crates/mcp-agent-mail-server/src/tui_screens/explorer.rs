@@ -1371,17 +1371,15 @@ impl MailScreen for MailExplorerScreen {
         // Mouse: scroll wheel moves result list cursor (parity with j/k)
         if let Event::Mouse(mouse) = event {
             match mouse.kind {
-                ftui::MouseEventKind::ScrollDown => {
-                    if self.focus == Focus::ResultList && !self.entries.is_empty() {
-                        self.cursor = (self.cursor + 1).min(self.entries.len() - 1);
-                        self.detail_scroll = 0;
-                    }
+                ftui::MouseEventKind::ScrollDown
+                    if self.focus == Focus::ResultList && !self.entries.is_empty() =>
+                {
+                    self.cursor = (self.cursor + 1).min(self.entries.len() - 1);
+                    self.detail_scroll = 0;
                 }
-                ftui::MouseEventKind::ScrollUp => {
-                    if self.focus == Focus::ResultList {
-                        self.cursor = self.cursor.saturating_sub(1);
-                        self.detail_scroll = 0;
-                    }
+                ftui::MouseEventKind::ScrollUp if self.focus == Focus::ResultList => {
+                    self.cursor = self.cursor.saturating_sub(1);
+                    self.detail_scroll = 0;
                 }
                 _ => {}
             }
@@ -1454,31 +1452,25 @@ impl MailScreen for MailExplorerScreen {
                     KeyCode::Tab | KeyCode::Char('f') => {
                         self.focus = Focus::FilterRail;
                     }
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if !self.entries.is_empty() {
-                            self.cursor = (self.cursor + 1).min(self.entries.len() - 1);
-                            self.detail_scroll = 0;
-                        }
+                    KeyCode::Char('j') | KeyCode::Down if !self.entries.is_empty() => {
+                        self.cursor = (self.cursor + 1).min(self.entries.len() - 1);
+                        self.detail_scroll = 0;
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         self.cursor = self.cursor.saturating_sub(1);
                         self.detail_scroll = 0;
                     }
-                    KeyCode::Char('G') | KeyCode::End => {
-                        if !self.entries.is_empty() {
-                            self.cursor = self.entries.len() - 1;
-                            self.detail_scroll = 0;
-                        }
+                    KeyCode::Char('G') | KeyCode::End if !self.entries.is_empty() => {
+                        self.cursor = self.entries.len() - 1;
+                        self.detail_scroll = 0;
                     }
                     KeyCode::Char('g') | KeyCode::Home => {
                         self.cursor = 0;
                         self.detail_scroll = 0;
                     }
-                    KeyCode::Char('d') | KeyCode::PageDown => {
-                        if !self.entries.is_empty() {
-                            self.cursor = (self.cursor + 20).min(self.entries.len() - 1);
-                            self.detail_scroll = 0;
-                        }
+                    KeyCode::Char('d') | KeyCode::PageDown if !self.entries.is_empty() => {
+                        self.cursor = (self.cursor + 20).min(self.entries.len() - 1);
+                        self.detail_scroll = 0;
                     }
                     KeyCode::Char('u') | KeyCode::PageUp => {
                         self.cursor = self.cursor.saturating_sub(20);

@@ -1386,27 +1386,18 @@ fn format_recovery_context() -> Option<String> {
 
     let owner_desc = match ownership.disposition {
         MailboxOwnershipDisposition::Unowned => "none".to_string(),
-        MailboxOwnershipDisposition::ActiveOtherOwner => {
-            if let Some(proc) = ownership.processes.first() {
-                format!("pid {} (active)", proc.pid)
-            } else {
-                "active (unknown pid)".to_string()
-            }
-        }
-        MailboxOwnershipDisposition::StaleLiveProcess => {
-            if let Some(proc) = ownership.processes.first() {
-                format!("pid {} (stale)", proc.pid)
-            } else {
-                "stale (unknown pid)".to_string()
-            }
-        }
-        MailboxOwnershipDisposition::DeletedExecutable => {
-            if let Some(proc) = ownership.processes.first() {
-                format!("pid {} (deleted executable)", proc.pid)
-            } else {
-                "deleted executable".to_string()
-            }
-        }
+        MailboxOwnershipDisposition::ActiveOtherOwner => ownership.processes.first().map_or_else(
+            || "active (unknown pid)".to_string(),
+            |proc| format!("pid {} (active)", proc.pid),
+        ),
+        MailboxOwnershipDisposition::StaleLiveProcess => ownership.processes.first().map_or_else(
+            || "stale (unknown pid)".to_string(),
+            |proc| format!("pid {} (stale)", proc.pid),
+        ),
+        MailboxOwnershipDisposition::DeletedExecutable => ownership.processes.first().map_or_else(
+            || "deleted executable".to_string(),
+            |proc| format!("pid {} (deleted executable)", proc.pid),
+        ),
         MailboxOwnershipDisposition::SplitBrain => format!(
             "split-brain ({} competing pids)",
             ownership.competing_pids.len()

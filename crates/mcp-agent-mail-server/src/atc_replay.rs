@@ -969,7 +969,7 @@ fn scenario_conflict_resolution() -> ScenarioManifest {
             paths: vec!["src/*.rs".into()],
             exclusive: true,
             project: "/tmp/project".into(),
-            timestamp_micros: 1 * US_PER_SEC,
+            timestamp_micros: US_PER_SEC,
         },
         // Theta tries overlapping reservation — conflict.
         ScenarioEvent::ReservationConflict {
@@ -1129,7 +1129,7 @@ fn scenario_suppressed_unsafe_action() -> ScenarioManifest {
         // Force safe mode on.
         ScenarioEvent::SetSafeMode {
             active: true,
-            timestamp_micros: 1 * US_PER_SEC,
+            timestamp_micros: US_PER_SEC,
         },
     ];
 
@@ -1284,7 +1284,7 @@ fn scenario_restart_recovery() -> ScenarioManifest {
         ScenarioEvent::AgentActivity {
             agent: "Xi".into(),
             project_key: None,
-            timestamp_micros: 1 * 60 * US_PER_SEC,
+            timestamp_micros: 60 * US_PER_SEC,
         },
         // Simulate restart by re-registering.
         ScenarioEvent::RegisterAgent {
@@ -1343,7 +1343,7 @@ fn scenario_degraded_learning_safe_mode() -> ScenarioManifest {
     // Force safe mode on (operator override).
     events.push(ScenarioEvent::SetSafeMode {
         active: true,
-        timestamp_micros: 1 * US_PER_SEC,
+        timestamp_micros: US_PER_SEC,
     });
 
     ScenarioManifest {
@@ -1736,7 +1736,7 @@ fn scenario_deadlock_cycle() -> ScenarioManifest {
             paths: vec!["file_a.rs".into()],
             exclusive: true,
             project: "/tmp/deadlock".into(),
-            timestamp_micros: 1 * US_PER_SEC,
+            timestamp_micros: US_PER_SEC,
         },
         // Chi holds file_b, wants file_a.
         ScenarioEvent::ReservationGranted {
@@ -1807,7 +1807,7 @@ fn scenario_multi_agent_conflict() -> ScenarioManifest {
             paths: vec!["shared.rs".into()],
             exclusive: true,
             project: "/tmp/multi".into(),
-            timestamp_micros: 1 * US_PER_SEC,
+            timestamp_micros: US_PER_SEC,
         },
         // Both Omega and AlphaB blocked.
         ScenarioEvent::ReservationConflict {

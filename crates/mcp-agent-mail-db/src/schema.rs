@@ -339,6 +339,12 @@ pub fn init_schema_sql_base() -> String {
 /// Schema version for migrations
 pub const SCHEMA_VERSION: i32 = 1;
 
+/// SQL for synchronizing SQLite `user_version` with the current schema version.
+#[must_use]
+pub fn schema_user_version_sql() -> String {
+    format!("PRAGMA user_version = {SCHEMA_VERSION};")
+}
+
 /// Name of the schema migration tracking table.
 ///
 /// Stored in the same `SQLite` database as the rest of Agent Mail data.
@@ -3415,7 +3421,8 @@ VALUES (1, 2, 'to', NULL, NULL);
 INSERT INTO file_reservations (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
 VALUES (1, 1, 1, 'src/legacy/**', 1, 'legacy reservation', '2026-02-24 15:33:00', '2026-12-24 15:33:00', NULL);
 ";
-        let seed_conn = DbConn::open_file(&db_path.display().to_string()).expect("open seed db");
+        let seed_db_path = db_path.to_string_lossy();
+        let seed_conn = DbConn::open_file(seed_db_path.as_ref()).expect("open seed db");
         for statement in seed_sql
             .split(';')
             .map(str::trim)

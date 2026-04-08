@@ -1413,15 +1413,11 @@ impl MailScreen for ToolMetricsScreen {
             match key.code {
                 KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
                 KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-                KeyCode::Char('G') | KeyCode::End => {
-                    if !self.sorted_tools.is_empty() {
-                        self.set_selected_index(Some(self.sorted_tools.len() - 1));
-                    }
+                KeyCode::Char('G') | KeyCode::End if !self.sorted_tools.is_empty() => {
+                    self.set_selected_index(Some(self.sorted_tools.len() - 1));
                 }
-                KeyCode::Char('g') | KeyCode::Home => {
-                    if !self.sorted_tools.is_empty() {
-                        self.set_selected_index(Some(0));
-                    }
+                KeyCode::Char('g') | KeyCode::Home if !self.sorted_tools.is_empty() => {
+                    self.set_selected_index(Some(0));
                 }
                 KeyCode::Char('s') => {
                     self.sort_col = (self.sort_col + 1) % SORT_LABELS.len();
@@ -1462,14 +1458,12 @@ impl MailScreen for ToolMetricsScreen {
                         self.disclosure_level = DisclosureLevel::Detail;
                     }
                 }
-                KeyCode::Escape => {
+                KeyCode::Escape if self.drilldown_active => {
                     // Step up one level or deactivate drill-down.
-                    if self.drilldown_active {
-                        if self.disclosure_level == DisclosureLevel::Badge {
-                            self.drilldown_active = false;
-                        } else {
-                            self.disclosure_level = self.disclosure_level.prev();
-                        }
+                    if self.disclosure_level == DisclosureLevel::Badge {
+                        self.drilldown_active = false;
+                    } else {
+                        self.disclosure_level = self.disclosure_level.prev();
                     }
                 }
                 KeyCode::Char('1') => {

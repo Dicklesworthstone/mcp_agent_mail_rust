@@ -263,7 +263,7 @@ impl std::ops::Deref for ResourceReadPool {
     }
 }
 
-/// Check whether the live SQLite database is suspect for resource reads.
+/// Check whether the live `SQLite` database is suspect for resource reads.
 ///
 /// Delegates to the fast mailbox verdict. When `DurabilityState` is
 /// `DegradedReadOnly` (or worse), resource reads should fall back to

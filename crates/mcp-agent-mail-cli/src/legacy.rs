@@ -1114,12 +1114,11 @@ fn build_detect_report(
     // If no binary is found at all, keep markers — there may be orphaned
     // Python artifacts (database, pyproject.toml) worth migrating even
     // though the Python binary itself was removed.
-    if !markers.is_empty() {
-        if let Some(binary_path) = find_installed_am_binary() {
-            if !is_likely_python_binary(&binary_path) {
-                markers.clear();
-            }
-        }
+    if !markers.is_empty()
+        && let Some(binary_path) = find_installed_am_binary()
+        && !is_likely_python_binary(&binary_path)
+    {
+        markers.clear();
     }
 
     let score: u32 = markers
@@ -1236,24 +1235,23 @@ fn is_likely_python_binary(path: &Path) -> bool {
 /// path directly.  Otherwise we fall back to a PATH lookup via `which`.
 fn find_installed_am_binary() -> Option<PathBuf> {
     // If the currently-running executable is `am`, use it directly.
-    if let Ok(exe) = std::env::current_exe() {
-        if exe
+    if let Ok(exe) = std::env::current_exe()
+        && exe
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|name| name == "am")
-        {
-            return Some(exe);
-        }
+    {
+        return Some(exe);
     }
     // Fallback: look up `am` in PATH via `which`.
-    if let Ok(output) = std::process::Command::new("which").arg("am").output() {
-        if output.status.success() {
-            let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path_str.is_empty() {
-                let p = PathBuf::from(path_str);
-                if p.exists() {
-                    return Some(p);
-                }
+    if let Ok(output) = std::process::Command::new("which").arg("am").output()
+        && output.status.success()
+    {
+        let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path_str.is_empty() {
+            let p = PathBuf::from(path_str);
+            if p.exists() {
+                return Some(p);
             }
         }
     }

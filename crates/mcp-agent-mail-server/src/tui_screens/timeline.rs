@@ -1309,10 +1309,8 @@ impl TimelineScreen {
             KeyCode::Escape => {
                 self.preset_dialog_mode = PresetDialogMode::None;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !names.is_empty() {
-                    self.load_preset_cursor = (self.load_preset_cursor + 1).min(names.len() - 1);
-                }
+            KeyCode::Char('j') | KeyCode::Down if !names.is_empty() => {
+                self.load_preset_cursor = (self.load_preset_cursor + 1).min(names.len() - 1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.load_preset_cursor = self.load_preset_cursor.saturating_sub(1);
@@ -1540,15 +1538,15 @@ impl MailScreen for TimelineScreen {
             Event::Mouse(mouse) => {
                 let area = self.last_area.get();
                 match mouse.kind {
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        if self.dock.hit_test_border(area, mouse.x, mouse.y) {
-                            self.dock_drag = DockDragState::Dragging;
-                        }
+                    MouseEventKind::Down(MouseButton::Left)
+                        if self.dock.hit_test_border(area, mouse.x, mouse.y) =>
+                    {
+                        self.dock_drag = DockDragState::Dragging;
                     }
-                    MouseEventKind::Drag(MouseButton::Left) => {
-                        if self.dock_drag == DockDragState::Dragging {
-                            self.dock.drag_to(area, mouse.x, mouse.y);
-                        }
+                    MouseEventKind::Drag(MouseButton::Left)
+                        if self.dock_drag == DockDragState::Dragging =>
+                    {
+                        self.dock.drag_to(area, mouse.x, mouse.y);
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
                         self.dock_drag = DockDragState::Idle;
@@ -2334,7 +2332,7 @@ fn render_timeline(
         String::new()
     };
     let title =
-        format!("Timeline ({pos}){follow_tag}{verbosity_tag}{filter_tag}{selected_tag}{dock_tag}",);
+        format!("Timeline ({pos}){follow_tag}{verbosity_tag}{filter_tag}{selected_tag}{dock_tag}");
 
     // Render block/border first.
     let tp = crate::tui_theme::TuiThemePalette::current();
@@ -2669,7 +2667,7 @@ fn render_timeline_log_viewer(
         String::new()
     };
     let title =
-        format!("Timeline LogViewer ({pos}){follow_tag}{verbosity_tag}{filter_tag}{dock_tag}",);
+        format!("Timeline LogViewer ({pos}){follow_tag}{verbosity_tag}{filter_tag}{dock_tag}");
 
     let tp = crate::tui_theme::TuiThemePalette::current();
     let block = Block::default()

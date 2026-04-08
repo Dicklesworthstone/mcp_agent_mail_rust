@@ -531,8 +531,10 @@ fn stress_concurrent_file_reservations() {
         }
         _ => panic!("unexpected outcome"),
     };
-    let _winner = winner;
-    let _loser = loser;
+    assert_ne!(
+        winner, loser,
+        "exactly one agent should win the reservation"
+    );
 }
 
 // =============================================================================

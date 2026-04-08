@@ -1347,16 +1347,13 @@ impl MessageBrowserScreen {
     }
 
     fn runtime_config_from_state(state: Option<&TuiSharedState>) -> mcp_agent_mail_core::Config {
-        match state {
-            Some(shared) => {
-                let snapshot = shared.config_snapshot();
-                let mut config = mcp_agent_mail_core::Config::from_env();
-                config.database_url = snapshot.raw_database_url;
-                config.storage_root = PathBuf::from(snapshot.storage_root);
-                config
-            }
-            None => mcp_agent_mail_core::Config::from_env(),
-        }
+        state.map_or_else(mcp_agent_mail_core::Config::from_env, |shared| {
+            let snapshot = shared.config_snapshot();
+            let mut config = mcp_agent_mail_core::Config::from_env();
+            config.database_url = snapshot.raw_database_url;
+            config.storage_root = PathBuf::from(snapshot.storage_root);
+            config
+        })
     }
 
     fn open_live_mutation_db_connection(state: Option<&TuiSharedState>) -> Result<DbConn, String> {
@@ -2081,10 +2078,8 @@ impl MessageBrowserScreen {
             KeyCode::Escape => {
                 self.preset_dialog_mode = PresetDialogMode::None;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !names.is_empty() {
-                    self.load_preset_cursor = (self.load_preset_cursor + 1).min(names.len() - 1);
-                }
+            KeyCode::Char('j') | KeyCode::Down if !names.is_empty() => {
+                self.load_preset_cursor = (self.load_preset_cursor + 1).min(names.len() - 1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.load_preset_cursor = self.load_preset_cursor.saturating_sub(1);
@@ -3063,24 +3058,20 @@ impl MailScreen for MessageBrowserScreen {
                             return Cmd::None;
                         }
                         // Cursor navigation
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            if !self.results.is_empty() {
-                                self.cursor = (self.cursor + 1).min(self.results.len() - 1);
-                                self.detail_scroll.set(0);
-                                self.extend_visual_selection_to_cursor();
-                            }
+                        KeyCode::Char('j') | KeyCode::Down if !self.results.is_empty() => {
+                            self.cursor = (self.cursor + 1).min(self.results.len() - 1);
+                            self.detail_scroll.set(0);
+                            self.extend_visual_selection_to_cursor();
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
                             self.cursor = self.cursor.saturating_sub(1);
                             self.detail_scroll.set(0);
                             self.extend_visual_selection_to_cursor();
                         }
-                        KeyCode::Char('G') | KeyCode::End => {
-                            if !self.results.is_empty() {
-                                self.cursor = self.results.len() - 1;
-                                self.detail_scroll.set(0);
-                                self.extend_visual_selection_to_cursor();
-                            }
+                        KeyCode::Char('G') | KeyCode::End if !self.results.is_empty() => {
+                            self.cursor = self.results.len() - 1;
+                            self.detail_scroll.set(0);
+                            self.extend_visual_selection_to_cursor();
                         }
                         KeyCode::Home => {
                             self.cursor = 0;
@@ -3093,12 +3084,10 @@ impl MailScreen for MessageBrowserScreen {
                             return Cmd::None;
                         }
                         // Page navigation
-                        KeyCode::Char('d') | KeyCode::PageDown => {
-                            if !self.results.is_empty() {
-                                self.cursor = (self.cursor + 20).min(self.results.len() - 1);
-                                self.detail_scroll.set(0);
-                                self.extend_visual_selection_to_cursor();
-                            }
+                        KeyCode::Char('d') | KeyCode::PageDown if !self.results.is_empty() => {
+                            self.cursor = (self.cursor + 20).min(self.results.len() - 1);
+                            self.detail_scroll.set(0);
+                            self.extend_visual_selection_to_cursor();
                         }
                         KeyCode::Char('u') | KeyCode::PageUp => {
                             self.cursor = self.cursor.saturating_sub(20);
@@ -6006,7 +5995,7 @@ first body
         let (storage_root, db_path) = write_archive_ahead_fixture(dir.path());
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config {
             database_url: format!("sqlite:///{}", db_path.display()),
-            storage_root: storage_root.clone(),
+            storage_root,
             ..Default::default()
         });
         let mut screen = MessageBrowserScreen::new();

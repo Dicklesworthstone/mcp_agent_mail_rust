@@ -3190,10 +3190,9 @@ pub async fn fetch_inbox(
     // is degraded the write will fail gracefully (already best-effort).
     {
         let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
-        let write_path = match get_db_pool() {
-            Ok(live_pool) => Some(live_pool.sqlite_path().to_string()),
-            Err(_) => None,
-        };
+        let write_path = get_db_pool()
+            .ok()
+            .map(|live_pool| live_pool.sqlite_path().to_string());
         if let Some(ref live_sqlite_path) = write_path {
             if let Err(e) = mcp_agent_mail_db::sync::mark_messages_read_batch_sync(
                 live_sqlite_path,

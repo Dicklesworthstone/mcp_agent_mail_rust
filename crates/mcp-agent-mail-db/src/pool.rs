@@ -19,7 +19,7 @@ use sqlmodel_pool::{Pool, PoolConfig, PooledConnection};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone)]
@@ -67,6 +67,7 @@ pub enum MailboxOwnershipDisposition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct MailboxOwnershipProcess {
     pub pid: u32,
     pub command: Option<String>,
@@ -317,7 +318,7 @@ impl RecoveryAction {
     }
 
     /// All recovery actions, in declaration order.
-    pub const ALL: &'static [RecoveryAction] = &[
+    pub const ALL: &'static [Self] = &[
         Self::WalCheckpointPassive,
         Self::WalCheckpointTruncate,
         Self::StaleLockCleanup,
@@ -336,7 +337,7 @@ impl RecoveryAction {
     ];
 
     /// All silent self-heal actions.
-    pub const SILENT: &'static [RecoveryAction] = &[
+    pub const SILENT: &'static [Self] = &[
         Self::WalCheckpointPassive,
         Self::WalCheckpointTruncate,
         Self::StaleLockCleanup,
@@ -349,7 +350,7 @@ impl RecoveryAction {
     ];
 
     /// All actions requiring explicit escalation.
-    pub const ESCALATED: &'static [RecoveryAction] = &[
+    pub const ESCALATED: &'static [Self] = &[
         Self::ReconstructFromArchive,
         Self::DeleteCorruptDb,
         Self::ForceUnlockContested,
@@ -433,15 +434,16 @@ impl RecoveryAdmissionController {
     pub const MAX_ATTEMPTS_IN_WINDOW: usize = 5;
 
     /// The sliding window over which [`MAX_ATTEMPTS_IN_WINDOW`] is tracked.
-    pub const SUPPRESSION_WINDOW: Duration = Duration::from_secs(300); // 5 minutes
+    pub const SUPPRESSION_WINDOW: Duration = Duration::from_mins(5);
 
     /// Base delay for exponential backoff (doubles on each consecutive failure).
     pub const BACKOFF_BASE: Duration = Duration::from_secs(2);
 
     /// Maximum backoff delay (cap to avoid unbounded wait).
-    pub const BACKOFF_CAP: Duration = Duration::from_secs(120); // 2 minutes
+    pub const BACKOFF_CAP: Duration = Duration::from_mins(2);
 
     /// Create a new controller in the ready (un-suppressed, no backoff) state.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             in_progress: std::sync::atomic::AtomicBool::new(false),
@@ -470,34 +472,40 @@ impl RecoveryAdmissionController {
         // Fast path: check suppression and backoff without acquiring the Mutex
         // on every call — but we do need the Mutex to read timestamps safely.
         {
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             let now = Instant::now();
 
             // Check loop suppression.
-            if let Some(until) = state.suppressed_until {
-                if now < until {
-                    tracing::warn!(
-                        remaining_secs = (until - now).as_secs(),
-                        "recovery admission suppressed — too many attempts in window"
-                    );
-                    return None;
-                }
+            if let Some(until) = state.suppressed_until
+                && now < until
+            {
+                tracing::warn!(
+                    remaining_secs = until
+                        .checked_duration_since(now)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    "recovery admission suppressed — too many attempts in window"
+                );
+                return None;
                 // Window expired — suppression will be cleared on next state update.
             }
 
             // Check exponential backoff.
-            if state.consecutive_failures > 0 {
-                if let Some(last) = state.last_attempt {
-                    let required_delay = Self::backoff_delay(state.consecutive_failures);
-                    let elapsed = now.saturating_duration_since(last);
-                    if elapsed < required_delay {
-                        tracing::info!(
-                            consecutive_failures = state.consecutive_failures,
-                            remaining_secs = (required_delay - elapsed).as_secs(),
-                            "recovery admission deferred — exponential backoff in effect"
-                        );
-                        return None;
-                    }
+            if state.consecutive_failures > 0
+                && let Some(last) = state.last_attempt
+            {
+                let required_delay = Self::backoff_delay(state.consecutive_failures);
+                let elapsed = now.saturating_duration_since(last);
+                if elapsed < required_delay {
+                    tracing::info!(
+                        consecutive_failures = state.consecutive_failures,
+                        remaining_secs = required_delay
+                            .checked_sub(elapsed)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        "recovery admission deferred — exponential backoff in effect"
+                    );
+                    return None;
                 }
             }
         }
@@ -523,7 +531,7 @@ impl RecoveryAdmissionController {
     /// Record a successful recovery. Resets consecutive-failure count and
     /// clears any active suppression.
     pub fn report_success(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
         state.consecutive_failures = 0;
         state.last_attempt = Some(now);
@@ -536,7 +544,7 @@ impl RecoveryAdmissionController {
     /// records the attempt in the sliding window, and may activate
     /// loop suppression if the window threshold is exceeded.
     pub fn report_failure(&self) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
         state.last_attempt = Some(now);
@@ -567,7 +575,7 @@ impl RecoveryAdmissionController {
         let delay_ms = Self::BACKOFF_BASE
             .as_millis()
             .saturating_mul(u128::from(multiplier));
-        let delay = Duration::from_millis(delay_ms.min(u128::from(u64::MAX)) as u64);
+        let delay = Duration::from_millis(u64::try_from(delay_ms).unwrap_or(u64::MAX));
         if delay > Self::BACKOFF_CAP {
             Self::BACKOFF_CAP
         } else {
@@ -578,13 +586,13 @@ impl RecoveryAdmissionController {
     /// Return the current admission status for diagnostics.
     #[must_use]
     pub fn status(&self) -> RecoveryAdmissionStatus {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
         RecoveryAdmissionStatus {
             in_progress: self.in_progress.load(std::sync::atomic::Ordering::SeqCst),
             consecutive_failures: state.consecutive_failures,
             attempts_in_window: state.window_attempts.len(),
-            suppressed: state.suppressed_until.map_or(false, |until| now < until),
+            suppressed: state.suppressed_until.is_some_and(|until| now < until),
             current_backoff: Self::backoff_delay(state.consecutive_failures),
         }
     }
@@ -604,11 +612,17 @@ impl RecoveryAdmissionController {
     pub fn reset(&self) {
         self.in_progress
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.consecutive_failures = 0;
         state.last_attempt = None;
         state.window_attempts.clear();
         state.suppressed_until = None;
+    }
+}
+
+impl Default for RecoveryAdmissionController {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -648,7 +662,7 @@ static RECOVERY_ADMISSION: OnceLock<RecoveryAdmissionController> = OnceLock::new
 /// Access the global recovery admission controller.
 #[must_use]
 pub fn recovery_admission() -> &'static RecoveryAdmissionController {
-    RECOVERY_ADMISSION.get_or_init(RecoveryAdmissionController::new)
+    RECOVERY_ADMISSION.get_or_init(RecoveryAdmissionController::default)
 }
 
 // ============================================================================
@@ -910,20 +924,23 @@ struct DeferredWriteQueueInner {
 /// preventing unbounded memory growth if recovery stalls.
 pub const DEFAULT_DEFERRED_WRITE_CAPACITY: usize = 1024;
 
-/// Default maximum age (seconds) for the oldest deferred write before the
-/// queue triggers a hard-stop. If the oldest entry is older than this, no
+/// Default maximum age for the oldest deferred write.
+///
+/// If the oldest entry is older than this, no
 /// new writes are accepted — the system is stalled and needs operator
 /// attention rather than quiet indefinite queuing.
 pub const DEFAULT_DEFERRED_WRITE_MAX_AGE_SECS: u64 = 300;
 
-/// Default estimated byte budget for the entire deferred queue. This is a
-/// soft limit — individual enqueue calls estimate their contribution and
+/// Default estimated byte budget for the entire deferred queue.
+///
+/// This is a soft limit — individual enqueue calls estimate their contribution and
 /// reject when the running total exceeds this threshold. Prevents memory
 /// exhaustion from large SQL payloads (e.g. multi-MB message bodies).
 pub const DEFAULT_DEFERRED_WRITE_MAX_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 
-/// Default per-operation fairness limit. No single operation type may
-/// consume more than this fraction of the queue capacity. Prevents a
+/// Default per-operation fairness limit.
+///
+/// No single operation type may consume more than this fraction of the queue capacity. Prevents a
 /// chatty tool (e.g. `send_message` in a broadcast loop) from starving
 /// other operation types.
 pub const DEFAULT_DEFERRED_WRITE_FAIRNESS_LIMIT_PCT: u8 = 60;
@@ -1012,6 +1029,8 @@ impl DeferredWriteQueue {
         params: Vec<Value>,
         operation: &'static str,
     ) -> DeferralOutcome {
+        let now_us = crate::now_micros();
+        let entry_bytes = estimate_deferred_write_bytes(&sql, &params);
         let mut inner = self.state.lock().expect("DeferredWriteQueue poisoned");
 
         if !inner.active {
@@ -1020,8 +1039,6 @@ impl DeferredWriteQueue {
         if inner.sealed {
             return DeferralOutcome::Sealed;
         }
-
-        let now_us = crate::now_micros();
 
         // Hard-stop: oldest entry exceeded max age → recovery is stalled.
         if let Some(oldest) = inner.entries.first() {
@@ -1037,7 +1054,6 @@ impl DeferredWriteQueue {
         }
 
         // Hard-stop: estimated bytes exceeded budget.
-        let entry_bytes = estimate_deferred_write_bytes(&sql, &params);
         if inner.estimated_bytes.saturating_add(entry_bytes) > inner.policy.max_bytes {
             inner.shed_count = inner.shed_count.saturating_add(1);
             return DeferralOutcome::HardStopBytes {
@@ -1082,6 +1098,7 @@ impl DeferredWriteQueue {
             operation,
         });
 
+        drop(inner);
         DeferralOutcome::Queued { position: seq }
     }
 
@@ -1100,6 +1117,7 @@ impl DeferredWriteQueue {
         inner.estimated_bytes = 0;
         inner.per_operation_counts.clear();
         let mut entries = std::mem::take(&mut inner.entries);
+        drop(inner);
         entries.sort_by_key(|e| e.seq);
         entries
     }
@@ -1129,13 +1147,15 @@ impl DeferredWriteQueue {
     #[must_use]
     pub fn pressure(&self) -> BacklogPressure {
         let inner = self.state.lock().expect("DeferredWriteQueue poisoned");
-        if !inner.active && !inner.sealed {
-            return BacklogPressure::Normal;
-        }
-        if inner.sealed {
-            return BacklogPressure::HardStop;
-        }
-        compute_backlog_pressure(&inner)
+        let pressure = if !inner.active && !inner.sealed {
+            BacklogPressure::Normal
+        } else if inner.sealed {
+            BacklogPressure::HardStop
+        } else {
+            compute_backlog_pressure(&inner)
+        };
+        drop(inner);
+        pressure
     }
 
     /// Age of the oldest deferred entry in seconds, or 0 if the queue is empty.
@@ -1170,7 +1190,7 @@ impl DeferredWriteQueue {
         } else {
             compute_backlog_pressure(&inner)
         };
-        DeferredWriteQueueStatus {
+        let status = DeferredWriteQueueStatus {
             active: inner.active,
             sealed: inner.sealed,
             queued: inner.entries.len(),
@@ -1180,7 +1200,9 @@ impl DeferredWriteQueue {
             oldest_age_secs: oldest_entry_age_secs(&inner),
             pressure,
             shed_count: inner.shed_count,
-        }
+        };
+        drop(inner);
+        status
     }
 }
 
@@ -1391,6 +1413,7 @@ impl WriteRouteDisposition {
 /// Authority surfaces ([`MutatingSurface::Supervisor`] and
 /// [`MutatingSurface::Migration`]) bypass ownership and deferral checks
 /// because they *are* the recovery/upgrade authority.
+#[must_use]
 pub fn evaluate_write_route(
     surface: MutatingSurface,
     ownership: &MailboxOwnershipState,
@@ -1470,7 +1493,7 @@ pub fn evaluate_write_route(
 
         let holder = recovery_lock
             .pid
-            .map_or("unknown".to_string(), |pid| format!("pid {pid}"));
+            .map_or_else(|| "unknown".to_string(), |pid| format!("pid {pid}"));
         return WriteRouteDisposition::Refused {
             reason: format!(
                 "Recovery lock held by {holder}; writes are blocked until recovery completes."
@@ -2972,6 +2995,19 @@ async fn run_sqlite_init_once(
         )));
     }
 
+    if let Err(err) = execute_sql_with_lock_retry(
+        &runtime_conn,
+        sqlite_path,
+        &schema::schema_user_version_sql(),
+        "sqlite init set user_version",
+    ) {
+        tracing::warn!(
+            path = %sqlite_path,
+            error = %err,
+            "failed to synchronize PRAGMA user_version after init"
+        );
+    }
+
     // Switch to WAL journal mode AFTER migrations complete.
     //
     // Migrations run in DELETE (rollback) mode for safety. Runtime connections
@@ -3269,13 +3305,15 @@ fn reconcile_archive_state_before_init(
 
     let db_inventory = inspect_mailbox_db_inventory(primary_path)?;
     let archive_max_id = archive.latest_message_id.unwrap_or(0);
+    let archive_message_count = archive.unique_message_ids;
+    let db_message_count = db_inventory.messages;
     let missing_archive_projects = crate::reconstruct::archive_missing_project_identities(
         &archive,
         &db_inventory.project_identities,
     );
     let archive_projects_ahead = archive.projects > db_inventory.projects;
     let archive_agents_ahead = archive.agents > db_inventory.agents;
-    let archive_messages_ahead = archive.unique_message_ids > db_inventory.messages;
+    let archive_messages_ahead = archive_message_count > db_message_count;
     let archive_latest_id_ahead = archive_max_id > db_inventory.max_message_id;
     let archive_identity_ahead = !missing_archive_projects.is_empty();
     let archive_ahead = archive_projects_ahead
@@ -4232,9 +4270,9 @@ pub fn inspect_mailbox_sidecar_state(db_path: &Path) -> MailboxSidecarState {
     let shm_meta = std::fs::metadata(&shm_path).ok();
 
     MailboxSidecarState {
-        wal_exists: wal_meta.as_ref().is_some_and(|meta| meta.is_file()),
+        wal_exists: wal_meta.as_ref().is_some_and(std::fs::Metadata::is_file),
         wal_bytes: wal_meta.as_ref().map(std::fs::Metadata::len),
-        shm_exists: shm_meta.as_ref().is_some_and(|meta| meta.is_file()),
+        shm_exists: shm_meta.as_ref().is_some_and(std::fs::Metadata::is_file),
         shm_bytes: shm_meta.as_ref().map(std::fs::Metadata::len),
         live_sidecars: sqlite_file_has_live_sidecars(db_path),
     }
@@ -4319,6 +4357,13 @@ fn mailbox_activity_lock_path_for_storage_root(storage_root: &Path) -> PathBuf {
 }
 
 #[cfg(target_os = "linux")]
+fn linux_device_numbers(dev: u64) -> (u32, u32) {
+    let major = u32::try_from((dev >> 8) & 0xfff).unwrap_or(u32::MAX);
+    let minor = u32::try_from((dev & 0xff) | ((dev >> 12) & 0xfff00)).unwrap_or(u32::MAX);
+    (major, minor)
+}
+
+#[cfg(target_os = "linux")]
 fn lock_holder_pids_via_proc(path: &Path) -> Vec<u32> {
     use std::os::unix::fs::MetadataExt;
 
@@ -4327,8 +4372,7 @@ fn lock_holder_pids_via_proc(path: &Path) -> Vec<u32> {
     };
     let target_ino = meta.ino();
     let target_dev = meta.dev();
-    let target_major = ((target_dev >> 8) & 0xfff) as u32;
-    let target_minor = ((target_dev & 0xff) | ((target_dev >> 12) & 0xfff00)) as u32;
+    let (target_major, target_minor) = linux_device_numbers(target_dev);
     let Ok(locks_content) = std::fs::read_to_string("/proc/locks") else {
         return Vec::new();
     };
@@ -4471,9 +4515,7 @@ fn pid_executable_path(_pid: u32) -> Option<PathBuf> {
 }
 
 fn pid_executable_deleted(pid: u32) -> bool {
-    pid_executable_path(pid)
-        .map(|path| path.to_string_lossy().contains(" (deleted)"))
-        .unwrap_or(false)
+    pid_executable_path(pid).is_some_and(|path| path.to_string_lossy().contains(" (deleted)"))
 }
 
 fn pid_is_agent_mail(pid: u32) -> bool {
@@ -5517,10 +5559,9 @@ pub fn get_or_create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
         let guard = cache.read();
         if let Some(pool) = guard.get(&cache_key)
             && let Some(shared_pool) = pool.upgrade()
+            && !shared_pool.is_closed()
         {
-            if !shared_pool.is_closed() {
-                return DbPool::from_shared_pool(config, shared_pool);
-            }
+            return DbPool::from_shared_pool(config, shared_pool);
         }
     }
 
@@ -5528,12 +5569,13 @@ pub fn get_or_create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
     // evict dead weak entries left after all callers dropped a pool.
     let mut guard = cache.write();
     // Double-check after acquiring write lock — another thread may have won the race.
-    if let Some(pool) = guard.get(&cache_key) {
-        if let Some(shared_pool) = pool.upgrade() {
-            if !shared_pool.is_closed() {
-                return DbPool::from_shared_pool(config, shared_pool);
-            }
-        }
+    if let Some(pool) = guard.get(&cache_key)
+        && let Some(shared_pool) = pool.upgrade()
+        && !shared_pool.is_closed()
+    {
+        return DbPool::from_shared_pool(config, shared_pool);
+    }
+    if guard.contains_key(&cache_key) {
         guard.remove(&cache_key);
     }
 
@@ -5722,7 +5764,7 @@ impl CanaryAlertTier {
     }
 
     /// All alert tiers in severity order (lowest to highest).
-    pub const ALL: &'static [CanaryAlertTier] = &[
+    pub const ALL: &'static [Self] = &[
         Self::Silent,
         Self::Observable,
         Self::Warning,
@@ -5749,6 +5791,30 @@ pub struct CanaryAlertPolicy {
     pub reason: &'static str,
     /// Human-readable detail message.
     pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Recovery outcome observed during a canary probe cycle.
+pub enum CanaryRecoveryOutcome {
+    /// Recovery was not needed for this probe cycle.
+    NotAttempted,
+    /// Recovery was attempted and completed successfully.
+    Succeeded,
+    /// Recovery was attempted and failed.
+    Failed,
+}
+
+/// Structured facts captured from a single canary probe cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanaryProbeObservation {
+    /// End-to-end probe latency in microseconds.
+    pub latency_us: u64,
+    /// Whether the probe assertions passed.
+    pub probe_ok: bool,
+    /// Whether the mailbox passed integrity validation.
+    pub integrity_ok: bool,
+    /// Whether recovery was attempted and, if so, how it ended.
+    pub recovery: CanaryRecoveryOutcome,
 }
 
 impl CanaryAlertPolicy {
@@ -5778,14 +5844,8 @@ const CANARY_SLOW_PROBE_THRESHOLD_US: u64 = 5_000_000;
 /// 4. Slow probe -> `Observable` (performance regression signal)
 /// 5. Otherwise -> `Silent` (routine success)
 #[must_use]
-pub fn classify_canary_outcome(
-    probe_ok: bool,
-    latency_us: u64,
-    integrity_ok: bool,
-    recovery_attempted: bool,
-    recovery_ok: bool,
-) -> CanaryAlertPolicy {
-    if !integrity_ok {
+pub fn classify_canary_outcome(observation: CanaryProbeObservation) -> CanaryAlertPolicy {
+    if !observation.integrity_ok {
         return CanaryAlertPolicy {
             tier: CanaryAlertTier::Engineering,
             reason: "integrity_mismatch",
@@ -5795,7 +5855,7 @@ pub fn classify_canary_outcome(
         };
     }
 
-    if recovery_attempted && !recovery_ok {
+    if matches!(observation.recovery, CanaryRecoveryOutcome::Failed) {
         return CanaryAlertPolicy {
             tier: CanaryAlertTier::Engineering,
             reason: "recovery_failed",
@@ -5805,7 +5865,7 @@ pub fn classify_canary_outcome(
         };
     }
 
-    if !probe_ok {
+    if !observation.probe_ok {
         return CanaryAlertPolicy {
             tier: CanaryAlertTier::Warning,
             reason: "probe_assertion_failed",
@@ -5815,13 +5875,13 @@ pub fn classify_canary_outcome(
         };
     }
 
-    if latency_us > CANARY_SLOW_PROBE_THRESHOLD_US {
+    if observation.latency_us > CANARY_SLOW_PROBE_THRESHOLD_US {
         return CanaryAlertPolicy {
             tier: CanaryAlertTier::Observable,
             reason: "slow_probe",
             detail: format!(
                 "canary probe succeeded but took {:.1}s (threshold: {:.1}s)",
-                latency_us as f64 / 1_000_000.0,
+                observation.latency_us as f64 / 1_000_000.0,
                 CANARY_SLOW_PROBE_THRESHOLD_US as f64 / 1_000_000.0,
             ),
         };
@@ -5829,7 +5889,7 @@ pub fn classify_canary_outcome(
 
     CanaryAlertPolicy::success(format!(
         "canary probe completed in {:.1}ms",
-        latency_us as f64 / 1_000.0,
+        observation.latency_us as f64 / 1_000.0,
     ))
 }
 
@@ -5838,30 +5898,24 @@ pub fn classify_canary_outcome(
 /// This is the single entry point that the canary runner calls after each
 /// probe cycle.  It updates only `CanaryMetrics` — never the production
 /// `DbMetrics` or `StorageMetrics`.
-pub fn record_canary_probe(
-    latency_us: u64,
-    ok: bool,
-    recovery_attempted: bool,
-    recovery_ok: bool,
-    integrity_ok: bool,
-) {
+pub fn record_canary_probe(observation: CanaryProbeObservation) {
     let m = &mcp_agent_mail_core::global_metrics().canary;
     m.canary_probes_total.inc();
-    m.canary_probe_latency_us.record(latency_us);
+    m.canary_probe_latency_us.record(observation.latency_us);
 
-    if ok {
+    if observation.probe_ok {
         m.canary_probes_ok.inc();
     } else {
         m.canary_probes_failed.inc();
     }
 
-    if !integrity_ok {
+    if !observation.integrity_ok {
         m.canary_integrity_failures_total.inc();
     }
 
-    if recovery_attempted {
+    if !matches!(observation.recovery, CanaryRecoveryOutcome::NotAttempted) {
         m.canary_recovery_attempts_total.inc();
-        if recovery_ok {
+        if matches!(observation.recovery, CanaryRecoveryOutcome::Succeeded) {
             m.canary_recovery_successes_total.inc();
         }
     }
@@ -7129,8 +7183,10 @@ mod tests {
             let cache = POOL_CACHE
                 .get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
             let guard = cache.read();
+            let has_pool_entry = guard.contains_key(&pool.cache_key);
+            drop(guard);
             assert!(
-                guard.contains_key(&pool.cache_key),
+                has_pool_entry,
                 "pool cache entry should exist before runtime recovery"
             );
         }
@@ -7138,8 +7194,10 @@ mod tests {
             let gates = SQLITE_INIT_GATES
                 .get_or_init(|| OrderedRwLock::new(LockLevel::DbSqliteInitGates, HashMap::new()));
             let guard = gates.read();
+            let has_init_gate = guard.contains_key(&pool.init_gate_key);
+            drop(guard);
             assert!(
-                guard.contains_key(&pool.init_gate_key),
+                has_init_gate,
                 "sqlite init gate should exist after first acquire"
             );
         }
@@ -7157,8 +7215,10 @@ mod tests {
             let cache = POOL_CACHE
                 .get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
             let guard = cache.read();
+            let has_pool_entry = guard.contains_key(&pool.cache_key);
+            drop(guard);
             assert!(
-                !guard.contains_key(&pool.cache_key),
+                !has_pool_entry,
                 "runtime recovery must evict the cached pool entry"
             );
         }
@@ -7166,8 +7226,10 @@ mod tests {
             let gates = SQLITE_INIT_GATES
                 .get_or_init(|| OrderedRwLock::new(LockLevel::DbSqliteInitGates, HashMap::new()));
             let guard = gates.read();
+            let has_init_gate = guard.contains_key(&pool.init_gate_key);
+            drop(guard);
             assert!(
-                !guard.contains_key(&pool.init_gate_key),
+                !has_init_gate,
                 "runtime recovery must clear the sqlite init gate so the next pool re-runs init"
             );
         }
@@ -9249,7 +9311,7 @@ mod tests {
         // (>= 32 bytes).  The cleanup function only removes WAL files shorter
         // than the 32-byte SQLite WAL header.
         let wal_path = dir.path().join("preserve_test.db-wal");
-        std::fs::write(&wal_path, &[0xAA; 64]).expect("create wal");
+        std::fs::write(&wal_path, [0xAA; 64]).expect("create wal");
         assert!(wal_path.exists());
 
         cleanup_empty_wal_sidecar(db_path.to_str().unwrap());
@@ -10371,13 +10433,15 @@ mod tests {
         // compute_ephemeral_storage_root checks is_default_storage_root, which
         // compares against the live config. We can only verify the method
         // doesn't panic and returns a modified config when conditions align.
-        let mut config = DbPoolConfig::default();
-        config.storage_root = None; // forces fallback to Config::from_env()
+        let config = DbPoolConfig {
+            storage_root: None, // forces fallback to Config::from_env()
+            ..Default::default()
+        };
         let rerouted = config.with_ephemeral_reroute(Path::new("/tmp/ci-test-run"));
         // Whether reroute actually happens depends on the runtime config's
         // storage_root being the default. We verify the method is callable
         // and produces a well-formed config.
-        assert!(rerouted.resolved_storage_root().as_os_str().len() > 0);
+        assert!(!rerouted.resolved_storage_root().as_os_str().is_empty());
     }
 
     #[test]
@@ -10486,35 +10550,60 @@ mod tests {
 
     #[test]
     fn classify_canary_outcome_success() {
-        let policy = classify_canary_outcome(true, 1_000, true, false, false);
+        let policy = classify_canary_outcome(CanaryProbeObservation {
+            latency_us: 1_000,
+            probe_ok: true,
+            integrity_ok: true,
+            recovery: CanaryRecoveryOutcome::NotAttempted,
+        });
         assert_eq!(policy.tier, CanaryAlertTier::Silent);
         assert_eq!(policy.reason, "probe_ok");
     }
 
     #[test]
     fn classify_canary_outcome_slow_probe() {
-        let policy = classify_canary_outcome(true, 6_000_000, true, false, false);
+        let policy = classify_canary_outcome(CanaryProbeObservation {
+            latency_us: 6_000_000,
+            probe_ok: true,
+            integrity_ok: true,
+            recovery: CanaryRecoveryOutcome::NotAttempted,
+        });
         assert_eq!(policy.tier, CanaryAlertTier::Observable);
         assert_eq!(policy.reason, "slow_probe");
     }
 
     #[test]
     fn classify_canary_outcome_probe_failed() {
-        let policy = classify_canary_outcome(false, 1_000, true, false, false);
+        let policy = classify_canary_outcome(CanaryProbeObservation {
+            latency_us: 1_000,
+            probe_ok: false,
+            integrity_ok: true,
+            recovery: CanaryRecoveryOutcome::NotAttempted,
+        });
         assert_eq!(policy.tier, CanaryAlertTier::Warning);
         assert_eq!(policy.reason, "probe_assertion_failed");
     }
 
     #[test]
     fn classify_canary_outcome_integrity_failure() {
-        let policy = classify_canary_outcome(true, 1_000, false, false, false);
+        let policy = classify_canary_outcome(CanaryProbeObservation {
+            latency_us: 1_000,
+            probe_ok: true,
+            integrity_ok: false,
+            recovery: CanaryRecoveryOutcome::NotAttempted,
+        });
         assert_eq!(policy.tier, CanaryAlertTier::Engineering);
         assert_eq!(policy.reason, "integrity_mismatch");
     }
 
     #[test]
     fn classify_canary_outcome_recovery_failure() {
-        let policy = classify_canary_outcome(true, 1_000, true, true, false);
+        let policy = classify_canary_outcome(CanaryProbeObservation {
+            latency_us: 1_000,
+            probe_ok: true,
+            integrity_ok: true,
+            recovery: CanaryRecoveryOutcome::Failed,
+        });
         assert_eq!(policy.tier, CanaryAlertTier::Engineering);
         assert_eq!(policy.reason, "recovery_failed");
     }
@@ -10522,14 +10611,24 @@ mod tests {
     #[test]
     fn classify_canary_outcome_integrity_trumps_recovery() {
         // Integrity failure is more severe than recovery failure.
-        let policy = classify_canary_outcome(false, 1_000, false, true, false);
+        let policy = classify_canary_outcome(CanaryProbeObservation {
+            latency_us: 1_000,
+            probe_ok: false,
+            integrity_ok: false,
+            recovery: CanaryRecoveryOutcome::Failed,
+        });
         assert_eq!(policy.tier, CanaryAlertTier::Engineering);
         assert_eq!(policy.reason, "integrity_mismatch");
     }
 
     #[test]
     fn record_canary_probe_updates_metrics() {
-        record_canary_probe(500, true, false, false, true);
+        record_canary_probe(CanaryProbeObservation {
+            latency_us: 500,
+            probe_ok: true,
+            integrity_ok: true,
+            recovery: CanaryRecoveryOutcome::NotAttempted,
+        });
         let snap = mcp_agent_mail_core::global_metrics().canary.snapshot();
         assert!(snap.canary_probes_total > 0);
         assert!(snap.canary_probes_ok > 0);

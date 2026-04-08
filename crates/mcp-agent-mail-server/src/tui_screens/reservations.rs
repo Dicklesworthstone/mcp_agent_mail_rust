@@ -1151,10 +1151,8 @@ impl ReservationsScreen {
             KeyCode::Escape => {
                 self.preset_dialog_mode = PresetDialogMode::None;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !names.is_empty() {
-                    self.load_preset_cursor = (self.load_preset_cursor + 1).min(names.len() - 1);
-                }
+            KeyCode::Char('j') | KeyCode::Down if !names.is_empty() => {
+                self.load_preset_cursor = (self.load_preset_cursor + 1).min(names.len() - 1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.load_preset_cursor = self.load_preset_cursor.saturating_sub(1);
@@ -1481,17 +1479,13 @@ impl MailScreen for ReservationsScreen {
                     self.move_selection(-1);
                     self.extend_visual_selection_to_cursor();
                 }
-                KeyCode::Char('G') | KeyCode::End => {
-                    if !self.sorted_keys.is_empty() {
-                        self.table_state.selected = Some(self.sorted_keys.len() - 1);
-                        self.extend_visual_selection_to_cursor();
-                    }
+                KeyCode::Char('G') | KeyCode::End if !self.sorted_keys.is_empty() => {
+                    self.table_state.selected = Some(self.sorted_keys.len() - 1);
+                    self.extend_visual_selection_to_cursor();
                 }
-                KeyCode::Char('g') | KeyCode::Home => {
-                    if !self.sorted_keys.is_empty() {
-                        self.table_state.selected = Some(0);
-                        self.extend_visual_selection_to_cursor();
-                    }
+                KeyCode::Char('g') | KeyCode::Home if !self.sorted_keys.is_empty() => {
+                    self.table_state.selected = Some(0);
+                    self.extend_visual_selection_to_cursor();
                 }
                 KeyCode::Char(' ') => self.toggle_selection_for_cursor(),
                 KeyCode::Char('v') => {

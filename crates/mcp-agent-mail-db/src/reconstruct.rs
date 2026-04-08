@@ -1166,6 +1166,9 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
         conn.execute_raw("REINDEX;")
             .map_err(|e| DbError::Sqlite(format!("reconstruct: REINDEX: {e}")))?;
 
+        conn.execute_raw(&schema::schema_user_version_sql())
+            .map_err(|e| DbError::Sqlite(format!("reconstruct: set user_version: {e}")))?;
+
         // Flush WAL (if any residual) and remove sidecar files so the DB is a
         // single clean file ready for the runtime to open with its own settings.
         let _ = conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE);");
@@ -2790,47 +2793,43 @@ fn merge_salvaged_database(
                     })?;
 
                 for row in &agent_link_rows {
-                    let Some(source_a_project_id) = row
+                    let Some(source_origin_ids) = row
                         .get_named::<i64>("a_project_id")
                         .ok()
                         .filter(|value| *value > 0)
+                        .zip(
+                            row.get_named::<i64>("a_agent_id")
+                                .ok()
+                                .filter(|value| *value > 0),
+                        )
                     else {
                         continue;
                     };
-                    let Some(source_a_agent_id) = row
-                        .get_named::<i64>("a_agent_id")
-                        .ok()
-                        .filter(|value| *value > 0)
-                    else {
-                        continue;
-                    };
-                    let Some(source_b_project_id) = row
+                    let Some(source_peer_ids) = row
                         .get_named::<i64>("b_project_id")
                         .ok()
                         .filter(|value| *value > 0)
-                    else {
-                        continue;
-                    };
-                    let Some(source_b_agent_id) = row
-                        .get_named::<i64>("b_agent_id")
-                        .ok()
-                        .filter(|value| *value > 0)
+                        .zip(
+                            row.get_named::<i64>("b_agent_id")
+                                .ok()
+                                .filter(|value| *value > 0),
+                        )
                     else {
                         continue;
                     };
 
-                    let Some(&target_a_project_id) = project_id_map.get(&source_a_project_id)
+                    let Some(target_origin_ids) = project_id_map
+                        .get(&source_origin_ids.0)
+                        .copied()
+                        .zip(agent_id_map.get(&source_origin_ids.1).copied())
                     else {
                         continue;
                     };
-                    let Some(&target_a_agent_id) = agent_id_map.get(&source_a_agent_id) else {
-                        continue;
-                    };
-                    let Some(&target_b_project_id) = project_id_map.get(&source_b_project_id)
+                    let Some(target_peer_ids) = project_id_map
+                        .get(&source_peer_ids.0)
+                        .copied()
+                        .zip(agent_id_map.get(&source_peer_ids.1).copied())
                     else {
-                        continue;
-                    };
-                    let Some(&target_b_agent_id) = agent_id_map.get(&source_b_agent_id) else {
                         continue;
                     };
 
@@ -2840,10 +2839,10 @@ fn merge_salvaged_database(
                              (a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts) \
                              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             &[
-                                Value::BigInt(target_a_project_id),
-                                Value::BigInt(target_a_agent_id),
-                                Value::BigInt(target_b_project_id),
-                                Value::BigInt(target_b_agent_id),
+                                Value::BigInt(target_origin_ids.0),
+                                Value::BigInt(target_origin_ids.1),
+                                Value::BigInt(target_peer_ids.0),
+                                Value::BigInt(target_peer_ids.1),
                                 Value::Text(
                                     row.get_named::<String>("status")
                                         .unwrap_or_else(|_| "pending".to_string()),
@@ -2864,7 +2863,11 @@ fn merge_salvaged_database(
                         .map_err(|e| {
                             DbError::Sqlite(format!(
                                 "reconstruct salvage: insert agent_link \
-                                 {source_a_project_id}/{source_a_agent_id}->{source_b_project_id}/{source_b_agent_id}: {e}"
+                                 {}/{}->{}/{}: {e}",
+                                source_origin_ids.0,
+                                source_origin_ids.1,
+                                source_peer_ids.0,
+                                source_peer_ids.1
                             ))
                         })?;
                 }

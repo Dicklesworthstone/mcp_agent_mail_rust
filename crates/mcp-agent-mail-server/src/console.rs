@@ -461,7 +461,7 @@ pub fn render_tool_call_end(
 
     // Title
     let title =
-        format!(" {color}{icon} {text}{tool_name}{RESET} {color}completed in {label}{RESET} ",);
+        format!(" {color}{icon} {text}{tool_name}{RESET} {color}completed in {label}{RESET} ");
     let icon_w = ftui::text::display_width(icon);
     // " " + icon + " " + tool_name + " " + "completed in " + label + " "
     let title_vis = 1 + icon_w + 1 + tool_name.len() + 1 + 13 + label.len() + 1;

@@ -5215,17 +5215,14 @@ struct AmbientEventSignalSummary {
     last_event_ts: i64,
 }
 
+type PaletteAgentDisplayMap = HashMap<String, (String, String)>;
+type PaletteDbData = (PaletteAgentDisplayMap, Vec<PaletteMessageSummary>);
+
 fn query_palette_db_data(
     state: &TuiSharedState,
     agent_limit: usize,
     message_limit: usize,
-) -> Result<
-    (
-        HashMap<String, (String, String)>,
-        Vec<PaletteMessageSummary>,
-    ),
-    String,
-> {
+) -> Result<PaletteDbData, String> {
     let snapshot = state.config_snapshot();
     let Some(db) = crate::open_observability_sync_db_connection(
         &snapshot.raw_database_url,
@@ -9421,7 +9418,7 @@ first body
 
         let config = Config {
             database_url: format!("sqlite:///{}", db_path.display()),
-            storage_root: storage_root.clone(),
+            storage_root,
             ..Config::default()
         };
         let state = TuiSharedState::new(&config);
@@ -9439,7 +9436,7 @@ first body
 
         {
             let mut guard = cache.lock().expect("cache lock");
-            guard.database_url = db_url.clone();
+            guard.database_url = db_url;
             guard.fetched_at_micros = now_micros() - PALETTE_DB_CACHE_TTL_MICROS - 1;
             guard.source_db_stats_gen = bridge_state.db_stats_gen;
             guard.agent_metadata.insert(
