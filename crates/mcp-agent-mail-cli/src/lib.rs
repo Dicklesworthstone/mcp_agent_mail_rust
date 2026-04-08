@@ -65,6 +65,8 @@ pub enum CliError {
 
 pub type CliResult<T> = Result<T, CliError>;
 
+const UNKNOWN_SENDER_DISPLAY: &str = "[unknown sender]";
+
 #[derive(Parser, Debug)]
 #[command(name = "am", version = env!("CARGO_PKG_VERSION"), about = "MCP Agent Mail CLI (Rust)")]
 pub struct Cli {
@@ -8487,16 +8489,18 @@ fn handle_acks_with_conn(conn: &mcp_agent_mail_db::DbConn, action: AcksCommand) 
             // Messages sent TO this agent with ack_required=1 that haven't been acked
             let rows = conn
                 .query_sync(
-                    "SELECT m.id, m.subject, m.importance, m.created_ts, \
-                            sender_a.name AS sender_name \
+                    &format!(
+                        "SELECT m.id, m.subject, m.importance, m.created_ts, \
+                            COALESCE(sender_a.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name \
                      FROM messages m \
                      JOIN message_recipients i ON i.message_id = m.id \
                      JOIN agents recv_a ON recv_a.id = i.agent_id \
-                     JOIN agents sender_a ON sender_a.id = m.sender_id \
+                     LEFT JOIN agents sender_a ON sender_a.id = m.sender_id \
                      WHERE m.project_id = ? AND recv_a.id = ? \
                        AND m.ack_required = 1 AND i.ack_ts IS NULL \
                      ORDER BY m.created_ts DESC \
-                     LIMIT ?",
+                     LIMIT ?"
+                    ),
                     &[
                         sqlmodel_core::Value::BigInt(project_id),
                         sqlmodel_core::Value::BigInt(agent_id),
@@ -8533,16 +8537,18 @@ fn handle_acks_with_conn(conn: &mcp_agent_mail_db::DbConn, action: AcksCommand) 
             let cutoff = now_us - min_age_minutes * 60 * 1_000_000;
             let rows = conn
                 .query_sync(
-                    "SELECT m.id, m.subject, m.created_ts, sender_a.name AS sender_name \
+                    &format!(
+                        "SELECT m.id, m.subject, m.created_ts, COALESCE(sender_a.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name \
                      FROM messages m \
                      JOIN message_recipients i ON i.message_id = m.id \
                      JOIN agents recv_a ON recv_a.id = i.agent_id \
-                     JOIN agents sender_a ON sender_a.id = m.sender_id \
+                     LEFT JOIN agents sender_a ON sender_a.id = m.sender_id \
                      WHERE m.project_id = ? AND recv_a.id = ? \
                        AND m.ack_required = 1 AND i.ack_ts IS NULL \
                        AND m.created_ts < ? \
                      ORDER BY m.created_ts ASC \
-                     LIMIT ?",
+                     LIMIT ?"
+                    ),
                     &[
                         sqlmodel_core::Value::BigInt(project_id),
                         sqlmodel_core::Value::BigInt(agent_id),
@@ -8586,16 +8592,18 @@ fn handle_acks_with_conn(conn: &mcp_agent_mail_db::DbConn, action: AcksCommand) 
             let cutoff = now_us - ttl_minutes * 60 * 1_000_000;
             let rows = conn
                 .query_sync(
-                    "SELECT m.id, m.subject, m.created_ts, sender_a.name AS sender_name \
+                    &format!(
+                        "SELECT m.id, m.subject, m.created_ts, COALESCE(sender_a.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name \
                      FROM messages m \
                      JOIN message_recipients i ON i.message_id = m.id \
                      JOIN agents recv_a ON recv_a.id = i.agent_id \
-                     JOIN agents sender_a ON sender_a.id = m.sender_id \
+                     LEFT JOIN agents sender_a ON sender_a.id = m.sender_id \
                      WHERE m.project_id = ? AND recv_a.id = ? \
                        AND m.ack_required = 1 AND i.ack_ts IS NULL \
                        AND m.created_ts < ? \
                      ORDER BY m.created_ts ASC \
-                     LIMIT ?",
+                     LIMIT ?"
+                    ),
                     &[
                         sqlmodel_core::Value::BigInt(project_id),
                         sqlmodel_core::Value::BigInt(agent_id),
@@ -9303,15 +9311,17 @@ fn handle_list_acks_with_conn(
     };
     let rows = conn
         .query_sync(
-            "SELECT m.id, m.subject, m.importance, m.created_ts, \
-                    i.ack_ts, i.read_ts, sender_a.name AS sender_name \
+            &format!(
+                "SELECT m.id, m.subject, m.importance, m.created_ts, \
+                    i.ack_ts, i.read_ts, COALESCE(sender_a.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name \
              FROM messages m \
              JOIN message_recipients i ON i.message_id = m.id \
              JOIN agents recv_a ON recv_a.id = i.agent_id \
-             JOIN agents sender_a ON sender_a.id = m.sender_id \
+             LEFT JOIN agents sender_a ON sender_a.id = m.sender_id \
              WHERE m.project_id = ? AND recv_a.id = ? AND m.ack_required = 1 \
              ORDER BY m.created_ts DESC \
-             LIMIT ?",
+             LIMIT ?"
+            ),
             &[
                 sqlmodel_core::Value::BigInt(project_id),
                 sqlmodel_core::Value::BigInt(agent_id),
@@ -32270,6 +32280,36 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn integration_acks_pending_keeps_orphaned_sender_rows_visible() {
+        use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
+
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+        conn.execute_sync("DELETE FROM agents WHERE id = ?", &[SqlValue::BigInt(2)])
+            .expect("delete sender row");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_acks_with_conn(
+            &conn,
+            AcksCommand::Pending {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                limit: 20,
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "acks pending failed: {result:?}");
+        assert!(
+            output.contains(UNKNOWN_SENDER_DISPLAY) && output.contains("Please review PR"),
+            "expected orphaned sender placeholder in output, got: {output}"
+        );
+    }
+
+    #[test]
     fn integration_acks_pending_empty_when_no_acks() {
         let _guard = stdio_capture_lock()
             .lock()
@@ -32341,6 +32381,29 @@ startup_timeout_sec = 42
         assert!(
             output.contains("RedFox") && output.contains("pending"),
             "expected ack-required message with pending status, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_list_acks_keeps_orphaned_sender_rows_visible() {
+        use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
+
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+        conn.execute_sync("DELETE FROM agents WHERE id = ?", &[SqlValue::BigInt(2)])
+            .expect("delete sender row");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_list_acks_with_conn(&conn, "test-proj", "BlueLake", 20);
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "list-acks failed: {result:?}");
+        assert!(
+            output.contains(UNKNOWN_SENDER_DISPLAY) && output.contains("pending"),
+            "expected orphaned sender placeholder in output, got: {output}"
         );
     }
 
