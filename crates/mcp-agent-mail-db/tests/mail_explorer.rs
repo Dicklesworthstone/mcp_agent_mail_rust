@@ -20,6 +20,7 @@ use mcp_agent_mail_db::mail_explorer::{
 };
 use mcp_agent_mail_db::queries;
 use mcp_agent_mail_db::{DbPool, DbPoolConfig};
+use sqlmodel_core::Value;
 
 // ────────────────────────────────────────────────────────────────────
 // Test harness
@@ -368,6 +369,132 @@ fn explorer_inbound_only() {
     for e in &page.entries {
         assert_eq!(e.direction, Direction::Inbound);
     }
+}
+
+#[test]
+fn explorer_inbound_keeps_orphaned_sender_rows_visible() {
+    let (pool, _dir) = make_pool();
+
+    let (project_id, sender_id, recipient_id) = {
+        let p = pool.clone();
+        block_on(move |cx| async move {
+            let project = match queries::ensure_project(
+                &cx,
+                &p,
+                "/tmp/__mcp-agent-mail-db-test-mail-explorer-orphaned-inbound",
+            )
+            .await
+            {
+                Outcome::Ok(r) => r,
+                other => panic!("ensure_project failed: {other:?}"),
+            };
+            let project_id = project.id.expect("project id");
+
+            let sender = match queries::register_agent(
+                &cx,
+                &p,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            {
+                Outcome::Ok(r) => r,
+                other => panic!("register sender failed: {other:?}"),
+            };
+            let recipient = match queries::register_agent(
+                &cx,
+                &p,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            {
+                Outcome::Ok(r) => r,
+                other => panic!("register recipient failed: {other:?}"),
+            };
+
+            match queries::create_message_with_recipients(
+                &cx,
+                &p,
+                project_id,
+                sender.id.expect("sender id"),
+                "Explorer survives sender drift",
+                "Body",
+                Some("explorer-orphaned-thread"),
+                "normal",
+                false,
+                "[]",
+                &[(recipient.id.expect("recipient id"), "to")],
+            )
+            .await
+            {
+                Outcome::Ok(_) => {}
+                other => panic!("create message failed: {other:?}"),
+            }
+
+            let conn = match p.acquire(&cx).await {
+                Outcome::Ok(conn) => conn,
+                other => panic!("acquire failed: {other:?}"),
+            };
+            conn.execute_sync(
+                "DELETE FROM agents WHERE id = ? AND project_id = ?",
+                &[
+                    Value::BigInt(sender.id.expect("sender id")),
+                    Value::BigInt(project_id),
+                ],
+            )
+            .expect("delete sender row");
+            drop(conn);
+
+            (
+                project_id,
+                sender.id.expect("sender id"),
+                recipient.id.expect("recipient id"),
+            )
+        })
+    };
+
+    let page = {
+        let p = pool.clone();
+        block_on(move |cx| async move {
+            match fetch_explorer_page(
+                &cx,
+                &p,
+                &ExplorerQuery {
+                    agent_name: "BlueLake".into(),
+                    project_id: Some(project_id),
+                    direction: Direction::Inbound,
+                    limit: 50,
+                    ..Default::default()
+                },
+            )
+            .await
+            {
+                Outcome::Ok(v) => v,
+                other => panic!("explorer inbound failed: {other:?}"),
+            }
+        })
+    };
+
+    let entry = page
+        .entries
+        .iter()
+        .find(|entry| entry.subject == "Explorer survives sender drift")
+        .expect("find orphaned explorer row");
+    assert_eq!(entry.project_id, project_id);
+    assert_eq!(entry.sender_name, "[unknown sender]");
+    assert_eq!(entry.direction, Direction::Inbound);
+    assert_ne!(sender_id, recipient_id);
 }
 
 #[test]

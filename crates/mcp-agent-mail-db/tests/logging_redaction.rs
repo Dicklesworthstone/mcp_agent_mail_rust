@@ -207,15 +207,24 @@ fn explain_fts_correlation_fields() {
         explain.method
     );
     assert!(
-        ["fts5", "like_fallback", "filter_only"].contains(&explain.method.as_str()),
+        [
+            "fts5",
+            "like_fallback",
+            "filter_only",
+            "lexical_v3",
+            "semantic_v3",
+            "hybrid_v3",
+            "auto_v3"
+        ]
+        .contains(&explain.method.as_str()),
         "method should be a known type: got '{}'",
         explain.method
     );
 
-    // SQL should be populated and contain SELECT
+    // SQL should be populated with either planner SQL or the V3 pipeline marker.
     assert!(
-        explain.sql.contains("SELECT"),
-        "sql should contain SELECT: got '{}'",
+        explain.sql.contains("SELECT") || explain.sql.starts_with("-- v3 pipeline"),
+        "sql should contain planner SQL or the V3 pipeline marker: got '{}'",
         explain.sql
     );
 

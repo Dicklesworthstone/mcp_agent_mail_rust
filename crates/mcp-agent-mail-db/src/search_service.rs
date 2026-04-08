@@ -381,9 +381,18 @@ fn try_tantivy_search(query: &SearchQuery) -> Option<Vec<SearchResult>> {
 }
 
 fn query_needs_recipient_filter(query: &SearchQuery) -> bool {
-    query.doc_kind == DocKind::Message
+    matches!(query.doc_kind, DocKind::Message | DocKind::Thread)
         && query.agent_name.is_some()
         && !matches!(query.direction, Some(Direction::Outbox))
+}
+
+fn message_query_uses_sql_plan(query: &SearchQuery) -> bool {
+    if !matches!(query.doc_kind, DocKind::Message | DocKind::Thread) {
+        return false;
+    }
+
+    let trimmed = query.text.trim();
+    trimmed.is_empty() || crate::queries::extract_like_terms(trimmed, 5).is_empty()
 }
 
 fn lexical_candidate_limit(query: &SearchQuery) -> usize {
@@ -516,17 +525,13 @@ fn unresolved_result_matches_agent_filter(query: &SearchQuery, result: &SearchRe
         return true;
     };
 
-    // If the result has sender info, check it.
-    let sender_matches = result.from_agent.as_deref().map_or_else(
-        || {
-            // If sender is missing, we can't definitively exclude it for Outbox,
-            // but for Outbox it's likely a mismatch. However, for candidate
-            // generation, we prefer false positives over false negatives.
-            // If both sender and recipients are missing (raw index hit), return true.
-            result.to.is_none()
-        },
-        |from_agent| from_agent.eq_ignore_ascii_case(agent_name),
-    );
+    // This path runs after retrieval when deciding whether an unresolved
+    // lexical hit may survive final filtering. Missing metadata must not count
+    // as a match here, or stale index hits can leak through agent filters.
+    let sender_matches = result
+        .from_agent
+        .as_deref()
+        .is_some_and(|from_agent| from_agent.eq_ignore_ascii_case(agent_name));
 
     // If the result has recipient info, check it.
     let recipient_matches = result.to.as_ref().is_some_and(|to| {
@@ -670,7 +675,7 @@ async fn canonicalize_message_results(
     raw_results: Vec<SearchResult>,
     preserve_unresolved_hits: bool,
 ) -> Outcome<Vec<SearchResult>, DbError> {
-    if query.doc_kind != DocKind::Message || raw_results.is_empty() {
+    if !matches!(query.doc_kind, DocKind::Message | DocKind::Thread) || raw_results.is_empty() {
         return Outcome::Ok(raw_results);
     }
 
@@ -3425,7 +3430,9 @@ pub async fn execute_search(
         .unwrap_or_else(|| mcp_agent_mail_core::Config::get().search_rollout.engine);
     let assistance = query_assistance_payload(query);
 
-    if matches!(query.doc_kind, DocKind::Agent | DocKind::Project) {
+    if matches!(query.doc_kind, DocKind::Agent | DocKind::Project)
+        || message_query_uses_sql_plan(query)
+    {
         return execute_sql_plan_search(
             cx, pool, query, options, cache, cache_key, assistance, timer,
         )
@@ -3814,9 +3821,10 @@ fn map_planned_rows(rows: Vec<sqlmodel_core::Row>, doc_kind: DocKind) -> Vec<Sea
                 created_ts: Some(row.get_as::<i64>(4).unwrap_or(0)),
                 thread_id: row.get_as::<Option<String>>(5).unwrap_or_default(),
                 from_agent: Some(row.get_as::<String>(6).unwrap_or_default()),
-                body: row.get_as::<String>(7).unwrap_or_default(),
-                project_id: Some(row.get_as::<i64>(8).unwrap_or(0)),
-                score: Some(row.get_as::<f64>(9).unwrap_or(0.0)),
+                from_agent_id: row.get_as::<Option<i64>>(7).unwrap_or_default(),
+                body: row.get_as::<String>(8).unwrap_or_default(),
+                project_id: Some(row.get_as::<i64>(9).unwrap_or(0)),
+                score: Some(row.get_as::<f64>(10).unwrap_or(0.0)),
                 ..SearchResult::default()
             })
             .collect(),
@@ -4287,6 +4295,23 @@ mod tests {
     }
 
     #[test]
+    fn thread_queries_need_recipient_filter_for_inbox_and_unscoped_directions() {
+        let mut query = SearchQuery {
+            doc_kind: DocKind::Thread,
+            agent_name: Some("BlueLake".to_string()),
+            ..SearchQuery::default()
+        };
+
+        assert!(query_needs_recipient_filter(&query));
+
+        query.direction = Some(Direction::Inbox);
+        assert!(query_needs_recipient_filter(&query));
+
+        query.direction = Some(Direction::Outbox);
+        assert!(!query_needs_recipient_filter(&query));
+    }
+
+    #[test]
     #[allow(clippy::cast_precision_loss)]
     fn next_cursor_present_when_full() {
         let results: Vec<SearchResult> = (0..50)
@@ -4349,6 +4374,80 @@ mod tests {
             decoded.score.to_bits(),
             (-1_700_000_000_000_123.0f64).to_bits()
         );
+    }
+
+    #[test]
+    fn planned_thread_rows_preserve_sender_identity_for_scope_enforcement() {
+        let row = sqlmodel_core::Row::new(
+            vec![
+                "id".to_string(),
+                "subject".to_string(),
+                "importance".to_string(),
+                "ack_required".to_string(),
+                "created_ts".to_string(),
+                "thread_id".to_string(),
+                "from_name".to_string(),
+                "from_agent_id".to_string(),
+                "body_md".to_string(),
+                "project_id".to_string(),
+                "score".to_string(),
+            ],
+            vec![
+                Value::BigInt(7),
+                Value::Text("Thread subject".to_string()),
+                Value::Text("high".to_string()),
+                Value::BigInt(1),
+                Value::BigInt(1_700_000_000),
+                Value::Text("thread-7".to_string()),
+                Value::Text("BlueLake".to_string()),
+                Value::BigInt(42),
+                Value::Text("Thread preview".to_string()),
+                Value::BigInt(3),
+                Value::Double(0.0),
+            ],
+        );
+
+        let results = map_planned_rows(vec![row], DocKind::Thread);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].from_agent.as_deref(), Some("BlueLake"));
+        assert_eq!(results[0].from_agent_id, Some(42));
+        assert_eq!(results[0].thread_id.as_deref(), Some("thread-7"));
+    }
+
+    #[test]
+    fn planned_thread_rows_keep_missing_sender_identity_absent() {
+        let row = sqlmodel_core::Row::new(
+            vec![
+                "id".to_string(),
+                "subject".to_string(),
+                "importance".to_string(),
+                "ack_required".to_string(),
+                "created_ts".to_string(),
+                "thread_id".to_string(),
+                "from_name".to_string(),
+                "from_agent_id".to_string(),
+                "body_md".to_string(),
+                "project_id".to_string(),
+                "score".to_string(),
+            ],
+            vec![
+                Value::BigInt(8),
+                Value::Text("Thread subject".to_string()),
+                Value::Text("normal".to_string()),
+                Value::BigInt(0),
+                Value::BigInt(1_700_000_001),
+                Value::Text("thread-8".to_string()),
+                Value::Text(String::new()),
+                Value::Null,
+                Value::Text("Thread preview".to_string()),
+                Value::BigInt(4),
+                Value::Double(0.0),
+            ],
+        );
+
+        let results = map_planned_rows(vec![row], DocKind::Thread);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].from_agent_id, None);
     }
 
     #[test]
@@ -5168,6 +5267,67 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_outbox_results_require_sender_metadata() {
+        let query = SearchQuery {
+            agent_name: Some("BlueLake".to_string()),
+            direction: Some(Direction::Outbox),
+            ..Default::default()
+        };
+        let result = SearchResult {
+            doc_kind: DocKind::Message,
+            id: 25,
+            project_id: Some(1),
+            title: "subject".to_string(),
+            body: String::new(),
+            score: Some(0.5),
+            importance: Some("normal".to_string()),
+            ack_required: Some(false),
+            created_ts: Some(2_500),
+            thread_id: Some("br-250".to_string()),
+            from_agent: None,
+            from_agent_id: None,
+            to: None,
+            cc: None,
+            bcc: None,
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
+            redacted: false,
+            redaction_reason: None,
+        };
+        assert!(!raw_result_matches_query_filters(&query, &result, None));
+    }
+
+    #[test]
+    fn unresolved_agent_results_require_sender_or_recipient_metadata() {
+        let query = SearchQuery {
+            agent_name: Some("BlueLake".to_string()),
+            ..Default::default()
+        };
+        let result = SearchResult {
+            doc_kind: DocKind::Message,
+            id: 26,
+            project_id: Some(1),
+            title: "subject".to_string(),
+            body: String::new(),
+            score: Some(0.5),
+            importance: Some("normal".to_string()),
+            ack_required: Some(false),
+            created_ts: Some(2_600),
+            thread_id: Some("br-260".to_string()),
+            from_agent: None,
+            from_agent_id: None,
+            to: None,
+            cc: None,
+            bcc: None,
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
+            redacted: false,
+            redaction_reason: None,
+        };
+        assert!(!raw_result_matches_query_filters(&query, &result, None));
+    }
+
+    #[test]
     fn lexical_candidate_limit_expands_for_inbox_agent_filter() {
         let query = SearchQuery {
             agent_name: Some("BlueLake".to_string()),
@@ -5197,6 +5357,33 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(lexical_candidate_limit(&query), 7);
+    }
+
+    #[test]
+    fn message_query_uses_sql_plan_for_blank_text() {
+        let query = SearchQuery {
+            thread_id: Some("br-300".to_string()),
+            ..SearchQuery::messages("", 1)
+        };
+        assert!(message_query_uses_sql_plan(&query));
+    }
+
+    #[test]
+    fn message_query_uses_sql_plan_for_non_searchable_text() {
+        let query = SearchQuery {
+            thread_id: Some("br-301".to_string()),
+            ..SearchQuery::messages("***", 1)
+        };
+        assert!(message_query_uses_sql_plan(&query));
+    }
+
+    #[test]
+    fn message_query_keeps_engine_path_for_searchable_text() {
+        let query = SearchQuery {
+            thread_id: Some("br-302".to_string()),
+            ..SearchQuery::messages("rollback", 1)
+        };
+        assert!(!message_query_uses_sql_plan(&query));
     }
 
     // ── Zero-result guidance tests ──────────────────────────────────

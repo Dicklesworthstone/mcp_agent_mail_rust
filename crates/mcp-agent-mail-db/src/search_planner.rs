@@ -10,6 +10,7 @@
 
 #![allow(clippy::module_name_repetitions)]
 
+use crate::queries::UNKNOWN_SENDER_DISPLAY;
 use crate::query_assistance::QueryAssistance;
 use serde::{Deserialize, Serialize};
 
@@ -712,6 +713,7 @@ const fn empty_plan_sql(kind: DocKind) -> &'static str {
                 0 AS created_ts, \
                 '' AS thread_id, \
                 '' AS from_name, \
+                0 AS from_agent_id, \
                 '' AS body_md, \
                 0 AS project_id, \
                 0.0 AS score \
@@ -800,20 +802,22 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
             where_clauses.push(like_filter);
 
             (
-                "m.id, m.subject, m.importance, m.ack_required, m.created_ts, \
-                 m.thread_id, a.name AS from_name, m.body_md, m.project_id, \
-                 0.0 AS score"
-                    .to_string(),
-                "messages m JOIN agents a ON a.id = m.sender_id".to_string(),
+                format!(
+                    "m.id, m.subject, m.importance, m.ack_required, m.created_ts, \
+                     m.thread_id, COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') AS from_name, \
+                     a.id AS from_agent_id, m.body_md, m.project_id, 0.0 AS score"
+                ),
+                "messages m LEFT JOIN agents a ON a.id = m.sender_id".to_string(),
                 message_order_clause.to_string(),
             )
         }
         PlanMethod::FilterOnly => (
-            "m.id, m.subject, m.importance, m.ack_required, m.created_ts, \
-             m.thread_id, a.name AS from_name, m.body_md, m.project_id, \
-             0.0 AS score"
-                .to_string(),
-            "messages m JOIN agents a ON a.id = m.sender_id".to_string(),
+            format!(
+                "m.id, m.subject, m.importance, m.ack_required, m.created_ts, \
+                 m.thread_id, COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') AS from_name, \
+                 a.id AS from_agent_id, m.body_md, m.project_id, 0.0 AS score"
+            ),
+            "messages m LEFT JOIN agents a ON a.id = m.sender_id".to_string(),
             message_order_clause.to_string(),
         ),
         PlanMethod::Empty | PlanMethod::TextMatch => unreachable!(),
@@ -1429,6 +1433,14 @@ mod tests {
         assert_eq!(plan.method, PlanMethod::Like);
         assert!(plan.sql.contains("LIKE ?"));
         assert!(plan.sql.contains("m.project_id = ?"));
+        assert!(
+            plan.sql
+                .contains("LEFT JOIN agents a ON a.id = m.sender_id")
+        );
+        assert!(
+            plan.sql
+                .contains("COALESCE(a.name, '[unknown sender]') AS from_name")
+        );
     }
 
     #[test]
@@ -1437,6 +1449,10 @@ mod tests {
         let plan = plan_search(&q);
         assert_eq!(plan.method, PlanMethod::Like);
         assert!(plan.sql.contains("product_project_links"));
+        assert!(
+            plan.sql
+                .contains("LEFT JOIN agents a ON a.id = m.sender_id")
+        );
         assert!(plan.facets_applied.contains(&"product_id".to_string()));
     }
 
@@ -1564,6 +1580,10 @@ mod tests {
         assert_eq!(plan.method, PlanMethod::FilterOnly);
         assert!(plan.sql.contains("m.importance IN (?)"));
         assert!(plan.sql.contains("m.project_id = ?"));
+        assert!(
+            plan.sql
+                .contains("LEFT JOIN agents a ON a.id = m.sender_id")
+        );
         assert!(!plan.sql.contains("fts_messages"));
     }
 

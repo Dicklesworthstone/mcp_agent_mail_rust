@@ -283,8 +283,12 @@ pub struct ScopeAuditSummary {
 /// Returns the verdict and reason without modifying the result.
 #[must_use]
 pub fn evaluate_scope(result: &SearchResult, ctx: &ScopeContext) -> ScopeDecision {
-    // Non-message entities (agents, projects) are always visible.
-    if result.doc_kind != crate::search_planner::DocKind::Message {
+    // Agent and project records are public metadata. Thread results reuse
+    // message rows and must therefore follow message visibility rules.
+    if matches!(
+        result.doc_kind,
+        crate::search_planner::DocKind::Agent | crate::search_planner::DocKind::Project
+    ) {
         return ScopeDecision {
             verdict: ScopeVerdict::Allow,
             reason: ScopeReason::NonMessageEntity,
@@ -654,7 +658,7 @@ mod tests {
         }
     }
 
-    // ── Non-message entities always visible ───────────────────────
+    // ── Public entity results always visible ──────────────────────
 
     #[test]
     fn agent_result_always_allowed() {
@@ -1204,32 +1208,16 @@ mod tests {
         assert_eq!(ctx2.recipient_map.len(), 1);
     }
 
-    // ── Thread result is NonMessageEntity ────────────────────────
+    // ── Thread results follow message visibility rules ───────────
 
     #[test]
-    fn thread_doc_kind_always_allowed() {
-        let result = SearchResult {
-            doc_kind: DocKind::Thread,
-            id: 1,
-            project_id: Some(99),
-            title: "Thread summary".to_string(),
-            body: String::new(),
-            score: None,
-            importance: None,
-            ack_required: None,
-            created_ts: None,
-            thread_id: None,
-            from_agent: None,
-            reason_codes: Vec::new(),
-            score_factors: Vec::new(),
-            redacted: false,
-            redaction_reason: None,
-            ..SearchResult::default()
-        };
+    fn thread_result_requires_message_scope() {
+        let mut result = make_message_result(1, 99, "BlueLake", 20);
+        result.doc_kind = DocKind::Thread;
         let ctx = viewer_ctx(10, 1); // different project
         let decision = evaluate_scope(&result, &ctx);
-        assert_eq!(decision.verdict, ScopeVerdict::Allow);
-        assert_eq!(decision.reason, ScopeReason::NonMessageEntity);
+        assert_eq!(decision.verdict, ScopeVerdict::Deny);
+        assert_eq!(decision.reason, ScopeReason::CrossProjectDenied);
     }
 
     // ── Auto policy allows when no other policy matches ──────────

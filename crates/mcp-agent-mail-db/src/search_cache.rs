@@ -282,14 +282,15 @@ impl<T: Clone> QueryCache<T> {
     /// Get a cached value if present and not expired.
     #[allow(clippy::significant_drop_tightening)] // Lock ordering is intentional
     pub fn get(&self, key: &QueryCacheKey) -> Option<T> {
-        if !self.config.enabled {
+        if !self.config.enabled || self.config.max_entries == 0 {
             return None;
         }
 
         // Check epoch first (quick rejection)
         if key.index_epoch != self.current_epoch.load(Ordering::Acquire) {
-            let mut metrics = self.metrics.write().ok()?;
-            metrics.misses += 1;
+            self.update_metrics(|metrics| {
+                metrics.misses += 1;
+            });
             return None;
         }
 
@@ -297,33 +298,37 @@ impl<T: Clone> QueryCache<T> {
         let Some(entry) = entries.get_mut(key) else {
             // Key not found - miss
             drop(entries); // Release write lock before acquiring metrics lock
-            if let Ok(mut metrics) = self.metrics.write() {
+            self.update_metrics(|metrics| {
                 metrics.misses += 1;
-            }
+            });
             return None;
         };
 
         // Check TTL
         if entry.is_expired(self.config.ttl) {
             entries.remove(key);
-            let mut metrics = self.metrics.write().ok()?;
-            metrics.misses += 1;
-            metrics.evictions_ttl += 1;
-            metrics.current_entries = entries.len();
+            let current_entries = entries.len();
+            drop(entries);
+            self.update_metrics(|metrics| {
+                metrics.misses += 1;
+                metrics.evictions_ttl += 1;
+                metrics.current_entries = current_entries;
+            });
             return None;
         }
 
         entry.touch();
-
-        let mut metrics = self.metrics.write().ok()?;
-        metrics.hits += 1;
-
-        Some(entry.value.clone())
+        let value = entry.value.clone();
+        drop(entries);
+        self.update_metrics(|metrics| {
+            metrics.hits += 1;
+        });
+        Some(value)
     }
 
     /// Insert a value into the cache.
     pub fn put(&self, key: QueryCacheKey, value: T) {
-        if !self.config.enabled {
+        if !self.config.enabled || self.config.max_entries == 0 {
             return;
         }
 
@@ -363,6 +368,12 @@ impl<T: Clone> QueryCache<T> {
                 metrics.evictions_capacity += 1;
                 metrics.current_entries = entries.len();
             }
+        }
+    }
+
+    fn update_metrics(&self, update: impl FnOnce(&mut CacheMetrics)) {
+        if let Ok(mut metrics) = self.metrics.write() {
+            update(&mut metrics);
         }
     }
 
@@ -1283,6 +1294,52 @@ mod tests {
 
         // Should still be one entry
         assert_eq!(cache.metrics().current_entries, 1);
+    }
+
+    #[test]
+    fn test_zero_capacity_config_is_preserved_and_disables_storage() {
+        let cache = QueryCache::new(CacheConfig {
+            max_entries: 0,
+            ttl: Duration::from_mins(1),
+            enabled: true,
+        });
+        let key = QueryCacheKey::without_filter("a", SearchMode::Hybrid, 0, 0, 10);
+
+        assert_eq!(cache.config.max_entries, 0);
+        cache.put(key.clone(), 1_i64);
+
+        assert_eq!(cache.get(&key), None);
+        assert_eq!(cache.metrics().inserts, 0);
+        assert_eq!(cache.metrics().current_entries, 0);
+    }
+
+    #[test]
+    fn test_zero_ttl_config_is_preserved() {
+        let cache: QueryCache<i64> = QueryCache::new(CacheConfig {
+            max_entries: 10,
+            ttl: Duration::ZERO,
+            enabled: true,
+        });
+
+        assert_eq!(cache.config.ttl, Duration::ZERO);
+    }
+
+    #[test]
+    fn test_metrics_poison_does_not_hide_cached_hit() {
+        let cache = QueryCache::new(CacheConfig {
+            max_entries: 10,
+            ttl: Duration::from_mins(1),
+            enabled: true,
+        });
+        let key = QueryCacheKey::without_filter("test", SearchMode::Hybrid, 0, 0, 10);
+        cache.put(key.clone(), 42_i64);
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.metrics.write().unwrap();
+            panic!("poison metrics lock");
+        }));
+
+        assert_eq!(cache.get(&key), Some(42));
     }
 
     // ── Trait coverage ──────────────────────────────────────────────

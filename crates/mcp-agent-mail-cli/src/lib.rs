@@ -12963,6 +12963,33 @@ struct DoctorProjectIdentity {
     human_key: Option<String>,
 }
 
+const DOCTOR_PROJECT_SEARCH_ROOTS_ENV: &str = "AM_DOCTOR_PROJECT_SEARCH_ROOTS";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorProjectMetadataNormalizationSource {
+    ExistingMetadata,
+    Database,
+    Filesystem,
+    SyntheticPlaceholder,
+}
+
+impl DoctorProjectMetadataNormalizationSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExistingMetadata => "existing_metadata",
+            Self::Database => "database",
+            Self::Filesystem => "filesystem",
+            Self::SyntheticPlaceholder => "synthetic_placeholder",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DoctorProjectMetadataNormalizationCandidate {
+    human_key: String,
+    source: DoctorProjectMetadataNormalizationSource,
+}
+
 impl DoctorProjectIdentity {
     fn from_parts(
         slug: Option<String>,
@@ -13111,6 +13138,181 @@ fn doctor_project_match_token(value: &str) -> Option<String> {
     }
 }
 
+fn doctor_placeholder_project_human_key(slug: &str) -> String {
+    format!("/{slug}")
+}
+
+fn doctor_is_placeholder_project_human_key(slug: &str, human_key: &str) -> bool {
+    human_key.trim() == doctor_placeholder_project_human_key(slug)
+}
+
+#[cfg(test)]
+fn doctor_project_search_roots_test_override() -> &'static std::sync::Mutex<Option<String>> {
+    static OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+        std::sync::OnceLock::new();
+    OVERRIDE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn with_doctor_project_search_roots_for_test<R>(value: &str, f: impl FnOnce() -> R) -> R {
+    struct OverrideGuard(Option<String>);
+
+    impl Drop for OverrideGuard {
+        fn drop(&mut self) {
+            if let Ok(mut guard) = doctor_project_search_roots_test_override().lock() {
+                *guard = self.0.take();
+            }
+        }
+    }
+
+    let previous = doctor_project_search_roots_test_override()
+        .lock()
+        .map(|mut guard| {
+            let previous = guard.clone();
+            *guard = Some(value.to_string());
+            previous
+        })
+        .unwrap_or(None);
+    let restore = OverrideGuard(previous);
+    let result = f();
+    drop(restore);
+    result
+}
+
+fn doctor_project_search_roots() -> Vec<PathBuf> {
+    let mut roots = std::collections::BTreeSet::new();
+
+    let raw_override = {
+        let std_env = std::env::var_os(DOCTOR_PROJECT_SEARCH_ROOTS_ENV);
+        #[cfg(test)]
+        let std_env = std_env.or_else(|| {
+            doctor_project_search_roots_test_override()
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+                .map(std::ffi::OsString::from)
+        });
+        std_env
+    };
+
+    if let Some(raw) = raw_override {
+        for candidate in std::env::split_paths(&raw) {
+            if candidate.is_dir() {
+                roots.insert(candidate);
+            }
+        }
+    }
+
+    if roots.is_empty() {
+        let data_projects = PathBuf::from("/data/projects");
+        if data_projects.is_dir() {
+            roots.insert(data_projects);
+        }
+
+        if let Some(home_dir) = std::env::var_os("HOME").map(PathBuf::from)
+            && home_dir.is_dir()
+        {
+            roots.insert(home_dir);
+        }
+
+        let tmp_dir = PathBuf::from("/tmp");
+        if tmp_dir.is_dir() {
+            roots.insert(tmp_dir);
+        }
+    }
+
+    roots.into_iter().collect()
+}
+
+fn doctor_collect_normalization_db_project_identities()
+-> std::collections::BTreeSet<DoctorProjectIdentity> {
+    let config = Config::from_env();
+    let Ok(opened) = open_db_for_doctor_check_with_context(&config.database_url) else {
+        return std::collections::BTreeSet::new();
+    };
+    collect_doctor_db_inventory(&opened.conn)
+        .map(|inventory| inventory.project_identities)
+        .unwrap_or_default()
+}
+
+fn doctor_infer_project_human_key_from_db(
+    slug: &str,
+    db_project_identities: &std::collections::BTreeSet<DoctorProjectIdentity>,
+) -> Option<String> {
+    let matches = db_project_identities
+        .iter()
+        .filter(|identity| identity.slug.as_deref() == Some(slug))
+        .filter_map(|identity| identity.human_key.as_deref())
+        .map(str::trim)
+        .filter(|human_key| {
+            Path::new(human_key).is_absolute()
+                && !doctor_is_placeholder_project_human_key(slug, human_key)
+        })
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    if matches.len() == 1 {
+        matches.into_iter().next()
+    } else {
+        None
+    }
+}
+
+fn doctor_infer_project_human_key_from_filesystem(slug: &str) -> Option<String> {
+    let mut matches = std::collections::BTreeSet::new();
+
+    for root in doctor_project_search_roots() {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() || file_type.is_symlink() {
+                continue;
+            }
+
+            let candidate = entry.path();
+            let resolved = candidate.canonicalize().unwrap_or(candidate);
+            let resolved_text = resolved.display().to_string();
+            if mcp_agent_mail_core::compute_project_slug(&resolved_text) == slug {
+                matches.insert(resolved_text);
+            }
+        }
+    }
+
+    if matches.len() == 1 {
+        matches.into_iter().next()
+    } else {
+        None
+    }
+}
+
+fn doctor_project_metadata_normalization_candidate(
+    slug: &str,
+    db_project_identities: &std::collections::BTreeSet<DoctorProjectIdentity>,
+) -> DoctorProjectMetadataNormalizationCandidate {
+    if let Some(human_key) = doctor_infer_project_human_key_from_db(slug, db_project_identities) {
+        return DoctorProjectMetadataNormalizationCandidate {
+            human_key,
+            source: DoctorProjectMetadataNormalizationSource::Database,
+        };
+    }
+
+    if let Some(human_key) = doctor_infer_project_human_key_from_filesystem(slug) {
+        return DoctorProjectMetadataNormalizationCandidate {
+            human_key,
+            source: DoctorProjectMetadataNormalizationSource::Filesystem,
+        };
+    }
+
+    DoctorProjectMetadataNormalizationCandidate {
+        human_key: doctor_placeholder_project_human_key(slug),
+        source: DoctorProjectMetadataNormalizationSource::SyntheticPlaceholder,
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 struct DoctorArchiveInventory {
     projects: u64,
@@ -13140,6 +13342,8 @@ struct DoctorArchiveProjectMetadataFinding {
     project_json: String,
     slug: String,
     canonical_human_key: Option<String>,
+    normalization_human_key: Option<String>,
+    normalization_source: Option<String>,
     problem: String,
 }
 
@@ -13199,15 +13403,19 @@ fn doctor_archive_scan_diagnostics(
             dedupe_rule: ArchiveScanDedupeRule::ProjectDir,
             dedupe_value: finding.project_dir.clone(),
             summary: format!("project '{}' is missing project.json", finding.slug),
-            recommendation: Some(
-                "Safe auto remediation can write canonical project metadata when the archive identity is already clear."
+            recommendation: Some(match finding.normalization_source.as_deref() {
+                Some("synthetic_placeholder") => {
+                    "Archive normalization can write an explicit synthetic placeholder identity when the original human_key is no longer recoverable."
+                        .to_string()
+                }
+                _ => "Archive normalization can restore project metadata from the best available exact identity."
                     .to_string(),
-            ),
+            }),
         });
     }
 
     for finding in &report.invalid_project_metadata {
-        let can_auto_normalize = finding.canonical_human_key.is_some();
+        let can_auto_normalize = finding.normalization_human_key.is_some();
         diagnostics.push(ArchiveScanDiagnostic {
             code: "invalid_project_metadata".to_string(),
             severity: if can_auto_normalize {
@@ -13231,8 +13439,14 @@ fn doctor_archive_scan_diagnostics(
                 )
             },
             recommendation: Some(if can_auto_normalize {
-                "Run archive normalization in dry-run mode first; this project has a canonical human_key candidate."
-                    .to_string()
+                match finding.normalization_source.as_deref() {
+                    Some("synthetic_placeholder") => {
+                        "Run archive normalization in dry-run mode first; this project can be stabilized with an explicit synthetic placeholder identity."
+                            .to_string()
+                    }
+                    _ => "Run archive normalization in dry-run mode first; this project has an exact human_key candidate."
+                        .to_string(),
+                }
             } else {
                 "Resolve project.json manually before trusting archive reconstruction or promotion."
                     .to_string()
@@ -14526,14 +14740,19 @@ fn doctor_archive_suspicious_project_reason(slug: &str, human_key: Option<&str>)
 fn doctor_archive_metadata_finding(
     project_path: &Path,
     slug: String,
-    canonical_human_key: Option<String>,
+    candidate: Option<&DoctorProjectMetadataNormalizationCandidate>,
     problem: String,
 ) -> DoctorArchiveProjectMetadataFinding {
     DoctorArchiveProjectMetadataFinding {
         project_dir: project_path.display().to_string(),
         project_json: project_path.join("project.json").display().to_string(),
         slug,
-        canonical_human_key,
+        canonical_human_key: candidate.and_then(|candidate| {
+            (candidate.source != DoctorProjectMetadataNormalizationSource::SyntheticPlaceholder)
+                .then(|| candidate.human_key.clone())
+        }),
+        normalization_human_key: candidate.map(|candidate| candidate.human_key.clone()),
+        normalization_source: candidate.map(|candidate| candidate.source.as_str().to_string()),
         problem,
     }
 }
@@ -14541,9 +14760,12 @@ fn doctor_archive_metadata_finding(
 fn doctor_audit_project_metadata(
     project_path: &Path,
     report: &mut DoctorArchiveAuditReport,
+    db_project_identities: &std::collections::BTreeSet<DoctorProjectIdentity>,
 ) -> (String, Option<String>) {
     let fallback_slug = doctor_archive_project_fallback_slug(project_path);
     let project_json = project_path.join("project.json");
+    let normalization_candidate =
+        doctor_project_metadata_normalization_candidate(&fallback_slug, db_project_identities);
 
     let (resolved_slug, resolved_human_key) = if !path_is_real_file(&project_json) {
         report
@@ -14551,10 +14773,13 @@ fn doctor_audit_project_metadata(
             .push(doctor_archive_metadata_finding(
                 project_path,
                 fallback_slug.clone(),
-                None,
+                Some(&normalization_candidate),
                 format!("missing {}", project_json.display()),
             ));
-        (fallback_slug, None)
+        (
+            fallback_slug,
+            Some(normalization_candidate.human_key.clone()),
+        )
     } else {
         match std::fs::read_to_string(&project_json) {
             Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
@@ -14592,7 +14817,11 @@ fn doctor_audit_project_metadata(
                                     doctor_archive_metadata_finding(
                                         project_path,
                                         fallback_slug.clone(),
-                                        Some(value.clone()),
+                                        Some(&DoctorProjectMetadataNormalizationCandidate {
+                                            human_key: value.clone(),
+                                            source:
+                                                DoctorProjectMetadataNormalizationSource::ExistingMetadata,
+                                        }),
                                         problem,
                                     ),
                                 );
@@ -14605,14 +14834,17 @@ fn doctor_audit_project_metadata(
                                 .push(doctor_archive_metadata_finding(
                                     project_path,
                                     metadata_slug.unwrap_or_else(|| fallback_slug.clone()),
-                                    None,
+                                    Some(&normalization_candidate),
                                     format!(
                                         "non-absolute human_key '{}' in {}",
                                         value,
                                         project_json.display()
                                     ),
                                 ));
-                            (fallback_slug, None)
+                            (
+                                fallback_slug,
+                                Some(normalization_candidate.human_key.clone()),
+                            )
                         }
                         None => {
                             report
@@ -14620,13 +14852,16 @@ fn doctor_audit_project_metadata(
                                 .push(doctor_archive_metadata_finding(
                                     project_path,
                                     metadata_slug.unwrap_or_else(|| fallback_slug.clone()),
-                                    None,
+                                    Some(&normalization_candidate),
                                     format!(
                                         "missing or empty human_key in {}",
                                         project_json.display()
                                     ),
                                 ));
-                            (fallback_slug, None)
+                            (
+                                fallback_slug,
+                                Some(normalization_candidate.human_key.clone()),
+                            )
                         }
                     }
                 }
@@ -14636,10 +14871,13 @@ fn doctor_audit_project_metadata(
                         .push(doctor_archive_metadata_finding(
                             project_path,
                             fallback_slug.clone(),
-                            None,
+                            Some(&normalization_candidate),
                             format!("invalid JSON in {}: {err}", project_json.display()),
                         ));
-                    (fallback_slug, None)
+                    (
+                        fallback_slug,
+                        Some(normalization_candidate.human_key.clone()),
+                    )
                 }
             },
             Err(err) => {
@@ -14648,10 +14886,13 @@ fn doctor_audit_project_metadata(
                     .push(doctor_archive_metadata_finding(
                         project_path,
                         fallback_slug.clone(),
-                        None,
+                        Some(&normalization_candidate),
                         format!("cannot read {}: {err}", project_json.display()),
                     ));
-                (fallback_slug, None)
+                (
+                    fallback_slug,
+                    Some(normalization_candidate.human_key.clone()),
+                )
             }
         }
     };
@@ -14761,6 +15002,7 @@ fn audit_doctor_archive(storage_root: &Path) -> DoctorArchiveAuditReport {
 
     let mut duplicate_candidates: std::collections::BTreeMap<i64, Vec<PathBuf>> =
         std::collections::BTreeMap::new();
+    let db_project_identities = doctor_collect_normalization_db_project_identities();
 
     for entry in entries.flatten() {
         let project_path = entry.path();
@@ -14771,7 +15013,7 @@ fn audit_doctor_archive(storage_root: &Path) -> DoctorArchiveAuditReport {
             continue;
         }
 
-        let _ = doctor_audit_project_metadata(&project_path, &mut report);
+        let _ = doctor_audit_project_metadata(&project_path, &mut report, &db_project_identities);
 
         let messages_dir = project_path.join("messages");
         if path_is_real_directory(&messages_dir) {
@@ -28172,32 +28414,97 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn doctor_archive_normalize_does_not_invent_missing_project_metadata() {
+    fn doctor_archive_normalize_recovers_missing_project_metadata_from_live_filesystem() {
         let _guard = stdio_capture_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let storage_root = tmp.path().join("storage");
+        let search_root = tmp.path().join("search-root");
         let db_path = tmp.path().join("archive-normalize.sqlite3");
-        let project_dir = storage_root.join("projects").join("demo-project");
+        let live_project = search_root.join("jeffreys-skills.md");
+        std::fs::create_dir_all(&live_project).unwrap();
+        let project_slug =
+            mcp_agent_mail_core::compute_project_slug(&live_project.display().to_string());
+        let project_dir = storage_root.join("projects").join(&project_slug);
         std::fs::create_dir_all(project_dir.join("messages").join("2026").join("03")).unwrap();
 
         let storage_root_text = storage_root.to_string_lossy().to_string();
+        let search_root_text = search_root.to_string_lossy().to_string();
         let database_url = format!("sqlite:///{}", db_path.display());
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[
-                ("STORAGE_ROOT", storage_root_text.as_str()),
-                ("DATABASE_URL", database_url.as_str()),
-            ],
-            || {
-                handle_doctor_archive_normalize(false, true, false, NormalizeApplyMode::Quarantine)
+        with_doctor_project_search_roots_for_test(search_root_text.as_str(), || {
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[
+                    ("STORAGE_ROOT", storage_root_text.as_str()),
+                    ("DATABASE_URL", database_url.as_str()),
+                ],
+                || {
+                    handle_doctor_archive_normalize(
+                        false,
+                        true,
+                        false,
+                        NormalizeApplyMode::Quarantine,
+                    )
                     .expect("archive normalization should succeed");
-            },
-        );
+                },
+            );
+        });
 
+        let metadata: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(project_dir.join("project.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["slug"], project_slug);
+        assert_eq!(metadata["human_key"], live_project.display().to_string());
         assert!(
-            !project_dir.join("project.json").exists(),
-            "normalization should not invent a synthetic human_key when metadata is missing"
+            metadata.get("human_key_source").is_none(),
+            "exact filesystem recovery should not be tagged as synthetic"
+        );
+    }
+
+    #[test]
+    fn doctor_archive_normalize_materializes_synthetic_placeholder_when_exact_identity_is_gone() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let empty_search_root = tmp.path().join("empty-search-root");
+        let db_path = tmp.path().join("archive-normalize.sqlite3");
+        let project_dir = storage_root.join("projects").join("demo-project");
+        std::fs::create_dir_all(&empty_search_root).unwrap();
+        std::fs::create_dir_all(project_dir.join("messages").join("2026").join("03")).unwrap();
+
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        let empty_search_root_text = empty_search_root.to_string_lossy().to_string();
+        let database_url = format!("sqlite:///{}", db_path.display());
+        with_doctor_project_search_roots_for_test(empty_search_root_text.as_str(), || {
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[
+                    ("STORAGE_ROOT", storage_root_text.as_str()),
+                    ("DATABASE_URL", database_url.as_str()),
+                ],
+                || {
+                    handle_doctor_archive_normalize(
+                        false,
+                        true,
+                        false,
+                        NormalizeApplyMode::Quarantine,
+                    )
+                    .expect("archive normalization should succeed");
+                },
+            );
+        });
+
+        let metadata: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(project_dir.join("project.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["slug"], "demo-project");
+        assert_eq!(metadata["human_key"], "/demo-project");
+        assert_eq!(
+            metadata["human_key_source"],
+            DoctorProjectMetadataNormalizationSource::SyntheticPlaceholder.as_str()
         );
     }
 
@@ -41924,12 +42231,31 @@ fn persist_doctor_warning_report(
     Ok(Some(report_path))
 }
 
-fn normalize_archive_project_metadata_content(slug: &str, human_key: &str) -> CliResult<String> {
-    serde_json::to_string_pretty(&serde_json::json!({
-        "slug": slug,
-        "human_key": human_key,
-    }))
-    .map_err(|err| {
+fn normalize_archive_project_metadata_content(
+    slug: &str,
+    human_key: &str,
+    source: Option<&str>,
+) -> CliResult<String> {
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "slug".to_string(),
+        serde_json::Value::String(slug.to_string()),
+    );
+    payload.insert(
+        "human_key".to_string(),
+        serde_json::Value::String(human_key.to_string()),
+    );
+    if source == Some(DoctorProjectMetadataNormalizationSource::SyntheticPlaceholder.as_str()) {
+        payload.insert(
+            "human_key_source".to_string(),
+            serde_json::Value::String(
+                DoctorProjectMetadataNormalizationSource::SyntheticPlaceholder
+                    .as_str()
+                    .to_string(),
+            ),
+        );
+    }
+    serde_json::to_string_pretty(&serde_json::Value::Object(payload)).map_err(|err| {
         CliError::Other(format!(
             "failed to serialize normalized project metadata: {err}"
         ))
@@ -42080,11 +42406,15 @@ fn handle_doctor_archive_normalize(
         dry_run,
         apply_mode: apply_mode.to_string(),
         storage_root: storage_root.display().to_string(),
-        unresolved_project_metadata_files: report.missing_project_metadata.len()
+        unresolved_project_metadata_files: report
+            .missing_project_metadata
+            .iter()
+            .filter(|finding| finding.normalization_human_key.is_none())
+            .count()
             + report
                 .invalid_project_metadata
                 .iter()
-                .filter(|finding| finding.canonical_human_key.is_none())
+                .filter(|finding| finding.normalization_human_key.is_none())
                 .count(),
         unresolved_malformed_message_files: report.malformed_message_files.len(),
         unresolved_suspicious_projects: report.suspicious_projects.len(),
@@ -42092,10 +42422,15 @@ fn handle_doctor_archive_normalize(
     };
 
     let actionable_count = report
-        .invalid_project_metadata
+        .missing_project_metadata
         .iter()
-        .filter(|finding| finding.canonical_human_key.is_some())
+        .filter(|finding| finding.normalization_human_key.is_some())
         .count()
+        + report
+            .invalid_project_metadata
+            .iter()
+            .filter(|finding| finding.normalization_human_key.is_some())
+            .count()
         + report
             .duplicate_canonical_groups
             .iter()
@@ -42144,22 +42479,31 @@ fn handle_doctor_archive_normalize(
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
 
     for finding in report
-        .invalid_project_metadata
+        .missing_project_metadata
         .iter()
-        .filter(|finding| finding.canonical_human_key.is_some())
+        .chain(report.invalid_project_metadata.iter())
+        .filter(|finding| finding.normalization_human_key.is_some())
     {
+        let normalized_human_key = finding
+            .normalization_human_key
+            .as_deref()
+            .unwrap_or_default();
+        let normalization_source = finding.normalization_source.as_deref();
         let project_json = PathBuf::from(&finding.project_json);
         let normalized = normalize_archive_project_metadata_content(
             &finding.slug,
-            finding.canonical_human_key.as_deref().unwrap_or_default(),
+            normalized_human_key,
+            normalization_source,
         )?;
+        let source_detail = normalization_source
+            .map(|source| format!(", source={source}"))
+            .unwrap_or_default();
         result.actions.push(DoctorArchiveNormalizeAction {
             kind: "write_project_metadata".to_string(),
             path: project_json.display().to_string(),
             detail: format!(
-                "slug={}, human_key={}",
-                finding.slug,
-                finding.canonical_human_key.as_deref().unwrap_or_default()
+                "slug={}, human_key={}{}",
+                finding.slug, normalized_human_key, source_detail
             ),
         });
         if !dry_run {

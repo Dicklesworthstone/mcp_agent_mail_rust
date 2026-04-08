@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::DbError;
 use crate::pool::DbPool;
+use crate::queries::UNKNOWN_SENDER_DISPLAY;
 use crate::tracking::record_query;
 
 use asupersync::{Cx, Outcome};
@@ -473,11 +474,11 @@ async fn fetch_inbound(
             "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
              m.importance, m.ack_required, m.created_ts, \
              r.kind, r.read_ts, r.ack_ts, \
-             s.name AS sender_name, p.slug AS project_slug, \
+             COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, p.slug AS project_slug, \
              COALESCE(GROUP_CONCAT(DISTINCT a_recip.name), '') AS to_agents \
              FROM message_recipients r \
              JOIN messages m ON m.id = r.message_id \
-             JOIN agents s ON s.id = m.sender_id \
+             LEFT JOIN agents s ON s.id = m.sender_id \
              JOIN projects p ON p.id = m.project_id \
              LEFT JOIN message_recipients mr2 ON mr2.message_id = m.id \
              LEFT JOIN agents a_recip ON a_recip.id = mr2.agent_id \
@@ -542,10 +543,10 @@ async fn fetch_outbound(
         let sql = format!(
             "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
              m.importance, m.ack_required, m.created_ts, \
-             s.name AS sender_name, p.slug AS project_slug, \
+             COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, p.slug AS project_slug, \
              COALESCE(GROUP_CONCAT(DISTINCT a_recip.name), '') AS to_agents \
              FROM messages m \
-             JOIN agents s ON s.id = m.sender_id \
+             LEFT JOIN agents s ON s.id = m.sender_id \
              JOIN projects p ON p.id = m.project_id \
              LEFT JOIN message_recipients mr ON mr.message_id = m.id \
              LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \

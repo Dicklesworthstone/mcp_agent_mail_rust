@@ -27,7 +27,7 @@ use sqlmodel::prelude::*;
 use sqlmodel_core::{Connection, Dialect, Error as SqlError, IsolationLevel, PreparedStatement};
 use sqlmodel_core::{Row as SqlRow, TransactionOps, Value};
 use sqlmodel_query::{raw_execute, raw_query};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
@@ -776,6 +776,60 @@ fn approved_contact_sql(item_count: usize) -> &'static str {
     &cache[capped]
 }
 
+const REQUIRED_ATC_EXPERIENCE_COLUMNS: &[&str] = &[
+    "experience_id",
+    "decision_id",
+    "effect_id",
+    "trace_id",
+    "claim_id",
+    "evidence_id",
+    "state",
+    "subsystem",
+    "decision_class",
+    "subject",
+    "project_key",
+    "policy_id",
+    "effect_kind",
+    "action",
+    "posterior_json",
+    "expected_loss",
+    "runner_up_action",
+    "runner_up_loss",
+    "evidence_summary",
+    "calibration_healthy",
+    "safe_mode_active",
+    "non_execution_json",
+    "outcome_json",
+    "features_json",
+    "feature_ext_json",
+    "created_ts",
+    "dispatched_ts",
+    "executed_ts",
+    "resolved_ts",
+    "context_json",
+];
+
+const REQUIRED_ATC_ROLLUP_COLUMNS: &[&str] = &[
+    "stratum_key",
+    "subsystem",
+    "effect_kind",
+    "risk_tier",
+    "total_count",
+    "resolved_count",
+    "censored_count",
+    "expired_count",
+    "correct_count",
+    "incorrect_count",
+    "total_regret",
+    "total_loss",
+    "ewma_loss",
+    "ewma_weight",
+    "delay_sum_micros",
+    "delay_count",
+    "delay_max_micros",
+    "last_updated_ts",
+];
+
 fn build_recent_contact_union_sql_with_placeholders(placeholders: &str) -> String {
     format!(
         "SELECT agent_id FROM ( \
@@ -811,18 +865,61 @@ async fn acquire_conn(
     map_sql_outcome(pool.acquire(cx).await)
 }
 
-fn canonical_table_exists(pool: &DbPool, table_name: &str) -> std::result::Result<bool, DbError> {
-    let conn = open_canonical_atc_conn(pool, "inspect canonical ATC table presence")?;
+fn canonical_table_columns(
+    conn: &crate::CanonicalDbConn,
+    table_name: &'static str,
+    purpose: &'static str,
+) -> std::result::Result<HashSet<String>, DbError> {
+    let rows = conn
+        .query_sync(&format!("PRAGMA table_info({table_name})"), &[])
+        .map_err(|error| DbError::Sqlite(format!("{purpose}: {error}")))?;
+    let mut columns = HashSet::with_capacity(rows.len());
+    for row in &rows {
+        if let Ok(name) = row.get_named::<String>("name") {
+            columns.insert(name);
+        }
+    }
+    Ok(columns)
+}
+
+fn inspect_canonical_atc_schema(pool: &DbPool) -> std::result::Result<Vec<String>, DbError> {
+    let conn = open_canonical_atc_conn(pool, "inspect canonical ATC schema")?;
     let result = (|| {
-        let rows = canonical_query_atc_rows(
+        let mut missing = Vec::new();
+
+        let experience_columns = canonical_table_columns(
             &conn,
-            "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
-            &[Value::Text(table_name.to_string())],
-            "inspect canonical ATC table presence",
+            "atc_experiences",
+            "inspect canonical ATC experience columns",
         )?;
-        Ok(!rows.is_empty())
+        if experience_columns.is_empty() {
+            missing.push("table atc_experiences".to_string());
+        } else {
+            for column in REQUIRED_ATC_EXPERIENCE_COLUMNS {
+                if !experience_columns.contains(*column) {
+                    missing.push(format!("atc_experiences.{column}"));
+                }
+            }
+        }
+
+        let rollup_columns = canonical_table_columns(
+            &conn,
+            "atc_experience_rollups",
+            "inspect canonical ATC rollup columns",
+        )?;
+        if rollup_columns.is_empty() {
+            missing.push("table atc_experience_rollups".to_string());
+        } else {
+            for column in REQUIRED_ATC_ROLLUP_COLUMNS {
+                if !rollup_columns.contains(*column) {
+                    missing.push(format!("atc_experience_rollups.{column}"));
+                }
+            }
+        }
+
+        Ok(missing)
     })();
-    close_canonical_db_conn(conn, "canonical ATC table presence connection");
+    close_canonical_db_conn(conn, "canonical ATC schema inspection connection");
     result
 }
 
@@ -830,20 +927,25 @@ async fn ensure_file_backed_atc_pool_initialized(cx: &Cx, pool: &DbPool) -> Outc
     if pool.sqlite_path() == ":memory:" {
         return Outcome::Ok(());
     }
-    match canonical_table_exists(pool, "atc_experiences") {
-        Ok(true) => return Outcome::Ok(()),
-        Ok(false) => {}
+    let missing_before = match inspect_canonical_atc_schema(pool) {
+        Ok(missing) => {
+            if missing.is_empty() {
+                return Outcome::Ok(());
+            }
+            missing
+        }
         Err(error) => return Outcome::Err(error),
-    }
+    };
     match acquire_conn(cx, pool).await {
         Outcome::Ok(conn) => {
             drop(conn);
-            match canonical_table_exists(pool, "atc_experiences") {
-                Ok(true) => Outcome::Ok(()),
-                Ok(false) => Outcome::Err(DbError::Internal(
-                    "ATC schema initialization completed but atc_experiences is still missing"
-                        .to_string(),
-                )),
+            match inspect_canonical_atc_schema(pool) {
+                Ok(missing_after) if missing_after.is_empty() => Outcome::Ok(()),
+                Ok(missing_after) => Outcome::Err(DbError::Internal(format!(
+                    "ATC schema initialization did not converge; missing before init: {}; still missing after init: {}",
+                    missing_before.join(", "),
+                    missing_after.join(", "),
+                ))),
                 Err(error) => Outcome::Err(error),
             }
         }
@@ -4087,9 +4189,9 @@ pub async fn get_messages_details_by_ids(
         let sql = format!(
             "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
                     m.importance, m.ack_required, m.created_ts, m.recipients_json, \
-                    m.attachments, a.name as from_name \
+                    m.attachments, COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') as from_name \
              FROM messages m \
-             JOIN agents a ON a.id = m.sender_id \
+             LEFT JOIN agents a ON a.id = m.sender_id \
              WHERE m.id IN ({placeholders}){project_clause}"
         );
 
@@ -4213,31 +4315,35 @@ pub async fn list_thread_messages(
             };
             params.push(Value::BigInt(limit_i64));
             (
+                format!(
+                    "SELECT m.id AS id, m.project_id AS project_id, m.sender_id AS sender_id, \
+                            m.thread_id AS thread_id, m.subject AS subject, m.body_md AS body_md, \
+                            m.importance AS importance, m.ack_required AS ack_required, \
+                            m.created_ts AS created_ts, m.recipients_json AS recipients_json, \
+                            m.attachments AS attachments, \
+                            COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') AS from_name \
+                     FROM messages m \
+                     LEFT JOIN agents a ON a.id = m.sender_id \
+                     WHERE m.project_id = ? AND (m.id = ? OR m.thread_id = ?) \
+                     ORDER BY created_ts DESC, id DESC \
+                     LIMIT ?"
+                ),
+                true,
+            )
+        }
+        (true, None) => (
+            format!(
                 "SELECT m.id AS id, m.project_id AS project_id, m.sender_id AS sender_id, \
                         m.thread_id AS thread_id, m.subject AS subject, m.body_md AS body_md, \
                         m.importance AS importance, m.ack_required AS ack_required, \
                         m.created_ts AS created_ts, m.recipients_json AS recipients_json, \
                         m.attachments AS attachments, \
-                        a.name AS from_name \
+                        COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') AS from_name \
                  FROM messages m \
-                 JOIN agents a ON a.id = m.sender_id \
+                 LEFT JOIN agents a ON a.id = m.sender_id \
                  WHERE m.project_id = ? AND (m.id = ? OR m.thread_id = ?) \
-                 ORDER BY created_ts DESC, id DESC \
-                 LIMIT ?",
-                true,
-            )
-        }
-        (true, None) => (
-            "SELECT m.id AS id, m.project_id AS project_id, m.sender_id AS sender_id, \
-                    m.thread_id AS thread_id, m.subject AS subject, m.body_md AS body_md, \
-                    m.importance AS importance, m.ack_required AS ack_required, \
-                    m.created_ts AS created_ts, m.recipients_json AS recipients_json, \
-                    m.attachments AS attachments, \
-                    a.name AS from_name \
-             FROM messages m \
-             JOIN agents a ON a.id = m.sender_id \
-             WHERE m.project_id = ? AND (m.id = ? OR m.thread_id = ?) \
-             ORDER BY created_ts ASC, id ASC",
+                 ORDER BY created_ts ASC, id ASC"
+            ),
             false,
         ),
         (false, Some(lim)) => {
@@ -4246,36 +4352,40 @@ pub async fn list_thread_messages(
             };
             params.push(Value::BigInt(limit_i64));
             (
+                format!(
+                    "SELECT m.id AS id, m.project_id AS project_id, m.sender_id AS sender_id, \
+                            m.thread_id AS thread_id, m.subject AS subject, m.body_md AS body_md, \
+                            m.importance AS importance, m.ack_required AS ack_required, \
+                            m.created_ts AS created_ts, m.recipients_json AS recipients_json, \
+                            m.attachments AS attachments, \
+                            COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') AS from_name \
+                     FROM messages m \
+                     LEFT JOIN agents a ON a.id = m.sender_id \
+                     WHERE m.project_id = ? AND m.thread_id = ? \
+                     ORDER BY created_ts DESC, id DESC \
+                     LIMIT ?"
+                ),
+                true,
+            )
+        }
+        (false, None) => (
+            format!(
                 "SELECT m.id AS id, m.project_id AS project_id, m.sender_id AS sender_id, \
                         m.thread_id AS thread_id, m.subject AS subject, m.body_md AS body_md, \
                         m.importance AS importance, m.ack_required AS ack_required, \
                         m.created_ts AS created_ts, m.recipients_json AS recipients_json, \
                         m.attachments AS attachments, \
-                        a.name AS from_name \
+                        COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') AS from_name \
                  FROM messages m \
-                 JOIN agents a ON a.id = m.sender_id \
+                 LEFT JOIN agents a ON a.id = m.sender_id \
                  WHERE m.project_id = ? AND m.thread_id = ? \
-                 ORDER BY created_ts DESC, id DESC \
-                 LIMIT ?",
-                true,
-            )
-        }
-        (false, None) => (
-            "SELECT m.id AS id, m.project_id AS project_id, m.sender_id AS sender_id, \
-                    m.thread_id AS thread_id, m.subject AS subject, m.body_md AS body_md, \
-                    m.importance AS importance, m.ack_required AS ack_required, \
-                    m.created_ts AS created_ts, m.recipients_json AS recipients_json, \
-                    m.attachments AS attachments, \
-                    a.name AS from_name \
-             FROM messages m \
-             JOIN agents a ON a.id = m.sender_id \
-             WHERE m.project_id = ? AND m.thread_id = ? \
-             ORDER BY created_ts ASC, id ASC",
+                 ORDER BY created_ts ASC, id ASC"
+            ),
             false,
         ),
     };
 
-    let rows_out = map_sql_outcome(traw_query(cx, &tracked, sql, &params).await);
+    let rows_out = map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await);
     match rows_out {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
@@ -4832,6 +4942,8 @@ pub struct SearchRow {
     pub body_md: String,
 }
 
+pub(crate) const UNKNOWN_SENDER_DISPLAY: &str = "[unknown sender]";
+
 /// Search result row that includes `project_id` for cross-project queries (e.g. product search).
 #[derive(Debug, Clone)]
 pub struct SearchRowWithProject {
@@ -5104,9 +5216,10 @@ async fn run_like_fallback(
     params.push(Value::BigInt(limit));
 
     let sql = format!(
-        "SELECT m.id, m.sender_id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, a.name as from_name, m.body_md \
+        "SELECT m.id, m.sender_id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, \
+                COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') as from_name, m.body_md \
          FROM messages m \
-         JOIN agents a ON a.id = m.sender_id \
+         LEFT JOIN agents a ON a.id = m.sender_id \
          WHERE m.project_id = ? AND ({where_clause}) \
          ORDER BY m.id DESC \
          LIMIT ?"
@@ -5138,9 +5251,10 @@ async fn run_like_fallback_product(
     params.push(Value::BigInt(limit));
 
     let sql = format!(
-        "SELECT m.id, m.sender_id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, a.name as from_name, m.body_md, m.project_id \
+        "SELECT m.id, m.sender_id, m.subject, m.importance, m.ack_required, m.created_ts, m.thread_id, \
+                COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') as from_name, m.body_md, m.project_id \
          FROM messages m \
-         JOIN agents a ON a.id = m.sender_id \
+         LEFT JOIN agents a ON a.id = m.sender_id \
          JOIN product_project_links ppl ON ppl.project_id = m.project_id \
          WHERE ppl.product_id = ? AND ({where_clause}) \
          ORDER BY m.id DESC \
@@ -5387,16 +5501,16 @@ pub async fn fetch_inbox_global(
 
     let tracked = tracked(&*conn);
 
-    let mut sql = String::from(
+    let mut sql = format!(
         "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
                 m.importance, m.ack_required, m.created_ts, m.recipients_json, \
                 m.attachments, \
-                r.kind, s.name as sender_name, r.ack_ts, p.slug as project_slug \
+                r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') as sender_name, r.ack_ts, p.slug as project_slug \
          FROM message_recipients r \
          JOIN messages m ON m.id = r.message_id \
-         JOIN agents s ON s.id = m.sender_id \
+         LEFT JOIN agents s ON s.id = m.sender_id \
          JOIN projects p ON p.id = m.project_id \
-         WHERE r.agent_id IN (SELECT id FROM agents WHERE name = ? COLLATE NOCASE)",
+         WHERE r.agent_id IN (SELECT id FROM agents WHERE name = ? COLLATE NOCASE)"
     );
 
     let mut params: Vec<Value> = vec![Value::Text(agent_name.to_string())];
@@ -5638,10 +5752,10 @@ async fn run_like_fallback_global(
 
     let sql = format!(
         "SELECT m.id, m.sender_id, m.subject, m.importance, m.ack_required, m.created_ts, \
-                m.thread_id, a.name as from_name, m.body_md, \
+                m.thread_id, COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') as from_name, m.body_md, \
                 m.project_id, p.slug as project_slug \
          FROM messages m \
-         JOIN agents a ON a.id = m.sender_id \
+         LEFT JOIN agents a ON a.id = m.sender_id \
          JOIN projects p ON p.id = m.project_id \
          WHERE {} \
          ORDER BY m.created_ts DESC \
@@ -8673,17 +8787,19 @@ pub async fn fetch_unacked_for_agent(
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
     };
 
-    let sql = "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
-                      m.importance, m.ack_required, m.created_ts, m.recipients_json, \
-                      m.attachments, \
-                      r.kind, s.name AS sender_name, r.read_ts \
-               FROM message_recipients r \
-               JOIN messages m ON m.id = r.message_id \
-               JOIN agents s ON s.id = m.sender_id \
-               WHERE r.agent_id = ? AND m.project_id = ? \
-                 AND m.ack_required = 1 AND r.ack_ts IS NULL \
-               ORDER BY m.created_ts ASC \
-               LIMIT ?";
+    let sql = format!(
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
+                  m.importance, m.ack_required, m.created_ts, m.recipients_json, \
+                  m.attachments, \
+                  r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, r.read_ts \
+           FROM message_recipients r \
+           JOIN messages m ON m.id = r.message_id \
+           LEFT JOIN agents s ON s.id = m.sender_id \
+           WHERE r.agent_id = ? AND m.project_id = ? \
+             AND m.ack_required = 1 AND r.ack_ts IS NULL \
+           ORDER BY m.created_ts ASC \
+           LIMIT ?"
+    );
 
     let params: Vec<Value> = vec![
         Value::BigInt(agent_id),
@@ -8691,7 +8807,7 @@ pub async fn fetch_unacked_for_agent(
         Value::BigInt(limit_i64),
     ];
 
-    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
@@ -10668,6 +10784,211 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_atc_init_repairs_partial_schema_before_runtime_writes() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("partial_atc_schema.db");
+        let conn = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open canonical sqlite");
+        conn.execute_raw(crate::schema::PRAGMA_DB_INIT_BASE_SQL)
+            .expect("apply base pragmas");
+        conn.execute_raw(
+            "CREATE TABLE atc_experiences (
+                experience_id INTEGER PRIMARY KEY,
+                decision_id INTEGER NOT NULL
+            )",
+        )
+        .expect("create partial experiences table");
+        conn.execute_raw(
+            "CREATE TABLE atc_experience_rollups (
+                stratum_key TEXT PRIMARY KEY
+            )",
+        )
+        .expect("create partial rollups table");
+        drop(conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            ensure_file_backed_atc_pool_initialized(&cx, &pool)
+                .await
+                .into_result()
+                .expect("ATC init should repair partial schema via migrations");
+        });
+
+        assert!(
+            inspect_canonical_atc_schema(&pool)
+                .expect("inspect canonical ATC schema")
+                .is_empty(),
+            "ATC init should converge the partial schema to the full required surface"
+        );
+    }
+
+    #[test]
+    fn reconstructed_file_backed_atc_runtime_writes_preserve_sqlite_quick_check() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        let db_path = dir.path().join("reconstructed_atc_runtime.sqlite3");
+        let agent_dir = storage_root
+            .join("projects")
+            .join("reconstructed-project")
+            .join("agents")
+            .join("BrownKite");
+        std::fs::create_dir_all(&agent_dir).expect("create archive agent dir");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": "BrownKite",
+                "program": "codex-cli",
+                "model": "gpt-5",
+                "task_description": "reconstructed runtime atc test",
+                "inception_ts": "2026-04-07T00:00:00Z",
+                "last_active_ts": "2026-04-07T00:00:00Z",
+                "attachments_policy": "auto",
+                "contact_policy": "auto"
+            }))
+            .expect("serialize profile"),
+        )
+        .expect("write profile");
+
+        crate::reconstruct::reconstruct_from_archive(&db_path, &storage_root)
+            .expect("reconstruct database from archive");
+
+        let cx = Cx::for_testing();
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 0,
+            max_connections: 1,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            for idx in 0_u64..64 {
+                let base_ts = 1_700_000_200_000_000_i64
+                    .saturating_add(i64::try_from(idx).expect("idx fits i64") * 25_000);
+                let row = ExperienceRow {
+                    experience_id: 0,
+                    decision_id: 30_000 + idx,
+                    effect_id: 40_000 + idx,
+                    trace_id: format!("trc-reconstruct-atc-{idx}"),
+                    claim_id: format!("clm-reconstruct-atc-{idx}"),
+                    evidence_id: format!("evi-reconstruct-atc-{idx}"),
+                    state: ExperienceState::Planned,
+                    subsystem: ExperienceSubsystem::Liveness,
+                    decision_class: "liveness_transition".to_string(),
+                    subject: "BrownKite".to_string(),
+                    project_key: Some("/data/projects/asupersync".to_string()),
+                    policy_id: Some("liveness-incumbent-r1".to_string()),
+                    effect_kind: EffectKind::Probe,
+                    action: "ProbeAgent".to_string(),
+                    posterior: vec![
+                        ("Alive".to_string(), 0.30),
+                        ("Flaky".to_string(), 0.45),
+                        ("Dead".to_string(), 0.25),
+                    ],
+                    expected_loss: 1.0,
+                    runner_up_action: Some("DeferProbe".to_string()),
+                    runner_up_loss: Some(1.4),
+                    evidence_summary: format!("reconstructed runtime probe candidate {idx}"),
+                    calibration_healthy: true,
+                    safe_mode_active: false,
+                    non_execution_reason: None,
+                    outcome: None,
+                    created_ts_micros: base_ts,
+                    dispatched_ts_micros: None,
+                    executed_ts_micros: None,
+                    resolved_ts_micros: None,
+                    features: Some(FeatureVector::zeroed()),
+                    feature_ext: None,
+                    context: Some(serde_json::json!({
+                        "reconstructed": true,
+                        "sequence": idx
+                    })),
+                };
+
+                let stored = append_atc_experience(&cx, &pool, &row)
+                    .await
+                    .into_result()
+                    .expect("append ATC experience on reconstructed db");
+                transition_atc_experience(
+                    &cx,
+                    &pool,
+                    stored.experience_id,
+                    ExperienceState::Dispatched,
+                    base_ts + 2_000,
+                    None,
+                    None,
+                )
+                .await
+                .into_result()
+                .expect("dispatch ATC experience");
+                transition_atc_experience(
+                    &cx,
+                    &pool,
+                    stored.experience_id,
+                    ExperienceState::Executed,
+                    base_ts + 4_000,
+                    None,
+                    Some(&serde_json::json!({
+                        "execution": {
+                            "status": "executed",
+                            "path": "reconstructed_db_runtime"
+                        }
+                    })),
+                )
+                .await
+                .into_result()
+                .expect("execute ATC experience");
+                update_atc_experience_rollup(
+                    &cx,
+                    &pool,
+                    &format!("reconstructed::{idx}"),
+                    "liveness",
+                    "probe",
+                    i32::from(FeatureVector::risk_tier_for(EffectKind::Probe)),
+                    ExperienceState::Resolved,
+                    true,
+                    0.0,
+                    0.0,
+                    5_000,
+                    base_ts + 8_000,
+                )
+                .await
+                .into_result()
+                .expect("update ATC rollup");
+            }
+        });
+
+        pool.wal_checkpoint().expect("checkpoint reconstructed db");
+        assert!(
+            crate::pool::sqlite_file_is_healthy(&db_path)
+                .expect("sqlite quick_check should succeed"),
+            "reconstructed database must stay healthy after runtime ATC writes"
+        );
+    }
+
+    #[test]
     fn fetch_open_atc_experiences_filters_subject_case_insensitively() {
         use asupersync::runtime::RuntimeBuilder;
 
@@ -11768,6 +12089,93 @@ mod tests {
             assert_eq!(rows.len(), 2);
             assert_eq!(rows[0].subject, "msg-1");
             assert_eq!(rows[1].subject, "msg-2");
+        });
+    }
+
+    #[test]
+    fn list_thread_messages_keeps_orphaned_sender_rows_visible() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("thread_orphaned_sender.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-thread-orphaned-sender-{base}"),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("sender"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let recipient = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+
+            let sender_id = sender.id.expect("sender id");
+            let recipient_id = recipient.id.expect("recipient id");
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "thread survives sender drift",
+                "body",
+                Some("THREAD-ORPHANED-SENDER"),
+                "normal",
+                false,
+                "[]",
+                &[(recipient_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create threaded message");
+
+            cleanup_committed_agent_after_consistency_failure(
+                &cx, &pool, project_id, sender_id, "BlueLake",
+            )
+            .await
+            .into_result()
+            .expect("orphan sender row");
+
+            let rows = list_thread_messages(&cx, &pool, project_id, "THREAD-ORPHANED-SENDER", None)
+                .await
+                .into_result()
+                .expect("list thread messages");
+
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].from, UNKNOWN_SENDER_DISPLAY);
+            assert_eq!(rows[0].subject, "thread survives sender drift");
         });
     }
 
@@ -15528,6 +15936,72 @@ mod tests {
     }
 
     #[test]
+    fn search_messages_keeps_orphaned_sender_rows_visible() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("search_orphaned_sender.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-search-orphaned-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "e2e-test",
+                "test-model",
+                Some("orphaned search sender"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create sender");
+            let sender_id = sender.id.expect("sender id");
+
+            create_message(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "needle subject",
+                "needle body",
+                Some("THREAD-ORPHANED-SEARCH"),
+                "normal",
+                false,
+                "[]",
+            )
+            .await
+            .into_result()
+            .expect("create message");
+
+            cleanup_committed_agent_after_consistency_failure(
+                &cx, &pool, project_id, sender_id, "BlueLake",
+            )
+            .await
+            .into_result()
+            .expect("orphan sender row");
+
+            let rows = search_messages(&cx, &pool, project_id, "needle", 25)
+                .await
+                .into_result()
+                .expect("search messages");
+
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].from, UNKNOWN_SENDER_DISPLAY);
+            assert_eq!(rows[0].subject, "needle subject");
+        });
+    }
+
+    #[test]
     fn search_messages_for_product_empty_corpus_returns_empty() {
         use asupersync::runtime::RuntimeBuilder;
         use tempfile::tempdir;
@@ -15584,6 +16058,88 @@ mod tests {
                 .into_result()
                 .expect("product search on empty corpus");
             assert!(rows.is_empty());
+        });
+    }
+
+    #[test]
+    fn search_messages_for_product_keeps_orphaned_sender_rows_visible() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("product_search_orphaned_sender.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-product-search-orphaned-{base}"),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let uid = format!("prod_orphaned_{base}");
+            let product = ensure_product(&cx, &pool, Some(uid.as_str()), Some(uid.as_str()))
+                .await
+                .into_result()
+                .expect("ensure product");
+            let product_id = product.id.expect("product id");
+
+            link_product_to_projects(&cx, &pool, product_id, &[project_id])
+                .await
+                .into_result()
+                .expect("link product");
+
+            let sender = create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "e2e-test",
+                "test-model",
+                Some("orphaned product search sender"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create sender");
+            let sender_id = sender.id.expect("sender id");
+
+            create_message(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "needle product subject",
+                "needle product body",
+                Some("THREAD-ORPHANED-PRODUCT-SEARCH"),
+                "normal",
+                false,
+                "[]",
+            )
+            .await
+            .into_result()
+            .expect("create message");
+
+            cleanup_committed_agent_after_consistency_failure(
+                &cx, &pool, project_id, sender_id, "BlueLake",
+            )
+            .await
+            .into_result()
+            .expect("orphan sender row");
+
+            let rows = search_messages_for_product(&cx, &pool, product_id, "needle", 25)
+                .await
+                .into_result()
+                .expect("product search");
+
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].from, UNKNOWN_SENDER_DISPLAY);
+            assert_eq!(rows[0].project_id, project_id);
         });
     }
 
@@ -15999,6 +16555,358 @@ mod tests {
     }
 
     #[test]
+    fn fetch_inbox_global_keeps_orphaned_sender_rows_visible() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("global_inbox_orphaned_sender.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project =
+                ensure_project(&cx, &pool, &format!("/tmp/am-global-inbox-orphaned-{base}"))
+                    .await
+                    .into_result()
+                    .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("sender"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let sender_id = sender.id.expect("sender id");
+            let recipient = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "Global inbox survives sender drift",
+                "Body",
+                Some("global-inbox-orphaned-thread"),
+                "normal",
+                false,
+                "[]",
+                &[(recipient.id.expect("recipient id"), "to")],
+            )
+            .await
+            .into_result()
+            .expect("create message");
+
+            cleanup_committed_agent_after_consistency_failure(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "GreenStone",
+            )
+            .await
+            .into_result()
+            .expect("orphan sender row");
+
+            let rows = fetch_inbox_global(&cx, &pool, "BlueLake", false, None, 25)
+                .await
+                .into_result()
+                .expect("fetch global inbox");
+
+            let row = rows
+                .iter()
+                .find(|row| row.message.subject == "Global inbox survives sender drift")
+                .expect("find orphaned global inbox row");
+            assert_eq!(row.sender_name, UNKNOWN_SENDER_DISPLAY);
+        });
+    }
+
+    #[test]
+    fn fetch_unacked_for_agent_keeps_orphaned_sender_rows_visible() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("unacked_orphaned_sender.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-unacked-orphaned-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("sender"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let sender_id = sender.id.expect("sender id");
+            let recipient = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+            let recipient_id = recipient.id.expect("recipient id");
+
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "Ack survives sender drift",
+                "Body",
+                Some("unacked-orphaned-thread"),
+                "high",
+                true,
+                "[]",
+                &[(recipient_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create ack-required message");
+
+            cleanup_committed_agent_after_consistency_failure(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "GreenStone",
+            )
+            .await
+            .into_result()
+            .expect("orphan sender row");
+
+            let rows = fetch_unacked_for_agent(&cx, &pool, project_id, recipient_id, 25)
+                .await
+                .into_result()
+                .expect("fetch unacked for agent");
+
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].sender_name, UNKNOWN_SENDER_DISPLAY);
+            assert_eq!(rows[0].message.subject, "Ack survives sender drift");
+            assert_eq!(rows[0].kind, "to");
+        });
+    }
+
+    #[test]
+    fn fetch_inbox_keeps_orphaned_sender_rows_visible() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("inbox_orphaned_sender.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-inbox-orphaned-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("sender"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let sender_id = sender.id.expect("sender id");
+            let recipient = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+            let recipient_id = recipient.id.expect("recipient id");
+
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "Inbox survives sender drift",
+                "Body",
+                Some("inbox-orphaned-thread"),
+                "normal",
+                false,
+                "[]",
+                &[(recipient_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create inbox message");
+
+            cleanup_committed_agent_after_consistency_failure(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "GreenStone",
+            )
+            .await
+            .into_result()
+            .expect("orphan sender row");
+
+            let rows = fetch_inbox(&cx, &pool, project_id, recipient_id, false, None, 25)
+                .await
+                .into_result()
+                .expect("fetch inbox");
+
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].sender_name, UNKNOWN_SENDER_DISPLAY);
+            assert_eq!(rows[0].message.subject, "Inbox survives sender drift");
+        });
+    }
+
+    #[test]
+    fn fetch_inbox_ack_required_keeps_orphaned_sender_rows_visible() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("inbox_ack_orphaned_sender.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project =
+                ensure_project(&cx, &pool, &format!("/tmp/am-inbox-ack-orphaned-{base}"))
+                    .await
+                    .into_result()
+                    .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("sender"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let sender_id = sender.id.expect("sender id");
+            let recipient = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+            let recipient_id = recipient.id.expect("recipient id");
+
+            create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "Ack inbox survives sender drift",
+                "Body",
+                Some("inbox-ack-orphaned-thread"),
+                "high",
+                true,
+                "[]",
+                &[(recipient_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create ack inbox message");
+
+            cleanup_committed_agent_after_consistency_failure(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "GreenStone",
+            )
+            .await
+            .into_result()
+            .expect("orphan sender row");
+
+            let rows = fetch_inbox_ack_required(&cx, &pool, project_id, recipient_id, 25)
+                .await
+                .into_result()
+                .expect("fetch ack-required inbox");
+
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].sender_name, UNKNOWN_SENDER_DISPLAY);
+            assert_eq!(rows[0].message.subject, "Ack inbox survives sender drift");
+        });
+    }
+
+    #[test]
     fn count_unread_global_empty_returns_empty() {
         use asupersync::runtime::RuntimeBuilder;
         use tempfile::tempdir;
@@ -16230,6 +17138,79 @@ mod tests {
                 .expect("search global with empty query");
 
             assert!(rows.is_empty());
+        });
+    }
+
+    #[test]
+    fn search_messages_global_keeps_orphaned_sender_rows_visible() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("global_search_orphaned_sender.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-global-search-orphaned-{base}"),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "e2e-test",
+                "test-model",
+                Some("orphaned global search sender"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create sender");
+            let sender_id = sender.id.expect("sender id");
+
+            create_message(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "needle global subject",
+                "needle global body",
+                Some("THREAD-ORPHANED-GLOBAL-SEARCH"),
+                "normal",
+                false,
+                "[]",
+            )
+            .await
+            .into_result()
+            .expect("create message");
+
+            cleanup_committed_agent_after_consistency_failure(
+                &cx, &pool, project_id, sender_id, "BlueLake",
+            )
+            .await
+            .into_result()
+            .expect("orphan sender row");
+
+            let rows = search_messages_global(&cx, &pool, "needle", 25)
+                .await
+                .into_result()
+                .expect("search global");
+
+            let row = rows
+                .iter()
+                .find(|row| row.subject == "needle global subject")
+                .expect("find orphaned global search row");
+            assert_eq!(row.from, UNKNOWN_SENDER_DISPLAY);
+            assert_eq!(row.project_id, project_id);
         });
     }
 

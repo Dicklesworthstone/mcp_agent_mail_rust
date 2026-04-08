@@ -9062,6 +9062,7 @@ pub fn atc_sync_population_from_db(
     let recency_micros =
         mcp_agent_mail_core::config::full_env_value("AM_ATC_POPULATION_RECENCY_SECS")
             .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|secs| *secs >= 0)
             .map(|secs| secs.saturating_mul(1_000_000))
             .unwrap_or(DEFAULT_RECENCY_MICROS);
 
@@ -10210,15 +10211,16 @@ mod alien_enhancement_tests {
         }
         drop(init_conn);
 
-        let pool = mcp_agent_mail_db::create_pool(&mcp_agent_mail_db::DbPoolConfig {
-            database_url: format!("sqlite:///{}", db_path.display()),
-            min_connections: 1,
-            max_connections: 1,
-            run_migrations: false,
-            warmup_connections: 0,
-            ..Default::default()
-        })
-        .expect("create pool");
+        let pool =
+            mcp_agent_mail_db::create_pool_without_startup_init(&mcp_agent_mail_db::DbPoolConfig {
+                database_url: format!("sqlite:///{}", db_path.display()),
+                min_connections: 1,
+                max_connections: 1,
+                run_migrations: false,
+                warmup_connections: 0,
+                ..Default::default()
+            })
+            .expect("create pool");
 
         let project = match fastmcp_core::block_on(mcp_agent_mail_db::queries::ensure_project(
             &cx,
@@ -10255,8 +10257,105 @@ mod alien_enhancement_tests {
         );
 
         let summary = atc_summary().expect("summary");
-        assert_eq!(summary.tracked_agents.len(), 1);
-        assert_eq!(summary.tracked_agents[0].name, "BlueLake");
+        assert!(
+            summary
+                .tracked_agents
+                .iter()
+                .any(|tracked| tracked.name == "BlueLake"),
+            "BlueLake should be present in hydrated ATC population"
+        );
+    }
+
+    #[test]
+    fn sync_population_from_db_clamps_negative_recency_override() {
+        let _guard = GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ATC_POPULATION_RECENCY_SECS", "-1")],
+            || {
+                let config = mcp_agent_mail_core::Config::default();
+                reset_global_atc_state_for_test(&config);
+
+                let cx = asupersync::Cx::for_testing();
+                let dir = tempfile::tempdir().expect("tempdir");
+                let db_path = dir.path().join("atc-sync-population-negative-recency.db");
+
+                let init_conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                    .expect("open db");
+                init_conn
+                    .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+                    .expect("apply init pragmas");
+                init_conn
+                    .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                    .expect("initialize base schema");
+                match fastmcp_core::block_on(mcp_agent_mail_db::schema::migrate_to_latest_base(
+                    &cx, &init_conn,
+                )) {
+                    asupersync::Outcome::Ok(_) => {}
+                    asupersync::Outcome::Err(error) => panic!("apply migrations: {error}"),
+                    other => panic!("unexpected migration outcome: {other:?}"),
+                }
+                drop(init_conn);
+
+                let pool = mcp_agent_mail_db::create_pool_without_startup_init(
+                    &mcp_agent_mail_db::DbPoolConfig {
+                        database_url: format!("sqlite:///{}", db_path.display()),
+                        min_connections: 1,
+                        max_connections: 1,
+                        run_migrations: false,
+                        warmup_connections: 0,
+                        ..Default::default()
+                    },
+                )
+                .expect("create pool");
+
+                let project =
+                    match fastmcp_core::block_on(mcp_agent_mail_db::queries::ensure_project(
+                        &cx,
+                        &pool,
+                        "/tmp/atc-sync-population-negative-recency",
+                    )) {
+                        asupersync::Outcome::Ok(project) => project,
+                        other => panic!("ensure project: {other:?}"),
+                    };
+                let project_id = project.id.expect("project id");
+
+                let agent =
+                    match fastmcp_core::block_on(mcp_agent_mail_db::queries::register_agent(
+                        &cx,
+                        &pool,
+                        project_id,
+                        "AmberLake",
+                        "claude-code",
+                        "gpt5",
+                        Some("ATC negative recency test"),
+                        None,
+                        None,
+                    )) {
+                        asupersync::Outcome::Ok(agent) => agent,
+                        other => panic!("register agent: {other:?}"),
+                    };
+
+                let stats = atc_sync_population_from_db(&pool).expect("sync population");
+                assert_eq!(stats.projects, 1);
+                assert_eq!(stats.agents, 1);
+                assert_eq!(stats.active_agents, 1);
+                assert_eq!(
+                    atc_agent_last_activity("AmberLake"),
+                    Some(agent.last_active_ts)
+                );
+
+                let summary = atc_summary().expect("summary");
+                assert!(
+                    summary
+                        .tracked_agents
+                        .iter()
+                        .any(|tracked| tracked.name == "AmberLake"),
+                    "AmberLake should remain hydrated even when the recency override is negative"
+                );
+            },
+        );
     }
 
     #[test]

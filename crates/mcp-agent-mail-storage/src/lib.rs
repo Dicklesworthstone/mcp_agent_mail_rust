@@ -206,11 +206,7 @@ struct WriteBehindQueue {
     op_depth: Arc<AtomicU64>,
 }
 
-// WBQ defaults — overridable via Config / AM_WBQ_* env vars.
-// These fallbacks are used when the static WBQ is initialised before Config
-// is available (e.g. in tests).
-const WBQ_CHANNEL_CAPACITY: usize = 8_192;
-const WBQ_DRAIN_BATCH_CAP: usize = 256;
+// WBQ timing defaults. Capacity and batch limits come from `Config`.
 const WBQ_FLUSH_INTERVAL_MS: u64 = 100;
 const WBQ_ENQUEUE_TIMEOUT_MS: u64 = 100;
 const WBQ_ENQUEUE_MAX_BACKOFF_MS: u64 = 8;
@@ -219,10 +215,11 @@ static WBQ: OnceLock<WriteBehindQueue> = OnceLock::new();
 
 fn new_write_behind_queue() -> WriteBehindQueue {
     let op_depth = Arc::new(AtomicU64::new(0));
+    let channel_capacity = Config::get().wbq_channel_capacity;
     mcp_agent_mail_core::global_metrics()
         .storage
         .wbq_capacity
-        .set(u64::try_from(WBQ_CHANNEL_CAPACITY).unwrap_or(u64::MAX));
+        .set(u64::try_from(channel_capacity).unwrap_or(u64::MAX));
 
     WriteBehindQueue {
         sender: Mutex::new(None),
@@ -252,11 +249,14 @@ fn wbq_start_inner(wbq: &WriteBehindQueue) {
         let _ = old_handle.join();
     }
 
-    let (tx, rx) = std::sync::mpsc::sync_channel(WBQ_CHANNEL_CAPACITY);
+    let config = Config::get();
+    let channel_capacity = config.wbq_channel_capacity;
+    let drain_batch_cap = config.wbq_drain_batch_cap;
+    let (tx, rx) = std::sync::mpsc::sync_channel(channel_capacity);
     let op_depth_worker = Arc::clone(&wbq.op_depth);
     let handle = std::thread::Builder::new()
         .name("wbq-drain".into())
-        .spawn(move || wbq_drain_loop(rx, op_depth_worker))
+        .spawn(move || wbq_drain_loop(rx, op_depth_worker, channel_capacity, drain_batch_cap))
         .unwrap_or_else(|error| panic!("failed to spawn wbq-drain thread: {error}"));
 
     *wbq.sender.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
@@ -281,7 +281,7 @@ fn wbq_record_enqueue_success(op_depth: &AtomicU64) {
     metrics.storage.wbq_depth.set(depth);
     metrics.storage.wbq_peak_depth.fetch_max(depth);
 
-    let cap = u64::try_from(WBQ_CHANNEL_CAPACITY).unwrap_or(u64::MAX);
+    let cap = u64::try_from(Config::get().wbq_channel_capacity).unwrap_or(u64::MAX);
     let threshold = cap.saturating_mul(80).saturating_div(100);
     if threshold > 0 && depth >= threshold {
         if metrics.storage.wbq_over_80_since_us.load() == 0 {
@@ -462,7 +462,12 @@ pub fn wbq_stats() -> WbqStats {
     }
 }
 
-fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, op_depth: Arc<AtomicU64>) {
+fn wbq_drain_loop(
+    rx: std::sync::mpsc::Receiver<WbqMsg>,
+    op_depth: Arc<AtomicU64>,
+    channel_capacity: usize,
+    drain_batch_cap: usize,
+) {
     let flush_interval = Duration::from_millis(WBQ_FLUSH_INTERVAL_MS);
     let mut flush_waiters: Vec<std::sync::mpsc::SyncSender<()>> = Vec::new();
     let mut shutting_down = false;
@@ -484,7 +489,7 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, op_depth: Arc<AtomicU64
         }
 
         // Drain remaining items from the channel (up to batch cap).
-        while batch.len() < WBQ_DRAIN_BATCH_CAP {
+        while batch.len() < drain_batch_cap {
             match rx.try_recv() {
                 Ok(WbqMsg::Op(op)) => batch.push(op),
                 Ok(WbqMsg::Flush(done_tx)) => flush_waiters.push(done_tx),
@@ -505,7 +510,7 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, op_depth: Arc<AtomicU64
 
         let metrics = mcp_agent_mail_core::global_metrics();
         metrics.storage.wbq_depth.set(depth_after);
-        let cap = u64::try_from(WBQ_CHANNEL_CAPACITY).unwrap_or(u64::MAX);
+        let cap = u64::try_from(channel_capacity).unwrap_or(u64::MAX);
         let threshold = cap.saturating_mul(80).saturating_div(100);
         if threshold > 0 && depth_after >= threshold {
             if metrics.storage.wbq_over_80_since_us.load() == 0 {
@@ -570,7 +575,7 @@ fn wbq_drain_loop(rx: std::sync::mpsc::Receiver<WbqMsg>, op_depth: Arc<AtomicU64
                     .saturating_sub(1);
                 let metrics = mcp_agent_mail_core::global_metrics();
                 metrics.storage.wbq_depth.set(depth_after);
-                let cap = u64::try_from(WBQ_CHANNEL_CAPACITY).unwrap_or(u64::MAX);
+                let cap = u64::try_from(channel_capacity).unwrap_or(u64::MAX);
                 let threshold = cap.saturating_mul(80).saturating_div(100);
                 if threshold > 0 && depth_after >= threshold {
                     if metrics.storage.wbq_over_80_since_us.load() == 0 {
@@ -1538,19 +1543,14 @@ pub struct CommitCoalescer {
     worker_count: usize,
 }
 
-// Coalescer defaults — overridable via Config / AM_COALESCER_* env vars.
-// These fallbacks are used when the coalescer is initialised before Config
-// is available (e.g. in tests).
+// Coalescer timing defaults. Worker and batch limits come from `Config`.
 /// Default flush interval for the coalescer (50ms).
 pub const DEFAULT_COALESCER_FLUSH_MS: u64 = 50;
 /// Guardrail against accidental zero-duration flush intervals.
 const MIN_COALESCER_FLUSH_MS: u64 = 5;
 const MIN_COALESCER_FLUSH_INTERVAL: Duration = Duration::from_millis(MIN_COALESCER_FLUSH_MS);
 
-const COALESCER_MAX_BATCH_SIZE: usize = 10;
 const COMMIT_COALESCER_SOFT_CAP: u64 = 8_192;
-/// Maximum worker threads for the coalescer pool.
-const COALESCER_MAX_WORKERS: usize = 32;
 
 const COALESCER_SPILL_PATH_CAP: usize = 4_096;
 const COALESCER_SPILL_MESSAGE_CAP: usize = 32;
@@ -1561,12 +1561,19 @@ fn clamp_coalescer_flush_interval(interval: Duration) -> Duration {
     interval.max(MIN_COALESCER_FLUSH_INTERVAL)
 }
 
-/// Auto-detect worker count: `min(available_parallelism, COALESCER_MAX_WORKERS)`, minimum 2.
+/// Auto-detect worker count bounded by `Config::coalescer_max_workers`.
+///
+/// When the configured max is `1`, honor that explicitly instead of trying to
+/// apply the usual multi-worker floor of `2`.
 fn coalescer_worker_count() -> usize {
+    let max_workers = Config::get().coalescer_max_workers;
+    if max_workers <= 1 {
+        return 1;
+    }
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .clamp(2, COALESCER_MAX_WORKERS)
+        .clamp(2, max_workers)
 }
 
 impl CommitCoalescer {
@@ -1995,6 +2002,8 @@ fn self_process_repo(
     repos: &Arc<Mutex<HashMap<PathBuf, Arc<RepoQueue>>>>,
     work_cv: &Arc<(Mutex<u64>, std::sync::Condvar)>,
 ) {
+    let max_batch_size = Config::get().coalescer_max_batch_size;
+
     // RAII guard to ensure processing flag is cleared even on panic
     struct ProcessingGuard<'a> {
         rq: &'a Arc<RepoQueue>,
@@ -2010,7 +2019,7 @@ fn self_process_repo(
     let mut batch: Vec<CoalescerCommitFields> = Vec::new();
     let queue_is_empty = {
         let mut q = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
-        while batch.len() < COALESCER_MAX_BATCH_SIZE {
+        while batch.len() < max_batch_size {
             let next = q.front();
             if let Some(next_fields) = next {
                 if let Some(first) = batch.first()
@@ -2089,10 +2098,7 @@ fn self_process_repo(
 
     // Phase 4: Commit
     while !panic_guard.pending_batch.is_empty() {
-        let chunk_size = panic_guard
-            .pending_batch
-            .len()
-            .min(COALESCER_MAX_BATCH_SIZE);
+        let chunk_size = panic_guard.pending_batch.len().min(max_batch_size);
         let chunk = panic_guard
             .pending_batch
             .drain(..chunk_size)
@@ -2538,7 +2544,7 @@ fn coalescer_commit_batch(
     // Keep batch commits bounded to avoid enormous commits under load.
     let commit_result = if can_merge
         && requests.len() > 1
-        && requests.len() <= COALESCER_MAX_BATCH_SIZE
+        && requests.len() <= Config::get().coalescer_max_batch_size
     {
         // Merge all into a single commit
         let merged_paths: Vec<String> = requests
@@ -10672,10 +10678,27 @@ mod tests {
 
     #[test]
     fn coalescer_worker_count_auto_detected() {
-        let coalescer = get_commit_coalescer();
-        let wc = coalescer.worker_count();
-        assert!(wc >= 2, "worker count should be >= 2, got {wc}");
-        assert!(wc <= 32, "worker count should be <= 32, got {wc}");
+        let max_workers = Config::get().coalescer_max_workers;
+        let min_workers = if max_workers <= 1 { 1 } else { 2 };
+        let wc = coalescer_worker_count();
+        assert!(
+            wc >= min_workers,
+            "worker count should be >= {min_workers}, got {wc}"
+        );
+        assert!(
+            wc <= max_workers,
+            "worker count should be <= configured max {max_workers}, got {wc}"
+        );
+    }
+
+    #[test]
+    fn coalescer_worker_count_honors_single_worker_override() {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_COALESCER_MAX_WORKERS", "1")],
+            || {
+                assert_eq!(coalescer_worker_count(), 1);
+            },
+        );
     }
 
     #[test]

@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 
 use crate::CliError;
 
+const UNKNOWN_SENDER_DISPLAY: &str = "[unknown sender]";
+const UNKNOWN_RECIPIENT_DISPLAY: &str = "[unknown recipient]";
+
 fn has_file_reservations_released_ts_column(conn: &DbConn) -> bool {
     conn.query_sync("PRAGMA table_info(file_reservations)", &[])
         .ok()
@@ -2818,7 +2821,8 @@ fn build_inbox(
     let sql = format!(
         "SELECT sub.id, sub.subject, sub.thread_id, sub.importance, sub.ack_required,
                 sub.created_ts, sub.sender_id, sub.read_ts, sub.ack_ts, sub.body_md,
-                sub.priority_bucket, a_sender.name AS sender_name
+                sub.priority_bucket,
+                COALESCE(a_sender.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name
          FROM (
              SELECT m.id, m.subject, m.thread_id, m.importance, m.ack_required,
                     m.created_ts, m.sender_id, mr.read_ts, mr.ack_ts, m.body_md,
@@ -2834,7 +2838,7 @@ fn build_inbox(
              JOIN messages m ON m.id = mr.message_id
              WHERE mr.agent_id = ? AND m.project_id = ?
          ) sub
-         JOIN agents a_sender ON a_sender.id = sub.sender_id
+         LEFT JOIN agents a_sender ON a_sender.id = sub.sender_id
          WHERE 1=1 {bucket_filter}
          ORDER BY sub.priority_bucket ASC, sub.created_ts DESC
          LIMIT ?"
@@ -2960,16 +2964,30 @@ fn load_recipient_display_names(
     message_id: i64,
     context: &'static str,
 ) -> Result<Vec<String>, CliError> {
-    let primary_rows = conn
-        .query_sync(
-            "SELECT a.name AS name
-             FROM message_recipients mr
-             JOIN agents a ON a.id = mr.agent_id
-             WHERE mr.message_id = ? AND mr.kind = 'to'
-             ORDER BY a.name COLLATE NOCASE ASC, a.name ASC",
-            &[Value::BigInt(message_id)],
-        )
-        .map_err(|e| CliError::Other(format!("{context} recipient to-query failed: {e}")))?;
+    let primary_rows = match conn.query_sync(
+        "SELECT CASE
+                    WHEN a.name IS NULL OR a.name = '' THEN ?1
+                    ELSE a.name
+                END AS name
+         FROM message_recipients mr
+         LEFT JOIN agents a ON a.id = mr.agent_id
+         WHERE mr.message_id = ?2 AND mr.kind = 'to'
+         ORDER BY name COLLATE NOCASE ASC, name ASC",
+        &[
+            Value::Text(UNKNOWN_RECIPIENT_DISPLAY.to_string()),
+            Value::BigInt(message_id),
+        ],
+    ) {
+        Ok(rows) => rows,
+        Err(error) if is_missing_agents_table_error(&error) => {
+            return load_recipient_placeholders_without_agents(conn, message_id, context);
+        }
+        Err(error) => {
+            return Err(CliError::Other(format!(
+                "{context} recipient to-query failed: {error}"
+            )));
+        }
+    };
     let primary_names: Vec<String> = primary_rows
         .iter()
         .filter_map(|row| row.get_named::<String>("name").ok())
@@ -2979,22 +2997,37 @@ fn load_recipient_display_names(
         return Ok(primary_names);
     }
 
-    let fallback_rows = conn
-        .query_sync(
-            "SELECT mr.kind AS kind, a.name AS name
-             FROM message_recipients mr
-             JOIN agents a ON a.id = mr.agent_id
-             WHERE mr.message_id = ?
-             ORDER BY CASE mr.kind
-                        WHEN 'cc' THEN 0
-                        WHEN 'bcc' THEN 1
-                        ELSE 2
-                      END ASC,
-                      a.name COLLATE NOCASE ASC,
-                      a.name ASC",
-            &[Value::BigInt(message_id)],
-        )
-        .map_err(|e| CliError::Other(format!("{context} recipient fallback query failed: {e}")))?;
+    let fallback_rows = match conn.query_sync(
+        "SELECT mr.kind AS kind,
+                CASE
+                    WHEN a.name IS NULL OR a.name = '' THEN ?1
+                    ELSE a.name
+                END AS name
+         FROM message_recipients mr
+         LEFT JOIN agents a ON a.id = mr.agent_id
+         WHERE mr.message_id = ?2
+         ORDER BY CASE mr.kind
+                    WHEN 'cc' THEN 0
+                    WHEN 'bcc' THEN 1
+                    ELSE 2
+                  END ASC,
+                  name COLLATE NOCASE ASC,
+                  name ASC",
+        &[
+            Value::Text(UNKNOWN_RECIPIENT_DISPLAY.to_string()),
+            Value::BigInt(message_id),
+        ],
+    ) {
+        Ok(rows) => rows,
+        Err(error) if is_missing_agents_table_error(&error) => {
+            return load_recipient_placeholders_without_agents(conn, message_id, context);
+        }
+        Err(error) => {
+            return Err(CliError::Other(format!(
+                "{context} recipient fallback query failed: {error}"
+            )));
+        }
+    };
     Ok(fallback_rows
         .iter()
         .filter_map(|row| {
@@ -3007,6 +3040,58 @@ fn load_recipient_display_names(
                 "cc" | "bcc" => format!("{kind}: {name}"),
                 _ => name,
             })
+        })
+        .collect())
+}
+
+fn is_missing_agents_table_error(error: &impl std::fmt::Display) -> bool {
+    let message = error.to_string();
+    message.contains("table not found: agents") || message.contains("no such table: agents")
+}
+
+fn load_recipient_placeholders_without_agents(
+    conn: &DbConn,
+    message_id: i64,
+    context: &'static str,
+) -> Result<Vec<String>, CliError> {
+    let primary_rows = conn
+        .query_sync(
+            "SELECT kind
+             FROM message_recipients
+             WHERE message_id = ? AND kind = 'to'
+             ORDER BY kind ASC",
+            &[Value::BigInt(message_id)],
+        )
+        .map_err(|e| CliError::Other(format!("{context} recipient to-query failed: {e}")))?;
+    if !primary_rows.is_empty() {
+        return Ok(vec![
+            UNKNOWN_RECIPIENT_DISPLAY.to_string();
+            primary_rows.len()
+        ]);
+    }
+
+    let fallback_rows = conn
+        .query_sync(
+            "SELECT kind
+             FROM message_recipients
+             WHERE message_id = ?
+             ORDER BY CASE kind
+                        WHEN 'cc' THEN 0
+                        WHEN 'bcc' THEN 1
+                        ELSE 2
+                      END ASC,
+                      kind ASC",
+            &[Value::BigInt(message_id)],
+        )
+        .map_err(|e| CliError::Other(format!("{context} recipient fallback query failed: {e}")))?;
+    Ok(fallback_rows
+        .iter()
+        .map(|row| {
+            let kind = row.get_named::<String>("kind").ok().unwrap_or_default();
+            match kind.as_str() {
+                "cc" | "bcc" => format!("{kind}: {UNKNOWN_RECIPIENT_DISPLAY}"),
+                _ => UNKNOWN_RECIPIENT_DISPLAY.to_string(),
+            }
         })
         .collect())
 }
@@ -3167,11 +3252,12 @@ fn build_thread(
     ));
     let sql = format!(
         "SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
-                m.sender_id, a_sender.name AS sender_name,
+                m.sender_id,
+                COALESCE(a_sender.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name,
                 COUNT(mr.agent_id) AS recipient_count,
                 SUM(CASE WHEN mr.ack_ts IS NOT NULL THEN 1 ELSE 0 END) AS acked_count
          FROM messages m
-         JOIN agents a_sender ON a_sender.id = m.sender_id
+         LEFT JOIN agents a_sender ON a_sender.id = m.sender_id
          LEFT JOIN message_recipients mr ON mr.message_id = m.id
          WHERE {where_clause}
          GROUP BY m.id
@@ -3315,9 +3401,11 @@ fn load_thread_participants(
     let sql = format!(
         "SELECT name, MIN(first_ts), MIN(first_id), lower(name)
          FROM (
-             SELECT a_sender.name AS name, MIN(m1.created_ts) AS first_ts, MIN(m1.id) AS first_id
+             SELECT COALESCE(a_sender.name, '{UNKNOWN_SENDER_DISPLAY}') AS name,
+                    MIN(m1.created_ts) AS first_ts,
+                    MIN(m1.id) AS first_id
              FROM messages m1
-             JOIN agents a_sender ON a_sender.id = m1.sender_id
+             LEFT JOIN agents a_sender ON a_sender.id = m1.sender_id
              WHERE {sender_where}
              GROUP BY a_sender.name
              UNION ALL
@@ -3386,11 +3474,15 @@ fn build_message(
         .query_sync(
             "SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required,
                     m.created_ts, m.thread_id, m.attachments,
-                    a.name AS sender_name, a.program, a.model
+                    COALESCE(a.name, ?1) AS sender_name, a.program, a.model
              FROM messages m
-             JOIN agents a ON a.id = m.sender_id
-             WHERE m.id = ? AND m.project_id = ?",
-            &[Value::BigInt(message_id), Value::BigInt(project_id)],
+             LEFT JOIN agents a ON a.id = m.sender_id
+             WHERE m.id = ?2 AND m.project_id = ?3",
+            &[
+                Value::Text(UNKNOWN_SENDER_DISPLAY.to_string()),
+                Value::BigInt(message_id),
+                Value::BigInt(project_id),
+            ],
         )
         .map_err(|e| CliError::Other(format!("message query failed: {e}")))?;
 
@@ -3453,9 +3545,10 @@ fn build_message(
         let thread_rows = conn
             .query_sync(
                 &format!(
-                    "SELECT m.id, m.subject, m.created_ts, a.name AS sender
+                    "SELECT m.id, m.subject, m.created_ts,
+                            COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender
                      FROM messages m
-                     JOIN agents a ON a.id = m.sender_id
+                     LEFT JOIN agents a ON a.id = m.sender_id
                      WHERE {thread_where}
                      ORDER BY m.created_ts ASC, m.id ASC"
                 ),
@@ -4429,12 +4522,17 @@ fn build_timeline(
     if kind_filter.is_none() || kind_filter == Some("message") {
         let msg_rows = conn
             .query_sync(
-                "SELECT m.id, m.subject, m.created_ts, m.importance, a.name AS sender
+                "SELECT m.id, m.subject, m.created_ts, m.importance,
+                        COALESCE(a.name, ?1) AS sender
                  FROM messages m
-                 JOIN agents a ON a.id = m.sender_id
-                 WHERE m.project_id = ? AND m.created_ts > ?
+                 LEFT JOIN agents a ON a.id = m.sender_id
+                 WHERE m.project_id = ?2 AND m.created_ts > ?3
                  ORDER BY m.created_ts ASC",
-                &[Value::BigInt(project_id), Value::BigInt(since_us)],
+                &[
+                    Value::Text(UNKNOWN_SENDER_DISPLAY.to_string()),
+                    Value::BigInt(project_id),
+                    Value::BigInt(since_us),
+                ],
             )
             .map_err(|e| CliError::Other(format!("timeline messages query: {e}")))?;
 
@@ -6448,16 +6546,17 @@ fn build_navigate_view(
                 .query_sync(
                     "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject,
                             m.importance, m.ack_required, m.created_ts, m.attachments, mr.kind,
-                            a_sender.name AS sender_name
+                            COALESCE(a_sender.name, ?1) AS sender_name
                      FROM message_recipients mr
                      JOIN messages m ON m.id = mr.message_id
-                     JOIN agents a_sender ON a_sender.id = m.sender_id
-                     WHERE mr.agent_id = ? AND m.project_id = ?
+                     LEFT JOIN agents a_sender ON a_sender.id = m.sender_id
+                     WHERE mr.agent_id = ?2 AND m.project_id = ?3
                        AND mr.read_ts IS NULL
                        AND m.importance IN ('urgent', 'high')
                      ORDER BY m.created_ts DESC
-                     LIMIT ?",
+                     LIMIT ?4",
                     &[
+                        Value::Text(UNKNOWN_SENDER_DISPLAY.to_string()),
                         Value::BigInt(agent_id),
                         Value::BigInt(project_id),
                         Value::BigInt(limit.try_into().unwrap_or(i64::MAX)),
@@ -7581,13 +7680,17 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let rows = scope
                 .conn()
                 .query_sync(
-                    "SELECT m.id, m.subject, m.attachments, a.name AS sender_name, m.created_ts
+                    "SELECT m.id, m.subject, m.attachments,
+                            COALESCE(a.name, ?1) AS sender_name, m.created_ts
                      FROM messages m
-                     JOIN agents a ON a.id = m.sender_id
-                     WHERE m.project_id = ? AND m.attachments != '[]'
+                     LEFT JOIN agents a ON a.id = m.sender_id
+                     WHERE m.project_id = ?2 AND m.attachments != '[]'
                      ORDER BY m.created_ts DESC
                      LIMIT 100",
-                    &[Value::BigInt(scope.project_id)],
+                    &[
+                        Value::Text(UNKNOWN_SENDER_DISPLAY.to_string()),
+                        Value::BigInt(scope.project_id),
+                    ],
                 )
                 .map_err(|e| CliError::Other(format!("attachments query: {e}")))?;
 
@@ -11972,6 +12075,32 @@ mod tests {
     }
 
     #[test]
+    fn test_build_inbox_keeps_messages_with_missing_sender_identity() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (122, 1, 999, 'Missing sender inbox', 'MISSING-SENDER', 'normal', 0, 10, 'body', '[]')",
+            &[],
+        )
+        .expect("insert inbox message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (122, 122, 2, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert inbox recipient");
+
+        let result = build_inbox(
+            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false,
+        )
+        .expect("build inbox");
+
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].from, UNKNOWN_SENDER_DISPLAY);
+    }
+
+    #[test]
     fn find_project_for_cwd_walks_ancestor_directories() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let root = temp_dir.path().join("workspace");
@@ -12599,6 +12728,40 @@ mod tests {
     }
 
     #[test]
+    fn test_load_recipient_display_names_uses_placeholder_for_missing_agent_row() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir
+            .path()
+            .join("robot_recipients_missing_agent.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE message_recipients (
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                read_ts INTEGER,
+                ack_ts INTEGER,
+                PRIMARY KEY (message_id, agent_id, kind)
+            )",
+            &empty,
+        )
+        .expect("create recipients");
+        conn.query_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (42, 999, 'to', NULL, NULL)",
+            &empty,
+        )
+        .expect("insert orphaned recipient");
+
+        let recipients =
+            load_recipient_display_names(&conn, 42, "test").expect("load recipient display names");
+        assert_eq!(recipients, vec![UNKNOWN_RECIPIENT_DISPLAY.to_string()]);
+    }
+
+    #[test]
     fn test_build_outbox_entries_supports_real_schema_without_recipient_id_column() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let db_path = temp_dir.path().join("robot_outbox_real_schema.sqlite3");
@@ -12707,6 +12870,40 @@ mod tests {
             no_primary.to == vec!["cc: Carol".to_string()],
             "cc-only recipients should remain visible with an explicit kind label"
         );
+    }
+
+    #[test]
+    fn test_build_message_keeps_missing_sender_identity_visible() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let created_ts = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(106),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(999),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("Missing sender message".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("MISSING-SENDER-MSG".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("normal".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(0),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_ts),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("body".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("[]".to_string()),
+            ],
+        )
+        .expect("insert message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (106, 106, 2, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert recipient");
+
+        let message = build_message(&conn, 1, 106).expect("build message");
+        assert_eq!(message.from, UNKNOWN_SENDER_DISPLAY);
+        assert_eq!(message.to, vec!["Bob".to_string()]);
     }
 
     #[test]

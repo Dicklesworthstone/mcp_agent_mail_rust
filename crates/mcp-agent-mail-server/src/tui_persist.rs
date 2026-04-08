@@ -431,7 +431,10 @@ impl TuiPreferences {
     ///
     /// Returns an error if the JSON is invalid or missing required fields.
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(s)
+        let mut prefs: Self = serde_json::from_str(s)?;
+        prefs.dock =
+            DockLayout::new(prefs.dock.position, prefs.dock.ratio).with_visible(prefs.dock.visible);
+        Ok(prefs)
     }
 
     /// Build the envfile key-value pairs for persistence.
@@ -1096,20 +1099,17 @@ mod tests {
     }
 
     #[test]
-    fn json_ratio_out_of_range_is_preserved() {
-        // JSON round-trip preserves the exact ratio (DockLayout::new would clamp)
+    fn json_ratio_out_of_range_is_clamped() {
         let json = r#"{"dock":{"position":"right","ratio":0.95,"visible":true}}"#;
         let prefs = TuiPreferences::from_json(json).unwrap();
-        // Serde doesn't call DockLayout::new, so the raw value is stored
-        assert!((prefs.dock.ratio - 0.95).abs() < f32::EPSILON);
+        assert!((prefs.dock.ratio - 0.8).abs() < f32::EPSILON);
     }
 
     #[test]
-    fn json_negative_ratio_is_preserved() {
+    fn json_negative_ratio_is_clamped() {
         let json = r#"{"dock":{"position":"right","ratio":-0.1,"visible":true}}"#;
         let prefs = TuiPreferences::from_json(json).unwrap();
-        // Serde doesn't validate range
-        assert!(prefs.dock.ratio < 0.0);
+        assert!((prefs.dock.ratio - 0.2).abs() < f32::EPSILON);
     }
 
     #[test]

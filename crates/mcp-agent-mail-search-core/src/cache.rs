@@ -283,14 +283,15 @@ impl<T: Clone> QueryCache<T> {
     /// Get a cached value if present and not expired.
     #[allow(clippy::significant_drop_tightening)] // Lock ordering is intentional
     pub fn get(&self, key: &QueryCacheKey) -> Option<T> {
-        if !self.config.enabled {
+        if !self.config.enabled || self.config.max_entries == 0 {
             return None;
         }
 
         // Check epoch first (quick rejection)
         if key.index_epoch != self.current_epoch.load(Ordering::Acquire) {
-            let mut metrics = self.metrics.write().ok()?;
-            metrics.misses += 1;
+            self.update_metrics(|metrics| {
+                metrics.misses += 1;
+            });
             return None;
         }
 
@@ -307,24 +308,28 @@ impl<T: Clone> QueryCache<T> {
         // Check TTL
         if entry.is_expired(self.config.ttl) {
             entries.remove(key);
-            let mut metrics = self.metrics.write().ok()?;
-            metrics.misses += 1;
-            metrics.evictions_ttl += 1;
-            metrics.current_entries = entries.len();
+            let current_entries = entries.len();
+            drop(entries);
+            self.update_metrics(|metrics| {
+                metrics.misses += 1;
+                metrics.evictions_ttl += 1;
+                metrics.current_entries = current_entries;
+            });
             return None;
         }
 
         entry.touch();
-
-        let mut metrics = self.metrics.write().ok()?;
-        metrics.hits += 1;
-
-        Some(entry.value.clone())
+        let value = entry.value.clone();
+        drop(entries);
+        self.update_metrics(|metrics| {
+            metrics.hits += 1;
+        });
+        Some(value)
     }
 
     /// Insert a value into the cache.
     pub fn put(&self, key: QueryCacheKey, value: T) {
-        if !self.config.enabled {
+        if !self.config.enabled || self.config.max_entries == 0 {
             return;
         }
 
@@ -364,6 +369,12 @@ impl<T: Clone> QueryCache<T> {
                 metrics.evictions_capacity += 1;
                 metrics.current_entries = entries.len();
             }
+        }
+    }
+
+    fn update_metrics(&self, update: impl FnOnce(&mut CacheMetrics)) {
+        if let Ok(mut metrics) = self.metrics.write() {
+            update(&mut metrics);
         }
     }
 
@@ -889,6 +900,22 @@ mod tests {
         assert_eq!(metrics.current_entries, 0);
     }
 
+    #[test]
+    fn test_zero_capacity_cache_put_is_noop() {
+        let config = CacheConfig {
+            max_entries: 0,
+            ttl: Duration::from_mins(5),
+            enabled: true,
+        };
+        let cache: QueryCache<i64> = QueryCache::new(config);
+        let key = QueryCacheKey::without_filter("test", SearchMode::Hybrid, 0, 0, 10);
+        cache.put(key.clone(), 42);
+        assert!(cache.get(&key).is_none());
+        let metrics = cache.metrics();
+        assert_eq!(metrics.inserts, 0);
+        assert_eq!(metrics.current_entries, 0);
+    }
+
     // ── TTL expiry ────────────────────────────────────────────────
 
     #[test]
@@ -917,6 +944,24 @@ mod tests {
         );
         let metrics = cache.metrics();
         assert_eq!(metrics.evictions_ttl, 1, "should record TTL eviction");
+    }
+
+    #[test]
+    fn test_metrics_poison_does_not_hide_cached_hit() {
+        let cache = QueryCache::new(CacheConfig {
+            max_entries: 10,
+            ttl: Duration::from_mins(1),
+            enabled: true,
+        });
+        let key = QueryCacheKey::without_filter("test", SearchMode::Hybrid, 0, 0, 10);
+        cache.put(key.clone(), 42_i64);
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.metrics.write().unwrap();
+            panic!("poison metrics lock");
+        }));
+
+        assert_eq!(cache.get(&key), Some(42));
     }
 
     // ── Epoch management ──────────────────────────────────────────

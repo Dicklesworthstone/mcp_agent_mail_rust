@@ -4009,6 +4009,25 @@ impl AtcExecutorMode {
     }
 }
 
+fn atc_durable_experience_store_writable(pool: &mcp_agent_mail_db::DbPool) -> bool {
+    // ATC experience IO now goes through the canonical SQLite path in the DB
+    // crate for both in-memory and file-backed mailboxes. The DB layer has
+    // dedicated integrity coverage for file-backed append/transition flows, so
+    // the server should not suppress durable ATC writes based on mailbox mode.
+    let _ = pool;
+    true
+}
+
+fn atc_durable_experience_store_enabled(
+    executor_mode: AtcExecutorMode,
+    atc_db_pool: Option<&mcp_agent_mail_db::DbPool>,
+) -> bool {
+    matches!(
+        executor_mode,
+        AtcExecutorMode::Live | AtcExecutorMode::Canary
+    ) && atc_db_pool.is_some_and(atc_durable_experience_store_writable)
+}
+
 impl AtcOperatorActionSnapshot {
     fn console_line(&self) -> String {
         self.message.as_deref().map_or_else(
@@ -4415,6 +4434,12 @@ fn append_atc_experience_for_effect(
     pool: &mcp_agent_mail_db::DbPool,
     effect: &atc::AtcEffectPlan,
 ) -> Result<ExperienceRow, String> {
+    if !atc_durable_experience_store_writable(pool) {
+        return Err(
+            "ATC durable experience store is disabled for file-backed mailboxes".to_string(),
+        );
+    }
+
     let row = build_atc_experience_row(effect)?;
     let cx = Cx::for_request_with_budget(Budget::INFINITE);
     match block_on(mcp_agent_mail_db::queries::append_atc_experience(
@@ -4609,6 +4634,10 @@ fn capture_atc_execution_result(
     status: &str,
     ts_micros: i64,
 ) {
+    if !atc_durable_experience_store_writable(pool) {
+        return;
+    }
+
     let Some(exp_id) = experience_id else {
         // No experience ID means append_atc_experience_for_effect failed earlier.
         // The effect was still executed but has no durable experience record.
@@ -4709,6 +4738,10 @@ fn promote_executed_experience_to_open_for_resolution(
     now_micros: i64,
     failure_message: &'static str,
 ) -> bool {
+    if !atc_durable_experience_store_writable(pool) {
+        return false;
+    }
+
     if state != ExperienceState::Executed {
         return true;
     }
@@ -4772,6 +4805,10 @@ fn sweep_open_experiences_for_resolution(
     now_micros: i64,
     resolution_window_micros: i64,
 ) {
+    if !atc_durable_experience_store_writable(pool) {
+        return;
+    }
+
     let cx = Cx::for_request_with_budget(Budget::INFINITE);
 
     // Fetch up to 50 open experiences per sweep to bound query cost.
@@ -4908,6 +4945,10 @@ pub(crate) fn resolve_conflict_experiences_on_reservation_event(
     correct: bool,
     evidence: serde_json::Value,
 ) {
+    if !atc_durable_experience_store_writable(pool) {
+        return;
+    }
+
     let now_micros = mcp_agent_mail_db::now_micros();
     let cx = Cx::for_request_with_budget(Budget::INFINITE);
 
@@ -5336,7 +5377,8 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
     if atc_db_pool.is_none() {
         tracing::warn!("ATC durable experience append disabled: failed to acquire DB pool");
     }
-
+    let durable_writes_enabled =
+        atc_durable_experience_store_enabled(executor_mode, atc_db_pool.as_ref());
     let mut recent_actions = VecDeque::with_capacity(ATC_OPERATOR_ACTION_CAPACITY);
     let mut recent_executions = VecDeque::with_capacity(ATC_OPERATOR_EXECUTION_CAPACITY);
     let mut last_action_by_key: HashMap<String, i64> = HashMap::new();
@@ -5392,10 +5434,6 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
         // execute effects.  Shadow and DryRun modes suppress all real actions,
         // so recording experiences for them generates write churn without any
         // learning value.
-        let durable_writes_enabled = matches!(
-            executor_mode,
-            AtcExecutorMode::Live | AtcExecutorMode::Canary
-        );
         for mut effect in new_effects {
             if durable_writes_enabled {
                 if let Some(pool) = atc_db_pool.as_ref() {
@@ -13332,6 +13370,60 @@ first body
     }
 
     #[test]
+    fn atc_durable_experience_store_is_enabled_for_file_backed_mailboxes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("atc-file-backed.sqlite3");
+        let pool = get_or_create_pool(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create file-backed pool");
+
+        assert!(atc_durable_experience_store_writable(&pool));
+        assert!(atc_durable_experience_store_enabled(
+            AtcExecutorMode::Live,
+            Some(&pool),
+        ));
+        assert!(atc_durable_experience_store_enabled(
+            AtcExecutorMode::Canary,
+            Some(&pool),
+        ));
+        assert!(!atc_durable_experience_store_enabled(
+            AtcExecutorMode::Shadow,
+            Some(&pool),
+        ));
+    }
+
+    #[test]
+    fn atc_durable_experience_store_still_tracks_executor_mode_for_in_memory_mailboxes() {
+        let pool = create_pool(&DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create in-memory pool");
+
+        assert!(atc_durable_experience_store_writable(&pool));
+        assert!(atc_durable_experience_store_enabled(
+            AtcExecutorMode::Live,
+            Some(&pool),
+        ));
+        assert!(atc_durable_experience_store_enabled(
+            AtcExecutorMode::Canary,
+            Some(&pool),
+        ));
+        assert!(!atc_durable_experience_store_enabled(
+            AtcExecutorMode::Shadow,
+            Some(&pool),
+        ));
+    }
+
+    #[test]
     fn atc_probe_effect_uses_probe_request_language() {
         let effect = sample_probe_effect();
         assert_eq!(
@@ -13693,45 +13785,26 @@ first body
     }
 
     #[test]
-    fn conflict_reservation_resolution_promotes_executed_rows_before_resolving() {
+    fn conflict_reservation_resolution_updates_file_backed_mailboxes() {
         let cx = Cx::for_testing();
         let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("conflict-resolution.db");
-
-        let init_conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
-            .expect("open base schema connection");
-        init_conn
-            .execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
-            .expect("apply init pragmas");
-        init_conn
-            .execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
-            .expect("initialize base schema");
-        match block_on(mcp_agent_mail_db::schema::migrate_to_latest_base(
-            &cx, &init_conn,
-        )) {
-            asupersync::Outcome::Ok(_) => {}
-            asupersync::Outcome::Err(error) => panic!("apply migrations: {error}"),
-            other => panic!("unexpected migration outcome: {other:?}"),
-        }
-        drop(init_conn);
-
-        let pool = mcp_agent_mail_db::create_pool(&mcp_agent_mail_db::DbPoolConfig {
+        let db_path = dir.path().join("conflict-resolution-file-backed.db");
+        let pool = get_or_create_pool(&DbPoolConfig {
             database_url: format!("sqlite:///{}", db_path.display()),
-            min_connections: 1,
+            min_connections: 0,
             max_connections: 1,
-            run_migrations: false,
             warmup_connections: 0,
             ..Default::default()
         })
-        .expect("create pool");
+        .expect("create file-backed pool");
 
         let row = ExperienceRow {
             experience_id: 0,
-            decision_id: 41,
-            effect_id: 91,
-            trace_id: "trc-conflict-resolution".to_string(),
-            claim_id: "clm-conflict-resolution".to_string(),
-            evidence_id: "evi-conflict-resolution".to_string(),
+            decision_id: 42,
+            effect_id: 92,
+            trace_id: "trc-conflict-file-backed".to_string(),
+            claim_id: "clm-conflict-file-backed".to_string(),
+            evidence_id: "evi-conflict-file-backed".to_string(),
             state: ExperienceState::Executed,
             subsystem: ExperienceSubsystem::Conflict,
             decision_class: "reservation_conflict".to_string(),
@@ -13749,9 +13822,9 @@ first body
             safe_mode_active: false,
             non_execution_reason: None,
             outcome: None,
-            created_ts_micros: 1_700_000_000_002_000,
-            dispatched_ts_micros: Some(1_700_000_000_002_050),
-            executed_ts_micros: Some(1_700_000_000_002_100),
+            created_ts_micros: 1_700_000_000_003_000,
+            dispatched_ts_micros: Some(1_700_000_000_003_050),
+            executed_ts_micros: Some(1_700_000_000_003_100),
             resolved_ts_micros: None,
             features: Some(FeatureVector::zeroed()),
             feature_ext: None,
@@ -13783,8 +13856,84 @@ first body
         .expect("fetch remaining open experiences");
         assert!(
             remaining.is_empty(),
-            "reservation-event resolution should consume executed conflict experiences once promoted to open"
+            "file-backed ATC experiences should resolve once the reservation conflict clears"
         );
+    }
+
+    #[test]
+    fn capture_atc_execution_result_updates_file_backed_mailboxes() {
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("capture-file-backed.db");
+        let pool = create_pool(&DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create file-backed pool");
+
+        let row = ExperienceRow {
+            experience_id: 0,
+            decision_id: 43,
+            effect_id: 93,
+            trace_id: "trc-capture-file-backed".to_string(),
+            claim_id: "clm-capture-file-backed".to_string(),
+            evidence_id: "evi-capture-file-backed".to_string(),
+            state: ExperienceState::Planned,
+            subsystem: ExperienceSubsystem::Liveness,
+            decision_class: "liveness_probe".to_string(),
+            subject: "AlphaAgent".to_string(),
+            project_key: Some("/tmp/project-a".to_string()),
+            policy_id: Some("liveness-r1".to_string()),
+            effect_kind: EffectKind::Probe,
+            action: "ProbeAgent".to_string(),
+            posterior: vec![("Alive".to_string(), 0.40), ("Dead".to_string(), 0.60)],
+            expected_loss: 1.0,
+            runner_up_action: Some("Wait".to_string()),
+            runner_up_loss: Some(1.4),
+            evidence_summary: "liveness probe planned".to_string(),
+            calibration_healthy: true,
+            safe_mode_active: false,
+            non_execution_reason: None,
+            outcome: None,
+            created_ts_micros: 1_700_000_000_004_000,
+            dispatched_ts_micros: None,
+            executed_ts_micros: None,
+            resolved_ts_micros: None,
+            features: Some(FeatureVector::zeroed()),
+            feature_ext: None,
+            context: None,
+        };
+
+        let stored = block_on(mcp_agent_mail_db::queries::append_atc_experience(
+            &cx, &pool, &row,
+        ))
+        .into_result()
+        .expect("append planned experience");
+
+        capture_atc_execution_result(
+            &pool,
+            Some(stored.experience_id),
+            "live",
+            "executed",
+            1_700_000_000_004_100,
+        );
+
+        let open = block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
+            &cx,
+            &pool,
+            Some("AlphaAgent"),
+            10,
+        ))
+        .into_result()
+        .expect("fetch open experiences");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].experience_id, stored.experience_id);
+        assert_eq!(open[0].state, ExperienceState::Executed);
+        assert_eq!(open[0].dispatched_ts_micros, Some(1_700_000_000_004_100));
+        assert_eq!(open[0].executed_ts_micros, Some(1_700_000_000_004_100));
     }
 
     #[test]

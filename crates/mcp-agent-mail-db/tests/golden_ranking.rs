@@ -1107,6 +1107,7 @@ fn golden_explain_metadata() {
             "filter_only",
             "empty",
             "lexical_v3",
+            "semantic_v3",
             "hybrid_v3",
             "auto_v3",
         ];
@@ -1127,11 +1128,13 @@ fn golden_explain_metadata() {
         );
         assertion_count += 1;
 
-        // Text queries should use fts5 or like_fallback
+        // Text queries may use the legacy planner contract or a V3 engine mode.
         if !q.text.is_empty() && q.importance.is_empty() && q.thread_id.is_none() {
             assert!(
-                explain.method == "fts5" || explain.method == "like_fallback",
-                "Text-only query '{}' should use fts5 or like, got '{}'",
+                explain.method == "fts5"
+                    || explain.method == "like_fallback"
+                    || explain.method.ends_with("_v3"),
+                "Text-only query '{}' should use legacy planner or V3 engine method, got '{}'",
                 q.label,
                 explain.method
             );
@@ -1236,8 +1239,11 @@ fn golden_zero_results() {
     // Explain should indicate method
     let explain = snap.explain.as_ref().unwrap();
     assert!(
-        explain.method == "fts5" || explain.method == "like_fallback" || explain.method == "empty",
-        "Zero-result method should be fts5/like/empty, got '{}'",
+        explain.method == "fts5"
+            || explain.method == "like_fallback"
+            || explain.method == "empty"
+            || explain.method.ends_with("_v3"),
+        "Zero-result method should be a legacy or V3 explain method, got '{}'",
         explain.method
     );
 

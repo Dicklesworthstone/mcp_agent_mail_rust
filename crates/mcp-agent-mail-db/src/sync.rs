@@ -6,7 +6,7 @@
 use crate::DbConn;
 use crate::error::DbError;
 use crate::models::MessageRow;
-use crate::queries::InboxRow;
+use crate::queries::{InboxRow, UNKNOWN_SENDER_DISPLAY};
 use sqlmodel_core::Value;
 
 const MAX_SYNC_IN_CLAUSE_ITEMS: usize = 500;
@@ -67,14 +67,14 @@ pub fn fetch_inbox_rows_from_conn(
 ) -> Result<Vec<InboxRow>, DbError> {
     let _ = conn.execute_raw("PRAGMA busy_timeout = 250");
 
-    let mut sql = String::from(
+    let mut sql = format!(
         "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
                 m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
-                r.kind, s.name AS sender_name, r.read_ts, r.ack_ts \
+                r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, r.read_ts, r.ack_ts \
          FROM message_recipients r \
          JOIN messages m ON m.id = r.message_id \
-         JOIN agents s ON s.id = m.sender_id \
-         WHERE r.agent_id = ? AND m.project_id = ?",
+         LEFT JOIN agents s ON s.id = m.sender_id \
+         WHERE r.agent_id = ? AND m.project_id = ?"
     );
 
     let mut params = vec![Value::BigInt(agent_id), Value::BigInt(project_id)];
