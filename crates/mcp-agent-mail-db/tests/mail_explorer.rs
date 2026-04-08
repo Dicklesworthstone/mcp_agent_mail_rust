@@ -444,7 +444,9 @@ fn explorer_inbound_keeps_orphaned_sender_rows_visible() {
 
             let conn = match p.acquire(&cx).await {
                 Outcome::Ok(conn) => conn,
-                other => panic!("acquire failed: {other:?}"),
+                Outcome::Err(error) => panic!("acquire failed: {error}"),
+                Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                Outcome::Panicked(_) => panic!("acquire panicked"),
             };
             conn.execute_sync(
                 "DELETE FROM agents WHERE id = ? AND project_id = ?",
