@@ -2869,7 +2869,13 @@ fn split_outbox_recipient_lists(
     let mut cc_list: Vec<String> = Vec::with_capacity(2);
     let mut bcc_list: Vec<String> = Vec::with_capacity(2);
     for rr in recip_rows {
-        let name: String = rr.get_named("name").unwrap_or_default();
+        let raw_agent_id = rr.get_named::<i64>("raw_agent_id").unwrap_or(0);
+        let name = rr
+            .get_named::<Option<String>>("name")
+            .ok()
+            .flatten()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| format!("[unknown-agent-{raw_agent_id}]"));
         let kind: String = rr.get_named("kind").unwrap_or_default();
         match kind.as_str() {
             "cc" => cc_list.push(name),
@@ -2942,8 +2948,9 @@ async fn load_outbox_messages(
     let mut messages: Vec<OutboxMessageEntry> = Vec::with_capacity(capped_rows.len());
     for row in capped_rows {
         let id: i64 = row.get_as(0).unwrap_or(0);
-        let recip_sql = "SELECT a.name, r.kind FROM message_recipients r \
-                        JOIN agents a ON a.id = r.agent_id \
+        let recip_sql = "SELECT r.agent_id AS raw_agent_id, a.name, r.kind \
+                        FROM message_recipients r \
+                        LEFT JOIN agents a ON a.id = r.agent_id \
                         WHERE r.message_id = ?";
         let recip_params = [Value::BigInt(id)];
         let recip_start = mcp_agent_mail_db::query_timer();
@@ -4704,6 +4711,7 @@ first body
         project_ref: String,
         sender_name: String,
         recipient_name: String,
+        recipient_id: i64,
         thread_id: String,
         message_id: i64,
     }
@@ -4734,6 +4742,7 @@ first body
             project_ref: project.human_key,
             sender_name: sender.name,
             recipient_name: recipient.name,
+            recipient_id: recipient.id.unwrap_or(0),
             thread_id,
             message_id: message.id.unwrap_or(0),
         }
@@ -5173,6 +5182,54 @@ first body
         with_serialized_resources(|| {
             run_async(|cx| async move {
                 assert_mailbox_uses_canonical_agent_names(&cx).await;
+            });
+        });
+    }
+
+    #[test]
+    fn mailbox_and_outbox_keep_orphaned_recipient_names_visible() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let fixture = setup_populated_mailbox_fixture(&cx).await;
+                let pool = get_db_pool().expect("db pool");
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(err) => panic!("acquire failed: {err}"),
+                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                    Outcome::Panicked(panic) => panic!("acquire panicked: {}", panic.message()),
+                };
+                conn.execute_sync(
+                    "DELETE FROM agents WHERE id = ?",
+                    &[mcp_agent_mail_db::sqlmodel::Value::BigInt(
+                        fixture.recipient_id,
+                    )],
+                )
+                .expect("delete recipient row");
+                drop(conn);
+
+                let mailbox_value = parse_json(
+                    &mailbox(
+                        &fixture.ctx,
+                        format!("{}?project={}", fixture.sender_name, fixture.project_ref),
+                    )
+                    .await
+                    .expect("mailbox"),
+                );
+                assert_eq!(mailbox_value["count"], 1);
+                assert_eq!(mailbox_value["messages"][0]["kind"], "outbox");
+
+                let outbox_value = parse_json(
+                    &outbox(
+                        &fixture.ctx,
+                        format!("{}?project={}", fixture.sender_name, fixture.project_ref),
+                    )
+                    .await
+                    .expect("outbox"),
+                );
+                assert_eq!(
+                    outbox_value["messages"][0]["to"][0],
+                    format!("[unknown-agent-{}]", fixture.recipient_id)
+                );
             });
         });
     }

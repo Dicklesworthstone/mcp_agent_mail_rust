@@ -5,10 +5,12 @@
 use std::path::Path;
 
 use mcp_agent_mail_db::DbConn;
+use mcp_agent_mail_db::queries::UNKNOWN_SENDER_DISPLAY;
 
 use crate::ShareError;
 
 type Conn = DbConn;
+const UNKNOWN_RECIPIENT_DISPLAY: &str = "[unknown recipient]";
 
 #[cfg(test)]
 // Historical alias name retained in tests; this still uses FrankenSQLite `DbConn`.
@@ -188,21 +190,27 @@ pub fn build_materialized_views(
         "printf('msg:%d', m.id)"
     };
     let sender_expr = if has_sender_id {
-        "COALESCE((SELECT a.name FROM agents a WHERE a.id = m.sender_id LIMIT 1), '') AS sender_name"
+        format!(
+            "COALESCE(NULLIF(TRIM((SELECT a.name FROM agents a WHERE a.id = m.sender_id LIMIT 1)), ''), '{UNKNOWN_SENDER_DISPLAY}') AS sender_name"
+        )
     } else {
-        "'' AS sender_name"
+        format!("'{UNKNOWN_SENDER_DISPLAY}' AS sender_name")
     };
-    let recipients_join = "LEFT JOIN ( \
+    let recipients_join = format!(
+        "LEFT JOIN ( \
              SELECT ordered_recipients.message_id, \
                     GROUP_CONCAT(ordered_recipients.name, ', ') AS recipients \
              FROM ( \
-                 SELECT mr.message_id, COALESCE(ag.name, '') AS name \
+                 SELECT DISTINCT \
+                     mr.message_id, \
+                     COALESCE(NULLIF(TRIM(ag.name), ''), '{UNKNOWN_RECIPIENT_DISPLAY}') AS name \
                  FROM message_recipients mr \
                  LEFT JOIN agents ag ON ag.id = mr.agent_id \
-                 ORDER BY ag.name \
+                 ORDER BY mr.message_id, name \
              ) AS ordered_recipients \
              GROUP BY ordered_recipients.message_id \
-         ) AS recipient_rollup ON recipient_rollup.message_id = m.id";
+         ) AS recipient_rollup ON recipient_rollup.message_id = m.id"
+    );
     let recipients_expr = "COALESCE(recipient_rollup.recipients, '') AS recipients";
     let attachments_expr = "CASE \
              WHEN json_valid(COALESCE(m.attachments, '[]')) \
@@ -290,32 +298,37 @@ pub fn build_materialized_views(
 
         // Use m.id for the rowid column since id INTEGER PRIMARY KEY aliases rowid.
         let fts_overview_sql = if has_sender_id {
-            "CREATE TABLE fts_search_overview_mv AS \
+            format!(
+                "CREATE TABLE fts_search_overview_mv AS \
              SELECT \
                  m.id AS rowid, \
                  m.id, \
                  m.subject, \
                  m.created_ts, \
                  m.importance, \
-                 COALESCE((SELECT a.name FROM agents a WHERE a.id = m.sender_id LIMIT 1), '') AS sender_name, \
+                 COALESCE(NULLIF(TRIM((SELECT a.name FROM agents a WHERE a.id = m.sender_id LIMIT 1)), ''), '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, \
                  SUBSTR(m.body_md, 1, 200) AS snippet \
              FROM messages m \
-             ORDER BY m.created_ts DESC"
+                 ORDER BY m.created_ts DESC"
+            )
         } else {
-            "CREATE TABLE fts_search_overview_mv AS \
+            format!(
+                "CREATE TABLE fts_search_overview_mv AS \
              SELECT \
                  m.id AS rowid, \
                  m.id, \
                  m.subject, \
                  m.created_ts, \
                  m.importance, \
-                 '' AS sender_name, \
+                 '{UNKNOWN_SENDER_DISPLAY}' AS sender_name, \
                  SUBSTR(m.body_md, 1, 200) AS snippet \
              FROM messages m \
              ORDER BY m.created_ts DESC"
+            )
+            .to_string()
         };
 
-        match conn.execute_raw(fts_overview_sql) {
+        match conn.execute_raw(&fts_overview_sql) {
             Ok(_) => {
                 for idx in [
                     "CREATE INDEX idx_fts_overview_rowid ON fts_search_overview_mv(rowid)",
@@ -460,23 +473,23 @@ pub fn create_performance_indexes(snapshot_path: &Path) -> Result<Vec<String>, S
 
     // Populate lowercase columns
     if has_sender_id {
-        conn.execute_raw(
+        conn.execute_raw(&format!(
             "UPDATE messages SET \
                  subject_lower = LOWER(COALESCE(subject, '')), \
                  sender_lower = LOWER(\
                      COALESCE(\
-                         (SELECT name FROM agents WHERE agents.id = messages.sender_id), \
-                         ''\
+                         NULLIF(TRIM((SELECT name FROM agents WHERE agents.id = messages.sender_id)), ''), \
+                         '{UNKNOWN_SENDER_DISPLAY}'\
                      )\
-                 )",
-        )
+                 )"
+        ))
         .map_err(sql_err)?;
     } else {
-        conn.execute_raw(
+        conn.execute_raw(&format!(
             "UPDATE messages SET \
                  subject_lower = LOWER(COALESCE(subject, '')), \
-                 sender_lower = ''",
-        )
+                 sender_lower = LOWER('{UNKNOWN_SENDER_DISPLAY}')"
+        ))
         .map_err(sql_err)?;
     }
 
@@ -843,6 +856,83 @@ mod tests {
             .unwrap();
         let recipients: String = rows[0].get_named("recipients").unwrap();
         assert_eq!(recipients, "AlphaAgent, BetaAgent");
+    }
+
+    #[test]
+    fn materialized_views_dedupe_and_normalize_recipient_display_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw(
+            "INSERT INTO agents VALUES (2, 1, 'BetaAgent', 'codex-cli', 'gpt-5', 'testing', \
+             '2025-01-01T00:00:00Z', '2025-01-01T12:00:00Z', 'auto', 'auto')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO agents VALUES (3, 1, 'BetaAgent', 'codex-cli', 'gpt-5', 'testing', \
+             '2025-01-01T00:00:00Z', '2025-01-01T12:00:00Z', 'auto', 'auto')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO agents VALUES (4, 1, '   ', 'codex-cli', 'gpt-5', 'testing', \
+             '2025-01-01T00:00:00Z', '2025-01-01T12:00:00Z', 'auto', 'auto')",
+        )
+        .unwrap();
+        conn.execute_raw("INSERT INTO message_recipients VALUES (1, 2, 'cc', NULL, NULL)")
+            .unwrap();
+        conn.execute_raw("INSERT INTO message_recipients VALUES (1, 3, 'bcc', NULL, NULL)")
+            .unwrap();
+        conn.execute_raw("INSERT INTO message_recipients VALUES (1, 4, 'cc', NULL, NULL)")
+            .unwrap();
+        drop(conn);
+
+        build_materialized_views(&db, false).unwrap();
+
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT recipients FROM message_overview_mv WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        let recipients: String = rows[0].get_named("recipients").unwrap();
+        assert_eq!(recipients, "AlphaAgent, BetaAgent, [unknown recipient]");
+    }
+
+    #[test]
+    fn materialized_views_order_recipients_per_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw(
+            "INSERT INTO agents VALUES (2, 1, 'BetaAgent', 'codex-cli', 'gpt-5', 'testing', \
+             '2025-01-01T00:00:00Z', '2025-01-01T12:00:00Z', 'auto', 'auto')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO agents VALUES (3, 1, 'ZetaAgent', 'codex-cli', 'gpt-5', 'testing', \
+             '2025-01-01T00:00:00Z', '2025-01-01T12:00:00Z', 'auto', 'auto')",
+        )
+        .unwrap();
+        conn.execute_raw("INSERT INTO message_recipients VALUES (1, 3, 'cc', NULL, NULL)")
+            .unwrap();
+        conn.execute_raw("INSERT INTO message_recipients VALUES (2, 2, 'cc', NULL, NULL)")
+            .unwrap();
+        drop(conn);
+
+        build_materialized_views(&db, false).unwrap();
+
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT id, recipients FROM message_overview_mv ORDER BY id ASC",
+                &[],
+            )
+            .unwrap();
+        let message_one_recipients: String = rows[0].get_named("recipients").unwrap();
+        let message_two_recipients: String = rows[1].get_named("recipients").unwrap();
+        assert_eq!(message_one_recipients, "AlphaAgent, ZetaAgent");
+        assert_eq!(message_two_recipients, "AlphaAgent, BetaAgent");
     }
 
     #[test]
@@ -1218,6 +1308,13 @@ mod tests {
             !indexes.contains(&"idx_messages_sender".to_string()),
             "should not create sender index when sender_id is absent"
         );
+
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync("SELECT sender_lower FROM messages WHERE id = 1", &[])
+            .unwrap();
+        let sender: String = rows[0].get_named("sender_lower").unwrap();
+        assert_eq!(sender, UNKNOWN_SENDER_DISPLAY.to_lowercase());
     }
 
     /// Create a test DB without thread_id column on messages.
@@ -1340,7 +1437,7 @@ mod tests {
         let views = build_materialized_views(&db, false).unwrap();
         assert!(views.contains(&"message_overview_mv".to_string()));
 
-        // Verify overview created with empty sender_name
+        // Verify overview uses the stable sender placeholder.
         let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
         let rows = conn
             .query_sync(
@@ -1349,7 +1446,63 @@ mod tests {
             )
             .unwrap();
         let name: String = rows[0].get_named("sender_name").unwrap();
-        assert_eq!(name, "", "should have empty sender_name without sender_id");
+        assert_eq!(name, UNKNOWN_SENDER_DISPLAY);
+    }
+
+    #[test]
+    fn materialized_views_replace_blank_sender_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw("UPDATE agents SET name = '   ' WHERE id = 1")
+            .unwrap();
+        drop(conn);
+
+        let views = build_materialized_views(&db, true).unwrap();
+        assert!(views.contains(&"message_overview_mv".to_string()));
+        assert!(views.contains(&"fts_search_overview_mv".to_string()));
+
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        let overview_rows = conn
+            .query_sync(
+                "SELECT sender_name FROM message_overview_mv WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        let overview_name: String = overview_rows[0].get_named("sender_name").unwrap();
+        assert_eq!(overview_name, UNKNOWN_SENDER_DISPLAY);
+
+        let fts_rows = conn
+            .query_sync(
+                "SELECT sender_name FROM fts_search_overview_mv WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        let fts_name: String = fts_rows[0].get_named("sender_name").unwrap();
+        assert_eq!(fts_name, UNKNOWN_SENDER_DISPLAY);
+    }
+
+    #[test]
+    fn materialized_views_keep_orphaned_sender_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw("DELETE FROM agents WHERE id = 1").unwrap();
+        drop(conn);
+
+        build_materialized_views(&db, false).unwrap();
+
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT sender_name FROM message_overview_mv WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        let name: String = rows[0].get_named("sender_name").unwrap();
+        assert_eq!(name, UNKNOWN_SENDER_DISPLAY);
     }
 
     #[test]

@@ -22,6 +22,7 @@ use tantivy::schema::IndexRecordOption;
 use tantivy::{Index, TantivyDocument, Term};
 
 use crate::DbConn;
+use crate::queries::UNKNOWN_SENDER_DISPLAY;
 use crate::search_planner::{
     Direction, DocKind, Importance, SearchQuery as PlannerQuery, SearchResult as PlannerResult,
 };
@@ -323,7 +324,9 @@ fn convert_results(results: &SearchResults, doc_kind: DocKind) -> Vec<PlannerRes
                 .metadata
                 .get("sender")
                 .and_then(|v| v.as_str())
-                .map(String::from);
+                .filter(|value| !value.trim().is_empty())
+                .map(String::from)
+                .or_else(|| Some(UNKNOWN_SENDER_DISPLAY.to_string()));
             let created_ts = hit
                 .metadata
                 .get("created_ts")
@@ -1146,7 +1149,10 @@ pub fn backfill_from_db(db_url: &str) -> Result<(usize, usize), String> {
                 .get(&project_id)
                 .cloned()
                 .unwrap_or_default();
-            let sender_name = sender_name_map.get(&sender_id).cloned().unwrap_or_default();
+            let sender_name = sender_name_map
+                .get(&sender_id)
+                .cloned()
+                .unwrap_or_else(|| UNKNOWN_SENDER_DISPLAY.to_string());
             let msg = IndexableMessage {
                 id: row.get_as::<i64>(0).unwrap_or(0),
                 project_id,
@@ -1768,11 +1774,27 @@ mod tests {
         assert_eq!(r.id, 1);
         assert_eq!(r.title, "");
         assert_eq!(r.body, "");
-        assert!(r.from_agent.is_none());
+        assert_eq!(r.from_agent.as_deref(), Some(UNKNOWN_SENDER_DISPLAY));
         assert!(r.importance.is_none());
         assert!(r.thread_id.is_none());
         assert!(r.created_ts.is_none());
         assert!(r.project_id.is_none());
+    }
+
+    #[test]
+    fn convert_results_replaces_empty_sender_with_unknown_placeholder() {
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("subject".to_string(), serde_json::json!("Subject"));
+        meta.insert("sender".to_string(), serde_json::json!(""));
+        let hit = make_hit(7, 0.8, Some("snippet"), meta);
+        let results = make_search_results(vec![hit]);
+        let converted = convert_results(&results, DocKind::Message);
+
+        assert_eq!(converted.len(), 1);
+        assert_eq!(
+            converted[0].from_agent.as_deref(),
+            Some(UNKNOWN_SENDER_DISPLAY)
+        );
     }
 
     // -- TantivyBridge in_memory and accessors ------------------------------
@@ -2327,6 +2349,50 @@ mod tests {
         let url = format!("sqlite:///{db_path}");
         let result = backfill_from_db(&url);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn backfill_from_db_keeps_orphaned_sender_placeholder() {
+        let _guard = BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_bridge_for_tests();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let db_path = create_test_db(
+            tmp.path(),
+            &[(
+                1,
+                "Orphan subject",
+                "orphan body",
+                "normal",
+                "thread-orphan",
+            )],
+        );
+        let conn = DbConn::open_file(&db_path).expect("open backfill db");
+        conn.execute_sync("DELETE FROM agents WHERE id = 1", &[])
+            .expect("delete sender row");
+
+        init_bridge(index_dir.path()).expect("init bridge");
+        let (indexed, _) = backfill_from_db(&db_path).expect("backfill from db");
+        assert_eq!(indexed, 1);
+
+        let results = get_bridge()
+            .expect("bridge initialized")
+            .search(&PlannerQuery {
+                text: "Orphan".to_string(),
+                doc_kind: DocKind::Message,
+                project_id: Some(1),
+                ..Default::default()
+            });
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].from_agent.as_deref(),
+            Some(UNKNOWN_SENDER_DISPLAY)
+        );
+
+        reset_bridge_for_tests();
     }
 
     #[test]

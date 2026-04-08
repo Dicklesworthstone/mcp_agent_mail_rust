@@ -71,6 +71,7 @@ const SEARCH_STACKED_DOCK_RATIO: f32 = 0.38;
 const SEARCH_FACET_GAP_THRESHOLD: u16 = 56;
 const SEARCH_SPLIT_GAP_THRESHOLD: u16 = 60;
 const SEARCH_PRESET_SCREEN_ID: &str = "search";
+const UNKNOWN_SENDER_DISPLAY: &str = "[unknown sender]";
 
 /// Max chars for the message snippet shown in the detail pane.
 const MAX_SNIPPET_CHARS: usize = 320;
@@ -2264,7 +2265,8 @@ impl SearchCockpitScreen {
 
         let sql = format!(
             "SELECT m.id, m.subject, m.importance, m.ack_required, m.created_ts, \
-             m.thread_id, a.name AS from_name, m.body_md, m.project_id, 0.0 AS score \
+             m.thread_id, COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') AS from_name, \
+             m.body_md, m.project_id, 0.0 AS score \
              FROM messages m \
              LEFT JOIN agents a ON a.id = m.sender_id{where_sql} \
              ORDER BY {order_clause} \
@@ -4058,7 +4060,12 @@ fn query_message_rows(
                         ack_required: row.get_named::<i64>("ack_required").ok().map(|v| v != 0),
                         created_ts: row.get_named("created_ts").ok(),
                         thread_id: row.get_named("thread_id").ok(),
-                        from_agent: row.get_named("from_name").ok(),
+                        from_agent: row
+                            .get_named::<String>("from_name")
+                            .ok()
+                            .map(|value| value.trim().to_string())
+                            .filter(|value| !value.is_empty())
+                            .or_else(|| Some(UNKNOWN_SENDER_DISPLAY.to_string())),
                         project_id: row.get_named("project_id").ok(),
                         reason_codes: Vec::new(),
                         score_factors: Vec::new(),
@@ -8164,6 +8171,53 @@ mod tests {
                 .is_some_and(|error| error.contains("Search failed:")),
             "expected propagated search failure, got {:?}",
             screen.last_error
+        );
+    }
+
+    #[test]
+    fn search_messages_recent_preserves_unknown_sender_placeholder() {
+        let conn = DbConn::open_memory().expect("open in-memory sqlite");
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE messages (
+                 id INTEGER PRIMARY KEY,
+                 sender_id INTEGER NOT NULL,
+                 subject TEXT NOT NULL,
+                 importance TEXT NOT NULL,
+                 ack_required INTEGER NOT NULL,
+                 created_ts INTEGER NOT NULL,
+                 thread_id TEXT,
+                 body_md TEXT NOT NULL,
+                 project_id INTEGER NOT NULL
+             );",
+        )
+        .expect("init message search schema");
+        conn.execute_sync(
+            "INSERT INTO messages (id, sender_id, subject, importance, ack_required, created_ts, thread_id, body_md, project_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(7),
+                Value::BigInt(404),
+                Value::Text("Orphaned sender result".to_string()),
+                Value::Text("normal".to_string()),
+                Value::BigInt(0),
+                Value::BigInt(1_700_000_000_000_000),
+                Value::Text("thread-orphan".to_string()),
+                Value::Text("body".to_string()),
+                Value::BigInt(1),
+            ],
+        )
+        .expect("insert message");
+
+        let mut screen = SearchCockpitScreen::new();
+        let results = screen
+            .search_messages_recent(&conn)
+            .expect("recent search succeeds");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].from_agent.as_deref(),
+            Some(UNKNOWN_SENDER_DISPLAY)
         );
     }
 

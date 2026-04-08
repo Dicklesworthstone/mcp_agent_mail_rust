@@ -219,6 +219,47 @@ fn set_reservation_released_ts(pool: &DbPool, reservation_id: i64, released_ts: 
     });
 }
 
+#[test]
+fn sample_recent_message_refs_keeps_orphaned_sender_rows_visible() {
+    let (pool, _dir) = make_pool();
+    let project_id = setup_project(&pool);
+    let sender_id = setup_agent(&pool, project_id, "BlueLake");
+    let recipient_id = setup_agent(&pool, project_id, "GreenStone");
+    send_msg(
+        &pool,
+        project_id,
+        sender_id,
+        recipient_id,
+        "Probe survives sender drift",
+        "body",
+        Some("thread-probe"),
+    );
+
+    block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            let conn = pool.acquire(&cx).await.into_result().expect("acquire");
+            conn.execute_sync(
+                "DELETE FROM agents WHERE id = ? AND project_id = ?",
+                &[Value::BigInt(sender_id), Value::BigInt(project_id)],
+            )
+            .expect("delete sender row");
+        }
+    });
+
+    let refs = pool.sample_recent_message_refs(50).expect("sample refs");
+    let orphaned = refs
+        .iter()
+        .find(|reference| reference.subject == "Probe survives sender drift")
+        .expect("find orphaned sender sample");
+    assert!(
+        orphaned.project_slug.starts_with("tmp-test-project-"),
+        "unexpected project slug: {}",
+        orphaned.project_slug
+    );
+    assert_eq!(orphaned.sender_name, "[unknown sender]");
+}
+
 /// Update a reservation's `released_ts` to a text sentinel via raw SQL.
 fn set_reservation_released_ts_text(pool: &DbPool, reservation_id: i64, released_ts: &str) {
     let escaped = released_ts.replace('\'', "''");

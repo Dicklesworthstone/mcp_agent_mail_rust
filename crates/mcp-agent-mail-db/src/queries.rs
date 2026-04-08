@@ -4558,9 +4558,9 @@ pub async fn list_message_recipient_names_for_messages(
             (0..=MAX_IN_CLAUSE_ITEMS)
                 .map(|c| {
                     format!(
-                        "SELECT DISTINCT a.name \
+                        "SELECT r.agent_id AS raw_agent_id, a.name AS name \
                          FROM message_recipients r \
-                         JOIN agents a ON a.id = r.agent_id \
+                         LEFT JOIN agents a ON a.id = r.agent_id \
                          JOIN messages m ON m.id = r.message_id \
                          WHERE m.project_id = ? AND r.message_id IN ({})",
                         placeholders(c)
@@ -4583,11 +4583,15 @@ pub async fn list_message_recipient_names_for_messages(
         match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
             Outcome::Ok(rows) => {
                 for row in rows {
-                    let name: String = match row.get_named("name") {
+                    let agent_id: i64 = match row.get_named("raw_agent_id") {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    out.push(name);
+                    let name: Option<String> = match row.get_named("name") {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    out.push(resolved_agent_display(agent_id, name));
                 }
             }
             Outcome::Err(e) => return Outcome::Err(e),
@@ -4616,9 +4620,9 @@ pub async fn list_message_recipients_by_message(
     };
 
     let tracked = tracked(&*conn);
-    let sql = "SELECT a.name, r.kind \
+    let sql = "SELECT r.agent_id AS raw_agent_id, a.name, r.kind \
                FROM message_recipients r \
-               JOIN agents a ON a.id = r.agent_id \
+               LEFT JOIN agents a ON a.id = r.agent_id \
                JOIN messages m ON m.id = r.message_id \
                WHERE m.project_id = ? AND r.message_id = ?";
     let params = [Value::BigInt(project_id), Value::BigInt(message_id)];
@@ -4627,15 +4631,22 @@ pub async fn list_message_recipients_by_message(
         Outcome::Ok(rows) => {
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
-                let name: String = match row.get_as(0) {
+                let agent_id: i64 = match row.get_as(0) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                let kind: String = match row.get_as(1) {
+                let name: Option<String> = match row.get_as(1) {
                     Ok(v) => v,
                     Err(e) => return Outcome::Err(map_sql_error(&e)),
                 };
-                out.push(MessageRecipientDetailRow { name, kind });
+                let kind: String = match row.get_as(2) {
+                    Ok(v) => v,
+                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                };
+                out.push(MessageRecipientDetailRow {
+                    name: resolved_agent_display(agent_id, name),
+                    kind,
+                });
             }
             out.sort_by(|left, right| {
                 let kind_rank = |kind: &str| {
@@ -4690,11 +4701,11 @@ pub async fn list_message_recipient_names_by_message(
     for chunk in message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
         let placeholders = placeholders(chunk.len());
         let sql = format!(
-            "SELECT r.message_id, a.name \
+            "SELECT r.message_id, r.agent_id AS raw_agent_id, a.name \
              FROM message_recipients r \
-             JOIN agents a ON a.id = r.agent_id \
+             LEFT JOIN agents a ON a.id = r.agent_id \
              WHERE r.message_id IN ({placeholders}) \
-             ORDER BY r.message_id ASC, a.name COLLATE NOCASE ASC"
+             ORDER BY r.message_id ASC, a.name COLLATE NOCASE ASC, r.agent_id ASC"
         );
 
         let params: Vec<Value> = chunk.iter().map(|&id| Value::BigInt(id)).collect();
@@ -4706,11 +4717,17 @@ pub async fn list_message_recipient_names_by_message(
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let name: String = match row.get_as(1) {
+                    let agent_id: i64 = match row.get_as(1) {
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    out.entry(message_id).or_default().push(name);
+                    let name: Option<String> = match row.get_as(2) {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    };
+                    out.entry(message_id)
+                        .or_default()
+                        .push(resolved_agent_display(agent_id, name));
                 }
             }
             Outcome::Err(e) => return Outcome::Err(e),
@@ -4724,6 +4741,7 @@ pub async fn list_message_recipient_names_by_message(
             left.bytes()
                 .map(|b| b.to_ascii_lowercase())
                 .cmp(right.bytes().map(|b| b.to_ascii_lowercase()))
+                .then_with(|| left.cmp(right))
         });
         names.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
     }
@@ -4942,7 +4960,16 @@ pub struct SearchRow {
     pub body_md: String,
 }
 
-pub(crate) const UNKNOWN_SENDER_DISPLAY: &str = "[unknown sender]";
+pub const UNKNOWN_SENDER_DISPLAY: &str = "[unknown sender]";
+
+fn unknown_agent_display(agent_id: i64) -> String {
+    format!("[unknown-agent-{agent_id}]")
+}
+
+fn resolved_agent_display(agent_id: i64, name: Option<String>) -> String {
+    name.filter(|value| !value.is_empty())
+        .unwrap_or_else(|| unknown_agent_display(agent_id))
+}
 
 /// Search result row that includes `project_id` for cross-project queries (e.g. product search).
 #[derive(Debug, Clone)]
@@ -16829,11 +16856,10 @@ mod tests {
 
         rt.block_on(async {
             let base = now_micros();
-            let project =
-                ensure_project(&cx, &pool, &format!("/tmp/am-inbox-ack-orphaned-{base}"))
-                    .await
-                    .into_result()
-                    .expect("ensure project");
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-inbox-ack-orphaned-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
             let project_id = project.id.expect("project id");
 
             let sender = register_agent(
@@ -16903,6 +16929,114 @@ mod tests {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].sender_name, UNKNOWN_SENDER_DISPLAY);
             assert_eq!(rows[0].message.subject, "Ack inbox survives sender drift");
+        });
+    }
+
+    #[test]
+    fn recipient_lookup_helpers_keep_orphaned_recipient_rows_visible() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("recipient_lookup_orphaned_agent.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-recipient-lookup-orphaned-{base}"),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("sender"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let recipient = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("recipient"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient");
+            let recipient_id = recipient.id.expect("recipient id");
+
+            let message = create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.expect("sender id"),
+                "Recipient helpers survive agent drift",
+                "Body",
+                Some("recipient-lookup-orphaned-thread"),
+                "normal",
+                false,
+                "[]",
+                &[(recipient_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create message");
+            let message_id = message.id.expect("message id");
+
+            cleanup_committed_agent_after_consistency_failure(
+                &cx,
+                &pool,
+                project_id,
+                recipient_id,
+                "BlueLake",
+            )
+            .await
+            .into_result()
+            .expect("orphan recipient row");
+
+            let expected = format!("[unknown-agent-{recipient_id}]");
+
+            let names =
+                list_message_recipient_names_for_messages(&cx, &pool, project_id, &[message_id])
+                    .await
+                    .into_result()
+                    .expect("list recipient names for messages");
+            assert_eq!(names, vec![expected.clone()]);
+
+            let details = list_message_recipients_by_message(&cx, &pool, project_id, message_id)
+                .await
+                .into_result()
+                .expect("list recipients by message");
+            assert_eq!(details.len(), 1);
+            assert_eq!(details[0].name, expected);
+            assert_eq!(details[0].kind, "to");
+
+            let grouped = list_message_recipient_names_by_message(&cx, &pool, &[message_id])
+                .await
+                .into_result()
+                .expect("list recipient names by message");
+            assert_eq!(
+                grouped.get(&message_id),
+                Some(&vec![format!("[unknown-agent-{recipient_id}]")])
+            );
         });
     }
 

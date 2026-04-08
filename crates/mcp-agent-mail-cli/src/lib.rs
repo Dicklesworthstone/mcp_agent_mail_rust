@@ -7949,18 +7949,20 @@ fn handle_file_reservations_with_conn(
             let sql = if active_only {
                 &format!(
                     "SELECT file_reservations.id, file_reservations.path_pattern, file_reservations.\"exclusive\", file_reservations.reason, \
-                            file_reservations.expires_ts, file_reservations.released_ts, a.name AS agent_name \
+                            file_reservations.expires_ts, file_reservations.released_ts, \
+                            COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || file_reservations.agent_id || ']') AS agent_name \
                      FROM file_reservations \
-                     JOIN agents a ON a.id = file_reservations.agent_id \
+                     LEFT JOIN agents a ON a.id = file_reservations.agent_id \
                      JOIN projects p ON p.id = file_reservations.project_id \
                      WHERE p.slug = ? AND ({active_reservation_predicate}) AND file_reservations.expires_ts > ? \
                      ORDER BY file_reservations.id"
                 )
             } else if all {
                 "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-                        fr.expires_ts, fr.released_ts, a.name AS agent_name \
+                        fr.expires_ts, fr.released_ts, \
+                        COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || fr.agent_id || ']') AS agent_name \
                  FROM file_reservations fr \
-                 JOIN agents a ON a.id = fr.agent_id \
+                 LEFT JOIN agents a ON a.id = fr.agent_id \
                  JOIN projects p ON p.id = fr.project_id \
                  WHERE p.slug = ? \
                  ORDER BY fr.id"
@@ -7968,9 +7970,10 @@ fn handle_file_reservations_with_conn(
                 // Default: active (not released, not expired)
                 &format!(
                     "SELECT file_reservations.id, file_reservations.path_pattern, file_reservations.\"exclusive\", file_reservations.reason, \
-                            file_reservations.expires_ts, file_reservations.released_ts, a.name AS agent_name \
+                            file_reservations.expires_ts, file_reservations.released_ts, \
+                            COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || file_reservations.agent_id || ']') AS agent_name \
                      FROM file_reservations \
-                     JOIN agents a ON a.id = file_reservations.agent_id \
+                     LEFT JOIN agents a ON a.id = file_reservations.agent_id \
                      JOIN projects p ON p.id = file_reservations.project_id \
                      WHERE p.slug = ? AND ({active_reservation_predicate}) AND file_reservations.expires_ts > ? \
                      ORDER BY file_reservations.id"
@@ -8020,9 +8023,10 @@ fn handle_file_reservations_with_conn(
                 active_reservation_predicate_sql("file_reservations");
             let sql = format!(
                 "SELECT file_reservations.id, file_reservations.path_pattern, file_reservations.\"exclusive\", file_reservations.reason, \
-                        file_reservations.expires_ts, a.name AS agent_name \
+                        file_reservations.expires_ts, \
+                        COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || file_reservations.agent_id || ']') AS agent_name \
                  FROM file_reservations \
-                 JOIN agents a ON a.id = file_reservations.agent_id \
+                 LEFT JOIN agents a ON a.id = file_reservations.agent_id \
                  JOIN projects p ON p.id = file_reservations.project_id \
                  WHERE p.slug = ? AND ({active_reservation_predicate}) AND file_reservations.expires_ts > ? \
                  ORDER BY file_reservations.expires_ts ASC \
@@ -8059,9 +8063,10 @@ fn handle_file_reservations_with_conn(
             let active_reservation_predicate =
                 active_reservation_predicate_sql("file_reservations");
             let sql = format!(
-                "SELECT file_reservations.id, file_reservations.path_pattern, file_reservations.expires_ts, a.name AS agent_name \
+                "SELECT file_reservations.id, file_reservations.path_pattern, file_reservations.expires_ts, \
+                        COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || file_reservations.agent_id || ']') AS agent_name \
                  FROM file_reservations \
-                 JOIN agents a ON a.id = file_reservations.agent_id \
+                 LEFT JOIN agents a ON a.id = file_reservations.agent_id \
                  JOIN projects p ON p.id = file_reservations.project_id \
                  WHERE p.slug = ? AND ({active_reservation_predicate}) \
                    AND file_reservations.expires_ts > ? AND file_reservations.expires_ts <= ? \
@@ -8132,9 +8137,9 @@ fn handle_file_reservations_with_conn(
                 .query_sync(
                     &format!(
                         "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-                                fr.expires_ts, a.name AS agent_name \
+                                fr.expires_ts, COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || fr.agent_id || ']') AS agent_name \
                          FROM file_reservations fr \
-                         JOIN agents a ON a.id = fr.agent_id \
+                         LEFT JOIN agents a ON a.id = fr.agent_id \
                          WHERE fr.project_id = ? AND ({active_reservation_predicate}) \
                            AND fr.expires_ts > ? AND fr.agent_id != ?"
                     ),
@@ -8408,9 +8413,9 @@ fn handle_file_reservations_with_conn(
                 .query_sync(
                     &format!(
                         "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.reason, \
-                                fr.expires_ts, a.name AS agent_name \
+                                fr.expires_ts, COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || fr.agent_id || ']') AS agent_name \
                          FROM file_reservations fr \
-                         JOIN agents a ON a.id = fr.agent_id \
+                         LEFT JOIN agents a ON a.id = fr.agent_id \
                          WHERE fr.project_id = ? AND ({active_reservation_predicate}) \
                            AND fr.expires_ts > ? AND fr.\"exclusive\" = 1"
                     ),
@@ -8840,9 +8845,9 @@ fn handle_contacts_with_conn(
             let outgoing = conn
                 .query_sync(
                     "SELECT al.status, al.reason, al.updated_ts, al.expires_ts, \
-                            a.name AS to_name \
+                            COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || al.b_agent_id || ']') AS to_name \
                      FROM agent_links al \
-                     JOIN agents a ON a.id = al.b_agent_id \
+                     LEFT JOIN agents a ON a.id = al.b_agent_id \
                      WHERE al.a_project_id = ? AND al.a_agent_id = ? \
                      ORDER BY al.updated_ts DESC",
                     &[
@@ -8856,9 +8861,9 @@ fn handle_contacts_with_conn(
             let incoming = conn
                 .query_sync(
                     "SELECT al.status, al.reason, al.updated_ts, al.expires_ts, \
-                            a.name AS from_name \
+                            COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || al.a_agent_id || ']') AS from_name \
                      FROM agent_links al \
-                     JOIN agents a ON a.id = al.a_agent_id \
+                     LEFT JOIN agents a ON a.id = al.a_agent_id \
                      WHERE al.b_project_id = ? AND al.b_agent_id = ? \
                      ORDER BY al.updated_ts DESC",
                     &[
@@ -32453,6 +32458,37 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn integration_file_reservations_list_keeps_orphaned_agent_visible() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+        conn.execute_sync(
+            "DELETE FROM agents WHERE id = ?",
+            &[sqlmodel_core::Value::BigInt(1)],
+        )
+        .expect("delete reservation holder row");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::List {
+                project: "test-proj".to_string(),
+                active_only: false,
+                all: false,
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "file_reservations list failed: {result:?}");
+        assert!(
+            output.contains("src/api/*.rs") && output.contains("[unknown-agent-1]"),
+            "expected orphaned holder placeholder, got: {output}"
+        );
+    }
+
+    #[test]
     fn integration_file_reservations_list_accepts_human_key() {
         let _guard = stdio_capture_lock()
             .lock()
@@ -32605,6 +32641,44 @@ startup_timeout_sec = 42
         assert!(
             output.contains("\"conflicts\"") && output.contains("BlueLake"),
             "expected conflict with BlueLake, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_file_reservations_reserve_detects_conflicts_with_orphaned_holder() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+        conn.execute_sync(
+            "DELETE FROM agents WHERE id = ?",
+            &[sqlmodel_core::Value::BigInt(1)],
+        )
+        .expect("delete conflicting holder row");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::Reserve {
+                project: "test-proj".to_string(),
+                agent: "RedFox".to_string(),
+                paths: vec!["src/api/*.rs".to_string()],
+                ttl: 3600,
+                exclusive: true,
+                shared: false,
+                reason: "overlap test".to_string(),
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(
+            result.is_ok(),
+            "reserve with orphaned conflict holder failed: {result:?}"
+        );
+        assert!(
+            output.contains("\"conflicts\"") && output.contains("[unknown-agent-1]"),
+            "expected orphaned conflict holder placeholder, got: {output}"
         );
     }
 
@@ -34954,6 +35028,52 @@ startup_timeout_sec = 42
         assert!(
             output.contains("RedFox"),
             "expected RedFox in contacts, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_contacts_list_keeps_orphaned_counterparty_visible() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::Request {
+                project_key: "test-proj".to_string(),
+                from_agent: "BlueLake".to_string(),
+                to_agent: "RedFox".to_string(),
+                reason: "x".to_string(),
+                ttl_seconds: 3600,
+                format: None,
+                json: false,
+            },
+        )
+        .unwrap();
+        conn.execute_sync(
+            "DELETE FROM agents WHERE id = ?",
+            &[sqlmodel_core::Value::BigInt(2)],
+        )
+        .expect("delete linked counterparty row");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::ListContacts {
+                project_key: "test-proj".to_string(),
+                agent_name: "BlueLake".to_string(),
+                format: None,
+                json: true,
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "list failed: {result:?}");
+        assert!(
+            output.contains("[unknown-agent-2]"),
+            "expected orphaned counterparty placeholder, got: {output}"
         );
     }
 

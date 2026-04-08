@@ -317,6 +317,16 @@ mod tests {
     }
 
     #[test]
+    fn glob_reservation_matches_exact_request_in_subdir() {
+        let idx =
+            ReservationIndex::build(vec![("src/**/*.rs".to_string(), make_ref(1))].into_iter());
+        let req = CompiledPattern::new("src/main/foo.rs");
+        let mut conflicts = Vec::new();
+        idx.find_conflicts(&req, &mut conflicts);
+        assert_eq!(conflicts.len(), 1);
+    }
+
+    #[test]
     fn exact_path_no_conflict_different_file() {
         let idx =
             ReservationIndex::build(vec![("src/main.rs".to_string(), make_ref(1))].into_iter());

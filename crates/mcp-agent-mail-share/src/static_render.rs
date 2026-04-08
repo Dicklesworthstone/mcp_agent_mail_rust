@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use mcp_agent_mail_db::DbConn;
+use mcp_agent_mail_db::queries::UNKNOWN_SENDER_DISPLAY;
 use serde::{Deserialize, Serialize};
 
 use crate::{ExportRedactionPolicy, RedactionAuditLog, RedactionReason, ShareError, ShareResult};
@@ -158,6 +159,7 @@ impl ThreadRouteKey {
 // ── Redaction helpers ────────────────────────────────────────────────────
 
 const BODY_REDACTED_PLACEHOLDER: &str = "[Message body redacted]";
+const UNKNOWN_RECIPIENT_DISPLAY: &str = "[unknown recipient]";
 
 /// Check if a message body appears to be a redacted placeholder.
 fn is_redacted_body(body: &str) -> bool {
@@ -501,10 +503,33 @@ pub fn render_static_site(
 fn discover_projects(conn: &DbConn) -> ShareResult<Vec<ProjectInfo>> {
     let rows = conn
         .query_sync(
-            "SELECT p.slug, p.human_key, \
-             (SELECT COUNT(*) FROM messages m WHERE m.project_id = p.id) AS msg_count, \
-             (SELECT COUNT(*) FROM agents a WHERE a.project_id = p.id) AS agent_count \
-             FROM projects p ORDER BY p.slug",
+            "WITH live_projects AS ( \
+                 SELECT p.id AS raw_project_id, \
+                        p.slug AS slug, \
+                        p.human_key AS human_key, \
+                        (SELECT COUNT(*) FROM messages m WHERE m.project_id = p.id) AS msg_count, \
+                        (SELECT COUNT(*) FROM agents a WHERE a.project_id = p.id) AS agent_count \
+                 FROM projects p \
+             ), orphan_project_ids AS ( \
+                 SELECT DISTINCT m.project_id AS raw_project_id \
+                 FROM messages m \
+                 LEFT JOIN projects p ON p.id = m.project_id \
+                 WHERE p.id IS NULL \
+                 UNION \
+                 SELECT DISTINCT a.project_id AS raw_project_id \
+                 FROM agents a \
+                 LEFT JOIN projects p ON p.id = a.project_id \
+                 WHERE p.id IS NULL \
+             ) \
+             SELECT slug, human_key, msg_count, agent_count \
+             FROM live_projects \
+             UNION ALL \
+             SELECT '[unknown-project-' || o.raw_project_id || ']' AS slug, \
+                    '[unknown-project-' || o.raw_project_id || ']' AS human_key, \
+                    (SELECT COUNT(*) FROM messages m WHERE m.project_id = o.raw_project_id) AS msg_count, \
+                    (SELECT COUNT(*) FROM agents a WHERE a.project_id = o.raw_project_id) AS agent_count \
+             FROM orphan_project_ids o \
+             ORDER BY slug",
             &[],
         )
         .map_err(|e| ShareError::Sqlite {
@@ -528,9 +553,10 @@ fn discover_messages(conn: &DbConn, config: &StaticRenderConfig) -> ShareResult<
     // Order by name for determinism.
     let recipient_rows = conn
         .query_sync(
-            "SELECT r.message_id, a.name FROM message_recipients r \
-             JOIN agents a ON a.id = r.agent_id \
-             ORDER BY r.message_id, a.name",
+            "SELECT r.message_id, a.name \
+             FROM message_recipients r \
+             LEFT JOIN agents a ON a.id = r.agent_id \
+             ORDER BY r.message_id, a.name, r.agent_id",
             &[],
         )
         .map_err(|e| ShareError::Sqlite {
@@ -539,24 +565,34 @@ fn discover_messages(conn: &DbConn, config: &StaticRenderConfig) -> ShareResult<
 
     let mut recipient_map: HashMap<i64, Vec<String>> = HashMap::new();
     for row in recipient_rows {
-        if let Ok(mid) = row.get_named::<i64>("message_id")
-            && let Ok(name) = row.get_named::<String>("name")
-        {
-            recipient_map.entry(mid).or_default().push(name);
+        if let Ok(mid) = row.get_named::<i64>("message_id") {
+            let name = row
+                .get_named::<Option<String>>("name")
+                .ok()
+                .flatten()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| UNKNOWN_RECIPIENT_DISPLAY.to_string());
+            let recipients = recipient_map.entry(mid).or_default();
+            if !recipients.contains(&name) {
+                recipients.push(name);
+            }
         }
     }
 
     // 2. Fetch messages joined with sender agent and project
     let rows = conn
         .query_sync(
-            "SELECT m.id, m.subject, m.body_md, m.importance, m.created_ts, \
-             NULLIF(TRIM(m.thread_id), '') AS thread_id, \
-             COALESCE(a.name, 'unknown') AS sender_name, \
-             p.slug AS project_slug \
-             FROM messages m \
-             LEFT JOIN agents a ON a.id = m.sender_id \
-             JOIN projects p ON p.id = m.project_id \
-             ORDER BY m.created_ts ASC, m.id ASC",
+            &format!(
+                "SELECT m.id, m.subject, m.body_md, m.importance, m.created_ts, \
+                 NULLIF(TRIM(m.thread_id), '') AS thread_id, \
+                 COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, \
+                 COALESCE(NULLIF(TRIM(p.slug), ''), '[unknown-project-' || m.project_id || ']') AS project_slug \
+                 FROM messages m \
+                 LEFT JOIN agents a ON a.id = m.sender_id \
+                 LEFT JOIN projects p ON p.id = m.project_id \
+                 ORDER BY m.created_ts ASC, m.id ASC"
+            ),
             &[],
         )
         .map_err(|e| ShareError::Sqlite {
@@ -594,7 +630,12 @@ fn discover_messages(conn: &DbConn, config: &StaticRenderConfig) -> ShareResult<
             body_md: body,
             importance: row.get_named("importance").unwrap_or_default(),
             created_ts,
-            sender_name: row.get_named("sender_name").unwrap_or_default(),
+            sender_name: row
+                .get_named::<String>("sender_name")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| UNKNOWN_SENDER_DISPLAY.to_string()),
             project_slug: row.get_named("project_slug").unwrap_or_default(),
             thread_id,
             recipients,
@@ -1820,6 +1861,332 @@ mod tests {
         assert!(msg_html.contains("Hello World"));
         assert!(msg_html.contains("RedFox"));
         assert!(msg_html.contains("test-project"));
+    }
+
+    #[test]
+    fn discover_messages_keeps_orphaned_agent_rows_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("orphaned-agent-render.sqlite3");
+
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, \
+             subject TEXT, body_md TEXT, importance TEXT, created_ts TEXT, thread_id TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, agent_id INTEGER, \
+             read_ts TEXT, ack_ts TEXT)",
+            &[],
+        )
+        .unwrap();
+
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key) VALUES (1, 'test-project', '/tmp/test')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, created_ts, thread_id) \
+             VALUES (1, 1, 101, 'Hello World', 'This is a test message body.', 'normal', '2024-01-01T00:00:00Z', 'thread-1')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id) VALUES (1, 1, 202)",
+            &[],
+        )
+        .unwrap();
+
+        let messages = discover_messages(&conn, &StaticRenderConfig::default()).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].sender_name, UNKNOWN_SENDER_DISPLAY);
+        assert_eq!(
+            messages[0].recipients,
+            vec![UNKNOWN_RECIPIENT_DISPLAY.to_string()]
+        );
+    }
+
+    #[test]
+    fn discover_projects_keeps_orphaned_project_rows_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("orphaned-project-render.sqlite3");
+
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, \
+             subject TEXT, body_md TEXT, importance TEXT, created_ts TEXT, thread_id TEXT)",
+            &[],
+        )
+        .unwrap();
+
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES (101, 7, 'BlueLake')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, created_ts, thread_id) \
+             VALUES (1, 7, 101, 'Hello World', 'This is a test message body.', 'normal', '2024-01-01T00:00:00Z', 'thread-1')",
+            &[],
+        )
+        .unwrap();
+
+        let projects = discover_projects(&conn).unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].slug, "[unknown-project-7]");
+        assert_eq!(projects[0].human_key, "[unknown-project-7]");
+        assert_eq!(projects[0].message_count, 1);
+        assert_eq!(projects[0].agent_count, 1);
+    }
+
+    #[test]
+    fn discover_messages_keeps_orphaned_project_rows_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("orphaned-project-message-render.sqlite3");
+
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, \
+             subject TEXT, body_md TEXT, importance TEXT, created_ts TEXT, thread_id TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, agent_id INTEGER, \
+             read_ts TEXT, ack_ts TEXT)",
+            &[],
+        )
+        .unwrap();
+
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES (101, 7, 'BlueLake')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, created_ts, thread_id) \
+             VALUES (1, 7, 101, 'Hello World', 'This is a test message body.', 'normal', '2024-01-01T00:00:00Z', 'thread-1')",
+            &[],
+        )
+        .unwrap();
+
+        let messages = discover_messages(&conn, &StaticRenderConfig::default()).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].sender_name, "BlueLake");
+        assert_eq!(messages[0].project_slug, "[unknown-project-7]");
+    }
+
+    #[test]
+    fn discover_messages_dedupes_flattened_recipient_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("duplicate-recipient-render.sqlite3");
+
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, \
+             subject TEXT, body_md TEXT, importance TEXT, created_ts TEXT, thread_id TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, agent_id INTEGER, \
+             read_ts TEXT, ack_ts TEXT)",
+            &[],
+        )
+        .unwrap();
+
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key) VALUES (1, 'test-project', '/tmp/test')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES (1, 1, 'BlueLake')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES (2, 1, 'GreenStone')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, created_ts, thread_id) \
+             VALUES (1, 1, 1, 'Hello World', 'This is a test message body.', 'normal', '2024-01-01T00:00:00Z', 'thread-1')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id) VALUES (1, 1, 2)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id) VALUES (2, 1, 2)",
+            &[],
+        )
+        .unwrap();
+
+        let messages = discover_messages(&conn, &StaticRenderConfig::default()).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].recipients, vec!["GreenStone".to_string()]);
+    }
+
+    #[test]
+    fn discover_messages_replaces_blank_recipient_name_with_unknown_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("blank-recipient-render.sqlite3");
+
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, \
+             subject TEXT, body_md TEXT, importance TEXT, created_ts TEXT, thread_id TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, agent_id INTEGER, \
+             read_ts TEXT, ack_ts TEXT)",
+            &[],
+        )
+        .unwrap();
+
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key) VALUES (1, 'test-project', '/tmp/test')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES (1, 1, 'BlueLake')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES (2, 1, '   ')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, created_ts, thread_id) \
+             VALUES (1, 1, 1, 'Hello World', 'This is a test message body.', 'normal', '2024-01-01T00:00:00Z', 'thread-1')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id) VALUES (1, 1, 2)",
+            &[],
+        )
+        .unwrap();
+
+        let messages = discover_messages(&conn, &StaticRenderConfig::default()).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].recipients,
+            vec![UNKNOWN_RECIPIENT_DISPLAY.to_string()]
+        );
+    }
+
+    #[test]
+    fn discover_messages_replaces_blank_sender_name_with_unknown_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("blank-sender-render.sqlite3");
+
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, \
+             subject TEXT, body_md TEXT, importance TEXT, created_ts TEXT, thread_id TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, agent_id INTEGER, \
+             read_ts TEXT, ack_ts TEXT)",
+            &[],
+        )
+        .unwrap();
+
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key) VALUES (1, 'test-project', '/tmp/test')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES (101, 1, '   ')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, created_ts, thread_id) \
+             VALUES (1, 1, 101, 'Hello World', 'This is a test message body.', 'normal', '2024-01-01T00:00:00Z', 'thread-1')",
+            &[],
+        )
+        .unwrap();
+
+        let messages = discover_messages(&conn, &StaticRenderConfig::default()).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].sender_name, UNKNOWN_SENDER_DISPLAY);
     }
 
     #[test]

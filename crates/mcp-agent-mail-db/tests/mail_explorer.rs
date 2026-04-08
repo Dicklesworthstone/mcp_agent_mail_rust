@@ -466,27 +466,24 @@ fn explorer_inbound_keeps_orphaned_sender_rows_visible() {
         })
     };
 
-    let page = {
-        let p = pool.clone();
-        block_on(move |cx| async move {
-            match fetch_explorer_page(
-                &cx,
-                &p,
-                &ExplorerQuery {
-                    agent_name: "BlueLake".into(),
-                    project_id: Some(project_id),
-                    direction: Direction::Inbound,
-                    limit: 50,
-                    ..Default::default()
-                },
-            )
-            .await
-            {
-                Outcome::Ok(v) => v,
-                other => panic!("explorer inbound failed: {other:?}"),
-            }
-        })
-    };
+    let page = block_on(move |cx| async move {
+        match fetch_explorer_page(
+            &cx,
+            &pool,
+            &ExplorerQuery {
+                agent_name: "BlueLake".into(),
+                project_id: Some(project_id),
+                direction: Direction::Inbound,
+                limit: 50,
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Outcome::Ok(v) => v,
+            other => panic!("explorer inbound failed: {other:?}"),
+        }
+    });
 
     let entry = page
         .entries

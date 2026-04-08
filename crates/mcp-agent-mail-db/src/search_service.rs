@@ -24,6 +24,7 @@ use mcp_agent_mail_core::config::SearchEngine;
 use mcp_agent_mail_core::metrics::global_metrics;
 use mcp_agent_mail_core::{EvidenceLedgerEntry, append_evidence_entry_if_configured};
 
+use crate::queries::UNKNOWN_SENDER_DISPLAY;
 use crate::query_assistance::{QueryAssistance, parse_query_assistance};
 #[cfg(feature = "hybrid")]
 use crate::search_auto_init::{TwoTierAvailability, get_two_tier_context};
@@ -3820,7 +3821,14 @@ fn map_planned_rows(rows: Vec<sqlmodel_core::Row>, doc_kind: DocKind) -> Vec<Sea
                 ack_required: Some(row.get_as::<i64>(3).unwrap_or(0) != 0),
                 created_ts: Some(row.get_as::<i64>(4).unwrap_or(0)),
                 thread_id: row.get_as::<Option<String>>(5).unwrap_or_default(),
-                from_agent: Some(row.get_as::<String>(6).unwrap_or_default()),
+                from_agent: Some(
+                    row.get_as::<String>(6)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string(),
+                )
+                .filter(|value| !value.is_empty())
+                .or_else(|| Some(UNKNOWN_SENDER_DISPLAY.to_string())),
                 from_agent_id: row.get_as::<Option<i64>>(7).unwrap_or_default(),
                 body: row.get_as::<String>(8).unwrap_or_default(),
                 project_id: Some(row.get_as::<i64>(9).unwrap_or(0)),
@@ -4415,7 +4423,7 @@ mod tests {
     }
 
     #[test]
-    fn planned_thread_rows_keep_missing_sender_identity_absent() {
+    fn planned_thread_rows_replace_missing_sender_identity_with_placeholder() {
         let row = sqlmodel_core::Row::new(
             vec![
                 "id".to_string(),
@@ -4447,6 +4455,10 @@ mod tests {
 
         let results = map_planned_rows(vec![row], DocKind::Thread);
         assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].from_agent.as_deref(),
+            Some(UNKNOWN_SENDER_DISPLAY)
+        );
         assert_eq!(results[0].from_agent_id, None);
     }
 

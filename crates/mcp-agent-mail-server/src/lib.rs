@@ -4010,12 +4010,12 @@ impl AtcExecutorMode {
 }
 
 fn atc_durable_experience_store_writable(pool: &mcp_agent_mail_db::DbPool) -> bool {
-    // ATC experience IO now goes through the canonical SQLite path in the DB
-    // crate for both in-memory and file-backed mailboxes. The DB layer has
-    // dedicated integrity coverage for file-backed append/transition flows, so
-    // the server should not suppress durable ATC writes based on mailbox mode.
-    let _ = pool;
-    true
+    // File-backed mailbox DBs still are not safe for durable ATC experience
+    // writes. Even through the canonical SQLite path, the current mixed-runtime
+    // stack can destabilize the main mailbox file. Keep durable ATC writes
+    // limited to in-memory pools until ATC state is moved to an isolated
+    // canonical store.
+    pool.sqlite_path() == ":memory:"
 }
 
 fn atc_durable_experience_store_enabled(
@@ -13370,7 +13370,7 @@ first body
     }
 
     #[test]
-    fn atc_durable_experience_store_is_enabled_for_file_backed_mailboxes() {
+    fn atc_durable_experience_store_is_disabled_for_file_backed_mailboxes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("atc-file-backed.sqlite3");
         let pool = get_or_create_pool(&DbPoolConfig {
@@ -13382,12 +13382,12 @@ first body
         })
         .expect("create file-backed pool");
 
-        assert!(atc_durable_experience_store_writable(&pool));
-        assert!(atc_durable_experience_store_enabled(
+        assert!(!atc_durable_experience_store_writable(&pool));
+        assert!(!atc_durable_experience_store_enabled(
             AtcExecutorMode::Live,
             Some(&pool),
         ));
-        assert!(atc_durable_experience_store_enabled(
+        assert!(!atc_durable_experience_store_enabled(
             AtcExecutorMode::Canary,
             Some(&pool),
         ));

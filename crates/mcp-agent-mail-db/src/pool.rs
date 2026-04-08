@@ -5,6 +5,7 @@
 use crate::DbConn;
 use crate::error::{DbError, DbResult, is_lock_error};
 use crate::integrity;
+use crate::queries::UNKNOWN_SENDER_DISPLAY;
 use crate::schema;
 use asupersync::sync::OnceCell;
 use asupersync::{Cx, Outcome};
@@ -2462,13 +2463,13 @@ impl DbPool {
             let Some(project_slug) = project_slugs_by_id.get(&message.project_id) else {
                 continue;
             };
-            let Some(sender_name) = sender_names_by_id.get(&message.sender_id) else {
-                continue;
-            };
             refs.push(ConsistencyMessageRef {
                 project_slug: project_slug.clone(),
                 message_id: message.id,
-                sender_name: sender_name.clone(),
+                sender_name: sender_names_by_id
+                    .get(&message.sender_id)
+                    .cloned()
+                    .unwrap_or_else(|| UNKNOWN_SENDER_DISPLAY.to_string()),
                 subject: message.subject,
                 created_ts_iso: message.created_ts_iso,
             });
@@ -4781,7 +4782,16 @@ fn reconstruction_candidate_path(primary_path: &Path, timestamp: &str) -> PathBu
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("storage.sqlite3");
-    primary_path.with_file_name(format!("{base_name}.reconstructing-{timestamp}"))
+    let mut candidate =
+        primary_path.with_file_name(format!("{base_name}.reconstructing-{timestamp}"));
+    let mut suffix = 1_u32;
+    while candidate.exists() {
+        candidate = primary_path.with_file_name(format!(
+            "{base_name}.reconstructing-{timestamp}-{suffix:02}"
+        ));
+        suffix = suffix.saturating_add(1);
+    }
+    candidate
 }
 
 #[allow(clippy::result_large_err)]
@@ -7057,6 +7067,81 @@ mod tests {
         assert_eq!(refs[2].message_id, 3);
     }
 
+    #[test]
+    fn sample_recent_message_refs_keeps_orphaned_sender_rows_visible() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("refs_orphaned_sender.db");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).expect("create pool");
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        rt.block_on(async {
+            let project = crate::queries::ensure_project(&cx, &pool, "/tmp/orphan-proj")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let sender = crate::queries::register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "test",
+                "test-model",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let sender_id = sender.id.expect("sender id");
+
+            crate::queries::create_message(
+                &cx,
+                &pool,
+                project_id,
+                sender_id,
+                "Probe survives sender drift",
+                "body",
+                Some("thread-1"),
+                "normal",
+                false,
+                "[]",
+            )
+            .await
+            .into_result()
+            .expect("create message");
+
+            let conn = pool.acquire(&cx).await.into_result().expect("acquire");
+            conn.execute_sync(
+                "DELETE FROM agents WHERE id = ? AND project_id = ?",
+                &[
+                    sqlmodel_core::Value::BigInt(sender_id),
+                    sqlmodel_core::Value::BigInt(project_id),
+                ],
+            )
+            .expect("delete sender row");
+        });
+
+        let refs = pool.sample_recent_message_refs(50).expect("sample refs");
+        let orphaned = refs
+            .iter()
+            .find(|reference| reference.subject == "Probe survives sender drift")
+            .expect("find orphaned sender sample");
+        assert_eq!(orphaned.project_slug, "tmp-orphan-proj");
+        assert_eq!(orphaned.sender_name, UNKNOWN_SENDER_DISPLAY);
+    }
+
     /// Verify `get_or_create_pool` returns the same pool for the same cache key.
     #[test]
     fn get_or_create_pool_caches_by_config_signature() {
@@ -8090,6 +8175,23 @@ mod tests {
                 .join("test.db.reconstruct-failed-20260218_120000_000")
                 .exists(),
             "quarantined primary should be rolled back on failure"
+        );
+    }
+
+    #[test]
+    fn reconstruction_candidate_path_avoids_existing_artifacts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("test.db");
+        let existing = dir
+            .path()
+            .join("test.db.reconstructing-20260218_120000_000");
+        std::fs::write(&existing, b"stale candidate").expect("write stale candidate");
+
+        let candidate = reconstruction_candidate_path(&primary, "20260218_120000_000");
+        assert_eq!(
+            candidate,
+            dir.path()
+                .join("test.db.reconstructing-20260218_120000_000-01")
         );
     }
 

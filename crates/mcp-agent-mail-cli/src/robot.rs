@@ -3409,12 +3409,14 @@ fn load_thread_participants(
              WHERE {sender_where}
              GROUP BY a_sender.name
              UNION ALL
-             SELECT a_rec.name AS name, MIN(m2.created_ts) AS first_ts, MIN(m2.id) AS first_id
+             SELECT COALESCE(NULLIF(a_rec.name, ''), '[unknown-agent-' || mr.agent_id || ']') AS name,
+                    MIN(m2.created_ts) AS first_ts,
+                    MIN(m2.id) AS first_id
              FROM message_recipients mr
              JOIN messages m2 ON m2.id = mr.message_id
-             JOIN agents a_rec ON a_rec.id = mr.agent_id
+             LEFT JOIN agents a_rec ON a_rec.id = mr.agent_id
              WHERE {recipient_where}
-             GROUP BY a_rec.name
+             GROUP BY COALESCE(NULLIF(a_rec.name, ''), '[unknown-agent-' || mr.agent_id || ']')
          ) participants
          GROUP BY name
          ORDER BY MIN(first_ts) ASC, MIN(first_id) ASC, lower(name) ASC, name ASC"
@@ -4306,9 +4308,10 @@ fn build_reservations(
         .query_sync(
             &format!(
                 "SELECT fr.id, fr.path_pattern, fr.\"exclusive\", fr.created_ts, fr.expires_ts,
-                        a.name AS agent_name, a.id AS agent_id
+                        COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || fr.agent_id || ']') AS agent_name,
+                        fr.agent_id AS agent_id
                  FROM file_reservations fr{active_reservation_join}
-                 JOIN agents a ON a.id = fr.agent_id
+                 LEFT JOIN agents a ON a.id = fr.agent_id
                  WHERE fr.project_id = ? AND ({active_reservation_predicate}) AND fr.expires_ts > ?
                  ORDER BY fr.expires_ts ASC"
             ),
@@ -4574,12 +4577,13 @@ fn build_timeline(
         let res_rows = conn
             .query_sync(
                 &format!(
-                    "SELECT fr.id, fr.path_pattern, fr.created_ts, {released_ts_sql} AS released_ts, a.name AS agent
-                 FROM file_reservations fr{release_join}
-                 JOIN agents a ON a.id = fr.agent_id
-                 WHERE fr.project_id = ?
-                   AND (fr.created_ts > ? OR (({released_ts_sql}) IS NOT NULL AND ({released_ts_sql}) > ?))
-                 ORDER BY fr.created_ts ASC"
+                    "SELECT fr.id, fr.path_pattern, fr.created_ts, {released_ts_sql} AS released_ts,
+                            COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || fr.agent_id || ']') AS agent
+                     FROM file_reservations fr{release_join}
+                     LEFT JOIN agents a ON a.id = fr.agent_id
+                     WHERE fr.project_id = ?
+                       AND (fr.created_ts > ? OR (({released_ts_sql}) IS NOT NULL AND ({released_ts_sql}) > ?))
+                     ORDER BY fr.created_ts ASC"
                 ),
                 &[
                     Value::BigInt(project_id),
@@ -4832,15 +4836,12 @@ fn build_analytics(
     let conflict_rows = conn
         .query_sync(
             &format!(
-                "SELECT fr1.path_pattern AS p1, fr2.path_pattern AS p2,
-                        a1.name AS agent1, a2.name AS agent2
+                "SELECT fr1.path_pattern AS p1, fr2.path_pattern AS p2
                  FROM file_reservations fr1{active_reservation_join_fr1}
                  JOIN file_reservations fr2 ON fr1.id < fr2.id
                    AND fr1.project_id = fr2.project_id
                    AND fr1.agent_id != fr2.agent_id
                  {active_reservation_join_fr2}
-                 JOIN agents a1 ON a1.id = fr1.agent_id
-                 JOIN agents a2 ON a2.id = fr2.agent_id
                  WHERE fr1.project_id = ? AND fr1.\"exclusive\" = 1 AND fr2.\"exclusive\" = 1
                    AND ({active_reservation_predicate_fr1}) AND ({active_reservation_predicate_fr2})
                    AND fr1.expires_ts > ? AND fr2.expires_ts > ?"
@@ -5084,11 +5085,12 @@ fn build_contacts(conn: &DbConn, project_id: i64) -> Result<Vec<ContactRow>, Cli
     let rows = conn
         .query_sync(
             "SELECT al.status, al.reason, al.updated_ts,
-                    a1.name AS from_agent, a1.contact_policy AS from_policy,
-                    a2.name AS to_agent
+                    COALESCE(NULLIF(a1.name, ''), '[unknown-agent-' || al.a_agent_id || ']') AS from_agent,
+                    COALESCE(NULLIF(a1.contact_policy, ''), 'unknown') AS from_policy,
+                    COALESCE(NULLIF(a2.name, ''), '[unknown-agent-' || al.b_agent_id || ']') AS to_agent
              FROM agent_links al
-             JOIN agents a1 ON a1.id = al.a_agent_id
-             JOIN agents a2 ON a2.id = al.b_agent_id
+             LEFT JOIN agents a1 ON a1.id = al.a_agent_id
+             LEFT JOIN agents a2 ON a2.id = al.b_agent_id
              WHERE al.a_project_id = ?
              ORDER BY al.updated_ts DESC",
             &[Value::BigInt(project_id)],
@@ -5549,9 +5551,11 @@ fn build_navigate_file_reservations(
     let (sql, params) = if active_only {
         (
             format!(
-                "SELECT fr.path_pattern, a.name, fr.\"exclusive\", fr.expires_ts, {released_ts_sql} AS released_ts, fr.created_ts
+                "SELECT fr.path_pattern,
+                        COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || fr.agent_id || ']') AS agent_name,
+                        fr.\"exclusive\", fr.expires_ts, {released_ts_sql} AS released_ts, fr.created_ts
                  FROM file_reservations fr{active_reservation_join}
-                 JOIN agents a ON a.id = fr.agent_id
+                 LEFT JOIN agents a ON a.id = fr.agent_id
                  WHERE fr.project_id = ? AND ({active_reservation_predicate})
                  ORDER BY fr.created_ts DESC LIMIT 50"
             ),
@@ -5560,9 +5564,11 @@ fn build_navigate_file_reservations(
     } else {
         (
             format!(
-                "SELECT fr.path_pattern, a.name, fr.\"exclusive\", fr.expires_ts, {released_ts_sql} AS released_ts, fr.created_ts
+                "SELECT fr.path_pattern,
+                        COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || fr.agent_id || ']') AS agent_name,
+                        fr.\"exclusive\", fr.expires_ts, {released_ts_sql} AS released_ts, fr.created_ts
                  FROM file_reservations fr{active_reservation_join}
-                 JOIN agents a ON a.id = fr.agent_id
+                 LEFT JOIN agents a ON a.id = fr.agent_id
                  WHERE fr.project_id = ?
                  ORDER BY fr.created_ts DESC LIMIT 50"
             ),
@@ -9354,6 +9360,48 @@ mod tests {
     }
 
     #[test]
+    fn build_contacts_keeps_orphaned_counterparty_rows_visible() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "CREATE TABLE agent_links (
+                id INTEGER PRIMARY KEY,
+                a_project_id INTEGER NOT NULL,
+                a_agent_id INTEGER NOT NULL,
+                b_project_id INTEGER NOT NULL,
+                b_agent_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                updated_ts INTEGER NOT NULL,
+                expires_ts INTEGER NOT NULL
+            )",
+            &[],
+        )
+        .expect("create agent_links");
+        conn.query_sync(
+            "INSERT INTO agent_links
+             (id, a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts)
+             VALUES (1, 1, 1, 1, 2, 'approved', 'coordination', ?, ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
+            ],
+        )
+        .expect("insert agent link");
+        conn.query_sync("DELETE FROM agents WHERE id = 2", &[])
+            .expect("delete counterparty agent row");
+
+        let contacts = build_contacts(&conn, 1).expect("build contacts");
+
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].from, "Alice");
+        assert_eq!(contacts[0].to, "[unknown-agent-2]");
+        assert_eq!(contacts[0].policy, "unknown");
+    }
+
+    #[test]
     fn test_project_row_serialization() {
         let project = ProjectRow {
             slug: "my-project".into(),
@@ -10922,6 +10970,106 @@ mod tests {
     }
 
     #[test]
+    fn test_build_navigate_file_reservations_preserves_orphaned_agent_rows() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir
+            .path()
+            .join("robot_navigate_reservation_orphan_agent.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create projects");
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                program TEXT NOT NULL,
+                model TEXT NOT NULL,
+                task_description TEXT,
+                created_at INTEGER,
+                updated_at INTEGER,
+                contact_policy TEXT,
+                attachments_policy TEXT,
+                last_active_ts INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents");
+        conn.query_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                path_pattern TEXT NOT NULL,
+                \"exclusive\" INTEGER NOT NULL,
+                reason TEXT,
+                created_ts INTEGER NOT NULL,
+                expires_ts INTEGER NOT NULL,
+                released_ts INTEGER
+            )",
+            &empty,
+        )
+        .expect("create file reservations");
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'proj', '/tmp/proj', 1000)",
+            &empty,
+        )
+        .expect("insert project");
+        conn.query_sync(
+            "INSERT INTO agents (
+                id, project_id, name, program, model, task_description,
+                created_at, updated_at, contact_policy, attachments_policy, last_active_ts
+             ) VALUES (
+                1, 1, 'Sender', 'codex-cli', 'gpt-5', 'task',
+                1000, 1000, 'auto', 'inline', 1000
+             )",
+            &empty,
+        )
+        .expect("insert agent");
+        conn.query_sync(
+            "INSERT INTO file_reservations (
+                id, project_id, agent_id, path_pattern, \"exclusive\",
+                reason, created_ts, expires_ts, released_ts
+             ) VALUES (
+                1, 1, 1, 'src/**', 1, 'test', 1000, 2000, NULL
+             )",
+            &empty,
+        )
+        .expect("insert reservation");
+        conn.query_sync("DELETE FROM agents WHERE id = 1", &[])
+            .expect("delete holder agent row");
+
+        let (result, _) = build_navigate(
+            &conn,
+            "resource://file_reservations/%2Ftmp%2Fproj?active_only=false",
+            99,
+            "wrong",
+            None,
+        )
+        .expect("navigate reservations");
+
+        match result {
+            NavigateResult::Generic { data, .. } => {
+                assert_eq!(data["reservations"].as_array().map(Vec::len), Some(1));
+                assert_eq!(data["reservations"][0]["agent"], "[unknown-agent-1]");
+            }
+            other => panic!("unexpected reservations result: {other:?}"),
+        }
+    }
+
+    #[test]
     fn active_reservation_helpers_omit_legacy_column_when_schema_lacks_it() {
         let active_with_ledger = active_reservation_filter_sql(true, false, "fr", "rr");
         assert_eq!(active_with_ledger, "rr.reservation_id IS NULL");
@@ -11854,7 +12002,8 @@ mod tests {
                 project_id INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 program TEXT,
-                model TEXT
+                model TEXT,
+                contact_policy TEXT
             )",
             &empty,
         )
@@ -12006,6 +12155,46 @@ mod tests {
         assert_eq!(
             thread.participants,
             vec!["Alice".to_string(), "Bob".to_string(), "Carol".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_build_thread_preserves_orphaned_recipient_participants() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let created_ts = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES
+                (210, 1, 1, 'First', 'PARTICIPANTS-ORPHAN', 'normal', 0, ?, 'body', '[]'),
+                (211, 1, 2, 'Second', 'PARTICIPANTS-ORPHAN', 'normal', 0, ?, 'body', '[]')",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_ts),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_ts + 1),
+            ],
+        )
+        .expect("insert messages");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES
+                (30, 210, 2, 'to', NULL, NULL),
+                (31, 210, 3, 'cc', NULL, NULL),
+                (32, 211, 1, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert recipients");
+        conn.query_sync("DELETE FROM agents WHERE id = 3", &[])
+            .expect("delete recipient agent row");
+
+        let thread = build_thread(&conn, 1, "PARTICIPANTS-ORPHAN", Some(10), None, false)
+            .expect("build thread");
+        assert_eq!(thread.participants.len(), 3);
+        assert!(thread.participants.contains(&"Alice".to_string()));
+        assert!(thread.participants.contains(&"Bob".to_string()));
+        assert!(
+            thread
+                .participants
+                .contains(&"[unknown-agent-3]".to_string())
         );
     }
 
@@ -12512,6 +12701,48 @@ mod tests {
     }
 
     #[test]
+    fn build_reservations_keeps_orphaned_agent_rows_visible() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 1, 'src/auth/**', 1, 'a', 0, ?, NULL),
+                (2, 1, 2, 'src/auth/jwt.rs', 1, 'b', 0, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
+            ],
+        )
+        .expect("insert reservations");
+        conn.query_sync("DELETE FROM agents WHERE id = 1", &[])
+            .expect("delete holder agent row");
+
+        let (data, _actions) = build_reservations(&conn, 1, "proj", None, false, false, Some(10))
+            .expect("build reservations");
+
+        assert_eq!(data.all_active.len(), 2);
+        assert!(
+            data.all_active
+                .iter()
+                .any(|entry| entry.agent.as_deref() == Some("[unknown-agent-1]")),
+            "orphaned holder should remain visible: {:?}",
+            data.all_active
+        );
+        assert_eq!(data.conflicts.len(), 1);
+        let conflict_agents = [&data.conflicts[0].agent_a, &data.conflicts[0].agent_b];
+        assert!(
+            conflict_agents
+                .iter()
+                .any(|name| name.as_str() == "[unknown-agent-1]")
+                && conflict_agents.iter().any(|name| name.as_str() == "Bob"),
+            "unexpected conflict agents: {:?}",
+            data.conflicts[0]
+        );
+    }
+
+    #[test]
     fn build_analytics_handles_release_ledger_conflict_query() {
         let (_temp_dir, conn) = setup_robot_thread_message_test_db();
         let now_us = mcp_agent_mail_db::now_micros();
@@ -12535,6 +12766,39 @@ mod tests {
             ],
         )
         .expect("insert conflicting reservations");
+
+        let anomalies = build_analytics(&conn, 1, None).expect("build analytics");
+        let reservation_conflict = anomalies
+            .iter()
+            .find(|anomaly| anomaly.category == "reservation_conflict")
+            .expect("reservation conflict anomaly");
+        assert!(
+            reservation_conflict
+                .headline
+                .contains("1 reservation conflict"),
+            "unexpected anomaly headline: {}",
+            reservation_conflict.headline
+        );
+    }
+
+    #[test]
+    fn build_analytics_keeps_orphaned_reservation_conflicts_visible() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (1, 1, 1, 'src/auth/**', 1, 'a', 0, ?, NULL),
+                (2, 1, 2, 'src/auth/jwt.rs', 1, 'b', 0, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
+            ],
+        )
+        .expect("insert conflicting reservations");
+        conn.query_sync("DELETE FROM agents WHERE id = 1", &[])
+            .expect("delete holder agent row");
 
         let anomalies = build_analytics(&conn, 1, None).expect("build analytics");
         let reservation_conflict = anomalies
