@@ -416,6 +416,13 @@ pub fn maybe_chunk_database(
     threshold_bytes: usize,
     chunk_bytes: usize,
 ) -> ShareResult<Option<ChunkManifest>> {
+    if chunk_bytes == 0 {
+        return Err(ShareError::InvalidThreshold {
+            field: "chunk_size",
+            value: 0,
+        });
+    }
+
     let file_size = snapshot_path.metadata()?.len();
     if file_size <= threshold_bytes as u64 {
         return Ok(None);
@@ -1466,6 +1473,22 @@ mod tests {
         // size == threshold → no chunking (matches legacy `<=`)
         let result = maybe_chunk_database(&db, dir.path(), 50_000, 10_000).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn chunk_zero_chunk_size_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("large.sqlite3");
+        std::fs::write(&db, vec![0u8; 50_001]).unwrap();
+
+        let err = maybe_chunk_database(&db, dir.path(), 50_000, 0).unwrap_err();
+        match err {
+            ShareError::InvalidThreshold { field, value } => {
+                assert_eq!(field, "chunk_size");
+                assert_eq!(value, 0);
+            }
+            other => panic!("expected InvalidThreshold, got {other:?}"),
+        }
     }
 
     #[test]

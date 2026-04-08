@@ -1814,11 +1814,11 @@ fn run_sqlite_quick_check(db_path: &Path) -> Result<(), String> {
     let result = row
         .get_named::<String>("quick_check")
         .ok()
-        .filter(|value| !value.is_empty())
+        .and_then(normalize_sqlite_check_result)
         .or_else(|| {
             row.get_named::<String>("integrity_check")
                 .ok()
-                .filter(|value| !value.is_empty())
+                .and_then(normalize_sqlite_check_result)
         })
         .unwrap_or_default();
     if result.eq_ignore_ascii_case("ok") {
@@ -1826,6 +1826,11 @@ fn run_sqlite_quick_check(db_path: &Path) -> Result<(), String> {
     } else {
         Err(format!("PRAGMA quick_check reported: {result}"))
     }
+}
+
+fn normalize_sqlite_check_result(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn validate_agent_mail_schema(db_path: &Path) -> Result<(), String> {
@@ -2099,6 +2104,12 @@ fn parse_chunk_checksums(path: &Path) -> Result<BTreeMap<String, String>, String
         if hash.len() != 64 || !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
             return Err(format!(
                 "chunks.sha256 line {} has an invalid SHA-256 digest",
+                line_number + 1
+            ));
+        }
+        if checksums.contains_key(rel) {
+            return Err(format!(
+                "chunks.sha256 line {} duplicates path {rel}",
                 line_number + 1
             ));
         }
@@ -3059,6 +3070,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validate_bundle_rejects_duplicate_chunk_checksum_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        create_minimal_bundle(&bundle);
+
+        let db_path = bundle.join("mailbox.sqlite3");
+        create_test_agent_mail_sqlite_file(&db_path);
+        let db_sha = sha256_file_streaming(&db_path).unwrap();
+        let chunk_manifest = crate::maybe_chunk_database(&db_path, &bundle, 1, 128)
+            .unwrap()
+            .unwrap();
+        write_manifest_with_database(&bundle, &db_sha, Some(&chunk_manifest));
+
+        let checksums_path = bundle.join("chunks.sha256");
+        let mut checksums = std::fs::read_to_string(&checksums_path).unwrap();
+        let first_line = checksums.lines().next().unwrap().to_string();
+        checksums.push('\n');
+        checksums.push_str(&first_line);
+        checksums.push('\n');
+        std::fs::write(&checksums_path, checksums).unwrap();
+
+        let report = validate_bundle(&bundle).unwrap();
+        assert!(!report.ready);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "database_chunk_checksums_valid" && !check.passed),
+            "duplicate checksum entries should fail deploy readiness"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn validate_bundle_rejects_symlinked_chunk_checksum_file() {
@@ -3235,6 +3279,15 @@ mod tests {
         for hash in integrity.values() {
             assert_eq!(hash.len(), 64);
         }
+    }
+
+    #[test]
+    fn normalize_sqlite_check_result_trims_whitespace() {
+        assert_eq!(
+            normalize_sqlite_check_result(" ok \n".to_string()),
+            Some("ok".to_string())
+        );
+        assert_eq!(normalize_sqlite_check_result("   ".to_string()), None);
     }
 
     // ── config generators ───────────────────────────────────────────
