@@ -332,7 +332,9 @@ fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
                     )));
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&current)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)?
+            }
             Err(error) => return Err(error),
         }
     }

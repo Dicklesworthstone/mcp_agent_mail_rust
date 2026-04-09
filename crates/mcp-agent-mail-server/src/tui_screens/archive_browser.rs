@@ -588,12 +588,6 @@ impl ArchiveBrowserScreen {
                 entry.metadata().map(|m| m.len()).unwrap_or(0)
             };
 
-            if !filter_lower.is_empty() {
-                if !crate::tui_screens::contains_ci(&name, filter_lower) {
-                    continue;
-                }
-            }
-
             items.push((is_dir, name, path, size));
         }
 
