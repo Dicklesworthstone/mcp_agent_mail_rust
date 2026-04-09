@@ -579,7 +579,9 @@ impl PresetManager {
             return Err(PresetError::BuiltinReadOnly(preset.name));
         }
         validate_preset_name(&preset.name)?;
-        if let Some(existing_name) = self.conflicting_name_for_path(&preset.name, Some(&preset.name)) {
+        if let Some(existing_name) =
+            self.conflicting_name_for_path(&preset.name, Some(&preset.name))
+        {
             return Err(PresetError::FilenameCollision {
                 name: preset.name,
                 existing_name,
@@ -657,11 +659,7 @@ impl PresetManager {
         self.storage_dir.join(format!("{safe_name}.json"))
     }
 
-    fn conflicting_name_for_path(
-        &self,
-        name: &str,
-        exclude_name: Option<&str>,
-    ) -> Option<String> {
+    fn conflicting_name_for_path(&self, name: &str, exclude_name: Option<&str>) -> Option<String> {
         let target_path = self.preset_path(name);
         self.presets.keys().find_map(|existing_name| {
             if exclude_name.is_some_and(|excluded| excluded == existing_name) {
@@ -1034,10 +1032,7 @@ mod tests {
         let conflicting =
             DashboardPreset::new("ops?review", PanelLayoutConfig::default_two_panel(), vec![]);
         let result = mgr.save(conflicting);
-        assert!(matches!(
-            result,
-            Err(PresetError::FilenameCollision { .. })
-        ));
+        assert!(matches!(result, Err(PresetError::FilenameCollision { .. })));
         assert!(mgr.get("ops/review").is_some());
         assert!(mgr.get("ops?review").is_none());
         assert!(dir.path().join("ops_review.json").exists());
