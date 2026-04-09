@@ -3401,18 +3401,28 @@ impl MailAppModel {
             macro_ids::RECORD_STOP => {
                 // Generate an auto-name based on timestamp.
                 let name = format!("macro-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"));
-                if let Some(def) = self.macro_engine.stop_recording(&name) {
-                    self.notifications.notify(
-                        Toast::new(format!("Saved \"{}\" ({} steps)", def.name, def.len()))
-                            .icon(ToastIcon::Info)
-                            .duration(Duration::from_secs(4)),
-                    );
-                } else {
-                    self.notifications.notify(
-                        Toast::new("No steps recorded")
-                            .icon(ToastIcon::Warning)
-                            .duration(Duration::from_secs(3)),
-                    );
+                match self.macro_engine.stop_recording(&name) {
+                    Ok(Some(def)) => {
+                        self.notifications.notify(
+                            Toast::new(format!("Saved \"{}\" ({} steps)", def.name, def.len()))
+                                .icon(ToastIcon::Info)
+                                .duration(Duration::from_secs(4)),
+                        );
+                    }
+                    Ok(None) => {
+                        self.notifications.notify(
+                            Toast::new("No steps recorded")
+                                .icon(ToastIcon::Warning)
+                                .duration(Duration::from_secs(3)),
+                        );
+                    }
+                    Err(error) => {
+                        self.notifications.notify(
+                            Toast::new(format!("Failed to save macro: {error}"))
+                                .icon(ToastIcon::Error)
+                                .duration(Duration::from_secs(4)),
+                        );
+                    }
                 }
                 Some(Cmd::none())
             }
@@ -3484,12 +3494,21 @@ impl MailAppModel {
                     return Some(Cmd::none());
                 }
                 if let Some(name) = id.strip_prefix(macro_ids::DELETE_PREFIX) {
-                    if self.macro_engine.delete_macro(name) {
-                        self.notifications.notify(
-                            Toast::new(format!("Deleted macro \"{name}\""))
-                                .icon(ToastIcon::Info)
-                                .duration(Duration::from_secs(3)),
-                        );
+                    match self.macro_engine.delete_macro(name) {
+                        Ok(()) => {
+                            self.notifications.notify(
+                                Toast::new(format!("Deleted macro \"{name}\""))
+                                    .icon(ToastIcon::Info)
+                                    .duration(Duration::from_secs(3)),
+                            );
+                        }
+                        Err(error) => {
+                            self.notifications.notify(
+                                Toast::new(format!("Failed to delete macro \"{name}\": {error}"))
+                                    .icon(ToastIcon::Error)
+                                    .duration(Duration::from_secs(4)),
+                            );
+                        }
                     }
                     return Some(Cmd::none());
                 }
@@ -9991,7 +10010,10 @@ first body
         // Rename to a stable test name for deterministic file paths.
         let macro_name = "e2e-macro";
         assert!(
-            model.macro_engine.rename_macro(&auto_name, macro_name),
+            model
+                .macro_engine
+                .rename_macro(&auto_name, macro_name)
+                .is_ok(),
             "rename macro"
         );
 
@@ -10154,7 +10176,12 @@ first body
         let auto_name = names[0].to_string();
 
         let macro_name = "e2e-macro";
-        assert!(model.macro_engine.rename_macro(&auto_name, macro_name));
+        assert!(
+            model
+                .macro_engine
+                .rename_macro(&auto_name, macro_name)
+                .is_ok()
+        );
 
         let original = model
             .macro_engine

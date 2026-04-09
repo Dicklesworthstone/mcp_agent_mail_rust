@@ -241,6 +241,51 @@ pub struct PlaybackLogEntry {
     pub error: Option<String>,
 }
 
+/// Errors from macro persistence operations.
+#[derive(Debug)]
+pub enum MacroError {
+    /// Macro not found.
+    NotFound(String),
+    /// Macro name cannot be empty or whitespace.
+    InvalidName(String),
+    /// Distinct macro names would map to the same on-disk filename.
+    FilenameCollision { name: String, existing_name: String },
+    /// I/O error during read/write/remove.
+    Io(std::io::Error),
+    /// JSON serialization error.
+    Serialize(serde_json::Error),
+}
+
+impl std::fmt::Display for MacroError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(name) => write!(f, "macro '{name}' not found"),
+            Self::InvalidName(name) => {
+                write!(f, "macro name must not be empty or whitespace: '{name}'")
+            }
+            Self::FilenameCollision {
+                name,
+                existing_name,
+            } => write!(
+                f,
+                "macro '{name}' conflicts with existing macro '{existing_name}' on disk"
+            ),
+            Self::Io(e) => write!(f, "macro I/O error: {e}"),
+            Self::Serialize(e) => write!(f, "macro serialization error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for MacroError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::Serialize(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
 impl MacroEngine {
     /// Create a new engine with default storage directory.
     #[must_use]
@@ -365,23 +410,35 @@ impl MacroEngine {
     /// Stop recording and save the macro with the given name.
     ///
     /// Returns the saved macro definition, or `None` if no steps were recorded.
-    pub fn stop_recording(&mut self, name: &str) -> Option<MacroDef> {
+    ///
+    /// Fails when the name is invalid, collides on disk with another macro,
+    /// or persistence cannot be completed safely.
+    pub fn stop_recording(&mut self, name: &str) -> Result<Option<MacroDef>, MacroError> {
         if !self.recorder.is_recording() {
-            return None;
+            return Ok(None);
         }
-
-        self.recorder = RecorderState::Idle;
-        self.last_step_ts = None;
 
         if self.recording_buffer.is_empty() {
-            return None;
+            self.recorder = RecorderState::Idle;
+            self.last_step_ts = None;
+            return Ok(None);
         }
 
-        let steps = std::mem::take(&mut self.recording_buffer);
-        let def = MacroDef::new(name, steps);
+        validate_macro_name(name)?;
+        if let Some(existing_name) = self.conflicting_name_for_path(name, Some(name)) {
+            return Err(MacroError::FilenameCollision {
+                name: name.to_string(),
+                existing_name,
+            });
+        }
+
+        let def = MacroDef::new(name, self.recording_buffer.clone());
+        self.save_macro(&def)?;
         self.macros.insert(name.to_string(), def.clone());
-        self.save_macro(&def);
-        Some(def)
+        self.recording_buffer.clear();
+        self.recorder = RecorderState::Idle;
+        self.last_step_ts = None;
+        Ok(Some(def))
     }
 
     /// Cancel recording without saving.
@@ -590,31 +647,61 @@ impl MacroEngine {
     // ── Macro management ───────────────────────────────────────────
 
     /// Delete a macro by name.
-    pub fn delete_macro(&mut self, name: &str) -> bool {
-        if self.macros.remove(name).is_some() {
-            let path = self.macro_path(name);
-            let _ = std::fs::remove_file(path);
-            true
-        } else {
-            false
+    pub fn delete_macro(&mut self, name: &str) -> Result<(), MacroError> {
+        if !self.macros.contains_key(name) {
+            return Err(MacroError::NotFound(name.to_string()));
         }
+
+        if let Some(existing_name) = self.conflicting_name_for_path(name, Some(name)) {
+            return Err(MacroError::FilenameCollision {
+                name: name.to_string(),
+                existing_name,
+            });
+        }
+
+        let path = self.macro_path(name);
+        if path.exists() {
+            std::fs::remove_file(path).map_err(MacroError::Io)?;
+        }
+        self.macros.remove(name);
+        Ok(())
     }
 
     /// Rename a macro.
-    pub fn rename_macro(&mut self, old_name: &str, new_name: &str) -> bool {
-        if let Some(mut def) = self.macros.remove(old_name) {
-            // Delete old file
-            let old_path = self.macro_path(old_name);
-            let _ = std::fs::remove_file(old_path);
+    pub fn rename_macro(&mut self, old_name: &str, new_name: &str) -> Result<(), MacroError> {
+        let Some(existing) = self.macros.get(old_name).cloned() else {
+            return Err(MacroError::NotFound(old_name.to_string()));
+        };
 
-            def.name = new_name.to_string();
-            def.updated_at = chrono::Utc::now().to_rfc3339();
-            self.macros.insert(new_name.to_string(), def.clone());
-            self.save_macro(&def);
-            true
-        } else {
-            false
+        validate_macro_name(new_name)?;
+        if let Some(existing_name) = self.conflicting_name_for_path(new_name, Some(old_name)) {
+            return Err(MacroError::FilenameCollision {
+                name: new_name.to_string(),
+                existing_name,
+            });
         }
+
+        if old_name == new_name {
+            return Ok(());
+        }
+
+        let old_path = self.macro_path(old_name);
+        let mut renamed = existing;
+        renamed.name = new_name.to_string();
+        renamed.updated_at = chrono::Utc::now().to_rfc3339();
+        self.save_macro(&renamed)?;
+
+        if old_path.exists() {
+            if let Err(error) = std::fs::remove_file(&old_path) {
+                let new_path = self.macro_path(new_name);
+                let _ = std::fs::remove_file(new_path);
+                return Err(MacroError::Io(error));
+            }
+        }
+
+        self.macros.remove(old_name);
+        self.macros.insert(new_name.to_string(), renamed);
+        Ok(())
     }
 
     // ── Persistence ────────────────────────────────────────────────
@@ -624,12 +711,21 @@ impl MacroEngine {
         self.storage_dir.join(format!("{safe_name}.json"))
     }
 
-    fn save_macro(&self, def: &MacroDef) {
-        let _ = std::fs::create_dir_all(&self.storage_dir);
+    fn conflicting_name_for_path(&self, name: &str, exclude_name: Option<&str>) -> Option<String> {
+        let target_path = self.macro_path(name);
+        self.macros.keys().find_map(|existing_name| {
+            if exclude_name.is_some_and(|excluded| excluded == existing_name) {
+                return None;
+            }
+            (self.macro_path(existing_name) == target_path).then(|| existing_name.clone())
+        })
+    }
+
+    fn save_macro(&self, def: &MacroDef) -> Result<(), MacroError> {
+        std::fs::create_dir_all(&self.storage_dir).map_err(MacroError::Io)?;
         let path = self.macro_path(&def.name);
-        if let Ok(json) = serde_json::to_string_pretty(def) {
-            let _ = std::fs::write(path, json);
-        }
+        let json = serde_json::to_string_pretty(def).map_err(MacroError::Serialize)?;
+        std::fs::write(path, json).map_err(MacroError::Io)
     }
 
     fn load_all(&mut self) {
@@ -683,6 +779,13 @@ fn sanitize_filename(name: &str) -> String {
             }
         })
         .collect()
+}
+
+fn validate_macro_name(name: &str) -> Result<(), MacroError> {
+    if name.trim().is_empty() {
+        return Err(MacroError::InvalidName(name.to_string()));
+    }
+    Ok(())
 }
 
 #[must_use]
@@ -750,7 +853,10 @@ mod tests {
         engine.record_step("macro:view_thread:t1", "View thread t1");
         engine.record_step("screen:Agents", "Go to Agents");
 
-        let def = engine.stop_recording("my-workflow").unwrap();
+        let def = engine
+            .stop_recording("my-workflow")
+            .expect("save macro")
+            .expect("macro saved");
         assert_eq!(def.name, "my-workflow");
         assert_eq!(def.steps.len(), 3);
         assert_eq!(def.steps[0].action_id, "screen:Messages");
@@ -761,7 +867,7 @@ mod tests {
     fn record_empty_yields_none() {
         let mut engine = test_engine();
         engine.start_recording();
-        let result = engine.stop_recording("empty");
+        let result = engine.stop_recording("empty").expect("stop recording");
         assert!(result.is_none());
         assert_eq!(engine.macro_count(), 0);
     }
@@ -772,7 +878,10 @@ mod tests {
         engine.start_recording();
         engine.record_step("app:macro_record_stop", "Stop recording");
         engine.record_step("screen:Messages", "Go to Messages");
-        let def = engine.stop_recording("filtered").unwrap();
+        let def = engine
+            .stop_recording("filtered")
+            .expect("save macro")
+            .expect("macro saved");
         assert_eq!(def.steps.len(), 1);
         assert_eq!(def.steps[0].action_id, "screen:Messages");
     }
@@ -803,7 +912,13 @@ mod tests {
         engine.start_recording();
         engine.record_step("screen:Messages", "Go to Messages");
         engine.record_step("screen:Threads", "Go to Threads");
-        engine.stop_recording("workflow");
+        assert!(
+            engine
+                .stop_recording("workflow")
+                .expect("save macro")
+                .is_some(),
+            "macro saved"
+        );
 
         assert!(engine.start_playback("workflow", PlaybackMode::Continuous));
 
@@ -839,7 +954,13 @@ mod tests {
         engine.start_recording();
         engine.record_step("screen:Messages", "Go to Messages");
         engine.record_step("screen:Threads", "Go to Threads");
-        engine.stop_recording("steps");
+        assert!(
+            engine
+                .stop_recording("steps")
+                .expect("save macro")
+                .is_some(),
+            "macro saved"
+        );
 
         assert!(engine.start_playback("steps", PlaybackMode::StepByStep));
         assert!(matches!(
@@ -870,7 +991,10 @@ mod tests {
         let mut engine = test_engine();
         engine.start_recording();
         engine.record_step("screen:Messages", "Go to Messages");
-        engine.stop_recording("dry");
+        assert!(
+            engine.stop_recording("dry").expect("save macro").is_some(),
+            "macro saved"
+        );
 
         assert!(engine.start_playback("dry", PlaybackMode::DryRun));
         let (action, mode) = engine.next_step().unwrap();
@@ -888,7 +1012,13 @@ mod tests {
         let mut engine = test_engine();
         engine.start_recording();
         engine.record_step("screen:Messages", "Go to Messages");
-        engine.stop_recording("cancel-test");
+        assert!(
+            engine
+                .stop_recording("cancel-test")
+                .expect("save macro")
+                .is_some(),
+            "macro saved"
+        );
 
         engine.start_playback("cancel-test", PlaybackMode::Continuous);
         engine.stop_playback();
@@ -903,7 +1033,13 @@ mod tests {
         let mut engine = test_engine();
         engine.start_recording();
         engine.record_step("screen:Messages", "Go to Messages");
-        engine.stop_recording("fail-test");
+        assert!(
+            engine
+                .stop_recording("fail-test")
+                .expect("save macro")
+                .is_some(),
+            "macro saved"
+        );
 
         engine.start_playback("fail-test", PlaybackMode::Continuous);
         engine.fail_playback("screen not available");
@@ -918,7 +1054,13 @@ mod tests {
         let mut engine = test_engine();
         engine.start_recording();
         engine.record_step("screen:Messages", "Go to Messages");
-        engine.stop_recording("clear-test");
+        assert!(
+            engine
+                .stop_recording("clear-test")
+                .expect("save macro")
+                .is_some(),
+            "macro saved"
+        );
 
         engine.start_playback("clear-test", PlaybackMode::Continuous);
         engine.next_step(); // complete
@@ -940,7 +1082,13 @@ mod tests {
             engine.start_recording();
             engine.record_step("screen:Messages", "Go to Messages");
             engine.record_step("screen:Threads", "Go to Threads");
-            engine.stop_recording("persisted");
+            assert!(
+                engine
+                    .stop_recording("persisted")
+                    .expect("save macro")
+                    .is_some(),
+                "macro saved"
+            );
         }
 
         // Load in a new engine
@@ -960,12 +1108,21 @@ mod tests {
         let mut engine = test_engine();
         engine.start_recording();
         engine.record_step("screen:Messages", "Go to Messages");
-        engine.stop_recording("deleteme");
+        assert!(
+            engine
+                .stop_recording("deleteme")
+                .expect("save macro")
+                .is_some(),
+            "macro saved"
+        );
 
         assert_eq!(engine.macro_count(), 1);
-        assert!(engine.delete_macro("deleteme"));
+        assert!(engine.delete_macro("deleteme").is_ok());
         assert_eq!(engine.macro_count(), 0);
-        assert!(!engine.delete_macro("deleteme")); // already gone
+        assert!(matches!(
+            engine.delete_macro("deleteme"),
+            Err(MacroError::NotFound(_))
+        )); // already gone
     }
 
     #[test]
@@ -973,11 +1130,121 @@ mod tests {
         let mut engine = test_engine();
         engine.start_recording();
         engine.record_step("screen:Messages", "Go to Messages");
-        engine.stop_recording("old-name");
+        assert!(
+            engine
+                .stop_recording("old-name")
+                .expect("save macro")
+                .is_some(),
+            "macro saved"
+        );
 
-        assert!(engine.rename_macro("old-name", "new-name"));
+        assert!(engine.rename_macro("old-name", "new-name").is_ok());
         assert!(engine.get_macro("old-name").is_none());
         assert_eq!(engine.get_macro("new-name").unwrap().name, "new-name");
+    }
+
+    #[test]
+    fn stop_recording_whitespace_name_fails_without_writing_dot_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = MacroEngine::with_dir(dir.path().to_path_buf());
+        engine.start_recording();
+        engine.record_step("screen:Messages", "Go to Messages");
+
+        let result = engine.stop_recording("   ");
+        assert!(matches!(result, Err(MacroError::InvalidName(_))));
+        assert!(!dir.path().join(".json").exists());
+        assert!(engine.get_macro("   ").is_none());
+        assert!(engine.recorder_state().is_recording());
+    }
+
+    #[test]
+    fn stop_recording_rejects_filename_collision_between_distinct_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = MacroEngine::with_dir(dir.path().to_path_buf());
+
+        engine.start_recording();
+        engine.record_step("screen:Messages", "Go to Messages");
+        assert!(
+            engine
+                .stop_recording("ops/review")
+                .expect("save first macro")
+                .is_some(),
+            "first macro saved"
+        );
+
+        engine.start_recording();
+        engine.record_step("screen:Threads", "Go to Threads");
+        let result = engine.stop_recording("ops?review");
+        assert!(matches!(result, Err(MacroError::FilenameCollision { .. })));
+        assert!(engine.get_macro("ops/review").is_some());
+        assert!(engine.get_macro("ops?review").is_none());
+        assert!(dir.path().join("ops_review.json").exists());
+    }
+
+    #[test]
+    fn rename_macro_rejects_filename_collision_and_preserves_original() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = MacroEngine::with_dir(dir.path().to_path_buf());
+
+        engine.start_recording();
+        engine.record_step("screen:Messages", "Go to Messages");
+        assert!(
+            engine
+                .stop_recording("ops/review")
+                .expect("save first macro")
+                .is_some(),
+            "first macro saved"
+        );
+
+        engine.start_recording();
+        engine.record_step("screen:Threads", "Go to Threads");
+        assert!(
+            engine
+                .stop_recording("other")
+                .expect("save second macro")
+                .is_some(),
+            "second macro saved"
+        );
+
+        let result = engine.rename_macro("other", "ops?review");
+        assert!(matches!(result, Err(MacroError::FilenameCollision { .. })));
+        assert!(engine.get_macro("other").is_some());
+        assert!(engine.get_macro("ops?review").is_none());
+        assert!(dir.path().join("ops_review.json").exists());
+        assert!(dir.path().join("other.json").exists());
+    }
+
+    #[test]
+    fn delete_macro_rejects_filename_collision_without_removing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = MacroEngine::with_dir(dir.path().to_path_buf());
+
+        engine.start_recording();
+        engine.record_step("screen:Messages", "Go to Messages");
+        assert!(
+            engine
+                .stop_recording("ops/review")
+                .expect("save first macro")
+                .is_some(),
+            "first macro saved"
+        );
+
+        let first = engine
+            .get_macro("ops/review")
+            .expect("saved first macro")
+            .clone();
+        engine.macros.insert(
+            "ops?review".to_string(),
+            MacroDef {
+                name: "ops?review".to_string(),
+                ..first
+            },
+        );
+
+        let result = engine.delete_macro("ops/review");
+        assert!(matches!(result, Err(MacroError::FilenameCollision { .. })));
+        assert!(dir.path().join("ops_review.json").exists());
+        assert!(engine.get_macro("ops/review").is_some());
     }
 
     // ── Preview ────────────────────────────────────────────────────
@@ -988,7 +1255,13 @@ mod tests {
         engine.start_recording();
         engine.record_step("screen:Messages", "Go to Messages");
         engine.record_step("screen:Threads", "Go to Threads");
-        engine.stop_recording("preview-test");
+        assert!(
+            engine
+                .stop_recording("preview-test")
+                .expect("save macro")
+                .is_some(),
+            "macro saved"
+        );
 
         let steps = engine.preview("preview-test").unwrap();
         assert_eq!(steps.len(), 2);
@@ -1095,7 +1368,13 @@ mod tests {
         engine.start_recording();
         engine.record_step("screen:Messages", "Go to Messages");
         engine.record_step("screen:Threads", "Go to Threads");
-        engine.stop_recording("log-test");
+        assert!(
+            engine
+                .stop_recording("log-test")
+                .expect("save macro")
+                .is_some(),
+            "macro saved"
+        );
 
         engine.start_playback("log-test", PlaybackMode::Continuous);
         engine.next_step();
@@ -1212,7 +1491,13 @@ mod tests {
         let mut engine = test_engine();
         engine.start_recording();
         engine.record_step("screen:Messages", "Go to Messages");
-        engine.stop_recording("err-test");
+        assert!(
+            engine
+                .stop_recording("err-test")
+                .expect("save macro")
+                .is_some(),
+            "macro saved"
+        );
 
         engine.start_playback("err-test", PlaybackMode::Continuous);
         engine.next_step();
@@ -1249,7 +1534,13 @@ mod tests {
         let mut engine = test_engine();
         engine.start_recording();
         engine.record_step("screen:Messages", "Go to Messages");
-        engine.stop_recording("active-test");
+        assert!(
+            engine
+                .stop_recording("active-test")
+                .expect("save macro")
+                .is_some(),
+            "macro saved"
+        );
 
         engine.start_playback("active-test", PlaybackMode::StepByStep);
         assert!(engine.playback_state().is_active());
@@ -1263,7 +1554,13 @@ mod tests {
         let mut engine = test_engine();
         engine.start_recording();
         engine.record_step("screen:Messages", "Go to Messages");
-        engine.stop_recording("conf-test");
+        assert!(
+            engine
+                .stop_recording("conf-test")
+                .expect("save macro")
+                .is_some(),
+            "macro saved"
+        );
 
         // Start in continuous mode — confirm_step should return None
         engine.start_playback("conf-test", PlaybackMode::Continuous);
@@ -1324,15 +1621,23 @@ mod tests {
     }
 
     #[test]
-    fn rename_nonexistent_macro_returns_false() {
+    fn rename_nonexistent_macro_returns_not_found() {
         let mut engine = test_engine();
-        assert!(!engine.rename_macro("nope", "also-nope"));
+        assert!(matches!(
+            engine.rename_macro("nope", "also-nope"),
+            Err(MacroError::NotFound(_))
+        ));
     }
 
     #[test]
     fn stop_recording_when_not_recording_returns_none() {
         let mut engine = test_engine();
-        assert!(engine.stop_recording("test").is_none());
+        assert!(
+            engine
+                .stop_recording("test")
+                .expect("idle stop should not error")
+                .is_none()
+        );
     }
 
     #[test]
