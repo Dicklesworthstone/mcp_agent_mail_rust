@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use mcp_agent_mail_core::Config;
@@ -29,6 +30,7 @@ const PALETTE_USAGE_FILENAME: &str = "palette_usage.json";
 const DISMISSED_HINTS_FILENAME: &str = "dismissed_hints.json";
 /// JSON filename for persisted screen filter presets.
 const SCREEN_FILTER_PRESETS_FILENAME: &str = "screen_filter_presets.json";
+static PERSIST_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Persisted command-palette usage map:
 /// `action_id` -> (`usage_count`, `last_used_micros`)
@@ -188,12 +190,9 @@ pub fn palette_usage_path(envfile_path: &Path) -> PathBuf {
 /// Returns an error if parent directory creation, JSON serialization,
 /// or file writing fails.
 pub fn save_palette_usage(path: &Path, usage: &PaletteUsageMap) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let json = serde_json::to_string_pretty(usage)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(path, json)
+    atomic_write_text(path, &json)
 }
 
 /// Load command-palette usage stats from disk.
@@ -246,13 +245,10 @@ pub fn save_dismissed_hints(
     path: &Path,
     hints: &HashSet<String, std::collections::hash_map::RandomState>,
 ) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let sorted: std::collections::BTreeSet<&String> = hints.iter().collect();
     let json = serde_json::to_string_pretty(&sorted)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(path, json)
+    atomic_write_text(path, &json)
 }
 
 /// Load dismissed coach-hint IDs from disk.
@@ -338,12 +334,9 @@ pub fn save_screen_filter_presets(
     path: &Path,
     store: &ScreenFilterPresetStore,
 ) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let json = serde_json::to_string_pretty(store)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(path, json)
+    atomic_write_text(path, &json)
 }
 
 /// Load screen filter presets from disk.
@@ -597,10 +590,7 @@ impl PreferencePersister {
         let json = prefs
             .to_json()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        if let Some(parent) = export_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&export_path, json)?;
+        atomic_write_text(&export_path, &json)?;
         Ok(export_path)
     }
 
@@ -622,6 +612,61 @@ impl PreferencePersister {
             .unwrap_or_else(|| Path::new("."))
             .join("layout.json")
     }
+}
+
+fn atomic_write_text(path: &Path, contents: &str) -> Result<(), std::io::Error> {
+    use std::io::Write as _;
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("persist");
+
+    for _ in 0..64 {
+        let seq = PERSIST_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_name = format!(".{file_name}.tmp-{}-{seq}", std::process::id());
+        let tmp_path = parent.join(tmp_name);
+
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+        {
+            Ok(mut file) => {
+                let write_result = (|| -> Result<(), std::io::Error> {
+                    file.write_all(contents.as_bytes())?;
+                    file.sync_data()?;
+                    drop(file);
+                    if let Err(error) = std::fs::rename(&tmp_path, path) {
+                        #[cfg(windows)]
+                        {
+                            if path.exists() {
+                                std::fs::remove_file(path)?;
+                                std::fs::rename(&tmp_path, path)?;
+                                return Ok(());
+                            }
+                        }
+                        return Err(error);
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = write_result {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(error);
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("failed to allocate unique temp file for {}", path.display()),
+    ))
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -867,6 +912,35 @@ mod tests {
 
         let imported = persister.import_json().unwrap();
         assert_eq!(imported, prefs);
+    }
+
+    #[test]
+    fn export_json_overwrites_existing_file_without_tmp_leaks() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            console_persist_path: dir.path().join("config.env"),
+            console_auto_save: true,
+            ..Config::default()
+        };
+        let persister = PreferencePersister::new(&config);
+        std::fs::write(persister.export_path(), "{ invalid json ]").unwrap();
+
+        let prefs = TuiPreferences {
+            dock: DockLayout::new(DockPosition::Top, 0.55).with_visible(false),
+            ..Default::default()
+        };
+
+        let path = persister.export_json(&prefs).expect("overwrite export");
+        let imported = persister.import_json().expect("import overwritten export");
+        assert_eq!(path, persister.export_path());
+        assert_eq!(imported, prefs);
+        assert!(dir.path().read_dir().unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
     }
 
     #[test]
@@ -1411,6 +1485,28 @@ mod tests {
     }
 
     #[test]
+    fn palette_usage_save_overwrites_existing_file_without_tmp_leaks() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = dir.path().join("config.env");
+        let usage_path = palette_usage_path(&env);
+        std::fs::write(&usage_path, "{ definitely-not-valid-json ]").unwrap();
+
+        let mut usage = PaletteUsageMap::new();
+        usage.insert("screen:dashboard".to_string(), (7, 1_700_000_123_000_000));
+
+        save_palette_usage(&usage_path, &usage).expect("overwrite palette usage");
+        let loaded = load_palette_usage(&usage_path).expect("load overwritten palette usage");
+        assert_eq!(loaded, usage);
+        assert!(dir.path().read_dir().unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+    }
+
+    #[test]
     fn palette_usage_missing_file_returns_empty_map() {
         let dir = tempfile::tempdir().unwrap();
         let usage_path = dir.path().join("missing_palette_usage.json");
@@ -1453,6 +1549,27 @@ mod tests {
         save_dismissed_hints(&path, &hints).expect("save dismissed hints");
         let loaded = load_dismissed_hints(&path).expect("load dismissed hints");
         assert_eq!(loaded, hints);
+    }
+
+    #[test]
+    fn dismissed_hints_save_overwrites_existing_file_without_tmp_leaks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dismissed_hints.json");
+        std::fs::write(&path, "{ definitely-not-valid-json ]").unwrap();
+
+        let mut hints = std::collections::HashSet::new();
+        hints.insert("timeline:triage".to_string());
+
+        save_dismissed_hints(&path, &hints).expect("overwrite dismissed hints");
+        let loaded = load_dismissed_hints(&path).expect("load overwritten dismissed hints");
+        assert_eq!(loaded, hints);
+        assert!(dir.path().read_dir().unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
     }
 
     #[test]
@@ -1556,6 +1673,29 @@ mod tests {
             preset.values.get("direction").map(String::as_str),
             Some("inbound")
         );
+    }
+
+    #[test]
+    fn screen_filter_store_save_overwrites_existing_file_without_tmp_leaks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("screen_filter_presets.json");
+        std::fs::write(&path, "{not-valid-json").unwrap();
+
+        let mut store = ScreenFilterPresetStore::default();
+        let mut values = BTreeMap::new();
+        values.insert("direction".to_string(), "outbound".to_string());
+        store.upsert("explorer", "triage", None, values);
+
+        save_screen_filter_presets(&path, &store).expect("overwrite presets");
+        let loaded = load_screen_filter_presets(&path).expect("load overwritten presets");
+        assert_eq!(loaded.list_names("explorer"), vec!["triage".to_string()]);
+        assert!(dir.path().read_dir().unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
     }
 
     #[test]
