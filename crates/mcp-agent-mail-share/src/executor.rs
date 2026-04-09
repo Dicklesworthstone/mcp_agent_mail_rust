@@ -15,7 +15,7 @@
 //! Shell commands are executed via `std::process::Command`.
 
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
@@ -135,7 +135,7 @@ fn execute_step(
             if let Some(ref cmd) = step.command {
                 // Extract path from "mkdir -p <path>"
                 if let Some(path) = path_from_simple_shell_command(cmd, "mkdir -p ") {
-                    std::fs::create_dir_all(&path).map_err(|e| {
+                    ensure_real_directory(&path).map_err(|e| {
                         WizardError::new(
                             WizardErrorCode::FileOperationFailed,
                             format!("Failed to create directory: {e}"),
@@ -161,7 +161,7 @@ fn execute_step(
             if let Some(ref cmd) = step.command {
                 // Extract path from "touch <path>"
                 if let Some(path) = path_from_simple_shell_command(cmd, "touch ") {
-                    std::fs::write(&path, "").map_err(|e| {
+                    write_generated_file(&path, "").map_err(|e| {
                         WizardError::new(
                             WizardErrorCode::FileOperationFailed,
                             format!("Failed to create .nojekyll: {e}"),
@@ -185,10 +185,7 @@ fn execute_step(
                     .map(|n| n == "_headers")
                     .unwrap_or(false)
             }) {
-                if let Some(parent) = headers_path.parent() {
-                    std::fs::create_dir_all(parent).ok();
-                }
-                std::fs::write(headers_path, headers_content).map_err(|e| {
+                write_generated_file(headers_path, &headers_content).map_err(|e| {
                     WizardError::new(
                         WizardErrorCode::FileOperationFailed,
                         format!("Failed to write _headers: {e}"),
@@ -273,6 +270,70 @@ fn execute_shell_command(command: &str) -> Result<String, WizardError> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        use std::path::Component;
+
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(std::io::Error::other(format!(
+                    "refusing to create directory with parent traversal: {}",
+                    path.display()
+                )));
+            }
+            Component::Normal(segment) => {
+                current.push(segment);
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) => {
+                        if metadata.file_type().is_symlink() {
+                            return Err(std::io::Error::other(format!(
+                                "refusing to traverse symlinked directory {}",
+                                current.display()
+                            )));
+                        }
+                        if !metadata.file_type().is_dir() {
+                            return Err(std::io::Error::other(format!(
+                                "expected directory but found non-directory {}",
+                                current.display()
+                            )));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir(&current)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_generated_file(path: &Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_real_directory(parent)?;
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::other(format!(
+                "refusing to write through symlinked path {}",
+                path.display()
+            )));
+        }
+        if !metadata.file_type().is_file() {
+            return Err(std::io::Error::other(format!(
+                "expected file but found non-file {}",
+                path.display()
+            )));
+        }
+    }
+    std::fs::write(path, content)
 }
 
 fn path_from_simple_shell_command(command: &str, prefix: &str) -> Option<PathBuf> {
@@ -505,6 +566,44 @@ mod tests {
         assert!(new_dir.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn execute_step_rejects_symlinked_output_dir_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let linked = temp.path().join("linked");
+        symlink(outside.path(), &linked).unwrap();
+        let new_dir = linked.join("docs");
+
+        let plan = DeploymentPlan {
+            provider: HostingProvider::GithubPages,
+            bundle_path: temp.path().to_path_buf(),
+            steps: vec![],
+            expected_url: None,
+            generated_files: vec![],
+            warnings: vec![],
+        };
+
+        let step = PlanStep {
+            index: 1,
+            id: "create_output_dir".to_string(),
+            description: "Create output directory".to_string(),
+            command: Some(format!("mkdir -p {}", new_dir.display())),
+            optional: false,
+            requires_confirm: false,
+        };
+
+        let result = execute_step(&step, &plan, false);
+        assert!(matches!(
+            result,
+            Err(error)
+                if error.message.contains("symlinked directory")
+                    && error.context.as_deref() == Some(new_dir.to_string_lossy().as_ref())
+        ));
+    }
+
     #[test]
     fn execute_step_creates_nojekyll() {
         let temp = tempfile::tempdir().unwrap();
@@ -559,6 +658,45 @@ mod tests {
         assert!(nojekyll.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn execute_step_rejects_symlinked_nojekyll_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let nojekyll = temp.path().join(".nojekyll");
+        let outside = temp.path().join("outside.txt");
+        std::fs::write(&outside, "keep").unwrap();
+        symlink(&outside, &nojekyll).unwrap();
+
+        let plan = DeploymentPlan {
+            provider: HostingProvider::GithubPages,
+            bundle_path: temp.path().to_path_buf(),
+            steps: vec![],
+            expected_url: None,
+            generated_files: vec![],
+            warnings: vec![],
+        };
+
+        let step = PlanStep {
+            index: 1,
+            id: "create_nojekyll".to_string(),
+            description: "Create .nojekyll".to_string(),
+            command: Some(format!("touch {}", nojekyll.display())),
+            optional: false,
+            requires_confirm: false,
+        };
+
+        let result = execute_step(&step, &plan, false);
+        assert!(matches!(
+            result,
+            Err(error)
+                if error.message.contains("symlinked path")
+                    && error.context.as_deref() == Some(nojekyll.to_string_lossy().as_ref())
+        ));
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "keep");
+    }
+
     #[test]
     fn execute_step_creates_headers_file() {
         let temp = tempfile::tempdir().unwrap();
@@ -585,6 +723,45 @@ mod tests {
         assert!(headers_path.exists());
         let content = std::fs::read_to_string(&headers_path).unwrap();
         assert!(content.contains("Cross-Origin-Opener-Policy"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_step_rejects_symlinked_headers_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let headers_path = temp.path().join("_headers");
+        let outside = temp.path().join("outside-headers");
+        std::fs::write(&outside, "preserve").unwrap();
+        symlink(&outside, &headers_path).unwrap();
+
+        let plan = DeploymentPlan {
+            provider: HostingProvider::GithubPages,
+            bundle_path: temp.path().to_path_buf(),
+            steps: vec![],
+            expected_url: None,
+            generated_files: vec![headers_path.clone()],
+            warnings: vec![],
+        };
+
+        let step = PlanStep {
+            index: 1,
+            id: "create_headers".to_string(),
+            description: "Create _headers file".to_string(),
+            command: None,
+            optional: false,
+            requires_confirm: false,
+        };
+
+        let result = execute_step(&step, &plan, false);
+        assert!(matches!(
+            result,
+            Err(error)
+                if error.message.contains("symlinked path")
+                    && error.context.as_deref() == Some(headers_path.to_string_lossy().as_ref())
+        ));
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "preserve");
     }
 
     // ── generate_headers_content: all providers ──────────────────────

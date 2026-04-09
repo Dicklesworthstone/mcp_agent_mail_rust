@@ -92,12 +92,23 @@ fn detect_github_pages_with_remote(cwd: &Path, git_remote: Option<&str>) -> Vec<
 
     // Check for GitHub Actions workflows
     if let Some(workflows_dir) = find_ancestor_path(cwd, ".github/workflows")
-        && workflows_dir.is_dir()
+        && crate::is_real_dir(&workflows_dir)
     {
         let mut has_pages_workflow = false;
         if let Ok(entries) = std::fs::read_dir(&workflows_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_lowercase();
+            let mut workflow_files: Vec<_> = entries
+                .flatten()
+                .map(|entry| {
+                    (
+                        entry.file_name().to_string_lossy().to_lowercase(),
+                        entry.path(),
+                    )
+                })
+                .filter(|(_, path)| crate::is_real_file(path))
+                .collect();
+            workflow_files.sort_by(|a, b| a.0.cmp(&b.0));
+
+            for (name, _path) in workflow_files {
                 if (name.ends_with(".yml") || name.ends_with(".yaml"))
                     && (name.contains("pages") || name.contains("deploy"))
                 {
@@ -129,7 +140,7 @@ fn detect_github_pages_with_remote(cwd: &Path, git_remote: Option<&str>) -> Vec<
     }
 
     // Check for docs/ directory (common GitHub Pages pattern)
-    if find_ancestor_path(cwd, "docs").is_some_and(|docs_dir| docs_dir.is_dir()) {
+    if find_ancestor_path(cwd, "docs").is_some_and(|docs_dir| crate::is_real_dir(&docs_dir)) {
         signals.push(DetectedSignal {
             source: "filesystem".to_string(),
             detail: "docs/ directory exists (common Pages pattern)".to_string(),
@@ -246,13 +257,24 @@ pub fn detect_s3(cwd: &Path) -> Vec<DetectedSignal> {
 
     // Check for S3-related scripts
     if let Some(scripts_dir) = find_ancestor_path(cwd, "scripts")
-        && scripts_dir.is_dir()
+        && crate::is_real_dir(&scripts_dir)
         && let Ok(entries) = std::fs::read_dir(&scripts_dir)
     {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_lowercase();
+        let mut script_files: Vec<_> = entries
+            .flatten()
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().to_lowercase(),
+                    entry.path(),
+                )
+            })
+            .filter(|(_, path)| crate::is_real_file(path))
+            .collect();
+        script_files.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (name, path) in script_files {
             if (name.contains("s3") || name.contains("aws") || name.contains("deploy"))
-                && let Ok(content) = std::fs::read_to_string(entry.path())
+                && let Ok(content) = std::fs::read_to_string(path)
                 && (content.contains("s3 ") || content.contains("aws s3"))
             {
                 signals.push(DetectedSignal {
@@ -509,15 +531,19 @@ fn git_remote_url(dir: &Path) -> Option<String> {
 
 /// Find an ancestor path containing the given name.
 fn find_ancestor_path(start: &Path, name: &str) -> Option<PathBuf> {
-    let search_root = if start.is_file() {
+    let search_root = if crate::is_real_file(start) {
         start.parent()?
-    } else {
+    } else if crate::is_real_dir(start) {
         start
+    } else {
+        return None;
     };
 
     for current in search_root.ancestors() {
         let candidate = current.join(name);
-        if candidate.exists() {
+        if std::fs::symlink_metadata(&candidate)
+            .is_ok_and(|metadata| metadata.file_type().is_file() || metadata.file_type().is_dir())
+        {
             return Some(candidate);
         }
     }
@@ -700,6 +726,19 @@ mod tests {
         assert_eq!(found, marker);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn find_ancestor_path_ignores_symlinked_markers() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("real-wrangler.toml");
+        std::fs::write(&target, "name = \"demo\"").expect("write target");
+        symlink(&target, dir.path().join("wrangler.toml")).expect("symlink marker");
+
+        assert_eq!(find_ancestor_path(dir.path(), "wrangler.toml"), None);
+    }
+
     #[test]
     fn detect_environment_marks_existing_bundle_when_manifest_present() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -848,6 +887,25 @@ mod tests {
         assert!(signals.iter().any(|s| s.detail.contains("docs/")));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn detect_github_pages_ignores_symlinked_docs_dir() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_docs = dir.path().join("real-docs");
+        std::fs::create_dir(&real_docs).expect("create real docs");
+        symlink(&real_docs, dir.path().join("docs")).expect("symlink docs");
+
+        let signals = detect_github_pages(dir.path());
+        assert!(
+            signals
+                .iter()
+                .all(|signal| !signal.detail.contains("docs/")),
+            "symlinked docs/ should not count as a Pages hint"
+        );
+    }
+
     #[test]
     fn detect_github_pages_workflow_dir_without_pages_workflow() {
         let dir = tempfile::tempdir().unwrap();
@@ -863,12 +921,81 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn detect_github_pages_ignores_symlinked_workflow_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workflows = dir.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&workflows).expect("create workflows");
+        let real_workflow = dir.path().join("deploy-pages.yml");
+        std::fs::write(&real_workflow, "name: Deploy Pages").expect("write real workflow");
+        symlink(&real_workflow, workflows.join("deploy-pages.yml")).expect("symlink workflow");
+
+        let signals = detect_github_pages(dir.path());
+        assert!(
+            signals
+                .iter()
+                .all(|signal| !signal.detail.contains("GitHub Actions workflow found")),
+            "symlinked workflow files should not count as Pages workflows"
+        );
+        assert!(
+            signals.iter().any(|signal| signal
+                .detail
+                .contains(".github/workflows/ directory exists")),
+            "the real workflows directory should still be detected"
+        );
+    }
+
+    #[test]
+    fn detect_github_pages_orders_workflow_signals_deterministically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workflows = dir.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&workflows).expect("create workflows");
+        std::fs::write(workflows.join("z-pages.yml"), "name: deploy").expect("write workflow");
+        std::fs::write(workflows.join("a-deploy.yaml"), "name: deploy").expect("write workflow");
+
+        let details: Vec<_> = detect_github_pages(dir.path())
+            .into_iter()
+            .filter(|signal| signal.detail.contains("GitHub Actions workflow found"))
+            .map(|signal| signal.detail)
+            .collect();
+
+        assert_eq!(
+            details,
+            vec![
+                "GitHub Actions workflow found: a-deploy.yaml".to_string(),
+                "GitHub Actions workflow found: z-pages.yml".to_string(),
+            ]
+        );
+    }
+
     #[test]
     fn detect_cloudflare_pages_with_wrangler() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("wrangler.toml"), "").unwrap();
         let signals = detect_cloudflare_pages(dir.path());
         assert!(signals.iter().any(|s| s.detail.contains("wrangler.toml")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_cloudflare_pages_ignores_symlinked_wrangler() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("real-wrangler.toml");
+        std::fs::write(&target, "name = \"demo\"").expect("write target");
+        symlink(&target, dir.path().join("wrangler.toml")).expect("symlink wrangler");
+
+        let signals = detect_cloudflare_pages(dir.path());
+        assert!(
+            signals
+                .iter()
+                .all(|signal| !signal.detail.contains("wrangler.toml")),
+            "symlinked wrangler.toml should not count as Cloudflare config"
+        );
     }
 
     #[test]
@@ -887,6 +1014,25 @@ mod tests {
         std::fs::write(dir.path().join("netlify.toml"), "[build]").unwrap();
         let signals = detect_netlify(dir.path());
         assert!(signals.iter().any(|s| s.detail.contains("netlify.toml")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_netlify_ignores_symlinked_netlify_toml() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("real-netlify.toml");
+        std::fs::write(&target, "[build]").expect("write target");
+        symlink(&target, dir.path().join("netlify.toml")).expect("symlink netlify");
+
+        let signals = detect_netlify(dir.path());
+        assert!(
+            signals
+                .iter()
+                .all(|signal| !signal.detail.contains("netlify.toml")),
+            "symlinked netlify.toml should not count as Netlify config"
+        );
     }
 
     #[test]
@@ -927,6 +1073,76 @@ mod tests {
                 .iter()
                 .any(|s| s.detail.contains("S3/AWS deploy script")),
             "expected ancestor scripts/ directory to be detected from nested path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_s3_ignores_symlinked_scripts_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_scripts = dir.path().join("real-scripts");
+        std::fs::create_dir(&real_scripts).expect("create real scripts");
+        std::fs::write(
+            real_scripts.join("deploy-s3.sh"),
+            "aws s3 sync . s3://bucket",
+        )
+        .expect("write deploy script");
+        symlink(&real_scripts, dir.path().join("scripts")).expect("symlink scripts");
+
+        let signals = detect_s3(dir.path());
+        assert!(
+            signals
+                .iter()
+                .all(|signal| !signal.detail.contains("S3/AWS deploy script")),
+            "symlinked scripts/ should not count as S3 deployment signals"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_s3_ignores_symlinked_script_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scripts = dir.path().join("scripts");
+        std::fs::create_dir(&scripts).expect("create scripts");
+        let real_script = dir.path().join("deploy-s3.sh");
+        std::fs::write(&real_script, "aws s3 sync . s3://bucket").expect("write real script");
+        symlink(&real_script, scripts.join("deploy-s3.sh")).expect("symlink deploy script");
+
+        let signals = detect_s3(dir.path());
+        assert!(
+            signals
+                .iter()
+                .all(|signal| !signal.detail.contains("S3/AWS deploy script")),
+            "symlinked deploy scripts should not count as S3 signals"
+        );
+    }
+
+    #[test]
+    fn detect_s3_orders_script_signals_deterministically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scripts = dir.path().join("scripts");
+        std::fs::create_dir(&scripts).expect("create scripts");
+        std::fs::write(scripts.join("z-deploy.sh"), "aws s3 sync . s3://bucket")
+            .expect("write script");
+        std::fs::write(scripts.join("a-s3.sh"), "aws s3 cp file s3://bucket")
+            .expect("write script");
+
+        let details: Vec<_> = detect_s3(dir.path())
+            .into_iter()
+            .filter(|signal| signal.detail.contains("S3/AWS deploy script"))
+            .map(|signal| signal.detail)
+            .collect();
+
+        assert_eq!(
+            details,
+            vec![
+                "S3/AWS deploy script: a-s3.sh".to_string(),
+                "S3/AWS deploy script: z-deploy.sh".to_string(),
+            ]
         );
     }
 

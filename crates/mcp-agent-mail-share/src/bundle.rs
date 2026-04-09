@@ -394,8 +394,10 @@ pub fn bundle_attachments(
         crate::build_materialized_views(&snapshot_path, fts_enabled)?;
     }
 
-    // Ensure attachments dir exists even if empty
-    let _ = ensure_real_directory(&attachments_dir);
+    // Ensure attachments dir exists even if empty.
+    // This must not fail open: a symlinked or otherwise invalid attachments/
+    // path means the export layout is unsafe/incomplete.
+    ensure_real_directory(&attachments_dir)?;
 
     Ok(AttachmentManifest {
         stats,
@@ -662,15 +664,16 @@ pub fn package_directory_as_zip(source_dir: &Path, destination: &Path) -> ShareR
     use zip::DateTime;
     use zip::write::SimpleFileOptions;
 
+    if !crate::is_real_dir(source_dir) {
+        return Err(ShareError::Io(std::io::Error::other(format!(
+            "ZIP source must be a real directory (got {})",
+            source_dir.display()
+        ))));
+    }
+
     let source = source_dir
         .canonicalize()
         .map_err(|e| ShareError::Io(std::io::Error::other(e.to_string())))?;
-    if !source.is_dir() {
-        return Err(ShareError::Io(std::io::Error::other(format!(
-            "ZIP source must be a directory (got {})",
-            source.display()
-        ))));
-    }
 
     let dest = if destination.is_absolute() {
         destination.to_path_buf()
@@ -827,6 +830,14 @@ fn resolve_attachment_path(
                 "absolute attachment paths are disabled",
             ));
         }
+        match std::fs::symlink_metadata(path_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::other("attachment path points to a symlink"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
         return match path_path.canonicalize() {
             Ok(canonical) => Ok(Some(canonical)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -835,6 +846,14 @@ fn resolve_attachment_path(
     }
 
     let candidate = root.join(path);
+    match std::fs::symlink_metadata(&candidate) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(std::io::Error::other("attachment path points to a symlink"));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
     let canonical = match candidate.canonicalize() {
         Ok(canonical) => canonical,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1294,7 +1313,7 @@ pub fn copy_viewer_assets_from(
     viewer_source: &Path,
     output_dir: &Path,
 ) -> ShareResult<Vec<String>> {
-    if !viewer_source.is_dir() {
+    if !crate::is_real_dir(viewer_source) {
         return Err(ShareError::BundleNotFound {
             path: viewer_source.display().to_string(),
         });
@@ -1350,7 +1369,7 @@ pub fn compute_viewer_sri(output_dir: &Path) -> HashMap<String, String> {
     let vendor_dir = output_dir.join("viewer").join("vendor");
     let mut sri_map = HashMap::new();
 
-    if !vendor_dir.is_dir() {
+    if !crate::is_real_dir(&vendor_dir) {
         return sri_map;
     }
 
@@ -1360,7 +1379,7 @@ pub fn compute_viewer_sri(output_dir: &Path) -> HashMap<String, String> {
 
     for relative_path in &entries {
         let full_path = vendor_dir.join(relative_path);
-        if full_path.is_file()
+        if crate::is_real_file(&full_path)
             && let Ok(data) = std::fs::read(&full_path)
         {
             let hash = Sha256::digest(&data);
@@ -1896,6 +1915,58 @@ mod tests {
     }
 
     #[test]
+    fn bundle_creates_attachments_directory_even_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let db = create_bundle_test_db(dir.path(), &[]);
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+
+        let result = bundle_attachments(
+            &db,
+            &output,
+            &storage,
+            crate::INLINE_ATTACHMENT_THRESHOLD,
+            crate::DETACH_ATTACHMENT_THRESHOLD,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(result.items.len(), 0);
+        assert!(output.join("attachments").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundle_rejects_symlinked_attachments_directory_even_when_empty() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+        let db = create_bundle_test_db(dir.path(), &[]);
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+        let outside = dir.path().join("outside-attachments");
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, output.join("attachments")).unwrap();
+
+        let err = bundle_attachments(
+            &db,
+            &output,
+            &storage,
+            crate::INLINE_ATTACHMENT_THRESHOLD,
+            crate::DETACH_ATTACHMENT_THRESHOLD,
+            true,
+        )
+        .expect_err("symlinked attachments directories must fail the export");
+
+        assert!(matches!(err, ShareError::Io(_)));
+        assert!(err.to_string().contains("symlinked bundle directory"));
+    }
+
+    #[test]
     fn bundle_missing_file_clears_stale_materialized_fields() {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path().join("storage");
@@ -2061,6 +2132,91 @@ mod tests {
         assert!(
             !att.contains(r#""type":"missing""#),
             "disallowed absolute paths must not be rewritten as missing attachments"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundle_symlinked_relative_attachment_errors_instead_of_following_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+
+        let real_file = storage.join("real.dat");
+        std::fs::write(&real_file, b"secret").unwrap();
+        std::os::unix::fs::symlink(&real_file, storage.join("alias.dat")).unwrap();
+
+        let att_json =
+            r#"[{"type":"file","path":"alias.dat","media_type":"application/octet-stream"}]"#;
+        let db = create_bundle_test_db(dir.path(), &[att_json]);
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+
+        let err = bundle_attachments(
+            &db,
+            &output,
+            &storage,
+            crate::INLINE_ATTACHMENT_THRESHOLD,
+            crate::DETACH_ATTACHMENT_THRESHOLD,
+            true,
+        )
+        .expect_err("symlinked attachment sources must fail the export");
+
+        assert!(matches!(err, ShareError::Io(_)));
+        assert!(err.to_string().contains("symlink"));
+
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync("SELECT attachments FROM messages WHERE id = 1", &[])
+            .unwrap();
+        let att: String = rows[0].get_named("attachments").unwrap();
+        assert!(
+            att.contains(r#""path":"alias.dat""#),
+            "attachment JSON should remain unchanged on symlink policy failures"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundle_symlinked_absolute_attachment_errors_instead_of_following_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+
+        let real_file = dir.path().join("real-absolute.dat");
+        std::fs::write(&real_file, b"secret").unwrap();
+        let symlink_path = dir.path().join("absolute-alias.dat");
+        std::os::unix::fs::symlink(&real_file, &symlink_path).unwrap();
+
+        let att_json = format!(
+            r#"[{{"type":"file","path":"{}","media_type":"application/octet-stream"}}]"#,
+            symlink_path.display()
+        );
+        let db = create_bundle_test_db(dir.path(), &[&att_json]);
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+
+        let err = bundle_attachments(
+            &db,
+            &output,
+            &storage,
+            crate::INLINE_ATTACHMENT_THRESHOLD,
+            crate::DETACH_ATTACHMENT_THRESHOLD,
+            true,
+        )
+        .expect_err("symlinked absolute attachment sources must fail the export");
+
+        assert!(matches!(err, ShareError::Io(_)));
+        assert!(err.to_string().contains("symlink"));
+
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync("SELECT attachments FROM messages WHERE id = 1", &[])
+            .unwrap();
+        let att: String = rows[0].get_named("attachments").unwrap();
+        assert!(
+            att.contains(&format!(r#""path":"{}""#, symlink_path.display())),
+            "absolute symlink attachment JSON should remain unchanged on policy failures"
         );
     }
 
@@ -2326,6 +2482,21 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn zip_rejects_symlinked_source_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_source = dir.path().join("real-source");
+        std::fs::create_dir_all(&real_source).unwrap();
+        std::fs::write(real_source.join("a.txt"), b"alpha").unwrap();
+        let linked_source = dir.path().join("linked-source");
+        std::os::unix::fs::symlink(&real_source, &linked_source).unwrap();
+
+        let zip_path = dir.path().join("bundle.zip");
+        let err = package_directory_as_zip(&linked_source, &zip_path).unwrap_err();
+        assert!(err.to_string().contains("real directory"));
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn zip_refuses_cyclic_internal_directory_symlink() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source");
@@ -2474,6 +2645,23 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn copy_viewer_assets_from_rejects_symlinked_source_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_source = dir.path().join("real-viewer-assets");
+        std::fs::create_dir_all(&real_source).unwrap();
+        std::fs::write(real_source.join("index.html"), b"<html>viewer</html>").unwrap();
+        let linked_source = dir.path().join("linked-viewer-assets");
+        std::os::unix::fs::symlink(&real_source, &linked_source).unwrap();
+
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+
+        let err = copy_viewer_assets_from(&linked_source, &output).unwrap_err();
+        assert!(matches!(err, ShareError::BundleNotFound { .. }));
+    }
+
+    #[test]
     fn copy_viewer_assets_deterministic_order() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("viewer_assets");
@@ -2508,6 +2696,36 @@ mod tests {
         assert!(sri.contains_key("vendor/test.wasm"));
         assert!(sri["vendor/test.js"].starts_with("sha256-"));
         assert!(sri["vendor/test.wasm"].starts_with("sha256-"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn compute_viewer_sri_ignores_symlinked_vendor_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(output.join("viewer")).unwrap();
+        let real_vendor = dir.path().join("real-vendor");
+        std::fs::create_dir_all(&real_vendor).unwrap();
+        std::fs::write(real_vendor.join("test.js"), b"console.log('hello')").unwrap();
+        std::os::unix::fs::symlink(&real_vendor, output.join("viewer/vendor")).unwrap();
+
+        let sri = compute_viewer_sri(&output);
+        assert!(sri.is_empty(), "symlinked vendor roots should be ignored");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn compute_viewer_sri_ignores_symlinked_vendor_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("bundle");
+        let vendor = output.join("viewer/vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        let real_asset = dir.path().join("test.js");
+        std::fs::write(&real_asset, b"console.log('hello')").unwrap();
+        std::os::unix::fs::symlink(&real_asset, vendor.join("test.js")).unwrap();
+
+        let sri = compute_viewer_sri(&output);
+        assert!(sri.is_empty(), "symlinked vendor files should be ignored");
     }
 
     #[test]

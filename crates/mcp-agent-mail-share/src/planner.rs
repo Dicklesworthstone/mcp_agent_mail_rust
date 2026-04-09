@@ -233,7 +233,7 @@ pub(crate) fn resolve_detection_root(bundle_path: &Path, shell_cwd: &Path) -> Pa
         if has_strong_project_root_marker(ancestor) {
             return ancestor.to_path_buf();
         }
-        if scripts_candidate.is_none() && ancestor.join("scripts").is_dir() {
+        if scripts_candidate.is_none() && crate::is_real_dir(&ancestor.join("scripts")) {
             scripts_candidate = Some(ancestor.to_path_buf());
         }
     }
@@ -242,13 +242,18 @@ pub(crate) fn resolve_detection_root(bundle_path: &Path, shell_cwd: &Path) -> Pa
 }
 
 fn has_strong_project_root_marker(path: &Path) -> bool {
-    path.join(".git").exists()
-        || path.join("wrangler.toml").exists()
-        || path.join("netlify.toml").exists()
-        || path.join(".github").join("workflows").is_dir()
-        || path.join("Cargo.toml").exists()
-        || path.join("package.json").exists()
-        || path.join("pyproject.toml").exists()
+    is_real_file_or_dir(&path.join(".git"))
+        || crate::is_real_file(&path.join("wrangler.toml"))
+        || crate::is_real_file(&path.join("netlify.toml"))
+        || crate::is_real_dir(&path.join(".github").join("workflows"))
+        || crate::is_real_file(&path.join("Cargo.toml"))
+        || crate::is_real_file(&path.join("package.json"))
+        || crate::is_real_file(&path.join("pyproject.toml"))
+}
+
+fn is_real_file_or_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_file() || metadata.file_type().is_dir())
 }
 
 fn resolve_provider(
@@ -1215,6 +1220,57 @@ mod tests {
 
         let detection_root = resolve_detection_root(Path::new("bundle"), shell_cwd.path());
         assert_eq!(detection_root, shell_cwd.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_detection_root_ignores_symlinked_scripts_directory() {
+        use std::os::unix::fs::symlink;
+
+        let shell_cwd = tempfile::tempdir().expect("shell cwd");
+        let project = tempfile::tempdir().expect("project");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::create_dir_all(outside.path().join("scripts")).expect("create outside scripts");
+        symlink(
+            outside.path().join("scripts"),
+            project.path().join("scripts"),
+        )
+        .expect("symlink scripts");
+
+        let bundle = project.path().join("nested/output/bundle");
+        std::fs::create_dir_all(&bundle).expect("create bundle");
+        std::fs::write(bundle.join("manifest.json"), "{}").expect("write manifest");
+
+        let detection_root = resolve_detection_root(&bundle, shell_cwd.path());
+        assert_eq!(
+            detection_root,
+            bundle.parent().expect("bundle parent"),
+            "symlinked scripts directory should not influence detection root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_detection_root_ignores_symlinked_root_markers() {
+        use std::os::unix::fs::symlink;
+
+        let shell_cwd = tempfile::tempdir().expect("shell cwd");
+        let project = tempfile::tempdir().expect("project");
+        let outside = tempfile::tempdir().expect("outside");
+        let real = outside.path().join("wrangler.toml");
+        std::fs::write(&real, "name = \"outside\"").expect("write external wrangler");
+        symlink(&real, project.path().join("wrangler.toml")).expect("symlink wrangler");
+
+        let bundle = project.path().join("nested/output/bundle");
+        std::fs::create_dir_all(&bundle).expect("create bundle");
+        std::fs::write(bundle.join("manifest.json"), "{}").expect("write manifest");
+
+        let detection_root = resolve_detection_root(&bundle, shell_cwd.path());
+        assert_eq!(
+            detection_root,
+            bundle.parent().expect("bundle parent"),
+            "symlinked root markers should not pull detection root to the project ancestor"
+        );
     }
 
     #[test]

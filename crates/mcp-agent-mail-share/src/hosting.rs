@@ -41,18 +41,24 @@ fn detect_github_pages(output_dir: &Path, git_remote: Option<&str>, hints: &mut 
     // Check for GitHub Actions workflows
     let workflows_dir = find_ancestor_path(output_dir, ".github/workflows");
     if let Some(dir) = workflows_dir
-        && dir.is_dir()
+        && crate::is_real_dir(&dir)
         && let Ok(entries) = std::fs::read_dir(&dir)
     {
-        let mut entry_names: Vec<_> = entries
+        let mut workflow_files: Vec<_> = entries
             .flatten()
-            .map(|e| e.file_name().to_string_lossy().to_string())
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().to_string(),
+                    entry.path(),
+                )
+            })
+            .filter(|(_, path)| crate::is_real_file(path))
             .collect();
-        entry_names.sort();
+        workflow_files.sort_by(|a, b| a.0.cmp(&b.0));
 
-        for name in entry_names {
+        for (name, path) in workflow_files {
             if (name.ends_with(".yml") || name.ends_with(".yaml"))
-                && let Ok(content) = std::fs::read_to_string(dir.join(&name))
+                && let Ok(content) = std::fs::read_to_string(path)
                 && (content.contains("pages") || content.contains("deploy"))
             {
                 signals.push(format!("Workflow {name} references Pages"));
@@ -164,18 +170,24 @@ fn detect_s3(output_dir: &Path, hints: &mut Vec<HostingHint>) {
     // Check for deploy scripts referencing S3
     let scripts_dir = find_ancestor_path(output_dir, "scripts");
     if let Some(dir) = scripts_dir
-        && dir.is_dir()
+        && crate::is_real_dir(&dir)
         && let Ok(entries) = std::fs::read_dir(&dir)
     {
-        let mut entry_names: Vec<_> = entries
+        let mut script_files: Vec<_> = entries
             .flatten()
-            .map(|e| e.file_name().to_string_lossy().to_string())
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().to_string(),
+                    entry.path(),
+                )
+            })
+            .filter(|(_, path)| crate::is_real_file(path))
             .collect();
-        entry_names.sort();
+        script_files.sort_by(|a, b| a.0.cmp(&b.0));
 
-        for name in entry_names {
+        for (name, path) in script_files {
             if (name.contains("deploy") || name.contains("s3"))
-                && let Ok(content) = std::fs::read_to_string(dir.join(&name))
+                && let Ok(content) = std::fs::read_to_string(path)
                 && content.contains("aws s3")
             {
                 signals.push(format!("Found S3 deployment script: {name}"));
@@ -200,15 +212,19 @@ fn detect_s3(output_dir: &Path, hints: &mut Vec<HostingHint>) {
 
 /// Walk ancestor directories looking for a specific file/dir.
 fn find_ancestor_path(start: &Path, name: &str) -> Option<std::path::PathBuf> {
-    let search_root = if start.is_file() {
+    let search_root = if crate::is_real_file(start) {
         start.parent()?
-    } else {
+    } else if crate::is_real_dir(start) {
         start
+    } else {
+        return None;
     };
 
     for current in search_root.ancestors() {
         let candidate = current.join(name);
-        if candidate.exists() {
+        if std::fs::symlink_metadata(&candidate)
+            .is_ok_and(|metadata| metadata.file_type().is_file() || metadata.file_type().is_dir())
+        {
             return Some(candidate);
         }
     }
@@ -352,6 +368,24 @@ mod tests {
         assert!(nl.signals.iter().any(|s| s.contains("netlify.toml")));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_wrangler_toml_is_ignored() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let real = outside.path().join("wrangler.toml");
+        std::fs::write(&real, "[vars]").unwrap();
+        symlink(&real, dir.path().join("wrangler.toml")).unwrap();
+
+        let hints = detect_hosting_hints(dir.path());
+        assert!(
+            hints.iter().all(|hint| hint.id != "cloudflare_pages"),
+            "symlinked wrangler.toml should not trigger cloudflare hint"
+        );
+    }
+
     #[test]
     fn hints_sorted_by_signal_count_descending() {
         let dir = tempfile::tempdir().unwrap();
@@ -463,6 +497,25 @@ mod tests {
         assert!(s3.is_some(), "S3 deploy script should trigger s3 hint");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_scripts_directory_is_ignored_for_s3_detection() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let scripts = outside.path().join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(scripts.join("deploy-s3.sh"), "aws s3 sync . s3://bucket").unwrap();
+        symlink(&scripts, dir.path().join("scripts")).unwrap();
+
+        let hints = detect_hosting_hints(dir.path());
+        assert!(
+            hints.iter().all(|hint| hint.id != "s3"),
+            "symlinked scripts directory should not trigger s3 hint"
+        );
+    }
+
     #[test]
     fn github_workflow_triggers_hint() {
         let dir = tempfile::tempdir().unwrap();
@@ -479,6 +532,30 @@ mod tests {
         assert!(
             gh.is_some(),
             "GitHub Actions workflow with 'pages' should trigger github_pages hint"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_workflow_file_is_ignored() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let workflows = dir.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let real = outside.path().join("deploy.yml");
+        std::fs::write(
+            &real,
+            "name: Deploy\njobs:\n  pages:\n    runs-on: ubuntu-latest",
+        )
+        .unwrap();
+        symlink(&real, workflows.join("deploy.yml")).unwrap();
+
+        let hints = detect_hosting_hints(dir.path());
+        assert!(
+            hints.iter().all(|hint| hint.id != "github_pages"),
+            "symlinked workflow files should not trigger github_pages hint"
         );
     }
 }

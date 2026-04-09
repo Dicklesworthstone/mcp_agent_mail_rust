@@ -2060,6 +2060,13 @@ fn validate_chunk_artifacts(
 
         let chunks_dir = bundle_dir.join("chunks");
         if let Ok(entries) = std::fs::read_dir(&chunks_dir) {
+            let mut entries: Vec<_> = entries.collect();
+            entries.sort_by(|left, right| match (left, right) {
+                (Ok(left), Ok(right)) => left.file_name().cmp(&right.file_name()),
+                (Err(_), Ok(_)) => std::cmp::Ordering::Less,
+                (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
+                (Err(_), Err(_)) => std::cmp::Ordering::Equal,
+            });
             for entry in entries {
                 match entry {
                     Ok(entry) => {
@@ -2085,6 +2092,7 @@ fn validate_chunk_artifacts(
                 }
             }
         }
+        issues.sort();
         checks.push(DeployCheck {
             name: "database_chunk_artifacts_valid".to_string(),
             passed: issues.is_empty(),
@@ -3316,6 +3324,39 @@ mod tests {
             .expect("chunk artifacts check present");
         assert!(!check.passed);
         assert!(check.message.contains("chunks/99999.bin is unexpected"));
+    }
+
+    #[test]
+    fn validate_bundle_orders_chunk_artifact_issues_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("bundle");
+        create_minimal_bundle(&bundle);
+
+        let db_path = bundle.join("mailbox.sqlite3");
+        create_test_agent_mail_sqlite_file(&db_path);
+        let db_sha = sha256_file_streaming(&db_path).unwrap();
+        let chunk_manifest = crate::maybe_chunk_database(&db_path, &bundle, 1, 128)
+            .unwrap()
+            .unwrap();
+        write_manifest_with_database(&bundle, &db_sha, Some(&chunk_manifest));
+
+        std::fs::write(bundle.join("chunks/z-extra.bin"), b"z-stale-extra-chunk").unwrap();
+        std::fs::write(bundle.join("chunks/a-extra.bin"), b"a-stale-extra-chunk").unwrap();
+
+        let report = validate_bundle(&bundle).unwrap();
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "database_chunk_artifacts_valid")
+            .expect("chunk artifacts check present");
+        assert!(!check.passed);
+        assert!(
+            check
+                .message
+                .starts_with("chunks/a-extra.bin is unexpected; chunks/z-extra.bin is unexpected"),
+            "unexpected issue order: {}",
+            check.message
+        );
     }
 
     #[test]
