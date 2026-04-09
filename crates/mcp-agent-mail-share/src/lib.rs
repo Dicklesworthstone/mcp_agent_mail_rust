@@ -525,21 +525,31 @@ pub fn load_bundle_export_config(bundle_dir: &Path) -> ShareResult<StoredExportC
     );
 
     let chunk_config_path = bundle_dir.join("mailbox.sqlite3.config.json");
-    if chunk_config_path.exists()
-        && let Ok(text) = std::fs::read_to_string(&chunk_config_path)
-        && let Ok(config) = serde_json::from_str::<Value>(&text)
-        && let Some(obj) = config.as_object()
-    {
-        chunk_size = coerce_int(obj.get("chunk_size"), chunk_size);
-        let threshold = coerce_int(obj.get("threshold_bytes"), chunk_threshold);
-        return Ok(StoredExportConfig {
-            projects,
-            inline_threshold,
-            detach_threshold,
-            chunk_threshold: threshold,
-            chunk_size,
-            scrub_preset,
-        });
+    match std::fs::symlink_metadata(&chunk_config_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            if let Ok(text) = std::fs::read_to_string(&chunk_config_path)
+                && let Ok(config) = serde_json::from_str::<Value>(&text)
+                && let Some(obj) = config.as_object()
+            {
+                chunk_size = coerce_int(obj.get("chunk_size"), chunk_size);
+                let threshold = coerce_int(obj.get("threshold_bytes"), chunk_threshold);
+                return Ok(StoredExportConfig {
+                    projects,
+                    inline_threshold,
+                    detach_threshold,
+                    chunk_threshold: threshold,
+                    chunk_size,
+                    scrub_preset,
+                });
+            }
+        }
+        Ok(_) => {
+            return Err(ShareError::Validation {
+                message: "mailbox.sqlite3.config.json must be a real file".to_string(),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ShareError::Io(error)),
     }
 
     Ok(StoredExportConfig {
@@ -899,5 +909,36 @@ mod tests {
         let err =
             load_bundle_export_config(dir.path()).expect_err("symlinked manifest should fail");
         assert!(matches!(err, ShareError::ManifestNotFound { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_bundle_export_config_rejects_symlinked_chunk_config() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("manifest.json"), "{}").expect("write manifest");
+        let real_chunk_config = dir.path().join("real-mailbox.sqlite3.config.json");
+        std::fs::write(&real_chunk_config, r#"{"chunk_size": 7000}"#).expect("write config");
+        symlink(&real_chunk_config, dir.path().join("mailbox.sqlite3.config.json"))
+            .expect("symlink chunk config");
+
+        let err = load_bundle_export_config(dir.path())
+            .expect_err("symlinked chunk config should fail validation");
+        assert!(matches!(err, ShareError::Validation { .. }));
+        assert!(err.to_string().contains("real file"));
+    }
+
+    #[test]
+    fn load_bundle_export_config_rejects_directory_chunk_config() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("manifest.json"), "{}").expect("write manifest");
+        std::fs::create_dir(dir.path().join("mailbox.sqlite3.config.json"))
+            .expect("create directory chunk config");
+
+        let err = load_bundle_export_config(dir.path())
+            .expect_err("directory chunk config should fail validation");
+        assert!(matches!(err, ShareError::Validation { .. }));
+        assert!(err.to_string().contains("real file"));
     }
 }
