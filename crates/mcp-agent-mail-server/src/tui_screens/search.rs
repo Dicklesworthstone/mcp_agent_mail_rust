@@ -1210,6 +1210,7 @@ pub struct SearchCockpitScreen {
     db_conn: Option<DbConn>,
     _db_snapshot_dir: Option<crate::SnapshotDirGuard>,
     metadata_db_conn: Option<DbConn>,
+    metadata_database_url: String,
     db_conn_attempted: bool,
     db_context_unavailable: bool,
     last_query: String,
@@ -1327,6 +1328,7 @@ impl SearchCockpitScreen {
             db_conn: None,
             _db_snapshot_dir: None,
             metadata_db_conn: None,
+            metadata_database_url: String::new(),
             db_conn_attempted: false,
             db_context_unavailable: false,
             last_query: String::new(),
@@ -1836,12 +1838,26 @@ impl SearchCockpitScreen {
     }
 
     fn ensure_metadata_db_conn(&mut self, state: &TuiSharedState) {
-        if self.metadata_db_conn.is_some() {
+        let cfg = state.config_snapshot();
+        if self.metadata_db_conn.is_some() && self.metadata_database_url == cfg.raw_database_url {
             return;
         }
 
-        let cfg = state.config_snapshot();
-        self.metadata_db_conn = crate::open_live_metadata_sync_db_connection(&cfg.raw_database_url);
+        self.metadata_database_url = cfg.raw_database_url;
+        self.metadata_db_conn =
+            crate::open_live_metadata_sync_db_connection(&self.metadata_database_url);
+        self.recipes_loaded = false;
+    }
+
+    fn open_live_metadata_operation_db_connection(&self) -> Result<DbConn, String> {
+        let sqlite_path =
+            crate::resolve_server_database_url_sqlite_path(&self.metadata_database_url)
+                .ok_or_else(|| "Search metadata database unavailable".to_string())?;
+        if !sqlite_path.exists() {
+            return Err("Search metadata database unavailable".to_string());
+        }
+        crate::open_interactive_sync_db_connection(sqlite_path.to_string_lossy().as_ref())
+            .map_err(|e| format!("Search metadata database unavailable: {e}"))
     }
 
     /// Ensure we have DB connections.
@@ -2543,11 +2559,11 @@ impl SearchCockpitScreen {
         if self.recipes_loaded {
             return;
         }
-        let Some(conn) = self.metadata_db_conn.as_ref() else {
+        let Ok(conn) = self.open_live_metadata_operation_db_connection() else {
             return;
         };
-        let recipes = list_recipes(conn);
-        let history = list_recent_history(conn, 50);
+        let recipes = list_recipes(&conn);
+        let history = list_recent_history(&conn, 50);
         if let Ok(saved_recipes) = recipes.as_ref() {
             self.saved_recipes = saved_recipes.clone();
         }
@@ -2556,9 +2572,11 @@ impl SearchCockpitScreen {
         }
         match (recipes, history) {
             (Ok(_), Ok(_)) => {
+                self.metadata_db_conn = Some(conn);
                 self.recipes_loaded = true;
             }
             (recipes_result, history_result) => {
+                self.metadata_db_conn = Some(conn);
                 if let Err(error) = recipes_result {
                     tracing::warn!(error = %error, "search screen failed loading saved recipes");
                 }
@@ -2584,8 +2602,9 @@ impl SearchCockpitScreen {
             executed_ts: now_micros(),
             ..Default::default()
         };
-        if let Some(ref conn) = self.metadata_db_conn {
-            let _ = insert_history(conn, &entry);
+        if let Ok(conn) = self.open_live_metadata_operation_db_connection() {
+            let _ = insert_history(&conn, &entry);
+            self.metadata_db_conn = Some(conn);
         }
         // Prepend to in-memory history
         self.query_history.insert(0, entry);
@@ -2611,9 +2630,10 @@ impl SearchCockpitScreen {
             thread_filter: self.thread_filter.clone(),
             ..Default::default()
         };
-        if let Some(ref conn) = self.metadata_db_conn
-            && let Ok(id) = insert_recipe(conn, &recipe)
+        if let Ok(conn) = self.open_live_metadata_operation_db_connection()
+            && let Ok(id) = insert_recipe(&conn, &recipe)
         {
+            self.metadata_db_conn = Some(conn);
             let mut saved = recipe;
             saved.id = Some(id);
             self.saved_recipes.insert(0, saved);
@@ -2654,8 +2674,11 @@ impl SearchCockpitScreen {
         self.debounce_remaining = 0;
 
         // Touch the recipe's use count
-        if let (Some(conn), Some(id)) = (&self.metadata_db_conn, recipe.id) {
-            let _ = touch_recipe(conn, id);
+        if let Some(id) = recipe.id
+            && let Ok(conn) = self.open_live_metadata_operation_db_connection()
+        {
+            let _ = touch_recipe(&conn, id);
+            self.metadata_db_conn = Some(conn);
         }
     }
 

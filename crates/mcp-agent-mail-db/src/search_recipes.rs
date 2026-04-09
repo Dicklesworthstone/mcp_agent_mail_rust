@@ -376,8 +376,17 @@ fn row_named_i64(row: &Row, col: &str) -> Option<i64> {
         .or_else(|| row.get_named::<i8>(col).ok().map(i64::from))
 }
 
+fn ensure_recipe_schema(conn: &DbConn) -> Result<(), String> {
+    for migration in recipe_migrations() {
+        conn.execute_sync(&migration.up, &[])
+            .map_err(|e| format!("migration {} failed: {e}", migration.id))?;
+    }
+    Ok(())
+}
+
 /// Insert a new search recipe. Returns the row ID.
 pub fn insert_recipe(conn: &DbConn, recipe: &SearchRecipe) -> Result<i64, String> {
+    ensure_recipe_schema(conn)?;
     with_sync_write_tx(conn, |conn| {
         let sql = "INSERT INTO search_recipes \
             (name, description, query_text, doc_kind, scope_mode, scope_id, \
@@ -402,6 +411,7 @@ pub fn insert_recipe(conn: &DbConn, recipe: &SearchRecipe) -> Result<i64, String
 
 /// Update an existing recipe by ID.
 pub fn update_recipe(conn: &DbConn, recipe: &SearchRecipe) -> Result<(), String> {
+    ensure_recipe_schema(conn)?;
     let Some(id) = recipe.id else {
         return Err("recipe has no ID".to_string());
     };
@@ -442,6 +452,7 @@ pub fn update_recipe(conn: &DbConn, recipe: &SearchRecipe) -> Result<(), String>
 
 /// Delete a recipe by ID.
 pub fn delete_recipe(conn: &DbConn, recipe_id: i64) -> Result<(), String> {
+    ensure_recipe_schema(conn)?;
     with_sync_write_tx(conn, |conn| {
         conn.execute_sync(
             "DELETE FROM search_recipes WHERE id = ?",
@@ -456,6 +467,7 @@ pub fn delete_recipe(conn: &DbConn, recipe_id: i64) -> Result<(), String> {
 ///
 /// Returns at most [`MAX_RECIPES`] entries to prevent unbounded memory growth.
 pub fn list_recipes(conn: &DbConn) -> Result<Vec<SearchRecipe>, String> {
+    ensure_recipe_schema(conn)?;
     let limit_val = i64::try_from(MAX_RECIPES).unwrap_or(200);
     let sql = "SELECT id, name, description, query_text, doc_kind, scope_mode, \
         scope_id, importance_filter, ack_filter, sort_mode, thread_filter, \
@@ -472,6 +484,7 @@ pub fn list_recipes(conn: &DbConn) -> Result<Vec<SearchRecipe>, String> {
 
 /// Get a single recipe by ID.
 pub fn get_recipe(conn: &DbConn, recipe_id: i64) -> Result<Option<SearchRecipe>, String> {
+    ensure_recipe_schema(conn)?;
     let sql = "SELECT id, name, description, query_text, doc_kind, scope_mode, \
         scope_id, importance_filter, ack_filter, sort_mode, thread_filter, \
         created_ts, updated_ts, pinned, use_count \
@@ -485,6 +498,7 @@ pub fn get_recipe(conn: &DbConn, recipe_id: i64) -> Result<Option<SearchRecipe>,
 
 /// Increment the use count for a recipe and update its timestamp.
 pub fn touch_recipe(conn: &DbConn, recipe_id: i64) -> Result<(), String> {
+    ensure_recipe_schema(conn)?;
     let now = now_micros();
     with_sync_write_tx(conn, |conn| {
         conn.execute_sync(
@@ -499,6 +513,7 @@ pub fn touch_recipe(conn: &DbConn, recipe_id: i64) -> Result<(), String> {
 /// Prune old recipes, keeping pinned recipes plus the most recently updated
 /// `keep` non-pinned recipes. Returns the number of deleted rows.
 pub fn prune_recipes(conn: &DbConn, keep: usize) -> Result<u64, String> {
+    ensure_recipe_schema(conn)?;
     let keep_val = i64::try_from(keep.min(10_000)).unwrap_or(200);
     // Keep all pinned recipes unconditionally, plus the `keep` most recently
     // updated non-pinned recipes.
@@ -514,6 +529,7 @@ pub fn prune_recipes(conn: &DbConn, keep: usize) -> Result<u64, String> {
 
 /// Count total recipes.
 pub fn count_recipes(conn: &DbConn) -> Result<i64, String> {
+    ensure_recipe_schema(conn)?;
     let rows = conn
         .query_sync("SELECT COUNT(*) AS cnt FROM search_recipes", &[])
         .map_err(|e| e.to_string())?;
@@ -524,6 +540,7 @@ pub fn count_recipes(conn: &DbConn) -> Result<i64, String> {
 
 /// Record a query execution in history.
 pub fn insert_history(conn: &DbConn, entry: &QueryHistoryEntry) -> Result<i64, String> {
+    ensure_recipe_schema(conn)?;
     with_sync_write_tx(conn, |conn| {
         let sql = "INSERT INTO query_history \
             (query_text, doc_kind, scope_mode, scope_id, result_count, executed_ts) \
@@ -554,6 +571,7 @@ pub fn insert_history(conn: &DbConn, entry: &QueryHistoryEntry) -> Result<i64, S
 
 /// List recent query history, newest first.
 pub fn list_recent_history(conn: &DbConn, limit: usize) -> Result<Vec<QueryHistoryEntry>, String> {
+    ensure_recipe_schema(conn)?;
     let sql = "SELECT id, query_text, doc_kind, scope_mode, scope_id, \
         result_count, executed_ts \
         FROM query_history \
@@ -569,6 +587,7 @@ pub fn list_recent_history(conn: &DbConn, limit: usize) -> Result<Vec<QueryHisto
 
 /// Prune old history entries, keeping only the most recent `keep` entries.
 pub fn prune_history(conn: &DbConn, keep: usize) -> Result<u64, String> {
+    ensure_recipe_schema(conn)?;
     let keep_val = i64::try_from(keep.min(10_000)).unwrap_or(500);
     let sql = "DELETE FROM query_history WHERE id NOT IN ( \
         SELECT id FROM query_history ORDER BY executed_ts DESC LIMIT ? \
@@ -581,6 +600,7 @@ pub fn prune_history(conn: &DbConn, keep: usize) -> Result<u64, String> {
 
 /// Count total history entries.
 pub fn count_history(conn: &DbConn) -> Result<i64, String> {
+    ensure_recipe_schema(conn)?;
     let rows = conn
         .query_sync("SELECT COUNT(*) AS cnt FROM query_history", &[])
         .map_err(|e| e.to_string())?;
