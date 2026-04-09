@@ -1673,13 +1673,13 @@ fn parse_salvaged_recipients_json(
 fn sync_reconstructed_message_recipients_json(conn: &DbConn, message_id: i64) -> DbResult<()> {
     let rows = conn
         .query_sync(
-            "SELECT a.name AS name, mr.kind AS kind \
+            "SELECT COALESCE(NULLIF(TRIM(a.name), ''), '[unknown-agent-' || mr.agent_id || ']') AS name, \
+                    mr.kind AS kind \
              FROM message_recipients mr \
-             JOIN agents a ON a.id = mr.agent_id \
+             LEFT JOIN agents a ON a.id = mr.agent_id \
              WHERE mr.message_id = ? \
              ORDER BY CASE mr.kind WHEN 'to' THEN 0 WHEN 'cc' THEN 1 WHEN 'bcc' THEN 2 ELSE 3 END, \
-                     TRIM(a.name) COLLATE NOCASE, \
-                     a.name COLLATE NOCASE",
+                     COALESCE(NULLIF(TRIM(a.name), ''), '[unknown-agent-' || mr.agent_id || ']') COLLATE NOCASE",
             &[Value::BigInt(message_id)],
         )
         .map_err(|e| {
@@ -3728,6 +3728,48 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&recipients_json).unwrap(),
             serde_json::json!({
                 "to": ["Bob"],
+                "cc": [],
+                "bcc": [],
+            })
+        );
+    }
+
+    #[test]
+    fn sync_reconstructed_message_recipients_json_keeps_orphaned_recipient_rows_visible() {
+        let conn = SqliteDbConn::open_memory().expect("open in-memory db");
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, name TEXT NOT NULL)",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, recipients_json TEXT NOT NULL DEFAULT '{}')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (message_id INTEGER NOT NULL, agent_id INTEGER NOT NULL, kind TEXT NOT NULL, read_ts INTEGER, ack_ts INTEGER)",
+        )
+        .unwrap();
+
+        conn.execute_raw("INSERT INTO messages (id, recipients_json) VALUES (1, '{}')")
+            .unwrap();
+        conn.execute_raw("INSERT INTO agents (id, project_id, name) VALUES (7, 1, 'Bob')")
+            .unwrap();
+        conn.execute_raw(
+            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (1, 7, 'to')",
+        )
+        .unwrap();
+        conn.execute_raw("DELETE FROM agents WHERE id = 7").unwrap();
+
+        sync_reconstructed_message_recipients_json(&conn, 1).expect("sync recipients_json");
+
+        let rows = conn
+            .query_sync("SELECT recipients_json FROM messages WHERE id = 1", &[])
+            .unwrap();
+        let recipients_json: String = rows[0].get_named("recipients_json").unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recipients_json).unwrap(),
+            serde_json::json!({
+                "to": ["[unknown-agent-7]"],
                 "cc": [],
                 "bcc": [],
             })
