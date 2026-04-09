@@ -147,7 +147,7 @@ pub fn bundle_attachments(
 ) -> ShareResult<AttachmentManifest> {
     use base64::Engine;
 
-    let snapshot_path = crate::resolve_share_sqlite_path(snapshot_path);
+    let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
     let path_str = snapshot_path.display().to_string();
     let conn = Conn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
         message: format!("cannot open snapshot: {e}"),
@@ -1405,7 +1405,7 @@ pub fn export_viewer_data(
     let data_dir = output_dir.join("viewer").join("data");
     ensure_real_directory(&data_dir)?;
 
-    let snapshot_path = crate::resolve_share_sqlite_path(snapshot_path);
+    let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
     let path_str = snapshot_path.display().to_string();
     let conn = Conn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
         message: format!("cannot open snapshot for viewer data: {e}"),
@@ -1758,6 +1758,26 @@ mod tests {
         }
 
         db_path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bundle_attachments_rejects_symlinked_snapshot() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_bundle_test_db(dir.path(), &["[]"]);
+        let linked = dir.path().join("linked.sqlite3");
+        symlink(&db, &linked).unwrap();
+
+        let output = dir.path().join("bundle");
+        let storage = dir.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+
+        let err = bundle_attachments(&linked, &output, &storage, 50, 100, true)
+            .expect_err("symlinked snapshots must fail validation");
+        assert!(matches!(err, ShareError::Validation { .. }));
+        assert!(err.to_string().contains("real file"));
     }
 
     #[test]
@@ -2767,6 +2787,23 @@ mod tests {
         assert_eq!(meta["message_count"], 2);
         assert_eq!(meta["messages_cached"], 2);
         assert_eq!(meta["fts_enabled"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_viewer_data_rejects_symlinked_snapshot() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_bundle_test_db(dir.path(), &["[]"]);
+        let linked = dir.path().join("linked.sqlite3");
+        symlink(&db, &linked).unwrap();
+
+        let output = dir.path().join("bundle");
+        let err = export_viewer_data(&linked, &output, true)
+            .expect_err("symlinked snapshots must fail validation");
+        assert!(matches!(err, ShareError::Validation { .. }));
+        assert!(err.to_string().contains("real file"));
     }
 
     #[cfg(unix)]

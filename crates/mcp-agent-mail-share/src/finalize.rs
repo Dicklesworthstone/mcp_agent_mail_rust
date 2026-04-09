@@ -573,7 +573,7 @@ pub fn finalize_export_db(snapshot_path: &Path) -> Result<FinalizeResult, ShareE
 }
 
 fn rewrite_snapshot_storage(snapshot_path: &Path) -> Result<(), ShareError> {
-    let snapshot_path = crate::resolve_share_sqlite_path(snapshot_path);
+    let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
     let parent = snapshot_path
         .parent()
         .ok_or_else(|| ShareError::Io(std::io::Error::other("snapshot path has no parent")))?;
@@ -610,7 +610,7 @@ fn rewrite_snapshot_storage(snapshot_path: &Path) -> Result<(), ShareError> {
 // --- helpers ---
 
 fn open_conn(path: &Path) -> Result<Conn, ShareError> {
-    let path = crate::resolve_share_sqlite_path(path);
+    let path = crate::require_real_share_sqlite_path(path)?;
     let path_str = path.display().to_string();
     Conn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
         message: format!("cannot open {path_str}: {e}"),
@@ -728,6 +728,22 @@ mod tests {
             .unwrap();
 
         db_path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finalize_export_db_rejects_symlinked_snapshot() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let linked = dir.path().join("linked.sqlite3");
+        symlink(&db, &linked).unwrap();
+
+        let err = finalize_export_db(&linked)
+            .expect_err("symlinked snapshots must fail validation");
+        assert!(matches!(err, ShareError::Validation { .. }));
+        assert!(err.to_string().contains("real file"));
     }
 
     #[test]

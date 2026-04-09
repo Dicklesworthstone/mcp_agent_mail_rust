@@ -1804,7 +1804,8 @@ fn validate_database_artifacts(
 }
 
 fn run_sqlite_quick_check(db_path: &Path) -> Result<(), String> {
-    let db_path = crate::resolve_share_sqlite_path(db_path);
+    let db_path =
+        crate::require_real_share_sqlite_path(db_path).map_err(|err| err.to_string())?;
     let db_path_str = db_path.display().to_string();
     let conn =
         DbConn::open_file(&db_path_str).map_err(|e| format!("cannot open mailbox.sqlite3: {e}"))?;
@@ -1837,7 +1838,8 @@ fn normalize_sqlite_check_result(value: String) -> Option<String> {
 }
 
 fn validate_agent_mail_schema(db_path: &Path) -> Result<(), String> {
-    let db_path = crate::resolve_share_sqlite_path(db_path);
+    let db_path =
+        crate::require_real_share_sqlite_path(db_path).map_err(|err| err.to_string())?;
     let db_path_str = db_path.display().to_string();
     let conn =
         DbConn::open_file(&db_path_str).map_err(|e| format!("cannot open mailbox.sqlite3: {e}"))?;
@@ -3078,6 +3080,26 @@ mod tests {
             "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (1, 1, 'to')",
         )
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_bundle_checks_reject_symlinked_database() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_db = dir.path().join("real.sqlite3");
+        create_test_agent_mail_sqlite_file(&real_db);
+        let linked_db = dir.path().join("linked.sqlite3");
+        symlink(&real_db, &linked_db).unwrap();
+
+        let quick_check = run_sqlite_quick_check(&linked_db)
+            .expect_err("symlinked databases must fail quick check validation");
+        assert!(quick_check.contains("real file"));
+
+        let schema_check = validate_agent_mail_schema(&linked_db)
+            .expect_err("symlinked databases must fail schema validation");
+        assert!(schema_check.contains("real file"));
     }
 
     fn write_manifest_with_database(
