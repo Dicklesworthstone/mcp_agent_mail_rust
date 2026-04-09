@@ -560,6 +560,11 @@ impl ArchiveBrowserScreen {
         expanded_state: &HashSet<PathBuf>,
         entries: &mut Vec<ArchiveEntry>,
     ) {
+        if !filter_lower.is_empty() {
+            Self::scan_directory_filtered(root, dir, depth, filter_lower, entries);
+            return;
+        }
+
         let Ok(read_dir) = std::fs::read_dir(dir) else {
             return;
         };
@@ -629,6 +634,93 @@ impl ArchiveBrowserScreen {
                 );
             }
         }
+    }
+
+    fn scan_directory_filtered(
+        root: &Path,
+        dir: &Path,
+        depth: usize,
+        filter_lower: &str,
+        entries: &mut Vec<ArchiveEntry>,
+    ) -> bool {
+        let Ok(read_dir) = std::fs::read_dir(dir) else {
+            return false;
+        };
+
+        let mut items: Vec<(bool, String, PathBuf, u64)> = Vec::new();
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+
+            if name.starts_with('.') || file_type.is_symlink() {
+                continue;
+            }
+
+            let is_dir = file_type.is_dir();
+            let size = if is_dir {
+                0
+            } else {
+                entry.metadata().map(|m| m.len()).unwrap_or(0)
+            };
+            items.push((is_dir, name, path, size));
+        }
+
+        items.sort_by(|a, b| match (a.0, b.0) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => super::cmp_ci(&a.1, &b.1),
+        });
+
+        let mut found_match = false;
+        for (is_dir, name, path, size) in items {
+            let rel_path = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+            let child_count = if is_dir {
+                std::fs::read_dir(&path).map_or(0, std::iter::Iterator::count)
+            } else {
+                0
+            };
+
+            if is_dir {
+                let mut child_entries = Vec::new();
+                let descendant_matches = Self::scan_directory_filtered(
+                    root,
+                    &path,
+                    depth + 1,
+                    filter_lower,
+                    &mut child_entries,
+                );
+                let self_matches = crate::tui_screens::contains_ci(&name, filter_lower);
+                if self_matches || descendant_matches {
+                    entries.push(ArchiveEntry {
+                        name,
+                        rel_path,
+                        is_dir: true,
+                        size,
+                        depth,
+                        expanded: descendant_matches,
+                        child_count,
+                    });
+                    entries.extend(child_entries);
+                    found_match = true;
+                }
+            } else if crate::tui_screens::contains_ci(&name, filter_lower) {
+                entries.push(ArchiveEntry {
+                    name,
+                    rel_path,
+                    is_dir: false,
+                    size,
+                    depth,
+                    expanded: false,
+                    child_count,
+                });
+                found_match = true;
+            }
+        }
+
+        found_match
     }
 
     /// Render the directory tree pane.
@@ -1075,7 +1167,7 @@ impl MailScreen for ArchiveBrowserScreen {
             tick_count.saturating_sub(self.last_refresh_tick) > 50 && self.pending_periodic_refresh;
 
         if is_first || is_periodic {
-            self.last_refresh_tick = tick_count;
+            self.last_refresh_tick = tick_count.max(1);
             self.pending_periodic_refresh = false;
             self.refresh_entries(state);
 
@@ -1330,6 +1422,18 @@ mod tests {
     }
 
     #[test]
+    fn first_tick_bootstrap_latches_nonzero_refresh_marker() {
+        let mut screen = ArchiveBrowserScreen::new();
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
+
+        screen.tick(0, &state);
+
+        assert_eq!(screen.last_refresh_tick, 1);
+        screen.tick(1, &state);
+        assert_eq!(screen.last_refresh_tick, 1);
+    }
+
+    #[test]
     fn refresh_entries_preserves_expanded_tree_and_preview_selection() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let archive_root = tmp.path().join("projects").join("demo");
@@ -1462,6 +1566,61 @@ mod tests {
                 .entries
                 .iter()
                 .any(|entry| entry.rel_path == Path::new("agents"))
+        );
+    }
+
+    #[test]
+    fn filter_finds_nested_matches_without_matching_ancestor_names() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let archive_root = tmp.path().join("projects").join("demo");
+        let nested_dir = archive_root.join("messages/2026/03");
+        std::fs::create_dir_all(&nested_dir).expect("create nested archive");
+        std::fs::write(
+            nested_dir.join("msg-001.md"),
+            "# Nested archive match\n\nsearch me\n",
+        )
+        .expect("write nested file");
+
+        let config = mcp_agent_mail_core::Config {
+            storage_root: tmp.path().to_path_buf(),
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let state = TuiSharedState::new(&config);
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 1,
+            projects_list: vec![crate::tui_events::ProjectSummary {
+                id: 1,
+                slug: "demo".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let mut screen = ArchiveBrowserScreen::new();
+        screen.filter = "msg-001".into();
+        screen.refresh_entries(&state);
+
+        let rel_paths = screen
+            .entries
+            .iter()
+            .map(|entry| entry.rel_path.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rel_paths,
+            vec![
+                PathBuf::from("messages"),
+                PathBuf::from("messages/2026"),
+                PathBuf::from("messages/2026/03"),
+                PathBuf::from("messages/2026/03/msg-001.md"),
+            ]
+        );
+        assert!(
+            screen
+                .entries
+                .iter()
+                .filter(|entry| entry.is_dir)
+                .all(|entry| entry.expanded),
+            "matching ancestor directories should be expanded during filtered scans"
         );
     }
 

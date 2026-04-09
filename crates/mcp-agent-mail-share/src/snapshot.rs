@@ -213,11 +213,19 @@ pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
 ) -> Result<PathBuf, ShareError> {
     let source = crate::resolve_share_sqlite_path(source);
 
-    // Validate source exists
-    if !source.exists() {
-        return Err(ShareError::SnapshotSourceNotFound {
-            path: source.display().to_string(),
-        });
+    match std::fs::symlink_metadata(&source) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(ShareError::Validation {
+                message: format!("snapshot source is not a real file: {}", source.display()),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ShareError::SnapshotSourceNotFound {
+                path: source.display().to_string(),
+            });
+        }
+        Err(error) => return Err(ShareError::Io(error)),
     }
 
     // Resolve destination to absolute path
@@ -228,15 +236,19 @@ pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
     };
 
     // Never overwrite
-    if dest.exists() {
-        return Err(ShareError::SnapshotDestinationExists {
-            path: dest.display().to_string(),
-        });
+    match std::fs::symlink_metadata(&dest) {
+        Ok(_) => {
+            return Err(ShareError::SnapshotDestinationExists {
+                path: dest.display().to_string(),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ShareError::Io(error)),
     }
 
     // Create parent dirs
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
+        ensure_real_directory(parent)?;
     }
 
     let source_str = source.display().to_string();
@@ -281,6 +293,50 @@ pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
     dst_close_result?;
 
     Ok(dest)
+}
+
+fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        use std::path::Component;
+
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(std::io::Error::other(format!(
+                    "refusing to create snapshot directory with parent traversal: {}",
+                    path.display()
+                )));
+            }
+            Component::Normal(part) => current.push(part),
+        }
+
+        if current.as_os_str().is_empty() {
+            continue;
+        }
+
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(std::io::Error::other(format!(
+                        "refusing to traverse symlinked snapshot directory {}",
+                        current.display()
+                    )));
+                }
+                if !metadata.file_type().is_dir() {
+                    return Err(std::io::Error::other(format!(
+                        "snapshot parent component is not a directory: {}",
+                        current.display()
+                    )));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&current)?,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// Transfer tables from a source snapshot to a fresh destination database.
@@ -521,6 +577,31 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_rejects_symlinked_source_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_source = dir.path().join("real-source.sqlite3");
+        let dest = dir.path().join("dest.sqlite3");
+
+        let conn = DbConn::open_file(real_source.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+        )
+        .unwrap();
+        drop(conn);
+
+        let linked_source = dir.path().join("linked-source.sqlite3");
+        symlink(&real_source, &linked_source).unwrap();
+
+        let err = create_sqlite_snapshot(&linked_source, &dest, false)
+            .expect_err("symlinked sources must fail validation");
+        assert!(matches!(err, ShareError::Validation { .. }));
+        assert!(err.to_string().contains("real file"));
+    }
+
     #[test]
     fn snapshot_creates_valid_copy() {
         let dir = tempfile::tempdir().unwrap();
@@ -607,6 +688,33 @@ mod tests {
             result,
             Err(ShareError::SnapshotDestinationExists { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_rejects_symlinked_destination_parent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.sqlite3");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let conn = DbConn::open_file(source.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+        )
+        .unwrap();
+        drop(conn);
+
+        let linked_parent = dir.path().join("linked-parent");
+        symlink(&outside, &linked_parent).unwrap();
+        let dest = linked_parent.join("dest.sqlite3");
+
+        let err = create_sqlite_snapshot(&source, &dest, false)
+            .expect_err("symlinked destination parents must fail");
+        assert!(matches!(err, ShareError::Io(_)));
+        assert!(err.to_string().contains("symlinked snapshot directory"));
     }
 
     #[test]

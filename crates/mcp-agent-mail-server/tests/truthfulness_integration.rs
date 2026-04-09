@@ -1074,8 +1074,8 @@ fn e1_archive_browser_truthful_when_seeded() {
 
     let storage_root = env.tmp_dir.path().join("storage");
     let archive_dir = storage_root
+        .join("projects")
         .join("alpha-proj")
-        .join(".archive")
         .join("messages")
         .join("2026")
         .join("03");

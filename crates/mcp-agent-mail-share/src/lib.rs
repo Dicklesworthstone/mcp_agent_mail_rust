@@ -920,8 +920,11 @@ mod tests {
         std::fs::write(dir.path().join("manifest.json"), "{}").expect("write manifest");
         let real_chunk_config = dir.path().join("real-mailbox.sqlite3.config.json");
         std::fs::write(&real_chunk_config, r#"{"chunk_size": 7000}"#).expect("write config");
-        symlink(&real_chunk_config, dir.path().join("mailbox.sqlite3.config.json"))
-            .expect("symlink chunk config");
+        symlink(
+            &real_chunk_config,
+            dir.path().join("mailbox.sqlite3.config.json"),
+        )
+        .expect("symlink chunk config");
 
         let err = load_bundle_export_config(dir.path())
             .expect_err("symlinked chunk config should fail validation");
