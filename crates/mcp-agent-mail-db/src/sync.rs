@@ -532,12 +532,13 @@ fn insert_message_recipients(
 fn sync_message_recipients_json(conn: &DbConn, msg_id: i64) -> Result<(), DbError> {
     let rows = conn
         .query_sync(
-            "SELECT a.name AS name, mr.kind AS kind \
+            "SELECT COALESCE(NULLIF(TRIM(a.name), ''), '[unknown-agent-' || mr.agent_id || ']') AS name, \
+                    mr.kind AS kind \
              FROM message_recipients mr \
-             JOIN agents a ON a.id = mr.agent_id \
+             LEFT JOIN agents a ON a.id = mr.agent_id \
              WHERE mr.message_id = ? \
              ORDER BY CASE mr.kind WHEN 'to' THEN 0 WHEN 'cc' THEN 1 WHEN 'bcc' THEN 2 ELSE 3 END, \
-                      a.name COLLATE NOCASE",
+                     COALESCE(NULLIF(TRIM(a.name), ''), '[unknown-agent-' || mr.agent_id || ']') COLLATE NOCASE",
             &[Value::BigInt(msg_id)],
         )
         .map_err(|e| DbError::Sqlite(e.to_string()))?;
@@ -999,6 +1000,49 @@ mod tests {
             .unwrap();
         assert!(recipients_json.contains("Recipient1"));
         assert!(recipients_json.contains("Recipient2"));
+    }
+
+    #[test]
+    fn sync_message_recipients_json_keeps_orphaned_recipient_rows_visible() {
+        let conn = test_conn();
+        let pid = insert_project(&conn);
+        let _sender = insert_agent(&conn, pid, "Sender");
+        let recipient_id = insert_agent(&conn, pid, "Recipient1");
+
+        let msg_id = dispatch_root_message(
+            &conn,
+            "Sender",
+            "Orphaned recipient",
+            "Body",
+            "normal",
+            None,
+            &[("Recipient1".to_string(), "to".to_string())],
+        )
+        .unwrap();
+
+        conn.execute_sync(
+            "DELETE FROM agents WHERE id = ? AND project_id = ?",
+            &[Value::BigInt(recipient_id), Value::BigInt(pid)],
+        )
+        .unwrap();
+
+        sync_message_recipients_json(&conn, msg_id).expect("sync recipients_json");
+
+        let message_rows = conn
+            .query_sync(
+                "SELECT recipients_json FROM messages WHERE id = ?",
+                &[Value::BigInt(msg_id)],
+            )
+            .unwrap();
+        let recipients_json = message_rows
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<String>("recipients_json").ok())
+            .unwrap();
+        assert!(
+            recipients_json.contains(&format!("[unknown-agent-{recipient_id}]")),
+            "orphaned recipient placeholder missing from {recipients_json}"
+        );
     }
 
     #[test]
