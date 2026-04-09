@@ -1804,8 +1804,7 @@ fn validate_database_artifacts(
 }
 
 fn run_sqlite_quick_check(db_path: &Path) -> Result<(), String> {
-    let db_path =
-        crate::require_real_share_sqlite_path(db_path).map_err(|err| err.to_string())?;
+    let db_path = crate::require_real_share_sqlite_path(db_path).map_err(|err| err.to_string())?;
     let db_path_str = db_path.display().to_string();
     let conn =
         DbConn::open_file(&db_path_str).map_err(|e| format!("cannot open mailbox.sqlite3: {e}"))?;
@@ -1838,8 +1837,7 @@ fn normalize_sqlite_check_result(value: String) -> Option<String> {
 }
 
 fn validate_agent_mail_schema(db_path: &Path) -> Result<(), String> {
-    let db_path =
-        crate::require_real_share_sqlite_path(db_path).map_err(|err| err.to_string())?;
+    let db_path = crate::require_real_share_sqlite_path(db_path).map_err(|err| err.to_string())?;
     let db_path_str = db_path.display().to_string();
     let conn =
         DbConn::open_file(&db_path_str).map_err(|e| format!("cannot open mailbox.sqlite3: {e}"))?;
@@ -2519,6 +2517,7 @@ fn bundle_path_relative_to_repo(repo_root: &Path, bundle_dir: &Path) -> ShareRes
 fn write_text_file_if_absent_or_identical(path: &Path, content: &str) -> ShareResult<()> {
     if let Some(parent) = path.parent() {
         ensure_real_directory(parent)?;
+        validate_real_directory_if_present(parent)?;
     }
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -2572,6 +2571,9 @@ fn write_text_file(path: &Path, content: &str) -> ShareResult<()> {
 }
 
 fn read_text_file_if_regular(path: &Path) -> ShareResult<Option<String>> {
+    if let Some(parent) = path.parent() {
+        validate_real_directory_if_present(parent)?;
+    }
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
@@ -2597,6 +2599,53 @@ fn read_text_file_if_regular(path: &Path) -> ShareResult<Option<String>> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(ShareError::Io(err)),
     }
+}
+
+fn validate_real_directory_if_present(path: &Path) -> ShareResult<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        use std::path::Component;
+
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(ShareError::Validation {
+                    message: format!(
+                        "refusing to traverse deployment directory with parent traversal: {}",
+                        path.display()
+                    ),
+                });
+            }
+            Component::Normal(segment) => {
+                current.push(segment);
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) => {
+                        if metadata.file_type().is_symlink() {
+                            return Err(ShareError::Validation {
+                                message: format!(
+                                    "refusing to traverse symlinked deployment directory {}",
+                                    current.display()
+                                ),
+                            });
+                        }
+                        if !metadata.file_type().is_dir() {
+                            return Err(ShareError::Validation {
+                                message: format!(
+                                    "expected deployment directory but found non-directory {}",
+                                    current.display()
+                                ),
+                            });
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(err) => return Err(ShareError::Io(err)),
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn ensure_real_directory(path: &Path) -> ShareResult<()> {
@@ -2670,7 +2719,9 @@ pub fn record_deploy(bundle_dir: &Path, entry: DeployHistoryEntry) -> ShareResul
         let drain_count = history.entries.len() - 50;
         history.entries.drain(..drain_count);
     }
-    let json = serde_json::to_string_pretty(&history).unwrap_or_else(|_| "{}".to_string());
+    let json = serde_json::to_string_pretty(&history).map_err(|e| ShareError::ManifestParse {
+        message: format!("deploy history serialization error: {e}"),
+    })?;
     write_text_file(&bundle_dir.join(DEPLOY_HISTORY_FILE), &json)?;
     Ok(())
 }
@@ -3964,6 +4015,56 @@ mod tests {
             std::fs::read_to_string(&outside).unwrap(),
             "{\"entries\":[]}\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_deploy_history_rejects_symlinked_bundle_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_bundle = dir.path().join("real-bundle");
+        std::fs::create_dir_all(&real_bundle).unwrap();
+        std::fs::write(real_bundle.join(DEPLOY_HISTORY_FILE), "{\"entries\":[]}\n").unwrap();
+
+        let linked_bundle = dir.path().join("bundle-link");
+        symlink(&real_bundle, &linked_bundle).unwrap();
+
+        let err = load_deploy_history(&linked_bundle)
+            .expect_err("symlinked bundle directories must fail deploy history reads");
+        assert!(matches!(err, ShareError::Validation { .. }));
+        assert!(err.to_string().contains("symlinked deployment directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn record_deploy_rejects_symlinked_bundle_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_bundle = dir.path().join("real-bundle");
+        std::fs::create_dir_all(&real_bundle).unwrap();
+        std::fs::write(real_bundle.join(DEPLOY_HISTORY_FILE), "{\"entries\":[]}\n").unwrap();
+
+        let linked_bundle = dir.path().join("bundle-link");
+        symlink(&real_bundle, &linked_bundle).unwrap();
+
+        let err = record_deploy(
+            &linked_bundle,
+            DeployHistoryEntry {
+                deployed_at: "2024-01-01T00:00:00Z".to_string(),
+                content_hash: "abc123".to_string(),
+                platform: "github_pages".to_string(),
+                file_count: 1,
+                total_bytes: 1,
+            },
+        )
+        .expect_err("symlinked bundle directories must fail deploy history writes");
+        assert!(matches!(err, ShareError::Validation { .. }));
+        assert!(err.to_string().contains("symlinked deployment directory"));
+
+        let history = std::fs::read_to_string(real_bundle.join(DEPLOY_HISTORY_FILE)).unwrap();
+        assert_eq!(history, "{\"entries\":[]}\n");
     }
 
     // ── Verify plan ──────────────────────────────────────────────────

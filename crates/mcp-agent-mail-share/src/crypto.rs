@@ -396,6 +396,8 @@ pub fn encrypt_with_age(input: &Path, recipients: &[String]) -> ShareResult<std:
         )));
     }
 
+    require_real_crypto_file(input, "encryption input")?;
+
     let output = input.with_extension(
         input
             .extension()
@@ -403,12 +405,7 @@ pub fn encrypt_with_age(input: &Path, recipients: &[String]) -> ShareResult<std:
             .unwrap_or_else(|| "age".to_string()),
     );
 
-    if output.exists() {
-        return Err(ShareError::Io(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("encrypted file already exists: {}", output.display()),
-        )));
-    }
+    validate_crypto_output_path(&output, "encrypted output")?;
 
     check_age_available()?;
 
@@ -451,6 +448,12 @@ pub fn decrypt_with_age(
             "either identity or passphrase required for decryption",
         )));
     }
+
+    require_real_crypto_file(encrypted_path, "encrypted input")?;
+    if let Some(id_path) = identity {
+        require_real_crypto_file(id_path, "identity file")?;
+    }
+    validate_crypto_output_path(output_path, "decryption output")?;
 
     check_age_available()?;
 
@@ -502,6 +505,114 @@ pub fn decrypt_with_age(
         }
     }
 
+    Ok(())
+}
+
+fn require_real_crypto_file(path: &Path, label: &str) -> ShareResult<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(ShareError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{label} must not be a symlink: {}", path.display()),
+                )));
+            }
+            if !metadata.file_type().is_file() {
+                return Err(ShareError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{label} must be a regular file: {}", path.display()),
+                )));
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(ShareError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{label} not found: {}", path.display()),
+            )))
+        }
+        Err(error) => Err(ShareError::Io(error)),
+    }
+}
+
+fn validate_crypto_output_path(path: &Path, label: &str) -> ShareResult<()> {
+    if let Some(parent) = path.parent() {
+        ensure_real_crypto_directory(parent)?;
+    }
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(ShareError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{label} path must not be a symlink: {}", path.display()),
+                )));
+            }
+            if !metadata.file_type().is_file() {
+                return Err(ShareError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{label} path must be a regular file: {}", path.display()),
+                )));
+            }
+            Err(ShareError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("{label} already exists: {}", path.display()),
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ShareError::Io(error)),
+    }
+}
+
+fn ensure_real_crypto_directory(path: &Path) -> ShareResult<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        use std::path::Component;
+
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(ShareError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "refusing to traverse crypto output path with parent traversal: {}",
+                        path.display()
+                    ),
+                )));
+            }
+            Component::Normal(segment) => {
+                current.push(segment);
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) => {
+                        if metadata.file_type().is_symlink() {
+                            return Err(ShareError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!(
+                                    "crypto output directory must not be a symlink: {}",
+                                    current.display()
+                                ),
+                            )));
+                        }
+                        if !metadata.file_type().is_dir() {
+                            return Err(ShareError::Io(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!(
+                                    "crypto output parent must be a directory: {}",
+                                    current.display()
+                                ),
+                            )));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir(&current)?;
+                    }
+                    Err(error) => return Err(ShareError::Io(error)),
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1722,6 +1833,75 @@ mod tests {
         let err = encrypt_with_age(&input, &["age1example".to_string()])
             .expect_err("existing encrypted output should be rejected before encryption");
         assert!(format!("{err}").contains("already exists"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn age_encrypt_rejects_symlinked_input() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_input = dir.path().join("real.bin");
+        std::fs::write(&real_input, b"data").unwrap();
+        let linked_input = dir.path().join("linked.bin");
+        symlink(&real_input, &linked_input).unwrap();
+
+        let err = encrypt_with_age(&linked_input, &["age1example".to_string()])
+            .expect_err("symlinked encryption inputs must be rejected");
+        assert!(format!("{err}").contains("must not be a symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn age_encrypt_rejects_symlinked_output_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("bundle.zip");
+        std::fs::write(&input, b"data").unwrap();
+
+        let outside = dir.path().join("outside.age");
+        std::fs::write(&outside, b"keep").unwrap();
+        symlink(&outside, dir.path().join("bundle.zip.age")).unwrap();
+
+        let err = encrypt_with_age(&input, &["age1example".to_string()])
+            .expect_err("symlinked encrypted outputs must be rejected");
+        assert!(format!("{err}").contains("must not be a symlink"));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn age_decrypt_refuses_existing_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let encrypted = dir.path().join("test.age");
+        let output = dir.path().join("out.bin");
+        let id_path = dir.path().join("id.txt");
+        std::fs::write(&encrypted, b"fake").unwrap();
+        std::fs::write(&output, b"existing").unwrap();
+        std::fs::write(&id_path, b"fake identity").unwrap();
+
+        let err = decrypt_with_age(&encrypted, &output, Some(&id_path), None)
+            .expect_err("existing decrypt outputs must be rejected");
+        assert!(format!("{err}").contains("already exists"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn age_decrypt_rejects_symlinked_identity_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let encrypted = dir.path().join("test.age");
+        let output = dir.path().join("out.bin");
+        let real_identity = dir.path().join("identity.txt");
+        let linked_identity = dir.path().join("identity-link.txt");
+        std::fs::write(&encrypted, b"fake").unwrap();
+        std::fs::write(&real_identity, b"fake identity").unwrap();
+        symlink(&real_identity, &linked_identity).unwrap();
+
+        let err = decrypt_with_age(&encrypted, &output, Some(&linked_identity), None)
+            .expect_err("symlinked identity files must be rejected");
+        assert!(format!("{err}").contains("must not be a symlink"));
     }
 
     #[test]

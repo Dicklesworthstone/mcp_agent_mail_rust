@@ -740,8 +740,8 @@ mod tests {
         let linked = dir.path().join("linked.sqlite3");
         symlink(&db, &linked).unwrap();
 
-        let err = finalize_export_db(&linked)
-            .expect_err("symlinked snapshots must fail validation");
+        let err =
+            finalize_export_db(&linked).expect_err("symlinked snapshots must fail validation");
         assert!(matches!(err, ShareError::Validation { .. }));
         assert!(err.to_string().contains("real file"));
     }
