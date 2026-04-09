@@ -374,7 +374,7 @@ pub fn bundle_attachments(
             // Write back updated attachments
             if updated {
                 let new_json =
-                    serde_json::to_string(&attachments).unwrap_or_else(|_| "[]".to_string());
+                    crate::encode_json(&attachments, "attachment manifest serialization failed")?;
                 conn.execute_sync(
                     "UPDATE messages SET attachments = ? WHERE id = ?",
                     &[SqlValue::Text(new_json), SqlValue::BigInt(msg_id)],
@@ -468,7 +468,7 @@ pub fn maybe_chunk_database(
         original_bytes: file_size,
         threshold_bytes,
     };
-    let config_json = serde_json::to_string_pretty(&config).unwrap_or_default();
+    let config_json = crate::encode_json_pretty(&config, "chunk config serialization failed")?;
     write_output_bytes(
         output_dir,
         "mailbox.sqlite3.config.json",
@@ -513,7 +513,7 @@ pub fn write_bundle_scaffolding(
         viewer_sri,
     );
     let sorted = sort_json_keys(&manifest);
-    let manifest_json = serde_json::to_string_pretty(&sorted).unwrap_or_default();
+    let manifest_json = crate::encode_json_pretty(&sorted, "bundle manifest serialization failed")?;
     write_output_bytes(output_dir, "manifest.json", manifest_json.as_bytes())?;
 
     // README.md
@@ -1455,7 +1455,7 @@ pub fn export_viewer_data(
 
     // Write messages.json
     let messages_json =
-        serde_json::to_string_pretty(&messages).unwrap_or_else(|_| "[]".to_string());
+        crate::encode_json_pretty(&messages, "viewer messages serialization failed")?;
     write_output_bytes(
         output_dir,
         "viewer/data/messages.json",
@@ -1471,7 +1471,7 @@ pub fn export_viewer_data(
     });
 
     // Write meta.json
-    let meta_json = serde_json::to_string_pretty(&meta).unwrap_or_else(|_| "{}".to_string());
+    let meta_json = crate::encode_json_pretty(&meta, "viewer metadata serialization failed")?;
     write_output_bytes(output_dir, "viewer/data/meta.json", meta_json.as_bytes())?;
 
     Ok(ViewerDataManifest {

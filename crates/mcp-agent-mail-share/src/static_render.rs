@@ -457,7 +457,7 @@ pub fn render_static_site(
     let data_dir = output_dir.join("viewer").join("data");
     ensure_real_directory(&data_dir)?;
 
-    let sitemap_json = serde_json::to_string_pretty(&sitemap).unwrap_or_else(|_| "[]".to_string());
+    let sitemap_json = crate::encode_json_pretty(&sitemap, "sitemap serialization failed")?;
     write_text_file(&data_dir.join("sitemap.json"), &sitemap_json)?;
     generated_files.push("viewer/data/sitemap.json".to_string());
 
@@ -467,13 +467,13 @@ pub fn render_static_site(
     sorted_index.sort_by_key(|e| e.id);
 
     let search_json =
-        serde_json::to_string_pretty(&sorted_index).unwrap_or_else(|_| "[]".to_string());
+        crate::encode_json_pretty(&sorted_index, "search index serialization failed")?;
     write_text_file(&data_dir.join("search_index.json"), &search_json)?;
     generated_files.push("viewer/data/search_index.json".to_string());
 
     // ── Write navigation.json ───────────────────────────────────────
     let nav = build_navigation(&projects, &threads, &thread_routes);
-    let nav_json = serde_json::to_string_pretty(&nav).unwrap_or_else(|_| "{}".to_string());
+    let nav_json = crate::encode_json_pretty(&nav, "navigation serialization failed")?;
     write_text_file(&data_dir.join("navigation.json"), &nav_json)?;
     generated_files.push("viewer/data/navigation.json".to_string());
 
@@ -481,7 +481,7 @@ pub fn render_static_site(
 
     // ── Write redaction audit log ──────────────────────────────────
     if audit.total() > 0 {
-        let audit_json = serde_json::to_string_pretty(&audit).unwrap_or_else(|_| "{}".to_string());
+        let audit_json = crate::encode_json_pretty(&audit, "redaction audit serialization failed")?;
         write_text_file(&data_dir.join("redaction_audit.json"), &audit_json)?;
         generated_files.push("viewer/data/redaction_audit.json".to_string());
         generated_files.sort();

@@ -299,8 +299,10 @@ pub fn scrub_snapshot(
 
                 // Write back attachment changes
                 if attachments_updated {
-                    let sanitized_json = serde_json::to_string(&attachments_data)
-                        .unwrap_or_else(|_| "[]".to_string());
+                    let sanitized_json = crate::encode_json(
+                        &attachments_data,
+                        "scrubbed attachments serialization failed",
+                    )?;
                     exec_count(
                         &conn,
                         "UPDATE messages SET attachments = ? WHERE id = ?",

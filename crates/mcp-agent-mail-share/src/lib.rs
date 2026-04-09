@@ -272,6 +272,18 @@ pub enum ShareError {
 
 pub type ShareResult<T> = Result<T, ShareError>;
 
+pub(crate) fn encode_json_pretty<T: Serialize>(value: &T, context: &str) -> ShareResult<String> {
+    serde_json::to_string_pretty(value).map_err(|error| ShareError::ManifestParse {
+        message: format!("{context}: {error}"),
+    })
+}
+
+pub(crate) fn encode_json<T: Serialize>(value: &T, context: &str) -> ShareResult<String> {
+    serde_json::to_string(value).map_err(|error| ShareError::ManifestParse {
+        message: format!("{context}: {error}"),
+    })
+}
+
 pub(crate) fn is_real_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
 }
@@ -980,5 +992,35 @@ mod tests {
             .expect_err("directory chunk config should fail validation");
         assert!(matches!(err, ShareError::Validation { .. }));
         assert!(err.to_string().contains("real file"));
+    }
+
+    #[test]
+    fn encode_json_pretty_surfaces_serialization_failure() {
+        struct FailingSerialize;
+
+        impl Serialize for FailingSerialize {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("boom"))
+            }
+        }
+
+        let err = encode_json_pretty(&FailingSerialize, "test payload")
+            .expect_err("serializer failure should surface");
+        assert!(matches!(err, ShareError::ManifestParse { .. }));
+        assert!(
+            err.to_string().contains("test payload: boom"),
+            "error should preserve context: {err}"
+        );
+
+        let compact_err = encode_json(&FailingSerialize, "compact payload")
+            .expect_err("compact serializer failure should surface");
+        assert!(matches!(compact_err, ShareError::ManifestParse { .. }));
+        assert!(
+            compact_err.to_string().contains("compact payload: boom"),
+            "error should preserve compact context: {compact_err}"
+        );
     }
 }

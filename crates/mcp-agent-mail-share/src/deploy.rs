@@ -2719,9 +2719,7 @@ pub fn record_deploy(bundle_dir: &Path, entry: DeployHistoryEntry) -> ShareResul
         let drain_count = history.entries.len() - 50;
         history.entries.drain(..drain_count);
     }
-    let json = serde_json::to_string_pretty(&history).map_err(|e| ShareError::ManifestParse {
-        message: format!("deploy history serialization error: {e}"),
-    })?;
+    let json = crate::encode_json_pretty(&history, "deploy history serialization failed")?;
     write_text_file(&bundle_dir.join(DEPLOY_HISTORY_FILE), &json)?;
     Ok(())
 }
@@ -2844,13 +2842,14 @@ pub fn write_deploy_tooling(repo_root: &Path, bundle_dir: &Path) -> ShareResult<
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755));
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(ShareError::Io)?;
     }
     written.push("scripts/validate_deploy.sh".to_string());
 
     // Deploy report
     let report = validate_bundle(bundle_dir)?;
-    let report_json = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string());
+    let report_json = crate::encode_json_pretty(&report, "deploy report serialization failed")?;
     write_text_file(&bundle_dir.join("deploy_report.json"), &report_json)?;
     written.push(format!("{bundle_rel}/deploy_report.json"));
 
@@ -3653,6 +3652,17 @@ mod tests {
         assert!(dir.path().join("netlify.toml.template").is_file());
         assert!(dir.path().join("scripts/validate_deploy.sh").is_file());
         assert!(bundle.join("deploy_report.json").is_file());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = std::fs::metadata(dir.path().join("scripts/validate_deploy.sh"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o755);
+        }
 
         // Verify deploy report is valid JSON with new fields
         let report_json = std::fs::read_to_string(bundle.join("deploy_report.json")).unwrap();

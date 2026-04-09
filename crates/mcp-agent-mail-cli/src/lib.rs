@@ -11411,7 +11411,8 @@ fn run_native_wizard(args: ShareWizardArgs) -> CliResult<()> {
 
     // Handle outcome
     if !matches!(fmt, output::CliOutputFormat::Table) {
-        let json = share::format_json_output(&outcome, outcome.confirmed, None);
+        let json = share::format_json_output(&outcome, outcome.confirmed, None)
+            .map_err(|e| CliError::Other(format!("wizard output encode failed: {e}")))?;
         let payload = serde_json::from_str::<serde_json::Value>(&json)
             .map_err(|e| CliError::Other(format!("wizard output encode failed: {e}")))?;
         output::emit_output(&payload, fmt, || {});

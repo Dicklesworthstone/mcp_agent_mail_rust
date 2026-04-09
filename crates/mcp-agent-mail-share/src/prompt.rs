@@ -667,7 +667,7 @@ pub fn format_json_output(
     outcome: &WizardOutcome,
     executed: bool,
     error: Option<&WizardError>,
-) -> String {
+) -> Result<String, WizardError> {
     let output = if let Some(err) = error {
         WizardJsonOutput::failure(err.clone(), outcome.inputs.bundle_path.clone())
             .with_environment(outcome.environment.clone())
@@ -694,7 +694,12 @@ pub fn format_json_output(
             .with_plan(outcome.plan.clone())
     };
 
-    serde_json::to_string_pretty(&output).unwrap_or_else(|_| "{}".to_string())
+    crate::encode_json_pretty(&output, "wizard output serialization failed").map_err(|err| {
+        WizardError::new(
+            WizardErrorCode::InternalError,
+            format!("failed to encode wizard output: {err}"),
+        )
+    })
 }
 
 // ── Prompt Helpers ──────────────────────────────────────────────────────
@@ -1046,9 +1051,10 @@ mod tests {
             confirmed: false,
         };
 
-        let payload =
-            serde_json::from_str::<serde_json::Value>(&format_json_output(&outcome, false, None))
-                .expect("wizard output should be valid json");
+        let payload = serde_json::from_str::<serde_json::Value>(
+            &format_json_output(&outcome, false, None).expect("wizard output should encode"),
+        )
+        .expect("wizard output should be valid json");
 
         assert_eq!(payload["result"]["metadata"]["mode"], "interactive");
         assert_eq!(payload["result"]["metadata"]["dry_run"], true);

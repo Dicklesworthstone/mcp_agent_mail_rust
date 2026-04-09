@@ -39,6 +39,11 @@ pub fn sign_manifest(
             path: manifest_path.display().to_string(),
         });
     }
+    require_real_crypto_file(signing_key_path, "signing key")?;
+
+    if let Some(parent) = output_path.parent() {
+        ensure_real_crypto_directory(parent)?;
+    }
 
     if let Ok(metadata) = std::fs::symlink_metadata(output_path) {
         if metadata.file_type().is_symlink() {
@@ -887,6 +892,65 @@ mod tests {
         symlink(&real_sig, &linked_sig).unwrap();
 
         let result = sign_manifest(&manifest_path, &key_path, &linked_sig, true);
+        assert!(matches!(
+            result,
+            Err(ShareError::Io(error))
+                if error.kind() == std::io::ErrorKind::InvalidInput
+                    && error.to_string().contains("must not be a symlink")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sign_rejects_symlinked_signing_key() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, r#"{"test": true}"#).unwrap();
+
+        let real_key = dir.path().join("real.key");
+        std::fs::write(&real_key, test_key_bytes()).unwrap();
+        let linked_key = dir.path().join("linked.key");
+        symlink(&real_key, &linked_key).unwrap();
+
+        let result = sign_manifest(
+            &manifest_path,
+            &linked_key,
+            &dir.path().join("sig.json"),
+            false,
+        );
+        assert!(matches!(
+            result,
+            Err(ShareError::Io(error))
+                if error.kind() == std::io::ErrorKind::InvalidInput
+                    && error.to_string().contains("must not be a symlink")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sign_rejects_symlinked_signature_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, r#"{"test": true}"#).unwrap();
+
+        let key_path = dir.path().join("test.key");
+        std::fs::write(&key_path, test_key_bytes()).unwrap();
+
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let linked_parent = dir.path().join("linked-parent");
+        symlink(&outside, &linked_parent).unwrap();
+
+        let result = sign_manifest(
+            &manifest_path,
+            &key_path,
+            &linked_parent.join("manifest.sig.json"),
+            false,
+        );
         assert!(matches!(
             result,
             Err(ShareError::Io(error))
