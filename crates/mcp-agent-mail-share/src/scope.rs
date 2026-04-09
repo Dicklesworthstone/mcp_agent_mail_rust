@@ -62,7 +62,7 @@ pub fn apply_project_scope(
     snapshot_path: &Path,
     identifiers: &[String],
 ) -> Result<ProjectScopeResult, ShareError> {
-    let snapshot_path = crate::resolve_share_sqlite_path(snapshot_path);
+    let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
     let path_str = snapshot_path.display().to_string();
     let conn = Conn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
         message: format!("cannot open snapshot {path_str}: {e}"),
@@ -530,6 +530,22 @@ mod tests {
         .unwrap();
 
         db_path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_project_scope_rejects_symlinked_snapshot() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let linked = dir.path().join("linked.sqlite3");
+        symlink(&db, &linked).unwrap();
+
+        let err = apply_project_scope(&linked, &["proj-alpha".to_string()])
+            .expect_err("symlinked snapshots must fail validation");
+        assert!(matches!(err, ShareError::Validation { .. }));
+        assert!(err.to_string().contains("real file"));
     }
 
     #[test]

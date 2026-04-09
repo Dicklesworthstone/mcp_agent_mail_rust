@@ -263,7 +263,7 @@ pub fn render_static_site(
     output_dir: &Path,
     config: &StaticRenderConfig,
 ) -> ShareResult<StaticRenderResult> {
-    let snapshot_path = crate::resolve_share_sqlite_path(snapshot_path);
+    let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
     let path_str = snapshot_path.display().to_string();
     let conn = DbConn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
         message: format!("cannot open snapshot for static render: {e}"),
@@ -1739,6 +1739,49 @@ mod tests {
         assert!(result.pages_generated > 0);
         assert!(output.join("viewer/pages/index.html").exists());
         assert!(!relative_db_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn render_static_site_rejects_symlinked_snapshot() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("linked-render.sqlite3");
+
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_sync(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, \
+             subject TEXT, body_md TEXT, importance TEXT, created_ts TEXT, thread_id TEXT)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (id INTEGER PRIMARY KEY, message_id INTEGER, agent_id INTEGER, \
+             read_ts TEXT, ack_ts TEXT)",
+            &[],
+        )
+        .unwrap();
+        drop(conn);
+
+        let linked = dir.path().join("linked.sqlite3");
+        symlink(&db_path, &linked).unwrap();
+
+        let output = dir.path().join("output");
+        let err = render_static_site(&linked, &output, &StaticRenderConfig::default())
+            .expect_err("symlinked snapshots must fail validation");
+        assert!(matches!(err, ShareError::Validation { .. }));
+        assert!(err.to_string().contains("real file"));
     }
 
     #[test]

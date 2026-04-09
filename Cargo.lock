@@ -2324,6 +2324,7 @@ dependencies = [
  "fsqlite-observability 0.1.2",
  "fsqlite-pager",
  "fsqlite-types",
+ "fsqlite-vfs",
  "fsqlite-wal",
  "nix 0.29.0",
  "parking_lot",

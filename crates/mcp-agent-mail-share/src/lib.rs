@@ -431,6 +431,26 @@ pub(crate) fn resolve_share_sqlite_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+pub(crate) fn require_real_share_sqlite_path(path: &Path) -> ShareResult<PathBuf> {
+    let path = resolve_share_sqlite_path(path);
+    if path == Path::new(":memory:") {
+        return Ok(path);
+    }
+
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(path),
+        Ok(_) => Err(ShareError::Validation {
+            message: format!("snapshot path is not a real file: {}", path.display()),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(ShareError::SnapshotSourceNotFound {
+                path: path.display().to_string(),
+            })
+        }
+        Err(error) => Err(ShareError::Io(error)),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StoredExportConfig {
     pub projects: Vec<String>,
@@ -741,6 +761,23 @@ mod tests {
         let explicit_relative = PathBuf::from("./tmp/share.sqlite3");
         let resolved = resolve_share_sqlite_path(&explicit_relative);
         assert_eq!(resolved, explicit_relative);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn require_real_share_sqlite_path_rejects_symlinked_database() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let real_db = dir.path().join("real.sqlite3");
+        std::fs::write(&real_db, b"sqlite").unwrap();
+        let linked_db = dir.path().join("linked.sqlite3");
+        symlink(&real_db, &linked_db).unwrap();
+
+        let err = require_real_share_sqlite_path(&linked_db)
+            .expect_err("symlinked database paths must fail validation");
+        assert!(matches!(err, ShareError::Validation { .. }));
+        assert!(err.to_string().contains("real file"));
     }
 
     #[test]

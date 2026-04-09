@@ -578,6 +578,13 @@ impl PresetManager {
         if self.presets.get(&preset.name).is_some_and(|p| p.builtin) {
             return Err(PresetError::BuiltinReadOnly(preset.name));
         }
+        validate_preset_name(&preset.name)?;
+        if let Some(existing_name) = self.conflicting_name_for_path(&preset.name, Some(&preset.name)) {
+            return Err(PresetError::FilenameCollision {
+                name: preset.name,
+                existing_name,
+            });
+        }
 
         let path = self.preset_path(&preset.name);
         if let Some(parent) = path.parent() {
@@ -601,9 +608,17 @@ impl PresetManager {
             return Err(PresetError::BuiltinReadOnly(name.to_string()));
         }
 
-        if self.presets.remove(name).is_none() {
+        if !self.presets.contains_key(name) {
             return Err(PresetError::NotFound(name.to_string()));
         }
+
+        if let Some(existing_name) = self.conflicting_name_for_path(name, Some(name)) {
+            return Err(PresetError::FilenameCollision {
+                name: name.to_string(),
+                existing_name,
+            });
+        }
+        self.presets.remove(name);
 
         // If the active preset was deleted, fall back to default.
         if self.active == name {
@@ -641,6 +656,20 @@ impl PresetManager {
         let safe_name = sanitize_filename(name);
         self.storage_dir.join(format!("{safe_name}.json"))
     }
+
+    fn conflicting_name_for_path(
+        &self,
+        name: &str,
+        exclude_name: Option<&str>,
+    ) -> Option<String> {
+        let target_path = self.preset_path(name);
+        self.presets.keys().find_map(|existing_name| {
+            if exclude_name.is_some_and(|excluded| excluded == existing_name) {
+                return None;
+            }
+            (self.preset_path(existing_name) == target_path).then(|| existing_name.clone())
+        })
+    }
 }
 
 // ── Errors ──────────────────────────────────────────────────────────────
@@ -652,6 +681,10 @@ pub enum PresetError {
     BuiltinReadOnly(String),
     /// Preset not found.
     NotFound(String),
+    /// Preset name cannot be empty or whitespace.
+    InvalidName(String),
+    /// Distinct preset names would map to the same on-disk filename.
+    FilenameCollision { name: String, existing_name: String },
     /// I/O error during read/write.
     Io(std::io::Error),
     /// JSON serialization error.
@@ -663,6 +696,16 @@ impl std::fmt::Display for PresetError {
         match self {
             Self::BuiltinReadOnly(name) => write!(f, "preset '{name}' is built-in and read-only"),
             Self::NotFound(name) => write!(f, "preset '{name}' not found"),
+            Self::InvalidName(name) => {
+                write!(f, "preset name must not be empty or whitespace: '{name}'")
+            }
+            Self::FilenameCollision {
+                name,
+                existing_name,
+            } => write!(
+                f,
+                "preset '{name}' conflicts with existing preset '{existing_name}' on disk"
+            ),
             Self::Io(e) => write!(f, "preset I/O error: {e}"),
             Self::Serialize(e) => write!(f, "preset serialization error: {e}"),
         }
@@ -692,6 +735,13 @@ fn sanitize_filename(name: &str) -> String {
             }
         })
         .collect()
+}
+
+fn validate_preset_name(name: &str) -> Result<(), PresetError> {
+    if name.trim().is_empty() {
+        return Err(PresetError::InvalidName(name.to_string()));
+    }
+    Ok(())
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -962,6 +1012,38 @@ mod tests {
     }
 
     #[test]
+    fn manager_save_whitespace_name_fails_without_writing_dot_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = PresetManager::new(dir.path().to_path_buf(), None);
+
+        let preset = DashboardPreset::new("   ", PanelLayoutConfig::default_two_panel(), vec![]);
+        let result = mgr.save(preset);
+        assert!(matches!(result, Err(PresetError::InvalidName(_))));
+        assert!(!dir.path().join(".json").exists());
+    }
+
+    #[test]
+    fn manager_save_rejects_filename_collision_between_distinct_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = PresetManager::new(dir.path().to_path_buf(), None);
+
+        let first =
+            DashboardPreset::new("ops/review", PanelLayoutConfig::default_two_panel(), vec![]);
+        mgr.save(first).unwrap();
+
+        let conflicting =
+            DashboardPreset::new("ops?review", PanelLayoutConfig::default_two_panel(), vec![]);
+        let result = mgr.save(conflicting);
+        assert!(matches!(
+            result,
+            Err(PresetError::FilenameCollision { .. })
+        ));
+        assert!(mgr.get("ops/review").is_some());
+        assert!(mgr.get("ops?review").is_none());
+        assert!(dir.path().join("ops_review.json").exists());
+    }
+
+    #[test]
     fn manager_delete_user_preset() {
         let dir = tempfile::tempdir().unwrap();
         let mut mgr = PresetManager::new(dir.path().to_path_buf(), None);
@@ -1081,5 +1163,20 @@ mod tests {
     fn error_display_not_found() {
         let err = PresetError::NotFound("missing".into());
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn error_display_invalid_name() {
+        let err = PresetError::InvalidName("   ".into());
+        assert!(err.to_string().contains("empty or whitespace"));
+    }
+
+    #[test]
+    fn error_display_filename_collision() {
+        let err = PresetError::FilenameCollision {
+            name: "ops?review".into(),
+            existing_name: "ops/review".into(),
+        };
+        assert!(err.to_string().contains("conflicts with existing preset"));
     }
 }
