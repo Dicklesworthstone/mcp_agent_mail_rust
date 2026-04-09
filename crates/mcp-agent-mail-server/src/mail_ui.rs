@@ -22,7 +22,7 @@ use mcp_agent_mail_db::pool::DbPool;
 use mcp_agent_mail_db::timestamps::{micros_to_iso, micros_to_naive, now_micros};
 use mcp_agent_mail_db::{DbPoolConfig, get_or_create_pool, queries};
 use mcp_agent_mail_storage::{self as storage, ensure_archive_root};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::markdown;
 use crate::templates;
@@ -295,6 +295,112 @@ first body
                 .expect("route should return html");
             assert!(html.contains("ahead-project"), "{html}");
             assert!(html.contains("Alice"), "{html}");
+        });
+    }
+
+    #[test]
+    fn resolve_project_slug_defaults_to_archive_inventory_before_db_only_projects() {
+        let dir = tempdir().expect("tempdir");
+        let (storage_root, db_path) = write_archive_ahead_fixture(dir.path());
+        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("mail-ui-archive-default-source");
+
+        let _db_only_project = outcome_ok(block_on(queries::ensure_project(&cx, &pool, "/a")));
+
+        with_mail_ui_env(&storage_root, &db_path, || {
+            let (slug, human_key) =
+                resolve_project_slug(&cx, &pool, None).expect("archive default should resolve");
+            assert_eq!(slug, "ahead-project");
+            assert_eq!(human_key, "/ahead-project");
+        });
+    }
+
+    #[test]
+    fn render_api_project_agents_falls_back_to_archive_without_registered_project() {
+        let dir = tempdir().expect("tempdir");
+        let (storage_root, db_path) = write_archive_ahead_fixture(dir.path());
+        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("mail-ui-archive-agents");
+
+        with_mail_ui_env(&storage_root, &db_path, || {
+            let payload = render_api_project_agents(&cx, &pool, "ahead-project")
+                .expect("archive agent lookup should succeed")
+                .expect("archive agent lookup should return json");
+            assert_eq!(payload, "{\"agents\":[\"Alice\"]}");
+        });
+    }
+
+    #[test]
+    fn archive_snapshot_file_reservations_query_handles_archive_ahead_fixture() {
+        let dir = tempdir().expect("tempdir");
+        let (storage_root, db_path) = write_archive_ahead_fixture(dir.path());
+        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+
+        with_mail_ui_env(&storage_root, &db_path, || {
+            let read_pool = open_mail_ui_read_pool()
+                .expect("archive snapshot read pool should open")
+                .expect("archive snapshot read pool should exist");
+            let project = block_on_outcome(
+                &cx,
+                queries::get_project_by_slug(&cx, read_pool.pool(), "ahead-project"),
+            )
+            .expect("archive snapshot should expose ahead-project");
+            let project_id = project.id.expect("ahead-project id");
+            let rows = match block_on(queries::list_file_reservations(
+                &cx,
+                read_pool.pool(),
+                project_id,
+                false,
+            )) {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(error) => {
+                    panic!("archive snapshot file reservation query failed: {error}")
+                }
+                Outcome::Cancelled(_) => panic!("archive snapshot query cancelled"),
+                Outcome::Panicked(panic) => {
+                    panic!("archive snapshot query panicked: {}", panic.message())
+                }
+            };
+            assert!(rows.is_empty(), "fixture should have no file reservations");
+        });
+    }
+
+    #[test]
+    fn dispatch_file_reservations_get_uses_archive_snapshot_when_live_db_is_stale() {
+        let dir = tempdir().expect("tempdir");
+        let (storage_root, db_path) = write_archive_ahead_fixture(dir.path());
+
+        with_mail_ui_env(&storage_root, &db_path, || {
+            let html = dispatch(
+                "/mail/ahead-project/file_reservations",
+                "__static_export=1",
+                "GET",
+                "",
+            )
+            .expect("dispatch should succeed")
+            .expect("file reservations route should return html");
+            assert!(html.contains("ahead-project"), "{html}");
+        });
+    }
+
+    #[test]
+    fn archive_time_travel_snapshot_uses_archive_without_registered_project() {
+        let dir = tempdir().expect("tempdir");
+        let (storage_root, db_path) = write_archive_ahead_fixture(dir.path());
+        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("mail-ui-archive-snapshot");
+
+        with_mail_ui_env(&storage_root, &db_path, || {
+            let payload = render_archive_time_travel_snapshot(
+                &cx,
+                &pool,
+                "ahead-project",
+                "Alice",
+                "2026-03-22T12:00",
+            )
+            .expect("archive snapshot should succeed")
+            .expect("archive snapshot should return json");
+            assert!(payload.contains("\"requested_time\":\"2026-03-22T12:00\""));
         });
     }
 
@@ -1437,6 +1543,7 @@ mod auth_route_hardening_regression_suite {
     use asupersync::Outcome;
     use mcp_agent_mail_db::sqlmodel_core::Value;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::tempdir;
 
     fn outcome_ok<T>(outcome: Outcome<T, mcp_agent_mail_db::DbError>) -> T {
         match outcome {
@@ -1539,7 +1646,7 @@ mod auth_route_hardening_regression_suite {
     fn regression_archive_routes_reject_post_method() {
         let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool();
-        let result = dispatch_project_route("/archive/guide", "", "POST", &cx, &pool, &pool, "");
+        let result = render_archive_route("/archive/guide", "", "POST", &cx, &pool);
         let (status, _) = result.expect_err("POST to archive should be 405");
         assert_eq!(status, 405);
     }
@@ -1629,6 +1736,8 @@ mod auth_route_hardening_regression_suite {
     fn regression_archive_default_skips_placeholder_projects() {
         let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool();
+        let dir = tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
         let placeholder_project = outcome_ok(block_on(queries::ensure_project(
             &cx,
             &pool,
@@ -1652,6 +1761,10 @@ mod auth_route_hardening_regression_suite {
             &pool,
             &format!("/tmp/mail-ui-archive-real-{}", unique_nonce()),
         )));
+        let storage_root_str = storage_root
+            .to_str()
+            .expect("storage root utf-8")
+            .to_string();
 
         let conn = match block_on(pool.acquire(&cx)) {
             Outcome::Ok(conn) => conn,
@@ -1668,15 +1781,32 @@ mod auth_route_hardening_regression_suite {
         .expect("orphan placeholder project");
         drop(conn);
 
-        let (slug, _) =
-            resolve_project_slug(&cx, &pool, None).expect("archive default should resolve");
-        assert_eq!(slug, real_project.slug);
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", storage_root_str.as_str())],
+            || {
+                let config = Config::from_env();
+                let archive = storage::ensure_archive(&config, &real_project.slug)
+                    .expect("archive should initialize");
+                storage::write_project_metadata_with_config(
+                    &archive,
+                    &config,
+                    &real_project.human_key,
+                )
+                .expect("archive metadata should persist");
+
+                let (slug, _) =
+                    resolve_project_slug(&cx, &pool, None).expect("archive default should resolve");
+                assert_eq!(slug, real_project.slug);
+            },
+        );
     }
 
     #[test]
     fn regression_archive_time_travel_filters_placeholder_projects() {
         let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool();
+        let dir = tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
         let placeholder_project = outcome_ok(block_on(queries::ensure_project(
             &cx,
             &pool,
@@ -1700,6 +1830,10 @@ mod auth_route_hardening_regression_suite {
             &pool,
             &format!("/tmp/mail-ui-archive-picker-real-{}", unique_nonce()),
         )));
+        let storage_root_str = storage_root
+            .to_str()
+            .expect("storage root utf-8")
+            .to_string();
 
         let conn = match block_on(pool.acquire(&cx)) {
             Outcome::Ok(conn) => conn,
@@ -1716,11 +1850,26 @@ mod auth_route_hardening_regression_suite {
         .expect("orphan placeholder project");
         drop(conn);
 
-        let html = render_archive_time_travel(&cx, &pool)
-            .expect("archive time travel should succeed")
-            .expect("archive time travel should render html");
-        assert!(html.contains(&real_project.slug));
-        assert!(!html.contains(&format!("[unknown-project-{placeholder_id}]")));
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", storage_root_str.as_str())],
+            || {
+                let config = Config::from_env();
+                let archive = storage::ensure_archive(&config, &real_project.slug)
+                    .expect("archive should initialize");
+                storage::write_project_metadata_with_config(
+                    &archive,
+                    &config,
+                    &real_project.human_key,
+                )
+                .expect("archive metadata should persist");
+
+                let html = render_archive_time_travel(&cx, &pool)
+                    .expect("archive time travel should succeed")
+                    .expect("archive time travel should render html");
+                assert!(html.contains(&real_project.slug));
+                assert!(!html.contains(&format!("[unknown-project-{placeholder_id}]")));
+            },
+        );
     }
 
     // -- Cross-project route scoping (F1 scope) --
@@ -2324,6 +2473,30 @@ fn project_view(p: &ProjectRow) -> ProjectView {
         slug: p.slug.clone(),
         human_key: p.human_key.clone(),
         created_at: ts_display(p.created_at),
+    }
+}
+
+fn archive_project_view(project: &ArchiveProjectSummary) -> ProjectView {
+    ProjectView {
+        id: 0,
+        slug: project.slug.clone(),
+        human_key: project.human_key.clone(),
+        created_at: String::new(),
+    }
+}
+
+fn resolve_mail_project_view(
+    cx: &Cx,
+    pool: &DbPool,
+    project_slug: &str,
+) -> Result<(ProjectView, Option<i64>), (u16, String)> {
+    match block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug)) {
+        Ok(project) => Ok((project_view(&project), project.id)),
+        Err((404, _)) => {
+            let project = resolve_archive_project(project_slug)?;
+            Ok((archive_project_view(&project), None))
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -3179,13 +3352,13 @@ fn truncate_body(body: &str, max: usize) -> String {
 #[derive(Serialize)]
 struct FileReservationsCtx {
     project: ProjectView,
-    reservations: Vec<ReservationView>,
+    file_reservations: Vec<ReservationView>,
 }
 
 #[derive(Serialize)]
 struct ReservationView {
     id: i64,
-    agent_name: String,
+    agent: String,
     path_pattern: String,
     exclusive: bool,
     reason: String,
@@ -3199,9 +3372,15 @@ fn render_file_reservations(
     pool: &DbPool,
     project_slug: &str,
 ) -> Result<Option<String>, (u16, String)> {
-    let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
-    let pid = p.id.unwrap_or(0);
-    let rows = block_on_outcome(cx, queries::list_file_reservations(cx, pool, pid, false))?;
+    let (project, project_id) = resolve_mail_project_view(cx, pool, project_slug)?;
+    let rows = if let Some(project_id) = project_id {
+        block_on_outcome(
+            cx,
+            queries::list_file_reservations(cx, pool, project_id, false),
+        )?
+    } else {
+        Vec::new()
+    };
 
     let mut reservations = Vec::with_capacity(rows.len());
     for r in &rows {
@@ -3209,7 +3388,7 @@ fn render_file_reservations(
             .map_or_else(|_| format!("agent#{}", r.agent_id), |a| a.name);
         reservations.push(ReservationView {
             id: r.id.unwrap_or(0),
-            agent_name: agent,
+            agent,
             path_pattern: r.path_pattern.clone(),
             exclusive: r.exclusive != 0,
             reason: r.reason.clone(),
@@ -3222,8 +3401,8 @@ fn render_file_reservations(
     render(
         "mail_file_reservations.html",
         FileReservationsCtx {
-            project: project_view(&p),
-            reservations,
+            project,
+            file_reservations: reservations,
         },
     )
 }
@@ -3596,13 +3775,16 @@ fn render_api_unified_inbox(
 }
 
 fn render_api_project_agents(
-    cx: &Cx,
-    pool: &DbPool,
+    _cx: &Cx,
+    _pool: &DbPool,
     project_slug: &str,
 ) -> Result<Option<String>, (u16, String)> {
-    let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
-    let agents = block_on_outcome(cx, queries::list_agents(cx, pool, p.id.unwrap_or(0)))?;
-    let mut names: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+    let archive = match get_project_archive(project_slug) {
+        Ok(archive) => archive,
+        Err((status, detail)) => return json_detail_err(status, &detail),
+    };
+    let mut names = storage::list_archive_agents(&archive)
+        .map_err(|err| (500, format!("Archive error: {err}")))?;
     names.sort_unstable(); // Python parity: ORDER BY name
     let json = serde_json::to_string(&serde_json::json!({ "agents": names }))
         .map_err(|e| (500, format!("JSON error: {e}")))?;
@@ -3627,6 +3809,80 @@ fn get_project_archive(slug: &str) -> Result<storage::ProjectArchive, (u16, Stri
     storage::open_archive(&config, slug)
         .map_err(|e| (500, format!("Archive error: {e}")))?
         .ok_or_else(|| (404, "Archive not found".to_string()))
+}
+
+#[derive(Debug, Clone)]
+struct ArchiveProjectSummary {
+    slug: String,
+    human_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArchiveProjectMetadataFile {
+    #[serde(default)]
+    human_key: String,
+}
+
+fn archive_project_human_key(archive: &storage::ProjectArchive) -> String {
+    std::fs::read_to_string(archive.root.join("project.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<ArchiveProjectMetadataFile>(&raw).ok())
+        .map(|metadata| metadata.human_key.trim().to_string())
+        .filter(|human_key| !human_key.is_empty())
+        .unwrap_or_else(|| archive.slug.clone())
+}
+
+fn list_archive_projects() -> Result<Vec<ArchiveProjectSummary>, (u16, String)> {
+    let root = get_archive_root()?;
+    let projects_root = root.join("projects");
+    if !projects_root.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let config = Config::from_env();
+    let entries =
+        std::fs::read_dir(&projects_root).map_err(|err| (500, format!("Archive error: {err}")))?;
+    let mut projects = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| (500, format!("Archive error: {err}")))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|err| (500, format!("Archive error: {err}")))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let slug = entry.file_name().to_string_lossy().into_owned();
+        if !is_valid_project_slug(&slug) {
+            continue;
+        }
+
+        let Some(archive) = storage::open_archive(&config, &slug)
+            .map_err(|err| (500, format!("Archive error: {err}")))?
+        else {
+            continue;
+        };
+
+        projects.push(ArchiveProjectSummary {
+            slug,
+            human_key: archive_project_human_key(&archive),
+        });
+    }
+
+    projects.sort_by(|left, right| left.slug.cmp(&right.slug));
+    Ok(projects)
+}
+
+fn resolve_archive_project(project_slug: &str) -> Result<ArchiveProjectSummary, (u16, String)> {
+    if !is_valid_project_slug(project_slug) {
+        return Err((400, "Invalid project identifier".to_string()));
+    }
+
+    let archive = get_project_archive(project_slug)?;
+    Ok(ArchiveProjectSummary {
+        slug: archive.slug.clone(),
+        human_key: archive_project_human_key(&archive),
+    })
 }
 
 fn render_archive_route(
@@ -3698,6 +3954,7 @@ struct ArchiveGuideProject {
 }
 
 fn render_archive_guide(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, String)> {
+    let _ = (cx, pool);
     let config = Config::from_env();
     let storage_root = config.storage_root.display().to_string();
 
@@ -3731,8 +3988,8 @@ fn render_archive_guide(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, 
         },
     );
 
-    let db_projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
-    let projects: Vec<ArchiveGuideProject> = db_projects
+    let archive_projects = list_archive_projects()?;
+    let projects: Vec<ArchiveGuideProject> = archive_projects
         .iter()
         .map(|p| ArchiveGuideProject {
             slug: p.slug.clone(),
@@ -3875,21 +4132,15 @@ fn render_archive_timeline(
 ///
 /// F2: Validates slug format before DB lookup to reject malformed input early.
 fn resolve_project_slug(
-    cx: &Cx,
-    pool: &DbPool,
+    _cx: &Cx,
+    _pool: &DbPool,
     project: Option<&str>,
 ) -> Result<(String, String), (u16, String)> {
     if let Some(slug) = project {
-        if !is_valid_project_slug(slug) {
-            return Err((400, "Invalid project identifier".to_string()));
-        }
-        let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, slug))?;
-        Ok((p.slug.clone(), p.human_key))
+        let project = resolve_archive_project(slug)?;
+        Ok((project.slug, project.human_key))
     } else {
-        let projects: Vec<ProjectRow> = block_on_outcome(cx, queries::list_projects(cx, pool))?
-            .into_iter()
-            .filter(|project| is_valid_project_slug(&project.slug))
-            .collect();
+        let projects = list_archive_projects()?;
         let first = projects
             .first()
             .ok_or_else(|| (404, "No archive projects found".to_string()))?;
@@ -3907,8 +4158,8 @@ struct ArchiveBrowserCtx {
 }
 
 fn render_archive_browser(
-    cx: &Cx,
-    pool: &DbPool,
+    _cx: &Cx,
+    _pool: &DbPool,
     project: Option<&str>,
     path: &str,
 ) -> Result<Option<String>, (u16, String)> {
@@ -3919,8 +4170,6 @@ fn render_archive_browser(
     if !is_valid_project_slug(slug) {
         return Err((400, "Invalid project identifier".to_string()));
     }
-    // Enforce project scope via DB lookup before touching archive paths.
-    let _ = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, slug))?;
 
     let archive = get_project_archive(slug)?;
     let tree = storage::get_archive_tree(&archive, path)
@@ -3938,21 +4187,19 @@ fn render_archive_browser(
 
 /// JSON API: get file content from archive.
 fn render_archive_browser_file(
-    cx: &Cx,
-    pool: &DbPool,
+    _cx: &Cx,
+    _pool: &DbPool,
     project_slug: &str,
     path: &str,
 ) -> Result<Option<String>, (u16, String)> {
     if !is_valid_project_slug(project_slug) {
         return json_detail_err(400, "Invalid project identifier");
     }
-
-    if let Err((status, detail)) =
-        block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))
-    {
-        return json_detail_err(status, &detail);
-    }
-    let archive = get_project_archive(project_slug)?;
+    let archive = match get_project_archive(project_slug) {
+        Ok(archive) => archive,
+        Err((404, _)) => return json_detail_err(404, "File not found"),
+        Err((status, detail)) => return json_detail_err(status, &detail),
+    };
     match storage::get_archive_file_content(&archive, path, 10 * 1024 * 1024) {
         Ok(Some(content)) => {
             // Python parity: the payload is a JSON string with file content.
@@ -4018,11 +4265,11 @@ struct ArchiveTimeTravelCtx {
 }
 
 fn render_archive_time_travel(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, String)> {
-    let projects = block_on_outcome(cx, queries::list_projects(cx, pool))?;
+    let _ = (cx, pool);
+    let projects = list_archive_projects()?;
     let slugs: Vec<String> = projects
         .iter()
-        .filter(|project| is_valid_project_slug(&project.slug))
-        .map(|p| p.slug.clone())
+        .map(|project| project.slug.clone())
         .collect();
     render(
         "archive_time_travel.html",
@@ -4032,8 +4279,8 @@ fn render_archive_time_travel(cx: &Cx, pool: &DbPool) -> Result<Option<String>, 
 
 /// JSON API: get historical inbox snapshot at a point in time.
 fn render_archive_time_travel_snapshot(
-    cx: &Cx,
-    pool: &DbPool,
+    _cx: &Cx,
+    _pool: &DbPool,
     project_slug: &str,
     agent_name: &str,
     timestamp: &str,
@@ -4051,12 +4298,10 @@ fn render_archive_time_travel_snapshot(
         );
     }
 
-    if let Err((status, detail)) =
-        block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))
-    {
-        return json_detail_err(status, &detail);
-    }
-    let archive = get_project_archive(project_slug)?;
+    let archive = match get_project_archive(project_slug) {
+        Ok(archive) => archive,
+        Err((status, detail)) => return json_detail_err(status, &detail),
+    };
     let snapshot =
         match storage::get_historical_inbox_snapshot(&archive, agent_name, timestamp, 200) {
             Ok(s) => s,
@@ -4756,7 +5001,7 @@ mod fresh_eyes_regression_tests {
     }
 
     #[test]
-    fn archive_time_travel_snapshot_requires_registered_project() {
+    fn archive_time_travel_snapshot_requires_existing_archive() {
         let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("mail-ui-time-travel");
         let missing_slug = format!(
@@ -4777,7 +5022,7 @@ mod fresh_eyes_regression_tests {
         .expect_err("missing project should fail before archive lookup");
 
         assert_eq!(status, 404);
-        assert!(detail.contains("Project"), "unexpected detail: {detail}");
+        assert!(detail.contains("Archive"), "unexpected detail: {detail}");
     }
 
     #[test]

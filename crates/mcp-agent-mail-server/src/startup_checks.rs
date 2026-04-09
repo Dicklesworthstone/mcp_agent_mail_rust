@@ -1947,7 +1947,26 @@ fn probe_integrity(config: &Config) -> ProbeResult {
     };
 
     match pool.run_startup_integrity_check() {
-        Ok(_) => ProbeResult::Ok { name: "integrity" },
+        Ok(_) => {
+            let verdict = mcp_agent_mail_db::compute_mailbox_verdict(
+                &config.database_url,
+                &config.storage_root,
+                &mcp_agent_mail_db::VerdictOptions {
+                    skip_integrity_check: true,
+                    ..mcp_agent_mail_db::VerdictOptions::default()
+                },
+            );
+            if verdict.archive_drift.state
+                == mcp_agent_mail_db::MailboxArchiveDriftState::ArchiveAhead
+            {
+                tracing::warn!(
+                    detail = %verdict.archive_drift.detail,
+                    "startup integrity probe found archive-backed state ahead of healthy sqlite; attempting automatic recovery"
+                );
+                return attempt_probe_recovery(config);
+            }
+            ProbeResult::Ok { name: "integrity" }
+        }
         Err(ref e) => {
             let err_str = e.to_string();
 

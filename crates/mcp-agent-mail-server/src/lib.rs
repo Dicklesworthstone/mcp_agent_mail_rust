@@ -2052,7 +2052,7 @@ pub(crate) struct SnapshotDirGuard {
 
 impl SnapshotDirGuard {
     fn new(prefix: &str) -> std::io::Result<Self> {
-        let base = std::env::temp_dir();
+        let base = preferred_snapshot_temp_dir()?;
         let pid = std::process::id();
         for attempt in 0..32_u32 {
             let nonce = std::time::SystemTime::now()
@@ -2078,6 +2078,40 @@ impl SnapshotDirGuard {
     fn path(&self) -> &Path {
         &self.path
     }
+}
+
+fn preferred_snapshot_temp_dir() -> std::io::Result<PathBuf> {
+    for key in ["TMPDIR", "TEMP", "TMP"] {
+        let Some(value) = mcp_agent_mail_core::config::env_value(key) else {
+            continue;
+        };
+        let candidate = PathBuf::from(value);
+        if candidate.as_os_str().is_empty() {
+            continue;
+        }
+
+        let metadata = std::fs::metadata(&candidate).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!(
+                    "{key} points to unusable snapshot directory {}: {error}",
+                    candidate.display()
+                ),
+            )
+        })?;
+        if !metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{key} points to {} which is not a directory",
+                    candidate.display()
+                ),
+            ));
+        }
+        return Ok(candidate);
+    }
+
+    Ok(std::env::temp_dir())
 }
 
 impl Drop for SnapshotDirGuard {
