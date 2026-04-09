@@ -474,12 +474,13 @@ async fn fetch_inbound(
             "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
              m.importance, m.ack_required, m.created_ts, \
              r.kind, r.read_ts, r.ack_ts, \
-             COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, p.slug AS project_slug, \
-             COALESCE(GROUP_CONCAT(DISTINCT a_recip.name), '') AS to_agents \
+             COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, \
+             COALESCE(NULLIF(TRIM(p.slug), ''), '[unknown-project-' || m.project_id || ']') AS project_slug, \
+             COALESCE(GROUP_CONCAT(DISTINCT COALESCE(NULLIF(TRIM(a_recip.name), ''), '[unknown-agent-' || mr2.agent_id || ']')), '') AS to_agents \
              FROM message_recipients r \
              JOIN messages m ON m.id = r.message_id \
              LEFT JOIN agents s ON s.id = m.sender_id \
-             JOIN projects p ON p.id = m.project_id \
+             LEFT JOIN projects p ON p.id = m.project_id \
              LEFT JOIN message_recipients mr2 ON mr2.message_id = m.id \
              LEFT JOIN agents a_recip ON a_recip.id = mr2.agent_id \
              WHERE {where_clause} \
@@ -543,11 +544,12 @@ async fn fetch_outbound(
         let sql = format!(
             "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
              m.importance, m.ack_required, m.created_ts, \
-             COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, p.slug AS project_slug, \
-             COALESCE(GROUP_CONCAT(DISTINCT a_recip.name), '') AS to_agents \
+             COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, \
+             COALESCE(NULLIF(TRIM(p.slug), ''), '[unknown-project-' || m.project_id || ']') AS project_slug, \
+             COALESCE(GROUP_CONCAT(DISTINCT COALESCE(NULLIF(TRIM(a_recip.name), ''), '[unknown-agent-' || mr.agent_id || ']')), '') AS to_agents \
              FROM messages m \
              LEFT JOIN agents s ON s.id = m.sender_id \
-             JOIN projects p ON p.id = m.project_id \
+             LEFT JOIN projects p ON p.id = m.project_id \
              LEFT JOIN message_recipients mr ON mr.message_id = m.id \
              LEFT JOIN agents a_recip ON a_recip.id = mr.agent_id \
              WHERE {where_clause} \
