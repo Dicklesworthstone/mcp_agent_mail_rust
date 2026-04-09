@@ -235,10 +235,7 @@ where
     F: FnOnce(),
 {
     if json_mode {
-        ftui_runtime::ftui_println!(
-            "{}",
-            serde_json::to_string_pretty(data).unwrap_or_else(|_| "[]".to_string())
-        );
+        ftui_runtime::ftui_println!("{}", encode_json_pretty_or_error(data));
     } else {
         render();
     }
@@ -1251,6 +1248,29 @@ mod tests {
 
         let output = with_capture(|| {
             emit_output(&FailingSerialize, CliOutputFormat::Json, || {
+                panic!("table render should not be called");
+            });
+        });
+        let parsed: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("error output should be valid json");
+        assert_eq!(parsed["error"], "output serialization failed: boom");
+    }
+
+    #[test]
+    fn json_or_table_json_mode_surfaces_serialization_errors() {
+        struct FailingSerialize;
+
+        impl Serialize for FailingSerialize {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("boom"))
+            }
+        }
+
+        let output = with_capture(|| {
+            json_or_table(true, &FailingSerialize, || {
                 panic!("table render should not be called");
             });
         });

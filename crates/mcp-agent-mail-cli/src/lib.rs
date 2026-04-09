@@ -12158,6 +12158,13 @@ struct DoctorOrphanedMessageRecipient {
     missing_agent: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DoctorRecipientCleanupSummary {
+    deleted_rows: usize,
+    preserved_missing_agent_rows: usize,
+    affected_agents: usize,
+}
+
 fn doctor_foreign_key_violations(
     conn: &mcp_agent_mail_db::DbConn,
 ) -> CliResult<Vec<DoctorForeignKeyViolation>> {
@@ -12260,21 +12267,47 @@ fn doctor_rebuild_inbox_stats_for_agents(
 fn doctor_cleanup_orphaned_message_recipients(
     conn: &mcp_agent_mail_db::DbConn,
     dry_run: bool,
-) -> CliResult<(usize, usize)> {
+) -> CliResult<DoctorRecipientCleanupSummary> {
     let orphaned = doctor_orphaned_message_recipients(conn)?;
     if orphaned.is_empty() {
-        return Ok((0, 0));
+        return Ok(DoctorRecipientCleanupSummary {
+            deleted_rows: 0,
+            preserved_missing_agent_rows: 0,
+            affected_agents: 0,
+        });
     }
 
-    let affected_agents: Vec<i64> = orphaned
+    let dangling_message_rows: Vec<_> = orphaned
         .iter()
+        .filter(|row| row.missing_message)
+        .cloned()
+        .collect();
+    let preserved_missing_agent_rows = orphaned
+        .iter()
+        .filter(|row| !row.missing_message && row.missing_agent)
+        .count();
+    let affected_agents: Vec<i64> = dangling_message_rows
+        .iter()
+        .filter(|row| !row.missing_agent)
         .map(|row| row.agent_id)
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
 
     if dry_run {
-        return Ok((orphaned.len(), affected_agents.len()));
+        return Ok(DoctorRecipientCleanupSummary {
+            deleted_rows: dangling_message_rows.len(),
+            preserved_missing_agent_rows,
+            affected_agents: affected_agents.len(),
+        });
+    }
+
+    if dangling_message_rows.is_empty() {
+        return Ok(DoctorRecipientCleanupSummary {
+            deleted_rows: 0,
+            preserved_missing_agent_rows,
+            affected_agents: 0,
+        });
     }
 
     conn.execute_raw("BEGIN IMMEDIATE")
@@ -12282,7 +12315,7 @@ fn doctor_cleanup_orphaned_message_recipients(
 
     let cleanup_result = (|| -> CliResult<()> {
         let delete_sql = "DELETE FROM message_recipients WHERE message_id = ? AND agent_id = ?";
-        for orphan in &orphaned {
+        for orphan in &dangling_message_rows {
             let params = [
                 mcp_agent_mail_db::sqlmodel_core::Value::BigInt(orphan.message_id),
                 mcp_agent_mail_db::sqlmodel_core::Value::BigInt(orphan.agent_id),
@@ -12294,7 +12327,10 @@ fn doctor_cleanup_orphaned_message_recipients(
                 ))
             })?;
         }
-        doctor_rebuild_inbox_stats_for_agents(conn, &affected_agents)
+        if !affected_agents.is_empty() {
+            doctor_rebuild_inbox_stats_for_agents(conn, &affected_agents)?;
+        }
+        Ok(())
     })();
 
     match cleanup_result {
@@ -12307,7 +12343,11 @@ fn doctor_cleanup_orphaned_message_recipients(
         }
     }
 
-    Ok((orphaned.len(), affected_agents.len()))
+    Ok(DoctorRecipientCleanupSummary {
+        deleted_rows: dangling_message_rows.len(),
+        preserved_missing_agent_rows,
+        affected_agents: affected_agents.len(),
+    })
 }
 
 fn beads_issue_awareness_counts_from(
@@ -24030,6 +24070,10 @@ http_headers = { Authorization = "Bearer secret" }
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
 
+        let (code, _headers, body) = http_get(addr, "/__preview__/status-extra");
+        assert_eq!(code, 404, "status endpoint should require an exact path");
+        assert_eq!(body, b"Not Found");
+
         let (code, headers, _body) = http_get(addr, "/viewer/");
         assert_eq!(code, 200, "/viewer/ should serve index.html");
         assert!(
@@ -24061,6 +24105,16 @@ http_headers = { Authorization = "Bearer secret" }
         key_tx.send('d').expect("send deploy");
         let result = thread.join().expect("join preview thread");
         assert!(matches!(result, Err(CliError::ExitCode(42))));
+    }
+
+    #[test]
+    fn collect_preview_status_counts_only_real_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("index.html"), "<html>root</html>").expect("write index");
+        std::fs::write(temp.path().join("manifest.json"), "{}\n").expect("write manifest");
+
+        let status = collect_preview_status(temp.path());
+        assert_eq!(status.files_indexed, 2, "manual token must not count as a file");
     }
 
     #[test]
@@ -38546,6 +38600,124 @@ startup_timeout_sec = 42
             1
         );
     }
+
+    #[test]
+    fn doctor_repair_preserves_message_recipients_when_only_agent_metadata_is_missing() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir
+            .path()
+            .join("doctor_repair_preserve_missing_agent_recipient.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let backup_dir = dir.path().join("backups");
+
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init pragmas");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys for fixture");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'repair-preserve-recipient', '/tmp/repair-preserve-recipient', 0)",
+        )
+        .expect("insert project");
+        conn.execute_raw(
+            "INSERT INTO agents
+             (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+             VALUES
+                (1, 1, 'Sender', 'codex-cli', 'gpt-5', 'sender', 0, 0, 'auto', 'auto')",
+        )
+        .expect("insert sender");
+        conn.execute_raw(
+            "INSERT INTO messages
+             (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments)
+             VALUES (1, 1, 1, 'THREAD-PRESERVE-RECIPIENT', 'preserve', 'body', 'normal', 0, 100, '[]')",
+        )
+        .expect("insert message");
+        conn.execute_raw(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (1, 999, 'to', NULL, NULL)",
+        )
+        .expect("insert missing-agent recipient");
+        drop(conn);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        handle_doctor_repair_with(&db_url, dir.path(), &backup_dir, None, false, true)
+            .expect("repair");
+        let output = capture.drain_to_string();
+
+        let verify =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("reopen db");
+        let recipient_rows = verify
+            .query_sync(
+                "SELECT COUNT(*) AS count FROM message_recipients WHERE message_id = 1 AND agent_id = 999",
+                &[],
+            )
+            .expect("recipient count");
+        assert_eq!(
+            recipient_rows[0].get_named::<i64>("count").unwrap_or(-1),
+            1,
+            "repair should preserve recipient rows when only agent metadata is missing"
+        );
+        assert!(
+            output.contains("Preserved recipient rows with missing agent metadata: 1"),
+            "expected preserved-recipient notice, got: {output}"
+        );
+    }
+
+    #[test]
+    fn doctor_repair_preserves_messages_when_project_metadata_is_missing() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir
+            .path()
+            .join("doctor_repair_preserve_missing_project.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let backup_dir = dir.path().join("backups");
+
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init pragmas");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys for fixture");
+        conn.execute_raw(
+            "INSERT INTO messages
+             (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments)
+             VALUES (1, 777, NULL, 'THREAD-PRESERVE-PROJECT', 'preserve project drift', 'body', 'normal', 0, 100, '[]')",
+        )
+        .expect("insert orphan-project message");
+        drop(conn);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        handle_doctor_repair_with(&db_url, dir.path(), &backup_dir, None, false, true)
+            .expect("repair");
+        let output = capture.drain_to_string();
+
+        let verify =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("reopen db");
+        let message_rows = verify
+            .query_sync("SELECT COUNT(*) AS count FROM messages WHERE id = 1", &[])
+            .expect("message count");
+        assert_eq!(
+            message_rows[0].get_named::<i64>("count").unwrap_or(-1),
+            1,
+            "repair should preserve messages when only project metadata is missing"
+        );
+        assert!(
+            output.contains("Orphan messages: 1 (preserved; project metadata row missing)"),
+            "expected preserved-message notice, got: {output}"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41281,7 +41453,7 @@ fn handle_doctor_repair_with(
 
     ftui_runtime::ftui_println!("Running database repair...");
     if !confirm_mutating_doctor_action(
-        "Proceed with database repair? This can create backups, rebuild FTS tables, VACUUM/ANALYZE/REINDEX, and delete orphaned rows.",
+        "Proceed with database repair? This can create backups, rebuild FTS tables, VACUUM/ANALYZE/REINDEX, and clean dangling recipient rows.",
         dry_run,
         yes,
     )? {
@@ -41402,28 +41574,32 @@ fn handle_doctor_repair_with(
         .and_then(|r| r.get_named("cnt").ok())
         .unwrap_or(0);
     if orphan_count > 0 {
-        ftui_runtime::ftui_println!("  Orphan messages: {orphan_count}");
-        if !dry_run {
-            conn.execute_raw(
-                "DELETE FROM messages WHERE project_id NOT IN (SELECT id FROM projects)",
-            )
-            .ok();
-            ftui_runtime::ftui_println!("  Cleaned orphan messages.");
-        }
+        ftui_runtime::ftui_println!(
+            "  Orphan messages: {orphan_count} (preserved; project metadata row missing)"
+        );
     }
 
-    let (orphaned_recipients, affected_agents) =
-        doctor_cleanup_orphaned_message_recipients(&conn, dry_run)?;
-    if orphaned_recipients > 0 {
+    let recipient_cleanup = doctor_cleanup_orphaned_message_recipients(&conn, dry_run)?;
+    if recipient_cleanup.deleted_rows > 0 {
         if dry_run {
             ftui_runtime::ftui_println!(
-                "  Orphaned message recipients: {orphaned_recipients} (would rebuild inbox_stats for {affected_agents} agent(s))"
+                "  Dangling message recipients: {} (would rebuild inbox_stats for {} agent(s))",
+                recipient_cleanup.deleted_rows,
+                recipient_cleanup.affected_agents,
             );
         } else {
             ftui_runtime::ftui_println!(
-                "  Cleaned orphaned message recipients: {orphaned_recipients} (rebuilt inbox_stats for {affected_agents} agent(s))"
+                "  Cleaned dangling message recipients: {} (rebuilt inbox_stats for {} agent(s))",
+                recipient_cleanup.deleted_rows,
+                recipient_cleanup.affected_agents,
             );
         }
+    }
+    if recipient_cleanup.preserved_missing_agent_rows > 0 {
+        ftui_runtime::ftui_println!(
+            "  Preserved recipient rows with missing agent metadata: {}",
+            recipient_cleanup.preserved_missing_agent_rows
+        );
     }
 
     // 4. Rebuild FTS if tables exist
@@ -45071,7 +45247,7 @@ fn collect_preview_status(bundle_path: &Path) -> PreviewStatusPayload {
 
     PreviewStatusPayload {
         signature,
-        files_indexed: parts.len(),
+        files_indexed: file_entries.len(),
         last_modified_ns,
         last_modified_iso,
         manifest_ns,
@@ -45132,6 +45308,57 @@ fn collect_preview_files(
 }
 
 type PreviewLog = std::sync::Arc<std::sync::Mutex<std::fs::File>>;
+
+#[derive(Debug, Clone)]
+struct ToolingLockReport {
+    archive_root: String,
+    exists: bool,
+    raw_locks: Vec<serde_json::Value>,
+}
+
+impl ToolingLockReport {
+    fn payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "archive_root": self.archive_root,
+            "exists": self.exists,
+            "total": self.raw_locks.len(),
+            "locks": self.raw_locks,
+        })
+    }
+}
+
+fn tooling_lock_report_from_result(
+    config: &Config,
+    lock_info: mcp_agent_mail_storage::Result<serde_json::Value>,
+) -> CliResult<ToolingLockReport> {
+    let lock_info = lock_info.map_err(|err| {
+        CliError::Other(format!(
+            "failed to inspect archive locks under {}: {err}",
+            config.storage_root.display()
+        ))
+    })?;
+
+    Ok(ToolingLockReport {
+        archive_root: lock_info
+            .get("archive_root")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| config.storage_root.display().to_string()),
+        exists: lock_info
+            .get("exists")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| config.storage_root.exists()),
+        raw_locks: lock_info
+            .get("locks")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+    })
+}
+
+fn tooling_lock_report(config: &Config) -> CliResult<ToolingLockReport> {
+    tooling_lock_report_from_result(config, mcp_agent_mail_storage::collect_lock_status(config))
+}
 
 fn preview_log_line(log: &Option<PreviewLog>, line: &str) {
     use std::io::Write;
@@ -45210,7 +45437,7 @@ fn start_preview_server(
                         let path = uri.split('?').next().unwrap_or("/");
                         preview_log_line(&log, &format!("GET {path}"));
 
-                        if path.starts_with("/__preview__/status") {
+                        if path == "/__preview__/status" {
                             let payload = collect_preview_status(&dir);
                             let body = serde_json::to_vec(&payload).unwrap_or_default();
                             let mut resp = Response::new(200, "OK", body);
@@ -46029,8 +46256,28 @@ fn tooling_sql_value_to_text(value: sqlmodel_core::Value) -> String {
         sqlmodel_core::Value::TimestampTz(micros) => micros.to_string(),
         sqlmodel_core::Value::Uuid(uuid) => hex::encode(uuid),
         sqlmodel_core::Value::Json(json) => json.to_string(),
-        sqlmodel_core::Value::Array(items) => serde_json::to_string(&items).unwrap_or_default(),
+        sqlmodel_core::Value::Array(items) => {
+            let value = serde_json::Value::Array(
+                items
+                    .into_iter()
+                    .map(tooling_sql_value_to_json)
+                    .collect::<Vec<_>>(),
+            );
+            value.to_string()
+        }
     }
+}
+
+#[test]
+fn tooling_sql_value_to_text_preserves_array_values_with_non_finite_numbers() {
+    let rendered = tooling_sql_value_to_text(sqlmodel_core::Value::Array(vec![
+        sqlmodel_core::Value::Double(f64::NAN),
+        sqlmodel_core::Value::Text("ok".to_string()),
+        sqlmodel_core::Value::Int(7),
+    ]));
+    let parsed: serde_json::Value =
+        serde_json::from_str(&rendered).expect("rendered array text should remain valid json");
+    assert_eq!(parsed, serde_json::json!([null, "ok", 7]));
 }
 
 fn handle_tooling_directory(
@@ -46457,26 +46704,29 @@ fn handle_tooling_diagnostics(
 fn handle_tooling_locks(format: Option<output::CliOutputFormat>, json_mode: bool) -> CliResult<()> {
     let fmt = output::CliOutputFormat::resolve(format, json_mode);
     let config = Config::from_env();
-    let lock_info = mcp_agent_mail_storage::collect_lock_status(&config)
-        .unwrap_or_else(|_e| serde_json::json!({"archive_root": "", "exists": false, "locks": []}));
-
-    let raw_locks = lock_info
-        .get("locks")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let val = serde_json::json!({
-        "total": raw_locks.len(),
-        "locks": raw_locks,
-    });
+    let report = tooling_lock_report(&config)?;
+    let archive_root = report.archive_root.clone();
+    let exists = report.exists;
+    let raw_locks = report.raw_locks.clone();
+    let val = report.payload();
     output::emit_output(&val, fmt, || {
         output::section("Archive Locks:");
+        output::kv("Archive root", &archive_root);
+        output::kv("Exists", if exists { "yes" } else { "no" });
+
+        if !exists {
+            ftui_runtime::ftui_println!("");
+            output::warn("Archive root does not exist.");
+            return;
+        }
 
         if raw_locks.is_empty() {
+            ftui_runtime::ftui_println!("");
             output::emit_empty(fmt, "No active locks.");
             return;
         }
 
+        ftui_runtime::ftui_println!("");
         output::kv("Total", &raw_locks.len().to_string());
         ftui_runtime::ftui_println!("");
 
@@ -46514,6 +46764,51 @@ fn handle_tooling_locks(format: Option<output::CliOutputFormat>, json_mode: bool
         table.render();
     });
     Ok(())
+}
+
+#[test]
+fn tooling_lock_report_includes_archive_metadata() {
+    let config = Config {
+        storage_root: PathBuf::from("/tmp/tooling-lock-report-test"),
+        ..Config::default()
+    };
+    let report = tooling_lock_report_from_result(
+        &config,
+        Ok(serde_json::json!({
+            "archive_root": "/tmp/archive-root",
+            "exists": false,
+            "locks": [],
+        })),
+    )
+    .expect("lock report should build");
+
+    let payload = report.payload();
+    assert_eq!(payload["archive_root"], "/tmp/archive-root");
+    assert_eq!(payload["exists"], false);
+    assert_eq!(payload["total"], 0);
+    assert_eq!(payload["locks"], serde_json::json!([]));
+}
+
+#[test]
+fn tooling_lock_report_surfaces_storage_errors() {
+    let config = Config {
+        storage_root: PathBuf::from("/tmp/tooling-lock-report-error"),
+        ..Config::default()
+    };
+    let err = tooling_lock_report_from_result(
+        &config,
+        Err(mcp_agent_mail_storage::StorageError::NotInitialized),
+    )
+    .expect_err("storage errors must be surfaced");
+
+    match err {
+        CliError::Other(detail) => {
+            assert!(detail.contains("failed to inspect archive locks under"));
+            assert!(detail.contains("/tmp/tooling-lock-report-error"));
+            assert!(detail.contains("Archive not initialized"));
+        }
+        other => panic!("unexpected error variant: {other:?}"),
+    }
 }
 
 fn guess_content_type(path: &Path) -> &'static str {
