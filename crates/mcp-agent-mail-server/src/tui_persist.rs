@@ -639,17 +639,15 @@ fn atomic_write_text(path: &Path, contents: &str) -> Result<(), std::io::Error> 
                     file.write_all(contents.as_bytes())?;
                     file.sync_data()?;
                     drop(file);
-                    if let Err(error) = std::fs::rename(&tmp_path, path) {
-                        #[cfg(windows)]
-                        {
-                            if path.exists() {
-                                std::fs::remove_file(path)?;
-                                std::fs::rename(&tmp_path, path)?;
-                                return Ok(());
-                            }
+                    #[cfg(windows)]
+                    {
+                        if path.exists() {
+                            std::fs::remove_file(path)?;
+                            std::fs::rename(&tmp_path, path)?;
+                            return Ok(());
                         }
-                        return Err(error);
                     }
+                    std::fs::rename(&tmp_path, path)?;
                     Ok(())
                 })();
                 if let Err(error) = write_result {

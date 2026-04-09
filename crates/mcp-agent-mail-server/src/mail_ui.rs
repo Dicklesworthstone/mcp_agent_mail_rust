@@ -216,6 +216,30 @@ first body
     }
 
     #[test]
+    fn json_err_escapes_error_detail() {
+        let detail = "bad \"quote\"\nline";
+        let Err((status, body)) = json_err(422, detail) else {
+            panic!("json_err should return error payload");
+        };
+        assert_eq!(status, 422);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("error body should be valid json");
+        assert_eq!(parsed["error"], detail);
+    }
+
+    #[test]
+    fn json_detail_err_escapes_detail_payload() {
+        let detail = "missing \"field\"\\path";
+        let Err((status, body)) = json_detail_err(404, detail) else {
+            panic!("json_detail_err should return error payload");
+        };
+        assert_eq!(status, 404);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("detail error body should be valid json");
+        assert_eq!(parsed["detail"], detail);
+    }
+
+    #[test]
     fn unified_message_view_populates_client_fields() {
         let aggregate = UnifiedMessageAggregate {
             id: 7,
@@ -2087,17 +2111,20 @@ fn json_ok(value: &serde_json::Value) -> Result<Option<String>, (u16, String)> {
         .map_err(|e| (500, format!("JSON error: {e}")))
 }
 
+fn encode_json_error_body(field: &str, detail: &str) -> Result<String, (u16, String)> {
+    let body = serde_json::json!({ field: detail });
+    serde_json::to_string(&body).map_err(|e| (500, format!("JSON error: {e}")))
+}
+
 fn json_err(status: u16, detail: &str) -> Result<Option<String>, (u16, String)> {
-    let body = serde_json::json!({ "error": detail });
-    let s = serde_json::to_string(&body).unwrap_or_else(|_| format!("{{\"error\":\"{detail}\"}}"));
+    let s = encode_json_error_body("error", detail)?;
     // Return the JSON as a successful dispatch result so the caller can set the HTTP status.
     // We embed the status in the Err variant so the server can return the right code.
     Err((status, s))
 }
 
 fn json_detail_err(status: u16, detail: &str) -> Result<Option<String>, (u16, String)> {
-    let body = serde_json::json!({ "detail": detail });
-    let s = serde_json::to_string(&body).unwrap_or_else(|_| format!("{{\"detail\":\"{detail}\"}}"));
+    let s = encode_json_error_body("detail", detail)?;
     Err((status, s))
 }
 
@@ -4490,11 +4517,10 @@ fn parse_overseer_body(body: &str) -> Result<OverseerPayload, (u16, String)> {
 
     // Validation (Python parity).
     let err = |msg: &str| -> (u16, String) {
-        let body = serde_json::json!({ "error": msg });
-        (
-            400,
-            serde_json::to_string(&body).unwrap_or_else(|_| format!("{{\"error\":\"{msg}\"}}")),
-        )
+        match encode_json_error_body("error", msg) {
+            Ok(body) => (400, body),
+            Err(error) => error,
+        }
     };
     if recipients.is_empty() {
         return Err(err("At least one recipient is required"));

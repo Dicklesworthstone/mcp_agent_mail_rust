@@ -264,24 +264,45 @@ where
             table_render();
         }
         CliOutputFormat::Json => {
-            ftui_runtime::ftui_println!(
-                "{}",
-                serde_json::to_string_pretty(data).unwrap_or_else(|_| "{}".to_string())
-            );
+            ftui_runtime::ftui_println!("{}", encode_json_pretty_or_error(data));
         }
         CliOutputFormat::Toon => {
-            let json_str = serde_json::to_string(data).unwrap_or_else(|_| "{}".to_string());
+            let json_str = encode_json_compact_or_error(data);
             match toon::json_to_toon(&json_str) {
                 Ok(toon_str) => ftui_runtime::ftui_println!("{}", toon_str),
                 Err(_) => {
                     // Fallback to JSON if TOON conversion fails
-                    ftui_runtime::ftui_println!(
-                        "{}",
-                        serde_json::to_string_pretty(data).unwrap_or_else(|_| "{}".to_string())
-                    );
+                    ftui_runtime::ftui_println!("{}", encode_json_pretty_or_error(data));
                 }
             }
         }
+    }
+}
+
+fn encode_json_pretty_or_error<T: Serialize>(data: &T) -> String {
+    match serde_json::to_string_pretty(data) {
+        Ok(json) => json,
+        Err(error) => {
+            serialize_output_error_json(&format!("output serialization failed: {error}"), true)
+        }
+    }
+}
+
+fn encode_json_compact_or_error<T: Serialize>(data: &T) -> String {
+    match serde_json::to_string(data) {
+        Ok(json) => json,
+        Err(error) => {
+            serialize_output_error_json(&format!("output serialization failed: {error}"), false)
+        }
+    }
+}
+
+fn serialize_output_error_json(message: &str, pretty: bool) -> String {
+    let payload = serde_json::json!({ "error": message });
+    if pretty {
+        serde_json::to_string_pretty(&payload).expect("error payload must serialize")
+    } else {
+        serde_json::to_string(&payload).expect("error payload must serialize")
     }
 }
 
@@ -1213,6 +1234,29 @@ mod tests {
         assert!(!output.is_empty());
         // TOON uses different formatting than pretty JSON
         // Just verify it produces output without crashing
+    }
+
+    #[test]
+    fn emit_output_json_format_surfaces_serialization_errors() {
+        struct FailingSerialize;
+
+        impl Serialize for FailingSerialize {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("boom"))
+            }
+        }
+
+        let output = with_capture(|| {
+            emit_output(&FailingSerialize, CliOutputFormat::Json, || {
+                panic!("table render should not be called");
+            });
+        });
+        let parsed: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("error output should be valid json");
+        assert_eq!(parsed["error"], "output serialization failed: boom");
     }
 
     #[test]
