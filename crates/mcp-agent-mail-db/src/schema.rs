@@ -1265,6 +1265,11 @@ pub fn schema_migrations() -> Vec<Migration> {
     // no backfill needed. Pre-learning installations have no experience
     // data. Post-learning installations start accumulating rows from the
     // first ATC tick that emits experiences.
+    //
+    // Recovery note: interrupted bootstrap can leave behind partial ATC
+    // tables. `CREATE TABLE IF NOT EXISTS` does not repair those, so we add
+    // explicit `ALTER TABLE ... ADD COLUMN` repair steps before any dependent
+    // index migrations run.
 
     migrations.push(Migration::new(
         "v16_create_atc_experiences".to_string(),
@@ -1302,6 +1307,162 @@ pub fn schema_migrations() -> Vec<Migration> {
             context_json TEXT\
          )"
         .to_string(),
+        String::new(),
+    ));
+
+    for (id, description, column_def) in [
+        (
+            "v16a_atc_experiences_add_effect_id",
+            "repair partial atc_experiences schema by adding effect_id",
+            "effect_id INTEGER NOT NULL DEFAULT -1",
+        ),
+        (
+            "v16a_atc_experiences_add_trace_id",
+            "repair partial atc_experiences schema by adding trace_id",
+            "trace_id TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "v16a_atc_experiences_add_claim_id",
+            "repair partial atc_experiences schema by adding claim_id",
+            "claim_id TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "v16a_atc_experiences_add_evidence_id",
+            "repair partial atc_experiences schema by adding evidence_id",
+            "evidence_id TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "v16a_atc_experiences_add_state",
+            "repair partial atc_experiences schema by adding state",
+            "state TEXT NOT NULL DEFAULT 'planned'",
+        ),
+        (
+            "v16a_atc_experiences_add_subsystem",
+            "repair partial atc_experiences schema by adding subsystem",
+            "subsystem TEXT NOT NULL DEFAULT 'liveness'",
+        ),
+        (
+            "v16a_atc_experiences_add_decision_class",
+            "repair partial atc_experiences schema by adding decision_class",
+            "decision_class TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "v16a_atc_experiences_add_subject",
+            "repair partial atc_experiences schema by adding subject",
+            "subject TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "v16a_atc_experiences_add_project_key",
+            "repair partial atc_experiences schema by adding project_key",
+            "project_key TEXT",
+        ),
+        (
+            "v16a_atc_experiences_add_policy_id",
+            "repair partial atc_experiences schema by adding policy_id",
+            "policy_id TEXT",
+        ),
+        (
+            "v16a_atc_experiences_add_effect_kind",
+            "repair partial atc_experiences schema by adding effect_kind",
+            "effect_kind TEXT NOT NULL DEFAULT 'probe'",
+        ),
+        (
+            "v16a_atc_experiences_add_action",
+            "repair partial atc_experiences schema by adding action",
+            "action TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "v16a_atc_experiences_add_posterior_json",
+            "repair partial atc_experiences schema by adding posterior_json",
+            "posterior_json TEXT NOT NULL DEFAULT '[]'",
+        ),
+        (
+            "v16a_atc_experiences_add_expected_loss",
+            "repair partial atc_experiences schema by adding expected_loss",
+            "expected_loss REAL NOT NULL DEFAULT 0.0",
+        ),
+        (
+            "v16a_atc_experiences_add_runner_up_action",
+            "repair partial atc_experiences schema by adding runner_up_action",
+            "runner_up_action TEXT",
+        ),
+        (
+            "v16a_atc_experiences_add_runner_up_loss",
+            "repair partial atc_experiences schema by adding runner_up_loss",
+            "runner_up_loss REAL",
+        ),
+        (
+            "v16a_atc_experiences_add_evidence_summary",
+            "repair partial atc_experiences schema by adding evidence_summary",
+            "evidence_summary TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "v16a_atc_experiences_add_calibration_healthy",
+            "repair partial atc_experiences schema by adding calibration_healthy",
+            "calibration_healthy INTEGER NOT NULL DEFAULT 1",
+        ),
+        (
+            "v16a_atc_experiences_add_safe_mode_active",
+            "repair partial atc_experiences schema by adding safe_mode_active",
+            "safe_mode_active INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "v16a_atc_experiences_add_non_execution_json",
+            "repair partial atc_experiences schema by adding non_execution_json",
+            "non_execution_json TEXT",
+        ),
+        (
+            "v16a_atc_experiences_add_outcome_json",
+            "repair partial atc_experiences schema by adding outcome_json",
+            "outcome_json TEXT",
+        ),
+        (
+            "v16a_atc_experiences_add_features_json",
+            "repair partial atc_experiences schema by adding features_json",
+            "features_json TEXT",
+        ),
+        (
+            "v16a_atc_experiences_add_feature_ext_json",
+            "repair partial atc_experiences schema by adding feature_ext_json",
+            "feature_ext_json TEXT",
+        ),
+        (
+            "v16a_atc_experiences_add_created_ts",
+            "repair partial atc_experiences schema by adding created_ts",
+            "created_ts INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "v16a_atc_experiences_add_dispatched_ts",
+            "repair partial atc_experiences schema by adding dispatched_ts",
+            "dispatched_ts INTEGER",
+        ),
+        (
+            "v16a_atc_experiences_add_executed_ts",
+            "repair partial atc_experiences schema by adding executed_ts",
+            "executed_ts INTEGER",
+        ),
+        (
+            "v16a_atc_experiences_add_resolved_ts",
+            "repair partial atc_experiences schema by adding resolved_ts",
+            "resolved_ts INTEGER",
+        ),
+        (
+            "v16a_atc_experiences_add_context_json",
+            "repair partial atc_experiences schema by adding context_json",
+            "context_json TEXT",
+        ),
+    ] {
+        migrations.push(Migration::new(
+            id.to_string(),
+            description.to_string(),
+            format!("ALTER TABLE atc_experiences ADD COLUMN {column_def}"),
+            String::new(),
+        ));
+    }
+    migrations.push(Migration::new(
+        "v16a_atc_experiences_backfill_effect_id_from_pk".to_string(),
+        "backfill synthetic effect_id values for partial atc_experiences rows".to_string(),
+        "UPDATE atc_experiences SET effect_id = -experience_id WHERE effect_id = -1".to_string(),
         String::new(),
     ));
 
@@ -1382,6 +1543,76 @@ pub fn schema_migrations() -> Vec<Migration> {
         .to_string(),
         String::new(),
     ));
+
+    for (id, description, column_def) in [
+        (
+            "v16b_atc_rollups_add_subsystem",
+            "repair partial atc_experience_rollups schema by adding subsystem",
+            "subsystem TEXT NOT NULL DEFAULT 'liveness'",
+        ),
+        (
+            "v16b_atc_rollups_add_effect_kind",
+            "repair partial atc_experience_rollups schema by adding effect_kind",
+            "effect_kind TEXT NOT NULL DEFAULT 'probe'",
+        ),
+        (
+            "v16b_atc_rollups_add_risk_tier",
+            "repair partial atc_experience_rollups schema by adding risk_tier",
+            "risk_tier INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "v16b_atc_rollups_add_total_count",
+            "repair partial atc_experience_rollups schema by adding total_count",
+            "total_count INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "v16b_atc_rollups_add_resolved_count",
+            "repair partial atc_experience_rollups schema by adding resolved_count",
+            "resolved_count INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "v16b_atc_rollups_add_censored_count",
+            "repair partial atc_experience_rollups schema by adding censored_count",
+            "censored_count INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "v16b_atc_rollups_add_expired_count",
+            "repair partial atc_experience_rollups schema by adding expired_count",
+            "expired_count INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "v16b_atc_rollups_add_correct_count",
+            "repair partial atc_experience_rollups schema by adding correct_count",
+            "correct_count INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "v16b_atc_rollups_add_incorrect_count",
+            "repair partial atc_experience_rollups schema by adding incorrect_count",
+            "incorrect_count INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "v16b_atc_rollups_add_total_regret",
+            "repair partial atc_experience_rollups schema by adding total_regret",
+            "total_regret REAL NOT NULL DEFAULT 0.0",
+        ),
+        (
+            "v16b_atc_rollups_add_total_loss",
+            "repair partial atc_experience_rollups schema by adding total_loss",
+            "total_loss REAL NOT NULL DEFAULT 0.0",
+        ),
+        (
+            "v16b_atc_rollups_add_last_updated_ts",
+            "repair partial atc_experience_rollups schema by adding last_updated_ts",
+            "last_updated_ts INTEGER NOT NULL DEFAULT 0",
+        ),
+    ] {
+        migrations.push(Migration::new(
+            id.to_string(),
+            description.to_string(),
+            format!("ALTER TABLE atc_experience_rollups ADD COLUMN {column_def}"),
+            String::new(),
+        ));
+    }
 
     migrations.push(Migration::new(
         "v16_analyze_atc_experiences".to_string(),
