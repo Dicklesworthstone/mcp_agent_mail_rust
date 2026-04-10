@@ -1393,6 +1393,30 @@ mod utility_tests {
         assert_eq!(extract_query_str("", "q"), None);
     }
 
+    #[test]
+    fn parse_importance_filter_params_accepts_repeated_values() {
+        let parsed = parse_importance_filter_params("imp=urgent&imp=high");
+        assert_eq!(
+            parsed,
+            vec![
+                mcp_agent_mail_db::search_planner::Importance::Urgent,
+                mcp_agent_mail_db::search_planner::Importance::High,
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_importance_filter_params_accepts_comma_separated_values() {
+        let parsed = parse_importance_filter_params("imp=urgent%2Chigh");
+        assert_eq!(
+            parsed,
+            vec![
+                mcp_agent_mail_db::search_planner::Importance::Urgent,
+                mcp_agent_mail_db::search_planner::Importance::High,
+            ]
+        );
+    }
+
     // --- parse_ack_filter_param ---
 
     #[test]
@@ -3176,6 +3200,21 @@ fn extract_query_str_all(query: &str, key: &str) -> Vec<String> {
     out
 }
 
+fn parse_importance_filter_params(
+    query: &str,
+) -> Vec<mcp_agent_mail_db::search_planner::Importance> {
+    let mut out = Vec::new();
+    for raw_value in extract_query_str_all(query, "imp") {
+        for segment in raw_value.split(',') {
+            let value = segment.trim();
+            if let Some(importance) = mcp_agent_mail_db::search_planner::Importance::parse(value) {
+                out.push(importance);
+            }
+        }
+    }
+    out
+}
+
 fn parse_ack_filter_param(value: &str) -> Option<bool> {
     match value {
         "required" | "1" | "true" => Some(true),
@@ -3327,10 +3366,10 @@ fn render_search(
     let cursor = extract_query_str(query_str, "cursor").unwrap_or_default();
 
     // Facets
-    let imp_strs = extract_query_str_all(query_str, "imp");
-    let importance_filter: Vec<Importance> = imp_strs
+    let importance_filter: Vec<Importance> = parse_importance_filter_params(query_str);
+    let selected_importance: Vec<String> = importance_filter
         .iter()
-        .filter_map(|s| Importance::parse(s))
+        .map(|importance| importance.as_str().to_string())
         .collect();
 
     let agent_filter = extract_query_str(query_str, "agent").unwrap_or_default();
@@ -3455,7 +3494,7 @@ fn render_search(
             order,
             scope,
             boost,
-            importance: imp_strs,
+            importance: selected_importance,
             agent: agent_filter,
             thread: thread_filter,
             ack: ack_filter,
