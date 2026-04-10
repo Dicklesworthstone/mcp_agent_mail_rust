@@ -1845,8 +1845,43 @@ impl RobotDbHandle {
 fn prefer_archive_snapshot_when_local_db_lags_archive(
     local: RobotDbHandle,
     storage_root: &Path,
+    local_database_url: Option<&str>,
     context: &str,
 ) -> Result<RobotDbHandle, CliError> {
+    fn archive_is_authoritative_for_robot_db(
+        archive: &crate::DoctorArchiveInventory,
+        db: Option<&crate::DoctorDbInventory>,
+        storage_root: &Path,
+        local_database_url: Option<&str>,
+    ) -> bool {
+        let archive_root_can_override_external_db =
+            !mcp_agent_mail_core::config::is_default_storage_root(storage_root);
+        let resolved_sqlite_path = local_database_url
+            .and_then(|url| mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(url).ok());
+        match (db, resolved_sqlite_path) {
+            (Some(db), Some(resolved)) => {
+                let sqlite_path = Path::new(&resolved.canonical_path);
+                if !(archive_root_can_override_external_db || sqlite_path.starts_with(storage_root))
+                {
+                    return false;
+                }
+                crate::doctor_archive_is_authoritative_for_db(
+                    archive,
+                    db,
+                    sqlite_path,
+                    storage_root,
+                    archive_root_can_override_external_db,
+                )
+            }
+            (Some(db), None) => crate::doctor_archive_has_db_overlap(archive, db),
+            (None, Some(resolved)) => {
+                let sqlite_path = Path::new(&resolved.canonical_path);
+                archive_root_can_override_external_db || sqlite_path.starts_with(storage_root)
+            }
+            (None, None) => false,
+        }
+    }
+
     let archive = crate::collect_doctor_archive_inventory(storage_root);
     if archive.counts() == crate::DoctorInventoryCounts::default() {
         return Ok(local);
@@ -1854,6 +1889,14 @@ fn prefer_archive_snapshot_when_local_db_lags_archive(
 
     match crate::collect_doctor_db_inventory(&local.conn) {
         Ok(db) => {
+            if !archive_is_authoritative_for_robot_db(
+                &archive,
+                Some(&db),
+                storage_root,
+                local_database_url,
+            ) {
+                return Ok(local);
+            }
             if let Some(detail) = crate::doctor_archive_db_drift_detail(&archive, &db) {
                 tracing::warn!(
                     operation = context,
@@ -1866,6 +1909,14 @@ fn prefer_archive_snapshot_when_local_db_lags_archive(
             Ok(local)
         }
         Err(error) => {
+            if !archive_is_authoritative_for_robot_db(
+                &archive,
+                None,
+                storage_root,
+                local_database_url,
+            ) {
+                return Ok(local);
+            }
             tracing::warn!(
                 operation = context,
                 storage_root = %storage_root.display(),
@@ -2112,9 +2163,14 @@ fn resolve_robot_scope(
     agent_flag: Option<&str>,
 ) -> Result<ResolvedRobotScope, CliError> {
     let local = RobotDbHandle::open_local()?;
-    let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
-    let local =
-        prefer_archive_snapshot_when_local_db_lags_archive(local, &storage_root, "robot scope")?;
+    let config = mcp_agent_mail_core::Config::from_env();
+    let storage_root = config.storage_root;
+    let local = prefer_archive_snapshot_when_local_db_lags_archive(
+        local,
+        &storage_root,
+        Some(&config.database_url),
+        "robot scope",
+    )?;
     resolve_robot_scope_with_archive_fallback(local, &storage_root, project_flag, agent_flag)
 }
 
@@ -2122,10 +2178,12 @@ fn resolve_robot_project_scope(
     project_flag: Option<&str>,
 ) -> Result<ResolvedRobotProjectScope, CliError> {
     let local = RobotDbHandle::open_local()?;
-    let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
+    let config = mcp_agent_mail_core::Config::from_env();
+    let storage_root = config.storage_root;
     let local = prefer_archive_snapshot_when_local_db_lags_archive(
         local,
         &storage_root,
+        Some(&config.database_url),
         "robot project scope",
     )?;
     resolve_robot_project_scope_with_archive_fallback(local, &storage_root, project_flag)
@@ -2135,10 +2193,12 @@ fn resolve_robot_attachments_project_scope(
     project_flag: Option<&str>,
 ) -> Result<ResolvedRobotProjectScope, CliError> {
     let local = RobotDbHandle::open_local_attachments()?;
-    let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
+    let config = mcp_agent_mail_core::Config::from_env();
+    let storage_root = config.storage_root;
     let local = prefer_archive_snapshot_when_local_db_lags_archive(
         local,
         &storage_root,
+        Some(&config.database_url),
         "robot attachments project scope",
     )?;
     resolve_robot_project_scope_with_archive_fallback(local, &storage_root, project_flag)
@@ -12070,20 +12130,32 @@ mod tests {
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
         local_conn
             .query_sync(
-                "INSERT INTO projects (id, slug, human_key, created_at)
-                 VALUES (1, 'demo-project', '/tmp/demo-project', 0)",
+                "INSERT INTO projects (slug, human_key, created_at)
+                 VALUES ('demo-project', '/tmp/demo-project', 0)",
                 &empty,
             )
             .expect("insert local project");
+        let project_rows = local_conn
+            .query_sync(
+                "SELECT id AS project_id FROM projects
+                 WHERE slug = 'demo-project'
+                 ORDER BY id DESC
+                 LIMIT 1",
+                &empty,
+            )
+            .expect("lookup local project id");
+        let project_id = project_rows[0].get_named::<i64>("project_id").unwrap_or(0);
         local_conn
             .query_sync(
-                "INSERT INTO agents (
-                    id, project_id, name, program, model, task_description,
-                    created_at, updated_at, contact_policy, attachments_policy, last_active_ts
-                 ) VALUES (
-                    1, 1, 'BlueLake', 'codex-cli', 'gpt-5', 'robot',
-                    0, 0, 'auto', 'inline', 0
-                 )",
+                &format!(
+                    "INSERT INTO agents (
+                        project_id, name, program, model, task_description,
+                        inception_ts, last_active_ts, attachments_policy, contact_policy
+                     ) VALUES (
+                        {project_id}, 'BlueLake', 'codex-cli', 'gpt-5', 'robot',
+                        '2026-03-12 11:00:01', '2026-03-12 11:00:02', 'inline', 'auto'
+                     )"
+                ),
                 &empty,
             )
             .expect("insert local agent");
@@ -12124,6 +12196,7 @@ mod tests {
                     .expect("reopen local sqlite db"),
             ),
             storage_root.path(),
+            Some(&local_db_url),
             "robot scope",
         )
         .expect("archive drift should prefer archive snapshot");
@@ -12145,6 +12218,274 @@ mod tests {
         assert_eq!(
             scope.agent.as_ref().map(|(_, name)| name.as_str()),
             Some("BlueLake")
+        );
+    }
+
+    #[test]
+    fn prefer_archive_snapshot_when_local_db_lags_archive_keeps_live_db_for_metadata_only_archive_drift()
+     {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let local_db_path = temp_dir.path().join("robot_archive_metadata_only.sqlite3");
+        let local_db_url = format!("sqlite:///{}", local_db_path.display());
+        crate::handle_migrate_with_database_url(&local_db_url).expect("migrate local db");
+
+        let local_conn = mcp_agent_mail_db::DbConn::open_file(local_db_path.display().to_string())
+            .expect("open local sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+        local_conn
+            .query_sync(
+                "INSERT INTO projects (slug, human_key, created_at)
+                 VALUES ('demo-project', '/tmp/demo-project', 0)",
+                &empty,
+            )
+            .expect("insert local project");
+        let project_rows = local_conn
+            .query_sync(
+                "SELECT id AS project_id FROM projects
+                 WHERE slug = 'demo-project'
+                 ORDER BY id DESC
+                 LIMIT 1",
+                &empty,
+            )
+            .expect("lookup local project id");
+        let project_id = project_rows[0].get_named::<i64>("project_id").unwrap_or(0);
+        local_conn
+            .query_sync(
+                &format!(
+                    "INSERT INTO agents (
+                        project_id, name, program, model, task_description,
+                        inception_ts, last_active_ts, attachments_policy, contact_policy
+                     ) VALUES (
+                        {project_id}, 'BlueLake', 'codex-cli', 'gpt-5', 'robot',
+                        '2026-03-12 11:00:01', '2026-03-12 11:00:02', 'inline', 'auto'
+                     )"
+                ),
+                &empty,
+            )
+            .expect("insert local agent");
+        let agent_rows = local_conn
+            .query_sync(
+                &format!(
+                    "SELECT id AS agent_id FROM agents
+                     WHERE project_id = {project_id} AND name = 'BlueLake'
+                     ORDER BY id DESC
+                     LIMIT 1"
+                ),
+                &empty,
+            )
+            .expect("lookup local agent id");
+        let agent_id = agent_rows[0].get_named::<i64>("agent_id").unwrap_or(0);
+        local_conn
+            .query_sync(
+                &format!(
+                    "INSERT INTO messages (
+                        id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required,
+                        created_ts, attachments
+                     ) VALUES (
+                        4201, {project_id}, {agent_id}, 'demo-thread', 'Live only', 'body',
+                        'normal', 0, 0, '[]'
+                     )"
+                ),
+                &empty,
+            )
+            .expect("insert local message");
+        drop(local_conn);
+
+        let storage_root = tempfile::tempdir().expect("storage root");
+        let project_dir = storage_root.path().join("projects").join("demo-project");
+        let agents_dir = project_dir.join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("create agents dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"demo-project","human_key":"/tmp/demo-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::create_dir_all(agents_dir.join("BlueLake")).expect("create first agent dir");
+        std::fs::write(agents_dir.join("BlueLake").join("profile.json"), "{}")
+            .expect("write first agent profile");
+        std::fs::create_dir_all(agents_dir.join("RiverStone")).expect("create second agent dir");
+        std::fs::write(agents_dir.join("RiverStone").join("profile.json"), "{}")
+            .expect("write second agent profile");
+
+        let handle = prefer_archive_snapshot_when_local_db_lags_archive(
+            RobotDbHandle::from_conn(
+                mcp_agent_mail_db::DbConn::open_file(local_db_path.display().to_string())
+                    .expect("reopen local sqlite db"),
+            ),
+            storage_root.path(),
+            Some(&local_db_url),
+            "robot scope",
+        )
+        .expect("metadata-only archive drift should keep live db");
+
+        let rows = handle
+            .conn
+            .query_sync(
+                "SELECT COUNT(*) AS live_message_count
+                 FROM messages
+                 WHERE id = 4201 AND subject = 'Live only'",
+                &[],
+            )
+            .expect("query live sqlite messages");
+        let live_message_count = rows[0].get_named::<i64>("live_message_count").unwrap_or(0);
+        assert_eq!(
+            live_message_count, 1,
+            "robot should keep the live db handle"
+        );
+    }
+
+    #[test]
+    fn prefer_archive_snapshot_when_local_db_lags_archive_ignores_unrelated_default_archive() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let local_db_path = temp_dir.path().join("robot_archive_unrelated.sqlite3");
+        let local_db_url = format!("sqlite:///{}", local_db_path.display());
+        let xdg_data_home = temp_dir.path().join("xdg");
+        let xdg_data_home_text = xdg_data_home.to_string_lossy().into_owned();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("XDG_DATA_HOME", xdg_data_home_text.as_str())],
+            || {
+                crate::handle_migrate_with_database_url(&local_db_url).expect("migrate local db");
+
+                let local_conn =
+                    mcp_agent_mail_db::DbConn::open_file(local_db_path.display().to_string())
+                        .expect("open local sqlite db");
+                let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+                local_conn
+                    .query_sync(
+                        "INSERT INTO projects (slug, human_key, created_at)
+                         VALUES ('demo-project', '/tmp/demo-project', 0)",
+                        &empty,
+                    )
+                    .expect("insert local project");
+                let project_rows = local_conn
+                    .query_sync(
+                        "SELECT id AS project_id FROM projects
+                         WHERE slug = 'demo-project'
+                         ORDER BY id DESC
+                         LIMIT 1",
+                        &empty,
+                    )
+                    .expect("lookup local project id");
+                let project_id = project_rows[0].get_named::<i64>("project_id").unwrap_or(0);
+                local_conn
+                    .query_sync(
+                        &format!(
+                            "INSERT INTO agents (
+                                project_id, name, program, model, task_description,
+                                inception_ts, last_active_ts, attachments_policy, contact_policy
+                             ) VALUES (
+                                {project_id}, 'BlueLake', 'codex-cli', 'gpt-5', 'robot',
+                                '2026-03-12 11:00:01', '2026-03-12 11:00:02', 'inline', 'auto'
+                             )"
+                        ),
+                        &empty,
+                    )
+                    .expect("insert local agent");
+                let agent_rows = local_conn
+                    .query_sync(
+                        &format!(
+                            "SELECT id AS agent_id FROM agents
+                             WHERE project_id = {project_id} AND name = 'BlueLake'
+                             ORDER BY id DESC
+                             LIMIT 1"
+                        ),
+                        &empty,
+                    )
+                    .expect("lookup local agent id");
+                let agent_id = agent_rows[0].get_named::<i64>("agent_id").unwrap_or(0);
+                local_conn
+                    .query_sync(
+                        &format!(
+                            "INSERT INTO messages (
+                                id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required,
+                                created_ts, attachments
+                             ) VALUES (
+                                4301, {project_id}, {agent_id}, 'demo-thread', 'Live only', 'body',
+                                'normal', 0, 0, '[]'
+                             )"
+                        ),
+                        &empty,
+                    )
+                    .expect("insert local message");
+                drop(local_conn);
+
+                let storage_root = mcp_agent_mail_core::config::default_storage_root_path();
+                let project_dir = storage_root.join("projects").join("unrelated-project");
+                let agent_dir = project_dir.join("agents").join("RiverStone");
+                let canonical_dir = project_dir.join("messages").join("2026").join("04");
+                std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+                std::fs::create_dir_all(&canonical_dir).expect("create canonical dir");
+                std::fs::write(
+                    project_dir.join("project.json"),
+                    r#"{"slug":"unrelated-project","human_key":"/tmp/unrelated-project","created_at":0}"#,
+                )
+                .expect("write project metadata");
+                std::fs::write(agent_dir.join("profile.json"), "{}").expect("write agent profile");
+                std::fs::write(
+                    canonical_dir.join("2026-04-01T13-00-00Z__archive__7.md"),
+                    "---json\n{\"id\":7,\"from\":\"RiverStone\",\"to\":[],\"subject\":\"Archive only\"}\n---\nbody\n",
+                )
+                .expect("write canonical message");
+
+                let reopened_local =
+                    mcp_agent_mail_db::DbConn::open_file(local_db_path.display().to_string())
+                        .expect("reopen local sqlite db");
+                let local_rows = reopened_local
+                    .query_sync(
+                        "SELECT COUNT(*) AS live_message_count
+                         FROM messages
+                         WHERE id = 4301 AND subject = 'Live only'",
+                        &[],
+                    )
+                    .expect("query reopened local sqlite messages");
+                let reopened_live_message_count = local_rows[0]
+                    .get_named::<i64>("live_message_count")
+                    .unwrap_or(0);
+                assert_eq!(
+                    reopened_live_message_count, 1,
+                    "test fixture should prove the reopened local DB contains the live message"
+                );
+                let archive_inventory = crate::collect_doctor_archive_inventory(&storage_root);
+                let db_inventory = crate::collect_doctor_db_inventory(&reopened_local)
+                    .expect("inspect reopened local db inventory");
+                let resolved_local =
+                    mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&local_db_url)
+                        .expect("resolve local sqlite path");
+                assert!(
+                    crate::doctor_archive_has_db_overlap(&archive_inventory, &db_inventory),
+                    "fixture should prove archive/db identity overlap even though the default archive root is unrelated by path"
+                );
+                assert!(
+                    mcp_agent_mail_core::config::is_default_storage_root(&storage_root),
+                    "the archive root in this fixture should be the default/global mailbox root"
+                );
+                assert!(
+                    !std::path::Path::new(&resolved_local.canonical_path)
+                        .starts_with(&storage_root),
+                    "unrelated default archive should not be authoritative for the local sqlite path"
+                );
+
+                let handle = prefer_archive_snapshot_when_local_db_lags_archive(
+                    RobotDbHandle::from_conn(reopened_local),
+                    &storage_root,
+                    Some(&local_db_url),
+                    "robot scope",
+                )
+                .expect("unrelated default archive should not override live db");
+
+                let rows = handle
+                    .conn
+                    .query_sync(
+                        "SELECT COUNT(*) AS live_message_count
+                         FROM messages
+                         WHERE id = 4301 AND subject = 'Live only'",
+                        &[],
+                    )
+                    .expect("query live sqlite messages");
+                let live_message_count =
+                    rows[0].get_named::<i64>("live_message_count").unwrap_or(0);
+                assert_eq!(live_message_count, 1);
+            },
         );
     }
 
@@ -12752,6 +13093,91 @@ mod tests {
                 .contains("Archive canonical data is not fully represented in the SQLite DB"),
             "expected archive parity failure detail: {parity_probe:?}"
         );
+    }
+
+    #[test]
+    fn robot_health_ignores_metadata_only_archive_advantage_when_db_has_newer_messages() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_health_metadata_only.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        crate::handle_migrate_with_database_url(&db_url).expect("migrate");
+
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open local sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+        conn.query_sync(
+            "INSERT INTO projects (slug, human_key, created_at)
+             VALUES ('demo-project', '/data/projects/demo-project', 0)",
+            &empty,
+        )
+        .expect("insert project");
+        let project_rows = conn
+            .query_sync(
+                "SELECT id AS project_id FROM projects
+                 WHERE slug = 'demo-project'
+                 ORDER BY id DESC
+                 LIMIT 1",
+                &empty,
+            )
+            .expect("lookup project id");
+        let project_id = project_rows[0].get_named::<i64>("project_id").unwrap_or(0);
+        conn.query_sync(
+            &format!(
+                "INSERT INTO agents (
+                    project_id, name, program, model, task_description,
+                    inception_ts, last_active_ts, attachments_policy, contact_policy
+                 ) VALUES (
+                    {project_id}, 'BlueLake', 'codex-cli', 'gpt-5', 'robot',
+                    '2026-03-12 11:00:01', '2026-03-12 11:00:02', 'inline', 'auto'
+                 )"
+            ),
+            &empty,
+        )
+        .expect("insert agent");
+        let agent_rows = conn
+            .query_sync(
+                &format!(
+                    "SELECT id AS agent_id FROM agents
+                     WHERE project_id = {project_id} AND name = 'BlueLake'
+                     ORDER BY id DESC
+                     LIMIT 1"
+                ),
+                &empty,
+            )
+            .expect("lookup agent id");
+        let agent_id = agent_rows[0].get_named::<i64>("agent_id").unwrap_or(0);
+        conn.query_sync(
+            &format!(
+                "INSERT INTO messages (
+                    id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required,
+                    created_ts, attachments
+                 ) VALUES (
+                    4202, {project_id}, {agent_id}, 'demo-thread', 'Live only', 'body',
+                    'normal', 0, 0, '[]'
+                 )"
+            ),
+            &empty,
+        )
+        .expect("insert message");
+
+        let storage_root = temp_dir.path().join("storage");
+        let project_dir = storage_root.join("projects").join("demo-project");
+        let agents_dir = project_dir.join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("create agents dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"demo-project","human_key":"/data/projects/demo-project"}"#,
+        )
+        .expect("write project metadata");
+        std::fs::create_dir_all(agents_dir.join("BlueLake")).expect("create first agent dir");
+        std::fs::write(agents_dir.join("BlueLake").join("profile.json"), "{}")
+            .expect("write first agent profile");
+        std::fs::create_dir_all(agents_dir.join("RiverStone")).expect("create second agent dir");
+        std::fs::write(agents_dir.join("RiverStone").join("profile.json"), "{}")
+            .expect("write second agent profile");
+
+        let assessment = summarize_archive_db_parity_probe(Some(&conn), &storage_root);
+        assert_ne!(assessment.probe.status, "fail");
     }
 
     #[test]
