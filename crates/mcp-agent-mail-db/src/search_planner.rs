@@ -886,32 +886,36 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
         facets_applied.push("time_range_max".to_string());
     }
 
-    // Direction filter requires a subquery against message_recipients
+    // Direction filter must survive recipient metadata drift. The message
+    // envelope (`recipients_json`) remains durable even if `agents` rows are
+    // missing, so planner filtering uses that payload instead of inner-joining
+    // recipient identities.
     if let (Some(dir), Some(agent)) = (query.direction, &query.agent_name) {
+        let recipient_json_match =
+            "instr(lower(COALESCE(m.recipients_json, '')), lower(?)) > 0".to_string();
+        let recipient_json_token =
+            serde_json::to_string(agent).unwrap_or_else(|_| format!("\"{agent}\""));
         match dir {
             Direction::Outbox => {
                 where_clauses.push("a.name = ? COLLATE NOCASE".to_string());
                 params.push(PlanParam::Text(agent.clone()));
             }
             Direction::Inbox => {
-                where_clauses.push(
-                    "m.id IN (SELECT mr.message_id FROM message_recipients mr \
-                     JOIN agents ra ON ra.id = mr.agent_id WHERE ra.name = ? COLLATE NOCASE)"
-                        .to_string(),
-                );
-                params.push(PlanParam::Text(agent.clone()));
+                where_clauses.push(recipient_json_match);
+                params.push(PlanParam::Text(recipient_json_token));
             }
         }
         facets_applied.push("direction".to_string());
     } else if let Some(ref agent) = query.agent_name {
         // Agent filter without direction: match sender OR recipient
         where_clauses.push(
-            "(a.name = ? COLLATE NOCASE OR m.id IN (SELECT mr.message_id FROM message_recipients mr \
-             JOIN agents ra ON ra.id = mr.agent_id WHERE ra.name = ? COLLATE NOCASE))"
+            "(a.name = ? COLLATE NOCASE OR instr(lower(COALESCE(m.recipients_json, '')), lower(?)) > 0)"
                 .to_string(),
         );
         params.push(PlanParam::Text(agent.clone()));
-        params.push(PlanParam::Text(agent.clone()));
+        params.push(PlanParam::Text(
+            serde_json::to_string(agent).unwrap_or_else(|_| format!("\"{agent}\"")),
+        ));
         facets_applied.push("agent_name".to_string());
     }
 
@@ -1514,7 +1518,8 @@ mod tests {
         q.direction = Some(Direction::Inbox);
         q.agent_name = Some("BlueLake".to_string());
         let plan = plan_search(&q);
-        assert!(plan.sql.contains("message_recipients"));
+        assert!(plan.sql.contains("m.recipients_json"));
+        assert!(!plan.sql.contains("JOIN agents ra"));
         assert!(plan.facets_applied.contains(&"direction".to_string()));
     }
 
@@ -1525,7 +1530,8 @@ mod tests {
         let plan = plan_search(&q);
         // Should match sender OR recipient
         assert!(plan.sql.contains("a.name = ? COLLATE NOCASE"));
-        assert!(plan.sql.contains("message_recipients"));
+        assert!(plan.sql.contains("m.recipients_json"));
+        assert!(!plan.sql.contains("JOIN agents ra"));
         assert!(plan.facets_applied.contains(&"agent_name".to_string()));
     }
 

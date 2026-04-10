@@ -41,6 +41,11 @@ fn is_real_file(path: &Path) -> bool {
 }
 
 const DUPLICATE_CANONICAL_WARNING_SAMPLE_LIMIT: usize = 5;
+const MALFORMED_ATTACHMENTS_SENTINEL: &str = "[malformed-attachments-json]";
+const MALFORMED_RECIPIENTS_SENTINEL: &str = "[malformed-recipients-json]";
+const VALID_RECONSTRUCTED_ATTACHMENTS_POLICIES: &[&str] = &["auto", "inline", "file", "none"];
+const VALID_RECONSTRUCTED_CONTACT_POLICIES: &[&str] =
+    &["open", "auto", "contacts_only", "block_all"];
 
 fn trim_sql_identifier(token: &str) -> &str {
     token.trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '[' | ']' | ';'))
@@ -617,6 +622,12 @@ fn collect_project_archive_message_ids(
 /// Query the database for all message IDs.
 #[allow(clippy::result_large_err)]
 pub fn collect_db_message_ids(db_path: &Path) -> Result<BTreeSet<i64>, SqlError> {
+    if db_path.as_os_str() == ":memory:" {
+        return Err(SqlError::Custom(
+            "DB message-id inventory is unavailable for in-memory databases".to_string(),
+        ));
+    }
+
     let db_str = db_path.to_string_lossy();
     let conn = DbConn::open_file(db_str.as_ref()).map_err(|e| {
         SqlError::Custom(format!(
@@ -740,6 +751,27 @@ pub fn compute_archive_drift_report(
 
     // Scan archive for inventory counts (projects, agents, identities).
     let archive_inventory = scan_archive_message_inventory(storage_root);
+
+    if db_path.as_os_str() == ":memory:" {
+        warnings.push("DB-side drift comparison skipped for in-memory database".to_string());
+        return Ok(ArchiveDriftReport {
+            schema: ArchiveDriftReportSchema::default(),
+            captured_at_us,
+            archive_message_count: archive_ids.len(),
+            db_message_count: 0,
+            shared_message_count: 0,
+            archive_only_ids: BTreeSet::new(),
+            db_only_ids: BTreeSet::new(),
+            identity_mismatches: Vec::new(),
+            archive_projects: archive_inventory.projects,
+            db_projects: 0,
+            archive_agents: archive_inventory.agents,
+            db_agents: 0,
+            archive_latest_message_id: archive_inventory.latest_message_id,
+            db_max_message_id: 0,
+            warnings,
+        });
+    }
 
     // Query DB for full message ID set.
     let db_ids = match collect_db_message_ids(db_path) {
@@ -1168,10 +1200,6 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
 
         conn.execute_raw(&schema::schema_user_version_sql())
             .map_err(|e| DbError::Sqlite(format!("reconstruct: set user_version: {e}")))?;
-
-        // Flush WAL (if any residual) and remove sidecar files so the DB is a
-        // single clean file ready for the runtime to open with its own settings.
-        let _ = conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE);");
         Ok(())
     })();
 
@@ -1181,6 +1209,9 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
     }
     conn.execute_raw("COMMIT;")
         .map_err(|e| DbError::Sqlite(format!("reconstruct: commit transaction: {e}")))?;
+    drop(conn);
+    crate::pool::wal_checkpoint_truncate_path(db_path)
+        .map_err(|e| DbError::Sqlite(format!("reconstruct: checkpoint: {e}")))?;
 
     stats.finalize_duplicate_warnings();
     tracing::info!(%stats, "database reconstruction from archive complete");
@@ -1258,10 +1289,27 @@ fn discover_agents(
         if !file_type.is_dir() || file_type.is_symlink() {
             continue;
         }
-        let Some(agent_name) = path.file_name().and_then(|n| n.to_str()).map(String::from) else {
+        let Some(raw_agent_name) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+        else {
             continue;
         };
-
+        let Some(agent_name) = normalized_archive_agent_name(Some(&raw_agent_name)) else {
+            stats.parse_errors += 1;
+            stats.warnings.push(format!(
+                "Archive agent directory {} has empty/invalid name; skipping profile",
+                path.display()
+            ));
+            continue;
+        };
+        if agent_name != raw_agent_name {
+            stats.warnings.push(format!(
+                "Archive agent directory {} has non-canonical name {raw_agent_name:?}; normalizing to {agent_name:?}",
+                path.display()
+            ));
+        }
         let profile_path = path.join("profile.json");
         if !is_real_file(&profile_path) {
             continue;
@@ -1289,11 +1337,46 @@ fn discover_agents(
             }
         };
 
-        let program = json_str(&profile, "program").unwrap_or("unknown");
-        let model = json_str(&profile, "model").unwrap_or("unknown");
+        let profile_name = normalized_archive_agent_name(json_str(&profile, "name"));
+        let agent_name = match profile_name {
+            Some(profile_name) => {
+                if profile_name != agent_name {
+                    stats.warnings.push(format!(
+                        "Archive agent profile {} has name {profile_name:?} that disagrees with directory name {raw_agent_name:?}; using profile name",
+                        profile_path.display()
+                    ));
+                }
+                profile_name
+            }
+            None => agent_name,
+        };
+
+        let profile_source = format!("archive agent profile {}", profile_path.display());
+        let program = normalize_reconstructed_required_agent_field(
+            json_str(&profile, "program"),
+            &profile_source,
+            "program",
+            "unknown",
+            stats,
+        );
+        let model = normalize_reconstructed_required_agent_field(
+            json_str(&profile, "model"),
+            &profile_source,
+            "model",
+            "unknown",
+            stats,
+        );
         let task_description = json_str(&profile, "task_description").unwrap_or("");
-        let attachments_policy = json_str(&profile, "attachments_policy").unwrap_or("auto");
-        let contact_policy = json_str(&profile, "contact_policy").unwrap_or("auto");
+        let attachments_policy = normalize_reconstructed_attachments_policy(
+            json_str(&profile, "attachments_policy"),
+            &profile_source,
+            stats,
+        );
+        let contact_policy = normalize_reconstructed_contact_policy(
+            json_str(&profile, "contact_policy"),
+            &profile_source,
+            stats,
+        );
 
         // Parse inception timestamp (try both field names for compatibility)
         let inception_ts = parse_ts_from_json(&profile, "inception_ts")
@@ -1309,13 +1392,13 @@ fn discover_agents(
             &[
                 Value::BigInt(project_id),
                 Value::Text(agent_name.clone()),
-                Value::Text(program.to_string()),
-                Value::Text(model.to_string()),
+                Value::Text(program),
+                Value::Text(model),
                 Value::Text(task_description.to_string()),
                 Value::BigInt(inception_ts),
                 Value::BigInt(last_active_ts),
-                Value::Text(attachments_policy.to_string()),
-                Value::Text(contact_policy.to_string()),
+                Value::Text(attachments_policy),
+                Value::Text(contact_policy),
             ],
         )
         .map_err(|e| DbError::Sqlite(format!("reconstruct: insert agent {agent_name}: {e}")))?;
@@ -1457,18 +1540,17 @@ fn parse_and_insert_message(
     let created_ts = parse_ts_from_json(&msg, "created_ts")
         .or_else(|| parse_ts_from_json(&msg, "created"))
         .unwrap_or_else(crate::now_micros);
-    let attachments = msg
-        .get("attachments")
-        .map_or_else(|| "[]".to_string(), std::string::ToString::to_string);
+    let attachments = normalize_archive_attachments_json(
+        msg.get("attachments"),
+        &file_path.display().to_string(),
+        stats,
+    );
 
     // Ensure sender agent exists
     let sender_id = ensure_agent_exists(conn, project_id, &sender_name, agent_ids)?;
 
-    // Build recipient lists
-    let to_names = json_str_array(&msg, "to");
-    let cc_names = json_str_array(&msg, "cc");
-    let bcc_names = json_str_array(&msg, "bcc");
-    let recipients_json = encode_recipients_json(&to_names, &cc_names, &bcc_names);
+    let (recipients_json, to_names, cc_names, bcc_names) =
+        normalize_archive_recipients_json(&msg, &file_path.display().to_string(), stats);
 
     // Insert message, preserving canonical frontmatter ID when available.
     //
@@ -1634,6 +1716,89 @@ fn encode_recipients_json(
     .to_string()
 }
 
+fn malformed_attachments_json() -> String {
+    serde_json::json!([{
+        "name": MALFORMED_ATTACHMENTS_SENTINEL,
+        "media_type": serde_json::Value::Null,
+        "path": serde_json::Value::Null,
+        "bytes": serde_json::Value::Null,
+    }])
+    .to_string()
+}
+
+fn normalize_archive_attachments_json(
+    attachments: Option<&serde_json::Value>,
+    message_label: &str,
+    stats: &mut ReconstructStats,
+) -> String {
+    match attachments {
+        None => "[]".to_string(),
+        Some(serde_json::Value::Array(values)) => {
+            serde_json::Value::Array(values.clone()).to_string()
+        }
+        Some(_) => {
+            stats.warnings.push(format!(
+                "Archive message {message_label} has non-array attachments payload; preserving malformed attachment metadata sentinel"
+            ));
+            malformed_attachments_json()
+        }
+    }
+}
+
+fn normalize_archive_recipients_json(
+    msg: &serde_json::Value,
+    message_label: &str,
+    stats: &mut ReconstructStats,
+) -> (String, Vec<String>, Vec<String>, Vec<String>) {
+    if !reconstructed_recipients_payload_is_valid(msg) {
+        stats.warnings.push(format!(
+            "Archive message {message_label} has non-canonical recipient payload; preserving malformed recipient metadata sentinel"
+        ));
+        return (
+            encode_recipients_json(&[MALFORMED_RECIPIENTS_SENTINEL.to_string()], &[], &[]),
+            vec![MALFORMED_RECIPIENTS_SENTINEL.to_string()],
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+
+    let to_names = json_str_array(msg, "to");
+    let cc_names = json_str_array(msg, "cc");
+    let bcc_names = json_str_array(msg, "bcc");
+    (
+        encode_recipients_json(&to_names, &cc_names, &bcc_names),
+        to_names,
+        cc_names,
+        bcc_names,
+    )
+}
+
+fn parse_salvaged_attachments_json(
+    attachments_json: Option<String>,
+    message_id: i64,
+    stats: &mut ReconstructStats,
+) -> String {
+    let Some(attachments_json) = attachments_json.filter(|json| !json.trim().is_empty()) else {
+        return "[]".to_string();
+    };
+
+    match serde_json::from_str::<serde_json::Value>(&attachments_json) {
+        Ok(serde_json::Value::Array(values)) => serde_json::Value::Array(values).to_string(),
+        Ok(_) => {
+            stats.warnings.push(format!(
+                "Salvage message {message_id} has non-array attachments payload; preserving malformed attachment metadata sentinel"
+            ));
+            malformed_attachments_json()
+        }
+        Err(err) => {
+            stats.warnings.push(format!(
+                "Salvage message {message_id} has invalid attachments payload; preserving malformed attachment metadata sentinel: {err}"
+            ));
+            malformed_attachments_json()
+        }
+    }
+}
+
 fn parse_salvaged_recipients_json(
     recipients_json: Option<String>,
     message_id: i64,
@@ -1649,15 +1814,30 @@ fn parse_salvaged_recipients_json(
         return empty;
     };
 
+    let malformed = || {
+        (
+            encode_recipients_json(&[MALFORMED_RECIPIENTS_SENTINEL.to_string()], &[], &[]),
+            vec![MALFORMED_RECIPIENTS_SENTINEL.to_string()],
+            Vec::new(),
+            Vec::new(),
+        )
+    };
+
     let parsed: serde_json::Value = match serde_json::from_str(&recipients_json) {
         Ok(parsed) => parsed,
         Err(err) => {
             stats.warnings.push(format!(
-                "Salvage message {message_id} has invalid recipients_json; dropping malformed recipient metadata: {err}"
+                "Salvage message {message_id} has invalid recipients_json; preserving malformed recipient metadata sentinel: {err}"
             ));
-            return empty;
+            return malformed();
         }
     };
+    if !reconstructed_recipients_payload_is_valid(&parsed) {
+        stats.warnings.push(format!(
+            "Salvage message {message_id} has non-canonical recipients_json; preserving malformed recipient metadata sentinel"
+        ));
+        return malformed();
+    }
 
     let to_names = json_str_array(&parsed, "to");
     let cc_names = json_str_array(&parsed, "cc");
@@ -2358,6 +2538,7 @@ fn enrich_existing_agent_from_salvage(
     salvaged_last_active_ts: i64,
     salvaged_attachments_policy: &str,
     salvaged_contact_policy: &str,
+    stats: &mut ReconstructStats,
 ) -> DbResult<()> {
     let existing_rows = conn
         .query_sync(
@@ -2374,12 +2555,8 @@ fn enrich_existing_agent_from_salvage(
         return Ok(());
     };
 
-    let current_program = existing_row
-        .get_named::<String>("program")
-        .unwrap_or_else(|_| "unknown".to_string());
-    let current_model = existing_row
-        .get_named::<String>("model")
-        .unwrap_or_else(|_| "unknown".to_string());
+    let current_program_raw = existing_row.get_named::<String>("program").ok();
+    let current_model_raw = existing_row.get_named::<String>("model").ok();
     let current_task_description = existing_row
         .get_named::<String>("task_description")
         .unwrap_or_default();
@@ -2389,12 +2566,34 @@ fn enrich_existing_agent_from_salvage(
     let current_last_active_ts = existing_row
         .get_named::<i64>("last_active_ts")
         .unwrap_or_default();
-    let current_attachments_policy = existing_row
-        .get_named::<String>("attachments_policy")
-        .unwrap_or_else(|_| "auto".to_string());
-    let current_contact_policy = existing_row
-        .get_named::<String>("contact_policy")
-        .unwrap_or_else(|_| "auto".to_string());
+    let current_attachments_policy_raw =
+        existing_row.get_named::<String>("attachments_policy").ok();
+    let current_contact_policy_raw = existing_row.get_named::<String>("contact_policy").ok();
+    let existing_source = format!("existing agent row {agent_id} ({name})");
+    let current_program = normalize_reconstructed_required_agent_field(
+        current_program_raw.as_deref(),
+        &existing_source,
+        "program",
+        "unknown",
+        stats,
+    );
+    let current_model = normalize_reconstructed_required_agent_field(
+        current_model_raw.as_deref(),
+        &existing_source,
+        "model",
+        "unknown",
+        stats,
+    );
+    let current_attachments_policy = normalize_reconstructed_attachments_policy(
+        current_attachments_policy_raw.as_deref(),
+        &existing_source,
+        stats,
+    );
+    let current_contact_policy = normalize_reconstructed_contact_policy(
+        current_contact_policy_raw.as_deref(),
+        &existing_source,
+        stats,
+    );
     let is_placeholder_agent = current_program.trim() == "unknown"
         && current_model.trim() == "unknown"
         && current_task_description.trim().is_empty()
@@ -2692,12 +2891,8 @@ fn merge_salvaged_database(
                 continue;
             }
 
-            let salvaged_program = row
-                .get_named::<String>("program")
-                .unwrap_or_else(|_| "unknown".to_string());
-            let salvaged_model = row
-                .get_named::<String>("model")
-                .unwrap_or_else(|_| "unknown".to_string());
+            let salvaged_program_raw = row.get_named::<String>("program").ok();
+            let salvaged_model_raw = row.get_named::<String>("model").ok();
             let salvaged_task_description = row
                 .get_named::<String>("task_description")
                 .unwrap_or_default();
@@ -2707,12 +2902,34 @@ fn merge_salvaged_database(
             let salvaged_last_active_ts = row
                 .get_named::<i64>("last_active_ts")
                 .unwrap_or_else(|_| crate::now_micros());
-            let salvaged_attachments_policy = row
-                .get_named::<String>("attachments_policy")
-                .unwrap_or_else(|_| "auto".to_string());
-            let salvaged_contact_policy = row
-                .get_named::<String>("contact_policy")
-                .unwrap_or_else(|_| "auto".to_string());
+            let salvaged_attachments_policy_raw =
+                row.get_named::<String>("attachments_policy").ok();
+            let salvaged_contact_policy_raw = row.get_named::<String>("contact_policy").ok();
+            let salvage_agent_source = format!("salvage agent row {source_agent_id} ({name})");
+            let salvaged_program = normalize_reconstructed_required_agent_field(
+                salvaged_program_raw.as_deref(),
+                &salvage_agent_source,
+                "program",
+                "unknown",
+                stats,
+            );
+            let salvaged_model = normalize_reconstructed_required_agent_field(
+                salvaged_model_raw.as_deref(),
+                &salvage_agent_source,
+                "model",
+                "unknown",
+                stats,
+            );
+            let salvaged_attachments_policy = normalize_reconstructed_attachments_policy(
+                salvaged_attachments_policy_raw.as_deref(),
+                &salvage_agent_source,
+                stats,
+            );
+            let salvaged_contact_policy = normalize_reconstructed_contact_policy(
+                salvaged_contact_policy_raw.as_deref(),
+                &salvage_agent_source,
+                stats,
+            );
 
             let existed = query_last_insert_or_existing_id_composite(
                 &target_conn,
@@ -2768,6 +2985,7 @@ fn merge_salvaged_database(
                     salvaged_last_active_ts,
                     &salvaged_attachments_policy,
                     &salvaged_contact_policy,
+                    stats,
                 )?;
             }
         }
@@ -3116,6 +3334,11 @@ fn merge_salvaged_database(
                         message_id,
                         stats,
                     );
+                let attachments = parse_salvaged_attachments_json(
+                    row.get_named::<String>("attachments").ok(),
+                    message_id,
+                    stats,
+                );
 
                 target_conn
                     .execute_sync(
@@ -3141,10 +3364,7 @@ fn merge_salvaged_database(
                                     .unwrap_or_else(|_| crate::now_micros()),
                             ),
                             Value::Text(recipients_json),
-                            Value::Text(
-                                row.get_named::<String>("attachments")
-                                    .unwrap_or_else(|_| "[]".to_string()),
-                            ),
+                            Value::Text(attachments),
                         ],
                     )
                     .map_err(|e| {
@@ -3315,7 +3535,9 @@ fn merge_salvaged_database(
     target_conn
         .execute_raw("REINDEX;")
         .map_err(|e| DbError::Sqlite(format!("reconstruct salvage: REINDEX: {e}")))?;
-    let _ = target_conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE);");
+    drop(target_conn);
+    crate::pool::wal_checkpoint_truncate_path(target_db_path)
+        .map_err(|e| DbError::Sqlite(format!("reconstruct salvage: checkpoint: {e}")))?;
 
     Ok(())
 }
@@ -3475,6 +3697,65 @@ fn normalized_archive_agent_name(raw: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+fn normalize_reconstructed_required_agent_field(
+    raw: Option<&str>,
+    source: &str,
+    field: &str,
+    fallback: &str,
+    stats: &mut ReconstructStats,
+) -> String {
+    let Some(raw) = raw else {
+        return fallback.to_string();
+    };
+    let normalized = raw.trim();
+    if normalized.is_empty() {
+        stats.warnings.push(format!(
+            "Reconstruct {source} had empty {field}; defaulting to {fallback:?}"
+        ));
+        fallback.to_string()
+    } else {
+        normalized.to_string()
+    }
+}
+
+fn normalize_reconstructed_attachments_policy(
+    raw: Option<&str>,
+    source: &str,
+    stats: &mut ReconstructStats,
+) -> String {
+    let Some(raw) = raw else {
+        return "auto".to_string();
+    };
+    let normalized = raw.trim().to_ascii_lowercase();
+    if VALID_RECONSTRUCTED_ATTACHMENTS_POLICIES.contains(&normalized.as_str()) {
+        normalized
+    } else {
+        stats.warnings.push(format!(
+            "Reconstruct {source} had invalid attachments_policy {raw:?}; defaulting to \"auto\""
+        ));
+        "auto".to_string()
+    }
+}
+
+fn normalize_reconstructed_contact_policy(
+    raw: Option<&str>,
+    source: &str,
+    stats: &mut ReconstructStats,
+) -> String {
+    let Some(raw) = raw else {
+        return "auto".to_string();
+    };
+    let normalized = raw.replace('\0', "").trim().to_ascii_lowercase();
+    if VALID_RECONSTRUCTED_CONTACT_POLICIES.contains(&normalized.as_str()) {
+        normalized
+    } else {
+        stats.warnings.push(format!(
+            "Reconstruct {source} had invalid contact_policy {raw:?}; defaulting to \"auto\""
+        ));
+        "auto".to_string()
+    }
+}
+
 fn json_str_array(value: &serde_json::Value, key: &str) -> Vec<String> {
     match value.get(key) {
         Some(serde_json::Value::Array(arr)) => arr
@@ -3489,6 +3770,25 @@ fn json_str_array(value: &serde_json::Value, key: &str) -> Vec<String> {
         }
         _ => Vec::new(),
     }
+}
+
+fn reconstructed_recipient_field_is_valid(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(values) => values.iter().all(serde_json::Value::is_string),
+        serde_json::Value::String(_) | serde_json::Value::Null => true,
+        _ => false,
+    }
+}
+
+fn reconstructed_recipients_payload_is_valid(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    ["to", "cc", "bcc"].iter().all(|key| {
+        object
+            .get(*key)
+            .is_none_or(reconstructed_recipient_field_is_valid)
+    })
 }
 
 /// Parse a timestamp field from JSON (supports both ISO string and i64 micros).
@@ -3675,6 +3975,193 @@ mod tests {
         assert_eq!(json_str_array(&v, "cc"), vec!["Charlie"]);
         assert!(json_str_array(&v, "bcc").is_empty());
         assert!(json_str_array(&v, "missing").is_empty());
+    }
+
+    #[test]
+    fn normalize_reconstructed_agent_policies_coerces_invalid_values_to_auto() {
+        let mut stats = ReconstructStats::default();
+        assert_eq!(
+            normalize_reconstructed_required_agent_field(
+                Some("  claude-code  "),
+                "test archive profile",
+                "program",
+                "unknown",
+                &mut stats,
+            ),
+            "claude-code"
+        );
+        assert_eq!(
+            normalize_reconstructed_required_agent_field(
+                Some("   "),
+                "test archive profile",
+                "program",
+                "unknown",
+                &mut stats,
+            ),
+            "unknown"
+        );
+        assert_eq!(
+            normalize_reconstructed_attachments_policy(
+                Some(" INLINE "),
+                "test archive profile",
+                &mut stats,
+            ),
+            "inline"
+        );
+        assert_eq!(
+            normalize_reconstructed_contact_policy(
+                Some("\0Contacts_Only\0"),
+                "test archive profile",
+                &mut stats,
+            ),
+            "contacts_only"
+        );
+        assert_eq!(
+            normalize_reconstructed_attachments_policy(
+                Some("email"),
+                "test archive profile",
+                &mut stats,
+            ),
+            "auto"
+        );
+        assert_eq!(
+            normalize_reconstructed_contact_policy(
+                Some("contacts-only"),
+                "test archive profile",
+                &mut stats,
+            ),
+            "auto"
+        );
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("test archive profile")
+                && warning.contains("invalid attachments_policy")
+        }));
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("test archive profile") && warning.contains("empty program")
+        }));
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("test archive profile") && warning.contains("invalid contact_policy")
+        }));
+    }
+
+    #[test]
+    fn parse_salvaged_recipients_json_surfaces_malformed_payloads() {
+        let mut stats = ReconstructStats::default();
+        let (recipients_json, to_names, cc_names, bcc_names) =
+            parse_salvaged_recipients_json(Some("{not-json".to_string()), 42, &mut stats);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recipients_json)
+                .expect("recipients_json parses"),
+            serde_json::json!({
+                "to": [MALFORMED_RECIPIENTS_SENTINEL],
+                "cc": [],
+                "bcc": [],
+            })
+        );
+        assert_eq!(to_names, vec![MALFORMED_RECIPIENTS_SENTINEL]);
+        assert!(cc_names.is_empty());
+        assert!(bcc_names.is_empty());
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("invalid recipients_json")
+                && warning.contains("preserving malformed recipient metadata sentinel")
+        }));
+
+        let mut stats = ReconstructStats::default();
+        let (_, to_names, cc_names, bcc_names) = parse_salvaged_recipients_json(
+            Some(r#"{"to":[17],"cc":[],"bcc":[]}"#.to_string()),
+            43,
+            &mut stats,
+        );
+        assert_eq!(to_names, vec![MALFORMED_RECIPIENTS_SENTINEL]);
+        assert!(cc_names.is_empty());
+        assert!(bcc_names.is_empty());
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("non-canonical recipients_json")
+                && warning.contains("preserving malformed recipient metadata sentinel")
+        }));
+    }
+
+    #[test]
+    fn normalize_archive_recipients_json_surfaces_malformed_payloads() {
+        let mut stats = ReconstructStats::default();
+        let msg = serde_json::json!({
+            "to": {"name": "Bob"},
+            "cc": [],
+            "bcc": [],
+        });
+        let (recipients_json, to_names, cc_names, bcc_names) =
+            normalize_archive_recipients_json(&msg, "archive/test.md", &mut stats);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recipients_json)
+                .expect("recipients_json parses"),
+            serde_json::json!({
+                "to": [MALFORMED_RECIPIENTS_SENTINEL],
+                "cc": [],
+                "bcc": [],
+            })
+        );
+        assert_eq!(to_names, vec![MALFORMED_RECIPIENTS_SENTINEL]);
+        assert!(cc_names.is_empty());
+        assert!(bcc_names.is_empty());
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("non-canonical recipient payload")
+                && warning.contains("preserving malformed recipient metadata sentinel")
+        }));
+
+        let mut stats = ReconstructStats::default();
+        let msg = serde_json::json!({
+            "to": ["Bob"],
+            "cc": "Carol",
+            "bcc": [],
+        });
+        let (_, to_names, cc_names, bcc_names) =
+            normalize_archive_recipients_json(&msg, "archive/test.md", &mut stats);
+        assert_eq!(to_names, vec!["Bob"]);
+        assert_eq!(cc_names, vec!["Carol"]);
+        assert!(bcc_names.is_empty());
+        assert!(stats.warnings.is_empty());
+    }
+
+    #[test]
+    fn parse_salvaged_attachments_json_surfaces_malformed_payloads() {
+        let mut stats = ReconstructStats::default();
+        let attachments_json =
+            parse_salvaged_attachments_json(Some("{not-json".to_string()), 42, &mut stats);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&attachments_json)
+                .expect("attachments_json parses"),
+            serde_json::json!([{
+                "name": MALFORMED_ATTACHMENTS_SENTINEL,
+                "media_type": serde_json::Value::Null,
+                "path": serde_json::Value::Null,
+                "bytes": serde_json::Value::Null,
+            }])
+        );
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("invalid attachments payload")
+                && warning.contains("preserving malformed attachment metadata sentinel")
+        }));
+
+        let mut stats = ReconstructStats::default();
+        let attachments_json = parse_salvaged_attachments_json(
+            Some(r#"{"name":"artifact.txt"}"#.to_string()),
+            43,
+            &mut stats,
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&attachments_json)
+                .expect("attachments_json parses"),
+            serde_json::json!([{
+                "name": MALFORMED_ATTACHMENTS_SENTINEL,
+                "media_type": serde_json::Value::Null,
+                "path": serde_json::Value::Null,
+                "bytes": serde_json::Value::Null,
+            }])
+        );
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("non-array attachments payload")
+                && warning.contains("preserving malformed attachment metadata sentinel")
+        }));
     }
 
     #[test]
@@ -3938,6 +4425,232 @@ mod tests {
                 "reconstruct should preserve ATC rollup column {required}"
             );
         }
+    }
+
+    #[test]
+    fn reconstruct_with_agent_profile_normalizes_invalid_policy_values_to_auto() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test_invalid_agent_policy.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("test-project");
+        let agent_dir = project_dir.join("agents").join("TestAgent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+
+        let profile = serde_json::json!({
+            "name": "TestAgent",
+            "program": "   ",
+            "model": "\t",
+            "inception_ts": "2026-02-22T12:00:00Z",
+            "last_active_ts": "2026-02-22T12:00:00Z",
+            "attachments_policy": "email",
+            "contact_policy": "contacts-only",
+        });
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            serde_json::to_string_pretty(&profile).unwrap(),
+        )
+        .unwrap();
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("archive agent profile") && warning.contains("empty program")
+        }));
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("archive agent profile") && warning.contains("empty model")
+        }));
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("archive agent profile")
+                && warning.contains("invalid attachments_policy")
+        }));
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("archive agent profile") && warning.contains("invalid contact_policy")
+        }));
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open rebuilt db");
+        let agent_rows = conn
+            .query_sync(
+                "SELECT program, model, attachments_policy, contact_policy
+                 FROM agents
+                 WHERE name = 'TestAgent'",
+                &[],
+            )
+            .expect("query agent");
+        assert_eq!(agent_rows.len(), 1);
+        assert_eq!(
+            agent_rows[0]
+                .get_named::<String>("program")
+                .expect("program"),
+            "unknown"
+        );
+        assert_eq!(
+            agent_rows[0].get_named::<String>("model").expect("model"),
+            "unknown"
+        );
+        assert_eq!(
+            agent_rows[0]
+                .get_named::<String>("attachments_policy")
+                .expect("attachments_policy"),
+            "auto"
+        );
+        assert_eq!(
+            agent_rows[0]
+                .get_named::<String>("contact_policy")
+                .expect("contact_policy"),
+            "auto"
+        );
+    }
+
+    #[test]
+    fn reconstruct_trims_archive_agent_directory_names_before_matching_messages() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test_trimmed_archive_agent_name.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("test-project");
+        let agent_dir = project_dir.join("agents").join(" Alice ");
+        let messages_dir = project_dir.join("messages").join("2026").join("02");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&messages_dir).unwrap();
+
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{
+                "name":"Alice",
+                "program":"claude-code",
+                "model":"opus-4.6",
+                "inception_ts":"2026-02-22T12:00:00Z",
+                "last_active_ts":"2026-02-22T12:00:00Z"
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            messages_dir.join("2026-02-22T12-00-00Z__hello__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "Hello",
+  "importance": "normal",
+  "created_ts": "2026-02-22T12:00:00Z"
+}
+---
+
+hello
+"#,
+        )
+        .unwrap();
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("non-canonical name") && warning.contains("\" Alice \"")
+        }));
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open rebuilt db");
+        let agent_rows = conn
+            .query_sync("SELECT name, program FROM agents ORDER BY name", &[])
+            .expect("query agents");
+        assert_eq!(
+            agent_rows.len(),
+            2,
+            "Alice profile plus Bob recipient placeholder"
+        );
+        assert_eq!(
+            agent_rows[0]
+                .get_named::<String>("name")
+                .expect("first name"),
+            "Alice"
+        );
+        assert_eq!(
+            agent_rows[0]
+                .get_named::<String>("program")
+                .expect("Alice program"),
+            "claude-code"
+        );
+        assert_eq!(
+            agent_rows[1]
+                .get_named::<String>("name")
+                .expect("second name"),
+            "Bob"
+        );
+    }
+
+    #[test]
+    fn reconstruct_prefers_profile_name_when_archive_agent_directory_mismatches() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test_profile_name_mismatch.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("test-project");
+        let agent_dir = project_dir.join("agents").join("LegacyAlice");
+        let messages_dir = project_dir.join("messages").join("2026").join("02");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&messages_dir).unwrap();
+
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{
+                "name":"Alice",
+                "program":"claude-code",
+                "model":"opus-4.6",
+                "inception_ts":"2026-02-22T12:00:00Z",
+                "last_active_ts":"2026-02-22T12:00:00Z"
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            messages_dir.join("2026-02-22T12-00-00Z__hello__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "Hello",
+  "importance": "normal",
+  "created_ts": "2026-02-22T12:00:00Z"
+}
+---
+
+hello
+"#,
+        )
+        .unwrap();
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("disagrees with directory name")
+                && warning.contains("\"LegacyAlice\"")
+                && warning.contains("\"Alice\"")
+        }));
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open rebuilt db");
+        let agent_rows = conn
+            .query_sync("SELECT name, program FROM agents ORDER BY name", &[])
+            .expect("query agents");
+        assert_eq!(
+            agent_rows.len(),
+            2,
+            "Alice profile plus Bob recipient placeholder"
+        );
+        assert_eq!(
+            agent_rows[0]
+                .get_named::<String>("name")
+                .expect("first name"),
+            "Alice"
+        );
+        assert_eq!(
+            agent_rows[0]
+                .get_named::<String>("program")
+                .expect("Alice program"),
+            "claude-code"
+        );
+        assert_eq!(
+            agent_rows[1]
+                .get_named::<String>("name")
+                .expect("second name"),
+            "Bob"
+        );
     }
 
     #[test]
@@ -4570,6 +5283,154 @@ Hello Bob, this is a test message.
         assert_eq!(stats.messages, 0);
         assert_eq!(stats.parse_errors, 2, "both bad files should be counted");
         assert_eq!(stats.warnings.len(), 2);
+    }
+
+    #[test]
+    fn reconstruct_from_archive_surfaces_malformed_attachment_payloads() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("test-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"test-project","human_key":"/test-project","created_at":0}"#,
+        )
+        .unwrap();
+
+        let messages_dir = project_dir.join("messages").join("2026").join("02");
+        std::fs::create_dir_all(&messages_dir).unwrap();
+        std::fs::write(
+            messages_dir.join("2026-02-22T12-00-00Z__bad-attachments__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "Bad attachments",
+  "importance": "normal",
+  "created_ts": "2026-02-22T12:00:00Z",
+  "attachments": {"name":"artifact.txt"}
+}
+---
+
+Body.
+"#,
+        )
+        .unwrap();
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
+        assert_eq!(stats.messages, 1);
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("non-array attachments payload")
+                && warning.contains("preserving malformed attachment metadata sentinel")
+        }));
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync("SELECT attachments FROM messages WHERE id = 1", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let attachments_json = rows[0]
+            .get_named::<String>("attachments")
+            .expect("attachments");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&attachments_json)
+                .expect("attachments parses"),
+            serde_json::json!([{
+                "name": MALFORMED_ATTACHMENTS_SENTINEL,
+                "media_type": serde_json::Value::Null,
+                "path": serde_json::Value::Null,
+                "bytes": serde_json::Value::Null,
+            }])
+        );
+    }
+
+    #[test]
+    fn reconstruct_from_archive_surfaces_malformed_recipient_payloads() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("test-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"test-project","human_key":"/test-project","created_at":0}"#,
+        )
+        .unwrap();
+
+        let messages_dir = project_dir.join("messages").join("2026").join("02");
+        std::fs::create_dir_all(&messages_dir).unwrap();
+        std::fs::write(
+            messages_dir.join("2026-02-22T12-00-00Z__bad-recipients__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob", 17],
+  "cc": [],
+  "bcc": [],
+  "subject": "Bad recipients",
+  "importance": "normal",
+  "created_ts": "2026-02-22T12:00:00Z"
+}
+---
+
+Body.
+"#,
+        )
+        .unwrap();
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
+        assert_eq!(stats.messages, 1);
+        assert_eq!(stats.recipients, 1);
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("non-canonical recipient payload")
+                && warning.contains("preserving malformed recipient metadata sentinel")
+        }));
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync("SELECT recipients_json FROM messages WHERE id = 1", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let recipients_json = rows[0]
+            .get_named::<String>("recipients_json")
+            .expect("recipients_json");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recipients_json)
+                .expect("recipients_json parses"),
+            serde_json::json!({
+                "to": [MALFORMED_RECIPIENTS_SENTINEL],
+                "cc": [],
+                "bcc": [],
+            })
+        );
+
+        let recipient_rows = conn
+            .query_sync(
+                "SELECT a.name AS name, mr.kind AS kind
+                 FROM message_recipients mr
+                 JOIN agents a ON a.id = mr.agent_id
+                 WHERE mr.message_id = 1",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(recipient_rows.len(), 1);
+        assert_eq!(
+            recipient_rows[0]
+                .get_named::<String>("kind")
+                .expect("recipient kind"),
+            "to"
+        );
+        assert_eq!(
+            recipient_rows[0]
+                .get_named::<String>("name")
+                .expect("recipient name"),
+            MALFORMED_RECIPIENTS_SENTINEL
+        );
     }
 
     #[test]
@@ -5351,6 +6212,216 @@ archive body
     }
 
     #[test]
+    fn reconstruct_with_salvage_surfaces_malformed_recipients_json_instead_of_dropping_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed_malformed_recipients.db");
+        let salvage_db_path = tmp.path().join("salvage_malformed_recipients.db");
+        let storage_root = tmp.path().join("storage");
+
+        std::fs::create_dir_all(storage_root.join("projects")).unwrap();
+
+        let salvage_conn = SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE projects (
+                    id INTEGER PRIMARY KEY,
+                    slug TEXT NOT NULL,
+                    human_key TEXT,
+                    created_at INTEGER
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE agents (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    name TEXT NOT NULL
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    sender_id INTEGER NOT NULL,
+                    subject TEXT,
+                    body_md TEXT,
+                    created_ts INTEGER,
+                    recipients_json TEXT
+                )",
+            )
+            .unwrap();
+
+        salvage_conn
+            .query_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (100, 'test-project', '/test-project', 1)",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO agents (id, project_id, name) VALUES (10, 100, 'Alice')",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts, recipients_json)
+                 VALUES (2, 100, 10, 'DB-only', 'db body', 2, '{not-json')",
+                &[],
+            )
+            .unwrap();
+
+        let stats =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("salvage merge should succeed");
+        assert_eq!(stats.salvaged_messages, 1);
+        assert_eq!(stats.salvaged_recipients, 1);
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("invalid recipients_json")
+                && warning.contains("preserving malformed recipient metadata sentinel")
+        }));
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let message_rows = conn
+            .query_sync("SELECT recipients_json FROM messages WHERE id = 2", &[])
+            .unwrap();
+        assert_eq!(message_rows.len(), 1);
+        let recipients_json = message_rows[0]
+            .get_named::<String>("recipients_json")
+            .expect("recipients_json");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recipients_json)
+                .expect("recipients_json parses"),
+            serde_json::json!({
+                "to": [MALFORMED_RECIPIENTS_SENTINEL],
+                "cc": [],
+                "bcc": [],
+            })
+        );
+
+        let recipient_rows = conn
+            .query_sync(
+                "SELECT a.name AS name, mr.kind AS kind
+                 FROM message_recipients mr
+                 JOIN agents a ON a.id = mr.agent_id
+                 WHERE mr.message_id = 2",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(recipient_rows.len(), 1);
+        assert_eq!(
+            recipient_rows[0]
+                .get_named::<String>("kind")
+                .expect("recipient kind"),
+            "to"
+        );
+        assert_eq!(
+            recipient_rows[0]
+                .get_named::<String>("name")
+                .expect("recipient name"),
+            MALFORMED_RECIPIENTS_SENTINEL
+        );
+    }
+
+    #[test]
+    fn reconstruct_with_salvage_surfaces_malformed_attachments_instead_of_preserving_invalid_payload()
+     {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed_malformed_attachments.db");
+        let salvage_db_path = tmp.path().join("salvage_malformed_attachments.db");
+        let storage_root = tmp.path().join("storage");
+
+        std::fs::create_dir_all(storage_root.join("projects")).unwrap();
+
+        let salvage_conn = SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE projects (
+                    id INTEGER PRIMARY KEY,
+                    slug TEXT NOT NULL,
+                    human_key TEXT,
+                    created_at INTEGER
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE agents (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    name TEXT NOT NULL
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    sender_id INTEGER NOT NULL,
+                    subject TEXT,
+                    body_md TEXT,
+                    created_ts INTEGER,
+                    attachments TEXT
+                )",
+            )
+            .unwrap();
+
+        salvage_conn
+            .query_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (100, 'test-project', '/test-project', 1)",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO agents (id, project_id, name) VALUES (10, 100, 'Alice')",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts, attachments)
+                 VALUES (2, 100, 10, 'DB-only', 'db body', 2, '{\"name\":\"artifact.txt\"}')",
+                &[],
+            )
+            .unwrap();
+
+        let stats =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("salvage merge should succeed");
+        assert_eq!(stats.salvaged_messages, 1);
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("non-array attachments payload")
+                && warning.contains("preserving malformed attachment metadata sentinel")
+        }));
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let rows = conn
+            .query_sync("SELECT attachments FROM messages WHERE id = 2", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let attachments_json = rows[0]
+            .get_named::<String>("attachments")
+            .expect("attachments");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&attachments_json)
+                .expect("attachments parses"),
+            serde_json::json!([{
+                "name": MALFORMED_ATTACHMENTS_SENTINEL,
+                "media_type": serde_json::Value::Null,
+                "path": serde_json::Value::Null,
+                "bytes": serde_json::Value::Null,
+            }])
+        );
+    }
+
+    #[test]
     fn reconstruct_with_salvage_enriches_fallback_project_and_agent_metadata() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("reconstructed_enriched.db");
@@ -5499,6 +6570,163 @@ archive body
         assert_eq!(bob.get_named::<String>("contact_policy").unwrap(), "open");
     }
 
+    #[test]
+    fn reconstruct_with_salvage_normalizes_agent_policy_values() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed_policy_normalized.db");
+        let salvage_db_path = tmp.path().join("salvage_policy_normalized.db");
+        let storage_root = tmp.path().join("storage");
+
+        let project_dir = storage_root.join("projects").join("test-project");
+        let bob_dir = project_dir.join("agents").join("Bob");
+        std::fs::create_dir_all(&bob_dir).unwrap();
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"test-project","human_key":"/test-project","created_at":1}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            bob_dir.join("profile.json"),
+            r#"{
+                "name":"Bob",
+                "program":"   ",
+                "model":"\t",
+                "inception_ts":"2026-02-22T00:00:00Z",
+                "last_active_ts":"2026-02-22T00:00:00Z",
+                "attachments_policy":"email",
+                "contact_policy":"contacts-only"
+            }"#,
+        )
+        .unwrap();
+
+        let salvage_conn = SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE projects (
+                    id INTEGER PRIMARY KEY,
+                    slug TEXT NOT NULL,
+                    human_key TEXT,
+                    created_at INTEGER
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE agents (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    program TEXT,
+                    model TEXT,
+                    task_description TEXT,
+                    inception_ts INTEGER,
+                    last_active_ts INTEGER,
+                    attachments_policy TEXT,
+                    contact_policy TEXT
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (100, 'test-project', '/test-project', 1)",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO agents
+                 (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+                 VALUES
+                    (10, 100, 'Bob', 'salvage-program', 'salvage-model', 'salvaged bob', 10, 99, ' INLINE ', ' Contacts_Only '),
+                    (11, 100, 'Alice', '   ', '\t', 'salvaged alice', 11, 100, 'email', 'reject'),
+                    (12, 100, 'Carol', 'salvage-program', 'salvage-model', 'salvaged carol', 12, 101, ' FILE ', ' OPEN ')",
+                &[],
+            )
+            .unwrap();
+
+        let stats =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("salvage merge should normalize agent policies");
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("archive agent profile") && warning.contains("empty program")
+        }));
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("archive agent profile") && warning.contains("empty model")
+        }));
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("archive agent profile")
+                && warning.contains("invalid attachments_policy")
+        }));
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("archive agent profile") && warning.contains("invalid contact_policy")
+        }));
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("salvage agent row 11 (Alice)") && warning.contains("empty program")
+        }));
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("salvage agent row 11 (Alice)") && warning.contains("empty model")
+        }));
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("salvage agent row 11 (Alice)")
+                && warning.contains("invalid attachments_policy")
+        }));
+        assert!(stats.warnings.iter().any(|warning| {
+            warning.contains("salvage agent row 11 (Alice)")
+                && warning.contains("invalid contact_policy")
+        }));
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let agent_rows = conn
+            .query_sync(
+                "SELECT name, program, model, attachments_policy, contact_policy
+                 FROM agents
+                 ORDER BY name",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(agent_rows.len(), 3);
+
+        let alice = &agent_rows[0];
+        assert_eq!(alice.get_named::<String>("name").unwrap(), "Alice");
+        assert_eq!(alice.get_named::<String>("program").unwrap(), "unknown");
+        assert_eq!(alice.get_named::<String>("model").unwrap(), "unknown");
+        assert_eq!(
+            alice.get_named::<String>("attachments_policy").unwrap(),
+            "auto"
+        );
+        assert_eq!(alice.get_named::<String>("contact_policy").unwrap(), "auto");
+
+        let bob = &agent_rows[1];
+        assert_eq!(bob.get_named::<String>("name").unwrap(), "Bob");
+        assert_eq!(
+            bob.get_named::<String>("program").unwrap(),
+            "salvage-program"
+        );
+        assert_eq!(bob.get_named::<String>("model").unwrap(), "salvage-model");
+        assert_eq!(
+            bob.get_named::<String>("attachments_policy").unwrap(),
+            "inline"
+        );
+        assert_eq!(
+            bob.get_named::<String>("contact_policy").unwrap(),
+            "contacts_only"
+        );
+
+        let carol = &agent_rows[2];
+        assert_eq!(carol.get_named::<String>("name").unwrap(), "Carol");
+        assert_eq!(
+            carol.get_named::<String>("program").unwrap(),
+            "salvage-program"
+        );
+        assert_eq!(carol.get_named::<String>("model").unwrap(), "salvage-model");
+        assert_eq!(
+            carol.get_named::<String>("attachments_policy").unwrap(),
+            "file"
+        );
+        assert_eq!(carol.get_named::<String>("contact_policy").unwrap(), "open");
+    }
+
     // ========================================================================
     // Archive drift report tests
     // ========================================================================
@@ -5623,6 +6851,16 @@ archive body
         drop(conn);
         let ids = collect_db_message_ids(&db_path).unwrap();
         assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn collect_db_message_ids_rejects_memory_db() {
+        let err = collect_db_message_ids(Path::new(":memory:"))
+            .expect_err("in-memory message-id inventory should be unavailable");
+        assert!(
+            err.to_string().contains("in-memory"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -5805,5 +7043,37 @@ archive body
         assert_eq!(report.db_message_count, 0);
         assert_eq!(report.shared_message_count, 0);
         assert!(!report.has_any_drift());
+    }
+
+    #[test]
+    fn drift_report_skips_in_memory_db_comparison_without_fabricating_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+
+        write_archive_message(&storage_root, "test-project", 1);
+        write_archive_message(&storage_root, "test-project", 2);
+        std::fs::write(
+            storage_root
+                .join("projects")
+                .join("test-project")
+                .join("project.json"),
+            r#"{"slug": "test-project", "human_key": "/test/project"}"#,
+        )
+        .unwrap();
+
+        let report = compute_archive_drift_report(&storage_root, Path::new(":memory:")).unwrap();
+        assert_eq!(report.archive_message_count, 2);
+        assert_eq!(report.db_message_count, 0);
+        assert!(report.archive_only_ids.is_empty());
+        assert!(report.db_only_ids.is_empty());
+        assert!(!report.has_any_drift());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("skipped") && warning.contains("in-memory")),
+            "expected in-memory skip warning, got {:?}",
+            report.warnings
+        );
     }
 }

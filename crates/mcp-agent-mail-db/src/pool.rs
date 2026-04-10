@@ -18,6 +18,11 @@ use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Error as SqlError, Value};
 use sqlmodel_pool::{Pool, PoolConfig, PooledConnection};
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
@@ -2486,37 +2491,11 @@ impl DbPool {
     /// - Before export/snapshot (no loose WAL journal)
     /// - Idle periods (reclaim WAL disk space)
     ///
-    /// Returns the number of WAL frames checkpointed, or an error.
+    /// Returns the number of WAL frames checkpointed, or an error. Errors if
+    /// SQLite reports that the TRUNCATE checkpoint was busy or incomplete.
     /// No-ops silently for `:memory:` databases.
     pub fn wal_checkpoint(&self) -> DbResult<u64> {
-        if self.sqlite_path == ":memory:" {
-            return Ok(0);
-        }
-        let conn = crate::guard_db_conn(
-            open_sqlite_file_with_lock_retry(&self.sqlite_path)
-                .map_err(|e| DbError::Sqlite(format!("checkpoint: open failed: {e}")))?,
-            "wal checkpoint connection",
-        );
-
-        // Apply busy_timeout so the checkpoint waits for active readers/writers.
-        conn.execute_raw("PRAGMA busy_timeout = 60000;")
-            .map_err(|e| DbError::Sqlite(format!("checkpoint: busy_timeout: {e}")))?;
-
-        let rows = conn
-            .query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
-            .map_err(|e| DbError::Sqlite(format!("checkpoint: {e}")))?;
-
-        // wal_checkpoint returns (busy, log, checkpointed)
-        let checkpointed = rows
-            .first()
-            .and_then(|r| match r.get_by_name("checkpointed") {
-                Some(sqlmodel_core::Value::BigInt(n)) => Some(u64::try_from(*n).unwrap_or(0)),
-                Some(sqlmodel_core::Value::Int(n)) => Some(u64::try_from(*n).unwrap_or(0)),
-                _ => None,
-            })
-            .unwrap_or(0);
-
-        Ok(checkpointed)
+        wal_checkpoint_truncate_path(Path::new(&self.sqlite_path))
     }
 
     /// Run a **passive** WAL checkpoint that never blocks writers.
@@ -2545,17 +2524,7 @@ impl DbPool {
         let rows = conn
             .query_sync("PRAGMA wal_checkpoint(PASSIVE);", &[])
             .map_err(|e| DbError::Sqlite(format!("passive checkpoint: {e}")))?;
-
-        let checkpointed = rows
-            .first()
-            .and_then(|r| match r.get_by_name("checkpointed") {
-                Some(sqlmodel_core::Value::BigInt(n)) => Some(u64::try_from(*n).unwrap_or(0)),
-                Some(sqlmodel_core::Value::Int(n)) => Some(u64::try_from(*n).unwrap_or(0)),
-                _ => None,
-            })
-            .unwrap_or(0);
-
-        Ok(checkpointed)
+        parse_wal_checkpoint_rows(&rows, "passive checkpoint", false)
     }
 
     /// Create (or refresh) a `.bak` backup of the database file.
@@ -2579,13 +2548,7 @@ impl DbPool {
             return Ok(None);
         }
 
-        let bak_path = primary.with_file_name(format!(
-            "{}.bak",
-            primary
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("storage.sqlite3")
-        ));
+        let bak_path = sqlite_path_with_file_name_suffix(primary, ".bak", "storage.sqlite3.bak");
 
         // Skip if the existing backup is fresh enough.
         if bak_path.is_file()
@@ -3181,8 +3144,36 @@ pub struct MailboxDbInventory {
     pub project_identities: BTreeSet<crate::reconstruct::MailboxProjectIdentity>,
 }
 
+/// Treat archive-only metadata drift as decisive only when the live DB does not
+/// also have newer message evidence.
+#[must_use]
+pub fn archive_metadata_advantage_is_decisive(
+    archive_projects: usize,
+    archive_agents: usize,
+    archive_messages: usize,
+    archive_latest_message_id: Option<i64>,
+    db_projects: usize,
+    db_agents: usize,
+    db_messages: usize,
+    db_max_message_id: i64,
+    missing_archive_projects: &[String],
+) -> bool {
+    let live_db_has_newer_messages = db_messages > archive_messages
+        || db_max_message_id > archive_latest_message_id.unwrap_or(0);
+    !live_db_has_newer_messages
+        && (archive_projects > db_projects
+            || archive_agents > db_agents
+            || !missing_archive_projects.is_empty())
+}
+
 #[allow(clippy::result_large_err)]
 pub fn inspect_mailbox_db_inventory(primary_path: &Path) -> Result<MailboxDbInventory, SqlError> {
+    if primary_path.as_os_str() == ":memory:" {
+        return Err(SqlError::Custom(
+            "DB inventory is unavailable for in-memory databases".to_string(),
+        ));
+    }
+
     let conn = open_sqlite_file_with_lock_retry(primary_path.to_string_lossy().as_ref())?;
     let present = conn
         .query_sync(
@@ -3273,11 +3264,24 @@ fn archive_has_real_projects(storage_root: &Path) -> bool {
         })
 }
 
+#[must_use]
+pub fn archive_storage_root_is_authoritative_for_sqlite_path(
+    storage_root: &Path,
+    sqlite_path: &Path,
+) -> bool {
+    !mcp_agent_mail_core::config::is_default_storage_root(storage_root)
+        || sqlite_path.starts_with(storage_root)
+}
+
 #[allow(clippy::result_large_err)]
 fn reconcile_archive_state_before_init(
     primary_path: &Path,
     storage_root: &Path,
 ) -> Result<bool, SqlError> {
+    if !archive_storage_root_is_authoritative_for_sqlite_path(storage_root, primary_path) {
+        return Ok(false);
+    }
+
     if !archive_has_real_projects(storage_root) {
         return Ok(false);
     }
@@ -3312,16 +3316,20 @@ fn reconcile_archive_state_before_init(
         &archive,
         &db_inventory.project_identities,
     );
-    let archive_projects_ahead = archive.projects > db_inventory.projects;
-    let archive_agents_ahead = archive.agents > db_inventory.agents;
     let archive_messages_ahead = archive_message_count > db_message_count;
     let archive_latest_id_ahead = archive_max_id > db_inventory.max_message_id;
-    let archive_identity_ahead = !missing_archive_projects.is_empty();
-    let archive_ahead = archive_projects_ahead
-        || archive_agents_ahead
-        || archive_messages_ahead
-        || archive_latest_id_ahead
-        || archive_identity_ahead;
+    let archive_metadata_ahead = archive_metadata_advantage_is_decisive(
+        archive.projects,
+        archive.agents,
+        archive_message_count,
+        archive.latest_message_id,
+        db_inventory.projects,
+        db_inventory.agents,
+        db_message_count,
+        db_inventory.max_message_id,
+        &missing_archive_projects,
+    );
+    let archive_ahead = archive_messages_ahead || archive_latest_id_ahead || archive_metadata_ahead;
     if !archive_ahead {
         return Ok(false);
     }
@@ -3723,9 +3731,7 @@ fn cleanup_empty_wal_sidecar(sqlite_path: &str) {
 #[must_use]
 fn sqlite_file_has_live_sidecars(path: &Path) -> bool {
     for suffix in ["-wal", "-shm"] {
-        let mut sidecar_os = path.as_os_str().to_os_string();
-        sidecar_os.push(suffix);
-        let sidecar_path = PathBuf::from(sidecar_os);
+        let sidecar_path = sqlite_path_with_suffix(path, suffix);
         if let Ok(meta) = std::fs::metadata(&sidecar_path)
             && meta.len() > 0
         {
@@ -3733,6 +3739,50 @@ fn sqlite_file_has_live_sidecars(path: &Path) -> bool {
         }
     }
     false
+}
+
+#[must_use]
+pub(crate) fn sqlite_path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut suffixed = path.as_os_str().to_os_string();
+    suffixed.push(suffix);
+    PathBuf::from(suffixed)
+}
+
+#[must_use]
+fn os_string_with_suffix(value: &OsStr, suffix: &str) -> OsString {
+    let mut suffixed = value.to_os_string();
+    suffixed.push(suffix);
+    suffixed
+}
+
+#[must_use]
+fn sqlite_path_with_file_name_suffix(path: &Path, suffix: &str, fallback: &str) -> PathBuf {
+    match path.file_name() {
+        Some(file_name) => path.with_file_name(os_string_with_suffix(file_name, suffix)),
+        None => path.with_file_name(fallback),
+    }
+}
+
+#[must_use]
+fn os_str_starts_with(value: &OsStr, prefix: &OsStr) -> bool {
+    #[cfg(unix)]
+    {
+        value.as_bytes().starts_with(prefix.as_bytes())
+    }
+
+    #[cfg(windows)]
+    {
+        let value_units = value.encode_wide().collect::<Vec<_>>();
+        let prefix_units = prefix.encode_wide().collect::<Vec<_>>();
+        value_units.starts_with(&prefix_units)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        value
+            .to_string_lossy()
+            .starts_with(prefix.to_string_lossy().as_ref())
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -3779,13 +3829,7 @@ fn sqlite_ack_pending_probe_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
 }
 
 #[allow(clippy::result_large_err)]
-fn sqlite_file_is_healthy_with_compat_probe<F>(
-    path: &Path,
-    mut compatibility_probe: F,
-) -> Result<bool, SqlError>
-where
-    F: FnMut(&Path) -> Result<bool, SqlError>,
-{
+pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError> {
     if !path.exists() {
         return Ok(false);
     }
@@ -3843,12 +3887,38 @@ where
         }
     }
 
+    Ok(true)
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_file_is_healthy_with_compat_probe<F>(
+    path: &Path,
+    mut compatibility_probe: F,
+) -> Result<bool, SqlError>
+where
+    F: FnMut(&Path) -> Result<bool, SqlError>,
+{
+    if !sqlite_primary_read_path_is_healthy(path)? {
+        return Ok(false);
+    }
+
     // Confirm the primary verdict through a separate canonical connection too.
     // Keeping this as an independent reopen/probe still catches sidecar and
     // reopen-path issues even though the canonical path now uses FrankenSQLite.
-    match compatibility_probe(path) {
-        Ok(true) => {}
-        Ok(false) => return Ok(false),
+    if !normalize_compatibility_probe_result(path, compatibility_probe(path))? {
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+#[allow(clippy::result_large_err)]
+fn normalize_compatibility_probe_result(
+    path: &Path,
+    result: Result<bool, SqlError>,
+) -> Result<bool, SqlError> {
+    match result {
+        Ok(healthy) => Ok(healthy),
         Err(e) => {
             let msg = e.to_string();
             if is_corruption_error_message(&msg) || is_sqlite_recovery_error_message(&msg) {
@@ -3860,13 +3930,20 @@ where
                     error = %e,
                     "sqlite canonical health probe hit lock/busy error; preserving primary health verdict"
                 );
+                Ok(true)
             } else {
-                return Err(e);
+                Err(e)
             }
         }
     }
+}
 
-    Ok(true)
+#[allow(clippy::result_large_err)]
+pub fn sqlite_compatibility_read_path_is_healthy(path: &Path) -> Result<bool, SqlError> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    normalize_compatibility_probe_result(path, sqlite_file_is_healthy_canonical(path))
 }
 
 #[allow(clippy::result_large_err)]
@@ -3919,11 +3996,8 @@ fn refuse_auto_recovery_with_live_sidecars(primary_path: &Path) -> Result<(), Sq
 /// Try to checkpoint the WAL and remove sidecar files.
 #[allow(clippy::result_large_err)]
 fn try_checkpoint_and_clear_sidecars(primary_path: &Path) -> Result<(), SqlError> {
-    let path_str = primary_path.to_string_lossy();
-    let conn = DbConn::open_file(path_str.as_ref())?;
-    // Attempt a truncating checkpoint to fold WAL changes into the main DB
-    conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)")?;
-    drop(conn);
+    wal_checkpoint_truncate_path(primary_path)
+        .map_err(|e| SqlError::Custom(format!("checkpoint: {e}")))?;
     // Remove any residual sidecars left after the successful checkpoint.
     remove_sqlite_sidecars(primary_path);
     if sqlite_file_has_live_sidecars(primary_path) {
@@ -3938,9 +4012,7 @@ fn try_checkpoint_and_clear_sidecars(primary_path: &Path) -> Result<(), SqlError
 /// Remove WAL and SHM sidecar files if they exist.
 fn remove_sqlite_sidecars(primary_path: &Path) {
     for suffix in ["-wal", "-shm"] {
-        let mut sidecar_os = primary_path.as_os_str().to_os_string();
-        sidecar_os.push(suffix);
-        let sidecar_path = PathBuf::from(sidecar_os);
+        let sidecar_path = sqlite_path_with_suffix(primary_path, suffix);
         if sidecar_path.exists()
             && let Err(e) = std::fs::remove_file(&sidecar_path)
         {
@@ -3991,7 +4063,6 @@ fn try_repair_index_only_corruption(primary_path: &Path) -> Result<bool, SqlErro
     );
 
     conn.execute_raw("REINDEX;")?;
-    let _ = conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE);");
 
     let post_quick = sqlite_pragma_check_details_canonical(&conn, integrity::CheckKind::Quick)?;
     if !integrity::details_indicate_ok(&post_quick) {
@@ -4013,6 +4084,14 @@ fn try_repair_index_only_corruption(primary_path: &Path) -> Result<bool, SqlErro
         );
         return Ok(false);
     }
+
+    drop(conn);
+    wal_checkpoint_truncate_path(primary_path).map_err(|e| {
+        SqlError::Custom(format!(
+            "index-only repair checkpoint failed for {}: {e}",
+            primary_path.display()
+        ))
+    })?;
 
     tracing::warn!(
         path = %primary_path.display(),
@@ -4039,7 +4118,9 @@ fn recover_sqlite_file(primary_path: &Path) -> Result<(), SqlError> {
         recovery_lock_active = snapshot.recovery_lock_active,
         "pre-recovery snapshot captured"
     );
-    if is_real_directory(storage_root_path) {
+    if is_real_directory(storage_root_path)
+        && archive_storage_root_is_authoritative_for_sqlite_path(storage_root_path, primary_path)
+    {
         return ensure_sqlite_file_healthy_with_archive(primary_path, storage_root_path);
     }
     ensure_sqlite_file_healthy(primary_path)
@@ -4069,6 +4150,59 @@ fn capture_automatic_recovery_bundle(
     Ok(bundle_dir)
 }
 
+fn wal_checkpoint_row_i64(row: &sqlmodel_core::Row, name: &str) -> Option<i64> {
+    match row.get_by_name(name) {
+        Some(sqlmodel_core::Value::BigInt(n)) => Some(*n),
+        Some(sqlmodel_core::Value::Int(n)) => Some(i64::from(*n)),
+        _ => None,
+    }
+}
+
+fn parse_wal_checkpoint_rows(
+    rows: &[sqlmodel_core::Row],
+    context: &str,
+    require_full_checkpoint: bool,
+) -> DbResult<u64> {
+    let row = rows
+        .first()
+        .ok_or_else(|| DbError::Sqlite(format!("{context}: missing wal_checkpoint result row")))?;
+    let busy = wal_checkpoint_row_i64(row, "busy").unwrap_or(0);
+    let log = wal_checkpoint_row_i64(row, "log").unwrap_or(0);
+    let checkpointed = wal_checkpoint_row_i64(row, "checkpointed").unwrap_or(0);
+
+    if require_full_checkpoint && (busy > 0 || checkpointed < log) {
+        return Err(DbError::Sqlite(format!(
+            "{context}: incomplete wal_checkpoint(TRUNCATE) result (busy={busy}, log={log}, checkpointed={checkpointed})"
+        )));
+    }
+
+    Ok(u64::try_from(checkpointed.max(0)).unwrap_or(0))
+}
+
+/// Run a strict `TRUNCATE` checkpoint against a SQLite path.
+///
+/// Returns an error if SQLite reports that the checkpoint was busy or
+/// incomplete, even when the pragma itself executed successfully.
+pub fn wal_checkpoint_truncate_path(db_path: &Path) -> DbResult<u64> {
+    if db_path.as_os_str() == ":memory:" {
+        return Ok(0);
+    }
+    let path_str = db_path.to_string_lossy();
+    let conn = crate::guard_db_conn(
+        open_sqlite_file_with_lock_retry(path_str.as_ref())
+            .map_err(|e| DbError::Sqlite(format!("checkpoint: open failed: {e}")))?,
+        "wal checkpoint connection",
+    );
+
+    conn.execute_raw("PRAGMA busy_timeout = 60000;")
+        .map_err(|e| DbError::Sqlite(format!("checkpoint: busy_timeout: {e}")))?;
+
+    let rows = conn
+        .query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
+        .map_err(|e| DbError::Sqlite(format!("checkpoint: {e}")))?;
+    parse_wal_checkpoint_rows(&rows, "checkpoint", true)
+}
+
 fn is_real_directory(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
 }
@@ -4079,7 +4213,7 @@ fn is_real_file(path: &Path) -> bool {
 
 fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
     let mut candidates: Vec<(u8, SystemTime, PathBuf)> = Vec::new();
-    let Some(file_name) = primary_path.file_name().and_then(|n| n.to_str()) else {
+    let Some(file_name) = primary_path.file_name() else {
         return Vec::new();
     };
     let parent = primary_path.parent().unwrap_or_else(|| Path::new("."));
@@ -4089,7 +4223,7 @@ fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
         parent
     };
 
-    let bak = primary_path.with_file_name(format!("{file_name}.bak"));
+    let bak = primary_path.with_file_name(os_string_with_suffix(file_name, ".bak"));
     if is_real_file(&bak) {
         let modified = bak
             .metadata()
@@ -4098,9 +4232,9 @@ fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
         candidates.push((0, modified, bak));
     }
 
-    let backup_prefix = format!("{file_name}.backup-");
-    let backup_bak_prefix = format!("{file_name}.bak.");
-    let recovery_prefix = format!("{file_name}.recovery");
+    let backup_prefix = os_string_with_suffix(file_name, ".backup-");
+    let backup_bak_prefix = os_string_with_suffix(file_name, ".bak.");
+    let recovery_prefix = os_string_with_suffix(file_name, ".recovery");
     if let Ok(entries) = std::fs::read_dir(scan_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -4110,14 +4244,12 @@ fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
             if !file_type.is_file() || file_type.is_symlink() {
                 continue;
             }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let priority = if name.starts_with(&backup_bak_prefix) {
+            let name = entry.file_name();
+            let priority = if os_str_starts_with(&name, &backup_bak_prefix) {
                 1
-            } else if name.starts_with(&backup_prefix) {
+            } else if os_str_starts_with(&name, &backup_prefix) {
                 2
-            } else if name.starts_with(&recovery_prefix) {
+            } else if os_str_starts_with(&name, &recovery_prefix) {
                 3
             } else {
                 continue;
@@ -4167,7 +4299,7 @@ fn find_healthy_backup(primary_path: &Path) -> Option<PathBuf> {
 }
 
 fn has_quarantined_primary_artifact(primary_path: &Path) -> bool {
-    let Some(file_name) = primary_path.file_name().and_then(|n| n.to_str()) else {
+    let Some(file_name) = primary_path.file_name() else {
         return false;
     };
     let parent = primary_path.parent().unwrap_or_else(|| Path::new("."));
@@ -4177,9 +4309,9 @@ fn has_quarantined_primary_artifact(primary_path: &Path) -> bool {
         parent
     };
     let quarantine_prefixes = [
-        format!("{file_name}.corrupt-"),
-        format!("{file_name}.archive-reconcile-"),
-        format!("{file_name}.reconstruct-"),
+        os_string_with_suffix(file_name, ".corrupt-"),
+        os_string_with_suffix(file_name, ".archive-reconcile-"),
+        os_string_with_suffix(file_name, ".reconstruct-"),
     ];
 
     std::fs::read_dir(scan_dir)
@@ -4187,11 +4319,11 @@ fn has_quarantined_primary_artifact(primary_path: &Path) -> bool {
         .into_iter()
         .flatten()
         .flatten()
-        .filter_map(|entry| entry.file_name().into_string().ok())
+        .map(|entry| entry.file_name())
         .any(|name| {
             quarantine_prefixes
                 .iter()
-                .any(|prefix| name.starts_with(prefix))
+                .any(|prefix| os_str_starts_with(&name, prefix.as_os_str()))
         })
 }
 
@@ -4265,8 +4397,8 @@ pub fn inspect_mailbox_sidecar_state(db_path: &Path) -> MailboxSidecarState {
         return MailboxSidecarState::default();
     }
 
-    let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
-    let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
+    let wal_path = sqlite_path_with_suffix(db_path, "-wal");
+    let shm_path = sqlite_path_with_suffix(db_path, "-shm");
     let wal_meta = std::fs::metadata(&wal_path).ok();
     let shm_meta = std::fs::metadata(&shm_path).ok();
 
@@ -4281,7 +4413,7 @@ pub fn inspect_mailbox_sidecar_state(db_path: &Path) -> MailboxSidecarState {
 
 #[must_use]
 pub fn inspect_mailbox_recovery_lock(db_path: &Path) -> MailboxRecoveryLockState {
-    let lock_path = PathBuf::from(format!("{}.recovery.lock", db_path.display()));
+    let lock_path = sqlite_path_with_suffix(db_path, ".recovery.lock");
     if db_path.as_os_str() == ":memory:" {
         return MailboxRecoveryLockState {
             lock_path: lock_path.display().to_string(),
@@ -4769,26 +4901,27 @@ fn quarantined_sidecar_path(
     label: &str,
     timestamp: &str,
 ) -> PathBuf {
-    let base_name = primary_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("storage.sqlite3");
-    primary_path.with_file_name(format!("{base_name}{suffix}.{label}-{timestamp}"))
+    sqlite_path_with_file_name_suffix(
+        primary_path,
+        &format!("{suffix}.{label}-{timestamp}"),
+        &format!("storage.sqlite3{suffix}.{label}-{timestamp}"),
+    )
 }
 
 #[allow(clippy::result_large_err)]
 fn reconstruction_candidate_path(primary_path: &Path, timestamp: &str) -> PathBuf {
-    let base_name = primary_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("storage.sqlite3");
-    let mut candidate =
-        primary_path.with_file_name(format!("{base_name}.reconstructing-{timestamp}"));
+    let mut candidate = sqlite_path_with_file_name_suffix(
+        primary_path,
+        &format!(".reconstructing-{timestamp}"),
+        &format!("storage.sqlite3.reconstructing-{timestamp}"),
+    );
     let mut suffix = 1_u32;
     while candidate.exists() {
-        candidate = primary_path.with_file_name(format!(
-            "{base_name}.reconstructing-{timestamp}-{suffix:02}"
-        ));
+        candidate = sqlite_path_with_file_name_suffix(
+            primary_path,
+            &format!(".reconstructing-{timestamp}-{suffix:02}"),
+            &format!("storage.sqlite3.reconstructing-{timestamp}-{suffix:02}"),
+        );
         suffix = suffix.saturating_add(1);
     }
     candidate
@@ -4805,11 +4938,11 @@ fn quarantine_reconstruction_candidate_path(
         return Ok(None);
     }
 
-    let base_name = primary_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("storage.sqlite3");
-    let quarantined = primary_path.with_file_name(format!("{base_name}.{reason}-{timestamp}"));
+    let quarantined = sqlite_path_with_file_name_suffix(
+        primary_path,
+        &format!(".{reason}-{timestamp}"),
+        &format!("storage.sqlite3.{reason}-{timestamp}"),
+    );
     std::fs::rename(candidate_path, &quarantined).map_err(|e| {
         SqlError::Custom(format!(
             "failed to quarantine reconstructed sqlite candidate {}: {e}",
@@ -5045,11 +5178,11 @@ fn quarantine_reconstructed_candidate(
         return Ok(None);
     }
 
-    let base_name = primary_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("storage.sqlite3");
-    let quarantined = primary_path.with_file_name(format!("{base_name}.{reason}-{timestamp}"));
+    let quarantined = sqlite_path_with_file_name_suffix(
+        primary_path,
+        &format!(".{reason}-{timestamp}"),
+        &format!("storage.sqlite3.{reason}-{timestamp}"),
+    );
     std::fs::rename(primary_path, &quarantined).map_err(|e| {
         SqlError::Custom(format!(
             "failed to quarantine reconstructed database candidate {}: {e}",
@@ -5182,18 +5315,20 @@ fn reconstruct_sqlite_file_with_archive_salvage_inner(
         return reconstruct_archive_into_candidate(primary_path, storage_root, None, &timestamp);
     }
 
-    if let Ok(conn) = open_sqlite_file_with_lock_retry(primary_path.to_string_lossy().as_ref()) {
-        let _ = conn.query_sync("PRAGMA busy_timeout=60000;", &[]);
-        let _ = conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[]);
+    if let Err(err) = wal_checkpoint_truncate_path(primary_path) {
+        tracing::warn!(
+            path = %primary_path.display(),
+            error = %err,
+            "pre-reconcile WAL checkpoint did not complete; quarantining current database state without a flush"
+        );
     }
 
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-    let base_name = primary_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("storage.sqlite3");
-    let quarantined =
-        primary_path.with_file_name(format!("{base_name}.archive-reconcile-{timestamp}"));
+    let quarantined = sqlite_path_with_file_name_suffix(
+        primary_path,
+        &format!(".archive-reconcile-{timestamp}"),
+        &format!("storage.sqlite3.archive-reconcile-{timestamp}"),
+    );
 
     std::fs::rename(primary_path, &quarantined).map_err(|e| {
         SqlError::Custom(format!(
@@ -5240,11 +5375,11 @@ fn restore_from_backup(primary_path: &Path, backup_path: &Path) -> Result<(), Sq
     }
 
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-    let base_name = primary_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("storage.sqlite3");
-    let quarantined_db = primary_path.with_file_name(format!("{base_name}.corrupt-{timestamp}"));
+    let quarantined_db = sqlite_path_with_file_name_suffix(
+        primary_path,
+        &format!(".corrupt-{timestamp}"),
+        &format!("storage.sqlite3.corrupt-{timestamp}"),
+    );
 
     if primary_path.exists() {
         std::fs::rename(primary_path, &quarantined_db).map_err(|e| {
@@ -5291,11 +5426,11 @@ fn restore_from_backup(primary_path: &Path, backup_path: &Path) -> Result<(), Sq
 #[allow(clippy::result_large_err)]
 fn reinitialize_without_backup(primary_path: &Path) -> Result<(), SqlError> {
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-    let base_name = primary_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("storage.sqlite3");
-    let quarantined_db = primary_path.with_file_name(format!("{base_name}.corrupt-{timestamp}"));
+    let quarantined_db = sqlite_path_with_file_name_suffix(
+        primary_path,
+        &format!(".corrupt-{timestamp}"),
+        &format!("storage.sqlite3.corrupt-{timestamp}"),
+    );
 
     if primary_path.exists() {
         std::fs::rename(primary_path, &quarantined_db).map_err(|e| {
@@ -5422,6 +5557,13 @@ pub fn ensure_sqlite_file_healthy_with_archive(
     primary_path: &Path,
     storage_root: &Path,
 ) -> Result<(), SqlError> {
+    if !archive_storage_root_is_authoritative_for_sqlite_path(storage_root, primary_path) {
+        if !primary_path.exists() {
+            return Ok(());
+        }
+        return ensure_sqlite_file_healthy(primary_path);
+    }
+
     let had_primary = primary_path.exists();
     if had_primary {
         cleanup_empty_wal_sidecar(primary_path.to_string_lossy().as_ref());
@@ -5957,6 +6099,10 @@ pub fn canary_mailbox_destroyed() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
 
     #[test]
     fn normalize_sqlite_identity_path_caches_recent_entries() {
@@ -6452,6 +6598,32 @@ mod tests {
         assert!(frames <= 1000, "reasonable frame count: {frames}");
     }
 
+    #[test]
+    fn parse_wal_checkpoint_rows_rejects_busy_truncate_result() {
+        let conn = DbConn::open_file(":memory:".to_string()).expect("open");
+        let rows = conn
+            .query_sync("SELECT 1 AS busy, 5 AS log, 4 AS checkpointed", &[])
+            .expect("query");
+        let err = parse_wal_checkpoint_rows(&rows, "checkpoint", true)
+            .expect_err("busy truncate checkpoint should fail closed");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("incomplete wal_checkpoint(TRUNCATE) result"),
+            "unexpected error: {err_text}"
+        );
+    }
+
+    #[test]
+    fn parse_wal_checkpoint_rows_allows_partial_passive_result() {
+        let conn = DbConn::open_file(":memory:".to_string()).expect("open");
+        let rows = conn
+            .query_sync("SELECT 1 AS busy, 5 AS log, 4 AS checkpointed", &[])
+            .expect("query");
+        let checkpointed =
+            parse_wal_checkpoint_rows(&rows, "passive checkpoint", false).expect("parse");
+        assert_eq!(checkpointed, 4);
+    }
+
     /// Verify WAL checkpoint on :memory: is a no-op.
     #[test]
     fn wal_checkpoint_noop_for_memory_db() {
@@ -6541,6 +6713,37 @@ mod tests {
             candidates.first().map(PathBuf::as_path),
             Some(backup_bak_series.as_path()),
             "timestamped .bak.* backups should be discovered and prioritized over .backup-*"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_backup_candidates_include_non_utf8_backups() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base_name = OsString::from_vec(b"storage-\xFF.sqlite3".to_vec());
+        let primary = dir.path().join(PathBuf::from(base_name.clone()));
+        let dot_bak = dir
+            .path()
+            .join(PathBuf::from(os_string_with_suffix(&base_name, ".bak")));
+        let backup_series = dir.path().join(PathBuf::from(os_string_with_suffix(
+            &base_name,
+            ".backup-20260212_000000",
+        )));
+        std::fs::write(&primary, b"primary").expect("write primary");
+        std::fs::write(&dot_bak, b"bak").expect("write .bak");
+        std::fs::write(&backup_series, b"series").expect("write backup series");
+
+        let candidates = sqlite_backup_candidates(&primary);
+        assert_eq!(
+            candidates.first().map(PathBuf::as_path),
+            Some(dot_bak.as_path()),
+            "non-UTF-8 primary names should still resolve their .bak candidate"
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate == &backup_series),
+            "non-UTF-8 primary names should still resolve backup-series candidates"
         );
     }
 
@@ -7740,8 +7943,8 @@ mod tests {
             .expect("create");
         drop(conn);
 
-        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
-        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        let _ = std::fs::remove_file(sqlite_path_with_suffix(&path, "-wal"));
+        let _ = std::fs::remove_file(sqlite_path_with_suffix(&path, "-shm"));
 
         assert!(!sqlite_file_has_live_sidecars(&path));
 
@@ -8195,6 +8398,19 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn reconstruction_candidate_path_preserves_non_utf8_primary_basename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base_name = OsString::from_vec(b"test-\xFF.db".to_vec());
+        let primary = dir.path().join(PathBuf::from(base_name.clone()));
+
+        let candidate = reconstruction_candidate_path(&primary, "20260218_120000_000");
+        let expected_name =
+            os_string_with_suffix(&base_name, ".reconstructing-20260218_120000_000");
+        assert_eq!(candidate.file_name(), Some(expected_name.as_os_str()));
+    }
+
     #[test]
     fn quarantine_reconstruction_candidate_path_moves_candidate_and_journal() {
         let dir = tempfile::tempdir().unwrap();
@@ -8575,6 +8791,64 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_archive_state_before_init_ignores_unrelated_default_archive_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let xdg_data_root = dir.path().join("xdg-data");
+        std::fs::create_dir_all(&xdg_data_root).unwrap();
+        let xdg_data_root_str = xdg_data_root.to_str().unwrap().to_string();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("XDG_DATA_HOME", xdg_data_root_str.as_str())],
+            || {
+                let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
+                assert!(mcp_agent_mail_core::config::is_default_storage_root(
+                    &storage_root
+                ));
+
+                let proj_dir = storage_root.join("projects").join("test-proj");
+                let agent_dir = proj_dir.join("agents").join("SwiftFox");
+                let msg_dir = proj_dir.join("messages").join("2026").join("01");
+                std::fs::create_dir_all(&agent_dir).unwrap();
+                std::fs::create_dir_all(&msg_dir).unwrap();
+                std::fs::write(
+                    proj_dir.join("project.json"),
+                    r#"{"slug":"test-proj","human_key":"/tmp/test-proj"}"#,
+                )
+                .unwrap();
+                std::fs::write(
+                    agent_dir.join("profile.json"),
+                    r#"{"name":"SwiftFox","program":"coder","model":"claude","inception_ts":"2026-01-15T10:00:00Z","last_active_ts":"2026-01-15T10:00:01Z"}"#,
+                )
+                .unwrap();
+                std::fs::write(
+                    msg_dir.join("2026-01-15T10-05-00Z__test__7.md"),
+                    "---json\n{\"id\":7,\"from\":\"SwiftFox\",\"to\":[\"CalmLake\"],\"subject\":\"Test\",\"thread_id\":\"t1\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-01-15T10:05:00Z\",\"attachments\":[]}\n---\n\nTest body\n",
+                )
+                .unwrap();
+
+                let external_dir = dir.path().join("external-db");
+                std::fs::create_dir_all(&external_dir).unwrap();
+                let primary = external_dir.join("storage.sqlite3");
+                let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+                conn.execute_raw(&crate::schema::init_schema_sql_base())
+                    .unwrap();
+                drop(conn);
+
+                assert!(
+                    !reconcile_archive_state_before_init(&primary, &storage_root).unwrap(),
+                    "default-root archive state must not reconcile an external sqlite path"
+                );
+
+                let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+                let rows = conn
+                    .query_sync("SELECT COUNT(*) AS count FROM messages", &[])
+                    .unwrap();
+                assert_eq!(rows[0].get_named::<i64>("count").unwrap_or(-1), 0);
+            },
+        );
+    }
+
+    #[test]
     fn reconcile_archive_state_before_init_rebuilds_healthy_db_when_archive_is_ahead() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
@@ -8813,6 +9087,112 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_archive_state_before_init_keeps_live_db_when_only_archive_metadata_is_ahead() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+
+        let proj_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = proj_dir.join("agents").join("Alice");
+        let msg_dir = proj_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        std::fs::write(
+            proj_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"First\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:00:00Z\",\"attachments\":[]}\n---\n\nfirst body\n",
+        )
+        .unwrap();
+
+        crate::reconstruct::reconstruct_from_archive(&primary, &storage_root)
+            .expect("seed live db from archive");
+
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(3),
+                Value::BigInt(1),
+                Value::Text("BlueLake".to_string()),
+                Value::Text("coder".to_string()),
+                Value::Text("test".to_string()),
+                Value::Text(String::new()),
+                Value::BigInt(2),
+                Value::BigInt(2),
+                Value::Text("auto".to_string()),
+                Value::Text("auto".to_string()),
+            ],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments, recipients_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(2),
+                Value::BigInt(1),
+                Value::BigInt(1),
+                Value::Text("t2".to_string()),
+                Value::Text("Second".to_string()),
+                Value::Text("second body".to_string()),
+                Value::Text("normal".to_string()),
+                Value::BigInt(0),
+                Value::BigInt(2_000_000),
+                Value::Text("[]".to_string()),
+                Value::Text(r#"{"to":["BlueLake"],"cc":[],"bcc":[]}"#.to_string()),
+            ],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, ack_ts, read_ts) VALUES (?, ?, ?, NULL, NULL)",
+            &[
+                Value::BigInt(2),
+                Value::BigInt(3),
+                Value::Text("to".to_string()),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let archive_only_project = storage_root.join("projects").join("archive-only-project");
+        let archive_only_agent = archive_only_project.join("agents").join("ArchiveGhost");
+        std::fs::create_dir_all(&archive_only_agent).unwrap();
+        std::fs::write(
+            archive_only_project.join("project.json"),
+            r#"{"slug":"archive-only-project","human_key":"/archive-only-project","created_at":0}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            archive_only_agent.join("profile.json"),
+            r#"{"agent_name":"ArchiveGhost","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        assert!(
+            !reconcile_archive_state_before_init(&primary, &storage_root).unwrap(),
+            "metadata-only archive drift should not rebuild over a live DB with newer messages"
+        );
+
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id FROM messages",
+                &[],
+            )
+            .unwrap();
+        let row = rows.first().unwrap();
+        assert_eq!(row.get_named::<i64>("count").unwrap_or(0), 2);
+        assert_eq!(row.get_named::<i64>("max_id").unwrap_or(0), 2);
+    }
+
+    #[test]
     fn archive_recovery_accepts_project_only_reconstruction_as_durable_state() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
@@ -8838,6 +9218,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn archive_recovery_ignores_unrelated_default_archive_overlap_for_missing_external_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let xdg_data_root = dir.path().join("xdg-data");
+        std::fs::create_dir_all(&xdg_data_root).unwrap();
+        let xdg_data_root_str = xdg_data_root.to_str().unwrap().to_string();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("XDG_DATA_HOME", xdg_data_root_str.as_str())],
+            || {
+                let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
+                assert!(mcp_agent_mail_core::config::is_default_storage_root(
+                    &storage_root
+                ));
+
+                let project_dir = storage_root.join("projects").join("project-only");
+                std::fs::create_dir_all(&project_dir).unwrap();
+                std::fs::write(
+                    project_dir.join("project.json"),
+                    r#"{"slug":"project-only","human_key":"/project-only"}"#,
+                )
+                .unwrap();
+
+                let external_dir = dir.path().join("external-db");
+                std::fs::create_dir_all(&external_dir).unwrap();
+                let primary = external_dir.join("storage.sqlite3");
+
+                ensure_sqlite_file_healthy_with_archive(&primary, &storage_root).unwrap();
+
+                assert!(
+                    !primary.exists(),
+                    "default-root archive state must not reconstruct a missing external sqlite path"
+                );
+            },
+        );
     }
 
     #[test]
@@ -9691,6 +10108,16 @@ mod tests {
         let conn = open_sqlite_file_with_recovery(":memory:").unwrap();
         let rows = conn.query_sync("SELECT 1 AS val", &[]).unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
+    fn inspect_mailbox_db_inventory_rejects_memory_db() {
+        let err = inspect_mailbox_db_inventory(Path::new(":memory:"))
+            .expect_err("in-memory inventory should be unavailable");
+        assert!(
+            err.to_string().contains("in-memory"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

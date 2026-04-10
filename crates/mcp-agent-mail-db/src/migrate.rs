@@ -20,7 +20,10 @@
 //! }
 //! ```
 
-use crate::DbConn;
+use crate::{
+    DbConn,
+    pool::{sqlite_path_with_suffix, wal_checkpoint_truncate_path},
+};
 use chrono::NaiveDateTime;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use thiserror::Error;
@@ -828,26 +831,29 @@ pub fn copy_python_database_to_rust(
         ))
     })?;
 
+    // Fail closed if the destination mailbox still has stale sidecars that we
+    // cannot clear. Leaving those behind after a "successful" copy can poison
+    // the first Rust open with exactly the malformed-image path we are trying
+    // to avoid.
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = sqlite_path_with_suffix(&dest, suffix);
+        if sidecar.exists() {
+            std::fs::remove_file(&sidecar).map_err(|e| {
+                MigrationError::Aborted(format!(
+                    "cannot remove stale destination sqlite sidecar {} before copy: {e}",
+                    sidecar.display()
+                ))
+            })?;
+        }
+    }
+
     // Ensure the source DB is self-contained before copying.
-    let source_path = python_db.to_string_lossy().into_owned();
-    let source_conn = DbConn::open_file(&source_path).map_err(|e| {
+    wal_checkpoint_truncate_path(python_db).map_err(|e| {
         MigrationError::Aborted(format!(
-            "cannot open source database {} for checkpoint: {e}",
+            "cannot checkpoint source database {} before copy: {e}",
             python_db.display()
         ))
     })?;
-    source_conn
-        .execute_raw("PRAGMA busy_timeout = 60000;")
-        .map_err(|e| MigrationError::Aborted(format!("cannot set source busy_timeout: {e}")))?;
-    source_conn
-        .query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
-        .map_err(|e| {
-            MigrationError::Aborted(format!(
-                "cannot checkpoint source database {} before copy: {e}",
-                python_db.display()
-            ))
-        })?;
-    drop(source_conn);
 
     // Copy main DB file
     std::fs::copy(python_db, &dest).map_err(|e| {
@@ -857,16 +863,6 @@ pub fn copy_python_database_to_rust(
             dest.display()
         ))
     })?;
-
-    // Ensure destination starts without stale sidecars.
-    for suffix in ["-wal", "-shm"] {
-        let mut sidecar_os = dest.as_os_str().to_os_string();
-        sidecar_os.push(suffix);
-        let sidecar = std::path::PathBuf::from(sidecar_os);
-        if sidecar.exists() {
-            let _ = std::fs::remove_file(sidecar);
-        }
-    }
 
     Ok(Some(dest))
 }
@@ -1698,6 +1694,44 @@ mod tests {
 
         let content = std::fs::read(&dst_db).unwrap();
         assert!(content.ends_with(b"rust data"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn copy_database_fails_closed_when_destination_sidecar_cannot_be_cleared() {
+        let base = std::env::temp_dir().join("migrate_test_copy_sidecar_blocked");
+        let src_dir = base.join("python");
+        let dst_dir = base.join("rust_storage");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::create_dir_all(&src_dir);
+        let _ = std::fs::create_dir_all(&dst_dir);
+
+        let src_db = src_dir.join("storage.sqlite3");
+        let source_conn = DbConn::open_file(src_db.display().to_string()).expect("open source db");
+        source_conn
+            .execute_raw("CREATE TABLE marker(value TEXT)")
+            .expect("create source marker table");
+        drop(source_conn);
+
+        let blocking_wal_dir = dst_dir.join("storage.sqlite3-wal");
+        std::fs::create_dir_all(&blocking_wal_dir).expect("create blocking wal dir");
+
+        let err = copy_python_database_to_rust(&src_db, &dst_dir)
+            .expect_err("stale destination sidecar cleanup failure should abort migration");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("cannot remove stale destination sqlite sidecar"),
+            "unexpected error: {err_text}"
+        );
+        assert!(
+            !dst_dir.join("storage.sqlite3").exists(),
+            "destination DB should not be copied when sidecar cleanup is blocked"
+        );
+        assert!(
+            blocking_wal_dir.is_dir(),
+            "blocking sidecar directory should remain for operator inspection"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -148,26 +148,26 @@ impl SearchRecipe {
         let mut params: Vec<(&str, String)> = Vec::new();
 
         if !self.query_text.is_empty() {
-            params.push(("q", self.query_text.clone()));
+            params.push(("q", url_encode_component(&self.query_text)));
         }
         if self.doc_kind != "messages" {
-            params.push(("type", self.doc_kind.clone()));
+            params.push(("type", url_encode_component(&self.doc_kind)));
         }
         params.push(("scope", self.scope_mode.as_str().to_string()));
         if let Some(sid) = self.scope_id {
             params.push(("scope_id", sid.to_string()));
         }
         if !self.importance_filter.is_empty() {
-            params.push(("imp", self.importance_filter.clone()));
+            params.push(("imp", url_encode_component(&self.importance_filter)));
         }
         if self.ack_filter != "any" {
-            params.push(("ack", self.ack_filter.clone()));
+            params.push(("ack", url_encode_component(&self.ack_filter)));
         }
         if self.sort_mode != "newest" {
-            params.push(("sort", self.sort_mode.clone()));
+            params.push(("sort", url_encode_component(&self.sort_mode)));
         }
         if let Some(ref tid) = self.thread_filter {
-            params.push(("thread", tid.clone()));
+            params.push(("thread", url_encode_component(tid)));
         }
 
         if params.is_empty() {
@@ -185,6 +185,25 @@ impl SearchRecipe {
         }
         out
     }
+}
+
+fn url_encode_component(s: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut out = String::with_capacity(s.len() + 8);
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(b));
+            }
+            _ => {
+                out.push('%');
+                out.push(char::from(HEX[(b >> 4) as usize]));
+                out.push(char::from(HEX[(b & 0x0F) as usize]));
+            }
+        }
+    }
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1027,10 +1046,28 @@ mod tests {
         assert!(route.contains("type=all"));
         assert!(route.contains("scope=project"));
         assert!(route.contains("scope_id=1"));
-        assert!(route.contains("imp=urgent,high"));
+        assert!(route.contains("imp=urgent%2Chigh"));
         assert!(route.contains("ack=required"));
         assert!(route.contains("sort=relevance"));
         assert!(route.contains("thread=t-1"));
+    }
+
+    #[test]
+    fn recipe_route_string_percent_encodes_values() {
+        let recipe = SearchRecipe {
+            query_text: "error & warning".to_string(),
+            importance_filter: "urgent,high".to_string(),
+            ack_filter: "not_required".to_string(),
+            thread_filter: Some("topic/a b+".to_string()),
+            ..Default::default()
+        };
+
+        let route = recipe.route_string();
+
+        assert!(route.contains("q=error%20%26%20warning"));
+        assert!(route.contains("imp=urgent%2Chigh"));
+        assert!(route.contains("ack=not_required"));
+        assert!(route.contains("thread=topic%2Fa%20b%2B"));
     }
 
     // ── Serialization ─────────────────────────────────────────────

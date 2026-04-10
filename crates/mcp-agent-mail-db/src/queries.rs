@@ -8516,6 +8516,74 @@ pub async fn get_product_by_uid(
     }
 }
 
+fn parse_unknown_product_placeholder(key: &str) -> Option<i64> {
+    key.strip_prefix("[unknown-product-")?
+        .strip_suffix(']')?
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0)
+}
+
+/// Get product by key (product_uid, name, or orphaned placeholder id).
+pub async fn get_product_by_key(cx: &Cx, pool: &DbPool, key: &str) -> Outcome<ProductRow, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    let select_sql = "SELECT id, product_uid, name, created_at \
+                      FROM products WHERE product_uid = ? OR name = ? LIMIT 1";
+    let select_params = [Value::Text(key.to_string()), Value::Text(key.to_string())];
+
+    match map_sql_outcome(traw_query(cx, &tracked, select_sql, &select_params).await) {
+        Outcome::Ok(rows) => {
+            if let Some(row) = rows.first() {
+                return match decode_product_row_indexed(row) {
+                    Ok(row) => Outcome::Ok(row),
+                    Err(e) => Outcome::Err(e),
+                };
+            }
+
+            let Some(product_id) = parse_unknown_product_placeholder(key) else {
+                return Outcome::Err(DbError::not_found("Product", key));
+            };
+
+            let placeholder_sql = "SELECT COALESCE(MIN(created_at), 0) AS created_at \
+                                   FROM product_project_links WHERE product_id = ?";
+            let placeholder_params = [Value::BigInt(product_id)];
+
+            match map_sql_outcome(
+                traw_query(cx, &tracked, placeholder_sql, &placeholder_params).await,
+            ) {
+                Outcome::Ok(rows) => {
+                    let created_at = rows
+                        .first()
+                        .and_then(|row| row.get_named::<i64>("created_at").ok());
+                    match created_at.filter(|ts| *ts > 0) {
+                        Some(created_at) => Outcome::Ok(ProductRow {
+                            id: Some(product_id),
+                            product_uid: key.to_string(),
+                            name: key.to_string(),
+                            created_at,
+                        }),
+                        None => Outcome::Err(DbError::not_found("Product", key)),
+                    }
+                }
+                Outcome::Err(e) => Outcome::Err(e),
+                Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                Outcome::Panicked(p) => Outcome::Panicked(p),
+            }
+        }
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
 /// Force-release a single file reservation by ID regardless of owner.
 ///
 /// If `expected_expires_ts` is provided, the release is only performed if the
@@ -16640,6 +16708,64 @@ mod tests {
             assert_eq!(lookup.id, Some(project_id));
             assert_eq!(lookup.slug, format!("[unknown-project-{project_id}]"));
             assert_eq!(lookup.human_key, format!("[unknown-project-{project_id}]"));
+        });
+    }
+
+    #[test]
+    fn get_product_by_key_falls_back_to_orphaned_placeholder_inventory() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, dir) = setup_test_pool("get_product_by_key_orphaned.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(
+                &cx,
+                &pool,
+                &format!("/tmp/am-get-product-by-key-orphaned-{base}"),
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let uid = format!("prod_get_product_key_orphaned_{base}");
+            let product = ensure_product(&cx, &pool, Some(uid.as_str()), Some(uid.as_str()))
+                .await
+                .into_result()
+                .expect("ensure product");
+            let product_id = product.id.expect("product id");
+
+            link_product_to_projects(&cx, &pool, product_id, &[project_id])
+                .await
+                .into_result()
+                .expect("link product");
+
+            let db_path = dir.path().join("get_product_by_key_orphaned.db");
+            let repair_conn = crate::DbConn::open_file(db_path.display().to_string())
+                .expect("open direct product cleanup connection");
+            repair_conn
+                .execute_sync(
+                    "DELETE FROM products WHERE id = ?",
+                    &[Value::BigInt(product_id)],
+                )
+                .expect("orphan product row");
+
+            let lookup = get_product_by_key(&cx, &pool, &format!("[unknown-product-{product_id}]"))
+                .await
+                .into_result()
+                .expect("lookup orphaned placeholder product");
+
+            assert_eq!(lookup.id, Some(product_id));
+            assert_eq!(
+                lookup.product_uid,
+                format!("[unknown-product-{product_id}]")
+            );
+            assert_eq!(lookup.name, format!("[unknown-product-{product_id}]"));
+            assert!(lookup.created_at > 0);
         });
     }
 

@@ -112,7 +112,8 @@ pub use mailbox_verdict::{
     DURABILITY_TRANSITIONS, DurabilityState, DurabilityTransition, MailboxArchiveDriftState,
     MailboxArchiveDriftVerdict, MailboxHealthVerdict, MailboxSqlitePathVerdict, MailboxState,
     ProbeResult, ProbeSeverity, VerdictOptions, compute_mailbox_verdict,
-    validate_durability_transition,
+    validate_durability_transition, verdict_prefers_archive_snapshot_reads,
+    verdict_prefers_archive_snapshot_reads_for_primary_read_surface,
 };
 pub use migrate::{
     ColumnConversionResult, MigrationError, MigrationSummary, TIMESTAMP_COLUMNS, TimestampFormat,
@@ -173,6 +174,7 @@ pub use pool::{
     record_canary_probe,
     recovery_admission,
     resolve_mailbox_sqlite_path,
+    sqlite_primary_read_path_is_healthy,
 };
 pub use queries::{MvccRetryMetrics, mvcc_retry_metrics};
 pub use reconstruct::{

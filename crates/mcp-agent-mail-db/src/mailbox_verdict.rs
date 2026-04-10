@@ -32,7 +32,7 @@ use crate::pool::{
     MailboxOwnershipDisposition, MailboxOwnershipState, MailboxRecoveryLockState,
     MailboxSidecarState, inspect_mailbox_db_inventory, inspect_mailbox_ownership,
     inspect_mailbox_recovery_lock, inspect_mailbox_sidecar_state, resolve_mailbox_sqlite_path,
-    sqlite_file_is_healthy,
+    sqlite_compatibility_read_path_is_healthy, sqlite_primary_read_path_is_healthy,
 };
 use crate::reconstruct::{archive_missing_project_identities, scan_archive_message_inventory};
 use serde::{Deserialize, Serialize};
@@ -651,6 +651,66 @@ impl MailboxHealthVerdict {
     }
 }
 
+/// Whether read surfaces should prefer archive snapshots over the live DB.
+///
+/// Most degraded verdicts mean the live mailbox is unsafe or untrustworthy for
+/// direct reads. The exception is archive parity drift where the DB is ahead of
+/// the archive: that signals delayed archive persistence, not a reason to hide
+/// newer live data behind an older archive snapshot.
+#[must_use]
+pub fn verdict_prefers_archive_snapshot_reads(verdict: &MailboxHealthVerdict) -> bool {
+    let durability = DurabilityState::from_mailbox_state(verdict.state);
+    if !durability.allows_reads() {
+        return true;
+    }
+    if !durability.is_degraded() {
+        return false;
+    }
+
+    let only_archive_parity_failures = verdict
+        .probes
+        .iter()
+        .filter(|probe| !probe.passed)
+        .all(|probe| probe.name == "archive_db_parity");
+    if only_archive_parity_failures
+        && verdict.archive_drift.state == MailboxArchiveDriftState::DbAhead
+    {
+        return false;
+    }
+
+    true
+}
+
+/// Whether read surfaces using the primary FrankenSQLite path should prefer
+/// archive snapshots over the live DB.
+///
+/// The full mailbox verdict includes a secondary compatibility reopen/probe.
+/// That probe is useful for diagnostics, but it should not force archive
+/// fallback when the primary read path is still healthy, because the read
+/// surfaces themselves execute on the primary path.
+#[must_use]
+pub fn verdict_prefers_archive_snapshot_reads_for_primary_read_surface(
+    verdict: &MailboxHealthVerdict,
+    sqlite_path: &Path,
+) -> bool {
+    if !verdict_prefers_archive_snapshot_reads(verdict) {
+        return false;
+    }
+
+    let only_db_sanity_failures = verdict
+        .probes
+        .iter()
+        .filter(|probe| !probe.passed)
+        .all(|probe| probe.name == "db_sanity");
+    if only_db_sanity_failures
+        && crate::pool::sqlite_primary_read_path_is_healthy(sqlite_path).unwrap_or(false)
+    {
+        return false;
+    }
+
+    true
+}
+
 /// Compute the state from probe results.
 fn compute_state_from_probes(probes: &[ProbeResult], recovery_lock_held: bool) -> MailboxState {
     let mut state = MailboxState::Healthy;
@@ -905,14 +965,42 @@ fn probe_db_file_sanity(db_path: &Path) -> ProbeResult {
         u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
     }
 
+    if db_path.as_os_str() == ":memory:" {
+        return ProbeResult::ok("db_sanity", "In-memory database (quick_check skipped)");
+    }
+
     let start = std::time::Instant::now();
-    match sqlite_file_is_healthy(db_path) {
-        Ok(true) => ProbeResult::ok("db_sanity", "SQLite quick_check passed")
-            .with_duration(probe_duration_micros(start)),
-        Ok(false) => ProbeResult::error("db_sanity", "SQLite quick_check failed")
-            .with_duration(probe_duration_micros(start)),
-        Err(e) => ProbeResult::error("db_sanity", format!("Cannot run quick_check: {e}"))
-            .with_duration(probe_duration_micros(start)),
+    match sqlite_primary_read_path_is_healthy(db_path) {
+        Ok(true) => {}
+        Ok(false) => {
+            return ProbeResult::error("db_sanity", "Primary SQLite read-path health probe failed")
+                .with_duration(probe_duration_micros(start));
+        }
+        Err(e) => {
+            return ProbeResult::error(
+                "db_sanity",
+                format!("Cannot run primary SQLite read-path health probe: {e}"),
+            )
+            .with_duration(probe_duration_micros(start));
+        }
+    }
+
+    match sqlite_compatibility_read_path_is_healthy(db_path) {
+        Ok(true) => ProbeResult::ok(
+            "db_sanity",
+            "Primary SQLite read path and compatibility reopen probe passed",
+        )
+        .with_duration(probe_duration_micros(start)),
+        Ok(false) => ProbeResult::error(
+            "db_sanity",
+            "Primary SQLite read path passed, but the compatibility reopen probe failed",
+        )
+        .with_duration(probe_duration_micros(start)),
+        Err(e) => ProbeResult::error(
+            "db_sanity",
+            format!("Cannot run SQLite compatibility reopen probe: {e}"),
+        )
+        .with_duration(probe_duration_micros(start)),
     }
 }
 
@@ -1011,6 +1099,12 @@ fn probe_integrity(integrity: &MailboxIntegrityVerdict) -> ProbeResult {
 }
 
 fn inspect_archive_drift(db_path: &Path, archive_root: &Path) -> MailboxArchiveDriftVerdict {
+    if db_path.as_os_str() == ":memory:" {
+        return MailboxArchiveDriftVerdict::skipped(
+            "Archive drift inspection skipped for in-memory database",
+        );
+    }
+
     let archive_inventory = scan_archive_message_inventory(archive_root);
     let db_inventory = match inspect_mailbox_db_inventory(db_path) {
         Ok(inventory) => inventory,
@@ -1032,23 +1126,32 @@ fn inspect_archive_drift(db_path: &Path, archive_root: &Path) -> MailboxArchiveD
     };
     let missing_projects =
         archive_missing_project_identities(&archive_inventory, &db_inventory.project_identities);
-    let archive_projects_ahead = archive_inventory.projects > db_inventory.projects;
-    let archive_agents_ahead = archive_inventory.agents > db_inventory.agents;
     let archive_message_count = archive_inventory.unique_message_ids;
     let db_message_count = db_inventory.messages;
     let archive_messages_ahead = archive_message_count > db_message_count;
     let archive_latest_id_ahead =
         archive_inventory.latest_message_id.unwrap_or(0) > db_inventory.max_message_id;
-    let archive_identity_ahead = !missing_projects.is_empty();
-    let archive_ahead = archive_projects_ahead
-        || archive_agents_ahead
-        || archive_messages_ahead
-        || archive_latest_id_ahead
-        || archive_identity_ahead;
+    let archive_metadata_ahead = crate::pool::archive_metadata_advantage_is_decisive(
+        archive_inventory.projects,
+        archive_inventory.agents,
+        archive_message_count,
+        archive_inventory.latest_message_id,
+        db_inventory.projects,
+        db_inventory.agents,
+        db_message_count,
+        db_inventory.max_message_id,
+        &missing_projects,
+    );
+    let archive_ahead = archive_messages_ahead || archive_latest_id_ahead || archive_metadata_ahead;
     let db_projects_ahead = db_inventory.projects > archive_inventory.projects;
     let db_agents_ahead = db_inventory.agents > archive_inventory.agents;
     let db_messages_ahead = db_message_count > archive_message_count;
-    let db_ahead = db_projects_ahead || db_agents_ahead || db_messages_ahead;
+    let db_latest_id_ahead =
+        db_inventory.max_message_id > archive_inventory.latest_message_id.unwrap_or(0);
+    let db_ahead = db_messages_ahead
+        || db_latest_id_ahead
+        || (!(archive_messages_ahead || archive_latest_id_ahead)
+            && (db_projects_ahead || db_agents_ahead));
     let state = if archive_inventory.projects == 0
         && archive_inventory.agents == 0
         && archive_inventory.unique_message_ids == 0
@@ -1666,6 +1769,79 @@ mod tests {
     }
 
     #[test]
+    fn verdict_db_ahead_drift_does_not_prefer_archive_snapshots_when_it_is_only_failure() {
+        let probes = vec![
+            ProbeResult::ok("db_exists", "ok"),
+            ProbeResult::warn_state(
+                "archive_db_parity",
+                "DB is ahead of archive",
+                MailboxState::Suspect,
+            ),
+        ];
+        let mut verdict = verdict_from_probes(probes, false);
+        verdict.archive_drift = MailboxArchiveDriftVerdict {
+            state: MailboxArchiveDriftState::DbAhead,
+            archive_projects: 0,
+            archive_agents: 0,
+            archive_messages: 1,
+            db_projects: 1,
+            db_agents: 2,
+            db_messages: 2,
+            archive_latest_message_id: Some(1),
+            db_max_message_id: 2,
+            missing_projects: Vec::new(),
+            detail: "DB is ahead of archive by 1 message".to_string(),
+        };
+
+        assert!(!verdict_prefers_archive_snapshot_reads(&verdict));
+    }
+
+    #[test]
+    fn verdict_db_ahead_drift_still_prefers_archive_snapshots_when_other_failures_exist() {
+        let probes = vec![
+            ProbeResult::warn_state(
+                "archive_db_parity",
+                "DB is ahead of archive",
+                MailboxState::Suspect,
+            ),
+            ProbeResult::warn("sidecar_state", "WAL without SHM"),
+        ];
+        let mut verdict = verdict_from_probes(probes, false);
+        verdict.archive_drift = MailboxArchiveDriftVerdict {
+            state: MailboxArchiveDriftState::DbAhead,
+            archive_projects: 0,
+            archive_agents: 0,
+            archive_messages: 1,
+            db_projects: 1,
+            db_agents: 2,
+            db_messages: 2,
+            archive_latest_message_id: Some(1),
+            db_max_message_id: 2,
+            missing_projects: Vec::new(),
+            detail: "DB is ahead of archive by 1 message".to_string(),
+        };
+
+        assert!(verdict_prefers_archive_snapshot_reads(&verdict));
+    }
+
+    #[test]
+    fn verdict_db_sanity_only_failure_does_not_force_archive_when_primary_read_path_is_healthy() {
+        let probes = vec![ProbeResult::error(
+            "db_sanity",
+            "compatibility reopen failed",
+        )];
+        let verdict = verdict_from_probes(probes, false);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("primary-healthy.sqlite3");
+        let conn = crate::DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        drop(conn);
+
+        assert!(
+            !verdict_prefers_archive_snapshot_reads_for_primary_read_surface(&verdict, &db_path)
+        );
+    }
+
+    #[test]
     fn verdict_uses_explicit_probe_impact_state_not_probe_name() {
         let probes = vec![ProbeResult::warn_state(
             "totally_unrelated_name",
@@ -1701,6 +1877,104 @@ mod tests {
         ];
         let verdict = verdict_from_probes(probes, true);
         assert_eq!(verdict.state, MailboxState::Recovering);
+    }
+
+    #[test]
+    fn inspect_archive_drift_prefers_db_ahead_when_archive_only_has_metadata_advantage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+
+        let proj_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = proj_dir.join("agents").join("Alice");
+        let msg_dir = proj_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&msg_dir).expect("create message dir");
+        std::fs::write(
+            proj_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project"}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z"}"#,
+        )
+        .expect("write agent metadata");
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"First\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:00:00Z\",\"attachments\":[]}\n---\n\nfirst body\n",
+        )
+        .expect("write archive message");
+
+        crate::reconstruct::reconstruct_from_archive(&db_path, &storage_root)
+            .expect("seed live db from archive");
+
+        let conn = crate::DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                crate::sqlmodel::Value::BigInt(3),
+                crate::sqlmodel::Value::BigInt(1),
+                crate::sqlmodel::Value::Text("BlueLake".to_string()),
+                crate::sqlmodel::Value::Text("coder".to_string()),
+                crate::sqlmodel::Value::Text("test".to_string()),
+                crate::sqlmodel::Value::Text(String::new()),
+                crate::sqlmodel::Value::BigInt(2),
+                crate::sqlmodel::Value::BigInt(2),
+                crate::sqlmodel::Value::Text("auto".to_string()),
+                crate::sqlmodel::Value::Text("auto".to_string()),
+            ],
+        )
+        .expect("insert recipient");
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments, recipients_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                crate::sqlmodel::Value::BigInt(2),
+                crate::sqlmodel::Value::BigInt(1),
+                crate::sqlmodel::Value::BigInt(1),
+                crate::sqlmodel::Value::Text("t2".to_string()),
+                crate::sqlmodel::Value::Text("Second".to_string()),
+                crate::sqlmodel::Value::Text("second body".to_string()),
+                crate::sqlmodel::Value::Text("normal".to_string()),
+                crate::sqlmodel::Value::BigInt(0),
+                crate::sqlmodel::Value::BigInt(2_000_000),
+                crate::sqlmodel::Value::Text("[]".to_string()),
+                crate::sqlmodel::Value::Text(r#"{"to":["BlueLake"],"cc":[],"bcc":[]}"#.to_string()),
+            ],
+        )
+        .expect("insert newer live message");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, ack_ts, read_ts) VALUES (?, ?, ?, NULL, NULL)",
+            &[
+                crate::sqlmodel::Value::BigInt(2),
+                crate::sqlmodel::Value::BigInt(3),
+                crate::sqlmodel::Value::Text("to".to_string()),
+            ],
+        )
+        .expect("insert message recipient");
+        drop(conn);
+
+        let archive_only_project = storage_root.join("projects").join("archive-only-project");
+        let archive_only_agent = archive_only_project.join("agents").join("ArchiveGhost");
+        std::fs::create_dir_all(&archive_only_agent).expect("create archive-only project dir");
+        std::fs::write(
+            archive_only_project.join("project.json"),
+            r#"{"slug":"archive-only-project","human_key":"/archive-only-project","created_at":0}"#,
+        )
+        .expect("write archive-only project metadata");
+        std::fs::write(
+            archive_only_agent.join("profile.json"),
+            r#"{"agent_name":"ArchiveGhost","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
+        )
+        .expect("write archive-only agent metadata");
+
+        let drift = inspect_archive_drift(&db_path, &storage_root);
+        assert_eq!(drift.state, MailboxArchiveDriftState::DbAhead);
+        assert!(
+            drift.detail.contains("DB is ahead of archive"),
+            "expected db-ahead detail, got: {}",
+            drift.detail
+        );
     }
 
     #[test]
@@ -1805,6 +2079,13 @@ mod tests {
     }
 
     #[test]
+    fn probe_db_file_sanity_memory() {
+        let probe = probe_db_file_sanity(Path::new(":memory:"));
+        assert!(probe.passed);
+        assert!(probe.detail.contains("In-memory"));
+    }
+
+    #[test]
     fn probe_db_file_exists_missing() {
         let probe = probe_db_file_exists(Path::new("/nonexistent/path/db.sqlite3"));
         assert!(!probe.passed);
@@ -1816,6 +2097,57 @@ mod tests {
         let probe = probe_schema_populated(Path::new(":memory:"), 0);
         assert!(probe.passed);
         assert!(probe.detail.contains("In-memory"));
+    }
+
+    #[test]
+    fn compute_mailbox_verdict_skips_file_and_archive_drift_probes_for_in_memory_database() {
+        let archive_root = tempfile::tempdir().expect("tempdir");
+        let project_dir = archive_root.path().join("projects").join("demo-project");
+        let message_dir = project_dir.join("messages").join("2026").join("04");
+
+        std::fs::create_dir_all(&message_dir).expect("create message dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"demo-project","human_key":"/demo/project"}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            message_dir.join("2026-04-10T12-00-00Z__hello__1.md"),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"hello\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-04-10T12:00:00Z\",\"attachments\":[]}\n---\n\nbody\n",
+        )
+        .expect("write archive message");
+
+        let verdict = compute_mailbox_verdict(
+            "sqlite:///:memory:",
+            archive_root.path(),
+            &VerdictOptions::default(),
+        );
+
+        assert_eq!(verdict.state, MailboxState::Healthy);
+        assert_eq!(
+            verdict.archive_drift.state,
+            MailboxArchiveDriftState::Skipped
+        );
+        assert!(
+            verdict.archive_drift.detail.contains("in-memory")
+                || verdict.archive_drift.detail.contains("In-memory")
+        );
+
+        let db_sanity = verdict
+            .probes
+            .iter()
+            .find(|probe| probe.name == "db_sanity")
+            .expect("db_sanity probe present");
+        assert!(db_sanity.passed);
+        assert!(db_sanity.detail.contains("In-memory"));
+
+        let archive_parity = verdict
+            .probes
+            .iter()
+            .find(|probe| probe.name == "archive_db_parity")
+            .expect("archive parity probe present");
+        assert!(archive_parity.passed);
+        assert!(archive_parity.detail.contains("skipped"));
     }
 
     #[test]

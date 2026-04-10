@@ -5443,6 +5443,111 @@ mod tests {
         assert!(!message_query_uses_sql_plan(&query));
     }
 
+    #[test]
+    fn sql_plan_inbox_agent_filter_keeps_orphaned_recipient_rows_visible() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = crate::DbPoolConfig {
+            database_url: format!(
+                "sqlite:///{}",
+                root.path().join("search-orphaned-recipient.db").display()
+            ),
+            storage_root: Some(root.path().to_path_buf()),
+            ..crate::DbPoolConfig::default()
+        };
+        let pool = DbPool::new(&config).expect("pool");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+
+        runtime.block_on(async {
+            let cx = Cx::for_testing();
+            let project = match crate::queries::ensure_project(
+                &cx,
+                &pool,
+                "/data/projects/search-orphaned-recipient",
+            )
+            .await
+            {
+                Outcome::Ok(project) => project,
+                other => panic!("ensure_project failed: {other:?}"),
+            };
+            let project_id = project.id.unwrap_or(0);
+
+            let sender = match crate::queries::register_agent(
+                &cx, &pool, project_id, "RedPeak", "coder", "test", None, None, None,
+            )
+            .await
+            {
+                Outcome::Ok(agent) => agent,
+                other => panic!("register sender failed: {other:?}"),
+            };
+            let recipient = match crate::queries::register_agent(
+                &cx, &pool, project_id, "BlueLake", "coder", "test", None, None, None,
+            )
+            .await
+            {
+                Outcome::Ok(agent) => agent,
+                other => panic!("register recipient failed: {other:?}"),
+            };
+            let message = match crate::queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                sender.id.unwrap_or(0),
+                "Inbox query survives orphaned recipient metadata",
+                "body",
+                Some("br-search-inbox-orphan"),
+                "high",
+                false,
+                "[]",
+                &[(recipient.id.unwrap_or(0), "to")],
+            )
+            .await
+            {
+                Outcome::Ok(message) => message,
+                other => panic!("create_message_with_recipients failed: {other:?}"),
+            };
+
+            let conn = match pool.acquire(&cx).await {
+                Outcome::Ok(conn) => conn,
+                Outcome::Err(err) => panic!("acquire failed: {err}"),
+                Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                Outcome::Panicked(panic) => panic!("acquire panicked: {}", panic.message()),
+            };
+            conn.execute_sync(
+                "DELETE FROM agents WHERE id = ?",
+                &[sqlmodel_core::Value::BigInt(recipient.id.unwrap_or(0))],
+            )
+            .expect("delete recipient agent row");
+
+            let query = SearchQuery {
+                agent_name: Some("BlueLake".to_string()),
+                direction: Some(Direction::Inbox),
+                limit: Some(10),
+                ..SearchQuery::messages("", project_id)
+            };
+            let response = match execute_search_simple(&cx, &pool, &query).await {
+                Outcome::Ok(response) => response,
+                Outcome::Err(err) => panic!("execute_search_simple failed: {err}"),
+                Outcome::Cancelled(_) => panic!("execute_search_simple cancelled"),
+                Outcome::Panicked(panic) => {
+                    panic!("execute_search_simple panicked: {}", panic.message())
+                }
+            };
+
+            assert_eq!(
+                response.results.len(),
+                1,
+                "blank inbox searches should still find messages via recipients_json when recipient metadata rows drift"
+            );
+            assert_eq!(response.results[0].id, message.id.unwrap_or(0));
+            assert_eq!(
+                response.results[0].from_agent.as_deref(),
+                Some("RedPeak")
+            );
+        });
+    }
+
     // ── Zero-result guidance tests ──────────────────────────────────
 
     #[test]

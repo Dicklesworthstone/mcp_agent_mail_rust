@@ -7,7 +7,8 @@
 
 use crate::{
     pool::{
-        inspect_mailbox_db_inventory, inspect_mailbox_recovery_lock, inspect_mailbox_sidecar_state,
+        archive_metadata_advantage_is_decisive, inspect_mailbox_db_inventory,
+        inspect_mailbox_recovery_lock, inspect_mailbox_sidecar_state, sqlite_path_with_suffix,
     },
     reconstruct::{
         ArchiveMessageInventory, archive_missing_project_identities, compute_archive_drift_report,
@@ -166,9 +167,42 @@ fn read_sqlite_header_fields(db_path: &Path) -> Option<(u32, u32)> {
 /// connection, so it is safe to call even when the DB is corrupt or locked.
 #[must_use]
 pub fn capture_pre_recovery_snapshot(db_path: &Path, trigger: &str) -> ForensicPreSnapshot {
+    if is_in_memory_db_path(db_path) {
+        let recovery_lock = inspect_mailbox_recovery_lock(db_path);
+        let snapshot = ForensicPreSnapshot {
+            trigger: trigger.to_string(),
+            db_path: db_path.display().to_string(),
+            db_family: forensic_db_family_name(db_path),
+            db_bytes: None,
+            wal_bytes: None,
+            shm_bytes: None,
+            page_size: None,
+            page_count: None,
+            process_holders: Vec::new(),
+            file_locks: Vec::new(),
+            recovery_lock_active: recovery_lock.active,
+            recovery_lock_pid: recovery_lock.pid,
+            self_pid: std::process::id(),
+            captured_at_us: mcp_agent_mail_core::timestamps::now_micros(),
+            storage_root: None,
+            database_url_redacted: None,
+        };
+
+        tracing::info!(
+            db_path = %snapshot.db_path,
+            db_family = %snapshot.db_family,
+            trigger = %snapshot.trigger,
+            recovery_lock_active = snapshot.recovery_lock_active,
+            recovery_lock_pid = ?snapshot.recovery_lock_pid,
+            "captured pre-recovery forensic snapshot for in-memory database"
+        );
+
+        return snapshot;
+    }
+
     let db_bytes = std::fs::metadata(db_path).ok().map(|m| m.len());
-    let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
-    let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
+    let wal_path = sqlite_path_with_suffix(db_path, "-wal");
+    let shm_path = sqlite_path_with_suffix(db_path, "-shm");
     let wal_bytes = std::fs::metadata(&wal_path).ok().map(|m| m.len());
     let shm_bytes = std::fs::metadata(&shm_path).ok().map(|m| m.len());
     let (page_size, page_count) =
@@ -252,6 +286,33 @@ fn forensic_db_family_name(db_path: &Path) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or("database.sqlite3")
         .to_string()
+}
+
+fn is_in_memory_db_path(path: &Path) -> bool {
+    path.as_os_str() == ":memory:"
+}
+
+fn forensic_bundle_dir_component(db_path: &Path) -> String {
+    if is_in_memory_db_path(db_path) {
+        return "in-memory.sqlite3".to_string();
+    }
+
+    let family = forensic_db_family_name(db_path);
+    let mut sanitized = String::with_capacity(family.len());
+    for ch in family.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+
+    let sanitized = sanitized.trim_matches('_');
+    if sanitized.is_empty() {
+        "database.sqlite3".to_string()
+    } else {
+        sanitized.to_string()
+    }
 }
 
 fn bundle_rel_path(bundle_dir: &Path, path: &Path) -> Result<String, SqlError> {
@@ -346,6 +407,15 @@ fn add_report_artifact<T: Serialize>(
 }
 
 fn source_file_status(path: &Path) -> serde_json::Value {
+    if is_in_memory_db_path(path) {
+        return json!({
+            "path": path.display().to_string(),
+            "exists": false,
+            "bytes": serde_json::Value::Null,
+            "status": "in_memory",
+        });
+    }
+
     match std::fs::metadata(path) {
         Ok(metadata) => json!({
             "path": path.display().to_string(),
@@ -366,6 +436,16 @@ fn source_file_status(path: &Path) -> serde_json::Value {
     }
 }
 
+fn not_applicable_source_status(detail: &str) -> serde_json::Value {
+    json!({
+        "path": serde_json::Value::Null,
+        "exists": false,
+        "bytes": serde_json::Value::Null,
+        "status": "not_applicable",
+        "detail": detail,
+    })
+}
+
 fn inventory_identity_labels(
     identities: &BTreeSet<crate::reconstruct::MailboxProjectIdentity>,
 ) -> Vec<String> {
@@ -377,52 +457,83 @@ fn inventory_identity_labels(
 
 fn build_archive_drift_reference(capture: MailboxForensicCapture<'_>) -> serde_json::Value {
     let archive = scan_archive_message_inventory(capture.storage_root);
-    let db_inventory = inspect_mailbox_db_inventory(capture.db_path);
     let projects_dir = capture.storage_root.join("projects");
 
-    let (db_inventory_json, missing_archive_projects, drift_reasons) = match db_inventory {
-        Ok(inventory) => {
-            let labels =
-                archive_missing_project_identities(&archive, &inventory.project_identities);
-            let mut reasons = Vec::new();
-            let archive_message_count = archive.unique_message_ids;
-            let db_message_count = inventory.messages;
-            if archive.projects > inventory.projects {
-                reasons.push("archive_projects_ahead".to_string());
-            }
-            if archive.agents > inventory.agents {
-                reasons.push("archive_agents_ahead".to_string());
-            }
-            if archive_message_count > db_message_count {
-                reasons.push("archive_messages_ahead".to_string());
-            }
-            if archive.latest_message_id.unwrap_or(0) > inventory.max_message_id {
-                reasons.push("archive_latest_id_ahead".to_string());
-            }
-            if !labels.is_empty() {
-                reasons.push("archive_project_identity_ahead".to_string());
-            }
-            (
-                json!({
-                    "status": "ok",
-                    "projects": inventory.projects,
-                    "agents": inventory.agents,
-                    "messages": inventory.messages,
-                    "max_message_id": inventory.max_message_id,
-                    "project_identities": inventory_identity_labels(&inventory.project_identities),
-                }),
-                labels,
-                reasons,
-            )
-        }
-        Err(error) => (
+    let (db_inventory_json, missing_archive_projects, drift_reasons) = if capture
+        .db_path
+        .as_os_str()
+        == ":memory:"
+    {
+        (
             json!({
-                "status": "error",
-                "detail": error.to_string(),
+                "status": "skipped",
+                "detail": "DB inventory comparison skipped for in-memory database",
             }),
             Vec::new(),
-            vec!["database_inventory_unavailable".to_string()],
-        ),
+            vec!["database_inventory_skipped_in_memory".to_string()],
+        )
+    } else {
+        match inspect_mailbox_db_inventory(capture.db_path) {
+            Ok(inventory) => {
+                let labels =
+                    archive_missing_project_identities(&archive, &inventory.project_identities);
+                let mut reasons = Vec::new();
+                let archive_message_count = archive.unique_message_ids;
+                let db_message_count = inventory.messages;
+                let archive_messages_ahead = archive_message_count > db_message_count;
+                let archive_latest_id_ahead =
+                    archive.latest_message_id.unwrap_or(0) > inventory.max_message_id;
+                let archive_metadata_ahead = archive_metadata_advantage_is_decisive(
+                    archive.projects,
+                    archive.agents,
+                    archive_message_count,
+                    archive.latest_message_id,
+                    inventory.projects,
+                    inventory.agents,
+                    db_message_count,
+                    inventory.max_message_id,
+                    &labels,
+                );
+
+                if archive_messages_ahead {
+                    reasons.push("archive_messages_ahead".to_string());
+                }
+                if archive_latest_id_ahead {
+                    reasons.push("archive_latest_id_ahead".to_string());
+                }
+                if archive_metadata_ahead {
+                    if archive.projects > inventory.projects {
+                        reasons.push("archive_projects_ahead".to_string());
+                    }
+                    if archive.agents > inventory.agents {
+                        reasons.push("archive_agents_ahead".to_string());
+                    }
+                    if !labels.is_empty() {
+                        reasons.push("archive_project_identity_ahead".to_string());
+                    }
+                }
+                (
+                    json!({
+                        "status": "ok",
+                        "projects": inventory.projects,
+                        "agents": inventory.agents,
+                        "messages": inventory.messages,
+                        "max_message_id": inventory.max_message_id,
+                        "project_identities": inventory_identity_labels(&inventory.project_identities),
+                    }),
+                    labels,
+                    reasons,
+                )
+            }
+            Err(error) => (
+                json!({
+                    "status": "error",
+                    "detail": error.to_string(),
+                }),
+                Vec::new(),
+                vec!["database_inventory_unavailable".to_string()],
+            ),
+        }
     };
 
     json!({
@@ -432,7 +543,10 @@ fn build_archive_drift_reference(capture: MailboxForensicCapture<'_>) -> serde_j
         "archive": archive_inventory_json(capture.storage_root, &projects_dir, &archive),
         "database_inventory": db_inventory_json,
         "archive_ahead": !drift_reasons.is_empty()
-            && !drift_reasons.iter().all(|reason| reason == "database_inventory_unavailable"),
+            && !drift_reasons.iter().all(|reason| {
+                reason == "database_inventory_unavailable"
+                    || reason == "database_inventory_skipped_in_memory"
+            }),
         "archive_drift_reasons": drift_reasons,
         "missing_archive_projects": missing_archive_projects,
         "candidate_validation": {
@@ -488,8 +602,32 @@ fn build_environment_reference(capture: MailboxForensicCapture<'_>) -> serde_jso
 }
 
 fn build_live_db_reference(capture: MailboxForensicCapture<'_>) -> serde_json::Value {
-    let wal_path = PathBuf::from(format!("{}-wal", capture.db_path.display()));
-    let shm_path = PathBuf::from(format!("{}-shm", capture.db_path.display()));
+    if is_in_memory_db_path(capture.db_path) {
+        let sidecars = inspect_mailbox_sidecar_state(capture.db_path);
+        let recovery_lock = inspect_mailbox_recovery_lock(capture.db_path);
+        return json!({
+            "schema": { "name": "mcp-agent-mail-mailbox-forensics-live-db-state", "major": 1, "minor": 0 },
+            "command": capture.command_name,
+            "trigger": capture.trigger,
+            "db_family": forensic_db_family_name(capture.db_path),
+            "db": source_file_status(capture.db_path),
+            "wal": not_applicable_source_status("In-memory database has no WAL sidecar file"),
+            "shm": not_applicable_source_status("In-memory database has no SHM sidecar file"),
+            "sidecars": sidecars,
+            "recovery_lock": recovery_lock,
+            "process_inventory": {
+                "platform": std::env::consts::OS,
+                "holders": Vec::<ForensicProcessHolder>::new(),
+            },
+            "file_locks": {
+                "platform": std::env::consts::OS,
+                "locks": Vec::<ForensicFileLock>::new(),
+            },
+        });
+    }
+
+    let wal_path = sqlite_path_with_suffix(capture.db_path, "-wal");
+    let shm_path = sqlite_path_with_suffix(capture.db_path, "-shm");
     let sidecars = inspect_mailbox_sidecar_state(capture.db_path);
     let recovery_lock = inspect_mailbox_recovery_lock(capture.db_path);
     let holders = process_holders_for_paths(&[
@@ -737,9 +875,10 @@ pub fn capture_mailbox_forensic_bundle(
 ) -> Result<PathBuf, SqlError> {
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     let db_family = forensic_db_family_name(capture.db_path);
+    let bundle_dir_family = forensic_bundle_dir_component(capture.db_path);
     let bundle_name = format!("{}-{timestamp}", capture.command_name);
     let bundle_dir = forensics_root(capture.storage_root, capture.db_path)
-        .join(&db_family)
+        .join(&bundle_dir_family)
         .join(&bundle_name);
     std::fs::create_dir_all(&bundle_dir).map_err(|error| {
         SqlError::Custom(format!(
@@ -756,16 +895,11 @@ pub fn capture_mailbox_forensic_bundle(
     })?;
 
     let created_at = chrono::Utc::now().to_rfc3339();
+    let in_memory_db = is_in_memory_db_path(capture.db_path);
     let source_paths = [
         ("db", capture.db_path.to_path_buf()),
-        (
-            "wal",
-            PathBuf::from(format!("{}-wal", capture.db_path.display())),
-        ),
-        (
-            "shm",
-            PathBuf::from(format!("{}-shm", capture.db_path.display())),
-        ),
+        ("wal", sqlite_path_with_suffix(capture.db_path, "-wal")),
+        ("shm", sqlite_path_with_suffix(capture.db_path, "-shm")),
     ];
 
     let mut artifacts = Vec::new();
@@ -774,6 +908,35 @@ pub fn capture_mailbox_forensic_bundle(
     let mut files = Vec::new();
 
     for (kind, source_path) in source_paths {
+        if in_memory_db {
+            let detail = match kind {
+                "db" => "In-memory database has no SQLite file artifact",
+                "wal" => "In-memory database has no WAL sidecar artifact",
+                "shm" => "In-memory database has no SHM sidecar artifact",
+                _ => "In-memory database has no file artifact",
+            };
+            artifacts.push(json!({
+                "kind": kind,
+                "source_path": serde_json::Value::Null,
+                "captured_path": serde_json::Value::Null,
+                "size_bytes": serde_json::Value::Null,
+                "status": "not_applicable",
+                "error": serde_json::Value::Null,
+                "detail": detail,
+            }));
+            sqlite_manifest.insert(
+                kind.to_string(),
+                json!({
+                    "path": serde_json::Value::Null,
+                    "status": "not_applicable",
+                    "required": false,
+                    "contains_raw_mailbox_data": false,
+                    "detail": detail,
+                }),
+            );
+            continue;
+        }
+
         let destination = sqlite_dir.join(
             source_path
                 .file_name()
@@ -1021,9 +1184,13 @@ pub fn capture_mailbox_forensic_bundle(
 #[cfg(test)]
 mod tests {
     use super::{
-        MailboxForensicCapture, capture_mailbox_forensic_bundle, capture_pre_recovery_snapshot,
-        read_sqlite_header_fields,
+        MailboxForensicCapture, build_archive_drift_reference, build_live_db_reference,
+        capture_mailbox_forensic_bundle, capture_pre_recovery_snapshot, read_sqlite_header_fields,
     };
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
 
     #[test]
     fn capture_mailbox_forensic_bundle_records_reference_reports() {
@@ -1077,6 +1244,185 @@ mod tests {
     }
 
     #[test]
+    fn archive_drift_reference_skips_in_memory_db_inventory_without_error_state() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let storage_root = tempdir.path().join("storage");
+        let project_dir = storage_root.join("projects").join("demo");
+        std::fs::create_dir_all(project_dir.join("messages").join("2026").join("04"))
+            .expect("storage");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"demo","human_key":"/demo"}"#,
+        )
+        .expect("project metadata");
+
+        let drift = build_archive_drift_reference(MailboxForensicCapture {
+            command_name: "doctor",
+            trigger: "test",
+            database_url: "sqlite:///:memory:",
+            db_path: std::path::Path::new(":memory:"),
+            storage_root: &storage_root,
+            integrity_detail: None,
+        });
+
+        assert_eq!(drift["database_inventory"]["status"], "skipped");
+        assert_eq!(drift["archive_ahead"], false);
+        assert!(
+            drift["archive_drift_reasons"]
+                .as_array()
+                .expect("drift reasons")
+                .iter()
+                .any(|value| value == "database_inventory_skipped_in_memory")
+        );
+    }
+
+    #[test]
+    fn archive_drift_reference_suppresses_metadata_only_archive_ahead_when_db_has_newer_messages() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("storage.sqlite3");
+        let storage_root = tempdir.path().join("storage");
+
+        let proj_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = proj_dir.join("agents").join("Alice");
+        let msg_dir = proj_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&msg_dir).expect("create message dir");
+        std::fs::write(
+            proj_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project"}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z"}"#,
+        )
+        .expect("write agent metadata");
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"First\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:00:00Z\",\"attachments\":[]}\n---\n\nfirst body\n",
+        )
+        .expect("write archive message");
+
+        crate::reconstruct::reconstruct_from_archive(&db_path, &storage_root)
+            .expect("seed live db from archive");
+
+        let conn = crate::DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                crate::sqlmodel::Value::BigInt(3),
+                crate::sqlmodel::Value::BigInt(1),
+                crate::sqlmodel::Value::Text("BlueLake".to_string()),
+                crate::sqlmodel::Value::Text("coder".to_string()),
+                crate::sqlmodel::Value::Text("test".to_string()),
+                crate::sqlmodel::Value::Text(String::new()),
+                crate::sqlmodel::Value::BigInt(2),
+                crate::sqlmodel::Value::BigInt(2),
+                crate::sqlmodel::Value::Text("auto".to_string()),
+                crate::sqlmodel::Value::Text("auto".to_string()),
+            ],
+        )
+        .expect("insert recipient");
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments, recipients_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                crate::sqlmodel::Value::BigInt(2),
+                crate::sqlmodel::Value::BigInt(1),
+                crate::sqlmodel::Value::BigInt(1),
+                crate::sqlmodel::Value::Text("t2".to_string()),
+                crate::sqlmodel::Value::Text("Second".to_string()),
+                crate::sqlmodel::Value::Text("second body".to_string()),
+                crate::sqlmodel::Value::Text("normal".to_string()),
+                crate::sqlmodel::Value::BigInt(0),
+                crate::sqlmodel::Value::BigInt(2_000_000),
+                crate::sqlmodel::Value::Text("[]".to_string()),
+                crate::sqlmodel::Value::Text(r#"{"to":["BlueLake"],"cc":[],"bcc":[]}"#.to_string()),
+            ],
+        )
+        .expect("insert newer live message");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, ack_ts, read_ts) VALUES (?, ?, ?, NULL, NULL)",
+            &[
+                crate::sqlmodel::Value::BigInt(2),
+                crate::sqlmodel::Value::BigInt(3),
+                crate::sqlmodel::Value::Text("to".to_string()),
+            ],
+        )
+        .expect("insert message recipient");
+        drop(conn);
+
+        let archive_only_project = storage_root.join("projects").join("archive-only-project");
+        let archive_only_agent = archive_only_project.join("agents").join("ArchiveGhost");
+        std::fs::create_dir_all(&archive_only_agent).expect("create archive-only project dir");
+        std::fs::write(
+            archive_only_project.join("project.json"),
+            r#"{"slug":"archive-only-project","human_key":"/archive-only-project","created_at":0}"#,
+        )
+        .expect("write archive-only project metadata");
+        std::fs::write(
+            archive_only_agent.join("profile.json"),
+            r#"{"agent_name":"ArchiveGhost","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
+        )
+        .expect("write archive-only agent metadata");
+
+        let drift = build_archive_drift_reference(MailboxForensicCapture {
+            command_name: "doctor",
+            trigger: "test",
+            database_url: "sqlite://placeholder",
+            db_path: &db_path,
+            storage_root: &storage_root,
+            integrity_detail: None,
+        });
+
+        assert_eq!(drift["archive_ahead"], false);
+        let reasons = drift["archive_drift_reasons"]
+            .as_array()
+            .expect("drift reasons");
+        assert!(
+            !reasons
+                .iter()
+                .any(|value| value == "archive_projects_ahead"),
+            "metadata-only archive project drift should not be reported as decisive archive-ahead drift when the DB has newer messages: {reasons:?}"
+        );
+        assert!(
+            !reasons
+                .iter()
+                .any(|value| value == "archive_project_identity_ahead"),
+            "metadata-only project identity drift should not be reported as decisive archive-ahead drift when the DB has newer messages: {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn live_db_reference_marks_in_memory_artifacts_not_applicable() {
+        let live_db = build_live_db_reference(MailboxForensicCapture {
+            command_name: "doctor",
+            trigger: "test",
+            database_url: "sqlite:///:memory:",
+            db_path: std::path::Path::new(":memory:"),
+            storage_root: std::path::Path::new("/tmp"),
+            integrity_detail: None,
+        });
+
+        assert_eq!(live_db["db"]["status"], "in_memory");
+        assert_eq!(live_db["wal"]["status"], "not_applicable");
+        assert_eq!(live_db["shm"]["status"], "not_applicable");
+        assert_eq!(
+            live_db["process_inventory"]["holders"]
+                .as_array()
+                .expect("holders")
+                .len(),
+            0
+        );
+        assert_eq!(
+            live_db["file_locks"]["locks"]
+                .as_array()
+                .expect("locks")
+                .len(),
+            0
+        );
+    }
+
+    #[test]
     fn capture_mailbox_forensic_bundle_preserves_missing_db_as_evidence() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let storage_root = tempdir.path().join("storage");
@@ -1107,6 +1453,60 @@ mod tests {
                 .join("archive-drift.json")
                 .exists(),
             "archive drift evidence should still be recorded"
+        );
+    }
+
+    #[test]
+    fn capture_mailbox_forensic_bundle_marks_in_memory_sqlite_artifacts_not_applicable() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let storage_root = tempdir.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects").join("demo")).expect("storage");
+
+        let bundle_dir = capture_mailbox_forensic_bundle(MailboxForensicCapture {
+            command_name: "reconstruct",
+            trigger: "automatic-recovery",
+            database_url: "sqlite:///:memory:",
+            db_path: std::path::Path::new(":memory:"),
+            storage_root: &storage_root,
+            integrity_detail: None,
+        })
+        .expect("bundle");
+
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(bundle_dir.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest["artifacts"]["sqlite"]["db"]["status"],
+            "not_applicable"
+        );
+        assert_eq!(
+            manifest["artifacts"]["sqlite"]["wal"]["status"],
+            "not_applicable"
+        );
+        assert_eq!(
+            manifest["artifacts"]["sqlite"]["shm"]["status"],
+            "not_applicable"
+        );
+        assert_eq!(manifest["artifacts"]["sqlite"]["db"]["required"], false);
+        assert!(
+            bundle_dir
+                .components()
+                .any(|component| component.as_os_str() == "in-memory.sqlite3"),
+            "bundle path should use sanitized in-memory directory name: {}",
+            bundle_dir.display()
+        );
+    }
+
+    #[test]
+    fn forensic_bundle_dir_component_sanitizes_invalid_path_characters() {
+        assert_eq!(
+            super::forensic_bundle_dir_component(std::path::Path::new(":memory:")),
+            "in-memory.sqlite3"
+        );
+        assert_eq!(
+            super::forensic_bundle_dir_component(std::path::Path::new("mail:box?.sqlite3")),
+            "mail_box_.sqlite3"
         );
     }
 
@@ -1163,6 +1563,46 @@ mod tests {
         assert!(snap.shm_bytes.is_none());
         assert!(snap.page_size.is_none());
         assert!(snap.page_count.is_none());
+    }
+
+    #[test]
+    fn pre_snapshot_in_memory_database_avoids_fake_sidecar_evidence() {
+        let snap = capture_pre_recovery_snapshot(std::path::Path::new(":memory:"), "memory");
+
+        assert_eq!(snap.db_family, ":memory:");
+        assert!(snap.db_bytes.is_none());
+        assert!(snap.wal_bytes.is_none());
+        assert!(snap.shm_bytes.is_none());
+        assert!(snap.page_size.is_none());
+        assert!(snap.page_count.is_none());
+        assert!(snap.process_holders.is_empty());
+        assert!(snap.file_locks.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_snapshot_preserves_non_utf8_sidecar_and_lock_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_name = OsString::from_vec(b"mailbox-\xFF.sqlite3".to_vec());
+        let db_path = dir.path().join(std::path::PathBuf::from(db_name));
+
+        let mut header = vec![0u8; 100];
+        header[0..16].copy_from_slice(b"SQLite format 3\0");
+        header[16] = 0x10;
+        header[17] = 0x00;
+        std::fs::write(&db_path, &header).expect("write db");
+
+        let wal_path = crate::pool::sqlite_path_with_suffix(&db_path, "-wal");
+        std::fs::write(&wal_path, vec![0u8; 512]).expect("write wal");
+
+        let lock_path = crate::pool::sqlite_path_with_suffix(&db_path, ".recovery.lock");
+        std::fs::write(&lock_path, std::process::id().to_string()).expect("write lock");
+
+        let snap = capture_pre_recovery_snapshot(&db_path, "non-utf8");
+
+        assert_eq!(snap.wal_bytes, Some(512));
+        assert!(snap.recovery_lock_active);
+        assert_eq!(snap.recovery_lock_pid, Some(std::process::id()));
     }
 
     #[test]
