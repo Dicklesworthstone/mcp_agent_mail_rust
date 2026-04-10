@@ -13,7 +13,7 @@ use chrono::Utc;
 use clap::{Args, Subcommand};
 use mcp_agent_mail_core::Config;
 use mcp_agent_mail_core::disk::{
-    is_sqlite_memory_database_url, sqlite_file_path_from_database_url,
+    is_sqlite_memory_database_url, sqlite_file_path_from_database_url, sqlite_sidecar_path,
 };
 use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::schema;
@@ -1550,7 +1550,7 @@ fn backup_db_with_sidecars(db_path: &Path, destination_root: &Path) -> CliResult
         .unwrap_or_else(|| "storage.sqlite3".into());
     fs::copy(db_path, destination_root.join(db_name))?;
     for suffix in ["-wal", "-shm"] {
-        let sidecar = PathBuf::from(format!("{}{}", db_path.display(), suffix));
+        let sidecar = sqlite_sidecar_path(db_path, suffix);
         if sidecar.exists() {
             let file_name = sidecar
                 .file_name()
@@ -1562,14 +1562,7 @@ fn backup_db_with_sidecars(db_path: &Path, destination_root: &Path) -> CliResult
 }
 
 fn checkpoint_sqlite_for_copy(db_path: &Path) -> CliResult<()> {
-    let db_path_str = db_path.to_string_lossy().into_owned();
-    let conn =
-        sqlmodel_frankensqlite::FrankenConnection::open_file(db_path_str).map_err(|e| {
-            CliError::Other(format!("cannot open sqlite DB {}: {e}", db_path.display()))
-        })?;
-    conn.execute_raw("PRAGMA busy_timeout = 60000;")
-        .map_err(|e| CliError::Other(format!("cannot set busy_timeout before copy: {e}")))?;
-    conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
+    mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(db_path)
         .map_err(|e| CliError::Other(format!("WAL checkpoint failed before copy: {e}")))?;
     Ok(())
 }
@@ -1596,7 +1589,12 @@ fn copy_db_with_sidecars(source_db: &Path, target_db: &Path) -> CliResult<()> {
         target_sidecar_os.push(suffix);
         let target_sidecar = PathBuf::from(target_sidecar_os);
         if target_sidecar.exists() {
-            let _ = fs::remove_file(target_sidecar);
+            fs::remove_file(&target_sidecar).map_err(|e| {
+                CliError::Other(format!(
+                    "failed to clear stale target sidecar {}: {e}",
+                    target_sidecar.display()
+                ))
+            })?;
         }
     }
     Ok(())
@@ -2364,6 +2362,57 @@ mod tests {
             .and_then(|row| row.get_named::<String>("value").ok())
             .unwrap();
         assert_eq!(marker, "from-source");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_db_with_sidecars_copies_non_utf8_sidecars() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join(OsStr::from_bytes(b"legacy-\xFF.sqlite3"));
+        let backup_dir = tmp.path().join("backup");
+        fs::write(&db_path, b"db").unwrap();
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        fs::write(&wal_path, b"wal").unwrap();
+        fs::write(&shm_path, b"shm").unwrap();
+
+        backup_db_with_sidecars(&db_path, &backup_dir).unwrap();
+
+        assert!(backup_dir.join(db_path.file_name().unwrap()).exists());
+        assert!(backup_dir.join(wal_path.file_name().unwrap()).exists());
+        assert!(backup_dir.join(shm_path.file_name().unwrap()).exists());
+    }
+
+    #[test]
+    fn copy_db_with_sidecars_fails_when_stale_target_sidecar_cannot_be_cleared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source_db = tmp.path().join("source.sqlite3");
+        let target_db = tmp.path().join("target.sqlite3");
+
+        let source_conn = DbConn::open_file(source_db.display().to_string()).unwrap();
+        source_conn
+            .execute_raw("CREATE TABLE marker(value TEXT)")
+            .unwrap();
+        source_conn
+            .execute_raw("INSERT INTO marker(value) VALUES('from-source')")
+            .unwrap();
+        let _ = source_conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
+        drop(source_conn);
+
+        let target_wal = sqlite_sidecar_path(&target_db, "-wal");
+        fs::create_dir_all(&target_wal).unwrap();
+
+        let err = copy_db_with_sidecars(&source_db, &target_db).unwrap_err();
+        match err {
+            CliError::Other(message) => {
+                assert!(message.contains("failed to clear stale target sidecar"));
+                assert!(message.contains(target_wal.to_string_lossy().as_ref()));
+            }
+            other => panic!("expected copy failure, got {other:?}"),
+        }
     }
 
     #[cfg(unix)]

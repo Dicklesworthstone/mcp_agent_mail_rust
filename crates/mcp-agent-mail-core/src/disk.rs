@@ -192,6 +192,14 @@ pub fn sqlite_file_path_from_database_url(database_url: &str) -> Option<PathBuf>
     Some(PathBuf::from(path))
 }
 
+/// Return the sibling `SQLite` sidecar path for a `database` file.
+#[must_use]
+pub fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = db_path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
+}
+
 /// Sample disk space for the key local paths (storage root and `SQLite` file, if
 /// applicable) and classify pressure using the config thresholds.
 #[must_use]
@@ -573,6 +581,17 @@ mod tests {
                 .to_string_lossy(),
             "/var/data/db.sqlite3"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_sidecar_path_preserves_non_utf8_basename() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let db_path = PathBuf::from(OsStr::from_bytes(b"/tmp/sqlite-\xFF.db"));
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        assert_eq!(wal_path.as_os_str().as_bytes(), b"/tmp/sqlite-\xFF.db-wal");
     }
 
     #[test]
