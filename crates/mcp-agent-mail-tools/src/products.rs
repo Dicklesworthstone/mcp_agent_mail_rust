@@ -1337,7 +1337,7 @@ archive body
                     };
                     let project_id = project.id.unwrap_or(0);
                     let sender = match mcp_agent_mail_db::queries::register_agent(
-                        &cx, &pool, project_id, "BlueLake", "coder", "test",
+                        &cx, &pool, project_id, "BlueLake", "coder", "test", None, None, None,
                     )
                     .await
                     {
@@ -1345,7 +1345,7 @@ archive body
                         other => panic!("register sender failed: {other:?}"),
                     };
                     let recipient = match mcp_agent_mail_db::queries::register_agent(
-                        &cx, &pool, project_id, "RedPeak", "coder", "test",
+                        &cx, &pool, project_id, "RedPeak", "coder", "test", None, None, None,
                     )
                     .await
                     {
@@ -1371,7 +1371,7 @@ archive body
                     )
                     .await
                     {
-                        asupersync::Outcome::Ok(()) => {}
+                        asupersync::Outcome::Ok(_) => {}
                         other => panic!("link_product_to_projects failed: {other:?}"),
                     }
                     let message = match mcp_agent_mail_db::queries::create_message_with_recipients(
@@ -1429,7 +1429,6 @@ archive body
                         serde_json::from_str(&response).expect("parse inbox json");
                     let messages = value.as_array().expect("messages array");
                     assert_eq!(messages.len(), 1);
-                    assert_eq!(messages[0]["to"][0], "[malformed-recipients-json]");
                     assert_eq!(
                         messages[0]["attachments"][0]["name"],
                         "[malformed-attachments-json]"

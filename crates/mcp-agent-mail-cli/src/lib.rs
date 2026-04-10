@@ -39094,17 +39094,29 @@ startup_timeout_sec = 42
         conn.execute_raw("PRAGMA foreign_keys = OFF")
             .expect("disable foreign keys for fixture");
         conn.execute_raw(
-            "INSERT INTO projects (id, slug, human_key, created_at) \
-             VALUES (77, 'proj', '/proj', 0)",
+            "INSERT INTO projects (slug, human_key, created_at) \
+             VALUES ('orphan-proj', '/orphan-proj', 0)",
         )
         .expect("insert project");
+        let project_id = conn
+            .query_sync(
+                "SELECT id FROM projects WHERE slug = 'orphan-proj' LIMIT 1",
+                &[],
+            )
+            .expect("query project id")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("id").ok())
+            .expect("project id");
         conn.execute_raw(
-            "INSERT INTO agents \
+            &format!(
+                "INSERT INTO agents \
              (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
-             VALUES (77, 'BlueLake', 'codex-cli', 'gpt-5', '', 0, 0, 'auto', 'auto')",
+             VALUES ({project_id}, 'BlueLake', 'codex-cli', 'gpt-5', '', 0, 0, 'auto', 'auto')"
+            ),
         )
         .expect("insert agent");
-        conn.execute_raw("DELETE FROM projects WHERE id = 77")
+        conn.execute_raw(&format!("DELETE FROM projects WHERE id = {project_id}"))
             .expect("delete project");
         drop(conn);
 
@@ -39112,7 +39124,7 @@ startup_timeout_sec = 42
         handle_doctor_check_with(
             &db_url,
             dir.path(),
-            Some("[unknown-project-77]".to_string()),
+            Some(format!("[unknown-project-{project_id}]")),
             false,
             None,
             true,
@@ -39126,10 +39138,11 @@ startup_timeout_sec = 42
             .iter()
             .find(|check| check["check"].as_str() == Some("project_exists"))
             .expect("project_exists check");
+        let expected_detail = format!("project '[unknown-project-{project_id}]'");
         assert_eq!(project_exists["status"].as_str(), Some("ok"));
         assert_eq!(
             project_exists["detail"].as_str(),
-            Some("project '[unknown-project-77]'")
+            Some(expected_detail.as_str())
         );
 
         let agents_registered = checks
