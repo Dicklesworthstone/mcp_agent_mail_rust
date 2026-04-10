@@ -471,7 +471,7 @@
                   </div>
                   <div>
                     <div class="text-xs text-slate-600 dark:text-slate-400 font-medium uppercase tracking-wide">Project</div>
-                    <a :href="`/mail/${selectedMessage.project_slug}`"
+                    <a :href="window.agentMailAppendAuth(`/mail/${selectedMessage.project_slug}`)"
                        class="text-sm font-semibold text-primary-600 dark:text-primary-400 hover:underline"
                        x-text="selectedMessage.project_name"></a>
                   </div>
@@ -509,13 +509,13 @@
                   <i data-lucide="link" class="w-4 h-4"></i>
                   Copy Link
                 </button>
-                <a :href="`/mail/${selectedMessage.project_slug}/message/${selectedMessage.id}`"
+                <a :href="window.agentMailAppendAuth(`/mail/${selectedMessage.project_slug}/message/${selectedMessage.id}`)"
                    class="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors flex items-center gap-2 text-sm font-medium">
                   <i data-lucide="external-link" class="w-4 h-4"></i>
                   Open in Project
                 </a>
                 <template x-if="selectedMessage.thread_id">
-                  <a :href="`/mail/${selectedMessage.project_slug}/thread/${encodeURIComponent(selectedMessage.thread_id)}`"
+                  <a :href="window.agentMailAppendAuth(`/mail/${selectedMessage.project_slug}/thread/${encodeURIComponent(selectedMessage.thread_id)}`)"
                      class="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-300 rounded-lg transition-colors flex items-center gap-2 text-sm font-medium">
                     <i data-lucide="git-branch" class="w-4 h-4"></i>
                     View Thread
@@ -943,16 +943,16 @@ function unifiedInboxManager() {
       switch (this.sortBy) {
         case 'newest': {
           filtered.sort((a, b) => {
-            const parsedA = Date.parse(a.created_ts || '') || 0;
-            const parsedB = Date.parse(b.created_ts || '') || 0;
+            const parsedA = Date.parse(a.created_ts || a.created || '') || 0;
+            const parsedB = Date.parse(b.created_ts || b.created || '') || 0;
             return parsedB - parsedA;
           });
           break;
         }
         case 'oldest': {
           filtered.sort((a, b) => {
-            const parsedA = Date.parse(a.created_ts || '') || 0;
-            const parsedB = Date.parse(b.created_ts || '') || 0;
+            const parsedA = Date.parse(a.created_ts || a.created || '') || 0;
+            const parsedB = Date.parse(b.created_ts || b.created || '') || 0;
             return parsedA - parsedB;
           });
           break;
@@ -1074,7 +1074,7 @@ function unifiedInboxManager() {
         if (this.filters.importance) {
           params.set('filter_importance', this.filters.importance);
         }
-        const response = await fetch(`/mail/api/unified-inbox?${params.toString()}`, {
+        const response = await fetch(window.agentMailAppendAuth(`/mail/api/unified-inbox?${params.toString()}`), {
           headers: { Accept: 'application/json' },
           cache: 'no-store'
         });
@@ -1341,7 +1341,7 @@ function unifiedInboxManager() {
       try {
         const settledRequests = await Promise.allSettled(requests.map(async (request) => {
           const response = await fetch(
-            `/mail/${request.projectSlug}/inbox/${encodeURIComponent(request.agentName)}/mark-read`,
+            window.agentMailAppendAuth(`/mail/${request.projectSlug}/inbox/${encodeURIComponent(request.agentName)}/mark-read`),
             {
               method: 'POST',
               headers: {

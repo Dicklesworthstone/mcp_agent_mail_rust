@@ -188,7 +188,7 @@
             </div>
 
             <!-- Message Content (clickable) -->
-            <a :href="`/mail/{{ project.slug }}/message/${item.id}`"
+            <a :href="window.agentMailAppendAuth(`/mail/{{ project.slug }}/message/${item.id}`)"
                class="flex-1 min-w-0 group">
 
               <!-- Message Header -->
@@ -208,7 +208,7 @@
                       <span x-text="item.created"></span>
                     </div>
                     <template x-if="item.thread_url">
-                      <a :href="item.thread_url"
+                      <a :href="window.agentMailAppendAuth(item.thread_url)"
                          @click.stop
                          class="flex items-center gap-1.5 px-2 py-1 bg-primary-100 dark:bg-primary-900/30 hover:bg-primary-200 dark:hover:bg-primary-800/40 text-primary-700 dark:text-primary-300 rounded-md transition-colors">
                         <i data-lucide="messages-square" class="w-3.5 h-3.5"></i>
@@ -434,7 +434,7 @@
           const projectSlug = {{ project.slug | tojson }};
           const agentName = {{ agent | tojson }};
 
-          const response = await fetch(`/mail/${projectSlug}/inbox/${agentName}/mark-read`, {
+          const response = await fetch(window.agentMailAppendAuth(`/mail/${projectSlug}/inbox/${encodeURIComponent(agentName)}/mark-read`), {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -493,7 +493,7 @@
           const projectSlug = {{ project.slug | tojson }};
           const agentName = {{ agent | tojson }};
 
-          const response = await fetch(`/mail/${projectSlug}/inbox/${agentName}/mark-all-read`, {
+          const response = await fetch(window.agentMailAppendAuth(`/mail/${projectSlug}/inbox/${encodeURIComponent(agentName)}/mark-all-read`), {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',

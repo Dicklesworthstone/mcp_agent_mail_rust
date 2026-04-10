@@ -271,6 +271,7 @@ first body
         );
         assert!(view.read);
         assert!(view.excerpt.contains("Hello"));
+        assert_eq!(view.created_ts, view.created);
         assert!(!view.created_full.is_empty());
         assert!(!view.created_relative.is_empty());
     }
@@ -301,6 +302,7 @@ first body
             serde_json::json!({ "BlueLake": false })
         );
         assert_eq!(payload["read"], false);
+        assert_eq!(payload["created_ts"], message.created_ts);
         assert!(
             payload["excerpt"]
                 .as_str()
@@ -881,6 +883,26 @@ first body
             html_contains_url(&html, &mail_thread_href(&project.slug, &root_thread_ref)),
             "{html}"
         );
+        assert!(
+            html.contains("window.agentMailAppendAuth(`/mail/"),
+            "{html}"
+        );
+        assert!(
+            html.contains("window.agentMailAppendAuth(item.thread_url)"),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "window.agentMailAppendAuth(`/mail/${projectSlug}/inbox/${encodeURIComponent(agentName)}/mark-read`)"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "window.agentMailAppendAuth(`/mail/${projectSlug}/inbox/${encodeURIComponent(agentName)}/mark-all-read`)"
+            ),
+            "{html}"
+        );
     }
 
     #[test]
@@ -1044,6 +1066,43 @@ first body
             .expect("unified inbox should return html");
         assert!(html.contains("alreadyReadCount"));
         assert!(html.contains("selected recipient message(s) were already read"));
+    }
+
+    #[test]
+    fn render_unified_inbox_uses_auth_helper_for_client_actions() {
+        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("unified-auth-helper");
+        let html = render_unified_inbox(&cx, &pool, 10, None, false)
+            .expect("unified inbox render should succeed")
+            .expect("unified inbox should return html");
+        assert!(
+            html.contains(
+                "window.agentMailAppendAuth(`/mail/api/unified-inbox?${params.toString()}`)"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains("window.agentMailAppendAuth(`/mail/${selectedMessage.project_slug}`)"),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "window.agentMailAppendAuth(`/mail/${selectedMessage.project_slug}/message/${selectedMessage.id}`)"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "window.agentMailAppendAuth(`/mail/${selectedMessage.project_slug}/thread/${encodeURIComponent(selectedMessage.thread_id)}`)"
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                "window.agentMailAppendAuth(`/mail/${request.projectSlug}/inbox/${encodeURIComponent(request.agentName)}/mark-read`)"
+            ),
+            "{html}"
+        );
     }
 }
 
@@ -2396,6 +2455,7 @@ struct UnifiedMessage {
     body_md: String,
     body_html: String,
     created: String,
+    created_ts: String,
     created_full: String,
     created_relative: String,
     importance: String,
@@ -2475,6 +2535,7 @@ impl UnifiedMessageAggregate {
             body_html: markdown::render_markdown_to_safe_html(&self.body_md),
             excerpt: body_excerpt(&self.body_md, 150),
             body_md: self.body_md,
+            created_ts: created.clone(),
             created_full: ts_display_full(self.created_ts),
             created_relative: ts_display_relative(self.created_ts),
             created,
@@ -2678,7 +2739,7 @@ fn unified_api_message_value(message: &UnifiedMessage) -> serde_json::Value {
         "body_length": body_length,
         "excerpt": message.excerpt,
         "created": message.created,
-        "created_ts": message.created,
+        "created_ts": message.created_ts,
         "created_full": message.created_full,
         "created_relative": message.created_relative,
         "importance": message.importance,
