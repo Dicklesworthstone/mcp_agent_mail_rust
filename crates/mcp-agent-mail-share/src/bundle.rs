@@ -710,18 +710,6 @@ pub fn package_directory_as_zip(source_dir: &Path, destination: &Path) -> ShareR
         ))));
     }
 
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&dest)?;
-    let mut zip = zip::ZipWriter::new(file);
-    let fixed_time = DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0)
-        .map_err(|e| ShareError::Io(std::io::Error::other(e.to_string())))?;
-    let options = SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated)
-        .compression_level(Some(9))
-        .last_modified_time(fixed_time);
-
     // Collect and sort entries for reproducibility
     let mut entries = Vec::new();
     collect_entries_ctx(&source, &source, &mut entries, "ZIP")?;
@@ -730,6 +718,27 @@ pub fn package_directory_as_zip(source_dir: &Path, destination: &Path) -> ShareR
         entries.retain(|entry| entry != &relative_dest);
     }
     entries.sort();
+
+    let staging_parent = dest.parent().unwrap_or(&source);
+    let staging_dir = tempfile::Builder::new()
+        .prefix(".bundle-zip.")
+        .tempdir_in(staging_parent)?;
+    let staged_zip_name = dest
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("bundle.zip"));
+    let staged_zip_path = staging_dir.path().join(staged_zip_name);
+
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged_zip_path)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let fixed_time = DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0)
+        .map_err(|e| ShareError::Io(std::io::Error::other(e.to_string())))?;
+    let options = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .compression_level(Some(9))
+        .last_modified_time(fixed_time);
 
     for relative_path in &entries {
         let full_path = source.join(relative_path);
@@ -761,6 +770,7 @@ pub fn package_directory_as_zip(source_dir: &Path, destination: &Path) -> ShareR
 
     zip.finish()
         .map_err(|e| ShareError::Io(std::io::Error::other(e.to_string())))?;
+    std::fs::rename(&staged_zip_path, &dest)?;
     Ok(dest)
 }
 
@@ -2771,6 +2781,10 @@ mod tests {
         assert!(
             msg.contains("outside ZIP source"),
             "unexpected error message: {msg}"
+        );
+        assert!(
+            !zip_path.exists(),
+            "failed ZIP packaging should not strand a partial archive at the destination"
         );
     }
 

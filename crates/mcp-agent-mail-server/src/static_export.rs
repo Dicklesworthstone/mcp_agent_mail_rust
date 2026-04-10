@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -81,6 +82,9 @@ pub fn export_static_site(config: &ExportConfig) -> Result<ExportManifest, Strin
     ensure_output_dir_empty(&config.output_dir)?;
     ensure_real_directory(&config.output_dir)
         .map_err(|e| format!("create output dir {}: {e}", config.output_dir.display()))?;
+    let staged_output = create_export_stage(&config.output_dir)
+        .map_err(|e| format!("create staged output {}: {e}", config.output_dir.display()))?;
+    let staged_output_dir = staged_output.path();
 
     let read_pool_owner = open_static_export_read_pool()?;
     let live_pool_owner = if read_pool_owner.is_some() {
@@ -109,29 +113,29 @@ pub fn export_static_site(config: &ExportConfig) -> Result<ExportManifest, Strin
     let project_slugs = resolve_requested_project_slugs(&existing_slugs, &config.projects)?;
 
     // ── 2. Top-level routes ─────────────────────────────────────────
-    emit_html_route("/mail", "__static_export=1", &config.output_dir, &mut files)?;
-    emit_html_route("/mail/projects", "", &config.output_dir, &mut files)?;
+    emit_html_route("/mail", "__static_export=1", staged_output_dir, &mut files)?;
+    emit_html_route("/mail/projects", "", staged_output_dir, &mut files)?;
 
     // ── 3. Per-project routes ───────────────────────────────────────
     for slug in &project_slugs {
-        emit_project_routes(slug, &cx, &pool, &config.output_dir, &mut files)?;
+        emit_project_routes(slug, &cx, &pool, staged_output_dir, &mut files)?;
     }
 
     // ── 4. Archive routes ───────────────────────────────────────────
     if config.include_archive {
-        emit_archive_routes(&config.output_dir, &mut files)?;
+        emit_archive_routes(staged_output_dir, &mut files)?;
     }
 
     // ── 5. Search index ─────────────────────────────────────────────
     if config.include_search_index {
-        emit_search_index(&project_slugs, &cx, &pool, &config.output_dir, &mut files)?;
+        emit_search_index(&project_slugs, &cx, &pool, staged_output_dir, &mut files)?;
     }
 
     // ── 6. Navigation manifest ──────────────────────────────────────
-    emit_navigation(&project_slugs, &cx, &pool, &config.output_dir, &mut files)?;
+    emit_navigation(&project_slugs, &cx, &pool, staged_output_dir, &mut files)?;
 
     // ── 7. Hosting files ────────────────────────────────────────────
-    emit_hosting_files(&config.output_dir, &mut files)?;
+    emit_hosting_files(staged_output_dir, &mut files)?;
 
     // ── 8. Compute manifest ─────────────────────────────────────────
     let total_bytes = files.values().map(|e| e.size).sum();
@@ -149,9 +153,17 @@ pub fn export_static_site(config: &ExportConfig) -> Result<ExportManifest, Strin
     let manifest_json =
         serde_json::to_string_pretty(&manifest).map_err(|e| format!("serialize manifest: {e}"))?;
     write_to_file(
-        &config.output_dir.join("manifest.json"),
+        &staged_output_dir.join("manifest.json"),
         manifest_json.as_bytes(),
     )?;
+    if let Err(error) = publish_staged_export_output(staged_output_dir, &config.output_dir) {
+        let stage_path = staged_output.persist();
+        return Err(format!(
+            "publish staged static export into {} failed with staged output preserved at {}: {error}",
+            config.output_dir.display(),
+            stage_path.display()
+        ));
+    }
 
     Ok(manifest)
 }
@@ -210,6 +222,61 @@ fn ensure_output_dir_empty(output_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct StaticExportStage {
+    path: PathBuf,
+    cleanup_on_drop: bool,
+}
+
+impl StaticExportStage {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn persist(mut self) -> PathBuf {
+        self.cleanup_on_drop = false;
+        self.path.clone()
+    }
+}
+
+impl Drop for StaticExportStage {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+fn create_export_stage(output_dir: &Path) -> std::io::Result<StaticExportStage> {
+    let parent = output_dir.parent().unwrap_or_else(|| Path::new("."));
+    ensure_real_directory(parent)?;
+    let stem = output_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("static-export");
+    for attempt in 0..1024 {
+        let candidate = parent.join(format!(".{stem}.stage.{}.{}", std::process::id(), attempt));
+        match fs::create_dir(&candidate) {
+            Ok(()) => {
+                return Ok(StaticExportStage {
+                    path: candidate,
+                    cleanup_on_drop: true,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "could not create unique staged static export directory next to {}",
+            output_dir.display()
+        ),
+    ))
+}
+
 fn resolve_requested_project_slugs(
     existing: &[String],
     requested: &[String],
@@ -242,6 +309,99 @@ fn resolve_requested_project_slugs(
     }
 
     Ok(resolved)
+}
+
+fn publish_staged_export_output(
+    staged_output_dir: &Path,
+    output_dir: &Path,
+) -> std::io::Result<()> {
+    ensure_real_directory(output_dir)?;
+    let mut entry_names = Vec::new();
+    for entry in fs::read_dir(staged_output_dir)? {
+        let entry = entry?;
+        entry_names.push(entry.file_name());
+    }
+    entry_names.sort();
+
+    let mut published = Vec::new();
+    for entry_name in &entry_names {
+        match move_staged_export_entry(staged_output_dir, output_dir, entry_name) {
+            Ok(()) => published.push(entry_name.clone()),
+            Err(error) => {
+                rollback_published_export_entries(output_dir, staged_output_dir, &published)
+                    .map_err(|rollback_error| {
+                        std::io::Error::other(format!(
+                            "failed to publish staged export output {}: {error}; rollback failed: {rollback_error}",
+                            Path::new(entry_name).display()
+                        ))
+                    })?;
+                return Err(std::io::Error::other(format!(
+                    "failed to publish staged export output {}: {error}",
+                    Path::new(entry_name).display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn move_staged_export_entry(
+    staged_output_dir: &Path,
+    output_dir: &Path,
+    entry_name: &OsString,
+) -> std::io::Result<()> {
+    let source = staged_output_dir.join(entry_name);
+    let destination = output_dir.join(entry_name);
+    let source_metadata = fs::symlink_metadata(&source)?;
+    if source_metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other(format!(
+            "refusing to publish symlinked staged export path {}",
+            source.display()
+        )));
+    }
+    if fs::symlink_metadata(&destination).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(std::io::Error::other(format!(
+            "refusing to publish through symlinked export path {}",
+            destination.display()
+        )));
+    }
+    if fs::symlink_metadata(&destination).is_ok() {
+        return Err(std::io::Error::other(format!(
+            "expected empty export destination but found existing path {}",
+            destination.display()
+        )));
+    }
+    fs::rename(source, destination)
+}
+
+fn rollback_published_export_entries(
+    output_dir: &Path,
+    staged_output_dir: &Path,
+    published: &[OsString],
+) -> std::io::Result<()> {
+    for entry_name in published.iter().rev() {
+        let source = output_dir.join(entry_name);
+        let destination = staged_output_dir.join(entry_name);
+        if fs::symlink_metadata(&source).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return Err(std::io::Error::other(format!(
+                "refusing to rollback symlinked published export path {}",
+                source.display()
+            )));
+        }
+        if fs::symlink_metadata(&destination).is_ok() {
+            return Err(std::io::Error::other(format!(
+                "cannot rollback published export output because staged path already exists {}",
+                destination.display()
+            )));
+        }
+        if fs::symlink_metadata(&source)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            continue;
+        }
+        fs::rename(source, destination)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1154,6 +1314,28 @@ first body
         let err = export_static_site(&config)
             .expect_err("symlinked parent path should be rejected before any DB work");
         assert!(err.contains("symlinked export directory"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publish_staged_export_output_rolls_back_partial_publish_on_failure() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("output");
+        fs::create_dir(&output).unwrap();
+        let stage = create_export_stage(&output).unwrap();
+        fs::write(stage.path().join("manifest.json"), b"{}").unwrap();
+        let outside = dir.path().join("outside.txt");
+        fs::write(&outside, "bad").unwrap();
+        symlink(&outside, stage.path().join("zz-bad")).unwrap();
+
+        let err = publish_staged_export_output(stage.path(), &output)
+            .expect_err("symlinked staged entry should fail publish");
+        assert!(err.to_string().contains("symlinked staged export path"));
+        assert!(output.read_dir().unwrap().next().is_none());
+        assert!(stage.path().join("manifest.json").exists());
+        assert!(stage.path().join("zz-bad").exists());
     }
 
     #[test]

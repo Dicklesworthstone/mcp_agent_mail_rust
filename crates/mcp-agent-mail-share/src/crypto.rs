@@ -3,12 +3,20 @@
 //! - Ed25519 manifest signing via `ed25519-dalek`
 //! - Age encryption/decryption via CLI shelling
 
+#[cfg(test)]
+use std::cell::RefCell;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{ShareError, ShareResult};
+
+#[cfg(test)]
+thread_local! {
+    static AGE_COMMAND_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
 
 /// Signature metadata written to `manifest.sig.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -414,11 +422,14 @@ pub fn encrypt_with_age(input: &Path, recipients: &[String]) -> ShareResult<std:
 
     check_age_available()?;
 
-    let mut cmd = std::process::Command::new("age");
+    let (staging_dir, staged_output) =
+        create_staged_crypto_output_path(&output, "encrypted output", ".age-encrypt.")?;
+
+    let mut cmd = age_command();
     for r in recipients {
         cmd.arg("-r").arg(r);
     }
-    cmd.arg("-o").arg(&output).arg(input);
+    cmd.arg("-o").arg(&staged_output).arg(input);
 
     let result = cmd.output()?;
     if !result.status.success() {
@@ -428,6 +439,8 @@ pub fn encrypt_with_age(input: &Path, recipients: &[String]) -> ShareResult<std:
         ))));
     }
 
+    std::fs::rename(&staged_output, &output)?;
+    drop(staging_dir);
     Ok(output)
 }
 
@@ -462,7 +475,10 @@ pub fn decrypt_with_age(
 
     check_age_available()?;
 
-    let mut cmd = std::process::Command::new("age");
+    let (staging_dir, staged_output) =
+        create_staged_crypto_output_path(output_path, "decryption output", ".age-decrypt.")?;
+
+    let mut cmd = age_command();
     cmd.arg("-d");
 
     if let Some(id_path) = identity {
@@ -478,7 +494,7 @@ pub fn decrypt_with_age(
         )));
     }
 
-    cmd.arg("-o").arg(output_path).arg(encrypted_path);
+    cmd.arg("-o").arg(&staged_output).arg(encrypted_path);
 
     if let Some(pass) = passphrase {
         use std::io::Write;
@@ -510,7 +526,34 @@ pub fn decrypt_with_age(
         }
     }
 
+    std::fs::rename(&staged_output, output_path)?;
+    drop(staging_dir);
     Ok(())
+}
+
+fn create_staged_crypto_output_path(
+    final_output: &Path,
+    label: &str,
+    temp_prefix: &str,
+) -> ShareResult<(tempfile::TempDir, PathBuf)> {
+    let parent = crypto_output_parent(final_output)?;
+    let staged_dir = tempfile::Builder::new()
+        .prefix(temp_prefix)
+        .tempdir_in(&parent)?;
+    let file_name = final_output
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("output"));
+    let staged_output = staged_dir.path().join(file_name);
+    if staged_output == final_output {
+        return Err(ShareError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{label} staging path must differ from {}",
+                final_output.display()
+            ),
+        )));
+    }
+    Ok((staged_dir, staged_output))
 }
 
 fn require_real_crypto_file(path: &Path, label: &str) -> ShareResult<()> {
@@ -541,9 +584,7 @@ fn require_real_crypto_file(path: &Path, label: &str) -> ShareResult<()> {
 }
 
 fn validate_crypto_output_path(path: &Path, label: &str) -> ShareResult<()> {
-    if let Some(parent) = path.parent() {
-        ensure_real_crypto_directory(parent)?;
-    }
+    let _ = crypto_output_parent(path)?;
 
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -567,6 +608,15 @@ fn validate_crypto_output_path(path: &Path, label: &str) -> ShareResult<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(ShareError::Io(error)),
     }
+}
+
+fn crypto_output_parent(path: &Path) -> ShareResult<PathBuf> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => std::env::current_dir()?,
+    };
+    ensure_real_crypto_directory(&parent)?;
+    Ok(parent)
 }
 
 fn ensure_real_crypto_directory(path: &Path) -> ShareResult<()> {
@@ -622,13 +672,46 @@ fn ensure_real_crypto_directory(path: &Path) -> ShareResult<()> {
 }
 
 fn check_age_available() -> ShareResult<()> {
-    match std::process::Command::new("age").arg("--version").output() {
+    match age_command().arg("--version").output() {
         Ok(output) if output.status.success() => Ok(()),
         _ => Err(ShareError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "age CLI not found in PATH. Install from https://github.com/FiloSottile/age",
         ))),
     }
+}
+
+fn age_command() -> std::process::Command {
+    #[cfg(test)]
+    {
+        if let Some(path) = AGE_COMMAND_OVERRIDE.with(|slot| slot.borrow().clone()) {
+            return std::process::Command::new(path);
+        }
+    }
+    std::process::Command::new("age")
+}
+
+#[cfg(test)]
+fn with_age_command_override<R>(path: &Path, f: impl FnOnce() -> R) -> R {
+    struct AgeCommandOverrideGuard {
+        previous: Option<PathBuf>,
+    }
+
+    impl Drop for AgeCommandOverrideGuard {
+        fn drop(&mut self) {
+            AGE_COMMAND_OVERRIDE.with(|slot| {
+                let _ = slot.replace(self.previous.take());
+            });
+        }
+    }
+
+    AGE_COMMAND_OVERRIDE.with(|slot| {
+        let previous = slot.replace(Some(path.to_path_buf()));
+        let guard = AgeCommandOverrideGuard { previous };
+        let result = f();
+        drop(guard);
+        result
+    })
 }
 
 fn hex_sha256(data: &[u8]) -> String {
@@ -675,6 +758,18 @@ mod tests {
             .and_then(|line| line.split_whitespace().last())
             .map(|s| s.to_string())?;
         Some((identity_path, recipient))
+    }
+
+    #[cfg(unix)]
+    fn write_fake_age_script(dir: &Path, script_body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script_path = dir.join("fake-age");
+        std::fs::write(&script_path, script_body).unwrap();
+        let mut permissions = std::fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).unwrap();
+        script_path
     }
 
     fn extract_zip_archive(zip_path: &Path, output_dir: &Path) {
@@ -1934,6 +2029,28 @@ mod tests {
         assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn age_encrypt_failure_does_not_leave_partial_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("bundle.zip");
+        std::fs::write(&input, b"data").unwrap();
+        let script_path = write_fake_age_script(
+            dir.path(),
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo \"fake age 1.0\"\n  exit 0\nfi\nout=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"-o\" ]; then\n    out=\"$2\"\n    shift 2\n    continue\n  fi\n  shift\ndone\nprintf 'partial-ciphertext' > \"$out\"\necho 'simulated encryption failure' >&2\nexit 1\n",
+        );
+
+        let err = with_age_command_override(&script_path, || {
+            encrypt_with_age(&input, &["age1example".to_string()])
+                .expect_err("fake age failure should surface")
+        });
+        assert!(format!("{err}").contains("simulated encryption failure"));
+        assert!(
+            !input.with_extension("zip.age").exists(),
+            "failed encryption should not strand a partial output at the final path"
+        );
+    }
+
     #[test]
     fn age_decrypt_refuses_existing_output() {
         let dir = tempfile::tempdir().unwrap();
@@ -1947,6 +2064,31 @@ mod tests {
         let err = decrypt_with_age(&encrypted, &output, Some(&id_path), None)
             .expect_err("existing decrypt outputs must be rejected");
         assert!(format!("{err}").contains("already exists"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn age_decrypt_failure_does_not_leave_partial_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let encrypted = dir.path().join("bundle.zip.age");
+        let identity = dir.path().join("identity.txt");
+        let output = dir.path().join("bundle.zip");
+        std::fs::write(&encrypted, b"ciphertext").unwrap();
+        std::fs::write(&identity, b"identity").unwrap();
+        let script_path = write_fake_age_script(
+            dir.path(),
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo \"fake age 1.0\"\n  exit 0\nfi\nout=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"-o\" ]; then\n    out=\"$2\"\n    shift 2\n    continue\n  fi\n  shift\ndone\nprintf 'partial-plaintext' > \"$out\"\necho 'simulated decryption failure' >&2\nexit 1\n",
+        );
+
+        let err = with_age_command_override(&script_path, || {
+            decrypt_with_age(&encrypted, &output, Some(&identity), None)
+                .expect_err("fake age failure should surface")
+        });
+        assert!(format!("{err}").contains("simulated decryption failure"));
+        assert!(
+            !output.exists(),
+            "failed decryption should not strand a partial output at the final path"
+        );
     }
 
     #[cfg(unix)]

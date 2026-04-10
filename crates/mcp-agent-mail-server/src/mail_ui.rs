@@ -410,6 +410,24 @@ first body
     }
 
     #[test]
+    fn dispatch_file_reservations_get_accepts_presence_only_static_export_flag() {
+        let dir = tempdir().expect("tempdir");
+        let (storage_root, db_path) = write_archive_ahead_fixture(dir.path());
+
+        with_mail_ui_env(&storage_root, &db_path, || {
+            let html = dispatch(
+                "/mail/ahead-project/file_reservations",
+                "__static_export",
+                "GET",
+                "",
+            )
+            .expect("dispatch should succeed")
+            .expect("file reservations route should return html");
+            assert!(html.contains("ahead-project"), "{html}");
+        });
+    }
+
+    #[test]
     fn archive_time_travel_snapshot_uses_archive_without_registered_project() {
         let dir = tempdir().expect("tempdir");
         let (storage_root, db_path) = write_archive_ahead_fixture(dir.path());
@@ -720,6 +738,7 @@ first body
             None,
         )));
 
+        let thread_ref = "br-message";
         let root = outcome_ok(block_on(queries::create_message_with_recipients(
             &cx,
             &pool,
@@ -727,7 +746,7 @@ first body
             sender.id.unwrap_or(0),
             "Thread root",
             "First message",
-            None,
+            Some(thread_ref),
             "high",
             false,
             "[]",
@@ -740,7 +759,7 @@ first body
             blue.id.unwrap_or(0),
             "Thread reply",
             "Reply body",
-            Some("br-message"),
+            Some(thread_ref),
             "normal",
             false,
             "[]",
@@ -1225,8 +1244,35 @@ fn extract_query_int(query: &str, key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn extract_query_bool(query: &str, key: &str) -> Option<bool> {
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, raw_value) = pair
+            .split_once('=')
+            .map_or((pair, None), |(key, value)| (key, Some(value)));
+        if k != key {
+            continue;
+        }
+
+        let Some(raw_value) = raw_value else {
+            return Some(true);
+        };
+
+        let normalized = percent_decode_component(raw_value)
+            .trim()
+            .to_ascii_lowercase();
+        if normalized.is_empty() {
+            return Some(true);
+        }
+        return Some(!matches!(normalized.as_str(), "0" | "false" | "no" | "off"));
+    }
+    None
+}
+
 fn is_static_export_request(query: &str) -> bool {
-    extract_query_str(query, "__static_export").is_some()
+    extract_query_bool(query, "__static_export").unwrap_or(false)
 }
 
 fn is_synthetic_project_identifier(slug: &str) -> bool {
@@ -1450,6 +1496,24 @@ mod utility_tests {
     #[test]
     fn extract_query_str_empty_query() {
         assert_eq!(extract_query_str("", "q"), None);
+    }
+
+    #[test]
+    fn extract_query_bool_presence_only_flag_returns_true() {
+        assert_eq!(extract_query_bool("boost", "boost"), Some(true));
+        assert_eq!(extract_query_bool("boost=", "boost"), Some(true));
+    }
+
+    #[test]
+    fn extract_query_bool_false_tokens_return_false() {
+        assert_eq!(extract_query_bool("boost=0", "boost"), Some(false));
+        assert_eq!(extract_query_bool("boost=false", "boost"), Some(false));
+        assert_eq!(extract_query_bool("boost=off", "boost"), Some(false));
+    }
+
+    #[test]
+    fn is_static_export_request_accepts_presence_only_flag() {
+        assert!(is_static_export_request("__static_export"));
     }
 
     #[test]
@@ -3551,7 +3615,7 @@ fn render_search(
     let limit = extract_query_int(query_str, "limit", 50);
     let order = parse_mail_search_order(query_str);
     let field_scope = parse_mail_search_field_scope(query_str);
-    let boost = extract_query_str(query_str, "boost").is_some();
+    let boost = extract_query_bool(query_str, "boost").unwrap_or(false);
     let cursor = extract_query_str(query_str, "cursor").unwrap_or_default();
 
     // Facets
@@ -4164,8 +4228,7 @@ fn render_api_unified_inbox(
     // Keep API and HTML route limits aligned so live refreshes never shrink
     // the already-rendered unified inbox dataset.
     let limit = extract_query_int(query, "limit", 1000).clamp(1, 1000);
-    let include_projects =
-        extract_query_str(query, "include_projects").is_some_and(|v| v == "true" || v == "1");
+    let include_projects = extract_query_bool(query, "include_projects").unwrap_or(false);
     let filter_importance = extract_query_str(query, "filter_importance");
     let normalized_filter = filter_importance
         .map(|value| value.trim().to_ascii_lowercase())
@@ -4440,19 +4503,11 @@ fn render_archive_guide(cx: &Cx, pool: &DbPool) -> Result<Option<String>, (u16, 
 
 /// Estimate the size of a directory tree, returned as a human-readable string.
 fn estimate_repo_size(path: &std::path::Path) -> String {
-    use std::process::Stdio;
-
     // Try `du -sh` with timeout to prevent server lockup on massive/networked NFS archives.
     const DU_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
     let mut command = std::process::Command::new("du");
     command.args(["-sh", &path.display().to_string()]);
-
-    // Use standard stdout/stderr handling to avoid pipe deadlock if stderr fills up.
-    // Instead of polling try_wait(), we could just use wait_with_output() if we
-    // spawned a thread, but the active loop is okay *if* we don't pipe stderr,
-    // or if we pipe but only expect a single line. We'll drop stderr to avoid deadlocks.
-    command.stdout(Stdio::piped()).stderr(Stdio::null());
 
     run_command_stdout_with_timeout(&mut command, DU_TIMEOUT)
         .and_then(|stdout| stdout.split_whitespace().next().map(str::to_string))
@@ -4463,19 +4518,26 @@ fn run_command_stdout_with_timeout(
     command: &mut std::process::Command,
     timeout: std::time::Duration,
 ) -> Option<String> {
+    use std::io::Read;
+    use std::process::Stdio;
     use std::time::Instant;
 
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = command.spawn().ok()?;
+    let stdout_handle = child.stdout.take()?;
+    let mut stdout_reader = Some(std::thread::spawn(move || {
+        let mut stdout = stdout_handle;
+        let mut buffer = String::new();
+        let _ = stdout.read_to_string(&mut buffer);
+        buffer
+    }));
     let deadline = Instant::now() + timeout;
 
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                let output = child.wait_with_output().ok()?;
-                return Some(String::from_utf8_lossy(&output.stdout).into_owned());
+                let stdout = stdout_reader.take()?.join().ok()?;
+                return status.success().then_some(stdout);
             }
             Ok(None) if Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(25));
@@ -4483,6 +4545,7 @@ fn run_command_stdout_with_timeout(
             Ok(None) | Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                drop(stdout_reader.take());
                 return None;
             }
         }
@@ -5424,6 +5487,32 @@ mod fresh_eyes_regression_tests {
         );
         assert_eq!(messages[0]["importance"], "high");
         assert_eq!(messages[0]["subject"], "High priority");
+    }
+
+    #[test]
+    fn render_api_unified_inbox_presence_only_include_projects_returns_project_metadata() {
+        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("mail-ui-unified-api-include-projects");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            "/tmp/mail-ui-unified-api-include-projects",
+        )));
+
+        let payload = render_api_unified_inbox(&cx, &pool, "include_projects")
+            .expect("API render should succeed")
+            .expect("API route should return json");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("API payload should be valid json");
+        let projects = parsed["projects"]
+            .as_array()
+            .expect("projects payload should be present");
+
+        assert!(
+            projects.iter().any(|entry| entry["slug"] == project.slug),
+            "expected project metadata for {} in payload: {parsed}",
+            project.slug
+        );
     }
 
     #[test]

@@ -40880,7 +40880,77 @@ fn validate_share_signing_options(
                 .to_string(),
         ));
     }
+    if let Some(public_out) = signing_public_out {
+        validate_share_public_key_output_path(public_out)?;
+    }
     Ok(())
+}
+
+fn validate_share_real_existing_directory(path: &Path, label: &str) -> CliResult<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        use std::path::Component;
+
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(CliError::Other(format!(
+                    "refusing to traverse {label} with parent traversal: {}",
+                    path.display()
+                )));
+            }
+            Component::Normal(segment) => {
+                current.push(segment);
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) if metadata.file_type().is_dir() => {}
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(CliError::Other(format!(
+                            "{label} {} must not be a symlink",
+                            current.display()
+                        )));
+                    }
+                    Ok(_) => {
+                        return Err(CliError::Other(format!(
+                            "{label} {} exists but is not a directory",
+                            current.display()
+                        )));
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(CliError::Other(format!(
+                            "{label} {} does not exist or is not a directory",
+                            current.display()
+                        )));
+                    }
+                    Err(err) => return Err(CliError::Io(err)),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_share_public_key_output_path(path: &Path) -> CliResult<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        validate_share_real_existing_directory(parent, "public key output parent")?;
+    }
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(CliError::Other(format!(
+            "public key output {} must not be a symlink",
+            path.display()
+        ))),
+        Ok(_) => Err(CliError::Other(format!(
+            "public key output {} exists but is not a file",
+            path.display()
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(CliError::Io(err)),
+    }
 }
 
 fn ensure_share_zip_target_absent(
@@ -48802,6 +48872,42 @@ fn validate_share_signing_options_requires_signing_key_for_public_key_output() {
     let err = validate_share_signing_options(None, Some(Path::new("/tmp/public.pem")))
         .expect_err("public key output without signing key should fail");
     assert!(format!("{err}").contains("--signing-key"));
+}
+
+#[cfg(unix)]
+#[test]
+fn validate_share_public_key_output_path_rejects_symlinked_output() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let outside = temp.path().join("outside.pem");
+    let linked = temp.path().join("public.pem");
+    std::fs::write(&outside, "keep").expect("write outside target");
+    symlink(&outside, &linked).expect("symlink output");
+
+    let err = validate_share_public_key_output_path(&linked)
+        .expect_err("symlinked public key output should fail");
+    assert!(format!("{err}").contains("must not be a symlink"));
+    assert_eq!(
+        std::fs::read_to_string(&outside).expect("read outside target"),
+        "keep"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn validate_share_public_key_output_path_rejects_symlinked_parent_directory() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let real_parent = temp.path().join("real-parent");
+    std::fs::create_dir_all(&real_parent).expect("create real parent");
+    let linked_parent = temp.path().join("linked-parent");
+    symlink(&real_parent, &linked_parent).expect("symlink parent");
+
+    let err = validate_share_public_key_output_path(&linked_parent.join("public.pem"))
+        .expect_err("symlinked public key parent should fail");
+    assert!(format!("{err}").contains("must not be a symlink"));
 }
 
 #[test]

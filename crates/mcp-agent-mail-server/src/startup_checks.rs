@@ -1034,14 +1034,10 @@ fn wildcard_request_conflicts_with_listener(listener_host: &str, requested_host:
         parse_canonical_ip(listener_host),
         parse_canonical_ip(requested_host),
     ) {
-        (Some(listener_ip), Some(requested_ip)) => {
-            if requested_ip.is_ipv6() && requested_ip.is_unspecified() {
-                // IPv6 wildcard often covers IPv4 on dual-stack OS
-                true
-            } else {
-                listener_ip.is_ipv4() == requested_ip.is_ipv4()
-            }
-        }
+        // For wildcard bind requests, specific listeners only conflict when they
+        // occupy the same address family. We still treat wildcard/named listeners
+        // conservatively above because they may overlap the requested bind.
+        (Some(listener_ip), Some(requested_ip)) => listener_ip.is_ipv4() == requested_ip.is_ipv4(),
         // Be conservative for named hosts: if we cannot prove they do not conflict,
         // keep them in the candidate set so restart logic can inspect the listener PID.
         _ => true,
@@ -3273,6 +3269,7 @@ mod tests {
         assert!(listener_host_matches_request("127.0.0.1", "localhost"));
         assert!(!listener_host_matches_request("127.0.0.2", "127.0.0.1"));
         assert!(listener_host_matches_request("127.0.0.1", "0.0.0.0"));
+        assert!(!listener_host_matches_request("127.0.0.1", "::"));
         assert!(!listener_host_matches_request("::1", "0.0.0.0"));
         assert!(listener_host_matches_request("::1", "::"));
     }

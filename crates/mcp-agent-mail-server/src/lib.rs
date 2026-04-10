@@ -11230,11 +11230,16 @@ pub(crate) fn detect_tailscale_ip() -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if ip.is_empty() {
-        return None;
-    }
-    Some(ip)
+    parse_tailscale_ip_stdout(&output.stdout)
+}
+
+fn parse_tailscale_ip_stdout(stdout: &[u8]) -> Option<String> {
+    use std::net::Ipv4Addr;
+
+    let text = std::str::from_utf8(stdout).ok()?;
+    text.lines()
+        .map(str::trim)
+        .find_map(|line| line.parse::<Ipv4Addr>().ok().map(|ip| ip.to_string()))
 }
 
 /// Build a web UI URL with the given host, port, and optional auth token.
@@ -21007,6 +21012,22 @@ first body
             build_web_ui_url("2001:db8::42", 8765, None),
             "http://[2001:db8::42]:8765/mail"
         );
+    }
+
+    #[test]
+    fn parse_tailscale_ip_stdout_uses_first_valid_ipv4_line() {
+        let stdout = b"\n100.64.0.1\n100.64.0.2\n";
+        assert_eq!(
+            parse_tailscale_ip_stdout(stdout),
+            Some("100.64.0.1".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_tailscale_ip_stdout_rejects_non_ipv4_output() {
+        assert_eq!(parse_tailscale_ip_stdout(b""), None);
+        assert_eq!(parse_tailscale_ip_stdout(b"not-an-ip\n"), None);
+        assert_eq!(parse_tailscale_ip_stdout(b"fd7a:115c:a1e0::1\n"), None);
     }
 
     #[test]
