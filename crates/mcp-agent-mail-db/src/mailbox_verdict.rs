@@ -585,7 +585,7 @@ pub struct MailboxHealthVerdict {
     pub sqlite_path: MailboxSqlitePathVerdict,
     /// Most recent live integrity assessment.
     pub integrity: MailboxIntegrityVerdict,
-    /// Live WAL/SHM sidecar state.
+    /// Live rollback-journal/WAL/SHM sidecar state.
     pub wal: MailboxSidecarState,
     /// Recovery lock state for the mailbox.
     pub recovery_lock: MailboxRecoveryLockState,
@@ -1030,25 +1030,65 @@ fn probe_archive_writable(archive_root: &Path) -> ProbeResult {
     }
 }
 
-/// Probe: Check WAL/SHM sidecar state.
+fn describe_sidecar_state(sidecars: &MailboxSidecarState) -> String {
+    let mut parts = Vec::new();
+    if sidecars.journal_exists {
+        parts.push(format!(
+            "journal_bytes={}",
+            sidecars.journal_bytes.unwrap_or(0)
+        ));
+    }
+    if sidecars.wal_exists {
+        parts.push(format!("wal_bytes={}", sidecars.wal_bytes.unwrap_or(0)));
+    }
+    if sidecars.shm_exists {
+        parts.push(format!("shm_bytes={}", sidecars.shm_bytes.unwrap_or(0)));
+    }
+    if sidecars.live_sidecars {
+        parts.push("live_sidecars=true".to_string());
+    }
+    if parts.is_empty() {
+        "no sidecars recorded".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Probe: Check rollback-journal/WAL/SHM sidecar state.
 fn probe_sidecar_state(sidecars: &MailboxSidecarState) -> ProbeResult {
-    match (sidecars.wal_exists, sidecars.shm_exists) {
-        (false, false) => ProbeResult::ok("sidecar_state", "No WAL/SHM sidecars present"),
-        (true, true) => ProbeResult::ok("sidecar_state", "WAL and SHM sidecars present"),
-        (true, false) => ProbeResult::warn_state(
+    let detail = describe_sidecar_state(sidecars);
+    match (
+        sidecars.journal_exists,
+        sidecars.wal_exists,
+        sidecars.shm_exists,
+        sidecars.live_sidecars,
+    ) {
+        (false, false, false, false) => ProbeResult::ok(
             "sidecar_state",
-            format!(
-                "WAL exists without SHM (wal_bytes={})",
-                sidecars.wal_bytes.unwrap_or(0)
-            ),
+            "No rollback-journal/WAL/SHM sidecars present",
+        ),
+        (true, _, _, _) => ProbeResult::warn_state(
+            "sidecar_state",
+            format!("Rollback journal sidecar present ({detail})"),
             MailboxState::Suspect,
         ),
-        (false, true) => ProbeResult::warn_state(
+        (false, true, true, _) => ProbeResult::ok(
             "sidecar_state",
-            format!(
-                "SHM exists without WAL (shm_bytes={})",
-                sidecars.shm_bytes.unwrap_or(0)
-            ),
+            format!("WAL and SHM sidecars present ({detail})"),
+        ),
+        (false, true, false, _) => ProbeResult::warn_state(
+            "sidecar_state",
+            format!("WAL exists without SHM ({detail})"),
+            MailboxState::Suspect,
+        ),
+        (false, false, true, _) => ProbeResult::warn_state(
+            "sidecar_state",
+            format!("SHM exists without WAL ({detail})"),
+            MailboxState::Suspect,
+        ),
+        (false, false, false, true) => ProbeResult::warn_state(
+            "sidecar_state",
+            format!("Malformed or non-file SQLite sidecar artifact present ({detail})"),
             MailboxState::Suspect,
         ),
     }
@@ -1351,7 +1391,7 @@ pub enum DurabilityFaultClass {
     AbruptTermination,
     /// Concurrent readers during background rebuild.
     DegradedConcurrentRead,
-    /// WAL/SHM sidecars are inconsistent or orphaned.
+    /// Rollback-journal/WAL/SHM sidecars are inconsistent or orphaned.
     StaleSidecars,
     /// No fault injected (baseline/happy-path control).
     None,
@@ -1741,6 +1781,38 @@ mod tests {
         let verdict = verdict_from_probes(probes, false);
         assert_eq!(verdict.state, MailboxState::Healthy);
         assert_eq!(verdict.failure_count(), 0);
+    }
+
+    #[test]
+    fn probe_sidecar_state_warns_on_rollback_journal() {
+        let probe = probe_sidecar_state(&MailboxSidecarState {
+            journal_exists: true,
+            journal_bytes: Some(128),
+            ..MailboxSidecarState::default()
+        });
+
+        assert!(!probe.passed);
+        assert_eq!(probe.severity, ProbeSeverity::Warning);
+        assert_eq!(probe.impact_state, MailboxState::Suspect);
+        assert!(probe.detail.contains("Rollback journal sidecar present"));
+        assert!(probe.detail.contains("journal_bytes=128"));
+    }
+
+    #[test]
+    fn probe_sidecar_state_warns_on_non_file_sidecar_artifact() {
+        let probe = probe_sidecar_state(&MailboxSidecarState {
+            live_sidecars: true,
+            ..MailboxSidecarState::default()
+        });
+
+        assert!(!probe.passed);
+        assert_eq!(probe.severity, ProbeSeverity::Warning);
+        assert_eq!(probe.impact_state, MailboxState::Suspect);
+        assert!(
+            probe
+                .detail
+                .contains("Malformed or non-file SQLite sidecar artifact present")
+        );
     }
 
     #[test]

@@ -92,6 +92,8 @@ pub struct ForensicPreSnapshot {
     pub db_family: String,
     /// Primary DB file size in bytes, or `None` if missing.
     pub db_bytes: Option<u64>,
+    /// Rollback-journal sidecar size in bytes, or `None` if missing.
+    pub journal_bytes: Option<u64>,
     /// WAL file size in bytes, or `None` if missing.
     pub wal_bytes: Option<u64>,
     /// SHM file size in bytes, or `None` if missing.
@@ -100,9 +102,9 @@ pub struct ForensicPreSnapshot {
     pub page_size: Option<u32>,
     /// Total page count read from the DB header (bytes 28..32), or `None` on error.
     pub page_count: Option<u32>,
-    /// Processes with open file descriptors on the DB/WAL/SHM files.
+    /// Processes with open file descriptors on the DB/journal/WAL/SHM files.
     pub process_holders: Vec<ForensicProcessHolder>,
-    /// File-level locks held on the DB/WAL/SHM files.
+    /// File-level locks held on the DB/journal/WAL/SHM files.
     pub file_locks: Vec<ForensicFileLock>,
     /// Whether a `.recovery.lock` file exists and is held by a live process.
     pub recovery_lock_active: bool,
@@ -174,6 +176,7 @@ pub fn capture_pre_recovery_snapshot(db_path: &Path, trigger: &str) -> ForensicP
             db_path: db_path.display().to_string(),
             db_family: forensic_db_family_name(db_path),
             db_bytes: None,
+            journal_bytes: None,
             wal_bytes: None,
             shm_bytes: None,
             page_size: None,
@@ -201,8 +204,10 @@ pub fn capture_pre_recovery_snapshot(db_path: &Path, trigger: &str) -> ForensicP
     }
 
     let db_bytes = std::fs::metadata(db_path).ok().map(|m| m.len());
+    let journal_path = sqlite_path_with_suffix(db_path, "-journal");
     let wal_path = sqlite_path_with_suffix(db_path, "-wal");
     let shm_path = sqlite_path_with_suffix(db_path, "-shm");
+    let journal_bytes = std::fs::metadata(&journal_path).ok().map(|m| m.len());
     let wal_bytes = std::fs::metadata(&wal_path).ok().map(|m| m.len());
     let shm_bytes = std::fs::metadata(&shm_path).ok().map(|m| m.len());
     let (page_size, page_count) =
@@ -210,6 +215,7 @@ pub fn capture_pre_recovery_snapshot(db_path: &Path, trigger: &str) -> ForensicP
 
     let family_paths: Vec<(&str, PathBuf)> = vec![
         ("db", db_path.to_path_buf()),
+        ("journal", journal_path),
         ("wal", wal_path),
         ("shm", shm_path),
     ];
@@ -226,6 +232,7 @@ pub fn capture_pre_recovery_snapshot(db_path: &Path, trigger: &str) -> ForensicP
         db_path: db_path.display().to_string(),
         db_family: forensic_db_family_name(db_path),
         db_bytes,
+        journal_bytes,
         wal_bytes,
         shm_bytes,
         page_size,
@@ -245,6 +252,7 @@ pub fn capture_pre_recovery_snapshot(db_path: &Path, trigger: &str) -> ForensicP
         db_family = %snapshot.db_family,
         trigger = %snapshot.trigger,
         db_bytes = ?snapshot.db_bytes,
+        journal_bytes = ?snapshot.journal_bytes,
         wal_bytes = ?snapshot.wal_bytes,
         page_size = ?snapshot.page_size,
         page_count = ?snapshot.page_count,
@@ -611,6 +619,7 @@ fn build_live_db_reference(capture: MailboxForensicCapture<'_>) -> serde_json::V
             "trigger": capture.trigger,
             "db_family": forensic_db_family_name(capture.db_path),
             "db": source_file_status(capture.db_path),
+            "journal": not_applicable_source_status("In-memory database has no rollback-journal sidecar file"),
             "wal": not_applicable_source_status("In-memory database has no WAL sidecar file"),
             "shm": not_applicable_source_status("In-memory database has no SHM sidecar file"),
             "sidecars": sidecars,
@@ -626,17 +635,20 @@ fn build_live_db_reference(capture: MailboxForensicCapture<'_>) -> serde_json::V
         });
     }
 
+    let journal_path = sqlite_path_with_suffix(capture.db_path, "-journal");
     let wal_path = sqlite_path_with_suffix(capture.db_path, "-wal");
     let shm_path = sqlite_path_with_suffix(capture.db_path, "-shm");
     let sidecars = inspect_mailbox_sidecar_state(capture.db_path);
     let recovery_lock = inspect_mailbox_recovery_lock(capture.db_path);
     let holders = process_holders_for_paths(&[
         ("db", capture.db_path.to_path_buf()),
+        ("journal", journal_path.clone()),
         ("wal", wal_path.clone()),
         ("shm", shm_path.clone()),
     ]);
     let locks = file_locks_for_paths(&[
         ("db", capture.db_path.to_path_buf()),
+        ("journal", journal_path.clone()),
         ("wal", wal_path.clone()),
         ("shm", shm_path.clone()),
     ]);
@@ -647,6 +659,7 @@ fn build_live_db_reference(capture: MailboxForensicCapture<'_>) -> serde_json::V
         "trigger": capture.trigger,
         "db_family": forensic_db_family_name(capture.db_path),
         "db": source_file_status(capture.db_path),
+        "journal": source_file_status(&journal_path),
         "wal": source_file_status(&wal_path),
         "shm": source_file_status(&shm_path),
         "sidecars": sidecars,
@@ -900,6 +913,10 @@ pub fn capture_mailbox_forensic_bundle(
     let in_memory_db = is_in_memory_db_path(capture.db_path);
     let source_paths = [
         ("db", capture.db_path.to_path_buf()),
+        (
+            "journal",
+            sqlite_path_with_suffix(capture.db_path, "-journal"),
+        ),
         ("wal", sqlite_path_with_suffix(capture.db_path, "-wal")),
         ("shm", sqlite_path_with_suffix(capture.db_path, "-shm")),
     ];
@@ -913,6 +930,7 @@ pub fn capture_mailbox_forensic_bundle(
         if in_memory_db {
             let detail = match kind {
                 "db" => "In-memory database has no SQLite file artifact",
+                "journal" => "In-memory database has no rollback-journal sidecar artifact",
                 "wal" => "In-memory database has no WAL sidecar artifact",
                 "shm" => "In-memory database has no SHM sidecar artifact",
                 _ => "In-memory database has no file artifact",
@@ -1419,6 +1437,7 @@ mod tests {
         });
 
         assert_eq!(live_db["db"]["status"], "in_memory");
+        assert_eq!(live_db["journal"]["status"], "not_applicable");
         assert_eq!(live_db["wal"]["status"], "not_applicable");
         assert_eq!(live_db["shm"]["status"], "not_applicable");
         assert_eq!(
@@ -1435,6 +1454,29 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[test]
+    fn live_db_reference_reports_rollback_journal_artifacts() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tempdir.path().join("mailbox.sqlite3");
+        let journal_path = tempdir.path().join("mailbox.sqlite3-journal");
+        std::fs::write(&db_path, b"SQLite format 3\0").expect("write db header");
+        std::fs::write(&journal_path, b"rollback-journal").expect("write journal");
+
+        let live_db = build_live_db_reference(MailboxForensicCapture {
+            command_name: "doctor",
+            trigger: "test",
+            database_url: "sqlite:///tmp/mailbox.sqlite3",
+            db_path: &db_path,
+            storage_root: tempdir.path(),
+            integrity_detail: None,
+        });
+
+        assert_eq!(live_db["journal"]["exists"], true);
+        assert_eq!(live_db["journal"]["bytes"], 16);
+        assert_eq!(live_db["sidecars"]["journal_exists"], true);
+        assert_eq!(live_db["sidecars"]["journal_bytes"], 16);
     }
 
     #[test]
@@ -1496,6 +1538,10 @@ mod tests {
             "not_applicable"
         );
         assert_eq!(
+            manifest["artifacts"]["sqlite"]["journal"]["status"],
+            "not_applicable"
+        );
+        assert_eq!(
             manifest["artifacts"]["sqlite"]["wal"]["status"],
             "not_applicable"
         );
@@ -1553,6 +1599,7 @@ mod tests {
         assert_eq!(snap.trigger, "test-trigger");
         assert_eq!(snap.db_family, "test.sqlite3");
         assert_eq!(snap.db_bytes, Some(100));
+        assert!(snap.journal_bytes.is_none());
         assert_eq!(snap.wal_bytes, Some(512));
         assert!(snap.shm_bytes.is_none());
         assert_eq!(snap.page_size, Some(4096));
@@ -1574,6 +1621,7 @@ mod tests {
         let snap = capture_pre_recovery_snapshot(&db_path, "missing-db");
 
         assert!(snap.db_bytes.is_none());
+        assert!(snap.journal_bytes.is_none());
         assert!(snap.wal_bytes.is_none());
         assert!(snap.shm_bytes.is_none());
         assert!(snap.page_size.is_none());
@@ -1586,6 +1634,7 @@ mod tests {
 
         assert_eq!(snap.db_family, ":memory:");
         assert!(snap.db_bytes.is_none());
+        assert!(snap.journal_bytes.is_none());
         assert!(snap.wal_bytes.is_none());
         assert!(snap.shm_bytes.is_none());
         assert!(snap.page_size.is_none());
@@ -1600,12 +1649,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_name = OsString::from_vec(b"mailbox-\xFF.sqlite3".to_vec());
         let db_path = dir.path().join(std::path::PathBuf::from(db_name));
+        let journal_path = crate::pool::sqlite_path_with_suffix(&db_path, "-journal");
 
         let mut header = vec![0u8; 100];
         header[0..16].copy_from_slice(b"SQLite format 3\0");
         header[16] = 0x10;
         header[17] = 0x00;
         std::fs::write(&db_path, &header).expect("write db");
+        std::fs::write(&journal_path, b"rollback").expect("write journal");
 
         let wal_path = crate::pool::sqlite_path_with_suffix(&db_path, "-wal");
         std::fs::write(&wal_path, vec![0u8; 512]).expect("write wal");
@@ -1615,6 +1666,7 @@ mod tests {
 
         let snap = capture_pre_recovery_snapshot(&db_path, "non-utf8");
 
+        assert_eq!(snap.journal_bytes, Some(8));
         assert_eq!(snap.wal_bytes, Some(512));
         assert!(snap.recovery_lock_active);
         assert_eq!(snap.recovery_lock_pid, Some(std::process::id()));
@@ -1629,6 +1681,7 @@ mod tests {
         let snap = capture_pre_recovery_snapshot(&db_path, "corrupt");
 
         assert_eq!(snap.db_bytes, Some(25));
+        assert!(snap.journal_bytes.is_none());
         assert!(
             snap.page_size.is_none(),
             "non-sqlite header should yield None"
@@ -1647,6 +1700,7 @@ mod tests {
 
         assert_eq!(json["trigger"], "json-test");
         assert_eq!(json["db_family"], "serial.sqlite3");
+        assert_eq!(json["journal_bytes"], serde_json::Value::Null);
         assert!(json["self_pid"].is_number());
         assert!(json["captured_at_us"].is_number());
         assert!(json["process_holders"].is_array());

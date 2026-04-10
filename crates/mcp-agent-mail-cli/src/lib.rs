@@ -26169,6 +26169,68 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn archive_restore_state_keeps_live_state_when_archive_snapshot_is_invalid() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+
+        let root = tempfile::tempdir().unwrap();
+        let archive_path = root.path().join("invalid-restore.zip");
+        let restore_dir = root.path().join("restore");
+        let restore_db = restore_dir.join("mailbox.sqlite3");
+        let restore_storage = restore_dir.join("storage_repo");
+        std::fs::create_dir_all(&restore_dir).unwrap();
+        seed_mailbox_db(&restore_db);
+        seed_storage_root(&restore_storage);
+        let expected_db_stats = sqlite_message_stats(&restore_db);
+        let expected_storage_head = std::fs::read(restore_storage.join(".git/HEAD")).unwrap();
+
+        {
+            let file = std::fs::File::create(&archive_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = SimpleFileOptions::default();
+            zip.start_file(ARCHIVE_METADATA_FILENAME, options).unwrap();
+            zip.write_all(br#"{"database":{"source_path":"/tmp/live.sqlite3"},"storage":{"source_path":"/tmp/storage_repo"}}"#)
+                .unwrap();
+            zip.start_file(ARCHIVE_SNAPSHOT_RELATIVE.replace('\\', "/"), options)
+                .unwrap();
+            zip.write_all(b"not-a-valid-sqlite-snapshot").unwrap();
+            zip.start_file(format!("{ARCHIVE_STORAGE_DIRNAME}/.git/HEAD"), options)
+                .unwrap();
+            zip.write_all(b"fedcba9876543210\n").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let err = archive_restore_state(archive_path, &restore_db, &restore_storage, true, false)
+            .expect_err("invalid archive snapshot should fail before mutating live state");
+
+        assert!(
+            format!("{err}").contains("did not pass health check"),
+            "unexpected restore error: {err}"
+        );
+        assert_eq!(
+            sqlite_message_stats(&restore_db),
+            expected_db_stats,
+            "invalid archive restore should leave the live database untouched"
+        );
+        assert_eq!(
+            std::fs::read(restore_storage.join(".git/HEAD")).unwrap(),
+            expected_storage_head,
+            "invalid archive restore should leave the live storage repo untouched"
+        );
+        assert!(
+            find_backup_entry(&restore_dir, "mailbox.sqlite3.backup-").is_none(),
+            "snapshot validation failure should happen before any database backup is created"
+        );
+        assert!(
+            find_backup_entry(&restore_dir, "storage_repo.backup-").is_none(),
+            "snapshot validation failure should happen before any storage backup is created"
+        );
+    }
+
+    #[test]
     fn archive_save_state_uses_absolute_candidate_for_malformed_relative_source_db() {
         let _lock = ARCHIVE_TEST_LOCK
             .lock()
@@ -42405,6 +42467,161 @@ fn rollback_archive_restore(
     }
 }
 
+fn archive_restore_target_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn validate_archive_restore_targets(database_path: &Path, storage_root: &Path) -> CliResult<()> {
+    let database_parent = archive_restore_target_parent(database_path);
+    ensure_real_directory_tree(database_parent, "archive restore database parent")?;
+    if database_path.exists() && !path_is_real_file(database_path) {
+        return Err(CliError::Other(format!(
+            "archive restore database target {} must be a real file",
+            database_path.display()
+        )));
+    }
+
+    let storage_parent = archive_restore_target_parent(storage_root);
+    ensure_real_directory_tree(storage_parent, "archive restore storage root parent")?;
+    if storage_root.exists() {
+        share_update_require_real_directory(storage_root, "archive restore storage root")?;
+    }
+
+    Ok(())
+}
+
+fn stage_archive_restore_snapshot(
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    snapshot_entry_name: &str,
+    database_path: &Path,
+) -> CliResult<(tempfile::TempDir, PathBuf)> {
+    let database_parent = archive_restore_target_parent(database_path);
+    let staged_db_dir = tempfile::Builder::new()
+        .prefix(".archive-restore-db.")
+        .tempdir_in(database_parent)?;
+    let staged_db_path = staged_db_dir.path().join(
+        database_path
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| OsStr::new("mailbox.sqlite3")),
+    );
+
+    {
+        let mut snapshot_file = archive
+            .by_name(snapshot_entry_name)
+            .map_err(|e| CliError::Other(format!("{e}")))?;
+        let mut out = std::fs::File::create(&staged_db_path)?;
+        std::io::copy(&mut snapshot_file, &mut out)?;
+        out.sync_all()?;
+    }
+
+    let mut health = sqlite_file_is_healthy(&staged_db_path);
+    if let Err(error) = &health
+        && archive_restore_health_error_requires_fts_cleanup(error)
+        && cleanup_archive_restore_staged_snapshot_fts(&staged_db_path)?
+    {
+        health = sqlite_file_is_healthy(&staged_db_path);
+    }
+    match health {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(CliError::Other(format!(
+                "archive snapshot {} did not pass health check after staging copy; live database and storage are untouched",
+                snapshot_entry_name
+            )));
+        }
+        Err(error) => {
+            return Err(CliError::Other(format!(
+                "archive snapshot {} did not pass health check after staging copy: {error}; live database and storage are untouched",
+                snapshot_entry_name
+            )));
+        }
+    }
+
+    Ok((staged_db_dir, staged_db_path))
+}
+
+fn stage_archive_restore_storage_root(
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    storage_root: &Path,
+) -> CliResult<(tempfile::TempDir, PathBuf)> {
+    let storage_parent = archive_restore_target_parent(storage_root);
+    let staged_storage_dir = tempfile::Builder::new()
+        .prefix(".archive-restore-storage.")
+        .tempdir_in(storage_parent)?;
+    let staged_storage_root = staged_storage_dir.path().join(
+        storage_root
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| OsStr::new(ARCHIVE_STORAGE_DIRNAME)),
+    );
+    std::fs::create_dir(&staged_storage_root)?;
+
+    let prefix_path = Path::new(ARCHIVE_STORAGE_DIRNAME);
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| CliError::Other(format!("{e}")))?;
+        let Some(enclosed) = file.enclosed_name().map(|p| p.to_path_buf()) else {
+            continue;
+        };
+        if !enclosed.starts_with(prefix_path) {
+            continue;
+        }
+        let rel = match enclosed.strip_prefix(prefix_path) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+
+        let out_path = staged_storage_root.join(rel);
+        if file.is_dir() {
+            std::fs::create_dir_all(&out_path)?;
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out = std::fs::File::create(&out_path)?;
+        std::io::copy(&mut file, &mut out)?;
+
+        #[cfg(unix)]
+        if let Some(mode) = file.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode));
+        }
+    }
+
+    Ok((staged_storage_dir, staged_storage_root))
+}
+
+fn archive_restore_health_error_requires_fts_cleanup(error: &CliError) -> bool {
+    let message = format!("{error}").to_ascii_lowercase();
+    message.contains("fts_messages")
+        || message.contains("vtable constructor failed")
+        || message.contains("no such module")
+        || message.contains("unknown tokenizer")
+        || message.contains("not implemented")
+}
+
+fn cleanup_archive_restore_staged_snapshot_fts(snapshot_path: &Path) -> CliResult<bool> {
+    let path_str = snapshot_path.display().to_string();
+    let conn = match mcp_agent_mail_db::DbConn::open_file(&path_str) {
+        Ok(conn) => conn,
+        Err(_) => return Ok(false),
+    };
+    if doctor_legacy_fts_tables(&conn).is_empty() {
+        return Ok(false);
+    }
+    mcp_agent_mail_db::schema::enforce_runtime_fts_cleanup(&conn)
+        .map_err(|e| CliError::Other(format!("staged archive snapshot FTS cleanup failed: {e}")))?;
+    Ok(true)
+}
+
 fn sort_json_keys(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
@@ -42431,6 +42648,36 @@ fn iso_from_micros(micros: i64) -> String {
         .unwrap_or_default()
 }
 
+fn sqlite_row_named_timestamp_or_text(
+    row: &mcp_agent_mail_db::sqlmodel_core::Row,
+    column: &str,
+) -> String {
+    if let Ok(micros) = row.get_named::<i64>(column) {
+        return if micros == 0 {
+            String::new()
+        } else {
+            iso_from_micros(micros)
+        };
+    }
+
+    if let Ok(Some(raw)) = row.get_named::<Option<String>>(column) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        if let Ok(micros) = trimmed.parse::<i64>() {
+            return if micros == 0 {
+                String::new()
+            } else {
+                iso_from_micros(micros)
+            };
+        }
+        return trimmed.to_string();
+    }
+
+    String::new()
+}
+
 fn projects_included_from_snapshot(snapshot_path: &Path) -> CliResult<Vec<serde_json::Value>> {
     let path_str = snapshot_path.display().to_string();
     let conn = mcp_agent_mail_db::DbConn::open_file(&path_str)
@@ -42446,15 +42693,10 @@ fn projects_included_from_snapshot(snapshot_path: &Path) -> CliResult<Vec<serde_
     for row in &rows {
         let slug: String = row.get_named("slug").unwrap_or_default();
         let human_key: String = row.get_named("human_key").unwrap_or_default();
-        let created_at: i64 = row.get_named("created_at").unwrap_or(0);
         out.push(serde_json::json!({
             "slug": slug,
             "human_key": human_key,
-            "created_at": if created_at == 0 {
-                String::new()
-            } else {
-                iso_from_micros(created_at)
-            },
+            "created_at": sqlite_row_named_timestamp_or_text(row, "created_at"),
         }));
     }
     Ok(out)
@@ -42992,6 +43234,12 @@ fn archive_restore_state(
         )));
     }
 
+    validate_archive_restore_targets(&database_path, &storage_root)?;
+    let (_staged_db_dir, staged_db_path) =
+        stage_archive_restore_snapshot(&mut archive, snapshot_entry_name, &database_path)?;
+    let (_staged_storage_dir, staged_storage_root) =
+        stage_archive_restore_storage_root(&mut archive, &storage_root)?;
+
     // Back up existing files/dirs, then restore. Roll back from the backups if
     // any step fails after mutation has started.
     let database_existed = database_path.exists();
@@ -43027,63 +43275,8 @@ fn archive_restore_state(
             });
         }
 
-        // Restore snapshot.
-        if let Some(parent) = database_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        {
-            let mut snapshot_file = archive
-                .by_name(snapshot_entry_name)
-                .map_err(|e| CliError::Other(format!("{e}")))?;
-            let mut out = std::fs::File::create(&database_path)?;
-            std::io::copy(&mut snapshot_file, &mut out)?;
-        }
-
-        // Restore storage repo entries.
-        if let Some(parent) = storage_root.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::create_dir_all(&storage_root)?;
-
-        let prefix_path = Path::new(ARCHIVE_STORAGE_DIRNAME);
-        for i in 0..archive.len() {
-            let mut file = archive
-                .by_index(i)
-                .map_err(|e| CliError::Other(format!("{e}")))?;
-            let Some(enclosed) = file.enclosed_name().map(|p| p.to_path_buf()) else {
-                continue;
-            };
-            if !enclosed.starts_with(prefix_path) {
-                continue;
-            }
-            let rel = match enclosed.strip_prefix(prefix_path) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            if rel.as_os_str().is_empty() {
-                continue;
-            }
-            let out_path = storage_root.join(rel);
-            if file.is_dir() {
-                std::fs::create_dir_all(&out_path)?;
-                continue;
-            }
-            if let Some(parent) = out_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut out = std::fs::File::create(&out_path)?;
-            std::io::copy(&mut file, &mut out)?;
-
-            #[cfg(unix)]
-            if let Some(mode) = file.unix_mode() {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode));
-            }
-        }
+        std::fs::rename(&staged_db_path, &database_path)?;
+        std::fs::rename(&staged_storage_root, &storage_root)?;
 
         Ok(())
     })();

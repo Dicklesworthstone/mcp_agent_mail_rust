@@ -2077,6 +2077,7 @@ fn attempt_probe_recovery(config: &Config) -> ProbeResult {
     tracing::info!(
         trigger = pre_snapshot.trigger,
         db_bytes = ?pre_snapshot.db_bytes,
+        journal_bytes = ?pre_snapshot.journal_bytes,
         wal_bytes = ?pre_snapshot.wal_bytes,
         holders = pre_snapshot.process_holders.len(),
         recovery_lock_active = pre_snapshot.recovery_lock_active,

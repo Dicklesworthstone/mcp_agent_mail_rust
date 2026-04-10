@@ -52,6 +52,8 @@ pub struct MailboxSidecarState {
     pub wal_bytes: Option<u64>,
     pub shm_exists: bool,
     pub shm_bytes: Option<u64>,
+    pub journal_exists: bool,
+    pub journal_bytes: Option<u64>,
     pub live_sidecars: bool,
 }
 
@@ -3732,7 +3734,7 @@ fn cleanup_empty_wal_sidecar(sqlite_path: &str) {
 
 #[must_use]
 fn sqlite_file_has_live_sidecars(path: &Path) -> bool {
-    for suffix in ["-wal", "-shm"] {
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
         let sidecar_path = sqlite_path_with_suffix(path, suffix);
         if let Ok(meta) = std::fs::metadata(&sidecar_path)
             && meta.len() > 0
@@ -3959,19 +3961,20 @@ fn refuse_auto_recovery_with_live_sidecars(primary_path: &Path) -> Result<(), Sq
         return Ok(());
     }
 
-    // Stale WAL/SHM files are common after crashes or failed migrations.
-    // Instead of immediately refusing recovery, try to checkpoint the WAL.
-    // If no other process holds a lock, the checkpoint will succeed and we
-    // can remove the sidecars, allowing recovery to proceed.
+    // Stale SQLite sidecars are common after crashes or failed migrations.
+    // Instead of immediately refusing recovery, try to open/checkpoint first.
+    // If no other process holds a lock, SQLite will replay any hot rollback
+    // journal during open, the checkpoint will drain WAL state if present, and
+    // we can clear the remaining sidecars before continuing.
     tracing::info!(
         path = %primary_path.display(),
-        "live WAL/SHM sidecars detected; attempting checkpoint before recovery"
+        "live rollback-journal/WAL/SHM sidecars detected; attempting checkpoint before recovery"
     );
     match try_checkpoint_and_clear_sidecars(primary_path) {
         Ok(()) => {
             tracing::info!(
                 path = %primary_path.display(),
-                "WAL checkpoint succeeded; sidecars cleared, proceeding with recovery"
+                "checkpoint/open recovery succeeded; sqlite sidecars cleared, proceeding with recovery"
             );
             Ok(())
         }
@@ -3986,7 +3989,7 @@ fn refuse_auto_recovery_with_live_sidecars(primary_path: &Path) -> Result<(), Sq
                 )))
             } else {
                 Err(SqlError::Custom(format!(
-                    "cannot recover {} while live WAL/SHM sidecars are present; \
+                    "cannot recover {} while live rollback-journal/WAL/SHM sidecars are present; \
                      automatic checkpoint failed: {e}; stop the server and run explicit repair",
                     primary_path.display()
                 )))
@@ -3995,7 +3998,7 @@ fn refuse_auto_recovery_with_live_sidecars(primary_path: &Path) -> Result<(), Sq
     }
 }
 
-/// Try to checkpoint the WAL and remove sidecar files.
+/// Try to open/checkpoint the database and remove sidecar files.
 #[allow(clippy::result_large_err)]
 fn try_checkpoint_and_clear_sidecars(primary_path: &Path) -> Result<(), SqlError> {
     wal_checkpoint_truncate_path(primary_path)
@@ -4004,16 +4007,16 @@ fn try_checkpoint_and_clear_sidecars(primary_path: &Path) -> Result<(), SqlError
     remove_sqlite_sidecars(primary_path);
     if sqlite_file_has_live_sidecars(primary_path) {
         return Err(SqlError::Custom(format!(
-            "checkpoint completed for {} but non-empty WAL/SHM sidecars remain",
+            "checkpoint completed for {} but non-empty rollback-journal/WAL/SHM sidecars remain",
             primary_path.display()
         )));
     }
     Ok(())
 }
 
-/// Remove WAL and SHM sidecar files if they exist.
+/// Remove rollback-journal, WAL, and SHM sidecar files if they exist.
 fn remove_sqlite_sidecars(primary_path: &Path) {
-    for suffix in ["-wal", "-shm"] {
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
         let sidecar_path = sqlite_path_with_suffix(primary_path, suffix);
         if sidecar_path.exists()
             && let Err(e) = std::fs::remove_file(&sidecar_path)
@@ -4114,6 +4117,7 @@ fn recover_sqlite_file(primary_path: &Path) -> Result<(), SqlError> {
     tracing::info!(
         trigger = snapshot.trigger,
         db_bytes = ?snapshot.db_bytes,
+        journal_bytes = ?snapshot.journal_bytes,
         wal_bytes = ?snapshot.wal_bytes,
         holders = snapshot.process_holders.len(),
         locks = snapshot.file_locks.len(),
@@ -4399,8 +4403,10 @@ pub fn inspect_mailbox_sidecar_state(db_path: &Path) -> MailboxSidecarState {
         return MailboxSidecarState::default();
     }
 
+    let journal_path = sqlite_path_with_suffix(db_path, "-journal");
     let wal_path = sqlite_path_with_suffix(db_path, "-wal");
     let shm_path = sqlite_path_with_suffix(db_path, "-shm");
+    let journal_meta = std::fs::metadata(&journal_path).ok();
     let wal_meta = std::fs::metadata(&wal_path).ok();
     let shm_meta = std::fs::metadata(&shm_path).ok();
 
@@ -4409,6 +4415,10 @@ pub fn inspect_mailbox_sidecar_state(db_path: &Path) -> MailboxSidecarState {
         wal_bytes: wal_meta.as_ref().map(std::fs::Metadata::len),
         shm_exists: shm_meta.as_ref().is_some_and(std::fs::Metadata::is_file),
         shm_bytes: shm_meta.as_ref().map(std::fs::Metadata::len),
+        journal_exists: journal_meta
+            .as_ref()
+            .is_some_and(std::fs::Metadata::is_file),
+        journal_bytes: journal_meta.as_ref().map(std::fs::Metadata::len),
         live_sidecars: sqlite_file_has_live_sidecars(db_path),
     }
 }
@@ -8066,6 +8076,7 @@ mod tests {
             .expect("create");
         drop(conn);
 
+        let _ = std::fs::remove_file(sqlite_path_with_suffix(&path, "-journal"));
         let _ = std::fs::remove_file(sqlite_path_with_suffix(&path, "-wal"));
         let _ = std::fs::remove_file(sqlite_path_with_suffix(&path, "-shm"));
 
@@ -8076,6 +8087,25 @@ mod tests {
         let shm_path = PathBuf::from(shm_os);
         std::fs::write(&shm_path, b"live-sidecar").expect("write sidecar");
         assert!(sqlite_file_has_live_sidecars(&path));
+    }
+
+    #[test]
+    fn inspect_mailbox_sidecar_state_reports_rollback_journal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sidecar-journal.db");
+        let path_str = path.to_string_lossy();
+        let conn = DbConn::open_file(path_str.as_ref()).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create");
+        drop(conn);
+
+        let journal_path = sqlite_path_with_suffix(&path, "-journal");
+        std::fs::write(&journal_path, b"rollback-journal").expect("write journal");
+
+        let state = inspect_mailbox_sidecar_state(&path);
+        assert!(state.journal_exists);
+        assert_eq!(state.journal_bytes, Some(16));
+        assert!(state.live_sidecars);
     }
 
     #[test]
@@ -8198,7 +8228,7 @@ mod tests {
         if let Err(ref e) = result {
             let message = e.to_string();
             assert!(
-                !message.contains("WAL/SHM sidecars"),
+                !message.contains("rollback-journal/WAL/SHM sidecars"),
                 "should not refuse recovery for stale removable sidecars; got: {message}"
             );
         }
@@ -8220,7 +8250,7 @@ mod tests {
         if let Err(ref e) = result {
             let message = e.to_string();
             assert!(
-                !message.contains("WAL/SHM sidecars"),
+                !message.contains("rollback-journal/WAL/SHM sidecars"),
                 "should not refuse recovery for stale removable sidecars; got: {message}"
             );
         }
@@ -10048,7 +10078,7 @@ mod tests {
         let err_text = err.to_string();
         assert!(
             err_text.contains("automatic checkpoint failed")
-                || err_text.contains("non-empty WAL/SHM sidecars remain"),
+                || err_text.contains("non-empty rollback-journal/WAL/SHM sidecars remain"),
             "unexpected error: {err_text}"
         );
         assert!(
