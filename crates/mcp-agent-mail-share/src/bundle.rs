@@ -587,7 +587,8 @@ pub fn export_bundle_from_snapshot_context(
     config: &BundleExportConfig,
 ) -> ShareResult<BundleExportResult> {
     ensure_output_directory(output_dir)?;
-    clear_export_bundle_owned_outputs(output_dir)?;
+    let mut staged_output = create_bundle_output_stage(output_dir)?;
+    let staged_output_dir = staged_output.path();
     let detach_attachment_threshold = crate::adjust_detach_threshold(
         config.inline_attachment_threshold,
         config.detach_attachment_threshold,
@@ -595,44 +596,49 @@ pub fn export_bundle_from_snapshot_context(
 
     let attachment_manifest = bundle_attachments(
         &context.snapshot_path,
-        output_dir,
+        staged_output_dir,
         storage_root,
         config.inline_attachment_threshold,
         detach_attachment_threshold,
         config.allow_absolute_attachment_paths,
     )?;
 
-    let viewer_assets = copy_viewer_assets(output_dir)?;
+    let viewer_assets = copy_viewer_assets(staged_output_dir)?;
 
-    let db_dest = output_dir.join("mailbox.sqlite3");
-    copy_file_into_output(output_dir, "mailbox.sqlite3", &context.snapshot_path)?;
+    let db_dest = staged_output_dir.join("mailbox.sqlite3");
+    copy_file_into_output(staged_output_dir, "mailbox.sqlite3", &context.snapshot_path)?;
     let db_bytes = std::fs::read(&db_dest)?;
     let db_sha256 = hex::encode(Sha256::digest(&db_bytes));
     let db_size_bytes = db_bytes.len() as u64;
 
     let chunk_manifest = maybe_chunk_database(
         &db_dest,
-        output_dir,
+        staged_output_dir,
         config.chunk_threshold,
         config.chunk_size,
     )?;
 
-    let viewer_data = export_viewer_data(&context.snapshot_path, output_dir, context.fts_enabled)?;
+    let viewer_data = export_viewer_data(
+        &context.snapshot_path,
+        staged_output_dir,
+        context.fts_enabled,
+        &crate::ExportRedactionPolicy::from_preset(config.scrub_preset),
+    )?;
     let static_render = crate::render_static_site(
         &context.snapshot_path,
-        output_dir,
+        staged_output_dir,
         &crate::StaticRenderConfig {
             redaction: crate::ExportRedactionPolicy::from_preset(config.scrub_preset),
             ..crate::StaticRenderConfig::default()
         },
     )?;
 
-    let viewer_sri = compute_viewer_sri(output_dir);
+    let viewer_sri = compute_viewer_sri(staged_output_dir);
     let hosting_hints =
         hosting::detect_hosting_hints(config.hosting_hints_root.as_deref().unwrap_or(output_dir));
 
     write_bundle_scaffolding(
-        output_dir,
+        staged_output_dir,
         &context.scope,
         &context.scrub_summary,
         &attachment_manifest,
@@ -647,6 +653,14 @@ pub fn export_bundle_from_snapshot_context(
         Some(&viewer_data),
         &viewer_sri,
     )?;
+
+    if let Err(error) = publish_staged_bundle_outputs(staged_output_dir, output_dir) {
+        let stage_path = staged_output.persist();
+        return Err(ShareError::Io(std::io::Error::other(format!(
+            "failed to publish staged bundle from {}: {error}",
+            stage_path.display()
+        ))));
+    }
 
     Ok(BundleExportResult {
         attachment_manifest,
@@ -769,45 +783,282 @@ const BUNDLE_EXPORT_OWNED_FILES: &[&str] = &[
     "mailbox.sqlite3.config.json",
 ];
 
-fn clear_export_bundle_owned_outputs(output_dir: &Path) -> std::io::Result<()> {
-    for relative_path in BUNDLE_EXPORT_OWNED_DIRECTORIES {
-        remove_owned_output_path_if_exists(output_dir, relative_path)?;
+struct BundleOutputStage {
+    path: PathBuf,
+    cleanup_on_drop: bool,
+}
+
+impl BundleOutputStage {
+    fn path(&self) -> &Path {
+        &self.path
     }
-    for relative_path in BUNDLE_EXPORT_OWNED_FILES {
-        remove_owned_output_path_if_exists(output_dir, relative_path)?;
+
+    fn persist(&mut self) -> PathBuf {
+        self.cleanup_on_drop = false;
+        self.path.clone()
+    }
+}
+
+impl Drop for BundleOutputStage {
+    fn drop(&mut self) {
+        if self.cleanup_on_drop {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+fn create_bundle_output_stage(output_dir: &Path) -> std::io::Result<BundleOutputStage> {
+    create_bundle_temp_dir(output_dir, "stage")
+}
+
+fn create_bundle_backup_stage(output_dir: &Path) -> std::io::Result<BundleOutputStage> {
+    create_bundle_temp_dir(output_dir, "backup")
+}
+
+fn create_bundle_temp_dir(output_dir: &Path, label: &str) -> std::io::Result<BundleOutputStage> {
+    let parent = output_dir.parent().unwrap_or_else(|| Path::new("."));
+    ensure_real_directory(parent)?;
+    let base = output_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("bundle");
+    for attempt in 0..1024 {
+        let candidate = parent.join(format!(
+            ".{base}.bundle-{label}.{}.{attempt}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => {
+                return Ok(BundleOutputStage {
+                    path: candidate,
+                    cleanup_on_drop: true,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "could not create unique staged bundle directory next to {}",
+            output_dir.display()
+        ),
+    ))
+}
+
+fn publish_staged_bundle_outputs(
+    staged_output_dir: &Path,
+    output_dir: &Path,
+) -> std::io::Result<()> {
+    ensure_output_directory(output_dir)?;
+    let mut backup_output = create_bundle_backup_stage(output_dir)?;
+    let backup_output_dir = backup_output.path();
+    let mut backed_up_paths = Vec::new();
+    for relative_path in owned_bundle_relative_paths() {
+        match move_existing_output_to_backup_if_exists(output_dir, backup_output_dir, relative_path)
+        {
+            Ok(true) => backed_up_paths.push(relative_path),
+            Ok(false) => {}
+            Err(error) => {
+                if let Err(rollback_error) =
+                    restore_backup_bundle_outputs(backup_output_dir, output_dir, &backed_up_paths)
+                {
+                    let backup_path = backup_output.persist();
+                    return Err(std::io::Error::other(format!(
+                        "failed to prepare bundle publish backup for {relative_path}: {error}; \
+                         restoring original bundle also failed with backup preserved at {}: \
+                         {rollback_error}",
+                        backup_path.display()
+                    )));
+                }
+                return Err(std::io::Error::other(format!(
+                    "failed to prepare bundle publish backup for {relative_path}: {error}"
+                )));
+            }
+        }
+    }
+
+    let mut published_paths = Vec::new();
+    for relative_path in owned_bundle_relative_paths() {
+        match move_staged_output_if_exists(staged_output_dir, output_dir, relative_path) {
+            Ok(true) => published_paths.push(relative_path),
+            Ok(false) => {}
+            Err(error) => {
+                if let Err(rollback_error) = rollback_published_bundle_outputs(
+                    output_dir,
+                    staged_output_dir,
+                    backup_output_dir,
+                    &published_paths,
+                    &backed_up_paths,
+                ) {
+                    let backup_path = backup_output.persist();
+                    return Err(std::io::Error::other(format!(
+                        "failed to publish staged bundle output {relative_path}: {error}; \
+                         rollback failed with backup preserved at {}: {rollback_error}",
+                        backup_path.display()
+                    )));
+                }
+                return Err(std::io::Error::other(format!(
+                    "failed to publish staged bundle output {relative_path}: {error}"
+                )));
+            }
+        }
     }
     Ok(())
 }
 
-fn remove_owned_output_path_if_exists(
+fn owned_bundle_relative_paths() -> impl Iterator<Item = &'static str> {
+    BUNDLE_EXPORT_OWNED_DIRECTORIES
+        .iter()
+        .copied()
+        .chain(BUNDLE_EXPORT_OWNED_FILES.iter().copied())
+}
+
+fn move_staged_output_if_exists(
+    staged_output_dir: &Path,
     output_dir: &Path,
     relative_path: &str,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
+    move_bundle_output_if_exists(
+        staged_output_dir,
+        output_dir,
+        relative_path,
+        "refusing to publish symlinked staged bundle path",
+        "refusing to publish through symlinked bundle path",
+    )
+}
+
+fn move_existing_output_to_backup_if_exists(
+    output_dir: &Path,
+    backup_output_dir: &Path,
+    relative_path: &str,
+) -> std::io::Result<bool> {
+    move_bundle_output_if_exists(
+        output_dir,
+        backup_output_dir,
+        relative_path,
+        "refusing to back up symlinked bundle path",
+        "refusing to back up through symlinked bundle path",
+    )
+}
+
+fn restore_backup_output_if_exists(
+    backup_output_dir: &Path,
+    output_dir: &Path,
+    relative_path: &str,
+) -> std::io::Result<bool> {
+    move_bundle_output_if_exists(
+        backup_output_dir,
+        output_dir,
+        relative_path,
+        "refusing to restore symlinked backup bundle path",
+        "refusing to restore through symlinked bundle path",
+    )
+}
+
+fn restore_published_output_to_stage_if_exists(
+    output_dir: &Path,
+    staged_output_dir: &Path,
+    relative_path: &str,
+) -> std::io::Result<bool> {
+    move_bundle_output_if_exists(
+        output_dir,
+        staged_output_dir,
+        relative_path,
+        "refusing to roll back symlinked published bundle path",
+        "refusing to restore staged bundle through symlinked path",
+    )
+}
+
+fn move_bundle_output_if_exists(
+    source_root: &Path,
+    destination_root: &Path,
+    relative_path: &str,
+    symlinked_source_message: &str,
+    symlinked_destination_message: &str,
+) -> std::io::Result<bool> {
     let relative_path = Path::new(relative_path);
     validate_relative_output_path(relative_path)?;
-    let target = output_dir.join(relative_path);
-    match std::fs::symlink_metadata(&target) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                return Err(std::io::Error::other(format!(
-                    "refusing to remove symlinked bundle path {}",
-                    target.display()
-                )));
-            }
-            if metadata.is_dir() {
-                std::fs::remove_dir_all(&target)?;
-            } else if metadata.is_file() {
-                std::fs::remove_file(&target)?;
-            } else {
-                return Err(std::io::Error::other(format!(
-                    "refusing to remove non-file, non-directory bundle path {}",
-                    target.display()
-                )));
-            }
-            Ok(())
+    let source = source_root.join(relative_path);
+    let metadata = match std::fs::symlink_metadata(&source) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(std::io::Error::other(format!(
+            "{symlinked_source_message} {}",
+            source.display()
+        )));
+    }
+
+    let destination = destination_root.join(relative_path);
+    if let Some(parent) = destination.parent() {
+        ensure_real_directory(parent)?;
+    }
+    if std::fs::symlink_metadata(&destination)
+        .is_ok_and(|destination_meta| destination_meta.file_type().is_symlink())
+    {
+        return Err(std::io::Error::other(format!(
+            "{symlinked_destination_message} {}",
+            destination.display()
+        )));
+    }
+    std::fs::rename(source, destination)?;
+    Ok(true)
+}
+
+fn restore_backup_bundle_outputs(
+    backup_output_dir: &Path,
+    output_dir: &Path,
+    backed_up_paths: &[&str],
+) -> std::io::Result<()> {
+    let mut first_error = None;
+    for relative_path in backed_up_paths.iter().rev().copied() {
+        if let Err(error) =
+            restore_backup_output_if_exists(backup_output_dir, output_dir, relative_path)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
+    }
+    if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+fn rollback_published_bundle_outputs(
+    output_dir: &Path,
+    staged_output_dir: &Path,
+    backup_output_dir: &Path,
+    published_paths: &[&str],
+    backed_up_paths: &[&str],
+) -> std::io::Result<()> {
+    let mut first_error = None;
+    for relative_path in published_paths.iter().rev().copied() {
+        if let Err(error) = restore_published_output_to_stage_if_exists(
+            output_dir,
+            staged_output_dir,
+            relative_path,
+        ) && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    if let Err(error) =
+        restore_backup_bundle_outputs(backup_output_dir, output_dir, backed_up_paths)
+        && first_error.is_none()
+    {
+        first_error = Some(error);
+    }
+    if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(())
     }
 }
 
@@ -1401,6 +1652,7 @@ pub fn export_viewer_data(
     snapshot_path: &Path,
     output_dir: &Path,
     fts_enabled: bool,
+    redaction: &crate::ExportRedactionPolicy,
 ) -> ShareResult<ViewerDataManifest> {
     let data_dir = output_dir.join("viewer").join("data");
     ensure_real_directory(&data_dir)?;
@@ -1425,8 +1677,7 @@ pub fn export_viewer_data(
     // Fetch latest messages for cache
     let rows = conn
         .query_sync(
-            "SELECT id, subject, created_ts, importance, \
-             SUBSTR(body_md, 1, 200) AS snippet \
+            "SELECT id, subject, created_ts, importance, body_md \
              FROM messages ORDER BY created_ts DESC, id DESC LIMIT ?",
             &[SqlValue::BigInt(VIEWER_MESSAGE_CACHE_LIMIT as i64)],
         )
@@ -1437,10 +1688,32 @@ pub fn export_viewer_data(
     let mut messages = Vec::new();
     for row in &rows {
         let id: i64 = row.get_named("id").unwrap_or(0);
-        let subject: String = row.get_named("subject").unwrap_or_default();
+        let subject_raw: String = row.get_named("subject").unwrap_or_default();
         let created_ts: String = row.get_named("created_ts").unwrap_or_default();
         let importance: String = row.get_named("importance").unwrap_or_default();
-        let snippet: String = row.get_named("snippet").unwrap_or_default();
+        let body_md: String = row.get_named("body_md").unwrap_or_default();
+        let (subject, _) =
+            crate::static_render::sanitize_subject_for_export(&subject_raw, redaction);
+        let (sanitized_body, body_state) =
+            crate::static_render::sanitize_body_for_export(&body_md, redaction);
+        let snippet = if matches!(
+            body_state,
+            crate::static_render::BodySanitization::AlreadyRedacted
+                | crate::static_render::BodySanitization::RedactedByPolicy
+        ) && !redaction.snippet_placeholder.is_empty()
+        {
+            redaction.snippet_placeholder.clone()
+        } else {
+            let end = sanitized_body
+                .char_indices()
+                .nth(200)
+                .map_or(sanitized_body.len(), |(idx, _)| idx);
+            if end < sanitized_body.len() {
+                format!("{}...", &sanitized_body[..end])
+            } else {
+                sanitized_body
+            }
+        };
 
         messages.push(serde_json::json!({
             "id": id,
@@ -2762,7 +3035,13 @@ mod tests {
         let output = dir.path().join("bundle");
         std::fs::create_dir_all(&output).unwrap();
 
-        let manifest = export_viewer_data(&db, &output, true).unwrap();
+        let manifest = export_viewer_data(
+            &db,
+            &output,
+            true,
+            &crate::ExportRedactionPolicy::from_preset(crate::ScrubPreset::Standard),
+        )
+        .unwrap();
 
         // Files exist
         assert!(output.join("viewer/data/messages.json").exists());
@@ -2801,8 +3080,13 @@ mod tests {
         symlink(&db, &linked).unwrap();
 
         let output = dir.path().join("bundle");
-        let err = export_viewer_data(&linked, &output, true)
-            .expect_err("symlinked snapshots must fail validation");
+        let err = export_viewer_data(
+            &linked,
+            &output,
+            true,
+            &crate::ExportRedactionPolicy::from_preset(crate::ScrubPreset::Standard),
+        )
+        .expect_err("symlinked snapshots must fail validation");
         assert!(matches!(err, ShareError::Validation { .. }));
         assert!(err.to_string().contains("real file"));
     }
@@ -2820,8 +3104,179 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         symlink(&outside, output.join("viewer/data")).unwrap();
 
-        let err = export_viewer_data(&db, &output, true).unwrap_err();
+        let err = export_viewer_data(
+            &db,
+            &output,
+            true,
+            &crate::ExportRedactionPolicy::from_preset(crate::ScrubPreset::Standard),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("symlinked bundle directory"));
+    }
+
+    #[test]
+    fn export_viewer_data_applies_secret_scanning_to_subject_and_snippet() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_bundle_test_db(dir.path(), &["[]"]);
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw(
+            "UPDATE messages SET subject = 'Use ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789', \
+             body_md = 'Token ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789 appears here' \
+             WHERE id = 1",
+        )
+        .unwrap();
+        drop(conn);
+
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+
+        export_viewer_data(
+            &db,
+            &output,
+            true,
+            &crate::ExportRedactionPolicy::from_preset(crate::ScrubPreset::Standard),
+        )
+        .unwrap();
+
+        let msgs_text = std::fs::read_to_string(output.join("viewer/data/messages.json")).unwrap();
+        let msgs: Vec<Value> = serde_json::from_str(&msgs_text).unwrap();
+        let first = &msgs[0];
+        let subject = first["subject"].as_str().unwrap();
+        let snippet = first["snippet"].as_str().unwrap();
+        assert!(!subject.contains("ghp_"));
+        assert!(!snippet.contains("ghp_"));
+        assert!(subject.contains("[REDACTED]"));
+        assert!(snippet.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn export_viewer_data_uses_snippet_placeholder_when_policy_hides_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_bundle_test_db(dir.path(), &["[]"]);
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw(
+            "UPDATE messages SET body_md = 'Visible body that strict exports must hide' WHERE id = 1",
+        )
+        .unwrap();
+        drop(conn);
+
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+        let policy = crate::ExportRedactionPolicy::from_preset(crate::ScrubPreset::Strict);
+
+        export_viewer_data(&db, &output, true, &policy).unwrap();
+
+        let msgs_text = std::fs::read_to_string(output.join("viewer/data/messages.json")).unwrap();
+        let msgs: Vec<Value> = serde_json::from_str(&msgs_text).unwrap();
+        assert_eq!(
+            msgs[0]["snippet"].as_str().unwrap(),
+            policy.snippet_placeholder,
+            "viewer cache should honor strict body redaction just like the static renderer"
+        );
+    }
+
+    #[test]
+    fn export_bundle_from_snapshot_context_preserves_existing_bundle_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let escaped_attachment = dir.path().join("escaped.txt");
+        std::fs::write(&escaped_attachment, b"should not be bundled").unwrap();
+        let db = create_bundle_test_db(
+            dir.path(),
+            &[r#"[{"path":"../escaped.txt","media_type":"text/plain"}]"#],
+        );
+        let storage = dir.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(output.join("viewer/data")).unwrap();
+        std::fs::write(output.join("manifest.json"), b"old manifest").unwrap();
+        std::fs::write(
+            output.join("viewer/data/messages.json"),
+            b"[\"old viewer\"]",
+        )
+        .unwrap();
+
+        let context = crate::snapshot::SnapshotContext {
+            snapshot_path: db,
+            scope: ProjectScopeResult {
+                identifiers: vec!["proj".to_string()],
+                projects: vec![crate::scope::ProjectRecord {
+                    id: 1,
+                    slug: "proj".to_string(),
+                    human_key: "/test".to_string(),
+                }],
+                removed_count: 0,
+                remaining: test_remaining_counts(),
+            },
+            scrub_summary: test_scrub_summary(),
+            fts_enabled: false,
+        };
+
+        let err = export_bundle_from_snapshot_context(
+            &context,
+            &output,
+            &storage,
+            &BundleExportConfig::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("attachment path escapes storage root"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(output.join("manifest.json")).unwrap(),
+            "old manifest"
+        );
+        assert_eq!(
+            std::fs::read_to_string(output.join("viewer/data/messages.json")).unwrap(),
+            "[\"old viewer\"]"
+        );
+    }
+
+    #[test]
+    fn publish_staged_bundle_outputs_restores_existing_bundle_on_mid_publish_failure() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(output.join("viewer/data")).unwrap();
+        std::fs::write(output.join("manifest.json"), b"old manifest").unwrap();
+        std::fs::write(
+            output.join("viewer/data/messages.json"),
+            b"[\"old viewer\"]",
+        )
+        .unwrap();
+
+        let staged = dir.path().join("staged");
+        std::fs::create_dir_all(staged.join("viewer/data")).unwrap();
+        std::fs::write(
+            staged.join("viewer/data/messages.json"),
+            b"[\"new viewer\"]",
+        )
+        .unwrap();
+        let outside = dir.path().join("outside-manifest.json");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, staged.join("manifest.json")).unwrap();
+
+        let err = publish_staged_bundle_outputs(&staged, &output).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("failed to publish staged bundle output manifest.json"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(output.join("manifest.json")).unwrap(),
+            "old manifest"
+        );
+        assert_eq!(
+            std::fs::read_to_string(output.join("viewer/data/messages.json")).unwrap(),
+            "[\"old viewer\"]"
+        );
+        assert_eq!(
+            std::fs::read_to_string(staged.join("viewer/data/messages.json")).unwrap(),
+            "[\"new viewer\"]"
+        );
     }
 
     #[test]

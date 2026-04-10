@@ -117,6 +117,19 @@ pub fn build_search_indexes(snapshot_path: &Path) -> Result<bool, ShareError> {
             message: format!("DELETE FROM fts_messages failed: {e}"),
         })?;
 
+    let message_count_rows = conn
+        .query_sync("SELECT COUNT(*) AS cnt FROM messages", &[])
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("FTS message count failed: {e}"),
+        })?;
+    let message_count = message_count_rows
+        .first()
+        .and_then(|row| row.get_named::<i64>("cnt").ok())
+        .unwrap_or(0);
+    if message_count == 0 {
+        return Ok(true);
+    }
+
     // Populate from messages + projects
     let project_slug_expr = format!(
         "COALESCE(NULLIF(TRIM((SELECT p.slug FROM projects p WHERE p.id = m.project_id LIMIT 1)), ''), \
@@ -603,13 +616,8 @@ fn rewrite_snapshot_storage(snapshot_path: &Path) -> Result<(), ShareError> {
         &["PRAGMA journal_mode='DELETE'", "PRAGMA page_size=1024"],
     )?;
 
-    if let Err(rename_error) = std::fs::rename(&rebuilt_path, &snapshot_path) {
-        std::fs::copy(&rebuilt_path, &snapshot_path).map_err(|copy_error| {
-            ShareError::Io(std::io::Error::other(format!(
-                "failed to replace snapshot via rename ({rename_error}) or copy ({copy_error})"
-            )))
-        })?;
-    }
+    let backup_path = temp_dir.path().join("mailbox.backup.sqlite3");
+    replace_snapshot_with_rebuilt_path(&rebuilt_path, &snapshot_path, &backup_path)?;
     for suffix in ["-wal", "-shm"] {
         let mut sidecar_os = snapshot_path.as_os_str().to_os_string();
         sidecar_os.push(suffix);
@@ -618,6 +626,31 @@ fn rewrite_snapshot_storage(snapshot_path: &Path) -> Result<(), ShareError> {
             let _ = std::fs::remove_file(sidecar_path);
         }
     }
+    Ok(())
+}
+
+fn replace_snapshot_with_rebuilt_path(
+    rebuilt_path: &Path,
+    snapshot_path: &Path,
+    backup_path: &Path,
+) -> Result<(), ShareError> {
+    std::fs::rename(snapshot_path, backup_path).map_err(|error| {
+        ShareError::Io(std::io::Error::other(format!(
+            "failed to stage existing snapshot for replacement: {error}"
+        )))
+    })?;
+
+    if let Err(rename_error) = std::fs::rename(rebuilt_path, snapshot_path) {
+        if let Err(rollback_error) = std::fs::rename(backup_path, snapshot_path) {
+            return Err(ShareError::Io(std::io::Error::other(format!(
+                "failed to replace snapshot via rename ({rename_error}); rollback failed ({rollback_error})"
+            ))));
+        }
+        return Err(ShareError::Io(std::io::Error::other(format!(
+            "failed to replace snapshot via rename ({rename_error})"
+        ))));
+    }
+
     Ok(())
 }
 
@@ -1505,6 +1538,33 @@ mod tests {
         assert!(result.fts_enabled);
         assert!(!result.views_created.is_empty());
         assert!(!result.indexes_created.is_empty());
+    }
+
+    #[test]
+    fn replace_snapshot_with_rebuilt_path_restores_original_on_publish_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("snapshot.sqlite3");
+        let backup = dir.path().join("backup.sqlite3");
+        let missing_rebuilt = dir.path().join("missing-rebuilt.sqlite3");
+
+        std::fs::write(&snapshot, b"original snapshot").unwrap();
+
+        let err = replace_snapshot_with_rebuilt_path(&missing_rebuilt, &snapshot, &backup)
+            .expect_err("missing rebuilt snapshot should fail replacement");
+        assert!(
+            err.to_string()
+                .contains("failed to replace snapshot via rename"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&snapshot).unwrap(),
+            b"original snapshot",
+            "rollback should restore the original snapshot bytes"
+        );
+        assert!(
+            !backup.exists(),
+            "successful rollback should not leave the backup path behind"
+        );
     }
 
     #[test]

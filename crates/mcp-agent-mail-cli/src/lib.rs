@@ -871,7 +871,7 @@ pub struct ShareExportArgs {
     no_zip: bool,
     #[arg(long)]
     signing_key: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, requires = "signing_key")]
     signing_public_out: Option<PathBuf>,
     #[arg(long = "age-recipient")]
     age_recipient: Vec<String>,
@@ -898,7 +898,7 @@ pub struct ShareUpdateArgs {
     no_zip: bool,
     #[arg(long)]
     signing_key: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, requires = "signing_key")]
     signing_public_out: Option<PathBuf>,
     #[arg(long = "age-recipient")]
     age_recipient: Vec<String>,
@@ -29358,7 +29358,9 @@ startup_timeout_sec = 42
             DoctorSalvageAttempt::Failed(detail) => {
                 assert!(
                     detail.contains("could not be opened directly")
-                        || detail.contains("failed a direct sqlite probe"),
+                        || detail.contains("failed a direct sqlite probe")
+                        || detail.contains("could not be opened for canonical salvage read")
+                        || detail.contains("failed a canonical salvage probe"),
                     "unexpected salvage failure detail: {detail}"
                 );
             }
@@ -40868,6 +40870,19 @@ fn validate_share_archive_options(zip_enabled: bool, age_recipients: &[String]) 
     Ok(())
 }
 
+fn validate_share_signing_options(
+    signing_key: Option<&Path>,
+    signing_public_out: Option<&Path>,
+) -> CliResult<()> {
+    if signing_public_out.is_some() && signing_key.is_none() {
+        return Err(CliError::Other(
+            "--signing-public-out requires --signing-key so the CLI can emit a fresh public key"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_share_zip_target_absent(
     bundle_dir: &Path,
     age_encryption_enabled: bool,
@@ -41090,9 +41105,336 @@ fn share_update_remove_file_if_exists(path: &Path) -> CliResult<()> {
     }
 }
 
+#[cfg(test)]
 fn share_update_replace_dir(src: &Path, dst: &Path) -> CliResult<()> {
     share_update_remove_dir_tree_if_exists(dst)?;
     share_update_copy_dir_recursive(src, dst)
+}
+
+#[derive(Clone, Copy)]
+enum ShareUpdateOwnedPathKind {
+    File,
+    Directory,
+}
+
+#[derive(Clone, Copy)]
+struct ShareUpdateOwnedPath {
+    relative_path: &'static str,
+    kind: ShareUpdateOwnedPathKind,
+}
+
+const SHARE_UPDATE_OWNED_PATHS: &[ShareUpdateOwnedPath] = &[
+    ShareUpdateOwnedPath {
+        relative_path: "manifest.json",
+        kind: ShareUpdateOwnedPathKind::File,
+    },
+    ShareUpdateOwnedPath {
+        relative_path: "README.md",
+        kind: ShareUpdateOwnedPathKind::File,
+    },
+    ShareUpdateOwnedPath {
+        relative_path: "HOW_TO_DEPLOY.md",
+        kind: ShareUpdateOwnedPathKind::File,
+    },
+    ShareUpdateOwnedPath {
+        relative_path: "index.html",
+        kind: ShareUpdateOwnedPathKind::File,
+    },
+    ShareUpdateOwnedPath {
+        relative_path: ".nojekyll",
+        kind: ShareUpdateOwnedPathKind::File,
+    },
+    ShareUpdateOwnedPath {
+        relative_path: "_headers",
+        kind: ShareUpdateOwnedPathKind::File,
+    },
+    ShareUpdateOwnedPath {
+        relative_path: "mailbox.sqlite3",
+        kind: ShareUpdateOwnedPathKind::File,
+    },
+    ShareUpdateOwnedPath {
+        relative_path: "manifest.sig.json",
+        kind: ShareUpdateOwnedPathKind::File,
+    },
+    ShareUpdateOwnedPath {
+        relative_path: "mailbox.sqlite3-wal",
+        kind: ShareUpdateOwnedPathKind::File,
+    },
+    ShareUpdateOwnedPath {
+        relative_path: "mailbox.sqlite3-shm",
+        kind: ShareUpdateOwnedPathKind::File,
+    },
+    ShareUpdateOwnedPath {
+        relative_path: "_snapshot.sqlite3",
+        kind: ShareUpdateOwnedPathKind::File,
+    },
+    ShareUpdateOwnedPath {
+        relative_path: "chunks.sha256",
+        kind: ShareUpdateOwnedPathKind::File,
+    },
+    ShareUpdateOwnedPath {
+        relative_path: "mailbox.sqlite3.config.json",
+        kind: ShareUpdateOwnedPathKind::File,
+    },
+    ShareUpdateOwnedPath {
+        relative_path: "viewer",
+        kind: ShareUpdateOwnedPathKind::Directory,
+    },
+    ShareUpdateOwnedPath {
+        relative_path: "attachments",
+        kind: ShareUpdateOwnedPathKind::Directory,
+    },
+    ShareUpdateOwnedPath {
+        relative_path: "chunks",
+        kind: ShareUpdateOwnedPathKind::Directory,
+    },
+];
+
+fn share_update_move_output_if_exists(
+    source_root: &Path,
+    destination_root: &Path,
+    relative_path: &str,
+    symlinked_source_message: &str,
+    symlinked_destination_message: &str,
+) -> CliResult<bool> {
+    let source = source_root.join(relative_path);
+    let metadata = match std::fs::symlink_metadata(&source) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(CliError::Io(err)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(CliError::Other(format!(
+            "{symlinked_source_message} {}",
+            source.display()
+        )));
+    }
+
+    let destination = destination_root.join(relative_path);
+    if let Some(parent) = destination.parent() {
+        share_update_ensure_real_directory(parent)?;
+    }
+    if std::fs::symlink_metadata(&destination)
+        .is_ok_and(|destination_meta| destination_meta.file_type().is_symlink())
+    {
+        return Err(CliError::Other(format!(
+            "{symlinked_destination_message} {}",
+            destination.display()
+        )));
+    }
+    std::fs::rename(source, destination)?;
+    Ok(true)
+}
+
+fn share_update_move_existing_output_to_backup_if_exists(
+    bundle_root: &Path,
+    backup_root: &Path,
+    relative_path: &str,
+) -> CliResult<bool> {
+    share_update_move_output_if_exists(
+        bundle_root,
+        backup_root,
+        relative_path,
+        "refusing to back up symlinked bundle path",
+        "refusing to back up through symlinked bundle path",
+    )
+}
+
+fn share_update_restore_output_from_backup_if_exists(
+    backup_root: &Path,
+    bundle_root: &Path,
+    relative_path: &str,
+) -> CliResult<bool> {
+    share_update_move_output_if_exists(
+        backup_root,
+        bundle_root,
+        relative_path,
+        "refusing to restore symlinked backup bundle path",
+        "refusing to restore through symlinked bundle path",
+    )
+}
+
+fn share_update_copy_owned_output_if_exists(
+    staged_root: &Path,
+    bundle_root: &Path,
+    owned_path: ShareUpdateOwnedPath,
+) -> CliResult<bool> {
+    let source = staged_root.join(owned_path.relative_path);
+    let metadata = match std::fs::symlink_metadata(&source) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(CliError::Io(err)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(CliError::Other(format!(
+            "bundle update source {} must not be a symlink",
+            source.display()
+        )));
+    }
+
+    let destination = bundle_root.join(owned_path.relative_path);
+    match owned_path.kind {
+        ShareUpdateOwnedPathKind::File if metadata.file_type().is_file() => {
+            share_update_copy_file(&source, &destination)?;
+            Ok(true)
+        }
+        ShareUpdateOwnedPathKind::Directory if metadata.file_type().is_dir() => {
+            share_update_copy_dir_recursive(&source, &destination)?;
+            Ok(true)
+        }
+        ShareUpdateOwnedPathKind::File => Err(CliError::Other(format!(
+            "bundle update source {} exists but is not a file",
+            source.display()
+        ))),
+        ShareUpdateOwnedPathKind::Directory => Err(CliError::Other(format!(
+            "bundle update source {} exists but is not a directory",
+            source.display()
+        ))),
+    }
+}
+
+fn share_update_remove_output_if_exists(
+    bundle_root: &Path,
+    relative_path: &str,
+) -> CliResult<bool> {
+    let path = bundle_root.join(relative_path);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(CliError::Io(err)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(CliError::Other(format!(
+            "refusing to remove through symlinked bundle path {}",
+            path.display()
+        )));
+    }
+    if metadata.file_type().is_file() {
+        share_update_remove_file_if_exists(&path)?;
+        return Ok(true);
+    }
+    if metadata.file_type().is_dir() {
+        share_update_remove_dir_tree_if_exists(&path)?;
+        return Ok(true);
+    }
+    Err(CliError::Other(format!(
+        "unsupported file type in bundle: {}",
+        path.display()
+    )))
+}
+
+fn share_update_restore_backup_outputs(
+    backup_root: &Path,
+    bundle_root: &Path,
+    backed_up_paths: &[&'static str],
+) -> CliResult<()> {
+    let mut first_error = None;
+    for relative_path in backed_up_paths.iter().rev().copied() {
+        if let Err(error) = share_update_restore_output_from_backup_if_exists(
+            backup_root,
+            bundle_root,
+            relative_path,
+        ) && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+fn share_update_rollback_published_outputs(
+    bundle_root: &Path,
+    backup_root: &Path,
+    published_paths: &[&'static str],
+    backed_up_paths: &[&'static str],
+) -> CliResult<()> {
+    let mut first_error = None;
+    for relative_path in published_paths.iter().rev().copied() {
+        if let Err(error) = share_update_remove_output_if_exists(bundle_root, relative_path)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    if let Err(error) =
+        share_update_restore_backup_outputs(backup_root, bundle_root, backed_up_paths)
+        && first_error.is_none()
+    {
+        first_error = Some(error);
+    }
+    if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+fn share_update_publish_generated_outputs(staged_root: &Path, bundle_root: &Path) -> CliResult<()> {
+    let backup_parent = bundle_root.parent().unwrap_or(bundle_root);
+    let backup_root = tempfile::Builder::new()
+        .prefix(".share-update-backup.")
+        .tempdir_in(backup_parent)?;
+    let mut backed_up_paths = Vec::new();
+    for owned_path in SHARE_UPDATE_OWNED_PATHS {
+        match share_update_move_existing_output_to_backup_if_exists(
+            bundle_root,
+            backup_root.path(),
+            owned_path.relative_path,
+        ) {
+            Ok(true) => backed_up_paths.push(owned_path.relative_path),
+            Ok(false) => {}
+            Err(error) => {
+                if let Err(rollback_error) = share_update_restore_backup_outputs(
+                    backup_root.path(),
+                    bundle_root,
+                    &backed_up_paths,
+                ) {
+                    let backup_path = backup_root.keep();
+                    return Err(CliError::Other(format!(
+                        "failed to prepare bundle update backup for {}: {error}; restoring the original bundle also failed with backup preserved at {}: {rollback_error}",
+                        owned_path.relative_path,
+                        backup_path.display()
+                    )));
+                }
+                return Err(CliError::Other(format!(
+                    "failed to prepare bundle update backup for {}: {error}",
+                    owned_path.relative_path
+                )));
+            }
+        }
+    }
+
+    let mut published_paths = Vec::new();
+    for owned_path in SHARE_UPDATE_OWNED_PATHS {
+        match share_update_copy_owned_output_if_exists(staged_root, bundle_root, *owned_path) {
+            Ok(true) => published_paths.push(owned_path.relative_path),
+            Ok(false) => {}
+            Err(error) => {
+                if let Err(rollback_error) = share_update_rollback_published_outputs(
+                    bundle_root,
+                    backup_root.path(),
+                    &published_paths,
+                    &backed_up_paths,
+                ) {
+                    let backup_path = backup_root.keep();
+                    return Err(CliError::Other(format!(
+                        "failed to publish updated bundle output {}: {error}; rollback failed with backup preserved at {}: {rollback_error}",
+                        owned_path.relative_path,
+                        backup_path.display()
+                    )));
+                }
+                return Err(CliError::Other(format!(
+                    "failed to publish updated bundle output {}: {error}",
+                    owned_path.relative_path
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 struct ShareExportParams {
@@ -41125,6 +41467,10 @@ struct ShareUpdateParams {
 }
 
 fn run_share_export(params: ShareExportParams) -> CliResult<()> {
+    validate_share_signing_options(
+        params.signing_key.as_deref(),
+        params.signing_public_out.as_deref(),
+    )?;
     struct SnapshotCleanupGuard {
         path: PathBuf,
         cleaned: bool,
@@ -41354,6 +41700,10 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
 
 fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
     validate_share_archive_options(params.zip, &params.age_recipients)?;
+    validate_share_signing_options(
+        params.signing_key.as_deref(),
+        params.signing_public_out.as_deref(),
+    )?;
 
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let config = Config::from_env();
@@ -41455,6 +41805,19 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
         );
     }
 
+    let mut signature_metadata = None;
+    if let Some(ref key_path) = params.signing_key {
+        ftui_runtime::ftui_println!("Signing manifest...");
+        let sig = share::sign_manifest(
+            &temp_bundle.join("manifest.json"),
+            key_path,
+            &temp_bundle.join("manifest.sig.json"),
+            false,
+        )?;
+        ftui_runtime::ftui_println!("  Algorithm: {}", sig.algorithm);
+        signature_metadata = Some(sig);
+    }
+
     // 10. Clean up snapshot
     let _ = std::fs::remove_file(&snapshot_path);
 
@@ -41463,66 +41826,17 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
         params.bundle.display()
     );
 
-    // Replace top-level generated files (but intentionally do NOT touch manifest.sig.json unless re-signing).
-    let files = [
-        "manifest.json",
-        "README.md",
-        "HOW_TO_DEPLOY.md",
-        "index.html",
-        ".nojekyll",
-        "_headers",
-        "mailbox.sqlite3",
-    ];
-    for name in files {
-        share_update_copy_file(&temp_bundle.join(name), &params.bundle.join(name))?;
-    }
+    share_update_publish_generated_outputs(&temp_bundle, &params.bundle)?;
 
-    // Ensure bundle doesn't accumulate WAL/SHM files.
-    share_update_remove_file_if_exists(&params.bundle.join("mailbox.sqlite3-wal"))?;
-    share_update_remove_file_if_exists(&params.bundle.join("mailbox.sqlite3-shm"))?;
-    share_update_remove_file_if_exists(&params.bundle.join("_snapshot.sqlite3"))?;
-
-    // Viewer + attachments are always owned by the export; replace wholesale.
-    share_update_replace_dir(&temp_bundle.join("viewer"), &params.bundle.join("viewer"))?;
-    share_update_replace_dir(
-        &temp_bundle.join("attachments"),
-        &params.bundle.join("attachments"),
-    )?;
-
-    // Chunk artefacts: if the refreshed snapshot no longer needs chunking, prune the old chunk files.
-    if chunk.is_some() {
-        share_update_replace_dir(&temp_bundle.join("chunks"), &params.bundle.join("chunks"))?;
-        share_update_copy_file(
-            &temp_bundle.join("chunks.sha256"),
-            &params.bundle.join("chunks.sha256"),
-        )?;
-        share_update_copy_file(
-            &temp_bundle.join("mailbox.sqlite3.config.json"),
-            &params.bundle.join("mailbox.sqlite3.config.json"),
-        )?;
-    } else {
-        share_update_remove_dir_tree_if_exists(&params.bundle.join("chunks"))?;
-        share_update_remove_file_if_exists(&params.bundle.join("chunks.sha256"))?;
-        share_update_remove_file_if_exists(&params.bundle.join("mailbox.sqlite3.config.json"))?;
-    }
-
-    // Sign (optional).
-    if let Some(ref key_path) = params.signing_key {
-        ftui_runtime::ftui_println!("Signing manifest...");
-        let sig = share::sign_manifest(
-            &params.bundle.join("manifest.json"),
-            key_path,
-            &params.bundle.join("manifest.sig.json"),
-            true,
-        )?;
-        ftui_runtime::ftui_println!("  Algorithm: {}", sig.algorithm);
-        if let Some(ref pub_out) = params.signing_public_out {
-            std::fs::write(pub_out, &sig.public_key)?;
-            ftui_runtime::ftui_println!("  Public key written to: {}", pub_out.display());
-        }
+    if let Some(ref sig) = signature_metadata
+        && let Some(ref pub_out) = params.signing_public_out
+    {
+        std::fs::write(pub_out, &sig.public_key)?;
+        ftui_runtime::ftui_println!("  Public key written to: {}", pub_out.display());
     } else if existing_signature {
+        share_update_remove_file_if_exists(&params.bundle.join("manifest.sig.json"))?;
         ftui_runtime::ftui_eprintln!(
-            "warning: existing manifest signature may no longer match; re-run with --signing-key to refresh it."
+            "warning: removed stale manifest signature; re-run with --signing-key to generate a fresh signature."
         );
     }
 
@@ -48484,6 +48798,13 @@ fn validate_share_archive_options_requires_zip_for_age() {
 }
 
 #[test]
+fn validate_share_signing_options_requires_signing_key_for_public_key_output() {
+    let err = validate_share_signing_options(None, Some(Path::new("/tmp/public.pem")))
+        .expect_err("public key output without signing key should fail");
+    assert!(format!("{err}").contains("--signing-key"));
+}
+
+#[test]
 fn ensure_share_zip_target_absent_rejects_existing_archive() {
     let temp = tempfile::tempdir().expect("tempdir");
     let bundle = temp.path().join("bundle");
@@ -48586,6 +48907,42 @@ fn share_update_replace_dir_rejects_symlinked_child_in_existing_tree() {
         .expect_err("symlinked child in existing tree should be rejected");
     assert!(format!("{err}").contains("symlinked bundle path"));
     assert!(outside.exists(), "outside directory must remain untouched");
+}
+
+#[cfg(unix)]
+#[test]
+fn share_update_publish_generated_outputs_restores_bundle_on_mid_publish_failure() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let staged = temp.path().join("staged");
+    let bundle = temp.path().join("bundle");
+    let outside = temp.path().join("outside-readme.md");
+    std::fs::create_dir_all(&staged).expect("create staged dir");
+    std::fs::create_dir_all(&bundle).expect("create bundle dir");
+    std::fs::write(staged.join("manifest.json"), "{\"fresh\":true}\n")
+        .expect("write staged manifest");
+    std::fs::write(&outside, "outside").expect("write outside file");
+    symlink(&outside, staged.join("README.md")).expect("symlink staged README");
+    std::fs::write(bundle.join("manifest.json"), "{\"old\":true}\n").expect("write old manifest");
+    std::fs::write(bundle.join("README.md"), "old readme\n").expect("write old readme");
+
+    let err = share_update_publish_generated_outputs(&staged, &bundle)
+        .expect_err("mid-publish failure should abort and roll back");
+    assert!(
+        format!("{err}").contains("README.md"),
+        "error should identify the failing path: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(bundle.join("manifest.json")).expect("read restored manifest"),
+        "{\"old\":true}\n",
+        "rollback should restore the original manifest after a later publish failure"
+    );
+    assert_eq!(
+        std::fs::read_to_string(bundle.join("README.md")).expect("read restored readme"),
+        "old readme\n",
+        "rollback should restore files that were backed up before the publish failure"
+    );
 }
 
 #[cfg(test)]
@@ -48761,6 +49118,34 @@ fn run_share_export_removes_snapshot_when_signing_fails() {
 }
 
 #[test]
+fn run_share_export_rejects_public_key_output_without_signing_key() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let output = temp.path().join("bundle");
+
+    let err = run_share_export(ShareExportParams {
+        output: output.clone(),
+        projects: vec![],
+        inline_threshold: share::INLINE_ATTACHMENT_THRESHOLD,
+        detach_threshold: share::DETACH_ATTACHMENT_THRESHOLD,
+        scrub_preset: share::ScrubPreset::Standard,
+        chunk_threshold: share::DEFAULT_CHUNK_THRESHOLD,
+        chunk_size: share::DEFAULT_CHUNK_SIZE,
+        dry_run: false,
+        zip: false,
+        signing_key: None,
+        signing_public_out: Some(temp.path().join("public.pem")),
+        age_recipients: vec![],
+    })
+    .expect_err("public key output without a signing key should fail");
+
+    assert!(format!("{err}").contains("--signing-key"));
+    assert!(
+        !output.exists(),
+        "share export should fail before creating the bundle output"
+    );
+}
+
+#[test]
 fn run_share_export_reports_encrypted_archive_as_final_output() {
     let _share_lock = SHARE_EXPORT_TEST_LOCK
         .lock()
@@ -48830,6 +49215,33 @@ fn run_share_export_reports_encrypted_archive_as_final_output() {
         encrypted_path.exists(),
         "encrypted archive should exist at {}",
         encrypted_path.display()
+    );
+}
+
+#[test]
+fn run_share_update_rejects_public_key_output_without_signing_key() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let bundle = temp.path().join("bundle");
+
+    let err = run_share_update(ShareUpdateParams {
+        bundle: bundle.clone(),
+        projects: vec![],
+        inline_threshold: share::INLINE_ATTACHMENT_THRESHOLD,
+        detach_threshold: share::DETACH_ATTACHMENT_THRESHOLD,
+        scrub_preset: share::ScrubPreset::Standard,
+        chunk_threshold: share::DEFAULT_CHUNK_THRESHOLD,
+        chunk_size: share::DEFAULT_CHUNK_SIZE,
+        zip: false,
+        signing_key: None,
+        signing_public_out: Some(temp.path().join("public.pem")),
+        age_recipients: vec![],
+    })
+    .expect_err("public key output without a signing key should fail");
+
+    assert!(format!("{err}").contains("--signing-key"));
+    assert!(
+        !bundle.exists(),
+        "share update should fail before touching the bundle path"
     );
 }
 
@@ -49124,6 +49536,58 @@ fn run_share_update_uses_archive_snapshot_when_live_db_is_missing() {
     assert_eq!(
         max_id, 1,
         "updated bundle should preserve archive message ids"
+    );
+}
+
+#[test]
+fn run_share_update_removes_stale_signature_when_not_resigning() {
+    let _lock = SHARE_EXPORT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source_db = temp.path().join("share-update-source.sqlite3");
+    let storage_root = temp.path().join("storage");
+    let bundle = temp.path().join("bundle");
+    std::fs::create_dir_all(&storage_root).expect("create storage root");
+    std::fs::create_dir_all(&bundle).expect("create bundle dir");
+    std::fs::write(bundle.join("manifest.json"), b"{\"old\":true}\n").expect("seed manifest");
+    std::fs::write(bundle.join("manifest.sig.json"), b"{\"stale\":true}\n")
+        .expect("seed stale signature");
+    seed_share_export_source_db(&source_db);
+
+    let database_url = format!("sqlite:///{}", source_db.display());
+    let storage_root_text = storage_root.to_string_lossy().to_string();
+    mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        &[
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root_text.as_str()),
+        ],
+        || {
+            run_share_update(ShareUpdateParams {
+                bundle: bundle.clone(),
+                projects: vec![],
+                inline_threshold: share::INLINE_ATTACHMENT_THRESHOLD,
+                detach_threshold: share::DETACH_ATTACHMENT_THRESHOLD,
+                scrub_preset: share::ScrubPreset::Standard,
+                chunk_threshold: share::DEFAULT_CHUNK_THRESHOLD,
+                chunk_size: share::DEFAULT_CHUNK_SIZE,
+                zip: false,
+                signing_key: None,
+                signing_public_out: None,
+                age_recipients: vec![],
+            })
+        },
+    )
+    .expect("share update should succeed without resigning");
+
+    assert!(
+        !bundle.join("manifest.sig.json").exists(),
+        "share update should remove stale signature files when it does not generate a fresh one"
+    );
+    assert!(
+        bundle.join("manifest.json").exists(),
+        "updated bundle should still include the refreshed manifest"
     );
 }
 

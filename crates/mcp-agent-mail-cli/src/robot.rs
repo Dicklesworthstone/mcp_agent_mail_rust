@@ -607,7 +607,7 @@ impl<T: Serialize> RobotEnvelope<T> {
 
 /// Trait for data types that support custom markdown rendering.
 ///
-/// Most robot commands use TOON/JSON. Only a few (thread, message, search)
+/// Most robot commands use TOON/JSON. Only a few (thread, message)
 /// benefit from markdown. Types implementing this trait get custom markdown
 /// output instead of falling back to TOON.
 pub trait MarkdownRenderable {
@@ -616,26 +616,79 @@ pub trait MarkdownRenderable {
 
 // ── Format dispatcher ────────────────────────────────────────────────────────
 
+#[derive(Serialize)]
+struct RobotMetaView<'a> {
+    command: &'a str,
+    timestamp: &'a str,
+    format: &'a str,
+    version: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<&'a String>,
+}
+
+fn robot_alert_refs_empty(alerts: &&[RobotAlert]) -> bool {
+    alerts.is_empty()
+}
+
+fn string_refs_empty(actions: &&[String]) -> bool {
+    actions.is_empty()
+}
+
+#[derive(Serialize)]
+struct RobotEnvelopeView<'a, T: Serialize> {
+    _meta: RobotMetaView<'a>,
+    #[serde(skip_serializing_if = "robot_alert_refs_empty")]
+    _alerts: &'a [RobotAlert],
+    #[serde(skip_serializing_if = "string_refs_empty")]
+    _actions: &'a [String],
+    #[serde(flatten)]
+    data: &'a T,
+}
+
+fn serialize_envelope_with_format<T: Serialize>(
+    envelope: &RobotEnvelope<T>,
+    format: OutputFormat,
+    pretty: bool,
+) -> Result<String, CliError> {
+    let format_label = format.to_string();
+    let view = RobotEnvelopeView {
+        _meta: RobotMetaView {
+            command: &envelope._meta.command,
+            timestamp: &envelope._meta.timestamp,
+            format: format_label.as_str(),
+            version: envelope._meta.version,
+            project: envelope._meta.project.as_ref(),
+            agent: envelope._meta.agent.as_ref(),
+        },
+        _alerts: &envelope._alerts,
+        _actions: &envelope._actions,
+        data: &envelope.data,
+    };
+    if pretty {
+        serde_json::to_string_pretty(&view).map_err(|e| CliError::Format(e.to_string()))
+    } else {
+        serde_json::to_string(&view).map_err(|e| CliError::Format(e.to_string()))
+    }
+}
+
 /// Serialize a `RobotEnvelope<T>` into the requested output format.
 pub fn format_output<T: Serialize>(
     envelope: &RobotEnvelope<T>,
     format: OutputFormat,
 ) -> Result<String, CliError> {
     match format {
-        OutputFormat::Json => {
-            serde_json::to_string_pretty(envelope).map_err(|e| CliError::Format(e.to_string()))
-        }
+        OutputFormat::Json => serialize_envelope_with_format(envelope, OutputFormat::Json, true),
         OutputFormat::Toon => {
-            let json_str =
-                serde_json::to_string(envelope).map_err(|e| CliError::Format(e.to_string()))?;
+            let json_str = serialize_envelope_with_format(envelope, OutputFormat::Toon, false)?;
             toon::json_to_toon(&json_str).map_err(|e| CliError::Format(e.to_string()))
         }
         OutputFormat::Markdown => {
             // Markdown falls back to TOON for types that don't implement MarkdownRenderable.
             // Commands that support markdown should call to_markdown() directly before
             // reaching this generic path.
-            let json_str =
-                serde_json::to_string(envelope).map_err(|e| CliError::Format(e.to_string()))?;
+            let json_str = serialize_envelope_with_format(envelope, OutputFormat::Toon, false)?;
             toon::json_to_toon(&json_str).map_err(|e| CliError::Format(e.to_string()))
         }
     }
@@ -1453,7 +1506,7 @@ pub enum RobotSubcommand {
     Search {
         /// Search query.
         query: String,
-        /// Filter by message kind.
+        /// Filter by recipient kind (`to`, `cc`, `bcc`).
         #[arg(long)]
         kind: Option<String>,
         /// Filter by importance level.
@@ -1544,10 +1597,16 @@ pub enum RobotSubcommand {
 }
 
 impl RobotSubcommand {
+    /// Whether this command supports explicit Markdown output.
+    #[must_use]
+    pub const fn supports_markdown(&self) -> bool {
+        matches!(self, Self::Thread { .. } | Self::Message { .. })
+    }
+
     /// Whether this command's output is prose-heavy (prefers Markdown by default).
     #[must_use]
     pub const fn is_prose(&self) -> bool {
-        matches!(self, Self::Thread { .. } | Self::Message { .. })
+        self.supports_markdown()
     }
 
     /// Name string for the subcommand (used in envelope `_meta.command`).
@@ -1572,6 +1631,58 @@ impl RobotSubcommand {
             Self::Attachments => "robot attachments",
             Self::Atc { .. } => "robot atc",
         }
+    }
+}
+
+fn validate_requested_robot_format(args: &RobotArgs) -> Result<(), CliError> {
+    if matches!(args.format, Some(OutputFormat::Markdown)) && !args.command.supports_markdown() {
+        return Err(CliError::InvalidArgument(
+            "--format md is only supported for `am robot thread` and `am robot message`"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_search_recipient_kind(kind: Option<&str>) -> Result<Option<String>, CliError> {
+    let Some(kind) = kind.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let normalized = kind.to_ascii_lowercase();
+    if matches!(normalized.as_str(), "to" | "cc" | "bcc") {
+        Ok(Some(normalized))
+    } else {
+        Err(CliError::InvalidArgument(format!(
+            "invalid --kind filter `{kind}`; expected one of: to, cc, bcc"
+        )))
+    }
+}
+
+fn parse_timeline_kind(kind: Option<&str>) -> Result<Option<String>, CliError> {
+    let Some(kind) = kind.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let normalized = kind.to_ascii_lowercase();
+    if matches!(normalized.as_str(), "message" | "reservation" | "agent") {
+        Ok(Some(normalized))
+    } else {
+        Err(CliError::InvalidArgument(format!(
+            "invalid --kind filter `{kind}`; expected one of: message, reservation, agent"
+        )))
+    }
+}
+
+fn parse_agent_sort_field(sort: Option<&str>) -> Result<Option<String>, CliError> {
+    let Some(sort) = sort.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let normalized = sort.to_ascii_lowercase();
+    if matches!(normalized.as_str(), "last_active" | "name" | "msg_count") {
+        Ok(Some(normalized))
+    } else {
+        Err(CliError::InvalidArgument(format!(
+            "invalid --sort value `{sort}`; expected one of: last_active, name, msg_count"
+        )))
     }
 }
 
@@ -3744,8 +3855,9 @@ fn build_search(
         };
     }
 
-    let recipient_kind = kind_filter.map(str::trim).filter(|s| !s.is_empty());
-    let search_rows = collect_search_rows(conn, pool, &search_query, recipient_kind, limit)?;
+    let recipient_kind = parse_search_recipient_kind(kind_filter)?;
+    let search_rows =
+        collect_search_rows(conn, pool, &search_query, recipient_kind.as_deref(), limit)?;
 
     // Build results and facets
     let mut results = Vec::new();
@@ -4576,6 +4688,11 @@ fn build_timeline(
     source_filter: Option<&str>,
 ) -> Result<Vec<TimelineEvent>, CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
+    let kind_filter = parse_timeline_kind(kind_filter)?;
+    let kind_filter = kind_filter.as_deref();
+    let source_filter = source_filter
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
 
     // Default "since" to 24h ago
     let since_us = if let Some(s) = since {
@@ -7149,6 +7266,7 @@ fn build_navigate(
 
 /// Execute a robot subcommand and print formatted output.
 pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
+    validate_requested_robot_format(&args)?;
     let format = OutputFormat::resolve(args.format, args.command.is_prose());
     let cmd_name = args.command.name();
 
@@ -7769,6 +7887,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         }
         RobotSubcommand::Agents { active, sort } => {
             let scope = resolve_robot_scope(args.project.as_deref(), None)?;
+            let sort = parse_agent_sort_field(sort.as_deref())?;
             let agents = build_agents(scope.conn(), scope.project_id, active, sort.as_deref())?;
 
             #[derive(Serialize)]
@@ -14271,6 +14390,73 @@ mod tests {
         let md_result = format_output(&envelope, OutputFormat::Markdown).unwrap();
         let toon_result = format_output(&envelope, OutputFormat::Toon).unwrap();
         assert_eq!(md_result, toon_result);
+    }
+
+    #[test]
+    fn serialize_envelope_with_format_overrides_meta_format_label() {
+        let data = TestData {
+            items: vec!["x".into()],
+            count: 1,
+        };
+        let envelope = RobotEnvelope::new("test", OutputFormat::Json, data);
+
+        let json = serialize_envelope_with_format(&envelope, OutputFormat::Toon, false).unwrap();
+        let parsed: Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["_meta"]["format"], "toon");
+    }
+
+    #[test]
+    fn handle_robot_rejects_markdown_for_non_prose_command() {
+        let err = handle_robot(RobotArgs {
+            format: Some(OutputFormat::Markdown),
+            project: None,
+            agent: None,
+            command: RobotSubcommand::Status,
+        })
+        .expect_err("status should reject markdown format");
+
+        assert!(
+            err.to_string().contains(
+                "--format md is only supported for `am robot thread` and `am robot message`"
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_search_recipient_kind_rejects_invalid_value() {
+        let err = parse_search_recipient_kind(Some("message"))
+            .expect_err("unexpectedly accepted invalid recipient kind");
+
+        assert!(
+            err.to_string().contains("expected one of: to, cc, bcc"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_timeline_kind_rejects_invalid_value() {
+        let err = parse_timeline_kind(Some("mail"))
+            .expect_err("unexpectedly accepted invalid timeline kind");
+
+        assert!(
+            err.to_string()
+                .contains("expected one of: message, reservation, agent"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_agent_sort_field_rejects_invalid_value() {
+        let err = parse_agent_sort_field(Some("alphabetical"))
+            .expect_err("unexpectedly accepted invalid sort field");
+
+        assert!(
+            err.to_string()
+                .contains("expected one of: last_active, name, msg_count"),
+            "unexpected error: {err}"
+        );
     }
 
     // ── RobotEnvelope builder ──────────────────────────────────────────

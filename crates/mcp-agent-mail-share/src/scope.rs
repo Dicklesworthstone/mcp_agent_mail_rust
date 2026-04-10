@@ -8,6 +8,7 @@ use std::path::Path;
 
 use mcp_agent_mail_db::DbConn;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sqlmodel_core::Value;
 
 use crate::ShareError;
@@ -154,6 +155,8 @@ pub fn apply_project_scope(
         });
     }
 
+    let derived_artifacts = crate::scrub::detect_derived_export_artifacts(&conn)?;
+
     // Build SQL placeholders for allowed IDs
     let placeholders = build_placeholders(matched_ids.len());
     let id_values: Vec<Value> = matched_ids.iter().map(|&id| Value::BigInt(id)).collect();
@@ -272,17 +275,26 @@ pub fn apply_project_scope(
             &id_values,
         )?;
 
-        // 9. Delete agent-scoped aggregates that are not protected by FK constraints.
-        if table_exists(&conn, "inbox_stats")? {
-            exec(
-                &conn,
-                "DELETE FROM inbox_stats \
-                 WHERE agent_id NOT IN (SELECT id FROM agents)",
-                &[],
-            )?;
+        // 9. Delete recipient links that now point at filtered-out agents, then
+        // repair the denormalized recipients envelope for kept messages.
+        exec(
+            &conn,
+            "DELETE FROM message_recipients \
+             WHERE agent_id NOT IN (SELECT id FROM agents)",
+            &[],
+        )?;
+        if column_exists(&conn, "messages", "recipients_json")? {
+            sync_scope_recipients_json(&conn)?;
         }
 
-        // 10. Delete projects
+        // 10. Rebuild agent-scoped aggregates that are not protected by FK
+        // constraints. Kept agents can otherwise retain stale counts from
+        // messages trimmed out of scope.
+        if table_exists(&conn, "inbox_stats")? {
+            rebuild_scope_inbox_stats(&conn)?;
+        }
+
+        // 11. Delete projects
         exec(
             &conn,
             &format!(
@@ -308,6 +320,10 @@ pub fn apply_project_scope(
                 .map_err(|e| ShareError::Sqlite {
                     message: format!("COMMIT failed: {e}"),
                 })?;
+            drop(conn);
+            if derived_artifacts.any() {
+                crate::scrub::refresh_derived_export_artifacts(&snapshot_path, derived_artifacts)?;
+            }
             Ok(out)
         }
         Err(err) => {
@@ -460,12 +476,127 @@ fn table_exists(conn: &Conn, name: &str) -> Result<bool, ShareError> {
     }
 }
 
+fn column_exists(conn: &Conn, table: &str, column: &str) -> Result<bool, ShareError> {
+    let probe = format!("SELECT \"{column}\" FROM \"{table}\" LIMIT 0");
+    match conn.query_sync(&probe, &[]) {
+        Ok(_) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
 /// Execute a statement with parameters, mapping errors to [`ShareError`].
 fn exec(conn: &Conn, sql: &str, params: &[Value]) -> Result<u64, ShareError> {
     conn.execute_sync(sql, params)
         .map_err(|e| ShareError::Sqlite {
             message: format!("SQL exec failed: {e}"),
         })
+}
+
+fn sync_scope_recipients_json(conn: &Conn) -> Result<(), ShareError> {
+    let message_rows = conn
+        .query_sync("SELECT id FROM messages ORDER BY id ASC", &[])
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("scope recipients_json message inventory failed: {e}"),
+        })?;
+
+    for row in message_rows {
+        let message_id = row.get_named::<i64>("id").map_err(|e| ShareError::Sqlite {
+            message: format!("scope recipients_json message id decode failed: {e}"),
+        })?;
+        sync_scope_message_recipients_json(conn, message_id)?;
+    }
+
+    Ok(())
+}
+
+fn sync_scope_message_recipients_json(conn: &Conn, message_id: i64) -> Result<(), ShareError> {
+    let rows = conn
+        .query_sync(
+            "SELECT COALESCE(NULLIF(TRIM(a.name), ''), '[unknown-agent-' || mr.agent_id || ']') AS name, \
+                    mr.kind AS kind \
+             FROM message_recipients mr \
+             LEFT JOIN agents a ON a.id = mr.agent_id \
+             WHERE mr.message_id = ? \
+             ORDER BY CASE mr.kind WHEN 'to' THEN 0 WHEN 'cc' THEN 1 WHEN 'bcc' THEN 2 ELSE 3 END, \
+                     COALESCE(NULLIF(TRIM(a.name), ''), '[unknown-agent-' || mr.agent_id || ']') COLLATE NOCASE",
+            &[Value::BigInt(message_id)],
+        )
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("scope recipients_json query failed for message {message_id}: {e}"),
+        })?;
+
+    let mut to_names = Vec::new();
+    let mut cc_names = Vec::new();
+    let mut bcc_names = Vec::new();
+
+    for row in rows {
+        let name = row
+            .get_named::<String>("name")
+            .map_err(|e| ShareError::Sqlite {
+                message: format!(
+                    "scope recipients_json name decode failed for message {message_id}: {e}"
+                ),
+            })?;
+        let kind = row
+            .get_named::<String>("kind")
+            .map_err(|e| ShareError::Sqlite {
+                message: format!(
+                    "scope recipients_json kind decode failed for message {message_id}: {e}"
+                ),
+            })?;
+        match kind.as_str() {
+            "cc" => cc_names.push(name),
+            "bcc" => bcc_names.push(name),
+            _ => to_names.push(name),
+        }
+    }
+
+    let recipients_json = json!({
+        "to": to_names,
+        "cc": cc_names,
+        "bcc": bcc_names,
+    })
+    .to_string();
+
+    conn.execute_sync(
+        "UPDATE messages SET recipients_json = ? WHERE id = ?",
+        &[Value::Text(recipients_json), Value::BigInt(message_id)],
+    )
+    .map_err(|e| ShareError::Sqlite {
+        message: format!("scope recipients_json update failed for message {message_id}: {e}"),
+    })?;
+
+    Ok(())
+}
+
+fn rebuild_scope_inbox_stats(conn: &Conn) -> Result<(), ShareError> {
+    conn.execute_sync("DELETE FROM inbox_stats", &[])
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("scope inbox_stats reset failed: {e}"),
+        })?;
+
+    conn.execute_sync(
+        "INSERT INTO inbox_stats (\
+             agent_id, total_count, unread_count, ack_pending_count, last_message_ts\
+         ) \
+         SELECT \
+             mr.agent_id AS agent_id, \
+             COUNT(*) AS total_count, \
+             SUM(CASE WHEN mr.read_ts IS NULL THEN 1 ELSE 0 END) AS unread_count, \
+             SUM(CASE WHEN COALESCE(m.ack_required, 0) = 1 AND mr.ack_ts IS NULL THEN 1 ELSE 0 END) \
+                 AS ack_pending_count, \
+             MAX(m.created_ts) AS last_message_ts \
+         FROM message_recipients mr \
+         INNER JOIN messages m ON m.id = mr.message_id \
+         INNER JOIN agents a ON a.id = mr.agent_id \
+         GROUP BY mr.agent_id",
+        &[],
+    )
+    .map_err(|e| ShareError::Sqlite {
+        message: format!("scope inbox_stats rebuild failed: {e}"),
+    })?;
+
+    Ok(())
 }
 
 /// Count remaining rows in all relevant tables.
@@ -560,6 +691,7 @@ mod tests {
                 importance TEXT NOT NULL DEFAULT 'normal',
                 ack_required INTEGER NOT NULL DEFAULT 0,
                 created_ts TEXT NOT NULL DEFAULT '',
+                recipients_json TEXT NOT NULL DEFAULT '{}',
                 attachments TEXT NOT NULL DEFAULT '[]'
             )",
         )
@@ -1081,6 +1213,77 @@ mod tests {
     }
 
     #[test]
+    fn scope_rebuilds_inbox_stats_for_kept_agents_after_message_trimming() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw(
+            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (3, 1, 'cc')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "UPDATE inbox_stats \
+             SET total_count = 3, unread_count = 3, ack_pending_count = 1, last_message_ts = 20 \
+             WHERE agent_id = 1",
+        )
+        .unwrap();
+
+        let result = apply_project_scope(&db, &["proj-alpha".to_string()]).unwrap();
+        assert_eq!(result.remaining.inbox_stats, 1);
+
+        let rows = conn
+            .query_sync(
+                "SELECT total_count, unread_count, ack_pending_count \
+                 FROM inbox_stats WHERE agent_id = 1",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get_named::<i64>("total_count").unwrap(), 2);
+        assert_eq!(rows[0].get_named::<i64>("unread_count").unwrap(), 2);
+        assert_eq!(rows[0].get_named::<i64>("ack_pending_count").unwrap(), 0);
+    }
+
+    #[test]
+    fn scope_removes_filtered_recipients_from_kept_messages_and_recipients_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw(
+            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (1, 2, 'cc')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "UPDATE messages SET recipients_json = '{\"to\":[\"GreenCastle\"],\"cc\":[\"PurpleBear\"],\"bcc\":[]}' WHERE id = 1",
+        )
+        .unwrap();
+        drop(conn);
+
+        let result = apply_project_scope(&db, &["proj-alpha".to_string()]).unwrap();
+        assert_eq!(result.remaining.recipients, 2);
+
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        let recipient_rows = conn
+            .query_sync(
+                "SELECT agent_id, kind FROM message_recipients WHERE message_id = 1 ORDER BY agent_id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(recipient_rows.len(), 1);
+        let kept_agent_id: i64 = recipient_rows[0].get_named("agent_id").unwrap();
+        let kept_kind: String = recipient_rows[0].get_named("kind").unwrap();
+        assert_eq!(kept_agent_id, 1);
+        assert_eq!(kept_kind, "to");
+
+        let message_rows = conn
+            .query_sync("SELECT recipients_json FROM messages WHERE id = 1", &[])
+            .unwrap();
+        let recipients_json: String = message_rows[0].get_named("recipients_json").unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&recipients_json).unwrap();
+        assert_eq!(payload, json!({"to":["GreenCastle"],"cc":[],"bcc":[]}));
+    }
+
+    #[test]
     fn scope_removes_filtered_product_links_and_unreferenced_products() {
         let dir = tempfile::tempdir().unwrap();
         let db = create_test_db(dir.path());
@@ -1135,6 +1338,60 @@ mod tests {
         assert_eq!(remaining_products.len(), 1);
         let kept_product_id: i64 = remaining_products[0].get_named("id").unwrap();
         assert_eq!(kept_product_id, 10);
+    }
+
+    #[test]
+    fn scope_refreshes_derived_export_artifacts_after_finalized_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw(
+            "UPDATE messages \
+             SET attachments = '[{\"type\":\"image\",\"media_type\":\"image/png\",\"path\":\"beta.png\",\"bytes\":42}]' \
+             WHERE id = 3",
+        )
+        .unwrap();
+        drop(conn);
+
+        crate::build_materialized_views(&db, false).unwrap();
+        crate::create_performance_indexes(&db).unwrap();
+
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        let overview_before = conn
+            .query_sync("SELECT id FROM message_overview_mv ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(overview_before.len(), 3);
+        let attachments_before = conn
+            .query_sync(
+                "SELECT message_id FROM attachments_by_message_mv ORDER BY message_id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(attachments_before.len(), 1);
+        let attached_message_id: i64 = attachments_before[0].get_named("message_id").unwrap();
+        assert_eq!(attached_message_id, 3);
+        drop(conn);
+
+        let result = apply_project_scope(&db, &["proj-alpha".to_string()]).unwrap();
+        assert_eq!(result.remaining.messages, 2);
+
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        let overview_after = conn
+            .query_sync("SELECT id FROM message_overview_mv ORDER BY id", &[])
+            .unwrap();
+        let overview_ids: Vec<i64> = overview_after
+            .iter()
+            .map(|row| row.get_named("id").unwrap())
+            .collect();
+        assert_eq!(overview_ids, vec![1, 2]);
+
+        let attachments_after = conn
+            .query_sync(
+                "SELECT message_id FROM attachments_by_message_mv ORDER BY message_id",
+                &[],
+            )
+            .unwrap();
+        assert!(attachments_after.is_empty());
     }
 
     /// Conformance test: scope against the fixture `needs_scrub.sqlite3` and

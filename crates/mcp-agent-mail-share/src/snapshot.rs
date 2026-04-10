@@ -250,6 +250,22 @@ pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
     if let Some(parent) = dest.parent() {
         ensure_real_directory(parent)?;
     }
+    let dest_parent = dest.parent().ok_or_else(|| {
+        ShareError::Io(std::io::Error::other(format!(
+            "snapshot destination has no parent: {}",
+            dest.display()
+        )))
+    })?;
+    let stage_dir = tempfile::Builder::new()
+        .prefix(".snapshot-stage.")
+        .tempdir_in(dest_parent)
+        .map_err(ShareError::Io)?;
+    let staged_dest = stage_dir.path().join(
+        dest.file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("mailbox.sqlite3"),
+    );
 
     if checkpoint {
         mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&source).map_err(|e| {
@@ -266,7 +282,7 @@ pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
 
     // Create destination with FrankenSQLite. Page size must be chosen before
     // page 1 is initialized, so honor any requested destination page_size here.
-    let dest_str = dest.display().to_string();
+    let dest_str = staged_dest.display().to_string();
     let dst_conn = if let Some(page_size) = destination_page_size_bytes(destination_pragmas)? {
         DbConn::open_file_with_page_size(&dest_str, page_size).map_err(|e| ShareError::Sqlite {
             message: format!(
@@ -299,6 +315,7 @@ pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
     transfer_result?;
     src_close_result?;
     dst_close_result?;
+    std::fs::rename(&staged_dest, &dest).map_err(ShareError::Io)?;
 
     Ok(dest)
 }
@@ -352,6 +369,7 @@ fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
 /// Transfer tables from a source snapshot to a fresh destination database.
 fn transfer_tables_frank(src: &DbConn, dst: &DbConn) -> Result<(), ShareError> {
     for table in KNOWN_TABLES {
+        create_dst_table(dst, table)?;
         let source_columns = source_columns_frank(src, table.name)?;
         if source_columns.is_empty() {
             continue;
@@ -360,8 +378,6 @@ fn transfer_tables_frank(src: &DbConn, dst: &DbConn) -> Result<(), ShareError> {
         if available_columns.is_empty() {
             continue;
         }
-
-        create_dst_table(dst, table)?;
         let insert_sql = build_insert(table.name, table.columns);
         let select_columns = quoted_column_list(&available_columns);
         let page_by_column = table
@@ -401,10 +417,13 @@ fn transfer_tables_frank(src: &DbConn, dst: &DbConn) -> Result<(), ShareError> {
                     .columns
                     .iter()
                     .map(|c| {
-                        row.get_by_name(c)
-                            .cloned()
-                            .or_else(|| snapshot_default_value(table.name, c))
-                            .unwrap_or(Value::Null)
+                        normalize_snapshot_value(
+                            c,
+                            row.get_by_name(c)
+                                .cloned()
+                                .or_else(|| snapshot_default_value(table.name, c))
+                                .unwrap_or(Value::Null),
+                        )
                     })
                     .collect();
                 if let Some(page_by_column) = page_by_column {
@@ -534,6 +553,21 @@ fn snapshot_default_value(table: &str, column: &str) -> Option<Value> {
         ("messages", "recipients_json") => Some(Value::Text("{}".to_string())),
         _ => None,
     }
+}
+
+fn normalize_snapshot_value(column: &str, value: Value) -> Value {
+    if !snapshot_column_prefers_text(column) {
+        return value;
+    }
+    match value {
+        Value::Int(v) => Value::Text(v.to_string()),
+        Value::BigInt(v) => Value::Text(v.to_string()),
+        other => other,
+    }
+}
+
+fn snapshot_column_prefers_text(column: &str) -> bool {
+    column.ends_with("_ts") || column.ends_with("_at")
 }
 
 /// Full snapshot preparation pipeline.
@@ -997,6 +1031,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn snapshot_failure_does_not_leave_partial_destination_or_block_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_source = dir.path().join("bad.sqlite3");
+        let good_source = dir.path().join("good.sqlite3");
+        let dest = dir.path().join("snapshot.sqlite3");
+
+        let conn = DbConn::open_file(bad_source.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE messages (\
+                id TEXT PRIMARY KEY, \
+                project_id INTEGER, \
+                sender_id INTEGER, \
+                thread_id TEXT, \
+                subject TEXT DEFAULT '', \
+                body_md TEXT DEFAULT '', \
+                importance TEXT DEFAULT 'normal', \
+                ack_required INTEGER DEFAULT 0, \
+                created_ts INTEGER DEFAULT 0, \
+                recipients_json TEXT NOT NULL DEFAULT '{}', \
+                attachments TEXT DEFAULT '[]'\
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO messages VALUES ('oops', 7, 11, 'br-bad', 'subject', 'body', 'normal', 0, 12345, '{}', '[]')",
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = create_sqlite_snapshot(&bad_source, &dest, false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unexpected non-integer pagination column messages.id"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !dest.exists(),
+            "failed snapshot attempts must not leave partial destination files behind"
+        );
+
+        let conn = DbConn::open_file(good_source.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+        )
+        .unwrap();
+        conn.execute_raw("INSERT INTO projects VALUES (1, 'retry', '/retry', 0)")
+            .unwrap();
+        drop(conn);
+
+        create_sqlite_snapshot(&good_source, &dest, false)
+            .expect("retry should succeed because the failed attempt left no destination behind");
+
+        let copy_conn = SqliteConnection::open_file(dest.display().to_string()).unwrap();
+        let rows = copy_conn
+            .query_sync("SELECT slug FROM projects WHERE id = 1", &[])
+            .unwrap();
+        let slug: String = rows[0].get_named("slug").unwrap();
+        assert_eq!(slug, "retry");
+    }
+
     /// Full pipeline integration: snapshot → scope/scrub/finalize →
     /// canonical bundle export → sign → verify
     #[test]
@@ -1127,6 +1222,106 @@ mod tests {
         let verify = verify_bundle(&output, None).unwrap();
         assert!(verify.signature_checked);
         assert!(verify.signature_verified);
+    }
+
+    #[test]
+    fn create_snapshot_context_normalizes_integer_timestamps_for_share_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("integer-ts.sqlite3");
+        let snapshot = dir.path().join("snapshot.sqlite3");
+
+        let conn = DbConn::open_file(source.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER DEFAULT 0)",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE agents (id INTEGER PRIMARY KEY, project_id INTEGER, name TEXT, \
+             program TEXT DEFAULT '', model TEXT DEFAULT '', task_description TEXT DEFAULT '', \
+             inception_ts INTEGER DEFAULT 0, last_active_ts INTEGER DEFAULT 0, \
+             attachments_policy TEXT DEFAULT 'auto', contact_policy TEXT DEFAULT 'auto')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, \
+             thread_id TEXT, subject TEXT DEFAULT '', body_md TEXT DEFAULT '', \
+             importance TEXT DEFAULT 'normal', ack_required INTEGER DEFAULT 0, \
+             created_ts INTEGER DEFAULT 0, attachments TEXT DEFAULT '[]')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, \
+             kind TEXT DEFAULT 'to', read_ts INTEGER, ack_ts INTEGER, PRIMARY KEY(message_id, agent_id))",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO projects VALUES (1, 'myproj', '/test/proj', 1707000000000000)",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO agents VALUES (1, 1, 'Alice', 'claude-code', 'opus', 'testing', \
+             1707000000000000, 1707000001000000, 'auto', 'auto')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO messages VALUES (1, 1, 1, 'T1', 'Hello', 'Body', 'normal', 0, \
+             1707000002000000, '[]')",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO message_recipients VALUES (1, 1, 'to', 1707000003000000, NULL)",
+        )
+        .unwrap();
+        drop(conn);
+
+        let context =
+            create_snapshot_context(&source, &snapshot, &[], crate::ScrubPreset::Standard).unwrap();
+        assert!(context.snapshot_path.exists());
+
+        let copy_conn = SqliteConnection::open_file(snapshot.display().to_string()).unwrap();
+        let rows = copy_conn
+            .query_sync("SELECT created_at FROM projects WHERE id = 1", &[])
+            .unwrap();
+        let created_at: String = rows[0].get_named("created_at").unwrap();
+        assert_eq!(created_at, "1707000000000000");
+
+        let rows = copy_conn
+            .query_sync(
+                "SELECT inception_ts, last_active_ts FROM agents WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        let inception_ts: String = rows[0].get_named("inception_ts").unwrap();
+        let last_active_ts: String = rows[0].get_named("last_active_ts").unwrap();
+        assert_eq!(inception_ts, "1707000000000000");
+        assert_eq!(last_active_ts, "1707000001000000");
+
+        let rows = copy_conn
+            .query_sync("SELECT created_ts FROM messages WHERE id = 1", &[])
+            .unwrap();
+        let created_ts: String = rows[0].get_named("created_ts").unwrap();
+        assert_eq!(created_ts, "1707000002000000");
+
+        let rows = copy_conn
+            .query_sync(
+                "SELECT read_ts FROM message_recipients WHERE message_id = 1 AND agent_id = 1",
+                &[],
+            )
+            .unwrap();
+        let read_ts: Option<String> = rows[0].get_named("read_ts").unwrap();
+        assert_eq!(read_ts, None);
+
+        let rows = copy_conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM file_reservations", &[])
+            .unwrap();
+        let file_reservation_count: i64 = rows[0].get_named("cnt").unwrap();
+        assert_eq!(file_reservation_count, 0);
+
+        let rows = copy_conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM agent_links", &[])
+            .unwrap();
+        let agent_link_count: i64 = rows[0].get_named("cnt").unwrap();
+        assert_eq!(agent_link_count, 0);
     }
 
     #[test]

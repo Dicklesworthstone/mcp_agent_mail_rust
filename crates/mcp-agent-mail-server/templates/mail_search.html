@@ -17,7 +17,7 @@
 {% endblock %}
 
 {% block content %}
-<div class="space-y-6 animate-fade-in" x-data='{ scope: {{ scope|tojson }}, order: {{ order|tojson }}, showHelp: false, showFilters: {% if agent or thread or ack != "any" or direction or from_date or to_date or importance|length > 0 %}true{% else %}false{% endif %} }'>
+<div class="space-y-6 animate-fade-in" x-data='{ field: {{ field_scope|tojson }}, order: {{ order|tojson }}, showHelp: false, showFilters: {% if agent or thread or ack != "any" or direction or from_date or to_date or importance|length > 0 %}true{% else %}false{% endif %} }'>
   <!-- Search Header -->
   <div class="bg-white dark:bg-slate-800 rounded-xl p-8 shadow-soft border border-slate-200 dark:border-slate-700">
     <div class="flex items-center justify-between mb-6">
@@ -100,7 +100,7 @@
           aria-label="Search messages"
           autofocus
         />
-        <input type="hidden" name="scope" x-model="scope" />
+        <input type="hidden" id="mail-search-field" name="field" x-model="field" />
         <input type="hidden" name="order" x-model="order" />
         {% if static_export %}
         <input type="hidden" name="__static_export" value="1" />
@@ -113,14 +113,14 @@
         <div class="flex items-center gap-3">
           <span class="text-sm font-medium text-slate-700 dark:text-slate-300">Search in:</span>
           <div class="flex items-center gap-1">
-            <button type="button" @click="scope = ''"
-              :class="scope === '' ? 'bg-primary-600 text-white ring-2 ring-primary-500' : 'bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600'"
+            <button type="button" data-search-quick-control @click="field = ''"
+              :class="field === '' ? 'bg-primary-600 text-white ring-2 ring-primary-500' : 'bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600'"
               class="px-3 py-1.5 rounded-lg text-sm font-medium transition-all duration-200">Both</button>
-            <button type="button" @click="scope = 'subject'"
-              :class="scope === 'subject' ? 'bg-primary-600 text-white ring-2 ring-primary-500' : 'bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600'"
+            <button type="button" data-search-quick-control @click="field = 'subject'"
+              :class="field === 'subject' ? 'bg-primary-600 text-white ring-2 ring-primary-500' : 'bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600'"
               class="px-3 py-1.5 rounded-lg text-sm font-medium transition-all duration-200">Subject</button>
-            <button type="button" @click="scope = 'body'"
-              :class="scope === 'body' ? 'bg-primary-600 text-white ring-2 ring-primary-500' : 'bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600'"
+            <button type="button" data-search-quick-control @click="field = 'body'"
+              :class="field === 'body' ? 'bg-primary-600 text-white ring-2 ring-primary-500' : 'bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600'"
               class="px-3 py-1.5 rounded-lg text-sm font-medium transition-all duration-200">Body</button>
           </div>
         </div>
@@ -129,22 +129,24 @@
         <div class="flex items-center gap-3">
           <span class="text-sm font-medium text-slate-700 dark:text-slate-300">Order:</span>
           <div class="flex items-center gap-1">
-            <button type="button" @click="order = 'relevance'"
+            <button type="button" data-search-quick-control @click="order = 'relevance'"
               :class="order === 'relevance' ? 'bg-primary-600 text-white ring-2 ring-primary-500' : 'bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600'"
               class="px-3 py-1.5 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-1">
               <i data-lucide="star" class="w-3.5 h-3.5"></i> Relevance</button>
-            <button type="button" @click="order = 'time'"
+            <button type="button" data-search-quick-control @click="order = 'time'"
               :class="order === 'time' ? 'bg-primary-600 text-white ring-2 ring-primary-500' : 'bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600'"
               class="px-3 py-1.5 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-1">
               <i data-lucide="clock" class="w-3.5 h-3.5"></i> Time</button>
           </div>
         </div>
 
+        {% if static_export %}
         <!-- Boost -->
         <div class="flex items-center gap-2">
           <input type="checkbox" id="boostSubject" name="boost" value="1" class="h-4 w-4 text-primary-600 border-slate-300 rounded" {% if boost %}checked{% endif %}>
           <label for="boostSubject" class="text-sm text-slate-700 dark:text-slate-300">Boost subject</label>
         </div>
+        {% endif %}
 
         <button type="submit"
           class="ml-auto px-6 py-3 bg-primary-600 hover:bg-primary-700 text-white font-semibold rounded-lg shadow-medium hover:shadow-large transition-all duration-300 flex items-center gap-2 btn-ripple">
@@ -395,7 +397,7 @@
           {% endif %}
         </div>
 
-      {% elif q %}
+      {% elif search_active %}
         <!-- No Results -->
         <div class="bg-white dark:bg-slate-800 rounded-xl p-16 shadow-soft border border-slate-200 dark:border-slate-700 text-center">
           <div class="w-24 h-24 bg-slate-100 dark:bg-slate-700 rounded-full flex items-center justify-center mx-auto mb-6">
@@ -403,7 +405,7 @@
           </div>
           <h3 class="text-2xl font-semibold text-slate-900 dark:text-white mb-3">No results found</h3>
           <p class="text-slate-600 dark:text-slate-400 mb-6 max-w-md mx-auto">
-            No messages match your search query. Try different keywords, adjust filters, or check the query help.
+            No messages match your search. Try different keywords, adjust filters, or check the query help.
           </p>
           <a href="/mail/{{ project.slug }}/search"
              class="inline-flex px-6 py-3 bg-primary-600 hover:bg-primary-700 text-white font-medium rounded-lg shadow-medium hover:shadow-large transition-all duration-300 items-center gap-2 btn-ripple">
@@ -464,8 +466,13 @@
         }, 600);
       });
 
-      document.querySelectorAll('select[name="agent"], input[name="direction"], input[name="ack"]').forEach(el => {
+      document.querySelectorAll('select[name="agent"], input[name="direction"], input[name="ack"], input[name="imp"], input[name="boost"], input[name="from_date"], input[name="to_date"], input[name="thread"]').forEach(el => {
         el.addEventListener('change', () => form.submit());
+      });
+      document.querySelectorAll('[data-search-quick-control]').forEach(el => {
+        el.addEventListener('click', () => {
+          window.setTimeout(() => form.submit(), 0);
+        });
       });
       return;
     }
@@ -519,13 +526,47 @@
       return `${Math.floor(seconds / 86400)}d ago`;
     }
 
+    function normalizeSearchField(value) {
+      switch ((value || '').trim().toLowerCase()) {
+        case 'subject':
+          return 'subject';
+        case 'body':
+          return 'body';
+        case 'both':
+        case '':
+          return '';
+        default:
+          return '';
+      }
+    }
+
+    function parseSearchField(params) {
+      return normalizeSearchField(params.get('field') || params.get('scope') || '');
+    }
+
+    function normalizeSearchOrder(value) {
+      switch ((value || '').trim().toLowerCase()) {
+        case 'time':
+        case 'newest':
+        case 'oldest':
+          return 'time';
+        case 'relevance':
+        default:
+          return 'relevance';
+      }
+    }
+
+    function parseSearchOrder(params) {
+      return normalizeSearchOrder(params.get('order') || params.get('sort') || 'relevance');
+    }
+
     function dispatchReactiveUpdate(field) {
       field.dispatchEvent(new Event('input', { bubbles: true }));
       field.dispatchEvent(new Event('change', { bubbles: true }));
     }
 
     function syncReactiveStateFromDom() {
-      form.querySelectorAll('input[type="hidden"][name="scope"], input[type="hidden"][name="order"]').forEach(field => {
+      form.querySelectorAll('input[type="hidden"][name="field"], input[type="hidden"][name="order"]').forEach(field => {
         dispatchReactiveUpdate(field);
       });
     }
@@ -542,11 +583,21 @@
             }
           } else {
             field.value = value;
-            if (name === 'scope' || name === 'order') {
+            if (name === 'field' || name === 'order') {
               dispatchReactiveUpdate(field);
             }
           }
         });
+      }
+      const fieldInput = form.querySelector('input[type="hidden"][name="field"]');
+      if (fieldInput) {
+        fieldInput.value = parseSearchField(params);
+        dispatchReactiveUpdate(fieldInput);
+      }
+      const orderInput = form.querySelector('input[type="hidden"][name="order"]');
+      if (orderInput) {
+        orderInput.value = parseSearchOrder(params);
+        dispatchReactiveUpdate(orderInput);
       }
       syncReactiveStateFromDom();
     }
@@ -587,14 +638,20 @@
       }
 
       const terms = parseTerms(params.get('q') || '');
-      const scope = params.get('scope') || '';
-      const importance = new Set(params.getAll('imp'));
+      const field = parseSearchField(params);
+      const importance = new Set(
+        params
+          .getAll('imp')
+          .flatMap(value => `${value}`.split(','))
+          .map(value => value.trim())
+          .filter(Boolean)
+      );
       const agent = (params.get('agent') || '').trim();
       const thread = (params.get('thread') || '').trim();
       const fromDate = params.get('from_date');
       const toDate = params.get('to_date');
       const boost = params.get('boost') === '1';
-      const order = params.get('order') || 'relevance';
+      const order = parseSearchOrder(params);
 
       const filtered = entries
         .filter(entry => entry.project === projectSlug)
@@ -618,9 +675,9 @@
 
           const subject = entry.subject || '';
           const body = entry.body_text || entry.body_excerpt || '';
-          const haystack = scope === 'subject'
+          const haystack = field === 'subject'
             ? subject
-            : scope === 'body'
+            : field === 'body'
               ? body
               : `${subject}\n${body}\n${entry.from_agent || ''}\n${entry.thread_id || ''}`;
 
@@ -759,6 +816,14 @@
     document.querySelectorAll('select[name="agent"], input[name="direction"], input[name="ack"], input[name="imp"], input[name="boost"], input[name="from_date"], input[name="to_date"], input[name="thread"]').forEach(el => {
       el.addEventListener('change', () => {
         void runStaticSearch();
+      });
+    });
+
+    document.querySelectorAll('[data-search-quick-control]').forEach(el => {
+      el.addEventListener('click', () => {
+        window.setTimeout(() => {
+          void runStaticSearch();
+        }, 0);
       });
     });
 

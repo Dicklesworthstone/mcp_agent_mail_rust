@@ -91,7 +91,8 @@ struct ScrubConfig {
     drop_attachments: bool,
     scrub_secrets: bool,
     clear_ack_state: bool,
-    clear_recipients: bool,
+    clear_recipient_state: bool,
+    drop_recipient_metadata: bool,
     clear_file_reservations: bool,
     clear_agent_links: bool,
 }
@@ -104,7 +105,8 @@ fn preset_config(preset: ScrubPreset) -> ScrubConfig {
             drop_attachments: false,
             scrub_secrets: true,
             clear_ack_state: true,
-            clear_recipients: true,
+            clear_recipient_state: true,
+            drop_recipient_metadata: false,
             clear_file_reservations: true,
             clear_agent_links: true,
         },
@@ -114,7 +116,8 @@ fn preset_config(preset: ScrubPreset) -> ScrubConfig {
             drop_attachments: true,
             scrub_secrets: true,
             clear_ack_state: true,
-            clear_recipients: true,
+            clear_recipient_state: false,
+            drop_recipient_metadata: true,
             clear_file_reservations: true,
             clear_agent_links: true,
         },
@@ -124,7 +127,8 @@ fn preset_config(preset: ScrubPreset) -> ScrubConfig {
             drop_attachments: false,
             scrub_secrets: false,
             clear_ack_state: false,
-            clear_recipients: false,
+            clear_recipient_state: false,
+            drop_recipient_metadata: false,
             clear_file_reservations: false,
             clear_agent_links: false,
         },
@@ -148,6 +152,23 @@ pub struct ScrubSummary {
     pub attachments_cleared: i64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DerivedExportArtifacts {
+    has_search_index: bool,
+    has_materialized_views: bool,
+    has_fts_overview: bool,
+    has_shadow_columns: bool,
+}
+
+impl DerivedExportArtifacts {
+    pub(crate) const fn any(self) -> bool {
+        self.has_search_index
+            || self.has_materialized_views
+            || self.has_fts_overview
+            || self.has_shadow_columns
+    }
+}
+
 /// Apply scrub operations to a snapshot database according to the given preset.
 ///
 /// Operates in-place on the provided snapshot file.
@@ -165,6 +186,7 @@ pub fn scrub_snapshot(
     let conn = Conn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
         message: format!("cannot open snapshot {path_str}: {e}"),
     })?;
+    let derived_artifacts = detect_derived_export_artifacts(&conn)?;
 
     conn.execute_raw("PRAGMA foreign_keys = ON")
         .map_err(|e| ShareError::Sqlite {
@@ -187,8 +209,26 @@ pub fn scrub_snapshot(
             0
         };
 
-        // Clear recipient timestamps
-        let recipients_cleared = if cfg.clear_recipients {
+        // Standard exports preserve recipient identities but clear per-recipient
+        // read/ack state. Strict exports must remove recipient metadata entirely
+        // from the bundled database, not merely hide it in rendered HTML.
+        let recipients_cleared = if cfg.drop_recipient_metadata {
+            let removed = exec_count(&conn, "DELETE FROM message_recipients", &[])?;
+            if column_exists(&conn, "messages", "recipients_json")? {
+                exec_count(
+                    &conn,
+                    "UPDATE messages SET recipients_json = ?",
+                    &[SqlValue::Text(empty_recipients_json())],
+                )?;
+            }
+            if table_exists(&conn, "inbox_stats")? {
+                // These aggregates are computed from recipient rows, so keeping
+                // them after strict recipient scrubbing would leak recipient
+                // activity despite the row-level metadata being removed.
+                exec_count(&conn, "DELETE FROM inbox_stats", &[])?;
+            }
+            removed
+        } else if cfg.clear_recipient_state {
             exec_count(
                 &conn,
                 "UPDATE message_recipients SET read_ts = NULL, ack_ts = NULL",
@@ -371,6 +411,9 @@ pub fn scrub_snapshot(
             conn.execute_raw("COMMIT").map_err(|e| ShareError::Sqlite {
                 message: format!("COMMIT failed: {e}"),
             })?;
+            if scrub_mutates_export_artifacts(&cfg) && derived_artifacts.any() {
+                refresh_derived_export_artifacts(&snapshot_path, derived_artifacts)?;
+            }
             Ok(summary)
         }
         Err(err) => {
@@ -512,6 +555,93 @@ fn table_exists(conn: &Conn, name: &str) -> Result<bool, ShareError> {
         Ok(_) => Ok(true),
         Err(_) => Ok(false),
     }
+}
+
+fn column_exists(conn: &Conn, table: &str, column: &str) -> Result<bool, ShareError> {
+    let probe = format!("SELECT \"{column}\" FROM \"{table}\" LIMIT 0");
+    match conn.query_sync(&probe, &[]) {
+        Ok(_) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
+pub(crate) fn detect_derived_export_artifacts(
+    conn: &Conn,
+) -> Result<DerivedExportArtifacts, ShareError> {
+    Ok(DerivedExportArtifacts {
+        has_search_index: table_exists(conn, "fts_messages")?,
+        has_materialized_views: table_exists(conn, "message_overview_mv")?
+            || table_exists(conn, "attachments_by_message_mv")?,
+        has_fts_overview: table_exists(conn, "fts_search_overview_mv")?,
+        has_shadow_columns: column_exists(conn, "messages", "subject_lower")?
+            || column_exists(conn, "messages", "sender_lower")?,
+    })
+}
+
+const fn scrub_mutates_export_artifacts(cfg: &ScrubConfig) -> bool {
+    cfg.redact_body
+        || cfg.drop_attachments
+        || cfg.scrub_secrets
+        || cfg.clear_ack_state
+        || cfg.clear_recipient_state
+        || cfg.drop_recipient_metadata
+}
+
+pub(crate) fn refresh_derived_export_artifacts(
+    snapshot_path: &Path,
+    artifacts: DerivedExportArtifacts,
+) -> Result<(), ShareError> {
+    let path_str = snapshot_path.display().to_string();
+    let conn = Conn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
+        message: format!("cannot reopen snapshot {path_str} for artifact refresh: {e}"),
+    })?;
+
+    if artifacts.has_materialized_views {
+        conn.execute_raw("DROP TABLE IF EXISTS message_overview_mv")
+            .map_err(|e| ShareError::Sqlite {
+                message: format!("drop stale message_overview_mv failed: {e}"),
+            })?;
+        conn.execute_raw("DROP TABLE IF EXISTS attachments_by_message_mv")
+            .map_err(|e| ShareError::Sqlite {
+                message: format!("drop stale attachments_by_message_mv failed: {e}"),
+            })?;
+    }
+    if artifacts.has_fts_overview {
+        conn.execute_raw("DROP TABLE IF EXISTS fts_search_overview_mv")
+            .map_err(|e| ShareError::Sqlite {
+                message: format!("drop stale fts_search_overview_mv failed: {e}"),
+            })?;
+    }
+    if artifacts.has_search_index {
+        conn.execute_raw("DROP TABLE IF EXISTS fts_messages")
+            .map_err(|e| ShareError::Sqlite {
+                message: format!("drop stale fts_messages failed: {e}"),
+            })?;
+    }
+
+    let fts_enabled = if artifacts.has_search_index || artifacts.has_fts_overview {
+        crate::build_search_indexes(snapshot_path)?
+    } else {
+        false
+    };
+
+    if artifacts.has_materialized_views || artifacts.has_fts_overview {
+        crate::build_materialized_views(snapshot_path, fts_enabled)?;
+    }
+    if artifacts.has_shadow_columns {
+        crate::create_performance_indexes(snapshot_path)?;
+    }
+
+    Ok(())
+}
+
+fn empty_recipients_json() -> String {
+    serde_json::json!({
+        "to": Vec::<String>::new(),
+        "cc": Vec::<String>::new(),
+        "bcc": Vec::<String>::new(),
+    })
+    .to_string()
 }
 
 #[cfg(test)]
@@ -723,11 +853,11 @@ mod tests {
         scrub_snapshot(&strict_db, ScrubPreset::Strict).unwrap();
         scrub_snapshot(&archive_db, ScrubPreset::Archive).unwrap();
 
-        fn fetch_message_state(db_path: &std::path::Path) -> (i64, String, String) {
+        fn fetch_message_state(db_path: &std::path::Path) -> (i64, String, String, String) {
             let conn = Conn::open_file(db_path.display().to_string()).unwrap();
             let rows = conn
                 .query_sync(
-                    "SELECT ack_required, body_md, attachments FROM messages WHERE id = 1",
+                    "SELECT ack_required, body_md, attachments, recipients_json FROM messages WHERE id = 1",
                     &[],
                 )
                 .unwrap();
@@ -735,10 +865,20 @@ mod tests {
             let ack_required: i64 = row.get_named("ack_required").unwrap_or(0);
             let body_md: String = row.get_named("body_md").unwrap_or_default();
             let attachments: String = row.get_named("attachments").unwrap_or_default();
-            (ack_required, body_md, attachments)
+            let recipients_json: String = row.get_named("recipients_json").unwrap_or_default();
+            (ack_required, body_md, attachments, recipients_json)
         }
 
-        let (std_ack, std_body, std_attachments) = fetch_message_state(&standard_db);
+        fn recipient_row_count(db_path: &std::path::Path) -> i64 {
+            let conn = Conn::open_file(db_path.display().to_string()).unwrap();
+            let rows = conn
+                .query_sync("SELECT COUNT(*) AS cnt FROM message_recipients", &[])
+                .unwrap();
+            rows[0].get_named("cnt").unwrap_or(0)
+        }
+
+        let (std_ack, std_body, std_attachments, std_recipients_json) =
+            fetch_message_state(&standard_db);
         assert_eq!(std_ack, 0);
         assert_eq!(std_body, "body has [REDACTED]");
         let std_attachment_json: Value = serde_json::from_str(&std_attachments).unwrap();
@@ -751,17 +891,165 @@ mod tests {
             std_obj.get("path").and_then(Value::as_str),
             Some("data.json")
         );
+        assert_eq!(recipient_row_count(&standard_db), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&std_recipients_json).unwrap(),
+            serde_json::json!({"to":["TestAgent"],"cc":[],"bcc":[]})
+        );
 
-        let (strict_ack, strict_body, strict_attachments) = fetch_message_state(&strict_db);
+        let (strict_ack, strict_body, strict_attachments, strict_recipients_json) =
+            fetch_message_state(&strict_db);
         assert_eq!(strict_ack, 0);
         assert_eq!(strict_body, "[Message body redacted]");
         assert_eq!(strict_attachments, "[]");
+        assert_eq!(recipient_row_count(&strict_db), 0);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&strict_recipients_json).unwrap(),
+            serde_json::json!({"to":[],"cc":[],"bcc":[]})
+        );
 
-        let (archive_ack, archive_body, archive_attachments) = fetch_message_state(&archive_db);
+        let (archive_ack, archive_body, archive_attachments, archive_recipients_json) =
+            fetch_message_state(&archive_db);
         assert_eq!(archive_ack, 1);
         assert_eq!(archive_body, "body has sk-abcdef0123456789012345");
         assert!(archive_attachments.contains("download_url"));
         assert!(archive_attachments.contains("authorization"));
+        assert_eq!(recipient_row_count(&archive_db), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&archive_recipients_json).unwrap(),
+            serde_json::json!({"to":["TestAgent"],"cc":[],"bcc":[]})
+        );
+    }
+
+    #[test]
+    fn strict_scrub_removes_recipient_metadata_from_finalized_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_fixture_db(dir.path());
+
+        scrub_snapshot(&db, ScrubPreset::Strict).unwrap();
+        crate::build_materialized_views(&db, false).unwrap();
+
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT recipients FROM message_overview_mv WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        let recipients: String = rows[0].get_named("recipients").unwrap();
+        assert!(
+            recipients.is_empty(),
+            "strict export must not leak recipients"
+        );
+    }
+
+    #[test]
+    fn strict_scrub_removes_recipient_derived_inbox_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_fixture_db(dir.path());
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE inbox_stats (
+                agent_id INTEGER PRIMARY KEY,
+                total_count INTEGER NOT NULL DEFAULT 0,
+                unread_count INTEGER NOT NULL DEFAULT 0,
+                ack_pending_count INTEGER NOT NULL DEFAULT 0,
+                last_message_ts INTEGER
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "INSERT INTO inbox_stats (agent_id, total_count, unread_count, ack_pending_count, last_message_ts)
+             VALUES (1, 4, 2, 1, 12345)",
+        )
+        .unwrap();
+
+        scrub_snapshot(&db, ScrubPreset::Strict).unwrap();
+
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM inbox_stats", &[])
+            .unwrap();
+        let remaining: i64 = rows[0].get_named("cnt").unwrap_or(0);
+        assert_eq!(
+            remaining, 0,
+            "strict export must not leak recipient-derived inbox aggregates"
+        );
+    }
+
+    #[test]
+    fn standard_scrub_refreshes_existing_export_shadow_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_fixture_db(dir.path());
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_sync(
+            "UPDATE messages SET subject = ?, body_md = ?, attachments = ? WHERE id = 1",
+            &[
+                SqlValue::Text("subject sk-abcdef0123456789012345".to_string()),
+                SqlValue::Text("body has sk-abcdef0123456789012345".to_string()),
+                SqlValue::Text(
+                    r#"[{"type":"file","download_url":"https://secret.example.com","path":"data.json"}]"#
+                        .to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        crate::build_materialized_views(&db, false).unwrap();
+        crate::create_performance_indexes(&db).unwrap();
+
+        scrub_snapshot(&db, ScrubPreset::Standard).unwrap();
+
+        let message_rows = conn
+            .query_sync(
+                "SELECT latest_snippet FROM message_overview_mv WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        let latest_snippet: String = message_rows[0].get_named("latest_snippet").unwrap();
+        assert_eq!(latest_snippet, "body has [REDACTED]");
+
+        let lower_rows = conn
+            .query_sync("SELECT subject_lower FROM messages WHERE id = 1", &[])
+            .unwrap();
+        let subject_lower: String = lower_rows[0].get_named("subject_lower").unwrap();
+        assert_eq!(subject_lower, "subject [redacted]");
+    }
+
+    #[test]
+    fn strict_scrub_refreshes_existing_finalized_views_without_manual_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_fixture_db(dir.path());
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_sync(
+            "UPDATE messages SET attachments = ? WHERE id = 1",
+            &[SqlValue::Text(
+                r#"[{"type":"file","path":"data.json","bytes":42}]"#.to_string(),
+            )],
+        )
+        .unwrap();
+
+        crate::build_materialized_views(&db, false).unwrap();
+        scrub_snapshot(&db, ScrubPreset::Strict).unwrap();
+
+        let overview_rows = conn
+            .query_sync(
+                "SELECT recipients, attachment_count FROM message_overview_mv WHERE id = 1",
+                &[],
+            )
+            .unwrap();
+        let recipients: String = overview_rows[0].get_named("recipients").unwrap();
+        let attachment_count: i64 = overview_rows[0].get_named("attachment_count").unwrap();
+        assert!(recipients.is_empty());
+        assert_eq!(attachment_count, 0);
+
+        let attachment_rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM attachments_by_message_mv WHERE message_id = 1",
+                &[],
+            )
+            .unwrap();
+        let remaining: i64 = attachment_rows[0].get_named("cnt").unwrap_or(0);
+        assert_eq!(remaining, 0);
     }
 
     /// Conformance test against the Python fixture for all 3 presets.
@@ -886,7 +1174,7 @@ mod tests {
         )
         .unwrap();
         conn.execute_raw(
-            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, thread_id TEXT, subject TEXT DEFAULT '', body_md TEXT DEFAULT '', importance TEXT DEFAULT 'normal', ack_required INTEGER DEFAULT 0, created_ts TEXT DEFAULT '', attachments TEXT DEFAULT '[]')",
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, project_id INTEGER, sender_id INTEGER, thread_id TEXT, subject TEXT DEFAULT '', body_md TEXT DEFAULT '', importance TEXT DEFAULT 'normal', ack_required INTEGER DEFAULT 0, created_ts TEXT DEFAULT '', recipients_json TEXT NOT NULL DEFAULT '{}', attachments TEXT DEFAULT '[]')",
         )
         .unwrap();
         conn.execute_raw(
@@ -907,8 +1195,11 @@ mod tests {
             "INSERT INTO agents VALUES (1, 1, 'TestAgent', '', '', '', '', '', 'auto', 'auto')",
         )
         .unwrap();
-        conn.execute_raw("INSERT INTO messages VALUES (1, 1, 1, NULL, 'Hi', 'Hello world', 'normal', 0, '', '[]')")
-            .unwrap();
+        conn.execute_raw(
+            "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
+             VALUES (1, 1, 1, NULL, 'Hi', 'Hello world', 'normal', 0, '', '{\"to\":[\"TestAgent\"],\"cc\":[],\"bcc\":[]}', '[]')",
+        )
+        .unwrap();
         conn.execute_raw("INSERT INTO message_recipients VALUES (1, 1, 'to', NULL, NULL)")
             .unwrap();
         db_path

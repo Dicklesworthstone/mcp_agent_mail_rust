@@ -90,6 +90,7 @@ fn templates_render_mail_index() {
 struct ProjectCtx {
     project: ProjectView,
     agents: Vec<AgentView>,
+    static_export: bool,
 }
 
 #[derive(Serialize)]
@@ -127,11 +128,44 @@ fn templates_render_mail_project() {
             task_description: "Working on tests".to_string(),
             last_active: "2026-02-06T12:00:00Z".to_string(),
         }],
+        static_export: false,
     };
     let out =
         templates::render_template("mail_project.html", ctx).expect("render mail_project.html");
     assert!(out.contains("GreenLake"), "should contain agent name");
     assert!(out.contains("my-proj"), "should contain project slug");
+    assert!(
+        !out.contains("Prioritize subject matches in rankings"),
+        "live project page should not advertise static-only subject boost"
+    );
+    assert!(
+        !out.contains("__static_export"),
+        "live project page should not submit static-export markers"
+    );
+}
+
+#[test]
+fn templates_render_mail_project_static_export_search_controls() {
+    let ctx = ProjectCtx {
+        project: ProjectView {
+            id: 1,
+            slug: "my-proj".to_string(),
+            human_key: "/data/my-proj".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        },
+        agents: vec![],
+        static_export: true,
+    };
+    let out = templates::render_template("mail_project.html", ctx)
+        .expect("render static export mail_project.html");
+    assert!(
+        out.contains("Prioritize subject matches in rankings"),
+        "static export project page should expose subject boost"
+    );
+    assert!(
+        out.contains("name=\"__static_export\" value=\"1\""),
+        "static export project page should preserve the static search marker"
+    );
 }
 
 #[derive(Serialize)]
@@ -185,11 +219,12 @@ fn templates_render_mail_thread() {
 struct SearchCtx {
     project: ProjectView,
     q: String,
+    search_active: bool,
     results: Vec<SearchResult>,
     static_export: bool,
     static_search_index_path: String,
     order: String,
-    scope: String,
+    field_scope: String,
     boost: bool,
     importance: Vec<String>,
     agent: String,
@@ -199,6 +234,7 @@ struct SearchCtx {
     from_date: String,
     to_date: String,
     next_cursor: String,
+    next_page_url: String,
     cursor: String,
     result_count: usize,
     agents: Vec<AgentView>,
@@ -217,6 +253,7 @@ struct SearchResult {
     created_relative: String,
     importance: String,
     thread_id: String,
+    thread_url: String,
     ack_required: bool,
     score: String,
 }
@@ -240,12 +277,13 @@ fn sample_search_ctx(q: &str, results: Vec<SearchResult>, static_export: bool) -
             created_at: "2026-01-01T00:00:00Z".to_string(),
         },
         q: q.to_string(),
+        search_active: !q.is_empty(),
         result_count: results.len(),
         results,
         static_export,
         static_search_index_path: "../../../search-index.json".to_string(),
         order: "relevance".to_string(),
-        scope: String::new(),
+        field_scope: String::new(),
         boost: false,
         importance: Vec::new(),
         agent: String::new(),
@@ -255,6 +293,7 @@ fn sample_search_ctx(q: &str, results: Vec<SearchResult>, static_export: bool) -
         from_date: String::new(),
         to_date: String::new(),
         next_cursor: String::new(),
+        next_page_url: String::new(),
         cursor: String::new(),
         agents: Vec::new(),
         recipes: Vec::new(),
@@ -275,6 +314,7 @@ fn templates_render_mail_search() {
             created_relative: "2d ago".to_string(),
             importance: "high".to_string(),
             thread_id: "br-456".to_string(),
+            thread_url: "/mail/proj/thread/br-456".to_string(),
             ack_required: false,
             score: "1.00".to_string(),
         }],
@@ -284,6 +324,10 @@ fn templates_render_mail_search() {
     assert!(
         out.contains("auth") || out.contains("Auth"),
         "should contain search query"
+    );
+    assert!(
+        !out.contains("Boost subject"),
+        "live search should not advertise static-only boost control"
     );
 }
 
@@ -299,6 +343,10 @@ fn templates_render_mail_search_static_export() {
     assert!(
         out.contains("search-index.json"),
         "should reference offline search index"
+    );
+    assert!(
+        out.contains("Boost subject"),
+        "static export should expose subject boost control"
     );
 }
 
@@ -737,6 +785,7 @@ fn templates_render_project_no_agents() {
             created_at: "2026-01-01T00:00:00Z".to_string(),
         },
         agents: vec![],
+        static_export: false,
     };
     let out = templates::render_template("mail_project.html", ctx).expect("render empty project");
     assert!(out.contains("empty-proj"), "slug present");
@@ -853,6 +902,36 @@ fn templates_render_search_empty_results() {
     assert!(
         out.contains("nonexistent"),
         "query term present even with no results"
+    );
+    assert!(
+        out.contains("No results found"),
+        "empty state should render"
+    );
+}
+
+#[test]
+fn templates_render_search_filter_only_empty_results() {
+    let mut ctx = sample_search_ctx("", Vec::new(), false);
+    ctx.search_active = true;
+    ctx.importance = vec!["urgent".to_string()];
+    let out =
+        templates::render_template("mail_search.html", ctx).expect("render filter-only search");
+    assert!(
+        out.contains("No results found"),
+        "filter-only searches should still render the empty state"
+    );
+}
+
+#[test]
+fn templates_render_search_next_page_link() {
+    let mut ctx = sample_search_ctx("deploy", Vec::new(), false);
+    ctx.search_active = true;
+    ctx.next_cursor = "next-token".to_string();
+    ctx.next_page_url = "/mail/proj/search?q=deploy&cursor=next-token".to_string();
+    let out = templates::render_template("mail_search.html", ctx).expect("render paginated search");
+    assert!(
+        out.contains("href=\"/mail/proj/search?q=deploy&amp;cursor=next-token\""),
+        "pagination link should point at the next cursor URL"
     );
 }
 

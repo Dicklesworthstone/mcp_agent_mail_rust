@@ -136,6 +136,9 @@
         />
         <input type="hidden" id="scope" name="scope" x-model="scope" />
         <input type="hidden" id="order" name="order" x-model="order" />
+        {% if static_export %}
+        <input type="hidden" name="__static_export" value="1" />
+        {% endif %}
 
         <!-- Keyboard shortcut hint (cross-platform) -->
         <div class="absolute inset-y-0 right-0 pr-4 flex items-center pointer-events-none">
@@ -216,6 +219,7 @@
 
         <!-- Additional Options -->
         <div class="md:col-span-2 flex items-center justify-between pt-4 border-t border-slate-200 dark:border-slate-700">
+          {% if static_export %}
           <label class="flex items-center gap-3 cursor-pointer group">
             <input type="checkbox" id="boostSubject" name="boost" value="1"
                    class="w-4 h-4 text-primary-600 bg-white dark:bg-slate-800 border-slate-300 dark:border-slate-600 rounded focus:ring-2 focus:ring-primary-500 transition-all duration-200"
@@ -224,6 +228,9 @@
               Prioritize subject matches in rankings
             </span>
           </label>
+          {% else %}
+          <div></div>
+          {% endif %}
 
           <button
             type="submit"
@@ -232,7 +239,9 @@
             <span>Search</span>
           </button>
         </div>
+        {% if static_export %}
         <p class="md:col-span-2 text-xs text-slate-500 dark:text-slate-500">Subject prioritization nudges messages whose subject matches your query higher without hiding relevant body matches.</p>
+        {% endif %}
       </div>
     </form>
 

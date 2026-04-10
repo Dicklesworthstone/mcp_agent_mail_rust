@@ -1394,6 +1394,42 @@ mod utility_tests {
     }
 
     #[test]
+    fn parse_mail_search_field_scope_accepts_new_and_legacy_params() {
+        assert_eq!(parse_mail_search_field_scope("field=subject"), "subject");
+        assert_eq!(parse_mail_search_field_scope("scope=body"), "body");
+        assert_eq!(parse_mail_search_field_scope("field=both"), "");
+    }
+
+    #[test]
+    fn parse_mail_search_field_scope_ignores_cross_surface_scope_values() {
+        assert_eq!(parse_mail_search_field_scope("scope=project"), "");
+        assert_eq!(parse_mail_search_field_scope("scope=global"), "");
+        assert_eq!(parse_mail_search_field_scope("scope=product"), "");
+    }
+
+    #[test]
+    fn apply_mail_search_field_scope_prefixes_query() {
+        assert_eq!(
+            apply_mail_search_field_scope("deploy", "subject"),
+            "subject:deploy"
+        );
+        assert_eq!(
+            apply_mail_search_field_scope("deploy", "body"),
+            "body_md:deploy"
+        );
+        assert_eq!(apply_mail_search_field_scope("deploy", ""), "deploy");
+        assert_eq!(apply_mail_search_field_scope("", "subject"), "");
+    }
+
+    #[test]
+    fn parse_mail_search_order_accepts_sort_aliases() {
+        assert_eq!(parse_mail_search_order("order=time"), "time");
+        assert_eq!(parse_mail_search_order("sort=relevance"), "relevance");
+        assert_eq!(parse_mail_search_order("sort=newest"), "time");
+        assert_eq!(parse_mail_search_order("sort=oldest"), "time");
+    }
+
+    #[test]
     fn parse_importance_filter_params_accepts_repeated_values() {
         let parsed = parse_importance_filter_params("imp=urgent&imp=high");
         assert_eq!(
@@ -1437,6 +1473,22 @@ mod utility_tests {
     fn parse_ack_filter_param_rejects_unknown_values() {
         assert_eq!(parse_ack_filter_param("any"), None);
         assert_eq!(parse_ack_filter_param("banana"), None);
+    }
+
+    #[test]
+    fn build_search_next_page_url_adds_cursor_and_preserves_filters() {
+        let next =
+            build_search_next_page_url("proj", "q=deploy&imp=urgent%2Chigh&order=time", "abc 123");
+        assert_eq!(
+            next,
+            "/mail/proj/search?q=deploy&imp=urgent%2Chigh&order=time&cursor=abc%20123"
+        );
+    }
+
+    #[test]
+    fn build_search_next_page_url_replaces_existing_cursor() {
+        let next = build_search_next_page_url("proj", "q=deploy&cursor=old&order=time", "new");
+        assert_eq!(next, "/mail/proj/search?q=deploy&order=time&cursor=new");
     }
 
     // --- extract_query_int ---
@@ -3134,12 +3186,13 @@ fn render_thread(
 struct SearchCtx {
     project: ProjectView,
     q: String,
+    search_active: bool,
     results: Vec<WebSearchResult>,
     static_export: bool,
     static_search_index_path: String,
     // Facet state (round-trips through URL params)
     order: String,
-    scope: String,
+    field_scope: String,
     boost: bool,
     importance: Vec<String>,
     agent: String,
@@ -3150,6 +3203,7 @@ struct SearchCtx {
     to_date: String,
     // Pagination
     next_cursor: String,
+    next_page_url: String,
     cursor: String,
     result_count: usize,
     // Agent list for facet dropdown
@@ -3200,6 +3254,56 @@ fn extract_query_str_all(query: &str, key: &str) -> Vec<String> {
     out
 }
 
+fn normalize_mail_search_field_scope(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "subject" => Some("subject"),
+        "body" => Some("body"),
+        "both" | "" => Some(""),
+        _ => None,
+    }
+}
+
+fn parse_mail_search_field_scope(query: &str) -> String {
+    for key in ["field", "scope"] {
+        if let Some(raw) = extract_query_str(query, key)
+            && let Some(normalized) = normalize_mail_search_field_scope(&raw)
+        {
+            return normalized.to_string();
+        }
+    }
+    String::new()
+}
+
+fn apply_mail_search_field_scope(query: &str, field_scope: &str) -> String {
+    if query.is_empty() {
+        return String::new();
+    }
+    match field_scope {
+        "subject" => format!("subject:{query}"),
+        "body" => format!("body_md:{query}"),
+        _ => query.to_string(),
+    }
+}
+
+fn normalize_mail_search_order(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "relevance" => Some("relevance"),
+        "time" | "newest" | "oldest" => Some("time"),
+        _ => None,
+    }
+}
+
+fn parse_mail_search_order(query: &str) -> String {
+    for key in ["order", "sort"] {
+        if let Some(raw) = extract_query_str(query, key)
+            && let Some(normalized) = normalize_mail_search_order(&raw)
+        {
+            return normalized.to_string();
+        }
+    }
+    "relevance".to_string()
+}
+
 fn parse_importance_filter_params(
     query: &str,
 ) -> Vec<mcp_agent_mail_db::search_planner::Importance> {
@@ -3229,6 +3333,30 @@ fn build_search_deep_link(project_slug: &str, query_str: &str) -> String {
         return format!("/mail/{project_slug}/search");
     }
     format!("/mail/{project_slug}/search?{query_str}")
+}
+
+fn build_search_next_page_url(project_slug: &str, query_str: &str, next_cursor: &str) -> String {
+    if next_cursor.is_empty() {
+        return build_search_deep_link(project_slug, query_str);
+    }
+
+    let mut params: Vec<String> = query_str
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| pair.split_once('=').map_or(*pair, |(key, _)| key) != "cursor")
+        .map(|pair| pair.to_string())
+        .collect();
+    params.push(format!(
+        "cursor={}",
+        percent_encode_path_segment(next_cursor)
+    ));
+
+    let mut out = format!("/mail/{project_slug}/search");
+    if !params.is_empty() {
+        out.push('?');
+        out.push_str(&params.join("&"));
+    }
+    out
 }
 
 /// Highlight matched terms in a snippet by wrapping them in `<mark>` tags.
@@ -3360,8 +3488,8 @@ fn render_search(
     let q = extract_query_str(query_str, "q").unwrap_or_default();
     let static_export = is_static_export_request(query_str);
     let limit = extract_query_int(query_str, "limit", 50);
-    let order = extract_query_str(query_str, "order").unwrap_or_else(|| "relevance".to_string());
-    let scope = extract_query_str(query_str, "scope").unwrap_or_default();
+    let order = parse_mail_search_order(query_str);
+    let field_scope = parse_mail_search_field_scope(query_str);
     let boost = extract_query_str(query_str, "boost").is_some();
     let cursor = extract_query_str(query_str, "cursor").unwrap_or_default();
 
@@ -3408,9 +3536,10 @@ fn render_search(
         };
 
         let ack_required = parse_ack_filter_param(&ack_filter);
+        let scoped_query = apply_mail_search_field_scope(&q, &field_scope);
 
         let search_query = SearchQuery {
-            text: q.clone(),
+            text: scoped_query,
             doc_kind: mcp_agent_mail_db::search_planner::DocKind::Message,
             project_id: Some(pid),
             product_id: None,
@@ -3482,17 +3611,19 @@ fn render_search(
 
     let result_count = results.len();
     let deep_link = build_search_deep_link(project_slug, query_str);
+    let next_page_url = build_search_next_page_url(project_slug, query_str, &next_cursor_val);
 
     render(
         "mail_search.html",
         SearchCtx {
             project: project_view(&p),
             q,
+            search_active: has_any_filter,
             results,
             static_export,
             static_search_index_path: "../../../search-index.json".to_string(),
             order,
-            scope,
+            field_scope,
             boost,
             importance: selected_importance,
             agent: agent_filter,
@@ -3502,6 +3633,7 @@ fn render_search(
             from_date,
             to_date,
             next_cursor: next_cursor_val,
+            next_page_url,
             cursor,
             result_count,
             agents,

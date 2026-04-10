@@ -31,9 +31,9 @@ use crate::{
 
 fn split_param_and_query(input: &str) -> (String, HashMap<String, String>) {
     if let Some((base, query)) = input.split_once('?') {
-        (percent_decode_component(base), parse_query(query))
+        (percent_decode_path_component(base), parse_query(query))
     } else {
-        (percent_decode_component(input), HashMap::new())
+        (percent_decode_path_component(input), HashMap::new())
     }
 }
 
@@ -473,20 +473,28 @@ fn parse_query(query: &str) -> HashMap<String, String> {
             Some((k, v)) => (k, v),
             None => (pair, ""),
         };
-        let key = percent_decode_component(key);
-        let value = percent_decode_component(value);
+        let key = percent_decode_query_component(key);
+        let value = percent_decode_query_component(value);
         params.insert(key, value);
     }
     params
 }
 
-fn percent_decode_component(input: &str) -> String {
+fn percent_decode_path_component(input: &str) -> String {
+    percent_decode_component(input, false)
+}
+
+fn percent_decode_query_component(input: &str) -> String {
+    percent_decode_component(input, true)
+}
+
+fn percent_decode_component(input: &str, plus_as_space: bool) -> String {
     let bytes = input.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
     while i < bytes.len() {
         match bytes[i] {
-            b'+' => {
+            b'+' if plus_as_space => {
                 out.push(b' ');
                 i += 1;
             }
@@ -7038,6 +7046,13 @@ mod query_param_tests {
         assert_eq!(params.get("project").unwrap(), "/data/proj");
     }
 
+    #[test]
+    fn split_base_preserves_literal_plus() {
+        let (base, params) = split_param_and_query("%2Ftmp%2Fproj+plus?project=/data/proj");
+        assert_eq!(base, "/tmp/proj+plus");
+        assert_eq!(params.get("project").unwrap(), "/data/proj");
+    }
+
     // -----------------------------------------------------------------------
     // parse_query
     // -----------------------------------------------------------------------
@@ -7198,36 +7213,54 @@ mod query_param_tests {
 
     #[test]
     fn percent_decode_basic() {
-        assert_eq!(percent_decode_component("hello"), "hello");
+        assert_eq!(percent_decode_path_component("hello"), "hello");
+        assert_eq!(percent_decode_query_component("hello"), "hello");
     }
 
     #[test]
     fn percent_decode_encoded_slash() {
-        assert_eq!(percent_decode_component("%2Fdata%2Fpath"), "/data/path");
+        assert_eq!(
+            percent_decode_path_component("%2Fdata%2Fpath"),
+            "/data/path"
+        );
+        assert_eq!(
+            percent_decode_query_component("%2Fdata%2Fpath"),
+            "/data/path"
+        );
     }
 
     #[test]
-    fn percent_decode_space_encoding() {
-        assert_eq!(percent_decode_component("hello%20world"), "hello world");
-        assert_eq!(percent_decode_component("hello+world"), "hello world");
+    fn percent_decode_space_encoding_path_and_query() {
+        assert_eq!(
+            percent_decode_path_component("hello%20world"),
+            "hello world"
+        );
+        assert_eq!(
+            percent_decode_query_component("hello%20world"),
+            "hello world"
+        );
+        assert_eq!(percent_decode_path_component("hello+world"), "hello+world");
+        assert_eq!(percent_decode_query_component("hello+world"), "hello world");
     }
 
     #[test]
     fn percent_decode_special_chars() {
-        assert_eq!(percent_decode_component("%40user"), "@user");
-        assert_eq!(percent_decode_component("key%3Dvalue"), "key=value");
+        assert_eq!(percent_decode_path_component("%40user"), "@user");
+        assert_eq!(percent_decode_query_component("key%3Dvalue"), "key=value");
     }
 
     #[test]
     fn percent_decode_invalid_hex() {
         // Invalid hex should pass through unchanged.
-        assert_eq!(percent_decode_component("%ZZ"), "%ZZ");
+        assert_eq!(percent_decode_path_component("%ZZ"), "%ZZ");
+        assert_eq!(percent_decode_query_component("%ZZ"), "%ZZ");
     }
 
     #[test]
     fn percent_decode_truncated() {
         // Truncated % at end should pass through.
-        assert_eq!(percent_decode_component("abc%2"), "abc%2");
+        assert_eq!(percent_decode_path_component("abc%2"), "abc%2");
+        assert_eq!(percent_decode_query_component("abc%2"), "abc%2");
     }
 
     // -----------------------------------------------------------------------

@@ -158,11 +158,11 @@ impl ThreadRouteKey {
 
 // ── Redaction helpers ────────────────────────────────────────────────────
 
-const BODY_REDACTED_PLACEHOLDER: &str = "[Message body redacted]";
+pub(crate) const BODY_REDACTED_PLACEHOLDER: &str = "[Message body redacted]";
 const UNKNOWN_RECIPIENT_DISPLAY: &str = "[unknown recipient]";
 
 /// Check if a message body appears to be a redacted placeholder.
-fn is_redacted_body(body: &str) -> bool {
+pub(crate) fn is_redacted_body(body: &str) -> bool {
     let trimmed = body.trim();
     trimmed == BODY_REDACTED_PLACEHOLDER || trimmed.starts_with("[Message body redacted")
 }
@@ -177,6 +177,54 @@ fn defense_scan(input: &str, policy: &ExportRedactionPolicy) -> (String, bool) {
     (result, count > 0)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BodySanitization {
+    Unchanged,
+    AlreadyRedacted,
+    RedactedByPolicy,
+    SecretSanitized,
+}
+
+pub(crate) fn sanitize_subject_for_export(
+    subject: &str,
+    policy: &ExportRedactionPolicy,
+) -> (String, bool) {
+    defense_scan(subject, policy)
+}
+
+pub(crate) fn sanitize_body_for_export(
+    body: &str,
+    policy: &ExportRedactionPolicy,
+) -> (String, BodySanitization) {
+    if !policy.is_active() {
+        return (body.to_string(), BodySanitization::Unchanged);
+    }
+
+    if is_redacted_body(body) {
+        let placeholder = if policy.redact_bodies {
+            policy.body_placeholder.clone()
+        } else {
+            BODY_REDACTED_PLACEHOLDER.to_string()
+        };
+        return (placeholder, BodySanitization::AlreadyRedacted);
+    }
+
+    if policy.redact_bodies {
+        return (
+            policy.body_placeholder.clone(),
+            BodySanitization::RedactedByPolicy,
+        );
+    }
+
+    let (sanitized, had_secrets) = defense_scan(body, policy);
+    let state = if had_secrets {
+        BodySanitization::SecretSanitized
+    } else {
+        BodySanitization::Unchanged
+    };
+    (sanitized, state)
+}
+
 /// Apply the redaction policy to a message, returning the display body
 /// and whether it was redacted.
 fn apply_body_redaction(
@@ -185,46 +233,34 @@ fn apply_body_redaction(
     audit: &mut RedactionAuditLog,
     msg_id: i64,
 ) -> (String, bool) {
-    // If no redaction policy is active, pass through unchanged.
-    if !policy.is_active() {
-        return (body.to_string(), false);
+    let (sanitized, state) = sanitize_body_for_export(body, policy);
+    match state {
+        BodySanitization::Unchanged => (sanitized, false),
+        BodySanitization::AlreadyRedacted => {
+            audit.record(
+                RedactionReason::ScrubPreset,
+                format!("message {msg_id}: body was redacted by scrub pass"),
+                Some(msg_id),
+            );
+            (sanitized, true)
+        }
+        BodySanitization::RedactedByPolicy => {
+            audit.record(
+                RedactionReason::BodyRedacted,
+                format!("message {msg_id}: body hidden per strict export policy"),
+                Some(msg_id),
+            );
+            (sanitized, true)
+        }
+        BodySanitization::SecretSanitized => {
+            audit.record(
+                RedactionReason::SecretDetected,
+                format!("message {msg_id}: secret pattern detected in body"),
+                Some(msg_id),
+            );
+            (sanitized, false)
+        }
     }
-
-    // If the body was already redacted by the scrub pass, preserve the placeholder.
-    if is_redacted_body(body) {
-        audit.record(
-            RedactionReason::ScrubPreset,
-            format!("message {msg_id}: body was redacted by scrub pass"),
-            Some(msg_id),
-        );
-        let placeholder = if policy.redact_bodies {
-            policy.body_placeholder.clone()
-        } else {
-            BODY_REDACTED_PLACEHOLDER.to_string()
-        };
-        return (placeholder, true);
-    }
-
-    // If the policy says to redact all bodies (strict mode), replace it.
-    if policy.redact_bodies {
-        audit.record(
-            RedactionReason::BodyRedacted,
-            format!("message {msg_id}: body hidden per strict export policy"),
-            Some(msg_id),
-        );
-        return (policy.body_placeholder.clone(), true);
-    }
-
-    // Defense-in-depth: scan for any remaining secrets.
-    let (sanitized, had_secrets) = defense_scan(body, policy);
-    if had_secrets {
-        audit.record(
-            RedactionReason::SecretDetected,
-            format!("message {msg_id}: secret pattern detected in body"),
-            Some(msg_id),
-        );
-    }
-    (sanitized, had_secrets)
 }
 
 /// Apply redaction to a subject line (defense-in-depth scanning only).
@@ -234,7 +270,7 @@ fn apply_subject_redaction(
     audit: &mut RedactionAuditLog,
     msg_id: i64,
 ) -> String {
-    let (sanitized, had_secrets) = defense_scan(subject, policy);
+    let (sanitized, had_secrets) = sanitize_subject_for_export(subject, policy);
     if had_secrets {
         audit.record(
             RedactionReason::SecretDetected,
@@ -268,6 +304,7 @@ pub fn render_static_site(
     let conn = DbConn::open_file(&path_str).map_err(|e| ShareError::Sqlite {
         message: format!("cannot open snapshot for static render: {e}"),
     })?;
+    let preexisting_outputs = collect_existing_render_outputs(output_dir)?;
 
     let pages_dir = output_dir.join("viewer").join("pages");
     ensure_real_directory(&pages_dir)?;
@@ -486,6 +523,8 @@ pub fn render_static_site(
         generated_files.push("viewer/data/redaction_audit.json".to_string());
         generated_files.sort();
     }
+
+    remove_stale_render_outputs(output_dir, &preexisting_outputs, &generated_files)?;
 
     Ok(StaticRenderResult {
         pages_generated: sitemap.len(),
@@ -1168,6 +1207,176 @@ fn write_text_file(path: &Path, content: &str) -> ShareResult<()> {
     Ok(())
 }
 
+const STATIC_RENDER_OWNED_DATA_FILES: &[&str] = &[
+    "viewer/data/sitemap.json",
+    "viewer/data/search_index.json",
+    "viewer/data/navigation.json",
+    "viewer/data/redaction_audit.json",
+];
+
+fn collect_existing_render_outputs(output_dir: &Path) -> ShareResult<BTreeSet<String>> {
+    let mut outputs = BTreeSet::new();
+    collect_existing_render_page_outputs(
+        output_dir,
+        &output_dir.join("viewer").join("pages"),
+        &mut outputs,
+    )?;
+    for relative_path in STATIC_RENDER_OWNED_DATA_FILES {
+        let path = output_dir.join(relative_path);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(ShareError::Io(std::io::Error::other(format!(
+                        "refusing to traverse symlinked export path {}",
+                        path.display()
+                    ))));
+                }
+                if metadata.file_type().is_dir() {
+                    return Err(ShareError::Io(std::io::Error::other(format!(
+                        "expected export file but found directory {}",
+                        path.display()
+                    ))));
+                }
+                outputs.insert((*relative_path).to_string());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ShareError::Io(error)),
+        }
+    }
+    Ok(outputs)
+}
+
+fn collect_existing_render_page_outputs(
+    output_dir: &Path,
+    dir: &Path,
+    outputs: &mut BTreeSet<String>,
+) -> ShareResult<()> {
+    let metadata = match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(ShareError::Io(error)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(ShareError::Io(std::io::Error::other(format!(
+            "refusing to traverse symlinked export directory {}",
+            dir.display()
+        ))));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(ShareError::Io(std::io::Error::other(format!(
+            "expected export directory but found non-directory {}",
+            dir.display()
+        ))));
+    }
+
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(ShareError::Io(std::io::Error::other(format!(
+                "refusing to traverse symlinked export path {}",
+                path.display()
+            ))));
+        }
+        if metadata.file_type().is_dir() {
+            collect_existing_render_page_outputs(output_dir, &path, outputs)?;
+        } else if metadata.file_type().is_file() {
+            let relative_path = path
+                .strip_prefix(output_dir)
+                .map_err(|error| ShareError::Io(std::io::Error::other(error.to_string())))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            outputs.insert(relative_path);
+        } else {
+            return Err(ShareError::Io(std::io::Error::other(format!(
+                "unsupported export entry {}",
+                path.display()
+            ))));
+        }
+    }
+
+    Ok(())
+}
+
+fn remove_stale_render_outputs(
+    output_dir: &Path,
+    preexisting_outputs: &BTreeSet<String>,
+    generated_files: &[String],
+) -> ShareResult<()> {
+    let current_outputs: BTreeSet<&str> = generated_files.iter().map(String::as_str).collect();
+    for stale in preexisting_outputs {
+        if current_outputs.contains(stale.as_str()) {
+            continue;
+        }
+        let path = output_dir.join(stale);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(ShareError::Io(error)),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(ShareError::Io(std::io::Error::other(format!(
+                "refusing to remove symlinked export path {}",
+                path.display()
+            ))));
+        }
+        if !metadata.file_type().is_file() {
+            return Err(ShareError::Io(std::io::Error::other(format!(
+                "expected stale export file but found non-file {}",
+                path.display()
+            ))));
+        }
+        std::fs::remove_file(&path)?;
+    }
+    prune_empty_render_directories(&output_dir.join("viewer").join("pages"))?;
+    Ok(())
+}
+
+fn prune_empty_render_directories(dir: &Path) -> ShareResult<bool> {
+    let metadata = match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(ShareError::Io(error)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(ShareError::Io(std::io::Error::other(format!(
+            "refusing to traverse symlinked export directory {}",
+            dir.display()
+        ))));
+    }
+    if !metadata.file_type().is_dir() {
+        return Ok(false);
+    }
+
+    let mut is_empty = true;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let child_metadata = std::fs::symlink_metadata(&path)?;
+        if child_metadata.file_type().is_symlink() {
+            return Err(ShareError::Io(std::io::Error::other(format!(
+                "refusing to traverse symlinked export path {}",
+                path.display()
+            ))));
+        }
+        if child_metadata.file_type().is_dir() {
+            if !prune_empty_render_directories(&path)? {
+                is_empty = false;
+            }
+        } else {
+            is_empty = false;
+        }
+    }
+
+    if is_empty {
+        std::fs::remove_dir(dir)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
@@ -1655,12 +1864,8 @@ mod tests {
 
     // ── Integration: render with in-memory DB ───────────────────────
 
-    #[test]
-    fn render_empty_db() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.sqlite3");
-
-        // Create minimal schema
+    fn create_render_test_db(dir: &Path) -> PathBuf {
+        let db_path = dir.join("render-test.sqlite3");
         let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
         conn.execute_sync(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT)",
@@ -1685,6 +1890,13 @@ mod tests {
         )
         .unwrap();
         drop(conn);
+        db_path
+    }
+
+    #[test]
+    fn render_empty_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = create_render_test_db(dir.path());
 
         let output = dir.path().join("output");
         let config = StaticRenderConfig::default();
@@ -1699,6 +1911,108 @@ mod tests {
         assert!(output.join("viewer/data/sitemap.json").exists());
         assert!(output.join("viewer/data/search_index.json").exists());
         assert!(output.join("viewer/data/navigation.json").exists());
+    }
+
+    #[test]
+    fn render_static_site_removes_stale_pages_after_rerender() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = create_render_test_db(dir.path());
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key) VALUES (1, 'alpha', '/tmp/alpha')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key) VALUES (2, 'beta', '/tmp/beta')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES (1, 1, 'Alice')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name) VALUES (2, 2, 'Bob')",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, created_ts, thread_id) \
+             VALUES (1, 1, 1, 'Alpha msg', 'Alpha body', 'normal', '2024-01-01T00:00:00Z', NULL)",
+            &[],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, created_ts, thread_id) \
+             VALUES (2, 2, 2, 'Beta msg', 'Beta body', 'normal', '2024-01-02T00:00:00Z', 'beta-thread')",
+            &[],
+        )
+        .unwrap();
+        drop(conn);
+
+        let output = dir.path().join("output");
+        render_static_site(&db_path, &output, &StaticRenderConfig::default()).unwrap();
+
+        let stale_message = output.join("viewer/pages/messages/2.html");
+        let stale_project = output.join("viewer/pages/projects/beta");
+        let stale_thread = output.join("viewer/pages/threads/beta-thread.html");
+        assert!(stale_message.exists());
+        assert!(stale_project.join("index.html").exists());
+        assert!(stale_thread.exists());
+
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_sync("DELETE FROM messages WHERE id = 2", &[])
+            .unwrap();
+        conn.execute_sync("DELETE FROM agents WHERE id = 2", &[])
+            .unwrap();
+        conn.execute_sync("DELETE FROM projects WHERE id = 2", &[])
+            .unwrap();
+        drop(conn);
+
+        render_static_site(&db_path, &output, &StaticRenderConfig::default()).unwrap();
+
+        assert!(
+            !stale_message.exists(),
+            "stale message pages must be removed on rerender"
+        );
+        assert!(
+            !stale_project.exists(),
+            "stale project page directories must be pruned on rerender"
+        );
+        assert!(
+            !stale_thread.exists(),
+            "stale thread pages must be removed on rerender"
+        );
+    }
+
+    #[test]
+    fn render_static_site_removes_stale_redaction_audit_on_clean_rerender() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = create_secret_fixture_db(dir.path());
+        let output = dir.path().join("output");
+        let config = StaticRenderConfig::default();
+
+        let first = render_static_site(&db_path, &output, &config).unwrap();
+        let audit_path = output.join("viewer/data/redaction_audit.json");
+        assert!(first.redaction_audit.total() > 0);
+        assert!(audit_path.exists());
+
+        let conn = SqliteConnection::open_file(db_path.to_str().unwrap()).unwrap();
+        conn.execute_sync(
+            "UPDATE messages SET subject = 'Clean subject', body_md = 'Clean body' ",
+            &[],
+        )
+        .unwrap();
+        drop(conn);
+
+        let second = render_static_site(&db_path, &output, &config).unwrap();
+        assert_eq!(second.redaction_audit.total(), 0);
+        assert!(
+            !audit_path.exists(),
+            "stale redaction audit files must be removed when the next render is clean"
+        );
     }
 
     #[test]
