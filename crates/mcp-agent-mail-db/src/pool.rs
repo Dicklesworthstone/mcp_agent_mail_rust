@@ -46,6 +46,7 @@ pub struct ResolvedMailboxSqlitePath {
     pub used_absolute_fallback: bool,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MailboxSidecarState {
     pub wal_exists: bool,
