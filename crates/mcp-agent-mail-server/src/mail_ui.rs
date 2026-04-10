@@ -618,6 +618,67 @@ first body
     }
 
     #[test]
+    fn render_attachments_preserves_messages_when_agent_rows_are_missing() {
+        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("attachments-orphaned-agents");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-attachments-orphaned-agents-{}", unique_nonce()),
+        )));
+        let project_id = project.id.unwrap_or(0);
+
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project_id,
+            "GreenCastle",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        let recipient = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+        )));
+
+        outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            sender.id.unwrap_or(0),
+            "Orphaned attachment delivery",
+            "See attached orphan-safe artifact",
+            Some("br-attachments-orphaned"),
+            "normal",
+            false,
+            r#"[{"name":"artifact.txt","path":"attachments/demo.txt","content_type":"text/plain","size":"128"}]"#,
+            &[(recipient.id.unwrap_or(0), "to")],
+        )));
+
+        let conn = match block_on(pool.acquire(&cx)) {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(err) => panic!("acquire pooled conn: {err}"),
+            Outcome::Cancelled(reason) => panic!("acquire pooled conn cancelled: {reason}"),
+            Outcome::Panicked(payload) => {
+                panic!("acquire pooled conn panicked: {}", payload.message())
+            }
+        };
+        conn.execute_sync(
+            "DELETE FROM agents WHERE project_id = ?",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(project_id)],
+        )
+        .expect("delete project agents");
+
+        let html = render_attachments(&cx, &pool, &project.slug)
+            .expect("attachments render should succeed")
+            .expect("attachments route should return html");
+        assert!(html.contains("artifact.txt"), "{html}");
+        assert!(html.contains("Orphaned attachment delivery"), "{html}");
+    }
+
+    #[test]
     fn render_message_renders_sender_recipients_and_thread_preview() {
         let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
         let pool = make_test_pool("message");
@@ -862,6 +923,69 @@ first body
             .expect("message render should succeed")
             .expect("message route should return html");
         assert!(!html.contains("marked.parse(markdownContent)"), "{html}");
+    }
+
+    #[test]
+    fn render_message_preserves_orphaned_sender_with_placeholder() {
+        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("message-orphaned-sender");
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            &format!("/tmp/mail-ui-message-orphaned-sender-{}", unique_nonce()),
+        )));
+        let project_id = project.id.unwrap_or(0);
+
+        let sender = outcome_ok(block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project_id,
+            "GreenCastle",
+            "test",
+            "test",
+            None,
+            None,
+            None,
+        )));
+        let recipient = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+        )));
+        let message = outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            sender.id.unwrap_or(0),
+            "Sender drift",
+            "Still render this message",
+            None,
+            "normal",
+            false,
+            "[]",
+            &[(recipient.id.unwrap_or(0), "to")],
+        )));
+
+        let conn = match block_on(pool.acquire(&cx)) {
+            Outcome::Ok(conn) => conn,
+            Outcome::Err(err) => panic!("acquire pooled conn: {err}"),
+            Outcome::Cancelled(reason) => panic!("acquire pooled conn cancelled: {reason}"),
+            Outcome::Panicked(payload) => {
+                panic!("acquire pooled conn panicked: {}", payload.message())
+            }
+        };
+        conn.execute_sync(
+            "DELETE FROM agents WHERE id = ?",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(
+                sender.id.unwrap_or(0),
+            )],
+        )
+        .expect("delete sender row");
+
+        let html = render_message(&cx, &pool, &project.slug, message.id.unwrap_or(0))
+            .expect("message render should succeed")
+            .expect("message route should return html");
+        assert!(html.contains(&format!("[unknown-agent-{}]", sender.id.unwrap_or(0))), "{html}");
+        assert!(html.contains("BlueLake"), "{html}");
+        assert!(html.contains("Sender drift"), "{html}");
     }
 
     #[test]
@@ -2729,7 +2853,9 @@ fn render_message(
         return Err((404, "Message not found".to_string()));
     }
     let current_message_id = m.id.unwrap_or(0);
-    let sender = block_on_outcome(cx, queries::get_agent_by_id(cx, pool, m.sender_id))?;
+    let sender = block_on_outcome(cx, queries::get_agent_by_id(cx, pool, m.sender_id))
+        .map(|agent| agent.name)
+        .unwrap_or_else(|_| format!("[unknown-agent-{}]", m.sender_id));
     let recipients = block_on_outcome(
         cx,
         queries::list_message_recipients_by_message(cx, pool, pid, message_id),
@@ -2779,7 +2905,7 @@ fn render_message(
                 thread_id: thread_ref,
                 created: ts_display(m.created_ts),
                 ack_required: m.ack_required_bool(),
-                sender: sender.name,
+                sender,
             },
             recipients: recipients
                 .into_iter()
@@ -3538,49 +3664,57 @@ fn render_attachments(
 ) -> Result<Option<String>, (u16, String)> {
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
     let pid = p.id.unwrap_or(0);
-    let agents = block_on_outcome(cx, queries::list_agents(cx, pool, pid))?;
-    let mut items_by_id: std::collections::BTreeMap<i64, (i64, AttachmentMessageView)> =
-        std::collections::BTreeMap::new();
-
-    for agent in &agents {
-        let aid = agent.id.unwrap_or(0);
-        let inbox = block_on_outcome(
-            cx,
-            queries::fetch_inbox(cx, pool, pid, aid, false, None, 10_000),
-        )?;
-        for row in inbox {
-            let message = &row.message;
-            let Some(message_id) = message.id else {
-                continue;
-            };
-            if items_by_id.contains_key(&message_id) {
-                continue;
-            }
-
-            let attachments = parse_attachment_views(&message.attachments);
-            items_by_id.insert(
-                message_id,
-                (
-                    message.created_ts,
-                    AttachmentMessageView {
-                        id: message_id,
-                        subject: message.subject.clone(),
-                        created: ts_display(message.created_ts),
-                        attachments,
-                    },
-                ),
-            );
+    let conn = match block_on(pool.acquire(cx)) {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(err) => {
+            return Err((500, format!("Failed to open attachments view connection: {err}")));
         }
-    }
+        Outcome::Cancelled(reason) => {
+            return Err((
+                500,
+                format!("Attachments view connection acquisition cancelled: {reason}"),
+            ));
+        }
+        Outcome::Panicked(payload) => {
+            return Err((
+                500,
+                format!(
+                    "Attachments view connection acquisition panicked: {}",
+                    payload.message()
+                ),
+            ));
+        }
+    };
+    let rows = conn
+        .query_sync(
+            "SELECT id, subject, created_ts, attachments \
+             FROM messages \
+             WHERE project_id = ? \
+             ORDER BY created_ts DESC, id DESC",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(pid)],
+        )
+        .map_err(|err| (500, format!("Failed to load attachment messages: {err}")))?;
 
-    let mut items = items_by_id
+    let mut items = rows
         .into_iter()
-        .filter_map(|(_, (created_ts, item))| {
-            if item.attachments.is_empty() {
-                None
-            } else {
-                Some((created_ts, item))
+        .filter_map(|row| {
+            let message_id = row.get_named::<i64>("id").ok()?;
+            let attachments = parse_attachment_views(
+                &row.get_named::<String>("attachments").unwrap_or_default(),
+            );
+            if attachments.is_empty() {
+                return None;
             }
+            let created_ts = row.get_named::<i64>("created_ts").unwrap_or(0);
+            Some((
+                created_ts,
+                AttachmentMessageView {
+                    id: message_id,
+                    subject: row.get_named::<String>("subject").unwrap_or_default(),
+                    created: ts_display(created_ts),
+                    attachments,
+                },
+            ))
         })
         .collect::<Vec<_>>();
     items.sort_by(|(left_ts, left_item), (right_ts, right_item)| {
