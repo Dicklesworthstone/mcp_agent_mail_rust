@@ -5200,10 +5200,8 @@ fn sqlite_conn_incremental_check_ok_canonical(
 
 #[cfg(test)]
 fn sqlite_file_has_live_sidecars(path: &Path) -> bool {
-    for suffix in ["-wal", "-shm"] {
-        let mut sidecar_os = path.as_os_str().to_os_string();
-        sidecar_os.push(suffix);
-        let sidecar = PathBuf::from(sidecar_os);
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+        let sidecar = sqlite_sidecar_path(path, suffix);
         if let Ok(meta) = std::fs::metadata(&sidecar)
             && meta.len() > 0
         {
@@ -5431,6 +5429,37 @@ fn path_with_file_name_suffix(path: &Path, suffix: &str, fallback: &str) -> Path
     }
 }
 
+fn path_with_hidden_file_name_suffix(path: &Path, suffix: &str, fallback: &str) -> PathBuf {
+    match path.file_name() {
+        Some(file_name) => {
+            let mut hidden_name = OsString::from(".");
+            hidden_name.push(file_name);
+            hidden_name.push(suffix);
+            path.with_file_name(hidden_name)
+        }
+        None => path.with_file_name(fallback),
+    }
+}
+
+fn next_sibling_staged_file_path(path: &Path, label: &str) -> PathBuf {
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let mut candidate = path_with_hidden_file_name_suffix(
+        path,
+        &format!(".{label}-{timestamp}"),
+        &format!(".artifact.{label}-{timestamp}"),
+    );
+    let mut suffix = 1_u32;
+    while candidate.exists() {
+        candidate = path_with_hidden_file_name_suffix(
+            path,
+            &format!(".{label}-{timestamp}-{suffix:02}"),
+            &format!(".artifact.{label}-{timestamp}-{suffix:02}"),
+        );
+        suffix = suffix.saturating_add(1);
+    }
+    candidate
+}
+
 fn os_str_starts_with(value: &OsStr, prefix: &OsStr) -> bool {
     #[cfg(unix)]
     {
@@ -5501,8 +5530,7 @@ fn sqlite_backup_candidates(path: &Path) -> Vec<PathBuf> {
     let backup_prefix = os_string_with_suffix(file_name, ".backup-");
     let backup_bak_prefix = os_string_with_suffix(file_name, ".bak.");
     let recovery_prefix = os_string_with_suffix(file_name, ".recovery");
-    let wal_suffix = OsString::from("-wal");
-    let shm_suffix = OsString::from("-shm");
+    let sidecar_suffixes = SQLITE_RECOVERY_SIDECAR_SUFFIXES.map(OsString::from);
     if let Ok(entries) = std::fs::read_dir(scan_dir) {
         for entry in entries.flatten() {
             let candidate = entry.path();
@@ -5523,8 +5551,9 @@ fn sqlite_backup_candidates(path: &Path) -> Vec<PathBuf> {
             } else {
                 continue;
             };
-            if os_str_ends_with(&name, wal_suffix.as_os_str())
-                || os_str_ends_with(&name, shm_suffix.as_os_str())
+            if sidecar_suffixes
+                .iter()
+                .any(|suffix| os_str_ends_with(&name, suffix.as_os_str()))
             {
                 continue;
             }
@@ -9757,8 +9786,7 @@ fn list_db_backups(db_path: &Path, backup_dir: Option<&Path>) -> CliResult<Vec<P
         return Ok(Vec::new());
     };
     let prefix = os_string_with_suffix(db_name, ".bak.");
-    let wal_suffix = OsString::from("-wal");
-    let shm_suffix = OsString::from("-shm");
+    let sidecar_suffixes = SQLITE_RECOVERY_SIDECAR_SUFFIXES.map(OsString::from);
 
     let mut backups: Vec<PathBuf> = Vec::new();
     let entries = std::fs::read_dir(backup_parent).map_err(|e| {
@@ -9777,8 +9805,9 @@ fn list_db_backups(db_path: &Path, backup_dir: Option<&Path>) -> CliResult<Vec<P
         }
         let name = entry.file_name();
         if os_str_starts_with(&name, &prefix)
-            && !os_str_ends_with(&name, wal_suffix.as_os_str())
-            && !os_str_ends_with(&name, shm_suffix.as_os_str())
+            && !sidecar_suffixes
+                .iter()
+                .any(|suffix| os_str_ends_with(&name, suffix.as_os_str()))
         {
             backups.push(path);
         }
@@ -9794,6 +9823,8 @@ fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(sidecar_os)
 }
 
+const SQLITE_RECOVERY_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
+
 fn sqlite_checkpoint_truncate(db_path: &Path) -> CliResult<()> {
     mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(db_path)
         .map_err(|e| CliError::Other(format!("WAL checkpoint failed before backup: {e}")))?;
@@ -9805,6 +9836,20 @@ fn copy_sqlite_backup_consistently(source_db: &Path, backup_path: &Path) -> CliR
         return Err(CliError::Other(format!(
             "database file does not exist: {}",
             source_db.display()
+        )));
+    }
+    if std::fs::symlink_metadata(backup_path)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(CliError::Other(format!(
+            "refusing to create backup through symlinked destination {}",
+            backup_path.display()
+        )));
+    }
+    if backup_path.exists() {
+        return Err(CliError::Other(format!(
+            "refusing to overwrite existing backup {}",
+            backup_path.display()
         )));
     }
 
@@ -9819,9 +9864,19 @@ fn copy_sqlite_backup_consistently(source_db: &Path, backup_path: &Path) -> CliR
         })?;
     }
 
-    std::fs::copy(source_db, backup_path).map_err(|e| {
+    let staged_backup = next_sibling_staged_file_path(backup_path, "backup-stage");
+    std::fs::copy(source_db, &staged_backup).map_err(|e| {
+        let _ = std::fs::remove_file(&staged_backup);
         CliError::Other(format!(
-            "cannot create backup at {}: {e}",
+            "cannot stage backup at {}: {e}",
+            staged_backup.display()
+        ))
+    })?;
+    std::fs::rename(&staged_backup, backup_path).map_err(|e| {
+        let _ = std::fs::remove_file(&staged_backup);
+        CliError::Other(format!(
+            "cannot publish staged backup {} to {}: {e}",
+            staged_backup.display(),
             backup_path.display()
         ))
     })?;
@@ -9842,6 +9897,38 @@ fn remove_sqlite_sidecar_if_exists(sidecar_path: &Path, context: &str) -> CliRes
 }
 
 fn restore_db_from_backup(db_path: &Path, backup_path: &Path) -> CliResult<()> {
+    if !path_is_real_file(backup_path) {
+        return Err(CliError::Other(format!(
+            "refusing to restore from non-regular backup {}",
+            backup_path.display()
+        )));
+    }
+
+    let restore_ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let staged_restore =
+        next_doctor_artifact_path_with_timestamp(db_path, "restore", "sqlite3", &restore_ts);
+    std::fs::copy(backup_path, &staged_restore).map_err(|e| {
+        CliError::Other(format!(
+            "failed to copy backup {} to staged restore path {}: {e}",
+            backup_path.display(),
+            staged_restore.display()
+        ))
+    })?;
+    if !sqlite_file_is_healthy(&staged_restore)? {
+        cleanup_doctor_temp_sqlite_artifact(&staged_restore);
+        return Err(CliError::Other(format!(
+            "backup {} did not pass health check after staging copy; live database is untouched",
+            backup_path.display()
+        )));
+    }
+    for (suffix, label) in [
+        ("-journal", "staged restore rollback-journal"),
+        ("-wal", "staged restore WAL"),
+        ("-shm", "staged restore SHM"),
+    ] {
+        remove_sqlite_sidecar_if_exists(&sqlite_sidecar_path(&staged_restore, suffix), label)?;
+    }
+
     if db_path.exists() {
         let rollback_ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
         let rollback_backup = path_with_file_name_suffix(
@@ -9849,7 +9936,24 @@ fn restore_db_from_backup(db_path: &Path, backup_path: &Path) -> CliResult<()> {
             &format!(".pre_rollback.{rollback_ts}"),
             &format!("storage.sqlite3.pre_rollback.{rollback_ts}"),
         );
+        if std::fs::symlink_metadata(&rollback_backup)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            cleanup_doctor_temp_sqlite_artifact(&staged_restore);
+            return Err(CliError::Other(format!(
+                "refusing to create pre-rollback backup through symlinked destination {}",
+                rollback_backup.display()
+            )));
+        }
+        if rollback_backup.exists() {
+            cleanup_doctor_temp_sqlite_artifact(&staged_restore);
+            return Err(CliError::Other(format!(
+                "refusing to overwrite existing pre-rollback backup {}",
+                rollback_backup.display()
+            )));
+        }
         std::fs::copy(db_path, &rollback_backup).map_err(|e| {
+            cleanup_doctor_temp_sqlite_artifact(&staged_restore);
             CliError::Other(format!(
                 "failed to create pre-rollback backup {}: {e}",
                 rollback_backup.display()
@@ -9857,24 +9961,32 @@ fn restore_db_from_backup(db_path: &Path, backup_path: &Path) -> CliResult<()> {
         })?;
     }
 
-    let db_wal = sqlite_sidecar_path(db_path, "-wal");
-    let db_shm = sqlite_sidecar_path(db_path, "-shm");
-    remove_sqlite_sidecar_if_exists(&db_wal, "pre-restore WAL")?;
-    remove_sqlite_sidecar_if_exists(&db_shm, "pre-restore SHM")?;
+    for (suffix, label) in [
+        ("-journal", "pre-restore rollback-journal"),
+        ("-wal", "pre-restore WAL"),
+        ("-shm", "pre-restore SHM"),
+    ] {
+        if let Err(error) =
+            remove_sqlite_sidecar_if_exists(&sqlite_sidecar_path(db_path, suffix), label)
+        {
+            cleanup_doctor_temp_sqlite_artifact(&staged_restore);
+            return Err(error);
+        }
+    }
 
-    std::fs::copy(backup_path, db_path).map_err(|e| {
-        CliError::Other(format!(
-            "failed to restore {} -> {}: {e}",
-            backup_path.display(),
-            db_path.display()
-        ))
-    })?;
+    swap_validated_sqlite_artifact(db_path, &staged_restore, &restore_ts)?;
 
-    // Never restore WAL/SHM sidecars from backup artifacts. Sidecars can be
-    // stale/inconsistent relative to the copied main DB and have repeatedly
-    // caused malformed-image failures. Let SQLite recreate fresh sidecars.
-    remove_sqlite_sidecar_if_exists(&db_wal, "post-restore WAL")?;
-    remove_sqlite_sidecar_if_exists(&db_shm, "post-restore SHM")?;
+    // Never restore rollback-journal/WAL/SHM sidecars from backup artifacts.
+    // Sidecars can be stale/inconsistent relative to the copied main DB and
+    // have repeatedly caused malformed-image failures. Let SQLite recreate
+    // fresh sidecars.
+    for (suffix, label) in [
+        ("-journal", "post-restore rollback-journal"),
+        ("-wal", "post-restore WAL"),
+        ("-shm", "post-restore SHM"),
+    ] {
+        remove_sqlite_sidecar_if_exists(&sqlite_sidecar_path(db_path, suffix), label)?;
+    }
 
     if !sqlite_file_is_healthy(db_path)? {
         return Err(CliError::Other(format!(
@@ -10668,8 +10780,9 @@ fn handle_clear_and_reset(force: bool, archive: bool, no_archive: bool) -> CliRe
     let source_db_for_archive = match db_path.as_deref() {
         Some(p) if p.to_string_lossy() != ":memory:" => {
             database_files.push(p.to_path_buf());
-            database_files.push(mcp_agent_mail_core::disk::sqlite_sidecar_path(p, "-wal"));
-            database_files.push(mcp_agent_mail_core::disk::sqlite_sidecar_path(p, "-shm"));
+            for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+                database_files.push(mcp_agent_mail_core::disk::sqlite_sidecar_path(p, suffix));
+            }
             Some(p)
         }
         _ => None,
@@ -25165,18 +25278,26 @@ http_headers = { Authorization = "Bearer secret" }
         write_marker_db(&backup_source_path, "backup-db");
         std::fs::copy(&backup_source_path, &backup_path).expect("seed backup db");
 
+        let db_journal = sqlite_sidecar_path(&db_path, "-journal");
         let db_wal = sqlite_sidecar_path(&db_path, "-wal");
         let db_shm = sqlite_sidecar_path(&db_path, "-shm");
+        let backup_journal = sqlite_sidecar_path(&backup_path, "-journal");
         let backup_wal = sqlite_sidecar_path(&backup_path, "-wal");
         let backup_shm = sqlite_sidecar_path(&backup_path, "-shm");
+        std::fs::write(&db_journal, b"live-journal").expect("write live journal");
         std::fs::write(&db_wal, b"live-wal").expect("write live wal");
         std::fs::write(&db_shm, b"live-shm").expect("write live shm");
+        std::fs::write(&backup_journal, b"backup-journal").expect("write backup journal");
         std::fs::write(&backup_wal, b"backup-wal").expect("write backup wal");
         std::fs::write(&backup_shm, b"backup-shm").expect("write backup shm");
 
         restore_db_from_backup(&db_path, &backup_path).expect("restore");
         let restored = read_marker_db(&db_path);
         assert_eq!(restored, "backup-db");
+        assert!(
+            !db_journal.exists(),
+            "restore should remove stale rollback journals instead of preserving them"
+        );
 
         if db_wal.exists() {
             let wal_bytes = std::fs::read(&db_wal).expect("read restored wal");
@@ -25236,6 +25357,79 @@ http_headers = { Authorization = "Bearer secret" }
         assert!(
             db_wal.exists(),
             "blocking wal directory should remain in place after failure"
+        );
+    }
+
+    #[test]
+    fn restore_db_from_backup_leaves_live_db_untouched_when_staged_backup_is_invalid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("staged-invalid.sqlite3");
+        let backup_path = dir
+            .path()
+            .join("staged-invalid.sqlite3.bak.20260102_000000");
+
+        write_marker_db(&db_path, "live-db");
+        std::fs::write(&backup_path, b"not-a-valid-sqlite-backup").expect("seed invalid backup");
+
+        let err =
+            restore_db_from_backup(&db_path, &backup_path).expect_err("restore should fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("did not pass health check after staging copy"),
+            "unexpected error: {msg}"
+        );
+        assert_eq!(
+            read_marker_db(&db_path),
+            "live-db",
+            "live database should remain untouched when staged backup validation fails"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("read dir")
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".restore-")),
+            "staged restore artifacts should be cleaned up after failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_sqlite_backup_consistently_rejects_symlinked_destination() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        let real_target = dir.path().join("real-backup.sqlite3");
+        let backup_link = dir.path().join("backup-link.sqlite3");
+
+        write_marker_db(&db_path, "snapshot");
+        std::fs::write(&real_target, b"existing").expect("seed real target");
+        symlink(&real_target, &backup_link).expect("symlink backup target");
+
+        let err = copy_sqlite_backup_consistently(&db_path, &backup_link)
+            .expect_err("symlinked backup destination should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("symlinked destination"),
+            "unexpected error: {msg}"
+        );
+        assert_eq!(
+            std::fs::read(&real_target).expect("read real target"),
+            b"existing",
+            "backup creation must not write through symlinked destinations"
+        );
+    }
+
+    #[test]
+    fn staged_backup_paths_are_hidden_from_backup_discovery_patterns() {
+        let backup_path = PathBuf::from("/tmp/storage.sqlite3.bak.20260102_000000");
+        let staged = next_sibling_staged_file_path(&backup_path, "backup-stage");
+        let file_name = staged.file_name().and_then(|name| name.to_str()).unwrap();
+
+        assert!(file_name.starts_with('.'), "expected hidden stage path");
+        assert!(
+            !file_name.starts_with("storage.sqlite3.bak."),
+            "staged backup path must not look like a discoverable backup filename"
         );
     }
 
@@ -29719,23 +29913,28 @@ startup_timeout_sec = 42
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("storage.sqlite3");
         let quarantine = tmp.path().join("storage.sqlite3.corrupt");
+        let journal_path = sqlite_sidecar_path(&db_path, "-journal");
         let wal_path = sqlite_sidecar_path(&db_path, "-wal");
         let shm_path = sqlite_sidecar_path(&db_path, "-shm");
 
         std::fs::write(&db_path, b"main").unwrap();
+        std::fs::write(&journal_path, b"journal").unwrap();
         std::fs::write(&wal_path, b"wal").unwrap();
         std::fs::write(&shm_path, b"shm").unwrap();
 
         let state = quarantine_sqlite_state(&db_path, &quarantine).unwrap();
         assert!(!db_path.exists());
+        assert!(!journal_path.exists());
         assert!(!wal_path.exists());
         assert!(!shm_path.exists());
         assert!(quarantine.exists());
+        assert!(quarantine_sidecar_path(&quarantine, "-journal").exists());
         assert!(quarantine_sidecar_path(&quarantine, "-wal").exists());
         assert!(quarantine_sidecar_path(&quarantine, "-shm").exists());
 
         restore_quarantined_sqlite_state(&state).unwrap();
         assert!(db_path.exists());
+        assert!(journal_path.exists());
         assert!(wal_path.exists());
         assert!(shm_path.exists());
         assert!(!quarantine.exists());
@@ -29992,6 +30191,32 @@ startup_timeout_sec = 42
         );
     }
 
+    #[test]
+    fn next_doctor_artifact_path_skips_journal_only_collisions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("storage.sqlite3");
+        let first = next_doctor_artifact_path_with_timestamp(
+            &db_path,
+            "restore",
+            "sqlite3",
+            "20260324_120000_003",
+        );
+        let first_journal = sqlite_sidecar_path(&first, "-journal");
+        std::fs::write(&first_journal, b"stale-temp-journal").unwrap();
+
+        let second = next_doctor_artifact_path_with_timestamp(
+            &db_path,
+            "restore",
+            "sqlite3",
+            "20260324_120000_003",
+        );
+
+        assert_ne!(
+            first, second,
+            "journal-only collisions should force a new temp artifact path"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn next_sqlite_quarantine_path_preserves_non_utf8_basename_and_skips_sidecar_collisions() {
@@ -30002,8 +30227,8 @@ startup_timeout_sec = 42
         let db_path = tmp.path().join(&db_name);
 
         let first = next_sqlite_quarantine_path(&db_path, "20260324_120000_004");
-        let first_wal = sqlite_sidecar_path(&first, "-wal");
-        std::fs::write(&first_wal, b"stale-quarantine-wal").unwrap();
+        let first_journal = sqlite_sidecar_path(&first, "-journal");
+        std::fs::write(&first_journal, b"stale-quarantine-journal").unwrap();
 
         let second = next_sqlite_quarantine_path(&db_path, "20260324_120000_004");
         let expected = db_path.with_file_name(os_string_with_suffix(
@@ -30041,15 +30266,18 @@ startup_timeout_sec = 42
     fn cleanup_doctor_temp_sqlite_artifact_removes_orphan_sidecars() {
         let tmp = tempfile::tempdir().unwrap();
         let temp_db_path = tmp.path().join("storage.sqlite3.restore.sqlite3");
+        let journal_path = sqlite_sidecar_path(&temp_db_path, "-journal");
         let wal_path = sqlite_sidecar_path(&temp_db_path, "-wal");
         let shm_path = sqlite_sidecar_path(&temp_db_path, "-shm");
 
+        std::fs::write(&journal_path, b"stale-journal").unwrap();
         std::fs::write(&wal_path, b"stale-wal").unwrap();
         std::fs::write(&shm_path, b"stale-shm").unwrap();
 
         cleanup_doctor_temp_sqlite_artifact(&temp_db_path);
 
         assert!(!temp_db_path.exists());
+        assert!(!journal_path.exists());
         assert!(!wal_path.exists());
         assert!(!shm_path.exists());
     }
@@ -40821,28 +41049,18 @@ fn prompt_bool(label: &str, default: bool) -> CliResult<bool> {
 }
 
 fn prepare_share_export_output_dir(output: &Path) -> CliResult<()> {
-    if output.exists() {
-        if !output.is_dir() {
+    ensure_real_directory_tree(output, "share export output path")?;
+    let mut entries = output.read_dir()?;
+    match entries.next() {
+        None => {}
+        Some(Ok(_)) => {
             return Err(CliError::Other(format!(
-                "export path {} exists and is not a directory",
+                "export path {} is not empty; choose a new directory",
                 output.display()
             )));
         }
-        let mut entries = output.read_dir()?;
-        match entries.next() {
-            None => {}
-            Some(Ok(_)) => {
-                return Err(CliError::Other(format!(
-                    "export path {} is not empty; choose a new directory",
-                    output.display()
-                )));
-            }
-            Some(Err(e)) => return Err(CliError::Io(e)),
-        }
-        return Ok(());
+        Some(Err(e)) => return Err(CliError::Io(e)),
     }
-
-    std::fs::create_dir_all(output)?;
     Ok(())
 }
 
@@ -41011,7 +41229,7 @@ fn share_update_optional_real_file_exists(path: &Path, label: &str) -> CliResult
     }
 }
 
-fn share_update_ensure_real_directory(path: &Path) -> CliResult<()> {
+fn ensure_real_directory_tree(path: &Path, label: &str) -> CliResult<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
         use std::path::Component;
@@ -41022,7 +41240,7 @@ fn share_update_ensure_real_directory(path: &Path) -> CliResult<()> {
             Component::CurDir => {}
             Component::ParentDir => {
                 return Err(CliError::Other(format!(
-                    "refusing to create bundle directory with parent traversal: {}",
+                    "refusing to create {label} with parent traversal: {}",
                     path.display()
                 )));
             }
@@ -41032,13 +41250,13 @@ fn share_update_ensure_real_directory(path: &Path) -> CliResult<()> {
                     Ok(metadata) if metadata.file_type().is_dir() => {}
                     Ok(metadata) if metadata.file_type().is_symlink() => {
                         return Err(CliError::Other(format!(
-                            "refusing to traverse symlinked bundle directory {}",
+                            "{label} {} must not be a symlink",
                             current.display()
                         )));
                     }
                     Ok(_) => {
                         return Err(CliError::Other(format!(
-                            "expected bundle directory but found non-directory {}",
+                            "{label} {} exists but is not a directory",
                             current.display()
                         )));
                     }
@@ -41051,6 +41269,10 @@ fn share_update_ensure_real_directory(path: &Path) -> CliResult<()> {
         }
     }
     Ok(())
+}
+
+fn share_update_ensure_real_directory(path: &Path) -> CliResult<()> {
+    ensure_real_directory_tree(path, "bundle directory")
 }
 
 fn share_update_copy_file(src: &Path, dst: &Path) -> CliResult<()> {
@@ -42695,13 +42917,13 @@ fn archive_restore_state(
             next_backup_path(&database_path, &timestamp).display()
         ));
     }
-    for suffix in ["-wal", "-shm"] {
-        let wal_path = mcp_agent_mail_core::disk::sqlite_sidecar_path(&database_path, suffix);
-        if wal_path.exists() {
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+        let sidecar_path = mcp_agent_mail_core::disk::sqlite_sidecar_path(&database_path, suffix);
+        if sidecar_path.exists() {
             planned_ops.push(format!(
                 "backup {} -> {}",
-                wal_path.display(),
-                next_backup_path(&wal_path, &timestamp).display()
+                sidecar_path.display(),
+                next_backup_path(&sidecar_path, &timestamp).display()
             ));
         }
     }
@@ -42784,13 +43006,14 @@ fn archive_restore_state(
                 backup,
             });
         }
-        for suffix in ["-wal", "-shm"] {
-            let wal_path = mcp_agent_mail_core::disk::sqlite_sidecar_path(&database_path, suffix);
-            if wal_path.exists() {
-                let backup = next_backup_path(&wal_path, &timestamp);
-                std::fs::rename(&wal_path, &backup)?;
+        for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+            let sidecar_path =
+                mcp_agent_mail_core::disk::sqlite_sidecar_path(&database_path, suffix);
+            if sidecar_path.exists() {
+                let backup = next_backup_path(&sidecar_path, &timestamp);
+                std::fs::rename(&sidecar_path, &backup)?;
                 backup_entries.push(ArchiveRestoreBackupEntry {
-                    original: wal_path,
+                    original: sidecar_path,
                     backup,
                 });
             }
@@ -43530,7 +43753,7 @@ fn quarantine_sqlite_state(
     std::fs::rename(db_path, quarantine_db)?;
 
     let mut sidecars = Vec::new();
-    for suffix in ["-wal", "-shm"] {
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
         let original = sqlite_sidecar_path(db_path, suffix);
         if !original.exists() {
             continue;
@@ -43571,7 +43794,7 @@ fn restore_quarantined_sqlite_state(state: &QuarantinedSqliteState) -> CliResult
 
 fn sqlite_artifact_conflicts(candidate: &Path) -> bool {
     candidate.exists()
-        || ["-wal", "-shm"]
+        || SQLITE_RECOVERY_SIDECAR_SUFFIXES
             .iter()
             .any(|suffix| sqlite_sidecar_path(candidate, suffix).exists())
 }
@@ -43646,7 +43869,7 @@ where
         )));
     }
 
-    for suffix in ["-wal", "-shm"] {
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
         let temp_sidecar = sqlite_sidecar_path(temp_db_path, suffix);
         if temp_sidecar.exists() {
             let final_sidecar = sqlite_sidecar_path(db_path, suffix);
@@ -43772,7 +43995,7 @@ fn restore_swapped_replacement_sqlite_artifact_without_original(
 
 fn cleanup_doctor_temp_sqlite_artifact(path: &Path) {
     let _ = std::fs::remove_file(path);
-    for suffix in ["-wal", "-shm"] {
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
         let _ = std::fs::remove_file(sqlite_sidecar_path(path, suffix));
     }
 }
@@ -43780,7 +44003,7 @@ fn cleanup_doctor_temp_sqlite_artifact(path: &Path) {
 fn doctor_temp_sqlite_artifact_conflicts(candidate: &Path, extension: &str) -> bool {
     candidate.exists()
         || (extension.eq_ignore_ascii_case("sqlite3")
-            && ["-wal", "-shm"]
+            && SQLITE_RECOVERY_SIDECAR_SUFFIXES
                 .iter()
                 .any(|suffix| sqlite_sidecar_path(candidate, suffix).exists()))
 }
@@ -49248,6 +49471,54 @@ fn run_share_export_rejects_public_key_output_without_signing_key() {
     assert!(
         !output.exists(),
         "share export should fail before creating the bundle output"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn prepare_share_export_output_dir_rejects_symlinked_output_directory() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let real_output = temp.path().join("real-output");
+    let symlink_output = temp.path().join("bundle");
+    std::fs::create_dir_all(&real_output).expect("create real output");
+    std::os::unix::fs::symlink(&real_output, &symlink_output).expect("create symlinked output");
+
+    let err = prepare_share_export_output_dir(&symlink_output)
+        .expect_err("symlinked export output directory should be rejected");
+
+    assert!(
+        format!("{err}").contains("must not be a symlink"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        real_output
+            .read_dir()
+            .expect("read real output")
+            .next()
+            .is_none(),
+        "symlink target should remain untouched"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn prepare_share_export_output_dir_rejects_symlinked_parent_directory() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let real_parent = temp.path().join("real-parent");
+    let symlink_parent = temp.path().join("linked-parent");
+    std::fs::create_dir_all(&real_parent).expect("create real parent");
+    std::os::unix::fs::symlink(&real_parent, &symlink_parent).expect("create symlinked parent");
+
+    let err = prepare_share_export_output_dir(&symlink_parent.join("bundle"))
+        .expect_err("symlinked export parent should be rejected");
+
+    assert!(
+        format!("{err}").contains("must not be a symlink"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !real_parent.join("bundle").exists(),
+        "export helper should not create directories through a symlinked parent"
     );
 }
 

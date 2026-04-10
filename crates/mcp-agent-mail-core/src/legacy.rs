@@ -1542,6 +1542,8 @@ fn default_backup_dir(source_storage_root: &Path, timestamp: &str) -> PathBuf {
     parent.join("mcp-agent-mail-legacy-backups").join(timestamp)
 }
 
+const SQLITE_IMPORT_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
+
 fn backup_db_with_sidecars(db_path: &Path, destination_root: &Path) -> CliResult<()> {
     fs::create_dir_all(destination_root)?;
     let db_name = db_path
@@ -1549,7 +1551,7 @@ fn backup_db_with_sidecars(db_path: &Path, destination_root: &Path) -> CliResult
         .map(|v| v.to_owned())
         .unwrap_or_else(|| "storage.sqlite3".into());
     fs::copy(db_path, destination_root.join(db_name))?;
-    for suffix in ["-wal", "-shm"] {
+    for suffix in SQLITE_IMPORT_SIDECAR_SUFFIXES {
         let sidecar = sqlite_sidecar_path(db_path, suffix);
         if sidecar.exists() {
             let file_name = sidecar
@@ -1582,9 +1584,10 @@ fn copy_db_with_sidecars(source_db: &Path, target_db: &Path) -> CliResult<()> {
     }
     fs::copy(source_db, target_db)?;
 
-    // Avoid transporting stale WAL/SHM sidecars into the imported database.
-    // Sidecars are ephemeral and can be inconsistent with the copied main DB.
-    for suffix in ["-wal", "-shm"] {
+    // Avoid transporting stale rollback-journal/WAL/SHM sidecars into the
+    // imported database. Sidecars are ephemeral and can be inconsistent with
+    // the copied main DB.
+    for suffix in SQLITE_IMPORT_SIDECAR_SUFFIXES {
         let mut target_sidecar_os = target_db.as_os_str().to_os_string();
         target_sidecar_os.push(suffix);
         let target_sidecar = PathBuf::from(target_sidecar_os);
@@ -2374,14 +2377,17 @@ mod tests {
         let db_path = tmp.path().join(OsStr::from_bytes(b"legacy-\xFF.sqlite3"));
         let backup_dir = tmp.path().join("backup");
         fs::write(&db_path, b"db").unwrap();
+        let journal_path = sqlite_sidecar_path(&db_path, "-journal");
         let wal_path = sqlite_sidecar_path(&db_path, "-wal");
         let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        fs::write(&journal_path, b"journal").unwrap();
         fs::write(&wal_path, b"wal").unwrap();
         fs::write(&shm_path, b"shm").unwrap();
 
         backup_db_with_sidecars(&db_path, &backup_dir).unwrap();
 
         assert!(backup_dir.join(db_path.file_name().unwrap()).exists());
+        assert!(backup_dir.join(journal_path.file_name().unwrap()).exists());
         assert!(backup_dir.join(wal_path.file_name().unwrap()).exists());
         assert!(backup_dir.join(shm_path.file_name().unwrap()).exists());
     }
@@ -2402,14 +2408,14 @@ mod tests {
         let _ = source_conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
         drop(source_conn);
 
-        let target_wal = sqlite_sidecar_path(&target_db, "-wal");
-        fs::create_dir_all(&target_wal).unwrap();
+        let target_journal = sqlite_sidecar_path(&target_db, "-journal");
+        fs::create_dir_all(&target_journal).unwrap();
 
         let err = copy_db_with_sidecars(&source_db, &target_db).unwrap_err();
         match err {
             CliError::Other(message) => {
                 assert!(message.contains("failed to clear stale target sidecar"));
-                assert!(message.contains(target_wal.to_string_lossy().as_ref()));
+                assert!(message.contains(target_journal.to_string_lossy().as_ref()));
             }
             other => panic!("expected copy failure, got {other:?}"),
         }

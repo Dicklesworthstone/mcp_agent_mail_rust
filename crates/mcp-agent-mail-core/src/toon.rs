@@ -363,18 +363,20 @@ fn clear_result_cache_for_tests() {
 
 /// Resolve the encoder binary path from config.
 ///
-/// Returns the first token from the configured `TOON_BIN` (split via shell-like splitting),
-/// or the default "tru" if not configured.
+/// Returns the configured `TOON_BIN` as shell-style arguments, or the default
+/// `"tru"` if not configured.
+#[must_use]
 pub fn resolve_encoder(config: &Config) -> Vec<String> {
-    let raw = config.toon_bin.as_deref().unwrap_or(DEFAULT_ENCODER);
-
-    // Simple shell-like splitting (no quoting support, matches Python shlex.split fallback)
-    let parts: Vec<String> = raw.split_whitespace().map(String::from).collect();
-    if parts.is_empty() {
-        vec![DEFAULT_ENCODER.to_string()]
-    } else {
-        parts
+    let raw = config.toon_bin.as_deref().unwrap_or(DEFAULT_ENCODER).trim();
+    if raw.is_empty() {
+        return vec![DEFAULT_ENCODER.to_string()];
     }
+
+    // Respect quoted paths/arguments so configs like
+    // TOON_BIN='"/Applications/Toon Rust/tru" --experimental' survive intact.
+    shlex::split(raw)
+        .filter(|parts| !parts.is_empty())
+        .unwrap_or_else(|| vec![raw.to_string()])
 }
 
 /// Check if a binary looks like the `toon_rust` encoder.
@@ -1042,6 +1044,22 @@ mod tests {
     }
 
     #[test]
+    fn resolve_encoder_preserves_quoted_path_segments() {
+        let mut config = test_config();
+        config.toon_bin = Some("\"/Applications/Toon Rust/tru\" --experimental".to_string());
+
+        let parts = resolve_encoder(&config);
+
+        assert_eq!(
+            parts,
+            vec![
+                "/Applications/Toon Rust/tru".to_string(),
+                "--experimental".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn encoder_command_key_is_collision_resistant_for_separator_content() {
         // Old separator-join scheme would collide for these two vectors.
         let sep = '\u{1F}';
@@ -1641,6 +1659,21 @@ esac
         };
         let parts = resolve_encoder(&config);
         assert_eq!(parts, vec!["tru".to_string()]);
+    }
+
+    #[test]
+    fn resolve_encoder_preserves_malformed_quoted_input_as_single_command() {
+        let config = Config {
+            toon_bin: Some("\"/Applications/Toon Rust/tru --experimental".to_string()),
+            ..test_config()
+        };
+
+        let parts = resolve_encoder(&config);
+
+        assert_eq!(
+            parts,
+            vec!["\"/Applications/Toon Rust/tru --experimental".to_string()]
+        );
     }
 
     // -- Derive trait tests --

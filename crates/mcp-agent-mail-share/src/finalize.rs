@@ -12,6 +12,7 @@ use crate::ShareError;
 type Conn = DbConn;
 const UNKNOWN_RECIPIENT_DISPLAY: &str = "[unknown recipient]";
 const UNKNOWN_PROJECT_SLUG_PREFIX: &str = "[unknown-project-";
+const SQLITE_SNAPSHOT_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
 
 #[cfg(test)]
 // Historical alias name retained in tests; this still uses FrankenSQLite `DbConn`.
@@ -618,7 +619,7 @@ fn rewrite_snapshot_storage(snapshot_path: &Path) -> Result<(), ShareError> {
 
     let backup_path = temp_dir.path().join("mailbox.backup.sqlite3");
     replace_snapshot_with_rebuilt_path(&rebuilt_path, &snapshot_path, &backup_path)?;
-    for suffix in ["-wal", "-shm"] {
+    for suffix in SQLITE_SNAPSHOT_SIDECAR_SUFFIXES {
         let mut sidecar_os = snapshot_path.as_os_str().to_os_string();
         sidecar_os.push(suffix);
         let sidecar_path = std::path::PathBuf::from(sidecar_os);
@@ -1565,6 +1566,32 @@ mod tests {
             !backup.exists(),
             "successful rollback should not leave the backup path behind"
         );
+    }
+
+    #[test]
+    fn rewrite_snapshot_storage_removes_stale_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let journal_path = std::path::PathBuf::from(format!("{}-journal", db.display()));
+        let wal_path = std::path::PathBuf::from(format!("{}-wal", db.display()));
+        let shm_path = std::path::PathBuf::from(format!("{}-shm", db.display()));
+
+        std::fs::write(&journal_path, b"stale-journal").unwrap();
+        std::fs::write(&wal_path, b"stale-wal").unwrap();
+        std::fs::write(&shm_path, b"stale-shm").unwrap();
+
+        rewrite_snapshot_storage(&db).unwrap();
+
+        assert!(!journal_path.exists(), "rollback journal should be removed");
+        assert!(!wal_path.exists(), "WAL sidecar should be removed");
+        assert!(!shm_path.exists(), "SHM sidecar should be removed");
+
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM messages", &[])
+            .unwrap();
+        let count: i64 = rows[0].get_named("cnt").unwrap();
+        assert_eq!(count, 2, "snapshot should remain queryable after rewrite");
     }
 
     #[test]

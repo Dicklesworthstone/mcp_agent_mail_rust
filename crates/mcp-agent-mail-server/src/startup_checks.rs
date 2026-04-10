@@ -1080,17 +1080,51 @@ fn pid_is_agent_mail(pid: u32) -> bool {
 }
 
 fn pid_executable_path_matches(pid: u32, expected_path: &str) -> bool {
+    #[cfg(target_os = "linux")]
     let Some(actual_path) = pid_executable_path(pid) else {
         return false;
     };
 
-    canonicalize_process_path(expected_path)
-        == canonicalize_process_path(actual_path.to_string_lossy().as_ref())
+    #[cfg(target_os = "linux")]
+    {
+        canonicalize_process_path(expected_path)
+            == canonicalize_process_path(actual_path.to_string_lossy().as_ref())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        pid_command_line(pid)
+            .is_some_and(|command| command_line_starts_with_process_path(&command, expected_path))
+    }
 }
 
 fn canonicalize_process_path(path: &str) -> PathBuf {
     let candidate = PathBuf::from(path);
     std::fs::canonicalize(&candidate).unwrap_or(candidate)
+}
+
+#[cfg(any(test, not(target_os = "linux")))]
+fn process_path_prefix_matches(command: &str, candidate_path: &str) -> bool {
+    let trimmed = command.trim_start();
+    trimmed == candidate_path
+        || trimmed
+            .strip_prefix(candidate_path)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+}
+
+#[cfg(any(test, not(target_os = "linux")))]
+fn command_line_starts_with_process_path(command: &str, expected_path: &str) -> bool {
+    if expected_path.trim().is_empty() {
+        return false;
+    }
+    if process_path_prefix_matches(command, expected_path) {
+        return true;
+    }
+
+    let canonical = canonicalize_process_path(expected_path);
+    canonical
+        .to_str()
+        .is_some_and(|path| path != expected_path && process_path_prefix_matches(command, path))
 }
 
 fn command_line_has_agent_mail_signature(command: &str) -> bool {
@@ -1131,10 +1165,19 @@ fn pid_command_line(pid: u32) -> Option<String> {
     (!segments.is_empty()).then(|| segments.join(" "))
 }
 
+#[cfg(any(test, not(target_os = "linux")))]
+fn parse_ps_output_value(stdout: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 #[cfg(not(target_os = "linux"))]
-fn pid_command_line(pid: u32) -> Option<String> {
+fn ps_output_value(pid: u32, column: &str) -> Option<String> {
     let output = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
+        .args(["-p", &pid.to_string(), "-o", column])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
@@ -1142,43 +1185,30 @@ fn pid_command_line(pid: u32) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!command.is_empty()).then_some(command)
+    parse_ps_output_value(&output.stdout)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_command_line(pid: u32) -> Option<String> {
+    ps_output_value(pid, "command=")
 }
 
 #[cfg(target_os = "linux")]
 fn pid_executable_basename(pid: u32) -> Option<String> {
-    let exe = pid_executable_path(pid)?;
-    exe.file_name()
+    let actual_path = pid_executable_path(pid)?;
+    actual_path
+        .file_name()
         .map(|name| name.to_string_lossy().into_owned())
 }
 
 #[cfg(not(target_os = "linux"))]
 fn pid_executable_basename(pid: u32) -> Option<String> {
-    let exe = pid_executable_path(pid)?;
-    exe.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
+    ps_output_value(pid, "comm=")
 }
 
 #[cfg(target_os = "linux")]
 fn pid_executable_path(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/exe")).ok()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn pid_executable_path(pid: u32) -> Option<PathBuf> {
-    let output = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let command = String::from_utf8_lossy(&output.stdout);
-    let argv0 = command.split_whitespace().next()?.trim();
-    (!argv0.is_empty()).then(|| PathBuf::from(argv0))
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -3166,6 +3196,34 @@ mod tests {
         assert!(executable_name_has_agent_mail_signature(
             "mcp_agent_mail_cli.exe"
         ));
+    }
+
+    #[test]
+    fn process_path_prefix_matches_handles_spaces_in_executable_path() {
+        let command = "/Applications/Agent Mail.app/Contents/MacOS/mcp-agent-mail serve --no-auth";
+        let executable_path = "/Applications/Agent Mail.app/Contents/MacOS/mcp-agent-mail";
+        assert!(process_path_prefix_matches(command, executable_path));
+        assert!(command_line_starts_with_process_path(
+            command,
+            executable_path
+        ));
+    }
+
+    #[test]
+    fn process_path_prefix_matches_rejects_partial_prefixes() {
+        let command = "/opt/tools/mcp-agent-mail-helper serve";
+        assert!(!process_path_prefix_matches(
+            command,
+            "/opt/tools/mcp-agent-mail"
+        ));
+    }
+
+    #[test]
+    fn parse_ps_output_value_uses_first_nonempty_trimmed_line() {
+        assert_eq!(
+            parse_ps_output_value(b"\n  /usr/local/bin/mcp-agent-mail  \nignored\n"),
+            Some("/usr/local/bin/mcp-agent-mail".to_string())
+        );
     }
 
     #[test]

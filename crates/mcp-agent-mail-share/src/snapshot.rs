@@ -1412,6 +1412,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(output.join("manifest.sig.json"), "{\"stale\":true}").unwrap();
+        std::fs::write(output.join("mailbox.sqlite3-journal"), "stale journal").unwrap();
         std::fs::write(output.join("mailbox.sqlite3-wal"), "stale wal").unwrap();
         std::fs::write(output.join("mailbox.sqlite3-shm"), "stale shm").unwrap();
         std::fs::write(output.join("keep.txt"), "preserve me").unwrap();
@@ -1458,6 +1459,7 @@ mod tests {
         assert!(!output.join("chunks.sha256").exists());
         assert!(!output.join("mailbox.sqlite3.config.json").exists());
         assert!(!output.join("manifest.sig.json").exists());
+        assert!(!output.join("mailbox.sqlite3-journal").exists());
         assert!(!output.join("mailbox.sqlite3-wal").exists());
         assert!(!output.join("mailbox.sqlite3-shm").exists());
         assert_eq!(

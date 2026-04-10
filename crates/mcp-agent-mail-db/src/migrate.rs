@@ -28,6 +28,8 @@ use chrono::NaiveDateTime;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use thiserror::Error;
 
+const SQLITE_COPY_DESTINATION_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
+
 // ── Error types ────────────────────────────────────────────────────────────
 
 /// Errors that can occur during migration detection or conversion.
@@ -802,8 +804,9 @@ fn is_sqlite_file(path: &std::path::Path) -> bool {
 /// Copy a Python database to the Rust storage root.
 ///
 /// Performs `wal_checkpoint(TRUNCATE)` on the source DB first, then copies only
-/// the main database file. WAL/SHM sidecars are intentionally not copied to avoid
-/// transporting stale sidecar state that can trigger malformed-image failures.
+/// the main database file. Rollback-journal/WAL/SHM sidecars are intentionally not
+/// copied to avoid transporting stale sidecar state that can trigger malformed-image
+/// failures.
 ///
 /// Returns the destination path if successful, or `None` if:
 /// - The destination already exists (won't overwrite)
@@ -835,7 +838,7 @@ pub fn copy_python_database_to_rust(
     // cannot clear. Leaving those behind after a "successful" copy can poison
     // the first Rust open with exactly the malformed-image path we are trying
     // to avoid.
-    for suffix in ["-wal", "-shm"] {
+    for suffix in SQLITE_COPY_DESTINATION_SIDECAR_SUFFIXES {
         let sidecar = sqlite_path_with_suffix(&dest, suffix);
         if sidecar.exists() {
             std::fs::remove_file(&sidecar).map_err(|e| {
@@ -1635,8 +1638,10 @@ mod tests {
             .expect("seed source marker");
         let _ = source_conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
 
+        let source_journal = std::path::PathBuf::from(format!("{}-journal", src_db.display()));
         let source_wal = std::path::PathBuf::from(format!("{}-wal", src_db.display()));
         let source_shm = std::path::PathBuf::from(format!("{}-shm", src_db.display()));
+        std::fs::write(&source_journal, b"python-sidecar-journal").expect("write source journal");
         std::fs::write(&source_wal, b"python-sidecar-wal").expect("write source wal");
         std::fs::write(&source_shm, b"python-sidecar-shm").expect("write source shm");
 
@@ -1646,8 +1651,13 @@ mod tests {
         assert!(dest.exists());
         assert_eq!(dest, dst_dir.join("storage.sqlite3"));
 
+        let dest_journal = std::path::PathBuf::from(format!("{}-journal", dest.display()));
         let dest_wal = std::path::PathBuf::from(format!("{}-wal", dest.display()));
         let dest_shm = std::path::PathBuf::from(format!("{}-shm", dest.display()));
+        assert!(
+            !dest_journal.exists(),
+            "destination should not include copied rollback-journal sidecar"
+        );
         assert!(
             !dest_wal.exists(),
             "destination should not include copied WAL sidecar"
@@ -1714,8 +1724,8 @@ mod tests {
             .expect("create source marker table");
         drop(source_conn);
 
-        let blocking_wal_dir = dst_dir.join("storage.sqlite3-wal");
-        std::fs::create_dir_all(&blocking_wal_dir).expect("create blocking wal dir");
+        let blocking_journal_dir = dst_dir.join("storage.sqlite3-journal");
+        std::fs::create_dir_all(&blocking_journal_dir).expect("create blocking journal dir");
 
         let err = copy_python_database_to_rust(&src_db, &dst_dir)
             .expect_err("stale destination sidecar cleanup failure should abort migration");
@@ -1729,7 +1739,7 @@ mod tests {
             "destination DB should not be copied when sidecar cleanup is blocked"
         );
         assert!(
-            blocking_wal_dir.is_dir(),
+            blocking_journal_dir.is_dir(),
             "blocking sidecar directory should remain for operator inspection"
         );
 

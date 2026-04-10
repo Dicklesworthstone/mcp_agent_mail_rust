@@ -2258,6 +2258,7 @@ dependencies = [
  "fsqlite-error",
  "fsqlite-func",
  "fsqlite-types",
+ "smallvec",
  "tracing",
 ]
 
@@ -4809,6 +4810,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "shellexpand",
+ "shlex",
  "sqlmodel-frankensqlite",
  "tempfile",
  "thiserror",

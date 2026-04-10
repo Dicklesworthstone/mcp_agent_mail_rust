@@ -787,6 +787,7 @@ const BUNDLE_EXPORT_OWNED_FILES: &[&str] = &[
     ".nojekyll",
     "_headers",
     "mailbox.sqlite3",
+    "mailbox.sqlite3-journal",
     "mailbox.sqlite3-wal",
     "mailbox.sqlite3-shm",
     "chunks.sha256",
@@ -3290,6 +3291,31 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(staged.join("viewer/data/messages.json")).unwrap(),
             "[\"new viewer\"]"
+        );
+    }
+
+    #[test]
+    fn publish_staged_bundle_outputs_removes_stale_sqlite_journal_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("bundle");
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(output.join("mailbox.sqlite3"), b"old-db").unwrap();
+        std::fs::write(output.join("mailbox.sqlite3-journal"), b"stale-journal").unwrap();
+
+        let staged = dir.path().join("staged");
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join("mailbox.sqlite3"), b"new-db").unwrap();
+
+        publish_staged_bundle_outputs(&staged, &output).unwrap();
+
+        assert_eq!(
+            std::fs::read(output.join("mailbox.sqlite3")).unwrap(),
+            b"new-db",
+            "publish should replace the mailbox database with the staged output"
+        );
+        assert!(
+            !output.join("mailbox.sqlite3-journal").exists(),
+            "stale rollback-journal sidecars must be removed during bundle publish"
         );
     }
 

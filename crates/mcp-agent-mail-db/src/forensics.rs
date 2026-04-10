@@ -832,10 +832,19 @@ fn pid_command_line(pid: u32) -> Option<String> {
     (!segments.is_empty()).then(|| segments.join(" "))
 }
 
+#[cfg(any(test, not(target_os = "linux")))]
+fn parse_ps_output_value(stdout: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 #[cfg(not(target_os = "linux"))]
-fn pid_command_line(pid: u32) -> Option<String> {
+fn ps_output_value(pid: u32, column: &str) -> Option<String> {
     let output = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
+        .args(["-p", &pid.to_string(), "-o", column])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .output()
@@ -843,8 +852,12 @@ fn pid_command_line(pid: u32) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!command.is_empty()).then_some(command)
+    parse_ps_output_value(&output.stdout)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_command_line(pid: u32) -> Option<String> {
+    ps_output_value(pid, "command=")
 }
 
 #[cfg(target_os = "linux")]
@@ -854,18 +867,7 @@ fn pid_executable_path(pid: u32) -> Option<PathBuf> {
 
 #[cfg(not(target_os = "linux"))]
 fn pid_executable_path(pid: u32) -> Option<PathBuf> {
-    let output = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let command = String::from_utf8_lossy(&output.stdout);
-    let argv0 = command.split_whitespace().next()?.trim();
-    (!argv0.is_empty()).then(|| PathBuf::from(argv0))
+    ps_output_value(pid, "comm=").map(PathBuf::from)
 }
 
 /// Capture a mailbox forensic bundle and return the bundle directory.
@@ -1185,12 +1187,25 @@ pub fn capture_mailbox_forensic_bundle(
 mod tests {
     use super::{
         MailboxForensicCapture, build_archive_drift_reference, build_live_db_reference,
-        capture_mailbox_forensic_bundle, capture_pre_recovery_snapshot, read_sqlite_header_fields,
+        capture_mailbox_forensic_bundle, capture_pre_recovery_snapshot, parse_ps_output_value,
+        read_sqlite_header_fields,
     };
     #[cfg(unix)]
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn parse_ps_output_value_uses_first_nonempty_trimmed_line() {
+        let stdout = b"\n  /Applications/Agent Mail/bin/mcp-agent-mail --stdio  \nsecond line\n";
+
+        let parsed = parse_ps_output_value(stdout);
+
+        assert_eq!(
+            parsed.as_deref(),
+            Some("/Applications/Agent Mail/bin/mcp-agent-mail --stdio")
+        );
+    }
 
     #[test]
     fn capture_mailbox_forensic_bundle_records_reference_reports() {

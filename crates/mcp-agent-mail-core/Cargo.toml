@@ -18,6 +18,7 @@ regex.workspace = true
 dirs = "6"
 getrandom = "0.2"
 shellexpand = "3"
+shlex = "1"
 sha1.workspace = true
 fs2.workspace = true
 globset.workspace = true
