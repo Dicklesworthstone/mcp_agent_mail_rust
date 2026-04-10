@@ -364,13 +364,15 @@ impl AttachmentExplorerScreen {
                             .unwrap_or("")
                             .to_string();
                         #[allow(clippy::cast_possible_truncation)]
-                        let width =
-                            att.get("width").and_then(serde_json::Value::as_u64).unwrap_or(0)
-                                as u32;
+                        let width = att
+                            .get("width")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0) as u32;
                         #[allow(clippy::cast_possible_truncation)]
-                        let height =
-                            att.get("height").and_then(serde_json::Value::as_u64).unwrap_or(0)
-                                as u32;
+                        let height = att
+                            .get("height")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0) as u32;
                         let mode = att
                             .get("type")
                             .and_then(serde_json::Value::as_str)

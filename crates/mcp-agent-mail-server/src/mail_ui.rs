@@ -624,7 +624,10 @@ first body
         let project = outcome_ok(block_on(queries::ensure_project(
             &cx,
             &pool,
-            &format!("/tmp/mail-ui-attachments-orphaned-agents-{}", unique_nonce()),
+            &format!(
+                "/tmp/mail-ui-attachments-orphaned-agents-{}",
+                unique_nonce()
+            ),
         )));
         let project_id = project.id.unwrap_or(0);
 
@@ -983,7 +986,10 @@ first body
         let html = render_message(&cx, &pool, &project.slug, message.id.unwrap_or(0))
             .expect("message render should succeed")
             .expect("message route should return html");
-        assert!(html.contains(&format!("[unknown-agent-{}]", sender.id.unwrap_or(0))), "{html}");
+        assert!(
+            html.contains(&format!("[unknown-agent-{}]", sender.id.unwrap_or(0))),
+            "{html}"
+        );
         assert!(html.contains("BlueLake"), "{html}");
         assert!(html.contains("Sender drift"), "{html}");
     }
@@ -3667,7 +3673,10 @@ fn render_attachments(
     let conn = match spin_block_on(pool.acquire(cx)) {
         asupersync::Outcome::Ok(conn) => conn,
         asupersync::Outcome::Err(err) => {
-            return Err((500, format!("Failed to open attachments view connection: {err}")));
+            return Err((
+                500,
+                format!("Failed to open attachments view connection: {err}"),
+            ));
         }
         asupersync::Outcome::Cancelled(reason) => {
             return Err((
@@ -3699,9 +3708,8 @@ fn render_attachments(
         .into_iter()
         .filter_map(|row| {
             let message_id = row.get_named::<i64>("id").ok()?;
-            let attachments = parse_attachment_views(
-                &row.get_named::<String>("attachments").unwrap_or_default(),
-            );
+            let attachments =
+                parse_attachment_views(&row.get_named::<String>("attachments").unwrap_or_default());
             if attachments.is_empty() {
                 return None;
             }
