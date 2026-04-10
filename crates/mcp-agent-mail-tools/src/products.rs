@@ -142,41 +142,16 @@ fn is_not_found_tool_error(err: &McpError) -> bool {
 }
 
 async fn get_product_by_key(cx: &Cx, pool: &DbPool, key: &str) -> McpResult<Option<ProductRow>> {
-    use mcp_agent_mail_db::sqlmodel::{Model, Value};
-
-    let conn = match pool.acquire(cx).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Err(db_error_to_mcp_error(DbError::Pool(e.to_string()))),
-        Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
-        Outcome::Panicked(p) => {
-            return Err(McpError::internal_error(format!(
-                "Internal panic: {}",
-                p.message()
-            )));
-        }
-    };
-    let sql = "SELECT id, product_uid, name, created_at FROM products WHERE product_uid = ? OR name = ? LIMIT 1";
-    let params = [Value::Text(key.to_string()), Value::Text(key.to_string())];
-    let start = mcp_agent_mail_db::query_timer();
-    let rows = conn.query_sync(sql, &params);
-    let elapsed = mcp_agent_mail_db::elapsed_us(start);
-    mcp_agent_mail_db::tracking::record_query(sql, elapsed);
-    let rows = rows.map_err(|e| product_lookup_db_error_to_mcp_error(e.to_string()))?;
-    let Some(row) = rows.into_iter().next() else {
-        return Ok(None);
-    };
-    let product =
-        ProductRow::from_row(&row).map_err(|e| McpError::internal_error(e.to_string()))?;
-    Ok(Some(product))
-}
-
-fn product_lookup_db_error_to_mcp_error(message: String) -> McpError {
-    let db_error = if mcp_agent_mail_db::is_lock_error(&message) {
-        DbError::ResourceBusy(message)
-    } else {
-        DbError::Sqlite(message)
-    };
-    db_error_to_mcp_error(db_error)
+    match mcp_agent_mail_db::queries::get_product_by_key(cx, pool, key).await {
+        Outcome::Ok(product) => Ok(Some(product)),
+        Outcome::Err(DbError::NotFound { .. }) => Ok(None),
+        Outcome::Err(err) => Err(db_error_to_mcp_error(err)),
+        Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
+        Outcome::Panicked(panic) => Err(McpError::internal_error(format!(
+            "Internal panic: {}",
+            panic.message()
+        ))),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1458,19 +1433,121 @@ archive body
     }
 
     #[test]
-    fn product_lookup_lock_error_maps_to_resource_busy() {
-        let err = product_lookup_db_error_to_mcp_error("database is locked".to_string());
-        let data = err.data.expect("expected data payload");
-        assert_eq!(data["error"]["type"], "RESOURCE_BUSY");
-        assert_eq!(data["error"]["recoverable"], true);
-    }
+    fn products_link_accepts_orphaned_product_placeholder() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("product-placeholder-link.sqlite3");
 
-    #[test]
-    fn product_lookup_generic_sqlite_error_stays_database_error() {
-        let err = product_lookup_db_error_to_mcp_error("constraint violation".to_string());
-        let data = err.data.expect("expected data payload");
-        assert_eq!(data["error"]["type"], "DATABASE_ERROR");
-        assert_eq!(data["error"]["recoverable"], true);
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", db_path.display())),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+                ("WORKTREES_ENABLED", "1"),
+            ],
+            || {
+                Config::reset_cached();
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                rt.block_on(async {
+                    let cx = Cx::for_testing();
+                    let pool = get_db_pool().expect("db pool");
+                    let existing_project = match mcp_agent_mail_db::queries::ensure_project(
+                        &cx,
+                        &pool,
+                        "/data/projects/products-orphaned-existing",
+                    )
+                    .await
+                    {
+                        Outcome::Ok(project) => project,
+                        other => panic!("ensure existing project failed: {other:?}"),
+                    };
+                    let target_project = match mcp_agent_mail_db::queries::ensure_project(
+                        &cx,
+                        &pool,
+                        "/data/projects/products-orphaned-target",
+                    )
+                    .await
+                    {
+                        Outcome::Ok(project) => project,
+                        other => panic!("ensure target project failed: {other:?}"),
+                    };
+                    let product = match mcp_agent_mail_db::queries::ensure_product(
+                        &cx,
+                        &pool,
+                        None,
+                        Some("prod-placeholder-link"),
+                    )
+                    .await
+                    {
+                        Outcome::Ok(product) => product,
+                        other => panic!("ensure product failed: {other:?}"),
+                    };
+                    let product_id = product.id.expect("product id");
+                    match mcp_agent_mail_db::queries::link_product_to_projects(
+                        &cx,
+                        &pool,
+                        product_id,
+                        &[existing_project.id.unwrap_or(0)],
+                    )
+                    .await
+                    {
+                        Outcome::Ok(_) => {}
+                        other => panic!("seed product link failed: {other:?}"),
+                    }
+
+                    let conn = match pool.acquire(&cx).await {
+                        Outcome::Ok(conn) => conn,
+                        Outcome::Err(err) => panic!("acquire failed: {err}"),
+                        Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                        Outcome::Panicked(panic) => {
+                            panic!("acquire panicked: {}", panic.message())
+                        }
+                    };
+                    conn.execute_sync(
+                        "DELETE FROM products WHERE id = ?",
+                        &[mcp_agent_mail_db::sqlmodel::Value::BigInt(product_id)],
+                    )
+                    .expect("delete products row");
+
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let response = products_link(
+                        &ctx,
+                        format!("[unknown-product-{product_id}]"),
+                        target_project.human_key.clone(),
+                    )
+                    .await
+                    .expect("products_link should succeed");
+                    let parsed: ProductsLinkResponse =
+                        serde_json::from_str(&response).expect("parse products_link response");
+                    assert_eq!(parsed.product.id, product_id);
+                    assert_eq!(
+                        parsed.product.product_uid,
+                        format!("[unknown-product-{product_id}]")
+                    );
+                    assert_eq!(parsed.project.id, target_project.id.unwrap_or(0));
+                    assert_eq!(parsed.project.slug, target_project.slug);
+                    assert!(parsed.linked, "expected idempotent link success");
+
+                    let linked_projects = match mcp_agent_mail_db::queries::list_product_projects(
+                        &cx, &pool, product_id,
+                    )
+                    .await
+                    {
+                        Outcome::Ok(projects) => projects,
+                        other => panic!("list_product_projects failed: {other:?}"),
+                    };
+                    assert_eq!(
+                        linked_projects.len(),
+                        2,
+                        "expected both the seeded and new project links to remain visible"
+                    );
+                    assert!(linked_projects.iter().any(|project| {
+                        project.id == target_project.id && project.slug == target_project.slug
+                    }));
+                });
+            },
+        );
     }
 
     // -----------------------------------------------------------------------

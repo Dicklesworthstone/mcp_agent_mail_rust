@@ -182,8 +182,16 @@ fn resource_archive_inventory_has_state(storage_root: &Path) -> bool {
 
 fn resource_archive_is_ahead(
     storage_root: &Path,
+    sqlite_path: &Path,
     conn: &mcp_agent_mail_db::DbConn,
 ) -> Result<bool, String> {
+    if !crate::tool_util::archive_storage_root_is_authoritative_for_sqlite_path(
+        storage_root,
+        sqlite_path,
+    ) {
+        return Ok(false);
+    }
+
     let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
     if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
         return Ok(false);
@@ -197,11 +205,21 @@ fn resource_archive_is_ahead(
         &db_inventory.project_identities,
     );
 
-    Ok(archive.projects > db_inventory.projects
-        || archive.agents > db_inventory.agents
-        || archive_message_count > db_inventory.messages
+    let archive_metadata_ahead = mcp_agent_mail_db::pool::archive_metadata_advantage_is_decisive(
+        archive.projects,
+        archive.agents,
+        archive_message_count,
+        archive.latest_message_id,
+        db_inventory.projects,
+        db_inventory.agents,
+        db_inventory.messages,
+        db_inventory.max_message_id,
+        &missing_archive_projects,
+    );
+
+    Ok(archive_message_count > db_inventory.messages
         || archive_max_id > db_inventory.max_message_id
-        || !missing_archive_projects.is_empty())
+        || archive_metadata_ahead)
 }
 
 static RESOURCE_SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -271,14 +289,28 @@ impl std::ops::Deref for ResourceReadPool {
 /// Delegates to the fast mailbox verdict. When `DurabilityState` is
 /// `DegradedReadOnly` (or worse), resource reads should fall back to
 /// archive-based data instead of the potentially corrupt live file.
-fn resource_live_db_is_suspect(database_url: &str, storage_root: &Path) -> bool {
+fn resource_live_db_is_suspect(
+    database_url: &str,
+    storage_root: &Path,
+    sqlite_path: &Path,
+) -> bool {
+    if !crate::tool_util::archive_storage_root_is_authoritative_for_sqlite_path(
+        storage_root,
+        sqlite_path,
+    ) {
+        return false;
+    }
+
     let verdict = mcp_agent_mail_db::compute_mailbox_verdict(
         database_url,
         storage_root,
         &mcp_agent_mail_db::VerdictOptions::fast(),
     );
     let durability = mcp_agent_mail_db::DurabilityState::from_mailbox_state(verdict.state);
-    if durability.is_degraded() {
+    if mcp_agent_mail_db::verdict_prefers_archive_snapshot_reads_for_primary_read_surface(
+        &verdict,
+        sqlite_path,
+    ) {
         tracing::info!(
             verdict_state = %verdict.state,
             durability_state = %durability,
@@ -296,32 +328,32 @@ fn open_resource_read_pool() -> Result<Option<ResourceReadPool>, String> {
         return Ok(None);
     }
 
-    let cfg = mcp_agent_mail_db::DbPoolConfig {
-        database_url: config.database_url.clone(),
-        ..Default::default()
-    };
-    let sqlite_path = mcp_agent_mail_db::pool::normalize_sqlite_path_for_pool_key(
-        &cfg.sqlite_path().map_err(|err| err.to_string())?,
-    );
+    let sqlite_path = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
+        .map_err(|err| err.to_string())?
+        .canonical_path;
     if sqlite_path == ":memory:" {
         return Ok(None);
     }
 
     let resolved_path = PathBuf::from(&sqlite_path);
-    let archive_has_state = resource_archive_inventory_has_state(&config.storage_root);
+    let archive_has_state = crate::tool_util::archive_storage_root_is_authoritative_for_sqlite_path(
+        &config.storage_root,
+        &resolved_path,
+    ) && resource_archive_inventory_has_state(&config.storage_root);
 
     // When the durability verdict says the live DB is suspect or worse,
     // force archive-snapshot reads even if the archive isn't strictly
     // "ahead" of the DB by row count.
     let durability_forces_snapshot = archive_has_state
-        && resource_live_db_is_suspect(&config.database_url, &config.storage_root);
+        && resource_live_db_is_suspect(&config.database_url, &config.storage_root, &resolved_path);
 
     let use_archive_snapshot = if durability_forces_snapshot {
         true
     } else {
         match mcp_agent_mail_db::DbConn::open_file(&sqlite_path) {
             Ok(conn) => {
-                let archive_ahead = resource_archive_is_ahead(&config.storage_root, &conn);
+                let archive_ahead =
+                    resource_archive_is_ahead(&config.storage_root, &resolved_path, &conn);
                 drop(conn);
                 match archive_ahead {
                     Ok(true) => true,
@@ -2127,14 +2159,7 @@ pub async fn project_details(ctx: &McpContext, slug: String) -> McpResult<String
     let (slug, _query) = split_param_and_query(&slug);
     let pool = get_resource_db_pool()?;
 
-    // Find project by slug
-    let projects =
-        db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), &pool).await)?;
-
-    let project = projects
-        .into_iter()
-        .find(|p| p.slug == slug || p.human_key == slug)
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Project not found"))?;
+    let project = resolve_existing_resource_project(ctx, &pool, &slug).await?;
 
     let project_id = project.id.unwrap_or(0);
 
@@ -2196,29 +2221,6 @@ pub struct ProductProjectDetails {
 pub async fn product_details(ctx: &McpContext, key: String) -> McpResult<String> {
     use mcp_agent_mail_core::Config;
 
-    async fn get_product_by_key(
-        cx: &asupersync::Cx,
-        pool: &mcp_agent_mail_db::DbPool,
-        key: &str,
-    ) -> McpResult<Option<mcp_agent_mail_db::ProductRow>> {
-        use mcp_agent_mail_db::sqlmodel::{Model, Value};
-
-        let conn = acquire_resource_conn(cx, pool).await?;
-
-        let sql = "SELECT id, product_uid, name, created_at FROM products WHERE product_uid = ? OR name = ? LIMIT 1";
-        let params = [Value::Text(key.to_string()), Value::Text(key.to_string())];
-        let start = mcp_agent_mail_db::query_timer();
-        let rows = conn.query_sync(sql, &params);
-        mcp_agent_mail_db::record_query(sql, mcp_agent_mail_db::elapsed_us(start));
-        let rows = rows.map_err(|e| resource_sync_db_error_to_mcp_error(e.to_string()))?;
-        let Some(row) = rows.into_iter().next() else {
-            return Ok(None);
-        };
-        let product = mcp_agent_mail_db::ProductRow::from_row(&row)
-            .map_err(|e| McpError::internal_error(e.to_string()))?;
-        Ok(Some(product))
-    }
-
     let config = &Config::get();
     if !config.worktrees_enabled {
         return Err(McpError::new(
@@ -2229,14 +2231,17 @@ pub async fn product_details(ctx: &McpContext, key: String) -> McpResult<String>
 
     let (key, _query) = split_param_and_query(&key);
     let pool = get_resource_db_pool()?;
-    let product = get_product_by_key(ctx.cx(), &pool, key.trim())
-        .await?
-        .ok_or_else(|| {
-            McpError::new(
-                McpErrorCode::InvalidParams,
-                format!("Product '{key}' not found."),
-            )
-        })?;
+    let product =
+        match mcp_agent_mail_db::queries::get_product_by_key(ctx.cx(), &pool, key.trim()).await {
+            Outcome::Ok(product) => product,
+            Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => {
+                return Err(McpError::new(
+                    McpErrorCode::InvalidParams,
+                    format!("Product '{key}' not found."),
+                ));
+            }
+            other => return Err(db_outcome_to_mcp_result(other).unwrap_err()),
+        };
 
     let product_id = product.id.unwrap_or(0);
     let project_rows = db_outcome_to_mcp_result(
@@ -2322,9 +2327,16 @@ pub async fn message_details(ctx: &McpContext, message_id: String) -> McpResult<
     }
 
     // Get sender name
-    let sender = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::get_agent_by_id(ctx.cx(), &pool, msg.sender_id).await,
-    )?;
+    let sender_name =
+        match mcp_agent_mail_db::queries::get_agent_by_id_fresh(ctx.cx(), &pool, msg.sender_id)
+            .await
+        {
+            Outcome::Ok(agent) => agent.name,
+            Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => {
+                format!("[unknown-agent-{}]", msg.sender_id)
+            }
+            other => return Err(db_outcome_to_mcp_result(other).unwrap_err()),
+        };
 
     let recipients = parse_recipients_json(&msg.recipients_json);
     let to = recipient_names(&recipients, "to");
@@ -2342,7 +2354,7 @@ pub async fn message_details(ctx: &McpContext, message_id: String) -> McpResult<
         ack_required: msg.ack_required != 0,
         created_ts: Some(micros_to_iso(msg.created_ts)),
         attachments: parse_attachment_metadata(&msg.attachments),
-        from: sender.name,
+        from: sender_name,
         to,
         cc,
         bcc,
@@ -2416,14 +2428,7 @@ pub async fn thread_details(ctx: &McpContext, thread_id: String) -> McpResult<St
 
     let pool = get_resource_db_pool()?;
 
-    // Find project by slug
-    let projects =
-        db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), &pool).await)?;
-
-    let project = projects
-        .into_iter()
-        .find(|p| p.slug == project_key || p.human_key == project_key)
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Project not found"))?;
+    let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
     let project_id = project.id.unwrap_or(0);
 
@@ -3338,13 +3343,7 @@ pub async fn views_urgent_unread(ctx: &McpContext, agent: String) -> McpResult<S
 
     let pool = get_resource_db_pool()?;
 
-    // Find project by slug or human_key
-    let projects =
-        db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), &pool).await)?;
-    let project = projects
-        .into_iter()
-        .find(|p| p.slug == project_key || p.human_key == project_key)
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Project not found"))?;
+    let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
     let project_id = project.id.unwrap_or(0);
 
@@ -3419,13 +3418,7 @@ pub async fn views_ack_required(ctx: &McpContext, agent: String) -> McpResult<St
 
     let pool = get_resource_db_pool()?;
 
-    // Find project
-    let projects =
-        db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), &pool).await)?;
-    let project = projects
-        .into_iter()
-        .find(|p| p.slug == project_key || p.human_key == project_key)
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Project not found"))?;
+    let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
     let project_id = project.id.unwrap_or(0);
 
@@ -3532,13 +3525,7 @@ pub async fn views_acks_stale(ctx: &McpContext, agent: String) -> McpResult<Stri
 
     let pool = get_resource_db_pool()?;
 
-    // Find project
-    let projects =
-        db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), &pool).await)?;
-    let project = projects
-        .into_iter()
-        .find(|p| p.slug == project_key || p.human_key == project_key)
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Project not found"))?;
+    let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
     let project_id = project.id.unwrap_or(0);
 
@@ -3631,13 +3618,7 @@ pub async fn views_ack_overdue(ctx: &McpContext, agent: String) -> McpResult<Str
 
     let pool = get_resource_db_pool()?;
 
-    // Find project
-    let projects =
-        db_outcome_to_mcp_result(mcp_agent_mail_db::queries::list_projects(ctx.cx(), &pool).await)?;
-    let project = projects
-        .into_iter()
-        .find(|p| p.slug == project_key || p.human_key == project_key)
-        .ok_or_else(|| McpError::new(McpErrorCode::InvalidParams, "Project not found"))?;
+    let project = resolve_existing_resource_project(ctx, &pool, &project_key).await?;
 
     let project_id = project.id.unwrap_or(0);
 
@@ -4212,11 +4193,11 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
     // Release stale reservations (unreleased + agent inactive + no recent mail/fs/git).
     for row in all_rows.iter().filter(|r| r.expires_ts > now_micros) {
         let Some(id) = row.id else { continue };
-        let Some(agent) = agent_by_id.get(&row.agent_id) else {
-            continue;
-        };
-
-        let agent_inactive = now_micros.saturating_sub(agent.last_active_ts) > inactivity_micros;
+        let agent_last_active = agent_by_id
+            .get(&row.agent_id)
+            .map(|agent| agent.last_active_ts);
+        let agent_inactive =
+            agent_last_active.is_none_or(|ts| now_micros.saturating_sub(ts) > inactivity_micros);
 
         let mail_activity = if let Some(val) = mail_activity_cache.get(&row.agent_id) {
             *val
@@ -4296,9 +4277,10 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
                 );
                 continue;
             };
-            let agent_name = agent_by_id
-                .get(&row.agent_id)
-                .map_or_else(|| format!("agent_{}", row.agent_id), |a| a.name.clone());
+            let agent_name = agent_by_id.get(&row.agent_id).map_or_else(
+                || format!("[unknown-agent-{}]", row.agent_id),
+                |a| a.name.clone(),
+            );
 
             release_payloads.push(serde_json::json!({
                 "id": id,
@@ -4355,12 +4337,12 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
 
     let mut reservations: Vec<FileReservationResourceEntry> = Vec::with_capacity(rows.len());
     for row in rows {
-        let agent_name = agent_by_id
-            .get(&row.agent_id)
-            .map_or_else(|| format!("agent_{}", row.agent_id), |a| a.name.clone());
-        let last_agent_activity_ts = agent_by_id
-            .get(&row.agent_id)
-            .map(|a| micros_to_iso(a.last_active_ts));
+        let agent_name = agent_by_id.get(&row.agent_id).map_or_else(
+            || format!("[unknown-agent-{}]", row.agent_id),
+            |a| a.name.clone(),
+        );
+        let agent_last_active = agent_by_id.get(&row.agent_id).map(|a| a.last_active_ts);
+        let last_agent_activity_ts = agent_last_active.map(micros_to_iso);
 
         let mail_activity = if let Some(val) = mail_activity_cache.get(&row.agent_id) {
             *val
@@ -4391,9 +4373,9 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
             computed
         };
 
-        let agent_last_active = agent_by_id.get(&row.agent_id).map(|a| a.last_active_ts);
         let agent_inactive =
             agent_last_active.is_some_and(|ts| now_micros.saturating_sub(ts) > inactivity_micros);
+        let agent_missing = agent_last_active.is_none();
         let recent_mail =
             mail_activity.is_some_and(|ts| now_micros.saturating_sub(ts) <= grace_micros);
         let recent_fs = pat_activity
@@ -4405,11 +4387,13 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
 
         let stale = reservation_row_is_logically_unreleased(&row)
             && workspace_available
-            && agent_inactive
+            && (agent_missing || agent_inactive)
             && !(recent_mail || recent_fs || recent_git);
 
         let mut stale_reasons = Vec::with_capacity(4);
-        if agent_inactive {
+        if agent_missing {
+            stale_reasons.push("agent_missing".to_string());
+        } else if agent_inactive {
             stale_reasons.push(format!("agent_inactive>{inactivity_seconds}s"));
         } else {
             stale_reasons.push("agent_recently_active".to_string());
@@ -4551,19 +4535,7 @@ mod resource_shape_tests {
         .expect("write resource agent profile");
         std::fs::write(
             messages_dir.join("2026-03-22T12-00-00Z__first__1.md"),
-            r#"---json
-{
-  "id": 1,
-  "from": "Alice",
-  "to": ["Bob"],
-  "subject": "First copy",
-  "importance": "normal",
-  "created_ts": "2026-03-22T12:00:00Z"
-}
----
-
-first body
-"#,
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"First copy\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:00:00Z\",\"attachments\":[]}\n---\n\nfirst body\n",
         )
         .expect("write resource canonical message");
 
@@ -4572,6 +4544,105 @@ first body
         conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
             .expect("init resource live db schema");
         drop(conn);
+
+        (storage_root, db_path)
+    }
+
+    fn write_live_db_newer_than_metadata_only_archive_fixture(cx: &Cx) -> (PathBuf, PathBuf) {
+        let _ = cx;
+        let config = Config::from_env();
+        let storage_root = config.storage_root;
+        let db_path = PathBuf::from(
+            mcp_agent_mail_db::DbPoolConfig::from_env()
+                .sqlite_path()
+                .expect("resource fixture sqlite path"),
+        );
+        let project_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).expect("create resource agent dir");
+        std::fs::create_dir_all(&messages_dir).expect("create resource messages dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
+        )
+        .expect("write resource project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
+        )
+        .expect("write resource agent profile");
+        std::fs::write(
+            messages_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"First copy\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:00:00Z\",\"attachments\":[]}\n---\n\nfirst body\n",
+        )
+        .expect("write resource canonical message");
+
+        mcp_agent_mail_db::reconstruct_from_archive(&db_path, &storage_root)
+            .expect("seed live db from archive");
+
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open live db");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel::Value::BigInt(3),
+                mcp_agent_mail_db::sqlmodel::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel::Value::Text("BlueLake".to_string()),
+                mcp_agent_mail_db::sqlmodel::Value::Text("coder".to_string()),
+                mcp_agent_mail_db::sqlmodel::Value::Text("test".to_string()),
+                mcp_agent_mail_db::sqlmodel::Value::Text(String::new()),
+                mcp_agent_mail_db::sqlmodel::Value::BigInt(2),
+                mcp_agent_mail_db::sqlmodel::Value::BigInt(2),
+                mcp_agent_mail_db::sqlmodel::Value::Text("auto".to_string()),
+                mcp_agent_mail_db::sqlmodel::Value::Text("auto".to_string()),
+            ],
+        )
+        .expect("insert live-only recipient agent");
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments, recipients_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel::Value::BigInt(2),
+                mcp_agent_mail_db::sqlmodel::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel::Value::Text("resource-db-ahead".to_string()),
+                mcp_agent_mail_db::sqlmodel::Value::Text("Live DB newer than archive".to_string()),
+                mcp_agent_mail_db::sqlmodel::Value::Text("live body".to_string()),
+                mcp_agent_mail_db::sqlmodel::Value::Text("normal".to_string()),
+                mcp_agent_mail_db::sqlmodel::Value::BigInt(0),
+                mcp_agent_mail_db::sqlmodel::Value::BigInt(2_000_000),
+                mcp_agent_mail_db::sqlmodel::Value::Text("[]".to_string()),
+                mcp_agent_mail_db::sqlmodel::Value::Text(
+                    r#"{"to":["BlueLake"],"cc":[],"bcc":[]}"#.to_string(),
+                ),
+            ],
+        )
+        .expect("insert newer live message");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, ack_ts, read_ts) VALUES (?, ?, ?, NULL, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel::Value::BigInt(2),
+                mcp_agent_mail_db::sqlmodel::Value::BigInt(3),
+                mcp_agent_mail_db::sqlmodel::Value::Text("to".to_string()),
+            ],
+        )
+        .expect("insert live recipient row");
+        drop(conn);
+
+        let archive_only_project = storage_root.join("projects").join("archive-only-project");
+        let archive_only_agent = archive_only_project.join("agents").join("ArchiveGhost");
+        std::fs::create_dir_all(&archive_only_agent)
+            .expect("create archive-only project metadata dir");
+        std::fs::write(
+            archive_only_project.join("project.json"),
+            r#"{"slug":"archive-only-project","human_key":"/archive-only-project","created_at":0}"#,
+        )
+        .expect("write archive-only project metadata");
+        std::fs::write(
+            archive_only_agent.join("profile.json"),
+            r#"{"agent_name":"ArchiveGhost","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
+        )
+        .expect("write archive-only agent metadata");
 
         (storage_root, db_path)
     }
@@ -5839,6 +5910,66 @@ first body
     }
 
     #[test]
+    fn message_details_preserves_placeholder_when_sender_row_is_missing() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/resources-orphaned-sender-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let sender = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let recipient = register_agent(&cx, &pool, project_id, "RedPeak").await;
+                let message = create_message(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender.id.unwrap_or(0),
+                    recipient.id.unwrap_or(0),
+                    "Orphaned sender subject",
+                    "Orphaned sender body",
+                    &format!("thread-orphaned-sender-{}", unique_suffix()),
+                    false,
+                )
+                .await;
+                let message_id = message.id.unwrap_or(0);
+
+                match queries::get_agent_by_id(&cx, &pool, sender.id.unwrap_or(0)).await {
+                    Outcome::Ok(agent) => assert_eq!(agent.name, "BlueLake"),
+                    other => panic!("prime sender cache failed: {other:?}"),
+                }
+
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(err) => panic!("acquire failed: {err}"),
+                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                    Outcome::Panicked(panic) => {
+                        panic!("acquire panicked: {}", panic.message())
+                    }
+                };
+                conn.execute_sync(
+                    "DELETE FROM agents WHERE id = ?",
+                    &[mcp_agent_mail_db::sqlmodel::Value::BigInt(
+                        sender.id.unwrap_or(0),
+                    )],
+                )
+                .expect("delete sender row");
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let message_details_value = parse_json(
+                    &message_details(&ctx, format!("{message_id}?project={}", project.human_key))
+                        .await
+                        .expect("message details"),
+                );
+                assert_eq!(
+                    message_details_value["from"],
+                    format!("[unknown-agent-{}]", sender.id.unwrap_or(0))
+                );
+                assert_eq!(message_details_value["subject"], "Orphaned sender subject");
+            });
+        });
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn agent_named_resources_use_case_insensitive_lookup() {
         with_serialized_resources(|| {
@@ -5953,6 +6084,108 @@ first body
                     )
                     .await
                     .expect("case-insensitive ack-overdue"),
+                );
+                assert_eq!(overdue_value["count"], 1);
+            });
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn project_scoped_resources_use_case_insensitive_project_slug_lookup() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/resources-project-slug-case-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let sender = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let recipient = register_agent(&cx, &pool, project_id, "RedPeak").await;
+                let thread_id = format!("thread-project-case-{}", unique_suffix());
+                let message = create_message(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender.id.unwrap_or(0),
+                    recipient.id.unwrap_or(0),
+                    "Project Case Subject",
+                    "Project case body",
+                    &thread_id,
+                    true,
+                )
+                .await;
+                let message_id = message.id.unwrap_or(0);
+
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(err) => panic!("acquire failed: {err}"),
+                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                    Outcome::Panicked(panic) => {
+                        panic!("acquire panicked: {}", panic.message())
+                    }
+                };
+                conn.execute_sync(
+                    "UPDATE messages SET created_ts = created_ts - ? WHERE id = ?",
+                    &[
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(120_000_000),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(message_id),
+                    ],
+                )
+                .expect("age message for overdue/stale views");
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let project_ref = project.slug.to_ascii_uppercase();
+
+                let project_details_value = parse_json(
+                    &project_details(&ctx, project_ref.clone())
+                        .await
+                        .expect("case-insensitive project details"),
+                );
+                assert_eq!(project_details_value["id"], project_id);
+                assert_eq!(project_details_value["slug"], project.slug);
+
+                let thread_value = parse_json(
+                    &thread_details(
+                        &ctx,
+                        format!("{thread_id}?project={project_ref}&include_bodies=true"),
+                    )
+                    .await
+                    .expect("case-insensitive thread details"),
+                );
+                assert_eq!(thread_value["messages"].as_array().map_or(0, Vec::len), 1);
+                assert_eq!(
+                    thread_value["messages"][0]["subject"],
+                    "Project Case Subject"
+                );
+
+                let urgent_value = parse_json(
+                    &views_urgent_unread(&ctx, format!("RedPeak?project={project_ref}"))
+                        .await
+                        .expect("case-insensitive urgent-unread"),
+                );
+                assert_eq!(urgent_value["count"], 1);
+
+                let ack_required_value = parse_json(
+                    &views_ack_required(&ctx, format!("RedPeak?project={project_ref}"))
+                        .await
+                        .expect("case-insensitive ack-required"),
+                );
+                assert_eq!(ack_required_value["count"], 1);
+
+                let stale_value = parse_json(
+                    &views_acks_stale(&ctx, format!("RedPeak?project={project_ref}&ttl_seconds=0"))
+                        .await
+                        .expect("case-insensitive stale-acks"),
+                );
+                assert_eq!(stale_value["count"], 1);
+
+                let overdue_value = parse_json(
+                    &views_ack_overdue(
+                        &ctx,
+                        format!("RedPeak?project={project_ref}&ttl_minutes=1"),
+                    )
+                    .await
+                    .expect("case-insensitive overdue-acks"),
                 );
                 assert_eq!(overdue_value["count"], 1);
             });
@@ -6249,6 +6482,156 @@ first body
     }
 
     #[test]
+    fn file_reservations_release_orphaned_holder_rows_when_other_signals_are_stale() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let workspace = tempfile::tempdir().expect("workspace tempdir");
+                let project_key = workspace.path().to_string_lossy().to_string();
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let holder = register_agent(&cx, &pool, project_id, "AmberRiver").await;
+                let holder_id = holder.id.unwrap_or(0);
+
+                let created = match queries::create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    &["src/**"],
+                    3600,
+                    true,
+                    "orphaned holder cleanup test",
+                )
+                .await
+                {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("create reservations failed: {other:?}"),
+                };
+                let reservation_id = created[0].id.unwrap_or(0);
+
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(err) => panic!("acquire failed: {err}"),
+                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                    Outcome::Panicked(panic) => panic!("acquire panicked: {}", panic.message()),
+                };
+                conn.execute_sync(
+                    "DELETE FROM agents WHERE id = ?",
+                    &[mcp_agent_mail_db::sqlmodel::Value::BigInt(holder_id)],
+                )
+                .expect("delete holder row");
+                drop(conn);
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let payload =
+                    file_reservations(&ctx, format!("{}?active_only=false", project.slug))
+                        .await
+                        .expect("file reservations");
+                let reservations = parse_json(&payload);
+                let entries = reservations.as_array().expect("reservations array");
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0]["id"].as_i64(), Some(reservation_id));
+                let expected_holder = format!("[unknown-agent-{holder_id}]");
+                assert_eq!(entries[0]["agent"].as_str(), Some(expected_holder.as_str()));
+                assert!(entries[0]["released_ts"].is_string());
+                assert!(
+                    entries[0]["stale_reasons"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|value| value.as_str())
+                        .any(|reason| reason == "agent_missing"),
+                    "stale reasons should surface missing holder metadata"
+                );
+
+                let rows =
+                    match queries::list_file_reservations(&cx, &pool, project_id, false).await {
+                        Outcome::Ok(rows) => rows,
+                        other => panic!("list reservations failed: {other:?}"),
+                    };
+                let row = rows
+                    .iter()
+                    .find(|row| row.id == Some(reservation_id))
+                    .expect("reservation row");
+                assert!(
+                    row.released_ts.is_some(),
+                    "orphaned stale row should auto-release"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn product_details_accepts_orphaned_product_placeholder() {
+        with_serialized_resources(|| {
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[("WORKTREES_ENABLED", "true")],
+                || {
+                    run_async(|cx| async move {
+                        let pool = get_db_pool().expect("db pool");
+                        let project_key =
+                            format!("/tmp/resources-orphaned-product-{}", unique_suffix());
+                        let project = ensure_project(&cx, &pool, &project_key).await;
+                        let project_id = project.id.unwrap_or(0);
+
+                        let product = match queries::ensure_product(
+                            &cx,
+                            &pool,
+                            Some("prod-orphaned-resource"),
+                            Some("Orphaned Resource Product"),
+                        )
+                        .await
+                        {
+                            Outcome::Ok(product) => product,
+                            other => panic!("ensure product failed: {other:?}"),
+                        };
+                        let product_id = product.id.unwrap_or(0);
+
+                        match queries::link_product_to_projects(
+                            &cx,
+                            &pool,
+                            product_id,
+                            &[project_id],
+                        )
+                        .await
+                        {
+                            Outcome::Ok(_) => {}
+                            other => panic!("link product failed: {other:?}"),
+                        }
+
+                        let conn = match pool.acquire(&cx).await {
+                            Outcome::Ok(c) => c,
+                            Outcome::Err(err) => panic!("acquire failed: {err}"),
+                            Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                            Outcome::Panicked(panic) => {
+                                panic!("acquire panicked: {}", panic.message())
+                            }
+                        };
+                        conn.execute_sync(
+                            "DELETE FROM products WHERE id = ?",
+                            &[mcp_agent_mail_db::sqlmodel::Value::BigInt(product_id)],
+                        )
+                        .expect("delete product row");
+                        drop(conn);
+
+                        let ctx = McpContext::new(cx.clone(), 1);
+                        let placeholder = format!("[unknown-product-{product_id}]");
+                        let payload = product_details(&ctx, placeholder.clone())
+                            .await
+                            .expect("product details");
+                        let value = parse_json(&payload);
+                        assert_eq!(value["product_uid"].as_str(), Some(placeholder.as_str()));
+                        assert_eq!(value["name"].as_str(), Some(placeholder.as_str()));
+                        assert_eq!(value["projects"].as_array().map_or(0, Vec::len), 1);
+                        assert_eq!(value["projects"][0]["id"].as_i64(), Some(project_id));
+                    });
+                },
+            );
+        });
+    }
+
+    #[test]
     fn file_reservations_cleanup_artifacts_use_authoritative_release_timestamps() {
         with_serialized_resources(|| {
             run_async(|cx| async move {
@@ -6402,6 +6785,140 @@ first body
                 );
             });
         });
+    }
+
+    #[test]
+    fn resources_keep_live_db_when_db_has_newer_messages_than_metadata_only_archive_drift() {
+        with_serialized_resources(|| {
+            run_async(|cx: Cx| async move {
+                let (_storage_root, db_path) =
+                    write_live_db_newer_than_metadata_only_archive_fixture(&cx);
+
+                let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+                    .expect("open live db");
+                assert!(
+                    !resource_archive_is_ahead(&Config::from_env().storage_root, &db_path, &conn)
+                        .expect("resource archive ahead probe"),
+                    "newer live message evidence should suppress metadata-only archive fallback"
+                );
+                drop(conn);
+
+                let verdict = mcp_agent_mail_db::compute_mailbox_verdict(
+                    &Config::from_env().database_url,
+                    &Config::from_env().storage_root,
+                    &mcp_agent_mail_db::VerdictOptions::fast(),
+                );
+                let health_conn =
+                    mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+                        .expect("open db for integrity detail probe");
+                let quick_check =
+                    mcp_agent_mail_db::quick_check(&health_conn).expect("quick_check result");
+                let incremental_check = mcp_agent_mail_db::incremental_check(&health_conn)
+                    .expect("integrity_check result");
+                let failing_probes = verdict
+                    .probes
+                    .iter()
+                    .filter(|probe| !probe.passed)
+                    .map(|probe| format!("{}:{:?}:{}", probe.name, probe.severity, probe.detail))
+                    .collect::<Vec<_>>();
+                let db_sanity = verdict
+                    .probes
+                    .iter()
+                    .find(|probe| probe.name == "db_sanity")
+                    .expect("db_sanity probe");
+                assert!(
+                    db_sanity
+                        .detail
+                        .contains("compatibility reopen probe failed"),
+                    "db_sanity detail should identify the compatibility probe failure, got {:?}",
+                    db_sanity.detail
+                );
+                assert!(
+                    mcp_agent_mail_db::verdict_prefers_archive_snapshot_reads(&verdict),
+                    "generic verdict helper should stay conservative when the compatibility probe alone fails; state={} drift={:?} failing_probes={:?} quick_check={:?} incremental_check={:?}",
+                    verdict.state,
+                    verdict.archive_drift.state,
+                    failing_probes,
+                    quick_check.details,
+                    incremental_check.details
+                );
+                assert!(
+                    !mcp_agent_mail_db::verdict_prefers_archive_snapshot_reads_for_primary_read_surface(
+                        &verdict,
+                        &db_path,
+                    ),
+                    "primary read surfaces should not prefer archive snapshots when only the compatibility probe fails; state={} drift={:?} failing_probes={:?} quick_check={:?} incremental_check={:?}",
+                    verdict.state,
+                    verdict.archive_drift.state,
+                    failing_probes,
+                    quick_check.details,
+                    incremental_check.details
+                );
+
+                let pool = open_resource_read_pool().expect("open resource read pool");
+                assert!(
+                    pool.is_none(),
+                    "resource reads should stay on the live DB when only archive metadata is ahead"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn resources_ignore_unrelated_default_archive_overlap() {
+        let _guard = RESOURCE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("custom.sqlite3");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let xdg_data_home = temp.path().join("xdg");
+        let xdg_data_home_text = xdg_data_home.to_string_lossy().into_owned();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("XDG_DATA_HOME", xdg_data_home_text.as_str()),
+            ],
+            || {
+                Config::reset_cached();
+                let storage_root = Config::from_env().storage_root;
+                let project_dir = storage_root.join("projects").join("ahead-project");
+                let agent_dir = project_dir.join("agents").join("Alice");
+                let message_dir = project_dir.join("messages").join("2026").join("04");
+                std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+                std::fs::create_dir_all(&message_dir).expect("create message dir");
+                std::fs::write(
+                    project_dir.join("project.json"),
+                    r#"{"slug":"ahead-project","human_key":"/ahead-project"}"#,
+                )
+                .expect("write project metadata");
+                std::fs::write(agent_dir.join("profile.json"), "{}").expect("write agent profile");
+                std::fs::write(
+                    message_dir.join("2026-04-01T12-00-00Z__archive-only__7.md"),
+                    "---json\n{\"id\":7,\"from\":\"Alice\",\"to\":[],\"subject\":\"Archive only\"}\n---\nbody\n",
+                )
+                .expect("write canonical message");
+
+                let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+                    .expect("open db");
+                conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                    .expect("init schema");
+                conn.query_sync(
+                    "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'ahead-project', '/ahead-project', 0)",
+                    &[],
+                )
+                .expect("insert overlapping project");
+                drop(conn);
+
+                let pool = open_resource_read_pool().expect("open resource read pool");
+                assert!(
+                    pool.is_none(),
+                    "default global archive should not force resource snapshots for an external custom DB"
+                );
+            },
+        );
     }
 
     #[test]

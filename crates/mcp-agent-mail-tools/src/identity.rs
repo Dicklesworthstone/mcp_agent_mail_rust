@@ -254,6 +254,20 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
         );
     };
 
+    if !crate::tool_util::archive_storage_root_is_authoritative_for_sqlite_path(
+        &config.storage_root,
+        &sqlite_path,
+    ) {
+        return semantic_readiness_response(
+            "ok",
+            format!(
+                "Skipped semantic readiness archive parity because SQLite database {} is outside the default mailbox root {}",
+                sqlite_path.display(),
+                config.storage_root.display()
+            ),
+        );
+    }
+
     if !sqlite_path.exists() {
         return semantic_readiness_response(
             "fail",
@@ -383,12 +397,23 @@ fn health_check_semantic_readiness(config: &Config) -> SemanticReadinessResponse
     let missing_archive_projects =
         mcp_agent_mail_db::archive_missing_project_identities(&archive, &db_project_identities);
 
-    if u64::try_from(archive.projects).unwrap_or(u64::MAX) > db_project_count
-        || u64::try_from(archive.agents).unwrap_or(u64::MAX) > db_agent_count
-        || u64::try_from(archive.unique_message_ids).unwrap_or(u64::MAX) > db_message_count
-        || archive_max_id > db_max_id
-        || !missing_archive_projects.is_empty()
-    {
+    let archive_message_count = archive.unique_message_ids;
+    let archive_messages_ahead =
+        u64::try_from(archive_message_count).unwrap_or(u64::MAX) > db_message_count;
+    let archive_latest_id_ahead = archive_max_id > db_max_id;
+    let archive_metadata_ahead = mcp_agent_mail_db::pool::archive_metadata_advantage_is_decisive(
+        archive.projects,
+        archive.agents,
+        archive_message_count,
+        archive.latest_message_id,
+        usize::try_from(db_project_count).unwrap_or(usize::MAX),
+        usize::try_from(db_agent_count).unwrap_or(usize::MAX),
+        usize::try_from(db_message_count).unwrap_or(usize::MAX),
+        db_max_id,
+        &missing_archive_projects,
+    );
+
+    if archive_messages_ahead || archive_latest_id_ahead || archive_metadata_ahead {
         let missing_project_suffix = if missing_archive_projects.is_empty() {
             String::new()
         } else {
@@ -2274,6 +2299,197 @@ body
                         .as_str()
                         .is_some_and(|detail| detail.contains("archive inventory is ahead")),
                     "health_check should surface archive/db drift details: {value}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn health_check_accepts_db_newer_messages_than_metadata_only_archive_drift() {
+        let _guard = HEALTH_CHECK_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("db-newer-health-check.sqlite3");
+        let project_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("04");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&messages_dir).expect("create messages dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project"}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-04-01T00:00:00Z","last_active_ts":"2026-04-01T00:00:01Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            messages_dir.join("2026-04-01T12-00-00Z__hello__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "Hello",
+  "importance": "normal",
+  "created_ts": "2026-04-01T12:00:00Z"
+}
+---
+
+body
+"#,
+        )
+        .expect("write canonical message");
+
+        mcp_agent_mail_db::reconstruct::reconstruct_from_archive(&db_path, &storage_root)
+            .expect("reconstruct archive into db");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(3),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("BlueLake".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("coder".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("test".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text(String::new()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(2),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(2),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("auto".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("auto".to_string()),
+            ],
+        )
+        .expect("insert recipient");
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments, recipients_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(2),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("t2".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("Second".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("second body".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("normal".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(0),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(2_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("[]".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text(r#"{"to":["BlueLake"],"cc":[],"bcc":[]}"#.to_string()),
+            ],
+        )
+        .expect("insert newer live message");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, ack_ts, read_ts) VALUES (?, ?, ?, NULL, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(2),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(3),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("to".to_string()),
+            ],
+        )
+        .expect("insert message recipient");
+        drop(conn);
+
+        let archive_only_project = storage_root.join("projects").join("archive-only-project");
+        let archive_only_agent = archive_only_project.join("agents").join("ArchiveGhost");
+        std::fs::create_dir_all(&archive_only_agent).expect("create archive-only agent dir");
+        std::fs::write(
+            archive_only_project.join("project.json"),
+            r#"{"slug":"archive-only-project","human_key":"/archive-only-project"}"#,
+        )
+        .expect("write archive-only project metadata");
+        std::fs::write(
+            archive_only_agent.join("profile.json"),
+            r#"{"name":"ArchiveGhost","program":"coder","model":"test","inception_ts":"2026-04-01T00:00:00Z","last_active_ts":"2026-04-01T00:00:01Z"}"#,
+        )
+        .expect("write archive-only agent metadata");
+
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", db_path.display())),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+            ],
+            || {
+                Config::reset_cached();
+                let ctx = McpContext::new(Cx::for_testing(), 1);
+                let response = health_check(&ctx).expect("health_check should serialize");
+                let value: serde_json::Value =
+                    serde_json::from_str(&response).expect("parse health_check json");
+                assert_eq!(value["semantic_readiness"]["status"], "ok");
+                assert!(
+                    value["semantic_readiness"]["detail"]
+                        .as_str()
+                        .is_some_and(|detail| !detail.contains("archive inventory is ahead")),
+                    "health_check should not false-fail on metadata-only archive drift when the DB has newer messages: {value}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn health_check_ignores_unrelated_default_archive_overlap() {
+        let _guard = HEALTH_CHECK_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("custom-health-check.sqlite3");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let xdg_data_home = temp.path().join("xdg");
+        let xdg_data_home_text = xdg_data_home.to_string_lossy().into_owned();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("XDG_DATA_HOME", xdg_data_home_text.as_str()),
+            ],
+            || {
+                Config::reset_cached();
+                let storage_root = Config::from_env().storage_root;
+                let project_dir = storage_root.join("projects").join("ahead-project");
+                let agent_dir = project_dir.join("agents").join("Alice");
+                let message_dir = project_dir.join("messages").join("2026").join("04");
+                std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+                std::fs::create_dir_all(&message_dir).expect("create message dir");
+                std::fs::write(
+                    project_dir.join("project.json"),
+                    r#"{"slug":"ahead-project","human_key":"/ahead-project"}"#,
+                )
+                .expect("write project metadata");
+                std::fs::write(agent_dir.join("profile.json"), "{}").expect("write agent profile");
+                std::fs::write(
+                    message_dir.join("2026-04-01T12-00-00Z__archive-only__7.md"),
+                    "---json\n{\"id\":7,\"from\":\"Alice\",\"to\":[],\"subject\":\"Archive only\"}\n---\nbody\n",
+                )
+                .expect("write canonical message");
+
+                let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+                conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                    .expect("init schema");
+                conn.query_sync(
+                    "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'ahead-project', '/ahead-project', 0)",
+                    &[],
+                )
+                .expect("insert overlapping project");
+                drop(conn);
+
+                let ctx = McpContext::new(Cx::for_testing(), 1);
+                let response = health_check(&ctx).expect("health_check should serialize");
+                let value: serde_json::Value =
+                    serde_json::from_str(&response).expect("parse health_check json");
+                assert_eq!(value["status"], "ok");
+                assert_eq!(value["semantic_readiness"]["status"], "ok");
+                assert!(
+                    value["semantic_readiness"]["detail"].as_str().is_some_and(
+                        |detail| detail.contains("Skipped semantic readiness archive parity")
+                    ),
+                    "health_check should ignore unrelated default archive overlap for external custom DBs: {value}"
                 );
             },
         );

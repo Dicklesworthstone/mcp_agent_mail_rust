@@ -2116,12 +2116,24 @@ effective_free_bytes={free}"
     let mut notified = HashSet::new();
     for name in resolved_to.iter().chain(resolved_cc_recipients.iter()) {
         if notified.insert(name.clone()) {
-            let _ = mcp_agent_mail_storage::emit_notification_signal(
+            match mcp_agent_mail_storage::emit_notification_signal(
                 config,
                 &project.slug,
                 name,
                 Some(&notification_meta),
-            );
+            ) {
+                mcp_agent_mail_storage::SignalEmitOutcome::WriteFailed => tracing::warn!(
+                    project = %project.slug,
+                    recipient = %name,
+                    "failed to emit notification signal during send_message"
+                ),
+                mcp_agent_mail_storage::SignalEmitOutcome::InvalidTarget => tracing::warn!(
+                    project = %project.slug,
+                    recipient = %name,
+                    "resolved recipient produced invalid notification target during send_message"
+                ),
+                _ => {}
+            }
         }
     }
 
@@ -2389,7 +2401,8 @@ effective_free_bytes={free}"
 
     // Resolve original sender name for default recipient
     let original_sender = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::get_agent_by_id(ctx.cx(), &pool, original.sender_id).await,
+        mcp_agent_mail_db::queries::get_agent_by_id_fresh(ctx.cx(), &pool, original.sender_id)
+            .await,
     )?;
 
     // Determine thread_id: use original's thread_id, or the original message id as string.
@@ -2907,12 +2920,24 @@ effective_free_bytes={free}"
     let mut notified = HashSet::new();
     for name in resolved_to.iter().chain(resolved_cc_recipients.iter()) {
         if notified.insert(name.clone()) {
-            let _ = mcp_agent_mail_storage::emit_notification_signal(
+            match mcp_agent_mail_storage::emit_notification_signal(
                 config,
                 &project.slug,
                 name,
                 Some(&notification_meta),
-            );
+            ) {
+                mcp_agent_mail_storage::SignalEmitOutcome::WriteFailed => tracing::warn!(
+                    project = %project.slug,
+                    recipient = %name,
+                    "failed to emit notification signal during reply_message"
+                ),
+                mcp_agent_mail_storage::SignalEmitOutcome::InvalidTarget => tracing::warn!(
+                    project = %project.slug,
+                    recipient = %name,
+                    "resolved recipient produced invalid notification target during reply_message"
+                ),
+                _ => {}
+            }
         }
     }
 
@@ -3209,7 +3234,19 @@ pub async fn fetch_inbox(
 
     // Clear notification signal (best-effort).
     let config = &Config::get();
-    let _ = mcp_agent_mail_storage::clear_notification_signal(config, &project.slug, &agent.name);
+    match mcp_agent_mail_storage::clear_notification_signal(config, &project.slug, &agent.name) {
+        mcp_agent_mail_storage::SignalClearOutcome::RemoveFailed => tracing::warn!(
+            project = %project.slug,
+            agent = %agent.name,
+            "failed to clear notification signal after fetch_inbox"
+        ),
+        mcp_agent_mail_storage::SignalClearOutcome::InvalidTarget => tracing::warn!(
+            project = %project.slug,
+            agent = %agent.name,
+            "resolved agent produced invalid notification target during fetch_inbox clear"
+        ),
+        _ => {}
+    }
 
     serde_json::to_string(&messages)
         .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
@@ -3393,6 +3430,82 @@ mod tests {
             Outcome::Ok(agent) => agent,
             other => panic!("register_agent({name}, None) failed: {other:?}"),
         }
+    }
+
+    #[test]
+    fn reply_message_rejects_stale_cached_original_sender() {
+        run_thread_validation_test("reply-message-stale-sender.db", |cx, pool| async move {
+            let project = ensure_project_row(&cx, &pool, "/tmp/am-reply-stale-sender").await;
+            let project_id = project.id.expect("project id");
+            let original_sender = register_agent_row(&cx, &pool, project_id, "BlueLake").await;
+            let replier = register_agent_row(&cx, &pool, project_id, "RedPeak").await;
+            let original = match queries::create_message_with_recipients(
+                &cx,
+                &pool,
+                project_id,
+                original_sender.id.expect("sender id"),
+                "Reply stale sender",
+                "Body",
+                None,
+                "normal",
+                false,
+                "[]",
+                &[(replier.id.expect("replier id"), "to")],
+            )
+            .await
+            {
+                Outcome::Ok(message) => message,
+                other => panic!("create_message_with_recipients failed: {other:?}"),
+            };
+
+            match queries::get_agent_by_id(&cx, &pool, original_sender.id.expect("sender id")).await
+            {
+                Outcome::Ok(agent) => assert_eq!(agent.name, "BlueLake"),
+                other => panic!("prime sender cache failed: {other:?}"),
+            }
+
+            let conn = match pool.acquire(&cx).await {
+                Outcome::Ok(conn) => conn,
+                Outcome::Err(err) => panic!("acquire pooled conn failed: {err}"),
+                Outcome::Cancelled(reason) => {
+                    panic!("acquire pooled conn cancelled: {reason}")
+                }
+                Outcome::Panicked(payload) => {
+                    panic!("acquire pooled conn panicked: {}", payload.message())
+                }
+            };
+            conn.execute_sync(
+                "DELETE FROM agents WHERE id = ?",
+                &[mcp_agent_mail_db::sqlmodel::Value::BigInt(
+                    original_sender.id.expect("sender id"),
+                )],
+            )
+            .expect("delete original sender row");
+
+            let ctx = McpContext::new(cx.clone(), 1);
+            let err = reply_message(
+                &ctx,
+                project.human_key.clone(),
+                original.id.expect("message id"),
+                replier.name.clone(),
+                "Reply body".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("reply should fail when original sender metadata is missing");
+            assert!(
+                !err.message.is_empty(),
+                "reply should return a surfaced error when the original sender row is missing"
+            );
+        });
     }
 
     #[test]

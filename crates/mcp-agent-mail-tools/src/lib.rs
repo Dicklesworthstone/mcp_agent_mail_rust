@@ -466,10 +466,23 @@ pub mod tool_util {
         archive.projects > 0 || archive.agents > 0 || archive.unique_message_ids > 0
     }
 
+    pub(crate) fn archive_storage_root_is_authoritative_for_sqlite_path(
+        storage_root: &Path,
+        sqlite_path: &Path,
+    ) -> bool {
+        !mcp_agent_mail_core::config::is_default_storage_root(storage_root)
+            || sqlite_path.starts_with(storage_root)
+    }
+
     fn read_archive_is_ahead(
         storage_root: &Path,
+        sqlite_path: &Path,
         conn: &mcp_agent_mail_db::DbConn,
     ) -> Result<bool, String> {
+        if !archive_storage_root_is_authoritative_for_sqlite_path(storage_root, sqlite_path) {
+            return Ok(false);
+        }
+
         let archive = mcp_agent_mail_db::scan_archive_message_inventory(storage_root);
         if archive.projects == 0 && archive.agents == 0 && archive.unique_message_ids == 0 {
             return Ok(false);
@@ -483,11 +496,22 @@ pub mod tool_util {
             &db_inventory.project_identities,
         );
 
-        Ok(archive.projects > db_inventory.projects
-            || archive.agents > db_inventory.agents
-            || archive_message_count > db_inventory.messages
+        let archive_metadata_ahead =
+            mcp_agent_mail_db::pool::archive_metadata_advantage_is_decisive(
+                archive.projects,
+                archive.agents,
+                archive_message_count,
+                archive.latest_message_id,
+                db_inventory.projects,
+                db_inventory.agents,
+                db_inventory.messages,
+                db_inventory.max_message_id,
+                &missing_archive_projects,
+            );
+
+        Ok(archive_message_count > db_inventory.messages
             || archive_max_id > db_inventory.max_message_id
-            || !missing_archive_projects.is_empty())
+            || archive_metadata_ahead)
     }
 
     static READ_SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -556,14 +580,23 @@ pub mod tool_util {
     /// worse) according to a fast mailbox verdict. Returns `true` when read
     /// surfaces should fall back to archive snapshots instead of the
     /// potentially corrupt live file.
-    fn live_db_is_suspect(database_url: &str, storage_root: &Path) -> bool {
+    fn live_db_is_suspect(database_url: &str, storage_root: &Path, sqlite_path: &Path) -> bool {
+        if !archive_storage_root_is_authoritative_for_sqlite_path(storage_root, sqlite_path) {
+            return false;
+        }
+
         let verdict = mcp_agent_mail_db::compute_mailbox_verdict(
             database_url,
             storage_root,
             &mcp_agent_mail_db::VerdictOptions::fast(),
         );
         let durability = mcp_agent_mail_db::DurabilityState::from_mailbox_state(verdict.state);
-        if durability.is_degraded() && durability.allows_reads() {
+        let prefer_archive =
+            mcp_agent_mail_db::verdict_prefers_archive_snapshot_reads_for_primary_read_surface(
+                &verdict,
+                sqlite_path,
+            );
+        if prefer_archive && durability.allows_reads() {
             // DegradedReadOnly — reads should come from archive snapshots.
             tracing::info!(
                 verdict_state = %verdict.state,
@@ -571,7 +604,7 @@ pub mod tool_util {
                 "live SQLite is suspect; read surfaces will prefer archive snapshots"
             );
             true
-        } else if !durability.allows_reads() {
+        } else if prefer_archive && !durability.allows_reads() {
             // Corrupt / Recovering — reads are fully blocked on the live path,
             // so we should also try archive snapshots as a last resort.
             tracing::warn!(
@@ -591,32 +624,33 @@ pub mod tool_util {
             return Ok(None);
         }
 
-        let cfg = DbPoolConfig {
-            database_url: config.database_url.clone(),
-            ..Default::default()
-        };
-        let sqlite_path = mcp_agent_mail_db::pool::normalize_sqlite_path_for_pool_key(
-            &cfg.sqlite_path().map_err(|err| err.to_string())?,
-        );
+        let sqlite_path =
+            mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
+                .map_err(|err| err.to_string())?
+                .canonical_path;
         if sqlite_path == ":memory:" {
             return Ok(None);
         }
 
         let resolved_path = PathBuf::from(&sqlite_path);
-        let archive_has_state = read_archive_inventory_has_state(&config.storage_root);
+        let archive_has_state = archive_storage_root_is_authoritative_for_sqlite_path(
+            &config.storage_root,
+            &resolved_path,
+        ) && read_archive_inventory_has_state(&config.storage_root);
 
         // When the durability verdict says the live DB is suspect or worse,
         // force archive-snapshot reads even if the archive isn't strictly
         // "ahead" of the DB by row count.
-        let durability_forces_snapshot =
-            archive_has_state && live_db_is_suspect(&config.database_url, &config.storage_root);
+        let durability_forces_snapshot = archive_has_state
+            && live_db_is_suspect(&config.database_url, &config.storage_root, &resolved_path);
 
         let use_archive_snapshot = if durability_forces_snapshot {
             true
         } else {
             match mcp_agent_mail_db::DbConn::open_file(&sqlite_path) {
                 Ok(conn) => {
-                    let archive_ahead = read_archive_is_ahead(&config.storage_root, &conn);
+                    let archive_ahead =
+                        read_archive_is_ahead(&config.storage_root, &resolved_path, &conn);
                     drop(conn);
                     match archive_ahead {
                         Ok(true) => true,
@@ -1110,6 +1144,9 @@ pub mod tool_util {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::sync::{Mutex, OnceLock};
+
+        static READ_POOL_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
         #[test]
         fn legacy_tool_error_sets_payload_shape() {
@@ -1190,6 +1227,66 @@ pub mod tool_util {
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "DATABASE_POOL_EXHAUSTED");
             assert_eq!(data["error"]["recoverable"], true);
+        }
+
+        #[test]
+        fn open_read_db_pool_ignores_unrelated_default_archive_overlap() {
+            let _guard = READ_POOL_TEST_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let db_path = temp.path().join("custom.sqlite3");
+            let database_url = format!("sqlite:///{}", db_path.display());
+            let xdg_data_home = temp.path().join("xdg");
+            let xdg_data_home_text = xdg_data_home.to_string_lossy().into_owned();
+
+            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+                &[
+                    ("DATABASE_URL", database_url.as_str()),
+                    ("XDG_DATA_HOME", xdg_data_home_text.as_str()),
+                ],
+                || {
+                    Config::reset_cached();
+                    let storage_root = Config::from_env().storage_root;
+                    let project_dir = storage_root.join("projects").join("ahead-project");
+                    let agent_dir = project_dir.join("agents").join("Alice");
+                    let message_dir = project_dir.join("messages").join("2026").join("04");
+                    std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+                    std::fs::create_dir_all(&message_dir).expect("create message dir");
+                    std::fs::write(
+                        project_dir.join("project.json"),
+                        r#"{"slug":"ahead-project","human_key":"/ahead-project"}"#,
+                    )
+                    .expect("write project metadata");
+                    std::fs::write(agent_dir.join("profile.json"), "{}")
+                        .expect("write agent profile");
+                    std::fs::write(
+                        message_dir.join("2026-04-01T12-00-00Z__archive-only__7.md"),
+                        "---json\n{\"id\":7,\"from\":\"Alice\",\"to\":[],\"subject\":\"Archive only\"}\n---\nbody\n",
+                    )
+                    .expect("write canonical message");
+
+                    let conn =
+                        mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+                            .expect("open db");
+                    conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                        .expect("init schema");
+                    conn.query_sync(
+                        "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'ahead-project', '/ahead-project', 0)",
+                        &[],
+                    )
+                    .expect("insert overlapping project");
+                    drop(conn);
+
+                    let pool = open_read_db_pool().expect("open read db pool");
+                    assert!(
+                        pool.is_none(),
+                        "default global archive should not force shared tool read snapshots for an external custom DB"
+                    );
+                },
+            );
         }
 
         #[test]

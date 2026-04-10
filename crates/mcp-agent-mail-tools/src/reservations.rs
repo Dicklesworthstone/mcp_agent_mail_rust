@@ -1134,17 +1134,34 @@ pub async fn force_release_file_reservation(
     let grace_micros = grace_seconds.saturating_mul(1_000_000);
 
     // Validate inactivity heuristics (4 signals)
-    let holder_agent = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::get_agent_by_id(ctx.cx(), &pool, reservation.agent_id).await,
-    )?;
+    let holder_agent = match mcp_agent_mail_db::queries::get_agent_by_id_fresh(
+        ctx.cx(),
+        &pool,
+        reservation.agent_id,
+    )
+    .await
+    {
+        Outcome::Ok(agent) => Some(agent),
+        Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => None,
+        other => return Err(db_outcome_to_mcp_result(other).unwrap_err()),
+    };
+    let holder_agent_name = holder_agent.as_ref().map_or_else(
+        || format!("[unknown-agent-{}]", reservation.agent_id),
+        |agent| agent.name.clone(),
+    );
 
     let now_micros = mcp_agent_mail_db::now_micros();
     let mut stale_reasons = Vec::new();
 
     // Signal 1: Agent inactivity
-    let agent_inactive_secs = now_micros.saturating_sub(holder_agent.last_active_ts) / 1_000_000;
-    let agent_inactive = now_micros.saturating_sub(holder_agent.last_active_ts) > inactivity_micros;
-    if agent_inactive {
+    let holder_last_active_ts = holder_agent.as_ref().map(|agent| agent.last_active_ts);
+    let agent_inactive_secs =
+        holder_last_active_ts.map(|ts| now_micros.saturating_sub(ts) / 1_000_000);
+    let agent_inactive =
+        holder_last_active_ts.is_none_or(|ts| now_micros.saturating_sub(ts) > inactivity_micros);
+    if holder_last_active_ts.is_none() {
+        stale_reasons.push("agent_missing".to_string());
+    } else if agent_inactive {
         stale_reasons.push(format!("agent_inactive>{inactivity_seconds}s"));
     } else {
         stale_reasons.push("agent_recently_active".to_string());
@@ -1237,7 +1254,7 @@ pub async fn force_release_file_reservation(
         let res_json = serde_json::json!({
             "id": reservation.id.unwrap_or(0),
             "project": &project.human_key,
-            "agent": holder_agent.name,
+            "agent": &holder_agent_name,
             "path_pattern": &reservation.path_pattern,
             "exclusive": reservation.exclusive != 0,
             "reason": &reservation.reason,
@@ -1261,7 +1278,15 @@ pub async fn force_release_file_reservation(
     }
 
     // Optionally send notification to previous holder
-    let notified = if should_notify && released_count > 0 && holder_agent.name != agent_name {
+    let notified = if should_notify
+        && released_count > 0
+        && holder_agent
+            .as_ref()
+            .is_some_and(|agent| agent.name != agent_name)
+    {
+        let holder_agent = holder_agent
+            .as_ref()
+            .expect("holder agent present when notification is attempted");
         let raw_note = note.as_deref().unwrap_or("");
         // Truncate note to prevent bypassing message size limits (4KB cap)
         let note_text = if raw_note.len() > 4096 {
@@ -1281,10 +1306,14 @@ pub async fn force_release_file_reservation(
             .join("\n");
 
         let mut details = String::new();
-        let _ = writeln!(
-            details,
-            "- last agent activity \u{2248} {agent_inactive_secs}s ago"
-        );
+        if let Some(agent_inactive_secs) = agent_inactive_secs {
+            let _ = writeln!(
+                details,
+                "- last agent activity \u{2248} {agent_inactive_secs}s ago"
+            );
+        } else {
+            let _ = writeln!(details, "- holder agent metadata missing");
+        }
         if let Some(ts) = mail_activity {
             let _ = writeln!(
                 details,
@@ -1358,7 +1387,7 @@ pub async fn force_release_file_reservation(
                     &message.subject,
                     &message.body_md,
                 );
-                let all_recipient_names = vec![holder_agent.name.clone()];
+                let all_recipient_names = vec![holder_agent_name.clone()];
                 let msg_json = serde_json::json!({
                     "id": message_id,
                     "from": &agent_name,
@@ -1398,7 +1427,7 @@ pub async fn force_release_file_reservation(
         "released_at": &now_iso,
         "reservation": {
             "id": file_reservation_id,
-            "agent": holder_agent.name,
+            "agent": &holder_agent_name,
             "path_pattern": reservation.path_pattern,
             "exclusive": reservation.exclusive != 0,
             "reason": reservation.reason,
@@ -1406,7 +1435,7 @@ pub async fn force_release_file_reservation(
             "expires_ts": micros_to_iso(reservation.expires_ts),
             "released_ts": &now_iso,
             "stale_reasons": stale_reasons,
-            "last_agent_activity_ts": micros_to_iso(holder_agent.last_active_ts),
+            "last_agent_activity_ts": holder_last_active_ts.map(micros_to_iso),
             "last_mail_activity_ts": mail_activity.map(micros_to_iso),
             "last_filesystem_activity_ts": pattern_activity.fs_activity_micros.map(micros_to_iso),
             "last_git_activity_ts": pattern_activity.git_activity_micros.map(micros_to_iso),
@@ -2320,6 +2349,88 @@ mod tests {
                 .expect("release_file_reservations");
                 let parsed: Value = serde_json::from_str(&payload).expect("valid JSON");
                 assert_eq!(parsed["released"].as_i64(), Some(1));
+            });
+        });
+    }
+
+    #[test]
+    fn force_release_file_reservation_ignores_stale_cached_missing_holder_agent() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let workspace = tempfile::tempdir().expect("workspace tempdir");
+                let project_key = workspace.path().to_string_lossy().to_string();
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let holder = register_agent(&cx, &pool, project_id, "AmberRiver").await;
+                let actor = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let holder_id = holder.id.unwrap_or(0);
+
+                let created = match queries::create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder_id,
+                    &["src/**"],
+                    3600,
+                    true,
+                    "force release stale cache regression",
+                )
+                .await
+                {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("create_file_reservations failed: {other:?}"),
+                };
+                let reservation_id = created[0].id.unwrap_or(0);
+
+                match queries::get_agent_by_id(&cx, &pool, holder_id).await {
+                    Outcome::Ok(_) => {}
+                    other => panic!("prime holder cache failed: {other:?}"),
+                }
+
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(err) => panic!("acquire failed: {err}"),
+                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                    Outcome::Panicked(panic) => panic!("acquire panicked: {}", panic.message()),
+                };
+                conn.execute_sync(
+                    "DELETE FROM agents WHERE id = ?",
+                    &[mcp_agent_mail_db::sqlmodel::Value::BigInt(holder_id)],
+                )
+                .expect("delete holder row");
+                conn.execute_sync(
+                    "UPDATE file_reservations SET expires_ts = ? WHERE id = ?",
+                    &[
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(
+                            mcp_agent_mail_db::now_micros().saturating_sub(1),
+                        ),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(reservation_id),
+                    ],
+                )
+                .expect("expire reservation");
+                drop(conn);
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let payload = force_release_file_reservation(
+                    &ctx,
+                    project.human_key.clone(),
+                    actor.name.clone(),
+                    reservation_id,
+                    None,
+                    Some(true),
+                )
+                .await
+                .expect("force release succeeds");
+                let parsed: Value = serde_json::from_str(&payload).expect("valid JSON");
+                assert_eq!(parsed["released"].as_i64(), Some(1));
+                let expected_holder = format!("[unknown-agent-{holder_id}]");
+                assert_eq!(
+                    parsed["reservation"]["agent"].as_str(),
+                    Some(expected_holder.as_str())
+                );
+                assert_eq!(parsed["reservation"]["notified"].as_bool(), Some(false));
+                assert!(parsed["reservation"]["last_agent_activity_ts"].is_null());
             });
         });
     }
