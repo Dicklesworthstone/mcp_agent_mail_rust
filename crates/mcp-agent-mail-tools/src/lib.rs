@@ -118,10 +118,8 @@ pub mod tool_util {
     pub(crate) fn parse_recipients_json_value(input: &str) -> serde_json::Value {
         match serde_json::from_str::<serde_json::Value>(input) {
             Ok(value) if is_valid_recipients_payload(&value) => value,
-            Ok(_) if input.trim().is_empty() => json!({}),
-            Ok(_) => malformed_recipients_payload(),
-            Err(_) if input.trim().is_empty() => json!({}),
-            Err(_) => malformed_recipients_payload(),
+            Ok(_) | Err(_) if input.trim().is_empty() => json!({}),
+            Ok(_) | Err(_) => malformed_recipients_payload(),
         }
     }
 
