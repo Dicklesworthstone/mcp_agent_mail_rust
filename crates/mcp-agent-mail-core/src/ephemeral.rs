@@ -340,10 +340,18 @@ impl EphemeralSignals {
 // Environment lookup helper
 // ============================================================================
 
-/// Standard environment variable lookup via `std::env::var`.
+fn has_nonempty_env_value(env: &impl Fn(&str) -> Option<String>, key: &str) -> bool {
+    env(key).is_some_and(|value| !value.trim().is_empty())
+}
+
+/// Standard process-environment lookup.
+///
+/// This intentionally excludes user-global and project-local dotenv layers, but
+/// does honor the core process-env test override hook so deterministic tests
+/// and harnesses can control ephemeral detection.
 #[must_use]
 pub fn std_env_lookup(key: &str) -> Option<String> {
-    std::env::var(key).ok()
+    crate::config::process_env_value(key)
 }
 
 // ============================================================================
@@ -447,12 +455,13 @@ pub fn classify_ephemeral(
 
     signals.env_am_test_mode = env("AM_TEST_MODE")
         .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"));
-    signals.env_rust_test_threads = env("RUST_TEST_THREADS").is_some();
+    signals.env_rust_test_threads = has_nonempty_env_value(env, "RUST_TEST_THREADS");
 
     // ---- Tier 3: NTM/swarm ----
     signals.path_ntm_dir = normalized.contains("/.ntm/");
     signals.path_ntm_session = normalized.contains("/ntm-session-");
-    signals.env_ntm = env("NTM_SESSION_DIR").is_some() || env("NTM_SESSION").is_some();
+    signals.env_ntm = has_nonempty_env_value(env, "NTM_SESSION_DIR")
+        || has_nonempty_env_value(env, "NTM_SESSION");
 
     // ---- Tier 4: CI/CD ----
     signals.env_ci =
@@ -602,6 +611,13 @@ mod tests {
         assert_eq!(EphemeralMode::default(), EphemeralMode::Auto);
     }
 
+    #[test]
+    fn std_env_lookup_honors_process_env_test_overrides() {
+        crate::config::with_process_env_overrides_for_test(&[("RUST_TEST_THREADS", "7")], || {
+            assert_eq!(std_env_lookup("RUST_TEST_THREADS").as_deref(), Some("7"));
+        });
+    }
+
     // ---- Tier 1: System temp paths ----
 
     #[test]
@@ -681,6 +697,14 @@ mod tests {
         assert!(signals.env_rust_test_threads);
     }
 
+    #[test]
+    fn classify_blank_rust_test_threads_as_production() {
+        let env = env_with(&[("RUST_TEST_THREADS", "")]);
+        let (class, signals) = classify_ephemeral(Path::new("/data/projects/real-project"), &env);
+        assert_eq!(class, EphemeralClass::Production);
+        assert!(!signals.env_rust_test_threads);
+    }
+
     // ---- Tier 3: NTM/swarm ----
 
     #[test]
@@ -701,6 +725,14 @@ mod tests {
         assert_eq!(class, EphemeralClass::Ephemeral);
         assert!(signals.env_ntm);
         assert_eq!(signals.primary_tier(), Some(EphemeralTier::NtmSwarm));
+    }
+
+    #[test]
+    fn classify_blank_ntm_session_env_as_production() {
+        let env = env_with(&[("NTM_SESSION_DIR", "")]);
+        let (class, signals) = classify_ephemeral(Path::new("/data/projects/real-project"), &env);
+        assert_eq!(class, EphemeralClass::Production);
+        assert!(!signals.env_ntm);
     }
 
     #[test]

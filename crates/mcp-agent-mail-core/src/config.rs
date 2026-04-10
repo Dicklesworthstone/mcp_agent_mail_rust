@@ -2507,10 +2507,13 @@ fn layered_env_value(
         .or(project_dotenv_value)
 }
 
-/// Read a value from the real environment first, then the user-global env file,
-/// then the working-directory `.env`.
+/// Read a value from the process environment only.
+///
+/// Unlike [`env_value`], this intentionally skips the user-global env file and
+/// project-local `.env` layers. It still honors the process-env override hook
+/// used by tests and deterministic harnesses.
 #[must_use]
-pub fn env_value(key: &str) -> Option<String> {
+pub fn process_env_value(key: &str) -> Option<String> {
     #[cfg(test)]
     if let Some(v) = test_env_override_value(key) {
         return Some(v);
@@ -2518,7 +2521,18 @@ pub fn env_value(key: &str) -> Option<String> {
     if let Some(v) = process_env_override_value(key) {
         return Some(v);
     }
-    layered_env_value(env::var(key).ok(), user_env_value(key), dotenv_value(key))
+    env::var(key).ok()
+}
+
+/// Read a value from the real environment first, then the user-global env file,
+/// then the working-directory `.env`.
+#[must_use]
+pub fn env_value(key: &str) -> Option<String> {
+    layered_env_value(
+        process_env_value(key),
+        user_env_value(key),
+        dotenv_value(key),
+    )
 }
 
 /// Read an **infrastructure-level** environment value.
@@ -2531,16 +2545,9 @@ pub fn env_value(key: &str) -> Option<String> {
 /// Precedence: process env -> user-global env file (only).
 #[must_use]
 pub fn infra_env_value(key: &str) -> Option<String> {
-    #[cfg(test)]
-    if let Some(v) = test_env_override_value(key) {
-        return Some(v);
-    }
-    if let Some(v) = process_env_override_value(key) {
-        return Some(v);
-    }
     // Intentionally pass `None` for the project dotenv layer so that a
     // project-local `.env` can never override infrastructure keys.
-    layered_env_value(env::var(key).ok(), user_env_value(key), None)
+    layered_env_value(process_env_value(key), user_env_value(key), None)
 }
 
 fn normalize_http_path(raw: &str) -> String {
