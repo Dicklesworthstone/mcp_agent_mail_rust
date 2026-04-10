@@ -8595,18 +8595,7 @@ fn handle_contacts_with_conn(
             let expires_us = now_us + ttl.saturating_mul(1_000_000);
 
             // Resolve project and agents.
-            let proj_rows = conn
-                .query_sync(
-                    "SELECT id FROM projects WHERE slug = ?",
-                    &[sqlmodel_core::Value::Text(project_key.clone())],
-                )
-                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let project_id: i64 = proj_rows
-                .first()
-                .and_then(|r| r.get_named("id").ok())
-                .ok_or_else(|| {
-                    CliError::InvalidArgument(format!("project not found: {project_key}"))
-                })?;
+            let project_id = crate::context::resolve_project(conn, &project_key)?.id;
 
             let from_id = crate::context::resolve_agent(conn, project_id, &from_agent)?.id;
             let to_id = crate::context::resolve_agent(conn, project_id, &to_agent)?.id;
@@ -8678,18 +8667,7 @@ fn handle_contacts_with_conn(
             let ttl = ttl_seconds.max(60);
             let expires_us = now_us + ttl.saturating_mul(1_000_000);
 
-            let proj_rows = conn
-                .query_sync(
-                    "SELECT id FROM projects WHERE slug = ?",
-                    &[sqlmodel_core::Value::Text(project_key.clone())],
-                )
-                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let project_id: i64 = proj_rows
-                .first()
-                .and_then(|r| r.get_named("id").ok())
-                .ok_or_else(|| {
-                    CliError::InvalidArgument(format!("project not found: {project_key}"))
-                })?;
+            let project_id = crate::context::resolve_project(conn, &project_key)?.id;
 
             let from_id = crate::context::resolve_agent(conn, project_id, &from_agent)?.id;
             let to_id = crate::context::resolve_agent(conn, project_id, &agent_name)?.id;
@@ -8734,18 +8712,7 @@ fn handle_contacts_with_conn(
             json,
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
-            let proj_rows = conn
-                .query_sync(
-                    "SELECT id FROM projects WHERE slug = ?",
-                    &[sqlmodel_core::Value::Text(project_key.clone())],
-                )
-                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let project_id: i64 = proj_rows
-                .first()
-                .and_then(|r| r.get_named("id").ok())
-                .ok_or_else(|| {
-                    CliError::InvalidArgument(format!("project not found: {project_key}"))
-                })?;
+            let project_id = crate::context::resolve_project(conn, &project_key)?.id;
 
             let agent_id = crate::context::resolve_agent(conn, project_id, &agent_name)?.id;
 
@@ -8861,18 +8828,7 @@ fn handle_contacts_with_conn(
                 )));
             }
 
-            let proj_rows = conn
-                .query_sync(
-                    "SELECT id FROM projects WHERE slug = ?",
-                    &[sqlmodel_core::Value::Text(project_key.clone())],
-                )
-                .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-            let project_id: i64 = proj_rows
-                .first()
-                .and_then(|r| r.get_named("id").ok())
-                .ok_or_else(|| {
-                    CliError::InvalidArgument(format!("project not found: {project_key}"))
-                })?;
+            let project_id = crate::context::resolve_project(conn, &project_key)?.id;
 
             let agent = crate::context::resolve_agent(conn, project_id, &agent_name)?;
 
@@ -35181,6 +35137,51 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn integration_contacts_request_accepts_orphaned_project_placeholder() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+        conn.execute_sync(
+            "DELETE FROM projects WHERE id = ?",
+            &[sqlmodel_core::Value::BigInt(1)],
+        )
+        .expect("delete project row");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::Request {
+                project_key: "[unknown-project-1]".to_string(),
+                from_agent: "BlueLake".to_string(),
+                to_agent: "RedFox".to_string(),
+                reason: "need coordination".to_string(),
+                ttl_seconds: 3600,
+                format: None,
+                json: true,
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "request failed: {result:?}");
+        assert!(
+            output.contains("\"status\"") && output.contains("pending"),
+            "expected pending status, got: {output}"
+        );
+
+        let rows = conn
+            .query_sync(
+                "SELECT status, reason FROM agent_links WHERE a_agent_id = 1 AND b_agent_id = 2",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1, "expected 1 agent_link row");
+        let status: String = rows[0].get_named("status").unwrap();
+        assert_eq!(status, "pending");
+    }
+
+    #[test]
     fn integration_contacts_respond_approve() {
         let _guard = stdio_capture_lock()
             .lock()
@@ -35383,6 +35384,56 @@ startup_timeout_sec = 42
         assert!(
             output.contains("[unknown-agent-2]"),
             "expected orphaned counterparty placeholder, got: {output}"
+        );
+    }
+
+    #[test]
+    fn integration_contacts_list_accepts_orphaned_project_placeholder() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::Request {
+                project_key: "test-proj".to_string(),
+                from_agent: "BlueLake".to_string(),
+                to_agent: "RedFox".to_string(),
+                reason: "x".to_string(),
+                ttl_seconds: 3600,
+                format: None,
+                json: false,
+            },
+        )
+        .unwrap();
+        conn.execute_sync(
+            "DELETE FROM projects WHERE id = ?",
+            &[sqlmodel_core::Value::BigInt(1)],
+        )
+        .expect("delete project row");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::ListContacts {
+                project_key: "[unknown-project-1]".to_string(),
+                agent_name: "BlueLake".to_string(),
+                format: None,
+                json: true,
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "list failed: {result:?}");
+        assert!(
+            output.contains("\"direction\"") && output.contains("outgoing"),
+            "expected outgoing entry, got: {output}"
+        );
+        assert!(
+            output.contains("RedFox"),
+            "expected RedFox in contacts, got: {output}"
         );
     }
 
@@ -35762,6 +35813,48 @@ startup_timeout_sec = 42
         );
 
         // Verify DB.
+        let rows = conn
+            .query_sync(
+                "SELECT contact_policy FROM agents WHERE name = 'BlueLake'",
+                &[],
+            )
+            .unwrap();
+        let policy: String = rows[0].get_named("contact_policy").unwrap();
+        assert_eq!(policy, "contacts_only");
+    }
+
+    #[test]
+    fn integration_contacts_policy_accepts_orphaned_project_placeholder() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+        conn.execute_sync(
+            "DELETE FROM projects WHERE id = ?",
+            &[sqlmodel_core::Value::BigInt(1)],
+        )
+        .expect("delete project row");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_contacts_with_conn(
+            &conn,
+            ContactsCommand::Policy {
+                project_key: "[unknown-project-1]".to_string(),
+                agent_name: "BlueLake".to_string(),
+                policy: "contacts_only".to_string(),
+                format: None,
+                json: true,
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "policy set failed: {result:?}");
+        assert!(
+            output.contains("contacts_only"),
+            "expected policy in output, got: {output}"
+        );
+
         let rows = conn
             .query_sync(
                 "SELECT contact_policy FROM agents WHERE name = 'BlueLake'",
