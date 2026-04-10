@@ -233,6 +233,8 @@ struct ParsedAttachment {
     mime_type: String,
 }
 
+const MALFORMED_ATTACHMENTS_SENTINEL: &str = "[malformed-attachments-json]";
+
 fn parse_attachment_size_bytes(value: &serde_json::Value) -> Option<usize> {
     value
         .get("bytes")
@@ -285,40 +287,43 @@ fn parse_attachment_mime_type(value: &serde_json::Value) -> String {
         .to_string()
 }
 
-fn parse_attachments_json(attachments_json: &str) -> Vec<ParsedAttachment> {
-    serde_json::from_str::<serde_json::Value>(attachments_json)
-        .ok()
-        .and_then(|value| value.as_array().cloned())
-        .map(|items| {
-            items
-                .iter()
-                .map(|value| {
-                    let size_bytes = parse_attachment_size_bytes(value).unwrap_or(0);
-                    let size_text = parse_attachment_size_bytes(value)
-                        .map(|bytes| bytes.to_string())
-                        .or_else(|| {
-                            value
-                                .get("size")
-                                .and_then(|v| v.as_str())
-                                .map(str::to_string)
-                        })
-                        .unwrap_or_else(|| "unknown".to_string());
-                    ParsedAttachment {
-                        name: parse_attachment_name(value),
-                        size_text,
-                        size_bytes,
-                        mime_type: parse_attachment_mime_type(value),
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+fn parse_attachment_values(attachments_json: Option<&str>) -> Vec<serde_json::Value> {
+    match attachments_json.map(str::trim) {
+        None | Some("") => Vec::new(),
+        Some(raw) => match serde_json::from_str::<Vec<serde_json::Value>>(raw) {
+            Ok(values) => values,
+            Err(_) => vec![serde_json::json!({
+                "name": MALFORMED_ATTACHMENTS_SENTINEL,
+                "media_type": null,
+                "path": null,
+                "bytes": null,
+            })],
+        },
+    }
 }
 
-fn parse_attachment_values(attachments_json: Option<&str>) -> Vec<serde_json::Value> {
-    attachments_json
-        .and_then(|raw| serde_json::from_str::<Vec<serde_json::Value>>(raw).ok())
-        .unwrap_or_default()
+fn parse_attachments_json(attachments_json: &str) -> Vec<ParsedAttachment> {
+    parse_attachment_values(Some(attachments_json))
+        .iter()
+        .map(|value| {
+            let size_bytes = parse_attachment_size_bytes(value).unwrap_or(0);
+            let size_text = parse_attachment_size_bytes(value)
+                .map(|bytes| bytes.to_string())
+                .or_else(|| {
+                    value
+                        .get("size")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            ParsedAttachment {
+                name: parse_attachment_name(value),
+                size_text,
+                size_bytes,
+                mime_type: parse_attachment_mime_type(value),
+            }
+        })
+        .collect()
 }
 
 fn redact_navigate_database_url(url: &str) -> String {
@@ -13420,6 +13425,19 @@ mod tests {
         assert_eq!(message.attachments[2].mime_type, "application/octet-stream");
         // "image/png" in type field is a valid mime_type fallback
         assert_eq!(message.attachments[3].mime_type, "image/png");
+    }
+
+    #[test]
+    fn test_parse_attachment_helpers_surface_malformed_payloads() {
+        let parsed = parse_attachments_json("{not-json");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, MALFORMED_ATTACHMENTS_SENTINEL);
+        assert_eq!(parsed[0].size_text, "unknown");
+        assert_eq!(parsed[0].mime_type, "application/octet-stream");
+
+        let values = parse_attachment_values(Some("{not-json"));
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["name"], MALFORMED_ATTACHMENTS_SENTINEL);
     }
 
     #[test]

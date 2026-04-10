@@ -83,6 +83,20 @@ fn attachment_path(att: &serde_json::Value) -> Option<String> {
         })
 }
 
+fn parse_attachment_metadata_values(raw: &str) -> Vec<serde_json::Value> {
+    match serde_json::from_str::<Vec<serde_json::Value>>(raw) {
+        Ok(values) => values,
+        Err(_) if raw.trim().is_empty() => Vec::new(),
+        Err(_) => vec![serde_json::json!({
+            "name": "[malformed-attachments-json]",
+            "media_type": null,
+            "path": null,
+            "bytes": null,
+            "type": "unknown",
+        })],
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // AttachmentEntry — parsed attachment with provenance
 // ──────────────────────────────────────────────────────────────────────
@@ -341,51 +355,44 @@ impl AttachmentExplorerScreen {
                         .filter(|value| !value.is_empty())
                         .unwrap_or_else(|| format!("[unknown-project-{project_id}]"));
 
-                    // Parse attachment JSON array
-                    if let Ok(attachments) =
-                        serde_json::from_str::<Vec<serde_json::Value>>(&attachments_json)
-                    {
-                        for att in &attachments {
-                            let media_type = attachment_media_type(att);
-                            let bytes = attachment_bytes(att);
-                            let sha1 = att
-                                .get("sha1")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("")
-                                .to_string();
-                            #[allow(clippy::cast_possible_truncation)]
-                            let width = att
-                                .get("width")
-                                .and_then(serde_json::Value::as_u64)
-                                .unwrap_or(0) as u32;
-                            #[allow(clippy::cast_possible_truncation)]
-                            let height = att
-                                .get("height")
-                                .and_then(serde_json::Value::as_u64)
-                                .unwrap_or(0) as u32;
-                            let mode = att
-                                .get("type")
-                                .and_then(serde_json::Value::as_str)
-                                .unwrap_or("unknown")
-                                .to_string();
-                            let path = attachment_path(att);
+                    for att in parse_attachment_metadata_values(&attachments_json) {
+                        let media_type = attachment_media_type(&att);
+                        let bytes = attachment_bytes(&att);
+                        let sha1 = att
+                            .get("sha1")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        #[allow(clippy::cast_possible_truncation)]
+                        let width =
+                            att.get("width").and_then(serde_json::Value::as_u64).unwrap_or(0)
+                                as u32;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let height =
+                            att.get("height").and_then(serde_json::Value::as_u64).unwrap_or(0)
+                                as u32;
+                        let mode = att
+                            .get("type")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let path = attachment_path(&att);
 
-                            self.entries.push(AttachmentEntry {
-                                media_type,
-                                bytes,
-                                sha1,
-                                width,
-                                height,
-                                mode,
-                                path,
-                                message_id,
-                                sender_name: sender_name.clone(),
-                                subject: subject.clone(),
-                                thread_id: thread_id.clone(),
-                                created_ts,
-                                project_slug: project_slug.clone(),
-                            });
-                        }
+                        self.entries.push(AttachmentEntry {
+                            media_type,
+                            bytes,
+                            sha1,
+                            width,
+                            height,
+                            mode,
+                            path,
+                            message_id,
+                            sender_name: sender_name.clone(),
+                            subject: subject.clone(),
+                            thread_id: thread_id.clone(),
+                            created_ts,
+                            project_slug: project_slug.clone(),
+                        });
                     }
                 }
                 self.last_error = None;
@@ -2094,5 +2101,12 @@ mod tests {
         assert_eq!(make(1_048_575).size_display(), "1024.0 KB");
         assert_eq!(make(1_048_576).size_display(), "1.0 MB");
         assert_eq!(make(10_485_760).size_display(), "10.0 MB");
+    }
+
+    #[test]
+    fn parse_attachment_metadata_values_surfaces_malformed_payloads() {
+        let attachments = parse_attachment_metadata_values("{not-json");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0]["name"], "[malformed-attachments-json]");
     }
 }

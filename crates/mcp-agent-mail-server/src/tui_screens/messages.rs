@@ -255,6 +255,8 @@ struct StoredRecipients {
     bcc: Vec<String>,
 }
 
+const MALFORMED_RECIPIENTS_SENTINEL: &str = "[malformed-recipients-json]";
+
 impl RenderItem for MessageEntry {
     fn render(&self, area: Rect, frame: &mut Frame, selected: bool, _skip_rows: u16) {
         self.render_row(
@@ -1233,11 +1235,49 @@ impl MessageBrowserScreen {
 
     fn latest_project_slug(&self) -> Option<String> {
         let conn = self.db_conn.as_ref()?;
-        let sql = "SELECT slug FROM projects ORDER BY created_at DESC LIMIT 1";
-        conn.query_sync(sql, &[])
-            .ok()
-            .and_then(|rows| rows.into_iter().next())
-            .and_then(|row| row.get_named::<String>("slug").ok())
+        let active_predicate = mcp_agent_mail_db::queries::active_reservation_predicate_for("fr");
+        let sql = format!(
+            "SELECT project_slug FROM ( \
+                 SELECT NULLIF(TRIM(p.slug), '') AS project_slug, p.created_at AS sort_ts, p.id AS project_id \
+                 FROM projects p \
+                 UNION ALL \
+                 SELECT '[unknown-project-' || m.project_id || ']' AS project_slug, \
+                        MAX(m.created_ts) AS sort_ts, \
+                        m.project_id AS project_id \
+                 FROM messages m \
+                 LEFT JOIN projects p ON p.id = m.project_id \
+                 WHERE p.id IS NULL \
+                 GROUP BY m.project_id \
+                 UNION ALL \
+                 SELECT '[unknown-project-' || a.project_id || ']' AS project_slug, \
+                        MAX(a.inception_ts) AS sort_ts, \
+                        a.project_id AS project_id \
+                 FROM agents a \
+                 LEFT JOIN projects p ON p.id = a.project_id \
+                 WHERE p.id IS NULL \
+                 GROUP BY a.project_id \
+                 UNION ALL \
+                 SELECT '[unknown-project-' || fr.project_id || ']' AS project_slug, \
+                        MAX(fr.created_ts) AS sort_ts, \
+                        fr.project_id AS project_id \
+                 FROM file_reservations fr \
+                 LEFT JOIN projects p ON p.id = fr.project_id \
+                 WHERE p.id IS NULL \
+                   AND ({active_predicate}) \
+                   AND fr.expires_ts > ? \
+                 GROUP BY fr.project_id \
+             ) project_inventory \
+             WHERE project_slug IS NOT NULL AND TRIM(project_slug) <> '' \
+             ORDER BY sort_ts DESC, project_id DESC \
+             LIMIT 1"
+        );
+        conn.query_sync(
+            &sql,
+            &[Value::BigInt(mcp_agent_mail_core::timestamps::now_micros())],
+        )
+        .ok()
+        .and_then(|rows| rows.into_iter().next())
+        .and_then(|row| row.get_named::<String>("project_slug").ok())
     }
 
     fn load_agent_names_for_project(&self, project_slug: &str) -> Result<Vec<String>, String> {
@@ -4114,7 +4154,14 @@ fn synthetic_project_id(project_slug: &str) -> Option<i64> {
 }
 
 fn recipient_names_from_json(raw: &str) -> String {
-    let parsed = serde_json::from_str::<StoredRecipients>(raw).unwrap_or_default();
+    let parsed = match serde_json::from_str::<StoredRecipients>(raw) {
+        Ok(parsed) => parsed,
+        Err(_) if raw.trim().is_empty() => StoredRecipients::default(),
+        Err(_) => StoredRecipients {
+            to: vec![MALFORMED_RECIPIENTS_SENTINEL.to_string()],
+            ..StoredRecipients::default()
+        },
+    };
     let mut seen = std::collections::BTreeSet::new();
     let mut recipients = Vec::new();
     for group in [parsed.to, parsed.cc, parsed.bcc] {
@@ -7726,6 +7773,53 @@ first body
     }
 
     #[test]
+    fn open_compose_modal_uses_orphaned_project_placeholder_from_latest_inventory() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("messages-screen-compose.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                Value::BigInt(77),
+                Value::Text("proj".to_string()),
+                Value::Text("/proj".to_string()),
+                Value::BigInt(0),
+            ],
+        )
+        .expect("insert project");
+        conn.execute_sync(
+            "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(77),
+                Value::Text("BlueLake".to_string()),
+                Value::Text("test".to_string()),
+                Value::Text("test".to_string()),
+                Value::Text(String::new()),
+                Value::BigInt(1_700_000_000_000_000),
+                Value::BigInt(1_700_000_000_000_000),
+                Value::Text("auto".to_string()),
+                Value::Text("auto".to_string()),
+            ],
+        )
+        .expect("insert agent");
+        conn.execute_raw("DELETE FROM projects WHERE id = 77")
+            .expect("delete project row");
+
+        let mut screen = MessageBrowserScreen::new();
+        screen.db_conn = Some(conn);
+
+        screen.open_compose_modal(None, None);
+
+        let form = screen.compose_form.expect("compose form");
+        assert_eq!(form.project_slug, "[unknown-project-77]");
+        assert_eq!(form.available_agents, vec!["BlueLake".to_string()]);
+        assert_eq!(form.errors.general, None);
+    }
+
+    #[test]
     fn open_compose_modal_without_project_context_and_db_reports_database_unavailable() {
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
         let mut screen = MessageBrowserScreen::new();
@@ -8813,9 +8907,16 @@ first body
     }
 
     #[test]
-    fn recipient_names_from_json_dedups_and_ignores_invalid_payloads() {
+    fn recipient_names_from_json_dedups_and_surfaces_malformed_payloads() {
         let raw = r#"{"to":["BlueLake","bluelake",""],"cc":["BlueLake","  "],"bcc":["AmberOx"]}"#;
         assert_eq!(recipient_names_from_json(raw), "BlueLake, AmberOx");
-        assert!(recipient_names_from_json("{not-json").is_empty());
+        assert_eq!(
+            recipient_names_from_json("{not-json"),
+            MALFORMED_RECIPIENTS_SENTINEL
+        );
+        assert_eq!(
+            recipient_names_from_json(r#"{"to":"BlueLake"}"#),
+            MALFORMED_RECIPIENTS_SENTINEL
+        );
     }
 }

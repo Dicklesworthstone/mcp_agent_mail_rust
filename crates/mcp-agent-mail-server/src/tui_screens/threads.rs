@@ -309,6 +309,8 @@ struct StoredRecipients {
     bcc: Vec<String>,
 }
 
+const MALFORMED_RECIPIENTS_SENTINEL: &str = "[malformed-recipients-json]";
+
 // ──────────────────────────────────────────────────────────────────────
 // View lens and sort mode
 // ──────────────────────────────────────────────────────────────────────
@@ -2651,7 +2653,14 @@ fn unknown_project_label(project_id: i64) -> String {
 }
 
 fn recipient_names_from_json(raw: &str) -> BTreeSet<String> {
-    let parsed = serde_json::from_str::<StoredRecipients>(raw).unwrap_or_default();
+    let parsed = match serde_json::from_str::<StoredRecipients>(raw) {
+        Ok(parsed) => parsed,
+        Err(_) if raw.trim().is_empty() => StoredRecipients::default(),
+        Err(_) => StoredRecipients {
+            to: vec![MALFORMED_RECIPIENTS_SENTINEL.to_string()],
+            ..StoredRecipients::default()
+        },
+    };
     let mut recipients = BTreeSet::new();
     for group in [parsed.to, parsed.cc, parsed.bcc] {
         for name in group {
@@ -6838,5 +6847,14 @@ mod tests {
             screen.threads[0].thread_id, screen.threads[1].thread_id,
             "case-different thread_ids must not merge"
         );
+    }
+
+    #[test]
+    fn recipient_names_from_json_surfaces_malformed_payloads() {
+        let recipients = recipient_names_from_json("{not-json");
+        assert!(recipients.contains(MALFORMED_RECIPIENTS_SENTINEL));
+
+        let recipients = recipient_names_from_json(r#"{"to":"BlueLake"}"#);
+        assert!(recipients.contains(MALFORMED_RECIPIENTS_SENTINEL));
     }
 }
