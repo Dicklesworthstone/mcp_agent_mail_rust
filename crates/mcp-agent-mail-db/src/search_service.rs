@@ -668,6 +668,49 @@ fn raw_result_matches_query_filters(
     true
 }
 
+const MALFORMED_RECIPIENTS_SENTINEL: &str = "[malformed-recipients-json]";
+
+#[derive(serde::Deserialize, Default)]
+struct FastRecipients {
+    #[serde(default)]
+    to: Vec<String>,
+    #[serde(default)]
+    cc: Vec<String>,
+    #[serde(default)]
+    bcc: Vec<String>,
+}
+
+fn is_valid_recipients_payload(value: &serde_json::Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+
+    ["to", "cc", "bcc"].iter().all(|key| {
+        object.get(*key).is_none_or(|entries| {
+            entries
+                .as_array()
+                .is_some_and(|items| items.iter().all(serde_json::Value::is_string))
+        })
+    })
+}
+
+fn parse_search_result_recipients(input: &str) -> FastRecipients {
+    match serde_json::from_str::<serde_json::Value>(input) {
+        Ok(value) if is_valid_recipients_payload(&value) => serde_json::from_value(value)
+            .unwrap_or_else(|_| FastRecipients {
+                to: vec![MALFORMED_RECIPIENTS_SENTINEL.to_string()],
+                cc: Vec::new(),
+                bcc: Vec::new(),
+            }),
+        Ok(_) | Err(_) if input.trim().is_empty() => FastRecipients::default(),
+        Ok(_) | Err(_) => FastRecipients {
+            to: vec![MALFORMED_RECIPIENTS_SENTINEL.to_string()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+        },
+    }
+}
+
 #[allow(clippy::items_after_statements, clippy::too_many_lines)]
 async fn canonicalize_message_results(
     cx: &Cx,
@@ -726,16 +769,6 @@ async fn canonicalize_message_results(
         None
     };
 
-    #[derive(serde::Deserialize, Default)]
-    struct FastRecipients {
-        #[serde(default)]
-        to: Vec<String>,
-        #[serde(default)]
-        cc: Vec<String>,
-        #[serde(default)]
-        bcc: Vec<String>,
-    }
-
     let mut canonical = Vec::with_capacity(deduped.len());
     let mut dropped_missing = 0usize;
     let mut dropped_filter_mismatch = 0usize;
@@ -763,8 +796,7 @@ async fn canonicalize_message_results(
             continue;
         }
 
-        let recipients: FastRecipients =
-            serde_json::from_str(&detail.recipients).unwrap_or_default();
+        let recipients = parse_search_result_recipients(&detail.recipients);
 
         result.project_id = Some(detail.project_id);
         result.title.clone_from(&detail.subject);
@@ -5099,6 +5131,19 @@ mod tests {
             attachments: "[]".to_string(),
             from: from.to_string(),
         }
+    }
+
+    #[test]
+    fn parse_search_result_recipients_surfaces_malformed_payloads() {
+        assert!(parse_search_result_recipients("").to.is_empty());
+        assert_eq!(
+            parse_search_result_recipients(r#"{"to":"BlueLake"}"#).to,
+            vec![MALFORMED_RECIPIENTS_SENTINEL.to_string()]
+        );
+        assert_eq!(
+            parse_search_result_recipients("{not-json").to,
+            vec![MALFORMED_RECIPIENTS_SENTINEL.to_string()]
+        );
     }
 
     #[test]

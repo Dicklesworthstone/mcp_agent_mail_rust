@@ -18,7 +18,8 @@ use crate::messaging::InboxMessage;
 use crate::search::{ExampleMessage, SingleThreadResponse};
 use crate::tool_util::{
     db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, get_read_db_pool,
-    legacy_tool_error, resolve_agent, resolve_project,
+    legacy_tool_error, parse_attachment_metadata_json, parse_recipients_lists, resolve_agent,
+    resolve_project,
 };
 
 static PRODUCT_UID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -588,18 +589,7 @@ pub async fn fetch_inbox_product(
             let created_ts = msg.created_ts;
             let id = msg.id.unwrap_or(0);
 
-            #[derive(serde::Deserialize, Default)]
-            struct FastRecipients {
-                #[serde(default)]
-                to: Vec<String>,
-                #[serde(default)]
-                cc: Vec<String>,
-                #[serde(default)]
-                bcc: Vec<String>,
-            }
-
-            let recipients: FastRecipients =
-                serde_json::from_str(&msg.recipients_json).unwrap_or_default();
+            let recipients = parse_recipients_lists(&msg.recipients_json);
 
             let to = recipients.to;
             let cc = recipients.cc;
@@ -626,7 +616,7 @@ pub async fn fetch_inbox_product(
                     bcc,
                     created_ts: Some(micros_to_iso(created_ts)),
                     kind: row.kind,
-                    attachments: serde_json::from_str(&msg.attachments).unwrap_or_default(),
+                    attachments: parse_attachment_metadata_json(&msg.attachments),
                     body_md: if with_bodies { Some(msg.body_md) } else { None },
                 },
             ));
@@ -1309,6 +1299,140 @@ archive body
                             .as_str()
                             .is_some_and(|body| body.contains("archive body")),
                         "expected archive body in fetched message: {value}"
+                    );
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn fetch_inbox_product_surfaces_malformed_message_metadata() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("product-malformed-metadata.sqlite3");
+
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", db_path.display())),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+                ("WORKTREES_ENABLED", "1"),
+            ],
+            || {
+                Config::reset_cached();
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                rt.block_on(async {
+                    let cx = Cx::for_testing();
+                    let pool = get_db_pool().expect("db pool");
+                    let project = match mcp_agent_mail_db::queries::ensure_project(
+                        &cx,
+                        &pool,
+                        "/product-malformed-project",
+                    )
+                    .await
+                    {
+                        asupersync::Outcome::Ok(project) => project,
+                        other => panic!("ensure_project failed: {other:?}"),
+                    };
+                    let project_id = project.id.unwrap_or(0);
+                    let sender = match mcp_agent_mail_db::queries::register_agent(
+                        &cx, &pool, project_id, "BlueLake", "coder", "test",
+                    )
+                    .await
+                    {
+                        asupersync::Outcome::Ok(agent) => agent,
+                        other => panic!("register sender failed: {other:?}"),
+                    };
+                    let recipient = match mcp_agent_mail_db::queries::register_agent(
+                        &cx, &pool, project_id, "RedPeak", "coder", "test",
+                    )
+                    .await
+                    {
+                        asupersync::Outcome::Ok(agent) => agent,
+                        other => panic!("register recipient failed: {other:?}"),
+                    };
+                    let product = match mcp_agent_mail_db::queries::ensure_product(
+                        &cx,
+                        &pool,
+                        None,
+                        Some("prod-malformed"),
+                    )
+                    .await
+                    {
+                        asupersync::Outcome::Ok(product) => product,
+                        other => panic!("ensure_product failed: {other:?}"),
+                    };
+                    match mcp_agent_mail_db::queries::link_product_to_projects(
+                        &cx,
+                        &pool,
+                        product.id.unwrap_or(0),
+                        &[project_id],
+                    )
+                    .await
+                    {
+                        asupersync::Outcome::Ok(()) => {}
+                        other => panic!("link_product_to_projects failed: {other:?}"),
+                    }
+                    let message = match mcp_agent_mail_db::queries::create_message_with_recipients(
+                        &cx,
+                        &pool,
+                        project_id,
+                        sender.id.unwrap_or(0),
+                        "Malformed Product Metadata",
+                        "body",
+                        Some("prod-malformed-thread"),
+                        "high",
+                        true,
+                        "[]",
+                        &[(recipient.id.unwrap_or(0), "to")],
+                    )
+                    .await
+                    {
+                        asupersync::Outcome::Ok(message) => message,
+                        other => panic!("create_message_with_recipients failed: {other:?}"),
+                    };
+
+                    let conn = match pool.acquire(&cx).await {
+                        asupersync::Outcome::Ok(conn) => conn,
+                        asupersync::Outcome::Err(err) => panic!("acquire failed: {err}"),
+                        asupersync::Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                        asupersync::Outcome::Panicked(panic) => {
+                            panic!("acquire panicked: {}", panic.message())
+                        }
+                    };
+                    conn.execute_sync(
+                        "UPDATE messages SET recipients_json = ?, attachments = ? WHERE id = ?",
+                        &[
+                            mcp_agent_mail_db::sqlmodel::Value::Text(
+                                r#"{"to":"RedPeak"}"#.to_string(),
+                            ),
+                            mcp_agent_mail_db::sqlmodel::Value::Text("{not-json".to_string()),
+                            mcp_agent_mail_db::sqlmodel::Value::BigInt(message.id.unwrap_or(0)),
+                        ],
+                    )
+                    .expect("poison message metadata");
+
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let response = fetch_inbox_product(
+                        &ctx,
+                        "prod-malformed".to_string(),
+                        "RedPeak".to_string(),
+                        Some(10),
+                        Some(false),
+                        Some(true),
+                        None,
+                    )
+                    .await
+                    .expect("fetch_inbox_product should succeed");
+                    let value: serde_json::Value =
+                        serde_json::from_str(&response).expect("parse inbox json");
+                    let messages = value.as_array().expect("messages array");
+                    assert_eq!(messages.len(), 1);
+                    assert_eq!(messages[0]["to"][0], "[malformed-recipients-json]");
+                    assert_eq!(
+                        messages[0]["attachments"][0]["name"],
+                        "[malformed-attachments-json]"
                     );
                 });
             },

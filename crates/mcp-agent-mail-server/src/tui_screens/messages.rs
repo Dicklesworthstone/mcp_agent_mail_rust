@@ -3892,6 +3892,9 @@ fn run_message_search_via_service(
 }
 
 fn project_id_for_slug(conn: &DbConn, slug: &str) -> Option<i64> {
+    if let Some(project_id) = synthetic_project_id(slug) {
+        return Some(project_id);
+    }
     conn.query_sync(
         "SELECT id FROM projects WHERE slug = ? LIMIT 1",
         &[Value::Text(slug.to_string())],
@@ -7678,6 +7681,48 @@ first body
             .load_agent_names_for_project("[unknown-project-77]")
             .expect("load agents");
         assert_eq!(agents, vec!["BlueLake".to_string()]);
+    }
+
+    #[test]
+    fn fetch_recent_messages_accepts_placeholder_project_identifier() {
+        let conn = DbConn::open_memory().expect("open memory sqlite");
+        conn.execute_raw("CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT)")
+            .expect("create agents");
+        conn.execute_raw("CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT)")
+            .expect("create projects");
+        conn.execute_raw(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                subject TEXT,
+                body_md TEXT,
+                thread_id TEXT,
+                importance TEXT,
+                ack_required INTEGER,
+                created_ts INTEGER,
+                sender_id INTEGER,
+                project_id INTEGER,
+                recipients_json TEXT
+            )",
+        )
+        .expect("create messages");
+        conn.execute_raw(
+            "INSERT INTO messages (
+                id, subject, body_md, thread_id, importance, ack_required,
+                created_ts, sender_id, project_id, recipients_json
+            ) VALUES (
+                42, 'Subject', 'Body', 'thread-42', 'normal', 0,
+                1700000000000000, 99, 77, '{\"to\":[\"BlueLake\"],\"cc\":[],\"bcc\":[]}'
+            )",
+        )
+        .expect("seed message");
+
+        let (entries, total) =
+            fetch_recent_messages(&conn, PAGE_SIZE, Some("[unknown-project-77]"), true);
+
+        assert_eq!(total, 1);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, 42);
+        assert_eq!(entries[0].project_slug, "[unknown-project-77]");
     }
 
     #[test]

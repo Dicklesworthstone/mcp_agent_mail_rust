@@ -63,6 +63,78 @@ pub mod tool_util {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    pub(crate) const MALFORMED_ATTACHMENTS_SENTINEL: &str = "[malformed-attachments-json]";
+    pub(crate) const MALFORMED_RECIPIENTS_SENTINEL: &str = "[malformed-recipients-json]";
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+    pub(crate) struct ParsedRecipients {
+        #[serde(default)]
+        pub(crate) to: Vec<String>,
+        #[serde(default)]
+        pub(crate) cc: Vec<String>,
+        #[serde(default)]
+        pub(crate) bcc: Vec<String>,
+    }
+
+    fn malformed_attachments_payload() -> Vec<serde_json::Value> {
+        vec![json!({
+            "name": MALFORMED_ATTACHMENTS_SENTINEL,
+            "media_type": null,
+            "path": null,
+            "bytes": null,
+        })]
+    }
+
+    fn malformed_recipients_payload() -> serde_json::Value {
+        json!({
+            "to": [MALFORMED_RECIPIENTS_SENTINEL],
+            "cc": [],
+            "bcc": [],
+        })
+    }
+
+    fn is_valid_recipients_payload(value: &serde_json::Value) -> bool {
+        let Some(object) = value.as_object() else {
+            return false;
+        };
+
+        ["to", "cc", "bcc"].iter().all(|key| {
+            object.get(*key).is_none_or(|entries| {
+                entries
+                    .as_array()
+                    .is_some_and(|items| items.iter().all(serde_json::Value::is_string))
+            })
+        })
+    }
+
+    pub(crate) fn parse_attachment_metadata_json(input: &str) -> Vec<serde_json::Value> {
+        match serde_json::from_str::<Vec<serde_json::Value>>(input) {
+            Ok(attachments) => attachments,
+            Err(_) if input.trim().is_empty() => Vec::new(),
+            Err(_) => malformed_attachments_payload(),
+        }
+    }
+
+    pub(crate) fn parse_recipients_json_value(input: &str) -> serde_json::Value {
+        match serde_json::from_str::<serde_json::Value>(input) {
+            Ok(value) if is_valid_recipients_payload(&value) => value,
+            Ok(_) if input.trim().is_empty() => json!({}),
+            Ok(_) => malformed_recipients_payload(),
+            Err(_) if input.trim().is_empty() => json!({}),
+            Err(_) => malformed_recipients_payload(),
+        }
+    }
+
+    pub(crate) fn parse_recipients_lists(input: &str) -> ParsedRecipients {
+        serde_json::from_value(parse_recipients_json_value(input)).unwrap_or_else(|_| {
+            ParsedRecipients {
+                to: vec![MALFORMED_RECIPIENTS_SENTINEL.to_string()],
+                cc: Vec::new(),
+                bcc: Vec::new(),
+            }
+        })
+    }
+
     fn legacy_error_payload(
         error_type: &str,
         message: &str,
@@ -1079,6 +1151,28 @@ pub mod tool_util {
             assert_eq!(data["error"]["recoverable"], true);
             assert_eq!(data["error"]["data"]["entity"], "Agent");
             assert_eq!(data["error"]["data"]["identifier"], "BlueLake");
+        }
+
+        #[test]
+        fn parse_attachment_metadata_json_surfaces_malformed_payloads() {
+            assert!(parse_attachment_metadata_json("").is_empty());
+            assert_eq!(
+                parse_attachment_metadata_json("{not-json")[0]["name"],
+                MALFORMED_ATTACHMENTS_SENTINEL
+            );
+        }
+
+        #[test]
+        fn parse_recipients_lists_surfaces_malformed_payloads() {
+            assert_eq!(parse_recipients_lists(""), ParsedRecipients::default());
+            assert_eq!(
+                parse_recipients_lists(r#"{"to":"BlueLake"}"#).to,
+                vec![MALFORMED_RECIPIENTS_SENTINEL.to_string()]
+            );
+            assert_eq!(
+                parse_recipients_lists("{not-json").to,
+                vec![MALFORMED_RECIPIENTS_SENTINEL.to_string()]
+            );
         }
 
         #[test]

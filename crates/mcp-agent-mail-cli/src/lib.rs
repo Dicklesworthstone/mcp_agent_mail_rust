@@ -16820,26 +16820,23 @@ fn handle_doctor_check_with(
     if let Some(ref slug) = project
         && let Ok(conn) = open_db_for_doctor_check(database_url)
     {
-        let rows = conn
-            .query_sync(
-                "SELECT id, slug FROM projects WHERE slug = ?",
-                &[sqlmodel_core::Value::Text(slug.clone())],
-            )
-            .unwrap_or_default();
-        let project_exists = !rows.is_empty();
+        let resolved_project = crate::context::resolve_project(&conn, slug);
+        let project_exists = resolved_project.is_ok();
+        let project_detail = match &resolved_project {
+            Ok(project) => format!("project '{}'", project.slug),
+            Err(_) => format!("project '{slug}'"),
+        };
         checks.push(serde_json::json!({
             "check": "project_exists",
             "status": if project_exists { "ok" } else { "fail" },
-            "detail": format!("project '{slug}'"),
+            "detail": project_detail,
         }));
 
-        if project_exists {
+        if let Ok(project) = resolved_project {
             let agent_rows = conn
                 .query_sync(
-                    "SELECT COUNT(*) AS cnt FROM agents a \
-                     JOIN projects p ON p.id = a.project_id \
-                     WHERE p.slug = ?",
-                    &[sqlmodel_core::Value::Text(slug.clone())],
+                    "SELECT COUNT(*) AS cnt FROM agents WHERE project_id = ?",
+                    &[sqlmodel_core::Value::BigInt(project.id)],
                 )
                 .unwrap_or_default();
             let agent_count: i64 = agent_rows
@@ -39082,6 +39079,65 @@ startup_timeout_sec = 42
             output.contains("Orphan messages: 1 (preserved; project metadata row missing)"),
             "expected preserved-message notice, got: {output}"
         );
+    }
+
+    #[test]
+    fn doctor_check_project_specific_checks_accept_orphaned_project_placeholder() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("doctor_check_orphaned_project.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+
+        let conn = open_db_sync_with_database_url(&db_url).expect("open doctor db");
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys for fixture");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at) \
+             VALUES (77, 'proj', '/proj', 0)",
+        )
+        .expect("insert project");
+        conn.execute_raw(
+            "INSERT INTO agents \
+             (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+             VALUES (77, 'BlueLake', 'codex-cli', 'gpt-5', '', 0, 0, 'auto', 'auto')",
+        )
+        .expect("insert agent");
+        conn.execute_raw("DELETE FROM projects WHERE id = 77")
+            .expect("delete project");
+        drop(conn);
+
+        let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+        handle_doctor_check_with(
+            &db_url,
+            dir.path(),
+            Some("[unknown-project-77]".to_string()),
+            false,
+            None,
+            true,
+        )
+        .expect("doctor check");
+        let output = capture.drain_to_string();
+        let parsed = extract_doctor_check_json(&output).expect("doctor check json");
+        let checks = parsed["checks"].as_array().expect("checks array");
+
+        let project_exists = checks
+            .iter()
+            .find(|check| check["check"].as_str() == Some("project_exists"))
+            .expect("project_exists check");
+        assert_eq!(project_exists["status"].as_str(), Some("ok"));
+        assert_eq!(
+            project_exists["detail"].as_str(),
+            Some("project '[unknown-project-77]'")
+        );
+
+        let agents_registered = checks
+            .iter()
+            .find(|check| check["check"].as_str() == Some("agents_registered"))
+            .expect("agents_registered check");
+        assert_eq!(agents_registered["status"].as_str(), Some("ok"));
+        assert_eq!(agents_registered["detail"].as_str(), Some("1 agent(s)"));
     }
 }
 

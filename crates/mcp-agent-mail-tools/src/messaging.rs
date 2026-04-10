@@ -21,7 +21,8 @@ use serde_json::{Value, json};
 
 use crate::tool_util::{
     db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, get_read_db_pool,
-    legacy_tool_error, resolve_agent, resolve_project,
+    legacy_tool_error, parse_attachment_metadata_json, parse_recipients_lists, resolve_agent,
+    resolve_project,
 };
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 
@@ -3116,23 +3117,11 @@ pub async fn fetch_inbox(
         .await,
     )?;
 
-    #[derive(serde::Deserialize, Default)]
-    struct FastRecipients {
-        #[serde(default)]
-        to: Vec<String>,
-        #[serde(default)]
-        cc: Vec<String>,
-        #[serde(default)]
-        bcc: Vec<String>,
-    }
-
     let messages: Vec<InboxMessage> = inbox_rows
         .into_iter()
         .map(|row| {
-            let attachments: Vec<serde_json::Value> =
-                serde_json::from_str(&row.message.attachments).unwrap_or_default();
-            let recipients: FastRecipients =
-                serde_json::from_str(&row.message.recipients_json).unwrap_or_default();
+            let attachments = parse_attachment_metadata_json(&row.message.attachments);
+            let recipients = parse_recipients_lists(&row.message.recipients_json);
 
             let to = recipients.to;
             let cc = recipients.cc;

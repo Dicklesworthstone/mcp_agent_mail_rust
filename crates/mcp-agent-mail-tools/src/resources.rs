@@ -23,7 +23,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     tool_cluster,
-    tool_util::{db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool},
+    tool_util::{
+        db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool,
+        parse_attachment_metadata_json, parse_recipients_json_value,
+    },
 };
 
 fn split_param_and_query(input: &str) -> (String, HashMap<String, String>) {
@@ -401,11 +404,11 @@ async fn acquire_resource_conn(
 }
 
 fn parse_attachment_metadata(input: &str) -> Vec<serde_json::Value> {
-    serde_json::from_str(input).unwrap_or_default()
+    parse_attachment_metadata_json(input)
 }
 
 fn parse_recipients_json(input: &str) -> Value {
-    serde_json::from_str(input).unwrap_or_else(|_| json!({}))
+    parse_recipients_json_value(input)
 }
 
 fn recipient_names(recipients: &Value, key: &str) -> Vec<String> {
@@ -5751,6 +5754,86 @@ first body
                     .expect("ack-overdue"),
                 );
                 assert_attachment(&overdue_value["messages"][0]);
+            });
+        });
+    }
+
+    #[test]
+    fn resources_surface_malformed_message_metadata() {
+        with_serialized_resources(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/resources-malformed-metadata-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let sender = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let recipient = register_agent(&cx, &pool, project_id, "RedPeak").await;
+                let thread_id = format!("thread-malformed-{}", unique_suffix());
+                let message = create_message(
+                    &cx,
+                    &pool,
+                    project_id,
+                    sender.id.unwrap_or(0),
+                    recipient.id.unwrap_or(0),
+                    "Malformed Subject",
+                    "Malformed body",
+                    &thread_id,
+                    true,
+                )
+                .await;
+                let message_id = message.id.unwrap_or(0);
+
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(c) => c,
+                    Outcome::Err(err) => panic!("acquire failed: {err}"),
+                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                    Outcome::Panicked(panic) => {
+                        panic!("acquire panicked: {}", panic.message())
+                    }
+                };
+                conn.execute_sync(
+                    "UPDATE messages SET recipients_json = ?, attachments = ? WHERE id = ?",
+                    &[
+                        mcp_agent_mail_db::sqlmodel::Value::Text(r#"{"to":"RedPeak"}"#.to_string()),
+                        mcp_agent_mail_db::sqlmodel::Value::Text("{not-json".to_string()),
+                        mcp_agent_mail_db::sqlmodel::Value::BigInt(message_id),
+                    ],
+                )
+                .expect("poison message metadata");
+
+                let ctx = McpContext::new(cx.clone(), 1);
+                let project_ref = project.human_key.clone();
+
+                let message_details_value = parse_json(
+                    &message_details(&ctx, format!("{message_id}?project={project_ref}"))
+                        .await
+                        .expect("message details"),
+                );
+                assert_eq!(
+                    message_details_value["to"][0],
+                    "[malformed-recipients-json]"
+                );
+                assert_eq!(
+                    message_details_value["attachments"][0]["name"],
+                    "[malformed-attachments-json]"
+                );
+
+                let thread_value = parse_json(
+                    &thread_details(
+                        &ctx,
+                        format!("{thread_id}?project={project_ref}&include_bodies=true"),
+                    )
+                    .await
+                    .expect("thread details"),
+                );
+                assert_eq!(
+                    thread_value["messages"][0]["to"][0],
+                    "[malformed-recipients-json]"
+                );
+                assert_eq!(
+                    thread_value["messages"][0]["attachments"][0]["name"],
+                    "[malformed-attachments-json]"
+                );
             });
         });
     }
