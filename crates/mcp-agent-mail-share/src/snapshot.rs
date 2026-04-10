@@ -251,6 +251,17 @@ pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
         ensure_real_directory(parent)?;
     }
 
+    if checkpoint {
+        mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&source).map_err(|e| {
+            ShareError::Sqlite {
+                message: format!(
+                    "cannot checkpoint source DB {} before snapshot: {e}",
+                    source.display()
+                ),
+            }
+        })?;
+    }
+
     let source_str = source.display().to_string();
 
     // Create destination with FrankenSQLite. Page size must be chosen before
@@ -278,9 +289,6 @@ pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
     let src = DbConn::open_file(&source_str).map_err(|e| ShareError::Sqlite {
         message: format!("cannot open source DB {source_str}: {e}"),
     })?;
-    if checkpoint {
-        let _ = src.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
-    }
     let transfer_result = transfer_tables_frank(&src, &dst_conn);
     let src_close_result = src.close_sync().map_err(|e| ShareError::Sqlite {
         message: format!("failed to close source DB {source_str}: {e}"),

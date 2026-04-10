@@ -1529,6 +1529,7 @@ mod tests {
             messages: 0,
             recipients: 0,
             file_reservations: 0,
+            inbox_stats: 0,
             agent_links: 0,
             project_sibling_suggestions: 0,
         }

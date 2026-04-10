@@ -3,7 +3,7 @@
 //! Given a snapshot database and a list of project identifiers (slugs or
 //! human_keys), removes all data belonging to non-selected projects.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use mcp_agent_mail_db::DbConn;
@@ -43,6 +43,7 @@ pub struct RemainingCounts {
     pub messages: i64,
     pub recipients: i64,
     pub file_reservations: i64,
+    pub inbox_stats: i64,
     pub agent_links: i64,
     pub project_sibling_suggestions: i64,
 }
@@ -55,7 +56,7 @@ pub struct RemainingCounts {
 ///
 /// # Errors
 ///
-/// - [`ShareError::ScopeNoProjects`] if the database has no projects.
+/// - [`ShareError::ScopeNoProjects`] if the database has no discoverable project identities.
 /// - [`ShareError::ScopeIdentifierNotFound`] if any identifier doesn't match.
 /// - [`ShareError::Sqlite`] on any SQLite error.
 pub fn apply_project_scope(
@@ -74,33 +75,10 @@ pub fn apply_project_scope(
             message: format!("PRAGMA foreign_keys failed: {e}"),
         })?;
 
-    // Load all projects
-    let project_rows = conn
-        .query_sync(
-            "SELECT id, slug, human_key FROM projects ORDER BY id ASC",
-            &[],
-        )
-        .map_err(|e| ShareError::Sqlite {
-            message: format!("SELECT projects failed: {e}"),
-        })?;
-
-    if project_rows.is_empty() {
+    let all_projects = load_scope_projects(&conn)?;
+    if all_projects.is_empty() {
         return Err(ShareError::ScopeNoProjects);
     }
-
-    let all_projects: Vec<ProjectRecord> = project_rows
-        .iter()
-        .map(|row| {
-            let id: i64 = row.get_named("id").unwrap_or(0);
-            let slug: String = row.get_named("slug").unwrap_or_default();
-            let human_key: String = row.get_named("human_key").unwrap_or_default();
-            ProjectRecord {
-                id,
-                slug,
-                human_key,
-            }
-        })
-        .collect();
 
     // If no identifiers, keep everything
     if identifiers.is_empty() {
@@ -263,7 +241,28 @@ pub fn apply_project_scope(
             )?;
         }
 
-        // 7. Delete agents
+        // 7. Delete product links scoped to filtered-out projects and then
+        // remove any products that are no longer referenced by the kept scope.
+        if table_exists(&conn, "product_project_links")? {
+            exec(
+                &conn,
+                &format!(
+                    "DELETE FROM product_project_links WHERE project_id NOT IN ({p})",
+                    p = placeholders
+                ),
+                &id_values,
+            )?;
+            if table_exists(&conn, "products")? {
+                exec(
+                    &conn,
+                    "DELETE FROM products \
+                     WHERE id NOT IN (SELECT DISTINCT product_id FROM product_project_links)",
+                    &[],
+                )?;
+            }
+        }
+
+        // 8. Delete agents
         exec(
             &conn,
             &format!(
@@ -273,7 +272,17 @@ pub fn apply_project_scope(
             &id_values,
         )?;
 
-        // 8. Delete projects
+        // 9. Delete agent-scoped aggregates that are not protected by FK constraints.
+        if table_exists(&conn, "inbox_stats")? {
+            exec(
+                &conn,
+                "DELETE FROM inbox_stats \
+                 WHERE agent_id NOT IN (SELECT id FROM agents)",
+                &[],
+            )?;
+        }
+
+        // 10. Delete projects
         exec(
             &conn,
             &format!(
@@ -306,6 +315,126 @@ pub fn apply_project_scope(
             Err(err)
         }
     }
+}
+
+fn load_scope_projects(conn: &Conn) -> Result<Vec<ProjectRecord>, ShareError> {
+    let project_rows = conn
+        .query_sync(
+            "SELECT id, slug, human_key FROM projects ORDER BY id ASC",
+            &[],
+        )
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("SELECT projects failed: {e}"),
+        })?;
+
+    let mut projects: Vec<ProjectRecord> = project_rows
+        .iter()
+        .map(|row| {
+            let id: i64 = row.get_named("id").unwrap_or(0);
+            let slug: String = row.get_named("slug").unwrap_or_default();
+            let human_key: String = row.get_named("human_key").unwrap_or_default();
+            ProjectRecord {
+                id,
+                slug,
+                human_key,
+            }
+        })
+        .collect();
+
+    let known_ids: BTreeSet<i64> = projects.iter().map(|project| project.id).collect();
+    let orphan_ids = collect_orphan_project_ids(conn, &known_ids)?;
+    for id in orphan_ids {
+        let placeholder = format!("[unknown-project-{id}]");
+        projects.push(ProjectRecord {
+            id,
+            slug: placeholder.clone(),
+            human_key: placeholder,
+        });
+    }
+
+    projects.sort_by_key(|project| project.id);
+    Ok(projects)
+}
+
+fn collect_orphan_project_ids(
+    conn: &Conn,
+    known_ids: &BTreeSet<i64>,
+) -> Result<Vec<i64>, ShareError> {
+    let mut orphan_ids = BTreeSet::new();
+    collect_orphan_project_ids_from_query(
+        conn,
+        "SELECT DISTINCT project_id AS project_id FROM messages ORDER BY project_id",
+        known_ids,
+        &mut orphan_ids,
+    )?;
+    collect_orphan_project_ids_from_query(
+        conn,
+        "SELECT DISTINCT project_id AS project_id FROM agents ORDER BY project_id",
+        known_ids,
+        &mut orphan_ids,
+    )?;
+    collect_orphan_project_ids_from_query(
+        conn,
+        "SELECT DISTINCT project_id AS project_id FROM file_reservations ORDER BY project_id",
+        known_ids,
+        &mut orphan_ids,
+    )?;
+    if table_exists(conn, "product_project_links")? {
+        collect_orphan_project_ids_from_query(
+            conn,
+            "SELECT DISTINCT project_id AS project_id FROM product_project_links ORDER BY project_id",
+            known_ids,
+            &mut orphan_ids,
+        )?;
+    }
+    if table_exists(conn, "agent_links")? {
+        collect_orphan_project_ids_from_query(
+            conn,
+            "SELECT DISTINCT a_project_id AS project_id FROM agent_links ORDER BY a_project_id",
+            known_ids,
+            &mut orphan_ids,
+        )?;
+        collect_orphan_project_ids_from_query(
+            conn,
+            "SELECT DISTINCT b_project_id AS project_id FROM agent_links ORDER BY b_project_id",
+            known_ids,
+            &mut orphan_ids,
+        )?;
+    }
+    if table_exists(conn, "project_sibling_suggestions")? {
+        collect_orphan_project_ids_from_query(
+            conn,
+            "SELECT DISTINCT project_a_id AS project_id FROM project_sibling_suggestions ORDER BY project_a_id",
+            known_ids,
+            &mut orphan_ids,
+        )?;
+        collect_orphan_project_ids_from_query(
+            conn,
+            "SELECT DISTINCT project_b_id AS project_id FROM project_sibling_suggestions ORDER BY project_b_id",
+            known_ids,
+            &mut orphan_ids,
+        )?;
+    }
+    Ok(orphan_ids.into_iter().collect())
+}
+
+fn collect_orphan_project_ids_from_query(
+    conn: &Conn,
+    sql: &str,
+    known_ids: &BTreeSet<i64>,
+    orphan_ids: &mut BTreeSet<i64>,
+) -> Result<(), ShareError> {
+    let rows = conn.query_sync(sql, &[]).map_err(|e| ShareError::Sqlite {
+        message: format!("orphan project inventory query failed: {e}"),
+    })?;
+    for row in rows {
+        if let Ok(project_id) = row.get_named::<i64>("project_id")
+            && !known_ids.contains(&project_id)
+        {
+            orphan_ids.insert(project_id);
+        }
+    }
+    Ok(())
 }
 
 /// Build `?,?,?` placeholder string for `n` parameters.
@@ -347,6 +476,7 @@ fn count_remaining(conn: &Conn) -> Result<RemainingCounts, ShareError> {
         messages: count_table(conn, "messages")?,
         recipients: count_table(conn, "message_recipients")?,
         file_reservations: count_table(conn, "file_reservations")?,
+        inbox_stats: count_if_exists(conn, "inbox_stats")?,
         agent_links: count_if_exists(conn, "agent_links")?,
         project_sibling_suggestions: count_if_exists(conn, "project_sibling_suggestions")?,
     })
@@ -361,6 +491,7 @@ fn count_table(conn: &Conn, table: &str) -> Result<i64, ShareError> {
         "messages" => "SELECT COUNT(*) AS cnt FROM messages",
         "message_recipients" => "SELECT COUNT(*) AS cnt FROM message_recipients",
         "file_reservations" => "SELECT COUNT(*) AS cnt FROM file_reservations",
+        "inbox_stats" => "SELECT COUNT(*) AS cnt FROM inbox_stats",
         "agent_links" => "SELECT COUNT(*) AS cnt FROM agent_links",
         "project_sibling_suggestions" => "SELECT COUNT(*) AS cnt FROM project_sibling_suggestions",
         other => {
@@ -459,6 +590,16 @@ mod tests {
         )
         .unwrap();
         conn.execute_raw(
+            "CREATE TABLE inbox_stats (
+                agent_id INTEGER PRIMARY KEY,
+                total_count INTEGER NOT NULL DEFAULT 0,
+                unread_count INTEGER NOT NULL DEFAULT 0,
+                ack_pending_count INTEGER NOT NULL DEFAULT 0,
+                last_message_ts INTEGER
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(
             "CREATE TABLE agent_links (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 a_project_id INTEGER NOT NULL,
@@ -522,6 +663,10 @@ mod tests {
             .unwrap();
         conn.execute_raw("INSERT INTO file_reservations (project_id, agent_id, path_pattern) VALUES (1, 1, 'src/*.rs')")
             .unwrap();
+        conn.execute_raw("INSERT INTO inbox_stats (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) VALUES (1, 2, 1, 1, 10)")
+            .unwrap();
+        conn.execute_raw("INSERT INTO inbox_stats (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) VALUES (2, 1, 1, 0, 20)")
+            .unwrap();
         conn.execute_raw("INSERT INTO agent_links (a_project_id, a_agent_id, b_project_id, b_agent_id) VALUES (1, 1, 2, 2)")
             .unwrap();
         conn.execute_raw(
@@ -571,6 +716,7 @@ mod tests {
         assert_eq!(result.remaining.messages, 2);
         assert_eq!(result.remaining.recipients, 2);
         assert_eq!(result.remaining.file_reservations, 1);
+        assert_eq!(result.remaining.inbox_stats, 1);
         assert_eq!(result.remaining.agent_links, 0);
         assert_eq!(result.remaining.project_sibling_suggestions, 0);
     }
@@ -641,6 +787,7 @@ mod tests {
         assert_eq!(result.projects.len(), 2);
         assert_eq!(result.remaining.messages, 3);
         assert_eq!(result.remaining.agents, 2);
+        assert_eq!(result.remaining.inbox_stats, 2);
     }
 
     #[test]
@@ -673,6 +820,7 @@ mod tests {
         assert_eq!(result.removed_count, 0);
         assert_eq!(result.remaining.messages, 3);
         assert_eq!(result.remaining.agents, 2);
+        assert_eq!(result.remaining.inbox_stats, 2);
         assert_eq!(result.remaining.agent_links, 1);
         assert_eq!(result.remaining.project_sibling_suggestions, 1);
     }
@@ -739,6 +887,7 @@ mod tests {
         let result = apply_project_scope(&db_path, &[]).unwrap();
         assert_eq!(result.remaining.projects, 1);
         assert_eq!(result.remaining.agent_links, 0);
+        assert_eq!(result.remaining.inbox_stats, 0);
         assert_eq!(result.remaining.project_sibling_suggestions, 0);
     }
 
@@ -758,6 +907,7 @@ mod tests {
                 messages: 5,
                 recipients: 10,
                 file_reservations: 3,
+                inbox_stats: 1,
                 agent_links: 0,
                 project_sibling_suggestions: 0,
             },
@@ -785,6 +935,7 @@ mod tests {
         assert_eq!(result.remaining.messages, 1);
         assert_eq!(result.remaining.recipients, 1);
         assert_eq!(result.remaining.file_reservations, 0);
+        assert_eq!(result.remaining.inbox_stats, 1);
     }
 
     #[test]
@@ -885,6 +1036,107 @@ mod tests {
         assert!(matches!(result, Err(ShareError::ScopeNoProjects)));
     }
 
+    #[test]
+    fn scope_accepts_orphaned_project_placeholder_identifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw("DELETE FROM projects WHERE id = 1")
+            .unwrap();
+        drop(conn);
+
+        let result = apply_project_scope(&db, &["[unknown-project-1]".to_string()]).unwrap();
+        assert_eq!(result.removed_count, 1);
+        assert_eq!(result.projects.len(), 1);
+        assert_eq!(result.projects[0].id, 1);
+        assert_eq!(result.projects[0].slug, "[unknown-project-1]");
+        assert_eq!(result.remaining.projects, 0);
+        assert_eq!(result.remaining.agents, 1);
+        assert_eq!(result.remaining.messages, 2);
+        assert_eq!(result.remaining.recipients, 2);
+        assert_eq!(result.remaining.file_reservations, 1);
+        assert_eq!(result.remaining.inbox_stats, 1);
+    }
+
+    #[test]
+    fn scope_removes_inbox_stats_for_filtered_out_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        let result = apply_project_scope(&db, &["proj-alpha".to_string()]).unwrap();
+        assert_eq!(result.remaining.inbox_stats, 1);
+
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT agent_id, total_count FROM inbox_stats ORDER BY agent_id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let agent_id: i64 = rows[0].get_named("agent_id").unwrap();
+        let total_count: i64 = rows[0].get_named("total_count").unwrap();
+        assert_eq!(agent_id, 1);
+        assert_eq!(total_count, 2);
+    }
+
+    #[test]
+    fn scope_removes_filtered_product_links_and_unreferenced_products() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE products (
+                id INTEGER PRIMARY KEY,
+                product_uid TEXT NOT NULL,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .unwrap();
+        conn.execute_raw(
+            "CREATE TABLE product_project_links (
+                id INTEGER PRIMARY KEY,
+                product_id INTEGER NOT NULL,
+                project_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .unwrap();
+        conn.execute_raw("INSERT INTO products VALUES (10, 'prod-alpha', 'Product Alpha', '')")
+            .unwrap();
+        conn.execute_raw("INSERT INTO products VALUES (20, 'prod-beta', 'Product Beta', '')")
+            .unwrap();
+        conn.execute_raw("INSERT INTO product_project_links VALUES (100, 10, 1, '')")
+            .unwrap();
+        conn.execute_raw("INSERT INTO product_project_links VALUES (200, 20, 2, '')")
+            .unwrap();
+        drop(conn);
+
+        let result = apply_project_scope(&db, &["proj-alpha".to_string()]).unwrap();
+        assert_eq!(result.removed_count, 1);
+
+        let conn = Conn::open_file(db.display().to_string()).unwrap();
+        let remaining_links = conn
+            .query_sync(
+                "SELECT product_id, project_id FROM product_project_links ORDER BY id",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(remaining_links.len(), 1);
+        let product_id: i64 = remaining_links[0].get_named("product_id").unwrap();
+        let project_id: i64 = remaining_links[0].get_named("project_id").unwrap();
+        assert_eq!(product_id, 10);
+        assert_eq!(project_id, 1);
+
+        let remaining_products = conn
+            .query_sync("SELECT id FROM products ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(remaining_products.len(), 1);
+        let kept_product_id: i64 = remaining_products[0].get_named("id").unwrap();
+        assert_eq!(kept_product_id, 10);
+    }
+
     /// Conformance test: scope against the fixture `needs_scrub.sqlite3` and
     /// compare with `expected_scoped.json` produced by the Python reference.
     #[test]
@@ -936,6 +1188,12 @@ mod tests {
             ar["file_reservations"], er["file_reservations"],
             "remaining.file_reservations"
         );
+        if er.get("inbox_stats").is_some() {
+            assert_eq!(
+                ar["inbox_stats"], er["inbox_stats"],
+                "remaining.inbox_stats"
+            );
+        }
         assert_eq!(
             ar["agent_links"], er["agent_links"],
             "remaining.agent_links"

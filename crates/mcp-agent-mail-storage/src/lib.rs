@@ -111,6 +111,24 @@ pub struct NotificationMessage {
     pub importance: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalEmitOutcome {
+    Emitted,
+    Disabled,
+    InvalidTarget,
+    Debounced,
+    WriteFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalClearOutcome {
+    Cleared,
+    Disabled,
+    InvalidTarget,
+    Missing,
+    RemoveFailed,
+}
+
 // ---------------------------------------------------------------------------
 // Write-Behind Queue (WBQ)
 // ---------------------------------------------------------------------------
@@ -522,17 +540,10 @@ fn wbq_drain_loop(
 
         let mut errors = 0usize;
         for envelope in batch {
-            let disk_pressure = mcp_agent_mail_core::global_metrics()
-                .system
-                .disk_pressure_level
-                .load();
-            let r = if disk_pressure >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64() {
-                tracing::warn!("[wbq-drain] disk pressure critical, skipping write-behind op");
-                metrics.storage.wbq_errors_total.inc();
-                Ok(())
-            } else {
-                wbq_execute_op(&envelope.op)
-            };
+            // Critical-disk-pressure skipping is an enqueue-time decision only.
+            // Once an op has been accepted into the WBQ, the drain must attempt
+            // it rather than silently drop already-acknowledged archive work.
+            let r = wbq_execute_op(&envelope.op);
             let latency_us = u64::try_from(
                 envelope
                     .enqueued_at
@@ -585,21 +596,7 @@ fn wbq_drain_loop(
                     metrics.storage.wbq_over_80_since_us.set(0);
                 }
 
-                let disk_pressure = mcp_agent_mail_core::global_metrics()
-                    .system
-                    .disk_pressure_level
-                    .load();
-                let r = if disk_pressure
-                    >= mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64()
-                {
-                    tracing::warn!(
-                        "[wbq-drain] disk pressure critical, skipping write-behind op (shutdown drain)"
-                    );
-                    metrics.storage.wbq_errors_total.inc();
-                    Ok(())
-                } else {
-                    wbq_execute_op(&envelope.op)
-                };
+                let r = wbq_execute_op(&envelope.op);
                 let latency_us = u64::try_from(
                     envelope
                         .enqueued_at
@@ -693,18 +690,32 @@ fn wbq_execute_op_inner(op: &WriteOp) -> Result<()> {
             project_slug,
             agent_name,
             metadata,
-        } => {
-            emit_notification_signal(config, project_slug, agent_name, metadata.as_ref());
-            Ok(())
-        }
+        } => match emit_notification_signal(config, project_slug, agent_name, metadata.as_ref()) {
+            SignalEmitOutcome::Emitted
+            | SignalEmitOutcome::Disabled
+            | SignalEmitOutcome::InvalidTarget
+            | SignalEmitOutcome::Debounced => Ok(()),
+            SignalEmitOutcome::WriteFailed => {
+                Err(StorageError::Io(std::io::Error::other(format!(
+                    "failed to emit notification signal for project={project_slug} agent={agent_name}"
+                ))))
+            }
+        },
         WriteOp::ClearSignal {
             config,
             project_slug,
             agent_name,
-        } => {
-            clear_notification_signal(config, project_slug, agent_name);
-            Ok(())
-        }
+        } => match clear_notification_signal(config, project_slug, agent_name) {
+            SignalClearOutcome::Cleared
+            | SignalClearOutcome::Disabled
+            | SignalClearOutcome::InvalidTarget
+            | SignalClearOutcome::Missing => Ok(()),
+            SignalClearOutcome::RemoveFailed => {
+                Err(StorageError::Io(std::io::Error::other(format!(
+                    "failed to clear notification signal for project={project_slug} agent={agent_name}"
+                ))))
+            }
+        },
     }
 }
 
@@ -5280,16 +5291,14 @@ fn signal_debounce() -> &'static OrderedMutex<HashMap<(String, String), u128>> {
 }
 
 /// Emit a notification signal file for a project/agent.
-///
-/// Returns `true` if a signal was emitted, `false` if disabled, debounced, or failed.
 pub fn emit_notification_signal(
     config: &Config,
     project_slug: &str,
     agent_name: &str,
     message_metadata: Option<&NotificationMessage>,
-) -> bool {
+) -> SignalEmitOutcome {
     if !config.notifications_enabled {
-        return false;
+        return SignalEmitOutcome::Disabled;
     }
 
     // Reject empty, whitespace-only, or path-traversal values to prevent writing
@@ -5307,7 +5316,7 @@ pub fn emit_notification_signal(
         || agent_name == "."
         || agent_name.starts_with('.')
     {
-        return false;
+        return SignalEmitOutcome::InvalidTarget;
     }
 
     let debounce_ms = config.notifications_debounce_ms as u128;
@@ -5321,9 +5330,9 @@ pub fn emit_notification_signal(
         let mut map = signal_debounce().lock();
         let last = map.get(&key).copied().unwrap_or(0);
         if debounce_ms > 0 && now_ms.saturating_sub(last) < debounce_ms {
-            return false;
+            return SignalEmitOutcome::Debounced;
         }
-        map.insert(key, now_ms);
+        map.insert(key.clone(), now_ms);
     }
 
     let signal_path = config
@@ -5354,15 +5363,26 @@ pub fn emit_notification_signal(
         });
     }
 
-    write_json(&signal_path, &signal_data, false).is_ok()
+    match write_json(&signal_path, &signal_data, false) {
+        Ok(()) => SignalEmitOutcome::Emitted,
+        Err(_) => {
+            let mut map = signal_debounce().lock();
+            if map.get(&key).copied() == Some(now_ms) {
+                map.remove(&key);
+            }
+            SignalEmitOutcome::WriteFailed
+        }
+    }
 }
 
 /// Clear notification signal for a project/agent.
-///
-/// Returns `true` if a signal was removed, `false` otherwise.
-pub fn clear_notification_signal(config: &Config, project_slug: &str, agent_name: &str) -> bool {
+pub fn clear_notification_signal(
+    config: &Config,
+    project_slug: &str,
+    agent_name: &str,
+) -> SignalClearOutcome {
     if !config.notifications_enabled {
-        return false;
+        return SignalClearOutcome::Disabled;
     }
 
     // Reject path-traversal characters and dot-prefix names.
@@ -5377,7 +5397,7 @@ pub fn clear_notification_signal(config: &Config, project_slug: &str, agent_name
         || agent_name == "."
         || agent_name.starts_with('.')
     {
-        return false;
+        return SignalClearOutcome::InvalidTarget;
     }
 
     signal_debounce()
@@ -5392,10 +5412,13 @@ pub fn clear_notification_signal(config: &Config, project_slug: &str, agent_name
         .join(format!("{agent_name}.signal"));
 
     if !signal_path.exists() {
-        return false;
+        return SignalClearOutcome::Missing;
     }
 
-    fs::remove_file(&signal_path).is_ok()
+    match fs::remove_file(&signal_path) {
+        Ok(()) => SignalClearOutcome::Cleared,
+        Err(_) => SignalClearOutcome::RemoveFailed,
+    }
 }
 
 /// List pending notification signals.
@@ -5410,7 +5433,7 @@ pub fn list_pending_signals(config: &Config, project_slug: Option<&str>) -> Vec<
     }
 
     let mut results = Vec::new();
-    let dirs: Vec<PathBuf> = if let Some(slug) = project_slug {
+    let mut dirs: Vec<PathBuf> = if let Some(slug) = project_slug {
         // Reject path-traversal characters.
         if slug.contains('/')
             || slug.contains('\\')
@@ -5431,6 +5454,7 @@ pub fn list_pending_signals(config: &Config, project_slug: Option<&str>) -> Vec<
             Err(_) => return Vec::new(),
         }
     };
+    dirs.sort();
 
     for proj_dir in dirs {
         let slug = proj_dir
@@ -5438,15 +5462,12 @@ pub fn list_pending_signals(config: &Config, project_slug: Option<&str>) -> Vec<
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         let agents_dir = proj_dir.join("agents");
-        let entries = match fs::read_dir(&agents_dir) {
-            Ok(iter) => iter,
+        let mut entries: Vec<_> = match fs::read_dir(&agents_dir) {
+            Ok(iter) => iter.filter_map(|entry| entry.ok()).collect(),
             Err(_) => continue,
         };
+        entries.sort_by_key(|entry| entry.path());
         for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
             if entry.path().extension().is_some_and(|e| e == "signal") {
                 let content = match fs::read_to_string(entry.path()) {
                     Ok(c) => c,
@@ -5529,6 +5550,7 @@ pub fn get_recent_commits(
 
 /// Check if a commit touches files under a given path prefix.
 fn commit_touches_path(repo: &Repository, commit: &git2::Commit<'_>, path_prefix: &str) -> bool {
+    let filter = Path::new(path_prefix);
     let tree = match commit.tree() {
         Ok(t) => t,
         Err(_) => return false,
@@ -5537,7 +5559,7 @@ fn commit_touches_path(repo: &Repository, commit: &git2::Commit<'_>, path_prefix
     // Check if any entry in the diff starts with path_prefix
     if commit.parent_count() == 0 {
         // Root commit: check all entries
-        return tree_contains_prefix(&tree, path_prefix);
+        return tree_contains_prefix(&tree, filter);
     }
 
     if let Ok(parent) = commit.parent(0)
@@ -5547,9 +5569,15 @@ fn commit_touches_path(repo: &Repository, commit: &git2::Commit<'_>, path_prefix
         let mut found = false;
         let _ = diff.foreach(
             &mut |delta, _progress| {
-                if let Some(p) = delta.new_file().path()
-                    && p.to_string_lossy().starts_with(path_prefix)
-                {
+                let touches_new = delta
+                    .new_file()
+                    .path()
+                    .is_some_and(|path| repo_path_matches_filter(path, filter));
+                let touches_old = delta
+                    .old_file()
+                    .path()
+                    .is_some_and(|path| repo_path_matches_filter(path, filter));
+                if touches_new || touches_old {
                     found = true;
                 }
                 true
@@ -6701,16 +6729,29 @@ pub fn read_agent_profile(
     Ok(Some(value))
 }
 
-/// Check if a tree has any entry with the given path prefix.
-fn tree_contains_prefix(tree: &git2::Tree<'_>, prefix: &str) -> bool {
-    for entry in tree.iter() {
-        if let Some(name) = entry.name()
-            && (name.starts_with(prefix) || prefix.starts_with(name))
-        {
-            return true;
+fn repo_path_matches_filter(candidate: &Path, filter: &Path) -> bool {
+    candidate == filter || candidate.starts_with(filter)
+}
+
+/// Check if a tree has any entry with the given repo-relative path prefix.
+fn tree_contains_prefix(tree: &git2::Tree<'_>, prefix: &Path) -> bool {
+    let mut found = false;
+    let _ = tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+        let Some(name) = entry.name() else {
+            return git2::TreeWalkResult::Ok;
+        };
+        let candidate = if root.is_empty() {
+            PathBuf::from(name)
+        } else {
+            Path::new(root).join(name)
+        };
+        if repo_path_matches_filter(&candidate, prefix) {
+            found = true;
+            return git2::TreeWalkResult::Abort;
         }
-    }
-    false
+        git2::TreeWalkResult::Ok
+    });
+    found
 }
 
 /// Collect lock status information for diagnostics.
@@ -8396,12 +8437,10 @@ mod tests {
             subject: Some("Hello".to_string()),
             importance: Some("high".to_string()),
         };
-        assert!(emit_notification_signal(
-            &config,
-            "proj",
-            "Agent",
-            Some(&meta)
-        ));
+        assert_eq!(
+            emit_notification_signal(&config, "proj", "Agent", Some(&meta)),
+            SignalEmitOutcome::Emitted
+        );
 
         let signals = list_pending_signals(&config, Some("proj"));
         assert_eq!(signals.len(), 1);
@@ -8413,7 +8452,7 @@ mod tests {
         assert_eq!(signal["message"]["importance"], "high");
 
         let cleared = clear_notification_signal(&config, "proj", "Agent");
-        assert!(cleared);
+        assert_eq!(cleared, SignalClearOutcome::Cleared);
 
         let signals2 = list_pending_signals(&config, Some("proj"));
         assert!(signals2.is_empty());
@@ -8427,11 +8466,36 @@ mod tests {
         config.notifications_signals_dir = tmp.path().join("signals");
         config.notifications_debounce_ms = 60_000;
 
-        assert!(emit_notification_signal(&config, "proj", "Agent", None));
-        assert!(clear_notification_signal(&config, "proj", "Agent"));
-        assert!(
+        assert_eq!(
             emit_notification_signal(&config, "proj", "Agent", None),
+            SignalEmitOutcome::Emitted
+        );
+        assert_eq!(
+            clear_notification_signal(&config, "proj", "Agent"),
+            SignalClearOutcome::Cleared
+        );
+        assert_eq!(
+            emit_notification_signal(&config, "proj", "Agent", None),
+            SignalEmitOutcome::Emitted,
             "clearing should allow the next real notification immediately"
+        );
+    }
+
+    #[test]
+    fn test_emit_notification_signal_reports_debounced_state() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        config.notifications_debounce_ms = 60_000;
+
+        assert_eq!(
+            emit_notification_signal(&config, "proj", "Agent", None),
+            SignalEmitOutcome::Emitted
+        );
+        assert_eq!(
+            emit_notification_signal(&config, "proj", "Agent", None),
+            SignalEmitOutcome::Debounced
         );
     }
 
@@ -8454,12 +8518,10 @@ mod tests {
             subject: Some("Hello World".to_string()),
             importance: Some("high".to_string()),
         };
-        assert!(emit_notification_signal(
-            &config,
-            "test_project",
-            "TestAgent",
-            Some(&meta)
-        ));
+        assert_eq!(
+            emit_notification_signal(&config, "test_project", "TestAgent", Some(&meta)),
+            SignalEmitOutcome::Emitted
+        );
 
         let signals = list_pending_signals(&config, Some("test_project"));
         assert_eq!(signals.len(), 1);
@@ -8488,12 +8550,10 @@ mod tests {
             subject: Some("No importance field".to_string()),
             importance: None, // should default to "normal"
         };
-        assert!(emit_notification_signal(
-            &config,
-            "proj1",
-            "Agent1",
-            Some(&meta)
-        ));
+        assert_eq!(
+            emit_notification_signal(&config, "proj1", "Agent1", Some(&meta)),
+            SignalEmitOutcome::Emitted
+        );
 
         let signals = list_pending_signals(&config, Some("proj1"));
         assert_eq!(signals.len(), 1);
@@ -8516,12 +8576,10 @@ mod tests {
             subject: None,
             importance: None,
         };
-        assert!(emit_notification_signal(
-            &config,
-            "proj1",
-            "Agent2",
-            Some(&meta)
-        ));
+        assert_eq!(
+            emit_notification_signal(&config, "proj1", "Agent2", Some(&meta)),
+            SignalEmitOutcome::Emitted
+        );
 
         let signals = list_pending_signals(&config, Some("proj1"));
         assert_eq!(signals.len(), 1);
@@ -8546,12 +8604,10 @@ mod tests {
             subject: Some("Hello".to_string()),
             importance: Some("high".to_string()),
         };
-        assert!(emit_notification_signal(
-            &config,
-            "test_project",
-            "TestAgent",
-            Some(&meta)
-        ));
+        assert_eq!(
+            emit_notification_signal(&config, "test_project", "TestAgent", Some(&meta)),
+            SignalEmitOutcome::Emitted
+        );
 
         let signals = list_pending_signals(&config, Some("test_project"));
         assert_eq!(signals.len(), 1);
@@ -8569,12 +8625,10 @@ mod tests {
         config.notifications_signals_dir = tmp.path().join("signals");
         config.notifications_debounce_ms = 0;
 
-        assert!(emit_notification_signal(
-            &config,
-            "test_project",
-            "TestAgent",
-            None
-        ));
+        assert_eq!(
+            emit_notification_signal(&config, "test_project", "TestAgent", None),
+            SignalEmitOutcome::Emitted
+        );
 
         let signals = list_pending_signals(&config, Some("test_project"));
         assert_eq!(signals.len(), 1);
@@ -8588,9 +8642,38 @@ mod tests {
         config.notifications_enabled = false;
         config.notifications_signals_dir = tmp.path().join("signals");
 
-        assert!(!emit_notification_signal(&config, "proj", "Agent", None));
+        assert_eq!(
+            emit_notification_signal(&config, "proj", "Agent", None),
+            SignalEmitOutcome::Disabled
+        );
         let signals = list_pending_signals(&config, None);
         assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn test_signal_failed_write_does_not_poison_debounce_state() {
+        let tmp = TempDir::new().unwrap();
+        let blocked_root = tmp.path().join("blocked-signals");
+        fs::write(&blocked_root, "not a directory").unwrap();
+
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_debounce_ms = 60_000;
+        config.notifications_signals_dir = blocked_root;
+
+        assert_eq!(
+            emit_notification_signal(&config, "proj", "Agent", None),
+            SignalEmitOutcome::WriteFailed,
+            "first emit should fail when the configured signal root is not a directory"
+        );
+
+        config.notifications_signals_dir = tmp.path().join("signals");
+        assert_eq!(
+            emit_notification_signal(&config, "proj", "Agent", None),
+            SignalEmitOutcome::Emitted,
+            "a failed write must not reserve debounce state and suppress the retry"
+        );
+        assert_eq!(list_pending_signals(&config, Some("proj")).len(), 1);
     }
 
     #[test]
@@ -8603,9 +8686,18 @@ mod tests {
         config.notifications_debounce_ms = 0;
 
         // Emit signals across 2 projects and 2 agents
-        assert!(emit_notification_signal(&config, "proj1", "Agent1", None));
-        assert!(emit_notification_signal(&config, "proj1", "Agent2", None));
-        assert!(emit_notification_signal(&config, "proj2", "Agent1", None));
+        assert_eq!(
+            emit_notification_signal(&config, "proj1", "Agent1", None),
+            SignalEmitOutcome::Emitted
+        );
+        assert_eq!(
+            emit_notification_signal(&config, "proj1", "Agent2", None),
+            SignalEmitOutcome::Emitted
+        );
+        assert_eq!(
+            emit_notification_signal(&config, "proj2", "Agent1", None),
+            SignalEmitOutcome::Emitted
+        );
 
         // All signals
         let all = list_pending_signals(&config, None);
@@ -8621,6 +8713,48 @@ mod tests {
     }
 
     #[test]
+    fn test_signal_list_is_sorted_deterministically() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_include_metadata = false;
+        config.notifications_signals_dir = tmp.path().join("signals");
+        config.notifications_debounce_ms = 0;
+
+        assert_eq!(
+            emit_notification_signal(&config, "proj2", "AgentB", None),
+            SignalEmitOutcome::Emitted
+        );
+        assert_eq!(
+            emit_notification_signal(&config, "proj1", "AgentC", None),
+            SignalEmitOutcome::Emitted
+        );
+        assert_eq!(
+            emit_notification_signal(&config, "proj1", "AgentA", None),
+            SignalEmitOutcome::Emitted
+        );
+
+        let all = list_pending_signals(&config, None);
+        let ordered: Vec<(String, String)> = all
+            .iter()
+            .map(|signal| {
+                (
+                    signal["project"].as_str().unwrap_or_default().to_string(),
+                    signal["agent"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![
+                ("proj1".to_string(), "AgentA".to_string()),
+                ("proj1".to_string(), "AgentC".to_string()),
+                ("proj2".to_string(), "AgentB".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn test_signal_clear_and_relist() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(tmp.path());
@@ -8629,17 +8763,29 @@ mod tests {
         config.notifications_signals_dir = tmp.path().join("signals");
         config.notifications_debounce_ms = 0;
 
-        assert!(emit_notification_signal(&config, "proj", "Agent1", None));
-        assert!(emit_notification_signal(&config, "proj", "Agent2", None));
+        assert_eq!(
+            emit_notification_signal(&config, "proj", "Agent1", None),
+            SignalEmitOutcome::Emitted
+        );
+        assert_eq!(
+            emit_notification_signal(&config, "proj", "Agent2", None),
+            SignalEmitOutcome::Emitted
+        );
 
         // Clear Agent1
-        assert!(clear_notification_signal(&config, "proj", "Agent1"));
+        assert_eq!(
+            clear_notification_signal(&config, "proj", "Agent1"),
+            SignalClearOutcome::Cleared
+        );
         let signals = list_pending_signals(&config, Some("proj"));
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0]["agent"], "Agent2");
 
         // Clear nonexistent returns false
-        assert!(!clear_notification_signal(&config, "proj", "NonExistent"));
+        assert_eq!(
+            clear_notification_signal(&config, "proj", "NonExistent"),
+            SignalClearOutcome::Missing
+        );
     }
 
     #[test]
@@ -8667,28 +8813,64 @@ mod tests {
         let agent = "TravAgent";
 
         // Slash in project_slug
-        assert!(!emit_notification_signal(&config, "../evil", agent, None));
-        assert!(!emit_notification_signal(&config, "proj/sub", agent, None));
+        assert_eq!(
+            emit_notification_signal(&config, "../evil", agent, None),
+            SignalEmitOutcome::InvalidTarget
+        );
+        assert_eq!(
+            emit_notification_signal(&config, "proj/sub", agent, None),
+            SignalEmitOutcome::InvalidTarget
+        );
 
         // Backslash in project_slug
-        assert!(!emit_notification_signal(&config, "proj\\sub", agent, None));
+        assert_eq!(
+            emit_notification_signal(&config, "proj\\sub", agent, None),
+            SignalEmitOutcome::InvalidTarget
+        );
 
         // Dot-dot in project_slug
-        assert!(!emit_notification_signal(&config, "proj..", agent, None));
-        assert!(!emit_notification_signal(&config, "..proj", agent, None));
+        assert_eq!(
+            emit_notification_signal(&config, "proj..", agent, None),
+            SignalEmitOutcome::InvalidTarget
+        );
+        assert_eq!(
+            emit_notification_signal(&config, "..proj", agent, None),
+            SignalEmitOutcome::InvalidTarget
+        );
 
         // Slash in agent_name
-        assert!(!emit_notification_signal(&config, slug, "../evil", None));
-        assert!(!emit_notification_signal(&config, slug, "Agent/sub", None));
+        assert_eq!(
+            emit_notification_signal(&config, slug, "../evil", None),
+            SignalEmitOutcome::InvalidTarget
+        );
+        assert_eq!(
+            emit_notification_signal(&config, slug, "Agent/sub", None),
+            SignalEmitOutcome::InvalidTarget
+        );
 
         // Backslash in agent_name
-        assert!(!emit_notification_signal(&config, slug, "Agent\\sub", None));
+        assert_eq!(
+            emit_notification_signal(&config, slug, "Agent\\sub", None),
+            SignalEmitOutcome::InvalidTarget
+        );
 
         // clear_notification_signal rejects the same patterns
-        assert!(!clear_notification_signal(&config, "../evil", agent));
-        assert!(!clear_notification_signal(&config, slug, "../evil"));
-        assert!(!clear_notification_signal(&config, "proj\\sub", agent));
-        assert!(!clear_notification_signal(&config, slug, "Agent\\sub"));
+        assert_eq!(
+            clear_notification_signal(&config, "../evil", agent),
+            SignalClearOutcome::InvalidTarget
+        );
+        assert_eq!(
+            clear_notification_signal(&config, slug, "../evil"),
+            SignalClearOutcome::InvalidTarget
+        );
+        assert_eq!(
+            clear_notification_signal(&config, "proj\\sub", agent),
+            SignalClearOutcome::InvalidTarget
+        );
+        assert_eq!(
+            clear_notification_signal(&config, slug, "Agent\\sub"),
+            SignalClearOutcome::InvalidTarget
+        );
 
         // list_pending_signals rejects traversal in slug
         assert!(list_pending_signals(&config, Some("../evil")).is_empty());
@@ -8696,9 +8878,15 @@ mod tests {
         assert!(list_pending_signals(&config, Some("proj\\sub")).is_empty());
 
         // Legitimate names still work
-        assert!(emit_notification_signal(&config, slug, agent, None));
+        assert_eq!(
+            emit_notification_signal(&config, slug, agent, None),
+            SignalEmitOutcome::Emitted
+        );
         assert_eq!(list_pending_signals(&config, Some(slug)).len(), 1);
-        assert!(clear_notification_signal(&config, slug, agent));
+        assert_eq!(
+            clear_notification_signal(&config, slug, agent),
+            SignalClearOutcome::Cleared
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -9529,6 +9717,59 @@ mod tests {
     }
 
     #[test]
+    fn test_find_commit_for_path_does_not_confuse_sibling_prefixes_on_root_commit() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "read-sibling-proj").unwrap();
+
+        let agent = serde_json::json!({"name": "AB", "program": "test"});
+        write_agent_profile_with_config(&archive, &config, &agent).unwrap();
+        flush_async_commits();
+
+        let missing_rel = "projects/read-sibling-proj/agents/A/profile.json".to_string();
+        let commit = find_commit_for_path(&archive, &missing_rel).unwrap();
+        assert!(
+            commit.is_none(),
+            "path lookup must not attribute sibling commits via string-prefix matching"
+        );
+    }
+
+    #[test]
+    fn test_get_recent_commits_path_filter_includes_deletions() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "delete-filter-proj").unwrap();
+
+        let agent = serde_json::json!({"name": "DeleteAgent", "program": "test"});
+        write_agent_profile_with_config(&archive, &config, &agent).unwrap();
+        flush_async_commits();
+
+        let profile_path = archive
+            .root
+            .join("agents")
+            .join("DeleteAgent")
+            .join("profile.json");
+        let rel = rel_path_cached(&archive.canonical_repo_root, &profile_path).unwrap();
+
+        fs::remove_file(&profile_path).unwrap();
+        enqueue_async_commit(
+            &archive.repo_root,
+            &config,
+            "delete profile",
+            std::slice::from_ref(&rel),
+        );
+        flush_async_commits();
+
+        let commits = get_recent_commits(&archive, 10, Some(&rel)).unwrap();
+        assert!(
+            commits
+                .iter()
+                .any(|commit| commit.summary == "delete profile"),
+            "path-filtered history must include deletion commits that only touch old_file paths"
+        );
+    }
+
+    #[test]
     fn test_get_commits_by_author() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -10094,6 +10335,68 @@ mod tests {
         assert_eq!(accepted, WbqEnqueueResult::Enqueued);
         assert_eq!(op_depth.load(Ordering::Relaxed), 1);
         assert!(rx.recv_timeout(Duration::from_millis(20)).is_ok());
+    }
+
+    struct DiskPressureReset(u64);
+
+    impl DiskPressureReset {
+        fn set(level: u64) -> Self {
+            let metrics = mcp_agent_mail_core::global_metrics();
+            let previous = metrics.system.disk_pressure_level.load();
+            metrics.system.disk_pressure_level.set(level);
+            Self(previous)
+        }
+    }
+
+    impl Drop for DiskPressureReset {
+        fn drop(&mut self) {
+            mcp_agent_mail_core::global_metrics()
+                .system
+                .disk_pressure_level
+                .set(self.0);
+        }
+    }
+
+    #[test]
+    fn wbq_drain_executes_already_enqueued_ops_even_if_disk_turns_critical() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let project_slug = "wbq-drain-critical".to_string();
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        let op_depth = Arc::new(AtomicU64::new(1));
+        let agent_json = serde_json::json!({
+            "name": "DrainCriticalAgent",
+            "program": "wbq-test",
+            "model": "gpt5",
+        });
+        tx.send(WbqMsg::Op(WbqOpEnvelope {
+            enqueued_at: Instant::now(),
+            op: Box::new(WriteOp::AgentProfile {
+                project_slug: project_slug.clone(),
+                config: config.clone(),
+                agent_json,
+            }),
+        }))
+        .unwrap();
+        tx.send(WbqMsg::Shutdown).unwrap();
+        drop(tx);
+
+        let _pressure =
+            DiskPressureReset::set(mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64());
+        wbq_drain_loop(rx, op_depth, 4, 4);
+        flush_async_commits();
+
+        let archive = ensure_archive(&config, &project_slug).unwrap();
+        let profile_path = archive
+            .root
+            .join("agents")
+            .join("DrainCriticalAgent")
+            .join("profile.json");
+        assert!(
+            profile_path.exists(),
+            "drain must not drop already-enqueued archive writes when disk pressure changes later"
+        );
     }
 
     #[test]

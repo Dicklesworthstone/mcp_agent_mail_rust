@@ -11,6 +11,7 @@ use crate::ShareError;
 
 type Conn = DbConn;
 const UNKNOWN_RECIPIENT_DISPLAY: &str = "[unknown recipient]";
+const UNKNOWN_PROJECT_SLUG_PREFIX: &str = "[unknown-project-";
 
 #[cfg(test)]
 // Historical alias name retained in tests; this still uses FrankenSQLite `DbConn`.
@@ -117,34 +118,47 @@ pub fn build_search_indexes(snapshot_path: &Path) -> Result<bool, ShareError> {
         })?;
 
     // Populate from messages + projects
+    let project_slug_expr = format!(
+        "COALESCE(NULLIF(TRIM((SELECT p.slug FROM projects p WHERE p.id = m.project_id LIMIT 1)), ''), \
+             CASE \
+                 WHEN m.project_id IS NULL THEN '' \
+                 ELSE '{UNKNOWN_PROJECT_SLUG_PREFIX}' || m.project_id || ']' \
+             END \
+         )"
+    );
+
     let insert_sql = if has_thread_id {
-        "INSERT INTO fts_messages(message_id, subject, body, importance, project_slug, thread_key, created_ts) \
+        format!(
+            "INSERT INTO fts_messages(message_id, subject, body, importance, project_slug, thread_key, created_ts) \
          SELECT \
              m.id, \
              COALESCE(m.subject, ''), \
              COALESCE(m.body_md, ''), \
              COALESCE(m.importance, ''), \
-             COALESCE((SELECT p.slug FROM projects p WHERE p.id = m.project_id LIMIT 1), ''), \
+             {project_slug_expr}, \
              CASE \
                  WHEN m.thread_id IS NULL OR m.thread_id = '' THEN printf('msg:%d', m.id) \
                  ELSE m.thread_id \
              END, \
              COALESCE(m.created_ts, '') \
          FROM messages AS m"
+        )
     } else {
-        "INSERT INTO fts_messages(message_id, subject, body, importance, project_slug, thread_key, created_ts) \
+        format!(
+            "INSERT INTO fts_messages(message_id, subject, body, importance, project_slug, thread_key, created_ts) \
          SELECT \
              m.id, \
              COALESCE(m.subject, ''), \
              COALESCE(m.body_md, ''), \
              COALESCE(m.importance, ''), \
-             COALESCE((SELECT p.slug FROM projects p WHERE p.id = m.project_id LIMIT 1), ''), \
+             {project_slug_expr}, \
              printf('msg:%d', m.id), \
              COALESCE(m.created_ts, '') \
          FROM messages AS m"
+        )
     };
 
-    conn.execute_raw(insert_sql)
+    conn.execute_raw(&insert_sql)
         .map_err(|e| ShareError::Sqlite {
             message: format!("FTS populate failed: {e}"),
         })?;
@@ -1216,6 +1230,30 @@ mod tests {
     }
 
     #[test]
+    fn fts_keeps_orphaned_project_placeholder_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw("DELETE FROM projects WHERE id = 1")
+            .unwrap();
+        drop(conn);
+
+        let fts_ok = build_search_indexes(&db).unwrap();
+        assert!(fts_ok);
+
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT project_slug FROM fts_messages WHERE message_id = 1",
+                &[],
+            )
+            .unwrap();
+        let project_slug: String = rows[0].get_named("project_slug").unwrap();
+        assert_eq!(project_slug, "[unknown-project-1]");
+    }
+
+    #[test]
     fn materialized_views_without_fts() {
         let dir = tempfile::tempdir().unwrap();
         let db = create_test_db(dir.path());
@@ -1403,6 +1441,30 @@ mod tests {
             thread_key, "msg:1",
             "should use 'msg:N' format when thread_id column absent"
         );
+    }
+
+    #[test]
+    fn fts_without_thread_id_keeps_orphaned_project_placeholder_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db_no_thread_id(dir.path());
+
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        conn.execute_raw("DELETE FROM projects WHERE id = 1")
+            .unwrap();
+        drop(conn);
+
+        let fts_ok = build_search_indexes(&db).unwrap();
+        assert!(fts_ok);
+
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT project_slug FROM fts_messages WHERE message_id = 1",
+                &[],
+            )
+            .unwrap();
+        let project_slug: String = rows[0].get_named("project_slug").unwrap();
+        assert_eq!(project_slug, "[unknown-project-1]");
     }
 
     #[test]
