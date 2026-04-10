@@ -1964,10 +1964,23 @@ fn archive_inventory_has_state(storage_root: &Path) -> bool {
     archive.projects > 0 || archive.agents > 0 || archive.unique_message_ids > 0
 }
 
+fn archive_storage_root_is_authoritative_for_sqlite_path(
+    storage_root: &Path,
+    sqlite_path: &Path,
+) -> bool {
+    !mcp_agent_mail_core::config::is_default_storage_root(storage_root)
+        || sqlite_path.starts_with(storage_root)
+}
+
 fn inspect_archive_db_drift(
     storage_root: &Path,
+    sqlite_path: &Path,
     conn: &DbConn,
 ) -> Result<Option<ArchiveDbDriftSummary>, String> {
+    if !archive_storage_root_is_authoritative_for_sqlite_path(storage_root, sqlite_path) {
+        return Ok(None);
+    }
+
     let projects_root = storage_root.join("projects");
     let projects_root_is_dir = std::fs::symlink_metadata(&projects_root)
         .is_ok_and(|metadata| metadata.file_type().is_dir());
@@ -2017,12 +2030,23 @@ fn inspect_archive_db_drift(
     let missing_archive_projects =
         mcp_agent_mail_db::archive_missing_project_identities(&archive, &db_project_identities);
 
-    if u64::try_from(archive.projects).unwrap_or(u64::MAX) > db_project_count
-        || u64::try_from(archive.agents).unwrap_or(u64::MAX) > db_agent_count
-        || u64::try_from(archive.unique_message_ids).unwrap_or(u64::MAX) > db_message_count
-        || archive_max_id > db_max_id
-        || !missing_archive_projects.is_empty()
-    {
+    let archive_message_count = archive.unique_message_ids;
+    let archive_messages_ahead =
+        u64::try_from(archive_message_count).unwrap_or(u64::MAX) > db_message_count;
+    let archive_latest_id_ahead = archive_max_id > db_max_id;
+    let archive_metadata_ahead = mcp_agent_mail_db::pool::archive_metadata_advantage_is_decisive(
+        archive.projects,
+        archive.agents,
+        archive_message_count,
+        archive.latest_message_id,
+        usize::try_from(db_project_count).unwrap_or(usize::MAX),
+        usize::try_from(db_agent_count).unwrap_or(usize::MAX),
+        usize::try_from(db_message_count).unwrap_or(usize::MAX),
+        db_max_id,
+        &missing_archive_projects,
+    );
+
+    if archive_messages_ahead || archive_latest_id_ahead || archive_metadata_ahead {
         return Ok(Some(ArchiveDbDriftSummary {
             archive_projects: u64::try_from(archive.projects).unwrap_or(u64::MAX),
             archive_agents: u64::try_from(archive.agents).unwrap_or(u64::MAX),
@@ -2253,10 +2277,12 @@ pub(crate) fn open_observability_sync_db_connection(
     }
 
     let resolved_path = PathBuf::from(&sqlite_path);
-    let archive_has_state = archive_inventory_has_state(storage_root);
+    let archive_has_state =
+        archive_storage_root_is_authoritative_for_sqlite_path(storage_root, &resolved_path)
+            && archive_inventory_has_state(storage_root);
 
     match open_best_effort_sync_db_connection(&sqlite_path) {
-        Ok(conn) => match inspect_archive_db_drift(storage_root, &conn) {
+        Ok(conn) => match inspect_archive_db_drift(storage_root, &resolved_path, &conn) {
             Ok(Some(drift)) => {
                 tracing::warn!(
                     operation = context,
@@ -10720,7 +10746,9 @@ fn readiness_check_semantic_status(
         ));
     }
 
-    if let Some(drift) = inspect_archive_db_drift(&config.storage_root, conn)? {
+    if let Some(sqlite_path) = resolve_server_database_url_sqlite_path(&config.database_url)
+        && let Some(drift) = inspect_archive_db_drift(&config.storage_root, &sqlite_path, conn)?
+    {
         return Err(drift.readiness_error());
     }
 
@@ -10754,9 +10782,11 @@ fn log_active_database(config: &mcp_agent_mail_core::Config) {
     );
 
     // Best-effort warning: archive inventory is ahead of the live SQLite index.
-    if let Some(observed) =
-        dashboard_open_connection(&config.database_url, config.storage_root.as_path())
-        && let Ok(Some(drift)) = inspect_archive_db_drift(&config.storage_root, observed.conn())
+    if let Some(sqlite_path) = resolve_server_database_url_sqlite_path(&config.database_url)
+        && let Some(observed) =
+            dashboard_open_connection(&config.database_url, config.storage_root.as_path())
+        && let Ok(Some(drift)) =
+            inspect_archive_db_drift(&config.storage_root, &sqlite_path, observed.conn())
     {
         tracing::warn!(
             database = %db_display,
@@ -12075,6 +12105,81 @@ first body
     }
 
     #[test]
+    fn readiness_check_quick_ignores_unrelated_default_archive_overlap() {
+        let _env_lock = lock_mutex(&TOOL_DISPATCH_ENV_TEST_LOCK);
+        *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let xdg_data_root = temp.path().join("xdg-data");
+        std::fs::create_dir_all(&xdg_data_root).expect("create xdg data root");
+        let xdg_data_root_str = xdg_data_root
+            .to_str()
+            .expect("xdg data root utf-8")
+            .to_string();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("XDG_DATA_HOME", xdg_data_root_str.as_str())],
+            || {
+                let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
+                assert!(
+                    mcp_agent_mail_core::config::is_default_storage_root(&storage_root),
+                    "test must use the default storage root"
+                );
+
+                let project_dir = storage_root.join("projects").join("ahead-project");
+                let agent_dir = project_dir.join("agents").join("Alice");
+                let messages_dir = project_dir.join("messages").join("2026").join("03");
+                std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+                std::fs::create_dir_all(&messages_dir).expect("create messages dir");
+                std::fs::write(
+                    project_dir.join("project.json"),
+                    r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
+                )
+                .expect("write project metadata");
+                std::fs::write(
+                    agent_dir.join("profile.json"),
+                    r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
+                )
+                .expect("write agent profile");
+                std::fs::write(
+                    messages_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+                    r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "First copy",
+  "importance": "normal",
+  "created_ts": "2026-03-22T12:00:00Z"
+}
+---
+
+first body
+"#,
+                )
+                .expect("write canonical message");
+
+                let external_db_dir = temp.path().join("external-db");
+                std::fs::create_dir_all(&external_db_dir).expect("create external db dir");
+                let db_path = external_db_dir.join("readiness.sqlite3");
+                let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+                conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                    .expect("init schema");
+                drop(conn);
+
+                let mut config = mcp_agent_mail_core::Config::from_env();
+                config.database_url = format!("sqlite:///{}", db_path.display());
+                config.storage_root = storage_root;
+                config.integrity_check_on_startup = false;
+
+                readiness_check_quick(&config).expect(
+                    "default-root archive drift must be ignored for an external sqlite path",
+                );
+            },
+        );
+    }
+
+    #[test]
     fn readiness_check_quick_reports_archive_agent_drift_without_messages() {
         *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
 
@@ -12165,6 +12270,118 @@ first body
         assert!(
             error.contains("missing archive project(s) in db: archive-project (/archive-project)"),
             "readiness should surface missing archive project identity: {error}"
+        );
+    }
+
+    #[test]
+    fn readiness_check_quick_accepts_db_newer_messages_than_metadata_only_archive_drift() {
+        *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("db-newer-readiness.sqlite3");
+        let project_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("04");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&messages_dir).expect("create messages dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-04-01T00:00:00Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            messages_dir.join("2026-04-01T12-00-00Z__first__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "First",
+  "importance": "normal",
+  "created_ts": "2026-04-01T12:00:00Z"
+}
+---
+
+first body
+"#,
+        )
+        .expect("write canonical message");
+
+        mcp_agent_mail_db::reconstruct::reconstruct_from_archive(&db_path, &storage_root)
+            .expect("reconstruct archive into db");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(3),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("BlueLake".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("coder".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("test".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text(String::new()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(2),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(2),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("auto".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("auto".to_string()),
+            ],
+        )
+        .expect("insert recipient");
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments, recipients_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(2),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(1),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("t2".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("Second".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("second body".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("normal".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(0),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(2_000_000),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("[]".to_string()),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text(r#"{"to":["BlueLake"],"cc":[],"bcc":[]}"#.to_string()),
+            ],
+        )
+        .expect("insert newer live message");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, ack_ts, read_ts) VALUES (?1, ?2, ?3, NULL, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(2),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(3),
+                mcp_agent_mail_db::sqlmodel_core::Value::Text("to".to_string()),
+            ],
+        )
+        .expect("insert message recipient");
+        drop(conn);
+
+        let archive_only_project = storage_root.join("projects").join("archive-only-project");
+        let archive_only_agent = archive_only_project.join("agents").join("ArchiveGhost");
+        std::fs::create_dir_all(&archive_only_agent).expect("create archive-only project dir");
+        std::fs::write(
+            archive_only_project.join("project.json"),
+            r#"{"slug":"archive-only-project","human_key":"/archive-only-project","created_at":0}"#,
+        )
+        .expect("write archive-only project metadata");
+        std::fs::write(
+            archive_only_agent.join("profile.json"),
+            r#"{"agent_name":"ArchiveGhost","program":"coder","model":"test","registered_ts":"2026-04-01T00:00:00Z"}"#,
+        )
+        .expect("write archive-only agent metadata");
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = storage_root;
+        config.integrity_check_on_startup = false;
+
+        readiness_check_quick(&config).expect(
+            "metadata-only archive drift should not fail readiness when the DB has newer messages",
         );
     }
 
@@ -20527,6 +20744,98 @@ first body
             .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
             .expect("query snapshot messages");
         assert_eq!(rows[0].get_named::<i64>("c").unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn open_observability_sync_db_connection_ignores_unrelated_default_archive_overlap() {
+        let _env_lock = lock_mutex(&TOOL_DISPATCH_ENV_TEST_LOCK);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg_data_root = dir.path().join("xdg-data");
+        std::fs::create_dir_all(&xdg_data_root).expect("create xdg data root");
+        let xdg_data_root_str = xdg_data_root
+            .to_str()
+            .expect("xdg data root utf-8")
+            .to_string();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("XDG_DATA_HOME", xdg_data_root_str.as_str())],
+            || {
+                let storage_root = mcp_agent_mail_core::Config::from_env().storage_root;
+                assert!(
+                    mcp_agent_mail_core::config::is_default_storage_root(&storage_root),
+                    "test must use the default storage root"
+                );
+
+                let project_dir = storage_root.join("projects").join("ahead-project");
+                let agent_dir = project_dir.join("agents").join("Alice");
+                let messages_dir = project_dir.join("messages").join("2026").join("03");
+                std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+                std::fs::create_dir_all(&messages_dir).expect("create messages dir");
+                std::fs::write(
+                    project_dir.join("project.json"),
+                    r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
+                )
+                .expect("write project metadata");
+                std::fs::write(
+                    agent_dir.join("profile.json"),
+                    r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
+                )
+                .expect("write agent profile");
+                std::fs::write(
+                    messages_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+                    r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "First copy",
+  "importance": "normal",
+  "created_ts": "2026-03-22T12:00:00Z"
+}
+---
+
+first body
+"#,
+                )
+                .expect("write canonical message");
+
+                let external_db_dir = dir.path().join("external-db");
+                std::fs::create_dir_all(&external_db_dir).expect("create external db dir");
+                let db_path = external_db_dir.join("observability.sqlite3");
+                let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+                conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                    .expect("init schema");
+                drop(conn);
+
+                let database_url = format!("sqlite:///{}", db_path.display());
+                let observed = open_observability_sync_db_connection(
+                    &database_url,
+                    &storage_root,
+                    "unrelated default archive overlap",
+                )
+                .expect("open observability db")
+                .expect("observability db should exist");
+
+                assert!(
+                    !observed.uses_archive_snapshot(),
+                    "default-root archive state must not override an external sqlite path"
+                );
+
+                let (conn, sqlite_path, snapshot_dir) = observed.into_parts();
+                assert_eq!(
+                    sqlite_path,
+                    resolve_server_sync_sqlite_path(db_path.to_string_lossy().as_ref())
+                );
+                assert!(
+                    snapshot_dir.is_none(),
+                    "live sqlite binding should not allocate an archive snapshot dir"
+                );
+                let rows = conn
+                    .query_sync("SELECT COUNT(*) AS c FROM messages", &[])
+                    .expect("query live db");
+                assert_eq!(rows[0].get_named::<i64>("c").unwrap_or(-1), 0);
+            },
+        );
     }
 
     #[test]

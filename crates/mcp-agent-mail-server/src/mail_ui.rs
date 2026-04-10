@@ -1393,6 +1393,28 @@ mod utility_tests {
         assert_eq!(extract_query_str("", "q"), None);
     }
 
+    // --- parse_ack_filter_param ---
+
+    #[test]
+    fn parse_ack_filter_param_accepts_legacy_words() {
+        assert_eq!(parse_ack_filter_param("required"), Some(true));
+        assert_eq!(parse_ack_filter_param("not_required"), Some(false));
+    }
+
+    #[test]
+    fn parse_ack_filter_param_accepts_tui_bool_aliases() {
+        assert_eq!(parse_ack_filter_param("1"), Some(true));
+        assert_eq!(parse_ack_filter_param("true"), Some(true));
+        assert_eq!(parse_ack_filter_param("0"), Some(false));
+        assert_eq!(parse_ack_filter_param("false"), Some(false));
+    }
+
+    #[test]
+    fn parse_ack_filter_param_rejects_unknown_values() {
+        assert_eq!(parse_ack_filter_param("any"), None);
+        assert_eq!(parse_ack_filter_param("banana"), None);
+    }
+
     // --- extract_query_int ---
 
     #[test]
@@ -3154,6 +3176,14 @@ fn extract_query_str_all(query: &str, key: &str) -> Vec<String> {
     out
 }
 
+fn parse_ack_filter_param(value: &str) -> Option<bool> {
+    match value {
+        "required" | "1" | "true" => Some(true),
+        "not_required" | "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
 /// Build the deep-link URL for the current search state.
 fn build_search_deep_link(project_slug: &str, query_str: &str) -> String {
     if query_str.is_empty() {
@@ -3338,11 +3368,7 @@ fn render_search(
             _ => None,
         };
 
-        let ack_required = match ack_filter.as_str() {
-            "required" => Some(true),
-            "not_required" => Some(false),
-            _ => None,
-        };
+        let ack_required = parse_ack_filter_param(&ack_filter);
 
         let search_query = SearchQuery {
             text: q.clone(),
