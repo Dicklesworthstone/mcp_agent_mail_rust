@@ -1705,6 +1705,14 @@ impl DbPoolConfig {
             .unwrap_or_else(|| mcp_agent_mail_core::Config::from_env().storage_root)
     }
 
+    fn core_config_for_ephemeral_reroute(&self) -> mcp_agent_mail_core::Config {
+        let mut core_config = mcp_agent_mail_core::Config::from_env();
+        if let Some(storage_root) = self.storage_root.clone() {
+            core_config.storage_root = storage_root;
+        }
+        core_config
+    }
+
     /// Apply ephemeral-root rerouting if the given project root is classified
     /// as ephemeral (tmp, dev/shm, test harness, CI runner, etc.).
     ///
@@ -1727,7 +1735,7 @@ impl DbPoolConfig {
     /// ```
     #[must_use]
     pub fn with_ephemeral_reroute(mut self, project_root: &Path) -> Self {
-        let core_config = mcp_agent_mail_core::Config::from_env();
+        let core_config = self.core_config_for_ephemeral_reroute();
         if let Some(isolated) =
             mcp_agent_mail_core::compute_ephemeral_storage_root(project_root, &core_config)
         {
@@ -1765,7 +1773,7 @@ impl DbPoolConfig {
     /// This is a read-only query; it does not modify the config.
     #[must_use]
     pub fn would_reroute_for_project(&self, project_root: &Path) -> Option<PathBuf> {
-        let core_config = mcp_agent_mail_core::Config::from_env();
+        let core_config = self.core_config_for_ephemeral_reroute();
         mcp_agent_mail_core::compute_ephemeral_storage_root(project_root, &core_config)
     }
 }
@@ -11099,21 +11107,39 @@ mod tests {
 
     #[test]
     fn with_ephemeral_reroute_production_path_unchanged() {
-        let config = DbPoolConfig::default();
-        let rerouted = config.with_ephemeral_reroute(Path::new("/data/projects/real-project"));
-        // For a production path, the storage_root should not change.
-        // Default config has storage_root = None, so resolved_storage_root falls back
-        // to Config::from_env(). The ephemeral reroute should leave it as-is.
-        assert_eq!(rerouted.storage_root, None);
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_EPHEMERAL_MODE", "deny")],
+            || {
+                let config = DbPoolConfig {
+                    storage_root: Some(mcp_agent_mail_core::config::default_storage_root_path()),
+                    ..DbPoolConfig::default()
+                };
+                let rerouted =
+                    config.with_ephemeral_reroute(Path::new("/data/projects/real-project"));
+                assert_eq!(
+                    rerouted.storage_root,
+                    Some(mcp_agent_mail_core::config::default_storage_root_path())
+                );
+            },
+        );
     }
 
     #[test]
     fn would_reroute_for_project_returns_none_for_production() {
-        let config = DbPoolConfig::default();
-        let result = config.would_reroute_for_project(Path::new("/data/projects/my-project"));
-        assert!(
-            result.is_none(),
-            "production path should not trigger reroute"
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_EPHEMERAL_MODE", "deny")],
+            || {
+                let config = DbPoolConfig {
+                    storage_root: Some(mcp_agent_mail_core::config::default_storage_root_path()),
+                    ..DbPoolConfig::default()
+                };
+                let result =
+                    config.would_reroute_for_project(Path::new("/data/projects/my-project"));
+                assert!(
+                    result.is_none(),
+                    "production path should not trigger reroute"
+                );
+            },
         );
     }
 
@@ -11125,18 +11151,16 @@ mod tests {
 
     #[test]
     fn with_ephemeral_reroute_returns_isolated_for_tmp_when_default_root() {
-        // Build a config that looks like it uses the default storage root.
-        // compute_ephemeral_storage_root checks is_default_storage_root, which
-        // compares against the live config. We can only verify the method
-        // doesn't panic and returns a modified config when conditions align.
         let config = DbPoolConfig {
-            storage_root: None, // forces fallback to Config::from_env()
+            storage_root: Some(mcp_agent_mail_core::config::default_storage_root_path()),
             ..Default::default()
         };
         let rerouted = config.with_ephemeral_reroute(Path::new("/tmp/ci-test-run"));
-        // Whether reroute actually happens depends on the runtime config's
-        // storage_root being the default. We verify the method is callable
-        // and produces a well-formed config.
+        assert_ne!(
+            rerouted.storage_root,
+            Some(mcp_agent_mail_core::config::default_storage_root_path()),
+            "ephemeral project should be rerouted away from the default archive"
+        );
         assert!(!rerouted.resolved_storage_root().as_os_str().is_empty());
     }
 

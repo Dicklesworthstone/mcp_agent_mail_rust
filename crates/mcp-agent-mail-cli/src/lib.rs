@@ -42517,12 +42517,12 @@ fn stage_archive_restore_snapshot(
         out.sync_all()?;
     }
 
-    let mut health = sqlite_file_is_healthy(&staged_db_path);
+    let mut health = archive_restore_snapshot_is_healthy(&staged_db_path);
     if let Err(error) = &health
         && archive_restore_health_error_requires_fts_cleanup(error)
         && cleanup_archive_restore_staged_snapshot_fts(&staged_db_path)?
     {
-        health = sqlite_file_is_healthy(&staged_db_path);
+        health = archive_restore_snapshot_is_healthy(&staged_db_path);
     }
     match health {
         Ok(true) => {}
@@ -42541,6 +42541,42 @@ fn stage_archive_restore_snapshot(
     }
 
     Ok((staged_db_dir, staged_db_path))
+}
+
+fn archive_restore_snapshot_check_ok(
+    conn: &mcp_agent_mail_db::DbConn,
+    kind: mcp_agent_mail_db::CheckKind,
+) -> CliResult<bool> {
+    match sqlite_conn_check_ok(conn, kind) {
+        Ok(ok) => Ok(ok),
+        Err(error) => {
+            let message = error.to_string();
+            if is_sqlite_recovery_error_message(&message) || is_snapshot_conflict_cli_error(&error)
+            {
+                return Ok(false);
+            }
+            Err(error)
+        }
+    }
+}
+
+fn archive_restore_snapshot_is_healthy(snapshot_path: &Path) -> CliResult<bool> {
+    let path_string = snapshot_path.to_string_lossy().into_owned();
+    let conn = mcp_agent_mail_db::DbConn::open_file(&path_string).map_err(|e| {
+        CliError::Other(format!(
+            "cannot open staged archive snapshot {}: {e}",
+            snapshot_path.display()
+        ))
+    })?;
+
+    if !archive_restore_snapshot_check_ok(&conn, mcp_agent_mail_db::CheckKind::Quick)? {
+        return Ok(false);
+    }
+    if !archive_restore_snapshot_check_ok(&conn, mcp_agent_mail_db::CheckKind::Incremental)? {
+        return Ok(false);
+    }
+
+    sqlite_conn_supports_required_reads(&conn, &SQLITE_BASE_INIT_TABLES, &SQLITE_BASE_INIT_COLUMNS)
 }
 
 fn stage_archive_restore_storage_root(

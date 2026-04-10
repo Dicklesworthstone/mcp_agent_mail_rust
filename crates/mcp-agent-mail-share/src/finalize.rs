@@ -18,6 +18,10 @@ const SQLITE_SNAPSHOT_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"]
 // Historical alias name retained in tests; this still uses FrankenSQLite `DbConn`.
 type SqliteConnection = DbConn;
 
+#[cfg(test)]
+static FAIL_FINALIZE_SNAPSHOT_STAGE_BEFORE_PUBLISH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Result of the full finalization pipeline.
 #[derive(Debug, Clone)]
 pub struct FinalizeResult {
@@ -568,15 +572,12 @@ pub fn create_performance_indexes(snapshot_path: &Path) -> Result<Vec<String>, S
 /// This rebuilds the snapshot into a compact fresh database with the export
 /// page size, then applies the final journal mode and statistics pragmas.
 pub fn finalize_snapshot_for_export(snapshot_path: &Path) -> Result<(), ShareError> {
-    rewrite_snapshot_storage(snapshot_path)?;
+    let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
+    let (_temp_dir, rebuilt_path, backup_path) = prepare_rebuilt_snapshot_storage(&snapshot_path)?;
 
-    let conn = open_conn(snapshot_path)?;
-    conn.execute_raw("PRAGMA journal_mode='DELETE'")
-        .map_err(sql_err)?;
-    conn.execute_raw("PRAGMA analysis_limit=400")
-        .map_err(sql_err)?;
-    conn.execute_raw("ANALYZE").map_err(sql_err)?;
-    conn.execute_raw("PRAGMA optimize").map_err(sql_err)?;
+    apply_export_finalize_pragmas(&rebuilt_path)?;
+    replace_snapshot_with_rebuilt_path(&rebuilt_path, &snapshot_path, &backup_path)?;
+    cleanup_snapshot_sidecars(&snapshot_path);
 
     Ok(())
 }
@@ -600,7 +601,9 @@ pub fn finalize_export_db(snapshot_path: &Path) -> Result<FinalizeResult, ShareE
     })
 }
 
-fn rewrite_snapshot_storage(snapshot_path: &Path) -> Result<(), ShareError> {
+fn prepare_rebuilt_snapshot_storage(
+    snapshot_path: &Path,
+) -> Result<(tempfile::TempDir, std::path::PathBuf, std::path::PathBuf), ShareError> {
     let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
     let parent = snapshot_path
         .parent()
@@ -618,7 +621,37 @@ fn rewrite_snapshot_storage(snapshot_path: &Path) -> Result<(), ShareError> {
     )?;
 
     let backup_path = temp_dir.path().join("mailbox.backup.sqlite3");
+    Ok((temp_dir, rebuilt_path, backup_path))
+}
+
+fn rewrite_snapshot_storage(snapshot_path: &Path) -> Result<(), ShareError> {
+    let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
+    let (_temp_dir, rebuilt_path, backup_path) = prepare_rebuilt_snapshot_storage(&snapshot_path)?;
     replace_snapshot_with_rebuilt_path(&rebuilt_path, &snapshot_path, &backup_path)?;
+    cleanup_snapshot_sidecars(&snapshot_path);
+    Ok(())
+}
+
+fn apply_export_finalize_pragmas(snapshot_path: &Path) -> Result<(), ShareError> {
+    #[cfg(test)]
+    if FAIL_FINALIZE_SNAPSHOT_STAGE_BEFORE_PUBLISH.swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(ShareError::Sqlite {
+            message: "forced finalize failure before publish".to_string(),
+        });
+    }
+
+    let conn = open_conn(snapshot_path)?;
+    conn.execute_raw("PRAGMA journal_mode='DELETE'")
+        .map_err(sql_err)?;
+    conn.execute_raw("PRAGMA analysis_limit=400")
+        .map_err(sql_err)?;
+    conn.execute_raw("ANALYZE").map_err(sql_err)?;
+    conn.execute_raw("PRAGMA optimize").map_err(sql_err)?;
+    Ok(())
+}
+
+fn cleanup_snapshot_sidecars(snapshot_path: &Path) {
     for suffix in SQLITE_SNAPSHOT_SIDECAR_SUFFIXES {
         let mut sidecar_os = snapshot_path.as_os_str().to_os_string();
         sidecar_os.push(suffix);
@@ -627,7 +660,6 @@ fn rewrite_snapshot_storage(snapshot_path: &Path) -> Result<(), ShareError> {
             let _ = std::fs::remove_file(sidecar_path);
         }
     }
-    Ok(())
 }
 
 fn replace_snapshot_with_rebuilt_path(
@@ -1102,6 +1134,37 @@ mod tests {
         assert!(
             after < before,
             "expected VACUUM to shrink DB (before={before}, after={after})"
+        );
+    }
+
+    #[test]
+    fn finalize_snapshot_for_export_keeps_original_when_stage_finalize_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        let original_bytes = std::fs::read(&db).unwrap();
+
+        FAIL_FINALIZE_SNAPSHOT_STAGE_BEFORE_PUBLISH
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = finalize_snapshot_for_export(&db)
+            .expect_err("forced staged finalize failure should abort before publish");
+
+        assert!(
+            err.to_string()
+                .contains("forced finalize failure before publish"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            original_bytes,
+            "late finalize failure should leave the original snapshot bytes untouched"
+        );
+
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        let rows = conn.query_sync("PRAGMA page_size", &[]).unwrap();
+        let page_size: i64 = rows[0].get_named("page_size").unwrap();
+        assert_ne!(
+            page_size, 1024,
+            "failed staged finalize should not publish the rebuilt export-sized snapshot"
         );
     }
 
