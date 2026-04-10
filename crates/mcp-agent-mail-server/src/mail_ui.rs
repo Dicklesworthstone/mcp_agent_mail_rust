@@ -2853,7 +2853,7 @@ fn render_message(
         return Err((404, "Message not found".to_string()));
     }
     let current_message_id = m.id.unwrap_or(0);
-    let sender = block_on_outcome(cx, queries::get_agent_by_id(cx, pool, m.sender_id))
+    let sender = block_on_outcome(cx, queries::get_agent_by_id_fresh(cx, pool, m.sender_id))
         .map(|agent| agent.name)
         .unwrap_or_else(|_| format!("[unknown-agent-{}]", m.sender_id));
     let recipients = block_on_outcome(
@@ -3537,7 +3537,7 @@ fn render_file_reservations(
 
     let mut reservations = Vec::with_capacity(rows.len());
     for r in &rows {
-        let agent = block_on_outcome(cx, queries::get_agent_by_id(cx, pool, r.agent_id))
+        let agent = block_on_outcome(cx, queries::get_agent_by_id_fresh(cx, pool, r.agent_id))
             .map_or_else(|_| format!("agent#{}", r.agent_id), |a| a.name);
         reservations.push(ReservationView {
             id: r.id.unwrap_or(0),
@@ -3664,18 +3664,18 @@ fn render_attachments(
 ) -> Result<Option<String>, (u16, String)> {
     let p = block_on_outcome(cx, queries::get_project_by_slug(cx, pool, project_slug))?;
     let pid = p.id.unwrap_or(0);
-    let conn = match block_on(pool.acquire(cx)) {
-        Outcome::Ok(conn) => conn,
-        Outcome::Err(err) => {
+    let conn = match spin_block_on(pool.acquire(cx)) {
+        asupersync::Outcome::Ok(conn) => conn,
+        asupersync::Outcome::Err(err) => {
             return Err((500, format!("Failed to open attachments view connection: {err}")));
         }
-        Outcome::Cancelled(reason) => {
+        asupersync::Outcome::Cancelled(reason) => {
             return Err((
                 500,
                 format!("Attachments view connection acquisition cancelled: {reason}"),
             ));
         }
-        Outcome::Panicked(payload) => {
+        asupersync::Outcome::Panicked(payload) => {
             return Err((
                 500,
                 format!(
