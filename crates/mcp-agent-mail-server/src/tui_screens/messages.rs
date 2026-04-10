@@ -1244,12 +1244,20 @@ impl MessageBrowserScreen {
         let Some(conn) = &self.db_conn else {
             return Err("Database connection unavailable".to_string());
         };
-        let sql = "SELECT a.name AS name \
-             FROM agents a \
-             JOIN projects p ON p.id = a.project_id \
-             WHERE p.slug = ? \
-             ORDER BY a.name";
-        let params = vec![Value::Text(project_slug.to_string())];
+        let (sql, params) = if let Some(project_id) = synthetic_project_id(project_slug) {
+            (
+                "SELECT name FROM agents WHERE project_id = ? ORDER BY name",
+                vec![Value::BigInt(project_id)],
+            )
+        } else {
+            (
+                "SELECT a.name AS name \
+                 FROM agents a \
+                 WHERE a.project_id = (SELECT id FROM projects WHERE slug = ? LIMIT 1) \
+                 ORDER BY a.name",
+                vec![Value::Text(project_slug.to_string())],
+            )
+        };
         conn.query_sync(sql, &params)
             .map_err(|err| format!("Failed to load agents for compose: {err}"))
             .map(|rows| {
@@ -1425,14 +1433,17 @@ impl MessageBrowserScreen {
         state: Option<&TuiSharedState>,
     ) -> Result<(), String> {
         let conn = Self::open_live_mutation_db_connection(state)?;
-        let project_sql = "SELECT id FROM projects WHERE slug = ? LIMIT 1";
-        let project_id = conn
-            .query_sync(project_sql, &[Value::Text(project_slug.to_string())])
-            .map_err(|e| format!("Failed to resolve project: {e}"))?
-            .into_iter()
-            .next()
-            .and_then(|row| row.get_named::<i64>("id").ok())
-            .ok_or_else(|| format!("Project not found: {project_slug}"))?;
+        let project_id = if let Some(project_id) = synthetic_project_id(project_slug) {
+            project_id
+        } else {
+            let project_sql = "SELECT id FROM projects WHERE slug = ? LIMIT 1";
+            conn.query_sync(project_sql, &[Value::Text(project_slug.to_string())])
+                .map_err(|e| format!("Failed to resolve project: {e}"))?
+                .into_iter()
+                .next()
+                .and_then(|row| row.get_named::<i64>("id").ok())
+                .ok_or_else(|| format!("Project not found: {project_slug}"))?
+        };
 
         let existing_sender = conn
             .query_sync(
@@ -4090,6 +4101,12 @@ fn unknown_project_label(project_id: i64) -> String {
     format!("[unknown-project-{project_id}]")
 }
 
+fn synthetic_project_id(project_slug: &str) -> Option<i64> {
+    let rest = project_slug.strip_prefix("[unknown-project-")?;
+    let project_id = rest.strip_suffix(']')?;
+    project_id.parse::<i64>().ok().filter(|id| *id > 0)
+}
+
 fn recipient_names_from_json(raw: &str) -> String {
     let parsed = serde_json::from_str::<StoredRecipients>(raw).unwrap_or_default();
     let mut seen = std::collections::BTreeSet::new();
@@ -6078,6 +6095,58 @@ first body
         );
     }
 
+    #[test]
+    fn ensure_compose_sender_accepts_placeholder_project_identifier() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("compose-placeholder.db");
+        let storage_root = dir.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                Value::BigInt(77),
+                Value::Text("proj".to_string()),
+                Value::Text("/proj".to_string()),
+                Value::BigInt(0),
+            ],
+        )
+        .expect("insert project");
+        conn.execute_raw("DELETE FROM projects WHERE id = 77")
+            .expect("delete project row");
+        drop(conn);
+
+        let state = TuiSharedState::new(&mcp_agent_mail_core::Config {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root,
+            ..Default::default()
+        });
+        let screen = MessageBrowserScreen::new();
+
+        screen
+            .ensure_compose_sender("[unknown-project-77]", Some(&state))
+            .expect("ensure compose sender");
+
+        let live_conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("reopen db");
+        let sender_count = live_conn
+            .query_sync(
+                "SELECT COUNT(*) AS c FROM agents WHERE project_id = ? AND name = ?",
+                &[
+                    Value::BigInt(77),
+                    Value::Text(COMPOSE_SENDER_NAME.to_string()),
+                ],
+            )
+            .expect("count compose sender")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .unwrap_or_default();
+        assert_eq!(sender_count, 1, "compose sender should be created");
+    }
+
     fn ctrl_key(code: KeyCode) -> Event {
         Event::Key(ftui::KeyEvent {
             code,
@@ -7561,6 +7630,51 @@ first body
             .load_agent_names_for_project("proj")
             .expect_err("expected missing-connection error");
         assert_eq!(err, "Database connection unavailable");
+    }
+
+    #[test]
+    fn load_agent_names_for_placeholder_project_keeps_orphaned_agents_visible() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("messages-screen.db");
+        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init schema");
+        conn.execute_sync(
+            "INSERT INTO projects (id, slug, human_key, created_at) VALUES (?, ?, ?, ?)",
+            &[
+                Value::BigInt(77),
+                Value::Text("proj".to_string()),
+                Value::Text("/proj".to_string()),
+                Value::BigInt(0),
+            ],
+        )
+        .expect("insert project");
+        conn.execute_sync(
+            "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(77),
+                Value::Text("BlueLake".to_string()),
+                Value::Text("test".to_string()),
+                Value::Text("test".to_string()),
+                Value::Text(String::new()),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::Text("auto".to_string()),
+                Value::Text("auto".to_string()),
+            ],
+        )
+        .expect("insert agent");
+        conn.execute_raw("DELETE FROM projects WHERE id = 77")
+            .expect("delete project row");
+
+        let mut screen = MessageBrowserScreen::new();
+        screen.db_conn = Some(conn);
+
+        let agents = screen
+            .load_agent_names_for_project("[unknown-project-77]")
+            .expect("load agents");
+        assert_eq!(agents, vec!["BlueLake".to_string()]);
     }
 
     #[test]

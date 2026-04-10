@@ -11776,6 +11776,24 @@ fn handle_project_discovery_init(project_path: &Path, product: Option<String>) -
     Ok(())
 }
 
+fn load_project_alias_doc_for_update(path: &Path) -> CliResult<serde_json::Value> {
+    if !path.exists() {
+        return Ok(serde_json::json!({}));
+    }
+
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| CliError::Other(format!("read {} failed: {e}", path.display())))?;
+    let doc = serde_json::from_str::<serde_json::Value>(&text)
+        .map_err(|e| CliError::Other(format!("parse {} failed: {e}", path.display())))?;
+    if !doc.is_object() {
+        return Err(CliError::Other(format!(
+            "{} must contain a JSON object",
+            path.display()
+        )));
+    }
+    Ok(doc)
+}
+
 #[allow(clippy::too_many_lines)]
 fn handle_projects_adopt_with_conn(
     conn: &mcp_agent_mail_db::DbConn,
@@ -11847,6 +11865,25 @@ fn handle_projects_adopt_with_conn(
     if effective_dry_run {
         return Ok(());
     }
+
+    let aliases_path = target_archive.join("aliases.json");
+    let mut alias_doc = load_project_alias_doc_for_update(&aliases_path)?;
+    let mut former_slugs: std::collections::BTreeSet<String> = alias_doc
+        .get("former_slugs")
+        .and_then(|value| value.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|value| value.as_str().map(ToString::to_string))
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    former_slugs.insert(source_project.slug.clone());
+    alias_doc["former_slugs"] = serde_json::Value::Array(
+        former_slugs
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect(),
+    );
 
     let duplicate_agent_rows = conn
         .query_sync(
@@ -11923,32 +11960,6 @@ fn handle_projects_adopt_with_conn(
         &[sqlmodel_core::Value::BigInt(source_project.id)],
     )
     .map_err(|e| CliError::Other(format!("cleanup source product links failed: {e}")))?;
-
-    let aliases_path = target_archive.join("aliases.json");
-    let mut alias_doc = if aliases_path.exists() {
-        match std::fs::read_to_string(&aliases_path) {
-            Ok(text) => serde_json::from_str::<serde_json::Value>(&text).unwrap_or_default(),
-            Err(_) => serde_json::json!({}),
-        }
-    } else {
-        serde_json::json!({})
-    };
-    let mut former_slugs: std::collections::BTreeSet<String> = alias_doc
-        .get("former_slugs")
-        .and_then(|value| value.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|value| value.as_str().map(ToString::to_string))
-                .collect::<std::collections::BTreeSet<_>>()
-        })
-        .unwrap_or_default();
-    former_slugs.insert(source_project.slug.clone());
-    alias_doc["former_slugs"] = serde_json::Value::Array(
-        former_slugs
-            .into_iter()
-            .map(serde_json::Value::String)
-            .collect(),
-    );
     std::fs::write(
         &aliases_path,
         format!(
@@ -18209,38 +18220,87 @@ fn handle_mail(action: MailCommand) -> CliResult<()> {
     }
 }
 
+fn archive_mail_status_counts(storage_root: &Path, slug: &str) -> Option<(i64, i64)> {
+    let project_path = storage_root.join("projects").join(slug);
+    if !path_is_real_directory(&project_path) {
+        return None;
+    }
+
+    let mut message_ids = std::collections::HashSet::new();
+    let mut duplicate_message_ids = std::collections::HashSet::new();
+    let message_count = scan_doctor_project_messages(
+        &project_path.join("messages"),
+        &mut message_ids,
+        &mut duplicate_message_ids,
+    )
+    .messages as i64;
+
+    let mut agent_count = 0_i64;
+    let agents_dir = project_path.join("agents");
+    if path_is_real_directory(&agents_dir)
+        && let Ok(entries) = std::fs::read_dir(&agents_dir)
+    {
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() || file_type.is_symlink() {
+                continue;
+            }
+            if path_is_real_file(&entry.path().join("profile.json")) {
+                agent_count += 1;
+            }
+        }
+    }
+
+    Some((message_count, agent_count))
+}
+
 fn handle_mail_status_sync(conn: &mcp_agent_mail_db::DbConn, action: MailCommand) -> CliResult<()> {
     let MailCommand::Status { project_path } = action else {
         unreachable!()
     };
-    let identity = resolve_project_identity(project_path.to_string_lossy().as_ref());
-    let slug = &identity.slug;
+    let project_path_text = project_path.to_string_lossy().into_owned();
+    let identity = resolve_project_identity(&project_path_text);
+    let config = Config::from_env();
 
-    let rows = conn
-        .query_sync(
-            "SELECT COUNT(*) AS cnt FROM messages m \
-             JOIN projects p ON p.id = m.project_id \
-             WHERE p.slug = ?",
-            &[sqlmodel_core::Value::Text(slug.to_string())],
-        )
-        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-    let total: i64 = rows
-        .first()
-        .and_then(|r| r.get_named("cnt").ok())
-        .unwrap_or(0);
+    let resolved_project = match crate::context::resolve_project(conn, &project_path_text) {
+        Ok(project) => Some(project),
+        Err(CliError::InvalidArgument(_)) => None,
+        Err(err) => return Err(err),
+    };
 
-    let rows = conn
-        .query_sync(
-            "SELECT COUNT(*) AS cnt FROM agents a \
-             JOIN projects p ON p.id = a.project_id \
-             WHERE p.slug = ?",
-            &[sqlmodel_core::Value::Text(slug.to_string())],
-        )
-        .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
-    let agents: i64 = rows
-        .first()
-        .and_then(|r| r.get_named("cnt").ok())
-        .unwrap_or(0);
+    let (slug, total, agents) = if let Some(project) = resolved_project {
+        let total_rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM messages WHERE project_id = ?",
+                &[sqlmodel_core::Value::BigInt(project.id)],
+            )
+            .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+        let total = total_rows
+            .first()
+            .and_then(|r| r.get_named("cnt").ok())
+            .unwrap_or(0);
+
+        let agent_rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM agents WHERE project_id = ?",
+                &[sqlmodel_core::Value::BigInt(project.id)],
+            )
+            .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
+        let agents = agent_rows
+            .first()
+            .and_then(|r| r.get_named("cnt").ok())
+            .unwrap_or(0);
+
+        (project.slug, total, agents)
+    } else if let Some((total, agents)) =
+        archive_mail_status_counts(&config.storage_root, &identity.slug)
+    {
+        (identity.slug.clone(), total, agents)
+    } else {
+        (identity.slug.clone(), 0, 0)
+    };
 
     output::section(&format!("Project: {slug}"));
     output::kv("Messages", &total.to_string());
@@ -19996,8 +20056,7 @@ fn product_inbox_row_to_json(
     r: &mcp_agent_mail_db::queries::InboxRow,
     include_body: bool,
 ) -> serde_json::Value {
-    let attachments: Vec<serde_json::Value> =
-        serde_json::from_str(&r.message.attachments).unwrap_or_default();
+    let attachments = parse_product_inbox_attachments_json(&r.message.attachments);
     let mut v = serde_json::json!({
         "id": r.message.id.unwrap_or(0),
         "project_id": r.message.project_id,
@@ -20018,6 +20077,19 @@ fn product_inbox_row_to_json(
         );
     }
     v
+}
+
+fn parse_product_inbox_attachments_json(attachments_json: &str) -> Vec<serde_json::Value> {
+    match serde_json::from_str::<Vec<serde_json::Value>>(attachments_json) {
+        Ok(attachments) => attachments,
+        Err(_) if attachments_json.trim().is_empty() => Vec::new(),
+        Err(_) => vec![serde_json::json!({
+            "name": "[malformed-attachments-json]",
+            "media_type": serde_json::Value::Null,
+            "path": serde_json::Value::Null,
+            "bytes": serde_json::Value::Null,
+        })],
+    }
 }
 
 fn truncate_str(s: &str, max: usize) -> String {
@@ -20385,6 +20457,42 @@ mod mail_server_cli_bridge_tests {
         assert_eq!(
             json.get("body_md").and_then(serde_json::Value::as_str),
             Some("Body")
+        );
+    }
+
+    #[test]
+    fn product_inbox_row_to_json_preserves_malformed_attachment_signal() {
+        let row = mcp_agent_mail_db::queries::InboxRow {
+            message: mcp_agent_mail_db::MessageRow {
+                id: Some(43),
+                project_id: 7,
+                sender_id: 11,
+                thread_id: Some("br-43".to_string()),
+                subject: "Broken attachments".to_string(),
+                body_md: "Body".to_string(),
+                importance: "high".to_string(),
+                ack_required: 0,
+                created_ts: 1_742_208_000_000_000,
+                recipients_json: "{\"to\":[\"WindyGate\"]}".to_string(),
+                attachments: "{not-json}".to_string(),
+            },
+            kind: "message".to_string(),
+            sender_name: "BlueLake".to_string(),
+            read_ts: None,
+            ack_ts: None,
+        };
+
+        let json = product_inbox_row_to_json(&row, false);
+        let attachments = json
+            .get("attachments")
+            .and_then(serde_json::Value::as_array)
+            .expect("attachments array");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(
+            attachments[0]
+                .get("name")
+                .and_then(serde_json::Value::as_str),
+            Some("[malformed-attachments-json]")
         );
     }
 
@@ -24114,7 +24222,10 @@ http_headers = { Authorization = "Bearer secret" }
         std::fs::write(temp.path().join("manifest.json"), "{}\n").expect("write manifest");
 
         let status = collect_preview_status(temp.path());
-        assert_eq!(status.files_indexed, 2, "manual token must not count as a file");
+        assert_eq!(
+            status.files_indexed, 2,
+            "manual token must not count as a file"
+        );
     }
 
     #[test]
@@ -33449,6 +33560,72 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn integration_mail_status_uses_archive_counts_when_project_metadata_is_missing() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("orphaned.sqlite3");
+        let project_path = "/ahead-project";
+        let conn = seed_mail_status_db(&db_path, project_path);
+        conn.execute_raw("DELETE FROM projects WHERE id = 1")
+            .expect("delete project row");
+
+        let storage_root = dir.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let storage_root_text = storage_root.to_string_lossy().into_owned();
+        let message_dir = seed_archive_mailbox_project(&storage_root);
+        write_archive_mailbox_message(
+            &message_dir,
+            "msg-0001.md",
+            1,
+            "Alice",
+            "Archive message one",
+            "normal",
+            "2026-03-22T00:00:00Z",
+            "first archive message",
+        );
+        write_archive_mailbox_message(
+            &message_dir,
+            "msg-0002.md",
+            2,
+            "Alice",
+            "Archive message two",
+            "urgent",
+            "2026-03-22T00:05:00Z",
+            "second archive message",
+        );
+
+        let capture = ftui_runtime::StdioCapture::install().expect("install stdio capture");
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", storage_root_text.as_str())],
+            || {
+                handle_mail_status_sync(
+                    &conn,
+                    MailCommand::Status {
+                        project_path: PathBuf::from(project_path),
+                    },
+                )
+            },
+        );
+        let output = capture.drain_to_string();
+
+        assert!(result.is_ok(), "mail status failed: {result:?}");
+        assert!(
+            output.contains("Project: ahead-project"),
+            "expected archive project slug in output, got: {output}"
+        );
+        assert!(
+            output.contains("Messages") && output.contains("2"),
+            "expected archive message count in output, got: {output}"
+        );
+        assert!(
+            output.contains("Agents") && output.contains("1"),
+            "expected archive agent count in output, got: {output}"
+        );
+    }
+
+    #[test]
     fn integration_projects_mark_identity_writes_marker_file() {
         let _guard = stdio_capture_lock()
             .lock()
@@ -33726,6 +33903,94 @@ startup_timeout_sec = 42
         assert!(
             aliases.contains("src-proj"),
             "aliases.json should contain former source slug"
+        );
+    }
+
+    #[test]
+    fn integration_projects_adopt_apply_rejects_malformed_aliases_before_mutation() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let source_human_key = repo_root.join("src-worktree");
+        let target_human_key = repo_root.join("dst-worktree");
+        std::fs::create_dir_all(&source_human_key).unwrap();
+        std::fs::create_dir_all(&target_human_key).unwrap();
+
+        let git_init = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&repo_root)
+            .status()
+            .unwrap();
+        assert!(git_init.success(), "git init should succeed");
+
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_projects_adopt_db(&db_path, &source_human_key, &target_human_key);
+
+        let storage_root = dir.path().join("archive-root");
+        let source_archive = storage_root
+            .join("projects")
+            .join("src-proj")
+            .join("messages");
+        std::fs::create_dir_all(&source_archive).unwrap();
+        std::fs::write(source_archive.join("m1.md"), "# message").unwrap();
+
+        let target_archive = storage_root.join("projects").join("dst-proj");
+        std::fs::create_dir_all(&target_archive).unwrap();
+        let aliases_path = target_archive.join("aliases.json");
+        std::fs::write(&aliases_path, "{not-json}").unwrap();
+
+        let cfg = Config {
+            storage_root: storage_root.clone(),
+            ..Config::default()
+        };
+
+        let result =
+            handle_projects_adopt_with_conn(&conn, &cfg, "src-proj", "dst-proj", true, true);
+        let err = result.expect_err("malformed aliases.json should fail closed");
+        match err {
+            CliError::Other(detail) => {
+                assert!(detail.contains("parse"));
+                assert!(detail.contains("aliases.json"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+
+        let src_agent_count: i64 = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM agents WHERE project_id = 1",
+                &[],
+            )
+            .unwrap()
+            .first()
+            .and_then(|r| r.get_named("cnt").ok())
+            .unwrap_or(0);
+        let dst_agent_count: i64 = conn
+            .query_sync(
+                "SELECT COUNT(*) AS cnt FROM agents WHERE project_id = 2",
+                &[],
+            )
+            .unwrap()
+            .first()
+            .and_then(|r| r.get_named("cnt").ok())
+            .unwrap_or(0);
+        assert_eq!(src_agent_count, 1, "source agents must remain in place");
+        assert_eq!(dst_agent_count, 1, "target agents must remain unchanged");
+
+        assert!(
+            source_archive.join("m1.md").exists(),
+            "source archive file must remain in place"
+        );
+        assert!(
+            !target_archive.join("messages").join("m1.md").exists(),
+            "target archive must remain untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&aliases_path).unwrap(),
+            "{not-json}",
+            "malformed aliases.json must not be rewritten"
         );
     }
 
@@ -38691,9 +38956,16 @@ startup_timeout_sec = 42
         conn.execute_raw("PRAGMA foreign_keys = OFF")
             .expect("disable foreign keys for fixture");
         conn.execute_raw(
+            "INSERT INTO agents
+             (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+             VALUES
+                (1, 777, 'OrphanSender', 'codex-cli', 'gpt-5', 'sender', 0, 0, 'auto', 'auto')",
+        )
+        .expect("insert orphan-project sender");
+        conn.execute_raw(
             "INSERT INTO messages
              (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments)
-             VALUES (1, 777, NULL, 'THREAD-PRESERVE-PROJECT', 'preserve project drift', 'body', 'normal', 0, 100, '[]')",
+             VALUES (1, 777, 1, 'THREAD-PRESERVE-PROJECT', 'preserve project drift', 'body', 'normal', 0, 100, '[]')",
         )
         .expect("insert orphan-project message");
         drop(conn);
