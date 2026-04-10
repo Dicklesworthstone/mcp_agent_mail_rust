@@ -624,6 +624,7 @@ fn prepare_rebuilt_snapshot_storage(
     Ok((temp_dir, rebuilt_path, backup_path))
 }
 
+#[cfg(test)]
 fn rewrite_snapshot_storage(snapshot_path: &Path) -> Result<(), ShareError> {
     let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
     let (_temp_dir, rebuilt_path, backup_path) = prepare_rebuilt_snapshot_storage(&snapshot_path)?;

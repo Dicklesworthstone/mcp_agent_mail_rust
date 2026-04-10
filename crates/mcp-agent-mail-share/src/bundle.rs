@@ -863,6 +863,7 @@ fn publish_staged_bundle_outputs(
     staged_output_dir: &Path,
     output_dir: &Path,
 ) -> std::io::Result<()> {
+    let output_dir_existed = output_dir.exists();
     ensure_output_directory(output_dir)?;
     let mut backup_output = create_bundle_backup_stage(output_dir)?;
     let backup_output_dir = backup_output.path();
@@ -875,6 +876,12 @@ fn publish_staged_bundle_outputs(
             Err(error) => {
                 if let Err(rollback_error) =
                     restore_backup_bundle_outputs(backup_output_dir, output_dir, &backed_up_paths)
+                        .and_then(|()| {
+                            cleanup_created_bundle_output_dir_after_rollback(
+                                output_dir,
+                                output_dir_existed,
+                            )
+                        })
                 {
                     let backup_path = backup_output.persist();
                     return Err(std::io::Error::other(format!(
@@ -903,7 +910,10 @@ fn publish_staged_bundle_outputs(
                     backup_output_dir,
                     &published_paths,
                     &backed_up_paths,
-                ) {
+                )
+                .and_then(|()| {
+                    cleanup_created_bundle_output_dir_after_rollback(output_dir, output_dir_existed)
+                }) {
                     let backup_path = backup_output.persist();
                     return Err(std::io::Error::other(format!(
                         "failed to publish staged bundle output {relative_path}: {error}; \
@@ -918,6 +928,40 @@ fn publish_staged_bundle_outputs(
         }
     }
     Ok(())
+}
+
+fn cleanup_created_bundle_output_dir_after_rollback(
+    output_dir: &Path,
+    output_dir_existed: bool,
+) -> std::io::Result<()> {
+    if output_dir_existed {
+        return Ok(());
+    }
+
+    let mut entries = match std::fs::read_dir(output_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(std::io::Error::other(format!(
+                "failed to inspect newly created bundle output directory {} after rollback: {error}",
+                output_dir.display()
+            )));
+        }
+    };
+    if entries.next().transpose()?.is_some() {
+        return Err(std::io::Error::other(format!(
+            "rollback left unexpected files in newly created bundle output directory {}",
+            output_dir.display()
+        )));
+    }
+    match std::fs::remove_dir(output_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(std::io::Error::other(format!(
+            "failed to remove newly created bundle output directory {} after rollback: {error}",
+            output_dir.display()
+        ))),
+    }
 }
 
 fn owned_bundle_relative_paths() -> impl Iterator<Item = &'static str> {
@@ -3287,6 +3331,40 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(output.join("viewer/data/messages.json")).unwrap(),
             "[\"old viewer\"]"
+        );
+        assert_eq!(
+            std::fs::read_to_string(staged.join("viewer/data/messages.json")).unwrap(),
+            "[\"new viewer\"]"
+        );
+    }
+
+    #[test]
+    fn publish_staged_bundle_outputs_removes_fresh_bundle_dir_on_mid_publish_failure() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("bundle");
+
+        let staged = dir.path().join("staged");
+        std::fs::create_dir_all(staged.join("viewer/data")).unwrap();
+        std::fs::write(
+            staged.join("viewer/data/messages.json"),
+            b"[\"new viewer\"]",
+        )
+        .unwrap();
+        let outside = dir.path().join("outside-manifest.json");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, staged.join("manifest.json")).unwrap();
+
+        let err = publish_staged_bundle_outputs(&staged, &output).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("failed to publish staged bundle output manifest.json"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !output.exists(),
+            "failed first-time publish should not leave an empty bundle directory behind"
         );
         assert_eq!(
             std::fs::read_to_string(staged.join("viewer/data/messages.json")).unwrap(),

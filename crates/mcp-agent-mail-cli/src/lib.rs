@@ -10924,12 +10924,7 @@ fn clear_and_reset_everything(
     if storage_root.exists() {
         for entry in std::fs::read_dir(storage_root)? {
             let path = entry?.path();
-            let result = if path.is_dir() {
-                std::fs::remove_dir_all(&path)
-            } else {
-                std::fs::remove_file(&path)
-            };
-            match result {
+            match remove_storage_root_entry_for_reset(&path) {
                 Ok(()) => deleted_storage_entries.push(path),
                 Err(err) => {
                     ftui_runtime::ftui_eprintln!("Failed to remove {}: {err}", path.display());
@@ -10970,6 +10965,29 @@ fn clear_and_reset_everything(
         deleted_db_files,
         deleted_storage_entries,
     })
+}
+
+fn remove_storage_root_entry_for_reset(path: &Path) -> CliResult<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(CliError::Io(err)),
+    };
+
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() || file_type.is_file() {
+        std::fs::remove_file(path)?;
+        return Ok(());
+    }
+    if file_type.is_dir() {
+        std::fs::remove_dir_all(path)?;
+        return Ok(());
+    }
+
+    Err(CliError::Other(format!(
+        "unsupported storage-root entry type during reset: {}",
+        path.display()
+    )))
 }
 
 const BENCH_DEFAULT_REGRESSION_THRESHOLD: f64 = 0.10;
@@ -26231,6 +26249,219 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn archive_restore_state_handles_database_embedded_in_storage_root() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+
+        let source_storage = root.path().join("source-storage");
+        let source_db = root.path().join("source.sqlite3");
+        seed_storage_root(&source_storage);
+        seed_mailbox_db(&source_db);
+
+        let archive_path = archive_save_state(
+            &source_db,
+            &source_storage,
+            vec!["proj-alpha".to_string()],
+            "archive".to_string(),
+            Some("embedded-restore".to_string()),
+        )
+        .expect("archive save");
+
+        let restore_storage = root.path().join("restore-root");
+        let restore_db = restore_storage.join("storage.sqlite3");
+        std::fs::create_dir_all(&restore_storage).unwrap();
+        std::fs::write(&restore_db, b"old-embedded-db").unwrap();
+        std::fs::write(restore_storage.join("old.txt"), b"old-storage").unwrap();
+        std::fs::create_dir_all(restore_storage.join(".git")).unwrap();
+        std::fs::write(restore_storage.join(".git/HEAD"), b"old-head\n").unwrap();
+
+        archive_restore_state(archive_path, &restore_db, &restore_storage, true, false)
+            .expect("restore into embedded sqlite layout");
+
+        assert!(
+            find_backup_entry(root.path(), "storage.sqlite3.backup-").is_none(),
+            "embedded restore should not create a redundant standalone sqlite backup outside the storage backup"
+        );
+
+        let storage_backup = find_backup_entry(root.path(), "restore-root.backup-")
+            .expect("storage root backup created");
+        assert!(storage_backup.is_dir());
+        assert_eq!(
+            std::fs::read(storage_backup.join("storage.sqlite3")).unwrap(),
+            b"old-embedded-db",
+            "storage backup should preserve the original embedded sqlite file"
+        );
+        assert_eq!(
+            std::fs::read(storage_backup.join("old.txt")).unwrap(),
+            b"old-storage",
+            "storage backup should preserve the original storage contents"
+        );
+
+        let restored_conn =
+            mcp_agent_mail_db::DbConn::open_file(restore_db.display().to_string()).unwrap();
+        let rows = restored_conn
+            .query_sync("SELECT slug FROM projects ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let slug: String = rows[0].get_named("slug").unwrap();
+        assert_eq!(slug, "proj-alpha");
+        assert_eq!(
+            std::fs::read(restore_storage.join("nested/dir/file.txt")).unwrap(),
+            b"hello\n"
+        );
+        assert_eq!(
+            std::fs::read(restore_storage.join(".git/HEAD")).unwrap(),
+            b"0123456789abcdef\n"
+        );
+    }
+
+    #[test]
+    fn archive_restore_state_embedded_layout_missing_target_creates_no_backup() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+
+        let source_storage = root.path().join("source-storage");
+        let source_db = root.path().join("source.sqlite3");
+        seed_storage_root(&source_storage);
+        seed_mailbox_db(&source_db);
+
+        let archive_path = archive_save_state(
+            &source_db,
+            &source_storage,
+            vec!["proj-alpha".to_string()],
+            "archive".to_string(),
+            Some("embedded-missing-target".to_string()),
+        )
+        .expect("archive save");
+
+        let restore_storage = root.path().join("missing-restore-root");
+        let restore_db = restore_storage.join("storage.sqlite3");
+        assert!(
+            !restore_storage.exists(),
+            "test requires a missing restore root"
+        );
+
+        archive_restore_state(archive_path, &restore_db, &restore_storage, true, false)
+            .expect("restore into previously missing embedded sqlite layout");
+
+        assert!(
+            find_backup_entry(root.path(), "missing-restore-root.backup-").is_none(),
+            "embedded restore into a missing target should not create a backup of a directory that did not exist"
+        );
+        assert!(
+            restore_storage.is_dir(),
+            "restore should materialize the storage root"
+        );
+        assert!(
+            restore_db.is_file(),
+            "restore should materialize the embedded sqlite file"
+        );
+
+        let restored_conn =
+            mcp_agent_mail_db::DbConn::open_file(restore_db.display().to_string()).unwrap();
+        let rows = restored_conn
+            .query_sync("SELECT slug FROM projects ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let slug: String = rows[0].get_named("slug").unwrap();
+        assert_eq!(slug, "proj-alpha");
+    }
+
+    #[test]
+    fn archive_restore_state_embedded_layout_ignores_storage_payload_sqlite_artifacts() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        use std::io::Write;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+
+        let snapshot_source = root.path().join("snapshot.sqlite3");
+        seed_mailbox_db(&snapshot_source);
+
+        let archive_storage = root.path().join("archive-storage");
+        let archive_db = archive_storage.join("storage.sqlite3");
+        let archive_path = root.path().join("embedded-old-style.zip");
+        let metadata = serde_json::json!({
+            "database": {
+                "source_path": archive_db.display().to_string(),
+            },
+            "storage": {
+                "source_path": archive_storage.display().to_string(),
+            }
+        });
+        {
+            let file = std::fs::File::create(&archive_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default();
+
+            zip.start_file(ARCHIVE_METADATA_FILENAME, options).unwrap();
+            zip.write_all(
+                serde_json::to_string_pretty(&metadata)
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
+
+            zip.start_file(ARCHIVE_SNAPSHOT_RELATIVE.replace('\\', "/"), options)
+                .unwrap();
+            let mut snapshot = std::fs::File::open(&snapshot_source).unwrap();
+            std::io::copy(&mut snapshot, &mut zip).unwrap();
+
+            zip.start_file("storage_repo/.git/HEAD", options).unwrap();
+            zip.write_all(b"0123456789abcdef\n").unwrap();
+            zip.start_file("storage_repo/nested/dir/file.txt", options)
+                .unwrap();
+            zip.write_all(b"hello\n").unwrap();
+            zip.start_file("storage_repo/storage.sqlite3", options).unwrap();
+            zip.write_all(b"stale-main-db").unwrap();
+            zip.start_file("storage_repo/storage.sqlite3-wal", options)
+                .unwrap();
+            zip.write_all(b"stale-wal").unwrap();
+            zip.start_file("storage_repo/storage.sqlite3-shm", options)
+                .unwrap();
+            zip.write_all(b"stale-shm").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let restore_storage = root.path().join("restore-root");
+        let restore_db = restore_storage.join("storage.sqlite3");
+        archive_restore_state(archive_path, &restore_db, &restore_storage, true, false)
+            .expect("restore should ignore embedded sqlite artifacts from storage payload");
+
+        let restored_conn =
+            mcp_agent_mail_db::DbConn::open_file(restore_db.display().to_string()).unwrap();
+        let rows = restored_conn
+            .query_sync("SELECT slug FROM projects ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 2, "snapshot contents should be restored");
+        assert!(
+            !restore_storage.join("storage.sqlite3-wal").exists(),
+            "restore should not preserve stale WAL files from the storage payload when the dedicated snapshot is authoritative"
+        );
+        assert!(
+            !restore_storage.join("storage.sqlite3-shm").exists(),
+            "restore should not preserve stale SHM files from the storage payload when the dedicated snapshot is authoritative"
+        );
+        assert_eq!(
+            std::fs::read(restore_storage.join("nested/dir/file.txt")).unwrap(),
+            b"hello\n"
+        );
+    }
+
+    #[test]
     fn archive_save_state_uses_absolute_candidate_for_malformed_relative_source_db() {
         let _lock = ARCHIVE_TEST_LOCK
             .lock()
@@ -26520,6 +26751,81 @@ http_headers = { Authorization = "Bearer secret" }
         assert_eq!(files, vec![PathBuf::from("nested/file.txt")]);
     }
 
+    #[test]
+    fn archive_save_state_excludes_embedded_live_sqlite_from_storage_payload() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        use std::io::Read;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+
+        let storage_root = root.path().join("storage_repo");
+        seed_storage_root(&storage_root);
+
+        let embedded_db = storage_root.join("storage.sqlite3");
+        seed_mailbox_db(&embedded_db);
+        std::fs::write(storage_root.join("storage.sqlite3-wal"), b"wal").unwrap();
+        std::fs::write(storage_root.join("storage.sqlite3-shm"), b"shm").unwrap();
+
+        let archive_path = archive_save_state(
+            &embedded_db,
+            &storage_root,
+            vec!["proj-alpha".to_string()],
+            "archive".to_string(),
+            Some("embedded-db".to_string()),
+        )
+        .expect("archive save should succeed");
+
+        let file = std::fs::File::open(&archive_path).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let mut names = Vec::new();
+        for i in 0..zip.len() {
+            names.push(zip.by_index(i).unwrap().name().to_string());
+        }
+
+        assert!(
+            names.iter().any(|name| name == ARCHIVE_SNAPSHOT_RELATIVE),
+            "archive should still contain the dedicated snapshot entry"
+        );
+        assert!(
+            names.iter().any(|name| name == "storage_repo/.git/HEAD"),
+            "archive should still contain regular storage repo files"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == "storage_repo/storage.sqlite3"),
+            "archive storage payload must not leak the live embedded sqlite file"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == "storage_repo/storage.sqlite3-wal"),
+            "archive storage payload must not leak embedded sqlite WAL sidecars"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == "storage_repo/storage.sqlite3-shm"),
+            "archive storage payload must not leak embedded sqlite SHM sidecars"
+        );
+
+        let mut meta_contents = String::new();
+        zip.by_name(ARCHIVE_METADATA_FILENAME)
+            .unwrap()
+            .read_to_string(&mut meta_contents)
+            .unwrap();
+        let meta: serde_json::Value = serde_json::from_str(&meta_contents).unwrap();
+        assert_eq!(
+            meta["database"]["source_path"].as_str(),
+            Some(embedded_db.to_string_lossy().as_ref()),
+            "archive metadata should still report the embedded sqlite source path"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Clear-and-reset-everything integration-ish tests
     // -----------------------------------------------------------------------
@@ -26725,6 +27031,65 @@ http_headers = { Authorization = "Bearer secret" }
         assert!(
             storage_root.join(".git/HEAD").exists(),
             "storage-root git metadata should remain untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clear_and_reset_removes_symlinked_storage_entries_without_touching_targets() {
+        use std::os::unix::fs::symlink;
+
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+
+        let storage_root = root.path().join("storage_repo");
+        seed_storage_root(&storage_root);
+
+        let outside_dir = root.path().join("outside");
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        std::fs::write(outside_dir.join("keep.txt"), b"keep").unwrap();
+        symlink(&outside_dir, storage_root.join("linked-outside")).unwrap();
+
+        let db_path = root.path().join("mailbox.sqlite3");
+        seed_mailbox_db(&db_path);
+        let database_files = vec![db_path.clone()];
+
+        clear_and_reset_everything(
+            true,
+            Some(false),
+            Some(&db_path),
+            &database_files,
+            &storage_root,
+        )
+        .expect("clear-and-reset should remove symlink entries safely");
+
+        assert!(!db_path.exists(), "database file should be removed");
+        assert!(
+            !storage_root.join("linked-outside").exists(),
+            "symlinked storage entry should be removed from the storage root"
+        );
+        assert!(
+            storage_root.exists(),
+            "storage root directory should remain"
+        );
+        assert_eq!(
+            std::fs::read_dir(&storage_root).unwrap().count(),
+            0,
+            "storage root should be empty after reset"
+        );
+        assert!(
+            outside_dir.exists(),
+            "removing the symlinked storage entry must not remove the outside target directory"
+        );
+        assert_eq!(
+            std::fs::read(outside_dir.join("keep.txt")).unwrap(),
+            b"keep",
+            "outside target contents must remain untouched"
         );
     }
 
@@ -41768,17 +42133,38 @@ fn share_update_publish_generated_outputs(staged_root: &Path, bundle_root: &Path
             Ok(true) => published_paths.push(owned_path.relative_path),
             Ok(false) => {}
             Err(error) => {
-                if let Err(rollback_error) = share_update_rollback_published_outputs(
+                let cleanup_error =
+                    share_update_remove_output_if_exists(bundle_root, owned_path.relative_path)
+                        .err();
+                let rollback_error = share_update_rollback_published_outputs(
                     bundle_root,
                     backup_root.path(),
                     &published_paths,
                     &backed_up_paths,
-                ) {
+                )
+                .err();
+                if let Some(rollback_error) = rollback_error {
                     let backup_path = backup_root.keep();
+                    let cleanup_suffix = cleanup_error
+                        .as_ref()
+                        .map(|cleanup_error| {
+                            format!(
+                                "; cleanup of partially published output {} also failed: {cleanup_error}",
+                                owned_path.relative_path
+                            )
+                        })
+                        .unwrap_or_default();
                     return Err(CliError::Other(format!(
-                        "failed to publish updated bundle output {}: {error}; rollback failed with backup preserved at {}: {rollback_error}",
+                        "failed to publish updated bundle output {}: {error}{}; rollback failed with backup preserved at {}: {rollback_error}",
                         owned_path.relative_path,
+                        cleanup_suffix,
                         backup_path.display()
+                    )));
+                }
+                if let Some(cleanup_error) = cleanup_error {
+                    return Err(CliError::Other(format!(
+                        "failed to publish updated bundle output {}: {error}; cleanup of partially published output {} also failed: {cleanup_error}",
+                        owned_path.relative_path, owned_path.relative_path
                     )));
                 }
                 return Err(CliError::Other(format!(
@@ -42467,6 +42853,21 @@ fn rollback_archive_restore(
     }
 }
 
+fn archive_restore_db_embedded_in_storage_root(database_path: &Path, storage_root: &Path) -> bool {
+    database_path.starts_with(storage_root)
+}
+
+fn archive_restore_snapshot_staging_parent<'a>(
+    database_path: &'a Path,
+    storage_root: &'a Path,
+) -> &'a Path {
+    if archive_restore_db_embedded_in_storage_root(database_path, storage_root) {
+        archive_restore_target_parent(storage_root)
+    } else {
+        archive_restore_target_parent(database_path)
+    }
+}
+
 fn archive_restore_target_parent(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -42474,7 +42875,7 @@ fn archive_restore_target_parent(path: &Path) -> &Path {
 }
 
 fn validate_archive_restore_targets(database_path: &Path, storage_root: &Path) -> CliResult<()> {
-    let database_parent = archive_restore_target_parent(database_path);
+    let database_parent = archive_restore_snapshot_staging_parent(database_path, storage_root);
     ensure_real_directory_tree(database_parent, "archive restore database parent")?;
     if database_path.exists() && !path_is_real_file(database_path) {
         return Err(CliError::Other(format!(
@@ -42496,8 +42897,9 @@ fn stage_archive_restore_snapshot(
     archive: &mut zip::ZipArchive<std::fs::File>,
     snapshot_entry_name: &str,
     database_path: &Path,
+    storage_root: &Path,
 ) -> CliResult<(tempfile::TempDir, PathBuf)> {
-    let database_parent = archive_restore_target_parent(database_path);
+    let database_parent = archive_restore_snapshot_staging_parent(database_path, storage_root);
     let staged_db_dir = tempfile::Builder::new()
         .prefix(".archive-restore-db.")
         .tempdir_in(database_parent)?;
@@ -42582,6 +42984,7 @@ fn archive_restore_snapshot_is_healthy(snapshot_path: &Path) -> CliResult<bool> 
 fn stage_archive_restore_storage_root(
     archive: &mut zip::ZipArchive<std::fs::File>,
     storage_root: &Path,
+    excluded_rel_paths: &std::collections::BTreeSet<PathBuf>,
 ) -> CliResult<(tempfile::TempDir, PathBuf)> {
     let storage_parent = archive_restore_target_parent(storage_root);
     let staged_storage_dir = tempfile::Builder::new()
@@ -42611,6 +43014,9 @@ fn stage_archive_restore_storage_root(
             Err(_) => continue,
         };
         if rel.as_os_str().is_empty() {
+            continue;
+        }
+        if excluded_rel_paths.contains(rel) {
             continue;
         }
 
@@ -42656,6 +43062,29 @@ fn cleanup_archive_restore_staged_snapshot_fts(snapshot_path: &Path) -> CliResul
     mcp_agent_mail_db::schema::enforce_runtime_fts_cleanup(&conn)
         .map_err(|e| CliError::Other(format!("staged archive snapshot FTS cleanup failed: {e}")))?;
     Ok(true)
+}
+
+fn archive_restore_storage_excluded_relative_paths(
+    storage_root: &Path,
+    database_path: &Path,
+    archive_db_path: Option<&str>,
+    archive_storage_path: Option<&str>,
+) -> std::collections::BTreeSet<PathBuf> {
+    let mut excluded = archive_storage_excluded_relative_paths(storage_root, database_path);
+
+    let Some(archive_db_path) = archive_db_path else {
+        return excluded;
+    };
+    let Some(archive_storage_path) = archive_storage_path else {
+        return excluded;
+    };
+    let archive_db_path = Path::new(archive_db_path);
+    let archive_storage_path = Path::new(archive_storage_path);
+    let Ok(relative_db) = archive_db_path.strip_prefix(archive_storage_path) else {
+        return excluded;
+    };
+    extend_sqlite_artifact_relative_paths(&mut excluded, relative_db);
+    excluded
 }
 
 fn sort_json_keys(value: &serde_json::Value) -> serde_json::Value {
@@ -42816,7 +43245,12 @@ fn resolve_archive_path(candidate: &Path) -> CliResult<PathBuf> {
     )))
 }
 
-fn collect_files(base: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> CliResult<()> {
+fn collect_files_with_exclusions(
+    base: &Path,
+    dir: &Path,
+    excluded_rel_paths: &std::collections::BTreeSet<PathBuf>,
+    out: &mut Vec<PathBuf>,
+) -> CliResult<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -42824,15 +43258,53 @@ fn collect_files(base: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> CliResult<(
         if file_type.is_symlink() {
             continue;
         }
+        let rel = match path.strip_prefix(base) {
+            Ok(rel) => rel.to_path_buf(),
+            Err(_) => continue,
+        };
+        if excluded_rel_paths.contains(&rel) {
+            continue;
+        }
         if file_type.is_dir() {
-            collect_files(base, &path, out)?;
-        } else if file_type.is_file()
-            && let Ok(rel) = path.strip_prefix(base)
-        {
-            out.push(rel.to_path_buf());
+            collect_files_with_exclusions(base, &path, excluded_rel_paths, out)?;
+        } else if file_type.is_file() {
+            out.push(rel);
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn collect_files(base: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> CliResult<()> {
+    collect_files_with_exclusions(base, dir, &std::collections::BTreeSet::new(), out)
+}
+
+fn archive_storage_excluded_relative_paths(
+    storage_root: &Path,
+    database_path: &Path,
+) -> std::collections::BTreeSet<PathBuf> {
+    let mut excluded = std::collections::BTreeSet::new();
+    let Ok(relative_db) = database_path.strip_prefix(storage_root) else {
+        return excluded;
+    };
+    extend_sqlite_artifact_relative_paths(&mut excluded, relative_db);
+    excluded
+}
+
+fn extend_sqlite_artifact_relative_paths(
+    excluded_rel_paths: &mut std::collections::BTreeSet<PathBuf>,
+    relative_db: &Path,
+) {
+    if relative_db.as_os_str().is_empty() {
+        return;
+    }
+
+    excluded_rel_paths.insert(relative_db.to_path_buf());
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+        let mut sidecar_rel = relative_db.as_os_str().to_os_string();
+        sidecar_rel.push(suffix);
+        excluded_rel_paths.insert(PathBuf::from(sidecar_rel));
+    }
 }
 
 #[cfg(unix)]
@@ -43091,7 +43563,14 @@ fn archive_save_state_internal(
 
     // storage_repo/*
     let mut files = Vec::new();
-    collect_files(storage_root, storage_root, &mut files)?;
+    let excluded_storage_paths =
+        archive_storage_excluded_relative_paths(storage_root, source.reported_path());
+    collect_files_with_exclusions(
+        storage_root,
+        storage_root,
+        &excluded_storage_paths,
+        &mut files,
+    )?;
     files.sort();
     for rel in files {
         let full_path = storage_root.join(&rel);
@@ -43188,21 +43667,26 @@ fn archive_restore_state(
     // Planned operations (and safety backups)
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
     let mut planned_ops: Vec<String> = Vec::new();
-    if database_path.exists() {
+    let db_embedded_in_storage_root =
+        archive_restore_db_embedded_in_storage_root(&database_path, &storage_root);
+    if database_path.exists() && !db_embedded_in_storage_root {
         planned_ops.push(format!(
             "backup {} -> {}",
             database_path.display(),
             next_backup_path(&database_path, &timestamp).display()
         ));
     }
-    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
-        let sidecar_path = mcp_agent_mail_core::disk::sqlite_sidecar_path(&database_path, suffix);
-        if sidecar_path.exists() {
-            planned_ops.push(format!(
-                "backup {} -> {}",
-                sidecar_path.display(),
-                next_backup_path(&sidecar_path, &timestamp).display()
-            ));
+    if !db_embedded_in_storage_root {
+        for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+            let sidecar_path =
+                mcp_agent_mail_core::disk::sqlite_sidecar_path(&database_path, suffix);
+            if sidecar_path.exists() {
+                planned_ops.push(format!(
+                    "backup {} -> {}",
+                    sidecar_path.display(),
+                    next_backup_path(&sidecar_path, &timestamp).display()
+                ));
+            }
         }
     }
     if storage_root.exists() {
@@ -43270,60 +43754,92 @@ fn archive_restore_state(
         )));
     }
 
+    let database_existed = database_path.exists();
+    let storage_root_existed = storage_root.exists();
     validate_archive_restore_targets(&database_path, &storage_root)?;
-    let (_staged_db_dir, staged_db_path) =
-        stage_archive_restore_snapshot(&mut archive, snapshot_entry_name, &database_path)?;
+    let (_staged_db_dir, staged_db_path) = stage_archive_restore_snapshot(
+        &mut archive,
+        snapshot_entry_name,
+        &database_path,
+        &storage_root,
+    )?;
+    let storage_excluded_paths = archive_restore_storage_excluded_relative_paths(
+        &storage_root,
+        &database_path,
+        archive_db_path,
+        archive_storage_path,
+    );
     let (_staged_storage_dir, staged_storage_root) =
-        stage_archive_restore_storage_root(&mut archive, &storage_root)?;
+        stage_archive_restore_storage_root(&mut archive, &storage_root, &storage_excluded_paths)?;
 
     // Back up existing files/dirs, then restore. Roll back from the backups if
     // any step fails after mutation has started.
-    let database_existed = database_path.exists();
-    let storage_root_existed = storage_root.exists();
     let mut backup_entries: Vec<ArchiveRestoreBackupEntry> = Vec::new();
     let restore_result: CliResult<()> = (|| {
-        if database_existed {
-            let backup = next_backup_path(&database_path, &timestamp);
-            std::fs::rename(&database_path, &backup)?;
-            backup_entries.push(ArchiveRestoreBackupEntry {
-                original: database_path.clone(),
-                backup,
-            });
-        }
-        for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
-            let sidecar_path =
-                mcp_agent_mail_core::disk::sqlite_sidecar_path(&database_path, suffix);
-            if sidecar_path.exists() {
-                let backup = next_backup_path(&sidecar_path, &timestamp);
-                std::fs::rename(&sidecar_path, &backup)?;
+        if db_embedded_in_storage_root {
+            if storage_root_existed {
+                let backup = next_backup_path(&storage_root, &timestamp);
+                std::fs::rename(&storage_root, &backup)?;
                 backup_entries.push(ArchiveRestoreBackupEntry {
-                    original: sidecar_path,
+                    original: storage_root.clone(),
                     backup,
                 });
             }
-        }
-        if storage_root_existed {
-            let backup = next_backup_path(&storage_root, &timestamp);
-            std::fs::rename(&storage_root, &backup)?;
-            backup_entries.push(ArchiveRestoreBackupEntry {
-                original: storage_root.clone(),
-                backup,
-            });
-        }
+            std::fs::rename(&staged_storage_root, &storage_root)?;
+            if let Some(parent) = database_path.parent() {
+                ensure_real_directory_tree(parent, "archive restore database parent")?;
+            }
+            std::fs::rename(&staged_db_path, &database_path)?;
+        } else {
+            if database_existed {
+                let backup = next_backup_path(&database_path, &timestamp);
+                std::fs::rename(&database_path, &backup)?;
+                backup_entries.push(ArchiveRestoreBackupEntry {
+                    original: database_path.clone(),
+                    backup,
+                });
+            }
+            for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+                let sidecar_path =
+                    mcp_agent_mail_core::disk::sqlite_sidecar_path(&database_path, suffix);
+                if sidecar_path.exists() {
+                    let backup = next_backup_path(&sidecar_path, &timestamp);
+                    std::fs::rename(&sidecar_path, &backup)?;
+                    backup_entries.push(ArchiveRestoreBackupEntry {
+                        original: sidecar_path,
+                        backup,
+                    });
+                }
+            }
+            if storage_root_existed {
+                let backup = next_backup_path(&storage_root, &timestamp);
+                std::fs::rename(&storage_root, &backup)?;
+                backup_entries.push(ArchiveRestoreBackupEntry {
+                    original: storage_root.clone(),
+                    backup,
+                });
+            }
 
-        std::fs::rename(&staged_db_path, &database_path)?;
-        std::fs::rename(&staged_storage_root, &storage_root)?;
+            std::fs::rename(&staged_db_path, &database_path)?;
+            std::fs::rename(&staged_storage_root, &storage_root)?;
+        }
 
         Ok(())
     })();
 
     if let Err(error) = restore_result {
         let mut cleanup_targets = Vec::new();
-        if !database_existed {
-            cleanup_targets.push(database_path.clone());
-        }
-        if !storage_root_existed {
-            cleanup_targets.push(storage_root.clone());
+        if db_embedded_in_storage_root {
+            if !storage_root_existed {
+                cleanup_targets.push(storage_root.clone());
+            }
+        } else {
+            if !database_existed {
+                cleanup_targets.push(database_path.clone());
+            }
+            if !storage_root_existed {
+                cleanup_targets.push(storage_root.clone());
+            }
         }
 
         return match rollback_archive_restore(&backup_entries, &cleanup_targets) {
@@ -49500,6 +50016,47 @@ fn share_update_publish_generated_outputs_restores_bundle_on_mid_publish_failure
         std::fs::read_to_string(bundle.join("README.md")).expect("read restored readme"),
         "old readme\n",
         "rollback should restore files that were backed up before the publish failure"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn share_update_publish_generated_outputs_removes_partial_current_output_on_failure() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let staged = temp.path().join("staged");
+    let bundle = temp.path().join("bundle");
+    let outside = temp.path().join("outside-viewer");
+    let staged_viewer = staged.join("viewer");
+    std::fs::create_dir_all(&staged_viewer).expect("create staged viewer dir");
+    std::fs::create_dir_all(&bundle).expect("create bundle dir");
+    std::fs::create_dir_all(&outside).expect("create outside dir");
+    std::fs::write(staged.join("manifest.json"), "{\"fresh\":true}\n")
+        .expect("write staged manifest");
+    symlink(&outside, staged_viewer.join("leak")).expect("symlink staged viewer child");
+
+    let err = share_update_publish_generated_outputs(&staged, &bundle)
+        .expect_err("partial viewer publish failure should abort and clean up");
+    assert!(
+        format!("{err}").contains("viewer"),
+        "error should identify the failing path: {err}"
+    );
+    assert!(
+        !bundle.join("manifest.json").exists(),
+        "rollback should remove previously published files when a later path fails"
+    );
+    assert!(
+        !bundle.join("viewer").exists(),
+        "rollback should remove the partially created current output path"
+    );
+    assert!(
+        bundle
+            .read_dir()
+            .expect("read bundle root")
+            .next()
+            .is_none(),
+        "failed publish should leave the existing bundle root unchanged"
     );
 }
 
