@@ -1244,20 +1244,23 @@ impl MessageBrowserScreen {
         let Some(conn) = &self.db_conn else {
             return Err("Database connection unavailable".to_string());
         };
-        let (sql, params) = if let Some(project_id) = synthetic_project_id(project_slug) {
-            (
-                "SELECT name FROM agents WHERE project_id = ? ORDER BY name",
-                vec![Value::BigInt(project_id)],
-            )
-        } else {
-            (
-                "SELECT a.name AS name \
+        let (sql, params) = synthetic_project_id(project_slug).map_or_else(
+            || {
+                (
+                    "SELECT a.name AS name \
                  FROM agents a \
                  WHERE a.project_id = (SELECT id FROM projects WHERE slug = ? LIMIT 1) \
                  ORDER BY a.name",
-                vec![Value::Text(project_slug.to_string())],
-            )
-        };
+                    vec![Value::Text(project_slug.to_string())],
+                )
+            },
+            |project_id| {
+                (
+                    "SELECT name FROM agents WHERE project_id = ? ORDER BY name",
+                    vec![Value::BigInt(project_id)],
+                )
+            },
+        );
         conn.query_sync(sql, &params)
             .map_err(|err| format!("Failed to load agents for compose: {err}"))
             .map(|rows| {
