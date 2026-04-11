@@ -586,73 +586,116 @@ pub fn export_bundle_from_snapshot_context(
     storage_root: &Path,
     config: &BundleExportConfig,
 ) -> ShareResult<BundleExportResult> {
+    let output_dir_existed = output_dir.exists();
     ensure_output_directory(output_dir)?;
-    let mut staged_output = create_bundle_output_stage(output_dir)?;
+    let mut staged_output = match create_bundle_output_stage(output_dir) {
+        Ok(staged_output) => staged_output,
+        Err(error) => {
+            cleanup_bundle_output_dir_after_failed_assembly(output_dir, output_dir_existed)
+                .map_err(|cleanup_error| {
+                    ShareError::Io(std::io::Error::other(format!(
+                        "failed to create staged bundle output next to {}: {error}; \
+                         removing newly created bundle directory also failed: {cleanup_error}",
+                        output_dir.display()
+                    )))
+                })?;
+            return Err(ShareError::Io(std::io::Error::other(format!(
+                "failed to create staged bundle output next to {}: {error}",
+                output_dir.display()
+            ))));
+        }
+    };
     let staged_output_dir = staged_output.path();
-    let detach_attachment_threshold = crate::adjust_detach_threshold(
-        config.inline_attachment_threshold,
-        config.detach_attachment_threshold,
-    );
+    let export_result = (|| -> ShareResult<BundleExportResult> {
+        let detach_attachment_threshold = crate::adjust_detach_threshold(
+            config.inline_attachment_threshold,
+            config.detach_attachment_threshold,
+        );
 
-    let attachment_manifest = bundle_attachments(
-        &context.snapshot_path,
-        staged_output_dir,
-        storage_root,
-        config.inline_attachment_threshold,
-        detach_attachment_threshold,
-        config.allow_absolute_attachment_paths,
-    )?;
+        let attachment_manifest = bundle_attachments(
+            &context.snapshot_path,
+            staged_output_dir,
+            storage_root,
+            config.inline_attachment_threshold,
+            detach_attachment_threshold,
+            config.allow_absolute_attachment_paths,
+        )?;
 
-    let viewer_assets = copy_viewer_assets(staged_output_dir)?;
+        let viewer_assets = copy_viewer_assets(staged_output_dir)?;
 
-    let db_dest = staged_output_dir.join("mailbox.sqlite3");
-    copy_file_into_output(staged_output_dir, "mailbox.sqlite3", &context.snapshot_path)?;
-    let db_bytes = std::fs::read(&db_dest)?;
-    let db_sha256 = hex::encode(Sha256::digest(&db_bytes));
-    let db_size_bytes = db_bytes.len() as u64;
+        let db_dest = staged_output_dir.join("mailbox.sqlite3");
+        copy_file_into_output(staged_output_dir, "mailbox.sqlite3", &context.snapshot_path)?;
+        let db_bytes = std::fs::read(&db_dest)?;
+        let db_sha256 = hex::encode(Sha256::digest(&db_bytes));
+        let db_size_bytes = db_bytes.len() as u64;
 
-    let chunk_manifest = maybe_chunk_database(
-        &db_dest,
-        staged_output_dir,
-        config.chunk_threshold,
-        config.chunk_size,
-    )?;
+        let chunk_manifest = maybe_chunk_database(
+            &db_dest,
+            staged_output_dir,
+            config.chunk_threshold,
+            config.chunk_size,
+        )?;
 
-    let viewer_data = export_viewer_data(
-        &context.snapshot_path,
-        staged_output_dir,
-        context.fts_enabled,
-        &crate::ExportRedactionPolicy::from_preset(config.scrub_preset),
-    )?;
-    let static_render = crate::render_static_site(
-        &context.snapshot_path,
-        staged_output_dir,
-        &crate::StaticRenderConfig {
-            redaction: crate::ExportRedactionPolicy::from_preset(config.scrub_preset),
-            ..crate::StaticRenderConfig::default()
-        },
-    )?;
+        let viewer_data = export_viewer_data(
+            &context.snapshot_path,
+            staged_output_dir,
+            context.fts_enabled,
+            &crate::ExportRedactionPolicy::from_preset(config.scrub_preset),
+        )?;
+        let static_render = crate::render_static_site(
+            &context.snapshot_path,
+            staged_output_dir,
+            &crate::StaticRenderConfig {
+                redaction: crate::ExportRedactionPolicy::from_preset(config.scrub_preset),
+                ..crate::StaticRenderConfig::default()
+            },
+        )?;
 
-    let viewer_sri = compute_viewer_sri(staged_output_dir);
-    let hosting_hints =
-        hosting::detect_hosting_hints(config.hosting_hints_root.as_deref().unwrap_or(output_dir));
+        let viewer_sri = compute_viewer_sri(staged_output_dir);
+        let hosting_hints = hosting::detect_hosting_hints(
+            config.hosting_hints_root.as_deref().unwrap_or(output_dir),
+        );
 
-    write_bundle_scaffolding(
-        staged_output_dir,
-        &context.scope,
-        &context.scrub_summary,
-        &attachment_manifest,
-        chunk_manifest.as_ref(),
-        config.chunk_threshold,
-        config.chunk_size,
-        &hosting_hints,
-        context.fts_enabled,
-        "mailbox.sqlite3",
-        &db_sha256,
-        db_size_bytes,
-        Some(&viewer_data),
-        &viewer_sri,
-    )?;
+        write_bundle_scaffolding(
+            staged_output_dir,
+            &context.scope,
+            &context.scrub_summary,
+            &attachment_manifest,
+            chunk_manifest.as_ref(),
+            config.chunk_threshold,
+            config.chunk_size,
+            &hosting_hints,
+            context.fts_enabled,
+            "mailbox.sqlite3",
+            &db_sha256,
+            db_size_bytes,
+            Some(&viewer_data),
+            &viewer_sri,
+        )?;
+
+        Ok(BundleExportResult {
+            attachment_manifest,
+            chunk_manifest,
+            viewer_assets,
+            viewer_data,
+            static_render,
+            db_sha256,
+            db_size_bytes,
+        })
+    })();
+
+    let export_result = match export_result {
+        Ok(export_result) => export_result,
+        Err(error) => {
+            cleanup_bundle_output_dir_after_failed_assembly(output_dir, output_dir_existed)
+                .map_err(|cleanup_error| {
+                    ShareError::Io(std::io::Error::other(format!(
+                        "{error}; removing newly created bundle directory also failed: {cleanup_error}"
+                    )))
+                })?;
+            return Err(error);
+        }
+    };
 
     if let Err(error) = publish_staged_bundle_outputs(staged_output_dir, output_dir) {
         let stage_path = staged_output.persist();
@@ -662,15 +705,7 @@ pub fn export_bundle_from_snapshot_context(
         ))));
     }
 
-    Ok(BundleExportResult {
-        attachment_manifest,
-        chunk_manifest,
-        viewer_assets,
-        viewer_data,
-        static_render,
-        db_sha256,
-        db_size_bytes,
-    })
+    Ok(export_result)
 }
 
 /// Create a deterministic ZIP archive of a directory.
@@ -962,6 +997,13 @@ fn cleanup_created_bundle_output_dir_after_rollback(
             output_dir.display()
         ))),
     }
+}
+
+fn cleanup_bundle_output_dir_after_failed_assembly(
+    output_dir: &Path,
+    output_dir_existed: bool,
+) -> std::io::Result<()> {
+    cleanup_created_bundle_output_dir_after_rollback(output_dir, output_dir_existed)
 }
 
 fn owned_bundle_relative_paths() -> impl Iterator<Item = &'static str> {
@@ -3290,6 +3332,53 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(output.join("viewer/data/messages.json")).unwrap(),
             "[\"old viewer\"]"
+        );
+    }
+
+    #[test]
+    fn export_bundle_from_snapshot_context_removes_fresh_bundle_dir_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let escaped_attachment = dir.path().join("escaped.txt");
+        std::fs::write(&escaped_attachment, b"should not be bundled").unwrap();
+        let db = create_bundle_test_db(
+            dir.path(),
+            &[r#"[{"path":"../escaped.txt","media_type":"text/plain"}]"#],
+        );
+        let storage = dir.path().join("storage");
+        std::fs::create_dir_all(&storage).unwrap();
+
+        let output = dir.path().join("bundle");
+        let context = crate::snapshot::SnapshotContext {
+            snapshot_path: db,
+            scope: ProjectScopeResult {
+                identifiers: vec!["proj".to_string()],
+                projects: vec![crate::scope::ProjectRecord {
+                    id: 1,
+                    slug: "proj".to_string(),
+                    human_key: "/test".to_string(),
+                }],
+                removed_count: 0,
+                remaining: test_remaining_counts(),
+            },
+            scrub_summary: test_scrub_summary(),
+            fts_enabled: false,
+        };
+
+        let err = export_bundle_from_snapshot_context(
+            &context,
+            &output,
+            &storage,
+            &BundleExportConfig::default(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("attachment path escapes storage root"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !output.exists(),
+            "failed first-time bundle export should not leave a fresh empty output directory behind"
         );
     }
 

@@ -1041,6 +1041,8 @@ fn scan_archive_message_id(file_path: &Path) -> DbResult<Option<i64>> {
 #[allow(clippy::too_many_lines)]
 pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult<ReconstructStats> {
     let mut stats = ReconstructStats::default();
+    crate::pool::validate_sqlite_target_path(db_path, "reconstruct sqlite target")
+        .map_err(|error| DbError::Sqlite(format!("reconstruct: {error}")))?;
     if !is_real_directory(storage_root) {
         stats.warnings.push(format!(
             "Storage root {} is missing or not a real directory",
@@ -1248,6 +1250,8 @@ pub fn reconstruct_from_archive_with_salvage(
 }
 
 fn probe_salvage_database_for_merge(path: &Path) -> DbResult<()> {
+    crate::pool::validate_sqlite_target_path(path, "reconstruct salvage source")
+        .map_err(|error| DbError::Sqlite(format!("reconstruct salvage: {error}")))?;
     let conn = DbConn::open_file(path.to_string_lossy().as_ref()).map_err(|e| {
         DbError::Sqlite(format!(
             "reconstruct salvage: cannot open candidate {}: {e}",
@@ -4859,6 +4863,48 @@ body
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn reconstruct_rejects_symlinked_destination_path() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_db = tmp.path().join("real.db");
+        let linked_db = tmp.path().join("linked.db");
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects")).unwrap();
+        symlink(&real_db, &linked_db).unwrap();
+
+        let err = reconstruct_from_archive(&linked_db, &storage_root)
+            .expect_err("symlinked reconstruct destinations must be rejected");
+        assert!(
+            err.to_string().contains("symlinked path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconstruct_rejects_symlinked_destination_parent() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_parent = tmp.path().join("real-parent");
+        let linked_parent = tmp.path().join("linked-parent");
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(&real_parent).unwrap();
+        std::fs::create_dir_all(storage_root.join("projects")).unwrap();
+        symlink(&real_parent, &linked_parent).unwrap();
+        let db_path = linked_parent.join("test.db");
+
+        let err = reconstruct_from_archive(&db_path, &storage_root)
+            .expect_err("symlinked reconstruct destination parents must be rejected");
+        assert!(
+            err.to_string().contains("symlinked path"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn reconstruct_uses_project_metadata_human_key() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -4983,6 +5029,44 @@ body
             1_i64,
             "salvage database should promote project created_at"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconstruct_with_salvage_skips_symlinked_salvage_parent() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let storage_root = tmp.path().join("storage");
+        let real_parent = tmp.path().join("real-salvage");
+        let linked_parent = tmp.path().join("linked-salvage");
+        std::fs::create_dir_all(storage_root.join("projects")).unwrap();
+        std::fs::create_dir_all(&real_parent).unwrap();
+        symlink(&real_parent, &linked_parent).unwrap();
+
+        let real_salvage_db_path = real_parent.join("salvage.db");
+        let salvage_db_path = linked_parent.join("salvage.db");
+        let salvage_conn = SqliteDbConn::open_file(real_salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw("CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL)")
+            .unwrap();
+        drop(salvage_conn);
+
+        let stats =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect(
+                    "symlinked salvage parents should be skipped without failing reconstruction",
+                );
+        assert!(
+            stats
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("symlinked path")),
+            "expected symlink warning, got {:?}",
+            stats.warnings
+        );
+        assert_eq!(stats.salvaged_projects, 0);
     }
 
     #[test]

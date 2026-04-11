@@ -5507,7 +5507,7 @@ fn os_str_ends_with(value: &OsStr, suffix: &OsStr) -> bool {
 }
 
 fn sqlite_backup_candidates(path: &Path) -> Vec<PathBuf> {
-    let mut candidates: Vec<(u8, std::time::SystemTime, PathBuf)> = Vec::new();
+    let mut candidates: Vec<(std::time::SystemTime, bool, u8, PathBuf)> = Vec::new();
     let Some(file_name) = path.file_name() else {
         return Vec::new();
     };
@@ -5524,7 +5524,7 @@ fn sqlite_backup_candidates(path: &Path) -> Vec<PathBuf> {
             .metadata()
             .and_then(|meta| meta.modified())
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        candidates.push((0, modified, bak));
+        candidates.push((modified, true, 0, bak));
     }
 
     let backup_prefix = os_string_with_suffix(file_name, ".backup-");
@@ -5561,12 +5561,17 @@ fn sqlite_backup_candidates(path: &Path) -> Vec<PathBuf> {
                 .metadata()
                 .and_then(|meta| meta.modified())
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            candidates.push((priority, modified, candidate));
+            candidates.push((modified, false, priority, candidate));
         }
     }
 
-    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
-    candidates.into_iter().map(|(_, _, path)| path).collect()
+    candidates.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| b.3.cmp(&a.3))
+    });
+    candidates.into_iter().map(|(_, _, _, path)| path).collect()
 }
 
 fn find_healthy_sqlite_backup(path: &Path) -> Option<PathBuf> {
@@ -5591,6 +5596,7 @@ fn recover_sqlite_file_with_storage_root(
     if !path.exists() {
         return Ok(());
     }
+    validate_real_file_target_path(path, "recovery destination")?;
     if sqlite_file_is_healthy(path)? {
         reconcile_sqlite_file_with_archive(path, &storage_root)?;
         return Ok(());
@@ -9831,6 +9837,93 @@ fn sqlite_checkpoint_truncate(db_path: &Path) -> CliResult<()> {
     Ok(())
 }
 
+fn validate_real_existing_directory(path: &Path, label: &str) -> CliResult<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        use std::path::Component;
+
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(CliError::Other(format!(
+                    "refusing to traverse {label} with parent traversal: {}",
+                    path.display()
+                )));
+            }
+            Component::Normal(segment) => {
+                current.push(segment);
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) if metadata.file_type().is_dir() => {}
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(CliError::Other(format!(
+                            "{label} {} must not be a symlink",
+                            current.display()
+                        )));
+                    }
+                    Ok(_) => {
+                        return Err(CliError::Other(format!(
+                            "{label} {} exists but is not a directory",
+                            current.display()
+                        )));
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(CliError::Other(format!(
+                            "{label} {} does not exist or is not a directory",
+                            current.display()
+                        )));
+                    }
+                    Err(err) => return Err(CliError::Io(err)),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_real_file_target_path(path: &Path, label: &str) -> CliResult<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        validate_real_existing_directory(parent, &format!("{label} parent"))?;
+    }
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(CliError::Other(format!(
+            "{label} {} must not be a symlink",
+            path.display()
+        ))),
+        Ok(_) => Err(CliError::Other(format!(
+            "{label} {} exists but is not a file",
+            path.display()
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(CliError::Io(err)),
+    }
+}
+
+fn ensure_real_file_target_path(path: &Path, label: &str) -> CliResult<()> {
+    if let Some(parent) = path.parent() {
+        ensure_real_directory_tree(parent, &format!("{label} parent"))?;
+    }
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(CliError::Other(format!(
+            "{label} {} must not be a symlink",
+            path.display()
+        ))),
+        Ok(_) => Err(CliError::Other(format!(
+            "{label} {} exists but is not a file",
+            path.display()
+        ))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(CliError::Io(err)),
+    }
+}
+
 fn copy_sqlite_backup_consistently(source_db: &Path, backup_path: &Path) -> CliResult<()> {
     if !source_db.exists() {
         return Err(CliError::Other(format!(
@@ -9838,14 +9931,7 @@ fn copy_sqlite_backup_consistently(source_db: &Path, backup_path: &Path) -> CliR
             source_db.display()
         )));
     }
-    if std::fs::symlink_metadata(backup_path)
-        .is_ok_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(CliError::Other(format!(
-            "refusing to create backup through symlinked destination {}",
-            backup_path.display()
-        )));
-    }
+    ensure_real_file_target_path(backup_path, "backup destination")?;
     if backup_path.exists() {
         return Err(CliError::Other(format!(
             "refusing to overwrite existing backup {}",
@@ -9903,6 +9989,7 @@ fn restore_db_from_backup(db_path: &Path, backup_path: &Path) -> CliResult<()> {
             backup_path.display()
         )));
     }
+    ensure_real_file_target_path(db_path, "restore destination")?;
 
     let restore_ts = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
     let staged_restore =
@@ -9930,27 +10017,12 @@ fn restore_db_from_backup(db_path: &Path, backup_path: &Path) -> CliResult<()> {
     }
 
     if db_path.exists() {
-        let rollback_ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-        let rollback_backup = path_with_file_name_suffix(
-            db_path,
-            &format!(".pre_rollback.{rollback_ts}"),
-            &format!("storage.sqlite3.pre_rollback.{rollback_ts}"),
-        );
-        if std::fs::symlink_metadata(&rollback_backup)
-            .is_ok_and(|metadata| metadata.file_type().is_symlink())
-        {
+        let rollback_ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+        let rollback_backup =
+            next_sqlite_backup_artifact_path_with_timestamp(db_path, "pre_rollback", &rollback_ts);
+        if let Err(error) = ensure_real_file_target_path(&rollback_backup, "pre-rollback backup") {
             cleanup_doctor_temp_sqlite_artifact(&staged_restore);
-            return Err(CliError::Other(format!(
-                "refusing to create pre-rollback backup through symlinked destination {}",
-                rollback_backup.display()
-            )));
-        }
-        if rollback_backup.exists() {
-            cleanup_doctor_temp_sqlite_artifact(&staged_restore);
-            return Err(CliError::Other(format!(
-                "refusing to overwrite existing pre-rollback backup {}",
-                rollback_backup.display()
-            )));
+            return Err(error);
         }
         std::fs::copy(db_path, &rollback_backup).map_err(|e| {
             cleanup_doctor_temp_sqlite_artifact(&staged_restore);
@@ -10001,16 +10073,21 @@ fn restore_db_from_backup(db_path: &Path, backup_path: &Path) -> CliResult<()> {
 
 /// Create a timestamped backup of the database file.
 fn create_db_backup(db_path: &Path, backup_dir: Option<&Path>) -> CliResult<PathBuf> {
-    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    let backup_name = format!(
-        "{}.bak.{timestamp}",
-        db_path.file_name().unwrap_or_default().to_string_lossy()
-    );
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    create_db_backup_with_timestamp(db_path, backup_dir, &timestamp)
+}
 
+fn create_db_backup_with_timestamp(
+    db_path: &Path,
+    backup_dir: Option<&Path>,
+    timestamp: &str,
+) -> CliResult<PathBuf> {
     let backup_parent =
         backup_dir.unwrap_or_else(|| db_path.parent().unwrap_or_else(|| Path::new(".")));
 
-    let backup_path = backup_parent.join(&backup_name);
+    let backup_base_path = backup_parent.join(db_path.file_name().unwrap_or_default());
+    let backup_path =
+        next_sqlite_backup_artifact_path_with_timestamp(&backup_base_path, "bak", timestamp);
     copy_sqlite_backup_consistently(db_path, &backup_path)?;
     Ok(backup_path)
 }
@@ -11597,9 +11674,10 @@ fn run_native_wizard(args: ShareWizardArgs) -> CliResult<()> {
         }
     };
 
-    // Handle outcome
-    if !matches!(fmt, output::CliOutputFormat::Table) {
-        let json = share::format_json_output(&outcome, outcome.confirmed, None)
+    // In structured modes, emit the planning payload only when execution will
+    // not proceed. Successful executions should emit a single final payload.
+    if !matches!(fmt, output::CliOutputFormat::Table) && !outcome.confirmed {
+        let json = share::format_json_output(&outcome, None)
             .map_err(|e| CliError::Other(format!("wizard output encode failed: {e}")))?;
         let payload = serde_json::from_str::<serde_json::Value>(&json)
             .map_err(|e| CliError::Other(format!("wizard output encode failed: {e}")))?;
@@ -11630,7 +11708,9 @@ fn run_native_wizard(args: ShareWizardArgs) -> CliResult<()> {
         Ok(result) => result,
         Err(err) => {
             let output =
-                share::WizardJsonOutput::failure(err.clone(), outcome.inputs.bundle_path.clone());
+                share::WizardJsonOutput::failure(err.clone(), outcome.inputs.bundle_path.clone())
+                    .with_environment(outcome.environment.clone())
+                    .with_plan(outcome.plan.clone());
             output::emit_output(&output, fmt, || {
                 ftui_runtime::ftui_eprintln!("Execution error: {err}");
                 if let Some(ref hint) = err.hint {
@@ -11641,11 +11721,29 @@ fn run_native_wizard(args: ShareWizardArgs) -> CliResult<()> {
         }
     };
 
-    // Report success
-    let output = share::WizardJsonOutput::success(result);
+    let result_success = result.success;
+    let deployed_url = result.deployed_url.clone();
+    let failed_steps = result
+        .steps
+        .iter()
+        .filter(|step| !step.success)
+        .map(|step| (step.step_id.clone(), step.message.clone()))
+        .collect::<Vec<_>>();
+
+    // Report final outcome.
+    let output = share::WizardJsonOutput::success(result)
+        .with_environment(outcome.environment.clone())
+        .with_plan(outcome.plan.clone());
     output::emit_output(&output, fmt, || {
-        ftui_runtime::ftui_println!("\nDeployment complete.");
-        if let Some(ref url) = outcome.plan.expected_url {
+        if failed_steps.is_empty() {
+            ftui_runtime::ftui_println!("\nDeployment complete.");
+        } else {
+            ftui_runtime::ftui_eprintln!("\nDeployment completed with warnings.");
+            for (step_id, message) in &failed_steps {
+                ftui_runtime::ftui_eprintln!("  - {step_id}: {message}");
+            }
+        }
+        if let Some(ref url) = deployed_url {
             ftui_runtime::ftui_println!("Expected URL: {url}");
         }
         if !outcome.plan.warnings.is_empty() {
@@ -11656,7 +11754,11 @@ fn run_native_wizard(args: ShareWizardArgs) -> CliResult<()> {
         }
     });
 
-    Ok(())
+    if result_success {
+        Ok(())
+    } else {
+        Err(CliError::ExitCode(share::exit_codes::EXECUTION_ERROR))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -21810,6 +21912,25 @@ mod tests {
         extract_json_delimited(s, '{', '}')
     }
 
+    /// Extract all top-level JSON objects `{...}` from a string that may
+    /// contain non-JSON text between payloads.
+    fn extract_json_blocks(mut s: &str) -> Vec<&str> {
+        let mut blocks = Vec::new();
+        while let Some(start) = s.find('{') {
+            let candidate = &s[start..];
+            let Some(block) = extract_json_block(candidate) else {
+                break;
+            };
+            blocks.push(block);
+            let consumed = start + block.len();
+            if consumed >= s.len() {
+                break;
+            }
+            s = &s[consumed..];
+        }
+        blocks
+    }
+
     /// Extract the first top-level JSON array `[...]` from a string.
     fn extract_json_array(s: &str) -> Option<&str> {
         extract_json_delimited(s, '[', ']')
@@ -24749,9 +24870,120 @@ http_headers = { Authorization = "Bearer secret" }
         let parsed: serde_json::Value = serde_json::from_str(json_str)
             .unwrap_or_else(|_| panic!("Failed to parse JSON output: {json_str}"));
 
-        // Verify essential fields are present
-        assert!(parsed.get("success").is_some(), "missing 'success' field");
+        assert_eq!(parsed["success"], serde_json::Value::Bool(true));
         assert!(parsed.get("provider").is_some(), "missing 'provider' field");
+    }
+
+    #[test]
+    fn native_wizard_json_success_emits_single_final_payload() {
+        let _capture_lock = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let bundle_dir = temp.path().join("bundle");
+        std::fs::create_dir_all(&bundle_dir).expect("create bundle dir");
+        std::fs::write(bundle_dir.join("manifest.json"), "{}").expect("write manifest");
+
+        let args = ShareWizardArgs {
+            bundle: Some(bundle_dir.clone()),
+            provider: Some("custom".to_string()),
+            github_repo: None,
+            github_branch: "gh-pages".to_string(),
+            cloudflare_project: None,
+            netlify_site: None,
+            s3_bucket: None,
+            cloudfront_id: None,
+            base_url: None,
+            output: None,
+            yes: true,
+            dry_run: false,
+            non_interactive: true,
+            format: None,
+            json: true,
+        };
+
+        let result = run_native_wizard(args);
+        assert!(
+            result.is_ok(),
+            "wizard execution should succeed: {result:?}"
+        );
+
+        let output = capture.drain_to_string();
+        let json_blocks = extract_json_blocks(&output);
+        assert_eq!(
+            json_blocks.len(),
+            1,
+            "expected exactly one JSON payload, got output: {output}"
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(json_blocks[0])
+            .unwrap_or_else(|_| panic!("failed to parse wizard JSON output: {}", json_blocks[0]));
+        assert_eq!(parsed["success"], serde_json::Value::Bool(true));
+        assert_eq!(parsed["provider"], "custom");
+        assert!(parsed["environment"].is_object());
+        assert!(parsed["plan"].is_object());
+        assert_eq!(
+            parsed["result"]["steps"].as_array().map(std::vec::Vec::len),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn native_wizard_json_execution_failure_preserves_top_level_plan_context() {
+        let _capture_lock = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let bundle_dir = temp.path().join("bundle");
+        std::fs::create_dir_all(&bundle_dir).expect("create bundle dir");
+        std::fs::write(bundle_dir.join("manifest.json"), "{}").expect("write manifest");
+
+        let args = ShareWizardArgs {
+            bundle: Some(bundle_dir.clone()),
+            provider: Some("github".to_string()),
+            github_repo: Some("owner/repo".to_string()),
+            github_branch: "gh-pages".to_string(),
+            cloudflare_project: None,
+            netlify_site: None,
+            s3_bucket: None,
+            cloudfront_id: None,
+            base_url: None,
+            output: None,
+            yes: true,
+            dry_run: false,
+            non_interactive: true,
+            format: None,
+            json: true,
+        };
+
+        let result = run_native_wizard(args);
+        let expected_code = i32::from(share::WizardErrorCode::CommandFailed.code());
+        assert!(
+            matches!(result, Err(CliError::ExitCode(code)) if code == expected_code),
+            "expected command-failed exit code, got: {result:?}"
+        );
+
+        let output = capture.drain_to_string();
+        let json_blocks = extract_json_blocks(&output);
+        assert_eq!(
+            json_blocks.len(),
+            1,
+            "expected exactly one JSON payload, got output: {output}"
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(json_blocks[0])
+            .unwrap_or_else(|_| panic!("failed to parse wizard JSON output: {}", json_blocks[0]));
+        assert_eq!(parsed["success"], serde_json::Value::Bool(false));
+        assert_eq!(parsed["provider"], "github_pages");
+        assert_eq!(parsed["url"], "https://owner.github.io/repo");
+        assert_eq!(parsed["bundle_path"], bundle_dir.display().to_string());
+        assert_eq!(parsed["error_code"], "COMMAND_FAILED");
+        assert!(parsed["environment"].is_object());
+        assert!(parsed["plan"].is_object());
     }
 
     #[test]
@@ -25428,13 +25660,116 @@ http_headers = { Authorization = "Bearer secret" }
             .expect_err("symlinked backup destination should be rejected");
         let msg = err.to_string();
         assert!(
-            msg.contains("symlinked destination"),
+            msg.contains("backup destination") && msg.contains("must not be a symlink"),
             "unexpected error: {msg}"
         );
         assert_eq!(
             std::fs::read(&real_target).expect("read real target"),
             b"existing",
             "backup creation must not write through symlinked destinations"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_sqlite_backup_consistently_rejects_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        let real_parent = dir.path().join("real-backups");
+        let linked_parent = dir.path().join("linked-backups");
+        let backup_path = linked_parent.join("snapshot.sqlite3");
+
+        write_marker_db(&db_path, "snapshot");
+        std::fs::create_dir_all(&real_parent).expect("create real parent");
+        symlink(&real_parent, &linked_parent).expect("symlink parent");
+
+        let err = copy_sqlite_backup_consistently(&db_path, &backup_path)
+            .expect_err("symlinked backup parent should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("backup destination parent") && msg.contains("must not be a symlink"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            real_parent
+                .read_dir()
+                .expect("read real parent")
+                .next()
+                .is_none(),
+            "backup creation must not write through symlinked parent directories"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_db_from_backup_rejects_symlinked_destination() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_target = dir.path().join("real.sqlite3");
+        let db_path = dir.path().join("linked.sqlite3");
+        let backup_path = dir.path().join("linked.sqlite3.bak.20260102_000000");
+        let backup_source_path = dir.path().join("linked-backup-source.sqlite3");
+
+        write_marker_db(&real_target, "live-db");
+        write_marker_db(&backup_source_path, "backup-db");
+        std::fs::copy(&backup_source_path, &backup_path).expect("seed backup db");
+        symlink(&real_target, &db_path).expect("symlink restore destination");
+
+        let err = restore_db_from_backup(&db_path, &backup_path)
+            .expect_err("symlinked restore destination should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("restore destination") && msg.contains("must not be a symlink"),
+            "unexpected error: {msg}"
+        );
+        assert_eq!(
+            read_marker_db(&real_target),
+            "live-db",
+            "restore must not mutate the target behind a symlinked destination path"
+        );
+        assert!(
+            std::fs::symlink_metadata(&db_path)
+                .expect("stat symlink")
+                .file_type()
+                .is_symlink(),
+            "symlinked restore destination should remain untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_db_from_backup_rejects_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backup_path = dir.path().join("restore-parent.bak.20260102_000000");
+        let backup_source_path = dir.path().join("restore-parent-source.sqlite3");
+        let real_parent = dir.path().join("real-parent");
+        let linked_parent = dir.path().join("linked-parent");
+        let db_path = linked_parent.join("storage.sqlite3");
+
+        write_marker_db(&backup_source_path, "backup-db");
+        std::fs::copy(&backup_source_path, &backup_path).expect("seed backup db");
+        std::fs::create_dir_all(&real_parent).expect("create real parent");
+        symlink(&real_parent, &linked_parent).expect("symlink parent");
+
+        let err = restore_db_from_backup(&db_path, &backup_path)
+            .expect_err("symlinked restore parent should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("restore destination parent") && msg.contains("must not be a symlink"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            real_parent
+                .read_dir()
+                .expect("read real parent")
+                .next()
+                .is_none(),
+            "restore must not create files through a symlinked parent directory"
         );
     }
 
@@ -25500,6 +25835,74 @@ http_headers = { Authorization = "Bearer secret" }
         );
 
         assert_eq!(read_marker_db(&backup), "snapshot");
+    }
+
+    #[test]
+    fn create_db_backup_uses_unique_path_when_timestamped_name_collides() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        let colliding_backup = dir.path().join("storage.sqlite3.bak.20260102_000000");
+
+        write_marker_db(&db_path, "snapshot");
+        std::fs::write(&colliding_backup, b"existing-backup").expect("seed colliding backup");
+
+        let backup = create_db_backup_with_timestamp(&db_path, Some(dir.path()), "20260102_000000")
+            .expect("create backup with colliding timestamp");
+
+        assert_eq!(
+            backup.file_name().and_then(|name| name.to_str()),
+            Some("storage.sqlite3.bak.20260102_000000-01"),
+            "colliding timestamp should select the next available backup path"
+        );
+        assert_eq!(read_marker_db(&backup), "snapshot");
+        assert_eq!(
+            std::fs::read(&colliding_backup).expect("read existing backup"),
+            b"existing-backup"
+        );
+    }
+
+    #[test]
+    fn next_sqlite_backup_artifact_path_skips_sidecar_only_collisions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base_path = dir.path().join("storage.sqlite3");
+        let first = next_sqlite_backup_artifact_path_with_timestamp(
+            &base_path,
+            "pre_rollback",
+            "20260102_000000",
+        );
+        let first_journal = sqlite_sidecar_path(&first, "-journal");
+        std::fs::write(&first_journal, b"stale-pre-rollback-journal")
+            .expect("write stale pre-rollback journal");
+
+        let second = next_sqlite_backup_artifact_path_with_timestamp(
+            &base_path,
+            "pre_rollback",
+            "20260102_000000",
+        );
+        assert_ne!(
+            second, first,
+            "stale sidecars on a would-be backup artifact must force a new backup path"
+        );
+        assert_eq!(
+            second.file_name().and_then(|name| name.to_str()),
+            Some("storage.sqlite3.pre_rollback.20260102_000000-01")
+        );
+    }
+
+    #[test]
+    fn next_timestamped_sqlite_backup_path_in_dir_uses_unique_suffix_before_extension() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = dir.path().join("pre_repair_20260102_000000.sqlite3");
+        std::fs::write(&first, b"existing-pre-repair-backup")
+            .expect("seed colliding repair backup");
+
+        let second =
+            next_timestamped_sqlite_backup_path_in_dir(dir.path(), "pre_repair", "20260102_000000");
+        assert_eq!(
+            second.file_name().and_then(|name| name.to_str()),
+            Some("pre_repair_20260102_000000-01.sqlite3"),
+            "same-second repair backups should pick a unique suffixed filename"
+        );
     }
 
     #[test]
@@ -26382,50 +26785,64 @@ http_headers = { Authorization = "Bearer secret" }
         let _lock = ARCHIVE_TEST_LOCK
             .lock()
             .unwrap_or_else(|err| err.into_inner());
-        use std::io::Write;
+        use std::io::{Read, Write};
 
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
         let _cwd = CwdGuard::chdir(root.path());
 
-        let snapshot_source = root.path().join("snapshot.sqlite3");
-        seed_mailbox_db(&snapshot_source);
-
         let archive_storage = root.path().join("archive-storage");
+        let source_storage = root.path().join("source-storage");
+        seed_storage_root(&source_storage);
+        let source_db = root.path().join("source.sqlite3");
+        let source_db_str = source_db.display().to_string();
+        init_schema_sqlite_canonical(&source_db_str).expect("initialize canonical schema");
+        let conn = mcp_agent_mail_db::DbConn::open_file(&source_db_str).unwrap();
+        conn.execute_raw(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES ('proj-alpha', '/data/projects/alpha', 0)",
+        )
+        .unwrap();
+
+        let base_archive_path = archive_save_state(
+            &source_db,
+            &source_storage,
+            Vec::new(),
+            "archive".to_string(),
+            Some("embedded-old-style-base".to_string()),
+        )
+        .expect("base archive save");
+
         let archive_db = archive_storage.join("storage.sqlite3");
         let archive_path = root.path().join("embedded-old-style.zip");
-        let metadata = serde_json::json!({
-            "database": {
-                "source_path": archive_db.display().to_string(),
-            },
-            "storage": {
-                "source_path": archive_storage.display().to_string(),
-            }
-        });
         {
-            let file = std::fs::File::create(&archive_path).unwrap();
-            let mut zip = zip::ZipWriter::new(file);
+            let file = std::fs::File::open(&base_archive_path).unwrap();
+            let mut base_zip = zip::ZipArchive::new(file).unwrap();
+            let output = std::fs::File::create(&archive_path).unwrap();
+            let mut zip = zip::ZipWriter::new(output);
             let options = zip::write::SimpleFileOptions::default();
 
-            zip.start_file(ARCHIVE_METADATA_FILENAME, options).unwrap();
-            zip.write_all(
-                serde_json::to_string_pretty(&metadata)
-                    .unwrap()
-                    .as_bytes(),
-            )
-            .unwrap();
+            for i in 0..base_zip.len() {
+                let mut entry = base_zip.by_index(i).unwrap();
+                let name = entry.name().to_string();
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
 
-            zip.start_file(ARCHIVE_SNAPSHOT_RELATIVE.replace('\\', "/"), options)
-                .unwrap();
-            let mut snapshot = std::fs::File::open(&snapshot_source).unwrap();
-            std::io::copy(&mut snapshot, &mut zip).unwrap();
+                zip.start_file(name.clone(), options).unwrap();
+                if name == ARCHIVE_METADATA_FILENAME {
+                    let mut metadata: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    metadata["database"]["source_path"] =
+                        serde_json::Value::String(archive_db.display().to_string());
+                    metadata["storage"]["source_path"] =
+                        serde_json::Value::String(archive_storage.display().to_string());
+                    zip.write_all(serde_json::to_string_pretty(&metadata).unwrap().as_bytes())
+                        .unwrap();
+                } else {
+                    zip.write_all(&bytes).unwrap();
+                }
+            }
 
-            zip.start_file("storage_repo/.git/HEAD", options).unwrap();
-            zip.write_all(b"0123456789abcdef\n").unwrap();
-            zip.start_file("storage_repo/nested/dir/file.txt", options)
+            zip.start_file("storage_repo/storage.sqlite3", options)
                 .unwrap();
-            zip.write_all(b"hello\n").unwrap();
-            zip.start_file("storage_repo/storage.sqlite3", options).unwrap();
             zip.write_all(b"stale-main-db").unwrap();
             zip.start_file("storage_repo/storage.sqlite3-wal", options)
                 .unwrap();
@@ -26446,7 +26863,9 @@ http_headers = { Authorization = "Bearer secret" }
         let rows = restored_conn
             .query_sync("SELECT slug FROM projects ORDER BY id", &[])
             .unwrap();
-        assert_eq!(rows.len(), 2, "snapshot contents should be restored");
+        assert_eq!(rows.len(), 1, "snapshot contents should be restored");
+        let slug: String = rows[0].get_named("slug").unwrap();
+        assert_eq!(slug, "proj-alpha");
         assert!(
             !restore_storage.join("storage.sqlite3-wal").exists(),
             "restore should not preserve stale WAL files from the storage payload when the dedicated snapshot is authoritative"
@@ -29038,6 +29457,111 @@ startup_timeout_sec = 42
             }
             other => panic!("expected InvalidArgument, got: {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_reconstruct_rejects_symlinked_storage_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real_storage = tmp.path().join("real-storage");
+        let linked_storage = tmp.path().join("linked-storage");
+        std::fs::create_dir_all(real_storage.join("projects")).unwrap();
+        symlink(&real_storage, &linked_storage).unwrap();
+
+        let db_path = tmp.path().join("reconstructed.sqlite3");
+        let err = handle_doctor_reconstruct_with(
+            Some(&db_path),
+            Some(&linked_storage),
+            false,
+            true,
+            false,
+        )
+        .expect_err("symlinked storage root should be rejected");
+
+        match err {
+            CliError::Other(msg) => {
+                assert!(
+                    msg.contains("reconstruct storage root")
+                        && msg.contains("must not be a symlink"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Other, got: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_reconstruct_rejects_symlinked_destination() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let real_target = tmp.path().join("real.sqlite3");
+        let linked_target = tmp.path().join("linked.sqlite3");
+        std::fs::create_dir_all(storage_root.join("projects")).unwrap();
+        std::fs::write(&real_target, b"unchanged").unwrap();
+        symlink(&real_target, &linked_target).unwrap();
+
+        let err = handle_doctor_reconstruct_with(
+            Some(&linked_target),
+            Some(&storage_root),
+            false,
+            true,
+            false,
+        )
+        .expect_err("symlinked destination should be rejected");
+
+        match err {
+            CliError::Other(msg) => {
+                assert!(
+                    msg.contains("reconstruct destination")
+                        && msg.contains("must not be a symlink"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Other, got: {other:?}"),
+        }
+        assert_eq!(std::fs::read(&real_target).unwrap(), b"unchanged");
+        assert!(
+            std::fs::symlink_metadata(&linked_target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_reconstruct_rejects_symlinked_destination_parent() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tmp.path().join("storage");
+        let real_parent = tmp.path().join("real-parent");
+        let linked_parent = tmp.path().join("linked-parent");
+        std::fs::create_dir_all(storage_root.join("projects")).unwrap();
+        std::fs::create_dir_all(&real_parent).unwrap();
+        symlink(&real_parent, &linked_parent).unwrap();
+
+        let db_path = linked_parent.join("reconstructed.sqlite3");
+        let err =
+            handle_doctor_reconstruct_with(Some(&db_path), Some(&storage_root), false, true, false)
+                .expect_err("symlinked destination parent should be rejected");
+
+        match err {
+            CliError::Other(msg) => {
+                assert!(
+                    msg.contains("reconstruct destination parent")
+                        && msg.contains("must not be a symlink"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Other, got: {other:?}"),
+        }
+        assert!(!real_parent.join("reconstructed.sqlite3").exists());
     }
 
     #[test]
@@ -39798,6 +40322,20 @@ startup_timeout_sec = 42
         let _ = conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
         drop(conn);
 
+        let sibling_bak = PathBuf::from(format!("{}.bak", db_path.display()));
+        std::fs::copy(&db_path, &sibling_bak).expect("create stale sibling .bak");
+        let stale_conn = mcp_agent_mail_db::DbConn::open_file(sibling_bak.display().to_string())
+            .expect("open stale sibling .bak");
+        stale_conn
+            .execute_raw("DELETE FROM marker")
+            .expect("clear stale marker");
+        stale_conn
+            .execute_raw("INSERT INTO marker(value) VALUES('from-stale-bak')")
+            .expect("seed stale sibling marker");
+        let _ = stale_conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
+        drop(stale_conn);
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         let backup_path = db_path.with_file_name(format!(
             "{}.bak.20260303_000000",
             db_path.file_name().unwrap_or_default().to_string_lossy()
@@ -39818,7 +40356,7 @@ startup_timeout_sec = 42
         let marker: String = rows.first().unwrap().get_named("value").unwrap();
         assert_eq!(
             marker, "from-ts-backup",
-            "should restore from .bak.<timestamp>"
+            "should restore from the newer timestamped backup, not an older sibling .bak"
         );
     }
 
@@ -39902,6 +40440,75 @@ startup_timeout_sec = 42
         assert_eq!(
             std::fs::read(&db_path).expect("read original db"),
             b"THIS FILE IS CORRUPT"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recover_sqlite_file_rejects_symlinked_destination() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        let real_db = dir.path().join("real.sqlite3");
+        let linked_db = dir.path().join("linked.sqlite3");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        std::fs::write(&real_db, b"THIS FILE IS CORRUPT").expect("write corrupt db");
+        symlink(&real_db, &linked_db).expect("symlink destination");
+
+        let err = recover_sqlite_file_with_storage_root(&linked_db, Some(&storage_root))
+            .expect_err("symlinked recovery destination should be rejected");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("recovery destination") && err_text.contains("must not be a symlink"),
+            "unexpected error: {err_text}"
+        );
+        assert_eq!(
+            std::fs::read(&real_db).expect("read real db"),
+            b"THIS FILE IS CORRUPT"
+        );
+        assert!(
+            std::fs::symlink_metadata(&linked_db)
+                .expect("linked metadata")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recover_sqlite_file_rejects_symlinked_destination_parent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        let real_parent = dir.path().join("real-parent");
+        let linked_parent = dir.path().join("linked-parent");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        std::fs::create_dir_all(&real_parent).expect("create real parent");
+        symlink(&real_parent, &linked_parent).expect("symlink parent");
+
+        let linked_db = linked_parent.join("storage.sqlite3");
+        let real_db = real_parent.join("storage.sqlite3");
+        std::fs::write(&real_db, b"THIS FILE IS CORRUPT").expect("write corrupt db");
+
+        let err = recover_sqlite_file_with_storage_root(&linked_db, Some(&storage_root))
+            .expect_err("symlinked recovery parent should be rejected");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("recovery destination parent")
+                && err_text.contains("must not be a symlink"),
+            "unexpected error: {err_text}"
+        );
+        assert_eq!(
+            std::fs::read(&real_db).expect("read real db"),
+            b"THIS FILE IS CORRUPT"
+        );
+        assert!(
+            std::fs::symlink_metadata(&linked_parent)
+                .expect("linked metadata")
+                .file_type()
+                .is_symlink()
         );
     }
 
@@ -41532,48 +42139,7 @@ fn validate_share_signing_options(
 }
 
 fn validate_share_real_existing_directory(path: &Path, label: &str) -> CliResult<()> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        use std::path::Component;
-
-        match component {
-            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
-            Component::RootDir => current.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                return Err(CliError::Other(format!(
-                    "refusing to traverse {label} with parent traversal: {}",
-                    path.display()
-                )));
-            }
-            Component::Normal(segment) => {
-                current.push(segment);
-                match std::fs::symlink_metadata(&current) {
-                    Ok(metadata) if metadata.file_type().is_dir() => {}
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
-                        return Err(CliError::Other(format!(
-                            "{label} {} must not be a symlink",
-                            current.display()
-                        )));
-                    }
-                    Ok(_) => {
-                        return Err(CliError::Other(format!(
-                            "{label} {} exists but is not a directory",
-                            current.display()
-                        )));
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        return Err(CliError::Other(format!(
-                            "{label} {} does not exist or is not a directory",
-                            current.display()
-                        )));
-                    }
-                    Err(err) => return Err(CliError::Io(err)),
-                }
-            }
-        }
-    }
-    Ok(())
+    validate_real_existing_directory(path, label)
 }
 
 fn validate_share_public_key_output_path(path: &Path) -> CliResult<()> {
@@ -44224,8 +44790,7 @@ fn handle_doctor_repair_with(
     // 2. Optional backup before repair
     if !dry_run {
         std::fs::create_dir_all(backup_dir)?;
-        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-        let bak_name = format!("pre_repair_{timestamp}.sqlite3");
+        let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
         let cfg = mcp_agent_mail_db::DbPoolConfig {
             database_url: database_url.to_string(),
             ..Default::default()
@@ -44233,7 +44798,8 @@ fn handle_doctor_repair_with(
         let db_path =
             resolve_sqlite_path_with_absolute_candidate(&cfg.sqlite_path().unwrap_or_default());
         if std::path::Path::new(&db_path).exists() {
-            let bak_path = backup_dir.join(&bak_name);
+            let bak_path =
+                next_timestamped_sqlite_backup_path_in_dir(backup_dir, "pre_repair", &timestamp);
             copy_sqlite_backup_consistently(Path::new(&db_path), &bak_path)?;
             ftui_runtime::ftui_println!("  Backup: {}", bak_path.display());
 
@@ -44793,6 +45359,42 @@ fn next_doctor_artifact_path(base_path: &Path, label: &str, extension: &str) -> 
     next_doctor_artifact_path_with_timestamp(base_path, label, extension, &timestamp)
 }
 
+fn next_sqlite_backup_artifact_path_with_timestamp(
+    base_path: &Path,
+    label: &str,
+    timestamp: &str,
+) -> PathBuf {
+    let mut candidate = path_with_file_name_suffix(
+        base_path,
+        &format!(".{label}.{timestamp}"),
+        &format!("storage.sqlite3.{label}.{timestamp}"),
+    );
+    let mut suffix = 1_u32;
+    while sqlite_artifact_conflicts(&candidate) {
+        candidate = path_with_file_name_suffix(
+            base_path,
+            &format!(".{label}.{timestamp}-{suffix:02}"),
+            &format!("storage.sqlite3.{label}.{timestamp}-{suffix:02}"),
+        );
+        suffix = suffix.saturating_add(1);
+    }
+    candidate
+}
+
+fn next_timestamped_sqlite_backup_path_in_dir(
+    parent_dir: &Path,
+    stem_prefix: &str,
+    timestamp: &str,
+) -> PathBuf {
+    let mut candidate = parent_dir.join(format!("{stem_prefix}_{timestamp}.sqlite3"));
+    let mut suffix = 1_u32;
+    while sqlite_artifact_conflicts(&candidate) {
+        candidate = parent_dir.join(format!("{stem_prefix}_{timestamp}-{suffix:02}.sqlite3"));
+        suffix = suffix.saturating_add(1);
+    }
+    candidate
+}
+
 fn attempt_readable_sqlite_salvage_source(sqlite_path: &Path, label: &str) -> DoctorSalvageAttempt {
     let conn =
         match mcp_agent_mail_db::CanonicalDbConn::open_file(sqlite_path.to_string_lossy().as_ref())
@@ -44963,12 +45565,22 @@ fn handle_doctor_reconstruct_with(
         ),
     };
 
-    if !storage_root.is_dir() {
-        return Err(CliError::InvalidArgument(format!(
-            "storage root does not exist: {}",
-            storage_root.display()
-        )));
+    if let Err(error) = validate_real_existing_directory(&storage_root, "reconstruct storage root")
+    {
+        return match error {
+            CliError::Other(msg)
+                if msg.contains("does not exist or is not a directory")
+                    || msg.contains("exists but is not a directory") =>
+            {
+                Err(CliError::InvalidArgument(format!(
+                    "storage root does not exist: {}",
+                    storage_root.display()
+                )))
+            }
+            other => Err(other),
+        };
     }
+    validate_real_file_target_path(&db_path, "reconstruct destination")?;
 
     let projects_dir = storage_root.join("projects");
     if !path_is_real_directory(&projects_dir) {

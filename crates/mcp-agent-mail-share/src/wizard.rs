@@ -539,7 +539,7 @@ impl WizardJsonOutput {
     #[must_use]
     pub fn success(result: WizardResult) -> Self {
         Self {
-            success: true,
+            success: result.success,
             provider: result.provider.id().to_string(),
             url: result.deployed_url.clone(),
             bundle_path: result.bundle_path.display().to_string(),
@@ -579,6 +579,15 @@ impl WizardJsonOutput {
     /// Attach deployment plan.
     #[must_use]
     pub fn with_plan(mut self, plan: DeploymentPlan) -> Self {
+        if self.provider.is_empty() {
+            self.provider = plan.provider.id().to_string();
+        }
+        if self.url.is_none() {
+            self.url = plan.expected_url.clone();
+        }
+        if self.bundle_path.is_empty() {
+            self.bundle_path = plan.bundle_path.display().to_string();
+        }
         self.plan = Some(plan);
         self
     }
@@ -687,6 +696,30 @@ mod tests {
     }
 
     #[test]
+    fn json_output_success_reflects_result_success_flag() {
+        let result = WizardResult {
+            success: false,
+            provider: HostingProvider::Custom,
+            bundle_path: PathBuf::from("/tmp/bundle"),
+            deployed_url: None,
+            steps: vec![],
+            total_duration_ms: 0,
+            error: None,
+            error_code: None,
+            metadata: WizardMetadata {
+                version: WIZARD_VERSION.to_string(),
+                timestamp: "2026-02-12T07:00:00Z".to_string(),
+                mode: WizardMode::NonInteractive,
+                dry_run: false,
+            },
+        };
+
+        let output = WizardJsonOutput::success(result);
+        assert!(!output.success);
+        assert_eq!(output.provider, "custom");
+    }
+
+    #[test]
     fn json_output_failure_contains_error_details() {
         let error = WizardError::new(WizardErrorCode::CommandFailed, "deploy failed");
         let output = WizardJsonOutput::failure(error, Some(PathBuf::from("/tmp/bundle")));
@@ -725,10 +758,47 @@ mod tests {
 
         let output = base.with_environment(env).with_plan(plan.clone());
         assert!(output.environment.is_some());
+        assert_eq!(output.provider, "github_pages");
+        assert_eq!(output.url.as_deref(), Some("https://example.github.io/repo"));
+        assert_eq!(output.bundle_path, "/tmp/bundle");
         assert_eq!(
             output.plan.expect("plan should be set").provider,
             plan.provider
         );
+    }
+
+    #[test]
+    fn json_output_with_plan_preserves_existing_success_fields() {
+        let result = WizardResult {
+            success: true,
+            provider: HostingProvider::GithubPages,
+            bundle_path: PathBuf::from("/tmp/actual-bundle"),
+            deployed_url: Some("https://actual.example.test".to_string()),
+            steps: vec![],
+            total_duration_ms: 42,
+            error: None,
+            error_code: None,
+            metadata: WizardMetadata {
+                version: WIZARD_VERSION.to_string(),
+                timestamp: "2026-02-12T07:00:00Z".to_string(),
+                mode: WizardMode::NonInteractive,
+                dry_run: false,
+            },
+        };
+        let plan = DeploymentPlan {
+            provider: HostingProvider::GithubPages,
+            bundle_path: PathBuf::from("/tmp/planned-bundle"),
+            steps: vec![],
+            expected_url: Some("https://planned.example.test".to_string()),
+            generated_files: vec![],
+            warnings: vec![],
+        };
+
+        let output = WizardJsonOutput::success(result).with_plan(plan.clone());
+        assert_eq!(output.provider, "github_pages");
+        assert_eq!(output.url.as_deref(), Some("https://actual.example.test"));
+        assert_eq!(output.bundle_path, "/tmp/actual-bundle");
+        assert_eq!(output.plan.expect("plan should be set").bundle_path, plan.bundle_path);
     }
 
     #[test]

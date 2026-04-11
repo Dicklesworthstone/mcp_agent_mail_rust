@@ -731,27 +731,31 @@ fn wbq_execute_op_inner(op: &WriteOp) -> Result<()> {
 ///
 /// The outer `RwLock` is read-locked for lookup (hot path, concurrent) and
 /// write-locked only when creating a new project entry (cold path, once).
-static ARCHIVE_LOCK_MAP: OnceLock<OrderedRwLock<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+type ArchiveProcessLockKey = PathBuf;
 
-fn archive_process_lock(project_slug: &str) -> Arc<Mutex<()>> {
+static ARCHIVE_LOCK_MAP: OnceLock<OrderedRwLock<HashMap<ArchiveProcessLockKey, Arc<Mutex<()>>>>> =
+    OnceLock::new();
+
+fn archive_process_lock(archive: &ProjectArchive) -> Arc<Mutex<()>> {
     let map = ARCHIVE_LOCK_MAP
         .get_or_init(|| OrderedRwLock::new(LockLevel::StorageArchiveLockMap, HashMap::new()));
+    let key = archive.canonical_root.clone();
 
     // Fast path: read lock for existing entry.
     {
         let guard = map.read();
-        if let Some(lock) = guard.get(project_slug) {
+        if let Some(lock) = guard.get(&key) {
             return Arc::clone(lock);
         }
     }
 
     // Slow path: write lock to insert.
     let mut guard = map.write();
-    if let Some(lock) = guard.get(project_slug) {
+    if let Some(lock) = guard.get(&key) {
         return Arc::clone(lock);
     }
     let lock = Arc::new(Mutex::new(()));
-    guard.insert(project_slug.to_string(), Arc::clone(&lock));
+    guard.insert(key, Arc::clone(&lock));
     lock
 }
 
@@ -1100,7 +1104,7 @@ pub fn with_project_lock<F, T>(archive: &ProjectArchive, f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
 {
-    let process_lock = archive_process_lock(&archive.slug);
+    let process_lock = archive_process_lock(archive);
     let _guard = process_lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1217,6 +1221,7 @@ impl CommitQueue {
         if rel_paths.is_empty() {
             return Ok(());
         }
+        let repo_root = normalize_repo_root_key(&repo_root);
 
         {
             let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
@@ -1731,6 +1736,7 @@ impl CommitCoalescer {
         if rel_paths.is_empty() {
             return;
         }
+        let repo_root = normalize_repo_root_key(&repo_root);
 
         let metrics = mcp_agent_mail_core::global_metrics();
         metrics.storage.commit_enqueued_total.inc();
@@ -3711,6 +3717,10 @@ fn canonicalize_path_cached(path: &Path) -> std::io::Result<PathBuf> {
     Ok(canonical)
 }
 
+fn normalize_repo_root_key(repo_root: &Path) -> PathBuf {
+    canonicalize_path_cached(repo_root).unwrap_or_else(|_| repo_root.to_path_buf())
+}
+
 // ---------------------------------------------------------------------------
 // Archive initialization (br-2ei.2.1)
 // ---------------------------------------------------------------------------
@@ -3741,12 +3751,11 @@ pub fn open_archive(config: &Config, slug: &str) -> Result<Option<ProjectArchive
     }
 
     let repo_root = config.storage_root.clone();
-    if !repo_root.is_dir() {
+    let project_root = repo_root.join("projects").join(slug);
+    if path_existing_prefix_has_symlink(&project_root)? {
         return Ok(None);
     }
-
-    let project_root = repo_root.join("projects").join(slug);
-    if !project_root.is_dir() {
+    if !fs::symlink_metadata(&project_root).is_ok_and(|meta| meta.file_type().is_dir()) {
         return Ok(None);
     }
 
@@ -5283,11 +5292,21 @@ fn resolve_source_attachment_path_opt(
 // Notification signals (legacy parity)
 // ---------------------------------------------------------------------------
 
-static SIGNAL_DEBOUNCE: OnceLock<OrderedMutex<HashMap<(String, String), u128>>> = OnceLock::new();
+type SignalDebounceKey = (PathBuf, String, String);
 
-fn signal_debounce() -> &'static OrderedMutex<HashMap<(String, String), u128>> {
+static SIGNAL_DEBOUNCE: OnceLock<OrderedMutex<HashMap<SignalDebounceKey, u128>>> = OnceLock::new();
+
+fn signal_debounce() -> &'static OrderedMutex<HashMap<SignalDebounceKey, u128>> {
     SIGNAL_DEBOUNCE
         .get_or_init(|| OrderedMutex::new(LockLevel::StorageSignalDebounce, HashMap::new()))
+}
+
+fn signal_debounce_key(config: &Config, project_slug: &str, agent_name: &str) -> SignalDebounceKey {
+    (
+        config.notifications_signals_dir.clone(),
+        project_slug.to_string(),
+        agent_name.to_string(),
+    )
 }
 
 /// Emit a notification signal file for a project/agent.
@@ -5325,7 +5344,7 @@ pub fn emit_notification_signal(
         .unwrap_or_default()
         .as_millis();
 
-    let key = (project_slug.to_string(), agent_name.to_string());
+    let key = signal_debounce_key(config, project_slug, agent_name);
     {
         let mut map = signal_debounce().lock();
         let last = map.get(&key).copied().unwrap_or(0);
@@ -5386,7 +5405,9 @@ pub fn clear_notification_signal(
     }
 
     // Reject path-traversal characters and dot-prefix names.
-    if project_slug.contains('/')
+    if project_slug.trim().is_empty()
+        || agent_name.trim().is_empty()
+        || project_slug.contains('/')
         || project_slug.contains('\\')
         || project_slug.contains("..")
         || project_slug == "."
@@ -5400,23 +5421,34 @@ pub fn clear_notification_signal(
         return SignalClearOutcome::InvalidTarget;
     }
 
-    signal_debounce()
-        .lock()
-        .remove(&(project_slug.to_string(), agent_name.to_string()));
-
     let signal_path = config
         .notifications_signals_dir
         .join("projects")
         .join(project_slug)
         .join("agents")
         .join(format!("{agent_name}.signal"));
+    let signal_key = signal_debounce_key(config, project_slug, agent_name);
+    let parent = signal_path.parent().unwrap_or(Path::new("."));
+
+    if path_existing_prefix_has_symlink(parent).unwrap_or(true) {
+        return SignalClearOutcome::RemoveFailed;
+    }
+    if let Ok(meta) = fs::symlink_metadata(&signal_path)
+        && meta.file_type().is_symlink()
+    {
+        return SignalClearOutcome::RemoveFailed;
+    }
 
     if !signal_path.exists() {
+        signal_debounce().lock().remove(&signal_key);
         return SignalClearOutcome::Missing;
     }
 
     match fs::remove_file(&signal_path) {
-        Ok(()) => SignalClearOutcome::Cleared,
+        Ok(()) => {
+            signal_debounce().lock().remove(&signal_key);
+            SignalClearOutcome::Cleared
+        }
         Err(_) => SignalClearOutcome::RemoveFailed,
     }
 }
@@ -5428,14 +5460,18 @@ pub fn list_pending_signals(config: &Config, project_slug: Option<&str>) -> Vec<
     }
 
     let projects_root = config.notifications_signals_dir.join("projects");
-    if !projects_root.exists() {
+    if path_existing_prefix_has_symlink(&projects_root).unwrap_or(true) {
+        return Vec::new();
+    }
+    if !fs::symlink_metadata(&projects_root).is_ok_and(|meta| meta.file_type().is_dir()) {
         return Vec::new();
     }
 
     let mut results = Vec::new();
     let mut dirs: Vec<PathBuf> = if let Some(slug) = project_slug {
         // Reject path-traversal characters.
-        if slug.contains('/')
+        if slug.trim().is_empty()
+            || slug.contains('/')
             || slug.contains('\\')
             || slug.contains("..")
             || slug == "."
@@ -5444,12 +5480,22 @@ pub fn list_pending_signals(config: &Config, project_slug: Option<&str>) -> Vec<
             return Vec::new();
         }
         let d = projects_root.join(slug);
-        if d.exists() { vec![d] } else { vec![] }
+        if fs::symlink_metadata(&d).is_ok_and(|meta| meta.file_type().is_dir()) {
+            vec![d]
+        } else {
+            vec![]
+        }
     } else {
         match fs::read_dir(&projects_root) {
             Ok(iter) => iter
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.is_dir())
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    let file_type = entry.file_type().ok()?;
+                    if !file_type.is_dir() || file_type.is_symlink() {
+                        return None;
+                    }
+                    Some(entry.path())
+                })
                 .collect(),
             Err(_) => return Vec::new(),
         }
@@ -5462,12 +5508,22 @@ pub fn list_pending_signals(config: &Config, project_slug: Option<&str>) -> Vec<
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         let agents_dir = proj_dir.join("agents");
+        if !fs::symlink_metadata(&agents_dir).is_ok_and(|meta| meta.file_type().is_dir()) {
+            continue;
+        }
         let mut entries: Vec<_> = match fs::read_dir(&agents_dir) {
             Ok(iter) => iter.filter_map(|entry| entry.ok()).collect(),
             Err(_) => continue,
         };
         entries.sort_by_key(|entry| entry.path());
         for entry in entries {
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if file_type.is_symlink() || !file_type.is_file() {
+                continue;
+            }
             if entry.path().extension().is_some_and(|e| e == "signal") {
                 let content = match fs::read_to_string(entry.path()) {
                     Ok(c) => c,
@@ -7302,6 +7358,14 @@ fn canonicalize_with_existing_prefix(path: &Path) -> std::io::Result<PathBuf> {
     }
 }
 
+fn path_is_nonsymlink_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
+}
+
+fn path_is_nonsymlink_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+}
+
 fn path_existing_prefix_has_symlink(path: &Path) -> std::io::Result<bool> {
     let mut current = if path.is_absolute() {
         PathBuf::new()
@@ -7612,6 +7676,60 @@ mod tests {
         assert_eq!(archive.slug, "test-project");
         assert!(archive.root.exists());
         assert!(archive.root.ends_with("projects/test-project"));
+    }
+
+    #[test]
+    fn test_open_archive_returns_existing_project() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+
+        let created = ensure_archive(&config, "test-project").unwrap();
+        let opened = open_archive(&config, "test-project")
+            .unwrap()
+            .expect("archive should open");
+
+        assert_eq!(opened.slug, created.slug);
+        assert_eq!(opened.root, created.root);
+        assert_eq!(opened.canonical_root, created.canonical_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_open_archive_rejects_symlinked_project_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let projects_root = config.storage_root.join("projects");
+        let outside_project = tmp.path().join("outside-project");
+        fs::create_dir_all(&projects_root).unwrap();
+        fs::create_dir_all(&outside_project).unwrap();
+        symlink(&outside_project, projects_root.join("linked-proj")).unwrap();
+
+        assert!(
+            open_archive(&config, "linked-proj").unwrap().is_none(),
+            "symlinked project directories must not be opened"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_open_archive_rejects_symlinked_storage_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let real_root = tmp.path().join("real-root");
+        let linked_root = tmp.path().join("linked-root");
+        fs::create_dir_all(real_root.join("projects").join("proj")).unwrap();
+        symlink(&real_root, &linked_root).unwrap();
+
+        let mut config = test_config(tmp.path());
+        config.storage_root = linked_root;
+
+        assert!(
+            open_archive(&config, "proj").unwrap().is_none(),
+            "symlinked storage roots must not be traversed during archive open"
+        );
     }
 
     #[test]
@@ -8499,6 +8617,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_signal_debounce_is_scoped_to_signal_root() {
+        let tmp = TempDir::new().unwrap();
+        let mut config_a = test_config(tmp.path());
+        config_a.notifications_enabled = true;
+        config_a.notifications_signals_dir = tmp.path().join("signals-a");
+        config_a.notifications_debounce_ms = 60_000;
+
+        let mut config_b = test_config(tmp.path());
+        config_b.notifications_enabled = true;
+        config_b.notifications_signals_dir = tmp.path().join("signals-b");
+        config_b.notifications_debounce_ms = 60_000;
+
+        assert_eq!(
+            emit_notification_signal(&config_a, "proj", "Agent", None),
+            SignalEmitOutcome::Emitted
+        );
+        assert_eq!(
+            emit_notification_signal(&config_b, "proj", "Agent", None),
+            SignalEmitOutcome::Emitted,
+            "debounce state must not leak across distinct signal roots"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Notification signal fixture-driven tests
     // -----------------------------------------------------------------------
@@ -8860,6 +9002,14 @@ mod tests {
             SignalClearOutcome::InvalidTarget
         );
         assert_eq!(
+            clear_notification_signal(&config, "", agent),
+            SignalClearOutcome::InvalidTarget
+        );
+        assert_eq!(
+            clear_notification_signal(&config, slug, "   "),
+            SignalClearOutcome::InvalidTarget
+        );
+        assert_eq!(
             clear_notification_signal(&config, slug, "../evil"),
             SignalClearOutcome::InvalidTarget
         );
@@ -8873,6 +9023,8 @@ mod tests {
         );
 
         // list_pending_signals rejects traversal in slug
+        assert!(list_pending_signals(&config, Some("")).is_empty());
+        assert!(list_pending_signals(&config, Some("   ")).is_empty());
         assert!(list_pending_signals(&config, Some("../evil")).is_empty());
         assert!(list_pending_signals(&config, Some("proj/sub")).is_empty());
         assert!(list_pending_signals(&config, Some("proj\\sub")).is_empty());
@@ -8886,6 +9038,215 @@ mod tests {
         assert_eq!(
             clear_notification_signal(&config, slug, agent),
             SignalClearOutcome::Cleared
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_clear_notification_signal_refuses_symlinked_project_path_and_preserves_debounce() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let safe_signals = tmp.path().join("safe-signals");
+        let linked_signals = tmp.path().join("linked-signals");
+        let outside_project = tmp.path().join("outside-project");
+
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_debounce_ms = 60_000;
+        config.notifications_signals_dir = safe_signals.clone();
+
+        assert_eq!(
+            emit_notification_signal(&config, "proj", "Agent", None),
+            SignalEmitOutcome::Emitted
+        );
+
+        let outside_agents = outside_project.join("agents");
+        std::fs::create_dir_all(&outside_agents).unwrap();
+        std::fs::write(
+            outside_agents.join("Agent.signal"),
+            "{\"project\":\"proj\",\"agent\":\"Agent\"}",
+        )
+        .unwrap();
+        let linked_project = linked_signals.join("projects").join("proj");
+        std::fs::create_dir_all(linked_project.parent().unwrap()).unwrap();
+        symlink(&outside_project, &linked_project).unwrap();
+
+        config.notifications_signals_dir = linked_signals;
+        assert_eq!(
+            clear_notification_signal(&config, "proj", "Agent"),
+            SignalClearOutcome::RemoveFailed
+        );
+        assert!(
+            outside_agents.join("Agent.signal").exists(),
+            "failed clear must not delete through a symlinked project path"
+        );
+
+        config.notifications_signals_dir = safe_signals;
+        assert_eq!(
+            emit_notification_signal(&config, "proj", "Agent", None),
+            SignalEmitOutcome::Debounced,
+            "failed clear must not reset debounce state"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_clear_notification_signal_refuses_symlinked_signal_file() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_debounce_ms = 0;
+        config.notifications_signals_dir = tmp.path().join("signals");
+
+        let agents_dir = config
+            .notifications_signals_dir
+            .join("projects")
+            .join("proj")
+            .join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+
+        let outside_signal = tmp.path().join("outside.signal");
+        std::fs::write(
+            &outside_signal,
+            "{\"project\":\"proj\",\"agent\":\"Agent\"}",
+        )
+        .unwrap();
+        let linked_signal = agents_dir.join("Agent.signal");
+        symlink(&outside_signal, &linked_signal).unwrap();
+
+        assert_eq!(
+            clear_notification_signal(&config, "proj", "Agent"),
+            SignalClearOutcome::RemoveFailed
+        );
+        assert!(
+            linked_signal.exists(),
+            "symlink leaf should remain untouched"
+        );
+        assert!(
+            outside_signal.exists(),
+            "rejecting a symlink leaf must not disturb the external target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_signal_list_skips_symlinked_project_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+
+        let outside_project = tmp.path().join("outside-project");
+        let outside_agents = outside_project.join("agents");
+        std::fs::create_dir_all(&outside_agents).unwrap();
+        std::fs::write(
+            outside_agents.join("Ghost.signal"),
+            serde_json::json!({
+                "timestamp": "2026-04-10T12:00:00Z",
+                "project": "outside",
+                "agent": "Ghost",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let linked_project = config
+            .notifications_signals_dir
+            .join("projects")
+            .join("linked");
+        std::fs::create_dir_all(linked_project.parent().unwrap()).unwrap();
+        symlink(&outside_project, &linked_project).unwrap();
+
+        assert!(
+            list_pending_signals(&config, None).is_empty(),
+            "symlinked project directories must not be traversed"
+        );
+        assert!(
+            list_pending_signals(&config, Some("linked")).is_empty(),
+            "explicit slug reads must also ignore symlinked project directories"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_signal_list_skips_symlinked_agents_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+
+        let project_dir = config
+            .notifications_signals_dir
+            .join("projects")
+            .join("proj");
+        let outside_agents = tmp.path().join("outside-agents");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::create_dir_all(&outside_agents).unwrap();
+        std::fs::write(
+            outside_agents.join("Ghost.signal"),
+            serde_json::json!({
+                "timestamp": "2026-04-10T12:00:00Z",
+                "project": "outside",
+                "agent": "Ghost",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        symlink(&outside_agents, project_dir.join("agents")).unwrap();
+
+        assert!(
+            list_pending_signals(&config, None).is_empty(),
+            "symlinked agents directories must not be traversed"
+        );
+        assert!(
+            list_pending_signals(&config, Some("proj")).is_empty(),
+            "explicit slug reads must also ignore symlinked agents directories"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_signal_list_skips_symlinked_signal_file() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.notifications_enabled = true;
+        config.notifications_signals_dir = tmp.path().join("signals");
+
+        let agents_dir = config
+            .notifications_signals_dir
+            .join("projects")
+            .join("proj")
+            .join("agents");
+        let outside_signal = tmp.path().join("outside.signal");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            &outside_signal,
+            serde_json::json!({
+                "timestamp": "2026-04-10T12:00:00Z",
+                "project": "outside",
+                "agent": "Ghost",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        symlink(&outside_signal, agents_dir.join("Ghost.signal")).unwrap();
+
+        assert!(
+            list_pending_signals(&config, None).is_empty(),
+            "symlinked signal files must not be read during global listing"
+        );
+        assert!(
+            list_pending_signals(&config, Some("proj")).is_empty(),
+            "symlinked signal files must not be read during per-project listing"
         );
     }
 
@@ -9124,6 +9485,65 @@ mod tests {
         assert!(!archive.lock_path.exists());
     }
 
+    #[test]
+    fn test_with_project_lock_allows_same_slug_across_distinct_roots() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let tmp_a = TempDir::new().unwrap();
+        let tmp_b = TempDir::new().unwrap();
+
+        let config_a = test_config(tmp_a.path());
+        let config_b = test_config(tmp_b.path());
+        let archive_a = Arc::new(ensure_archive(&config_a, "shared-slug").unwrap());
+        let archive_b = Arc::new(ensure_archive(&config_b, "shared-slug").unwrap());
+
+        assert_ne!(
+            archive_a.canonical_root, archive_b.canonical_root,
+            "distinct storage roots must produce distinct archive roots"
+        );
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+
+        let worker = |archive: Arc<ProjectArchive>,
+                      barrier: Arc<std::sync::Barrier>,
+                      active: Arc<AtomicUsize>,
+                      max_active: Arc<AtomicUsize>| {
+            std::thread::spawn(move || {
+                barrier.wait();
+                with_project_lock(&archive, || {
+                    let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(now_active, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(100));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .unwrap();
+            })
+        };
+
+        let handle_a = worker(
+            Arc::clone(&archive_a),
+            Arc::clone(&barrier),
+            Arc::clone(&active),
+            Arc::clone(&max_active),
+        );
+        let handle_b = worker(archive_b, barrier, active, Arc::clone(&max_active));
+
+        handle_a.join().unwrap();
+        handle_b.join().unwrap();
+
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            2,
+            "same slug in distinct archive roots should not serialize on the in-process lock"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Commit queue tests
     // -----------------------------------------------------------------------
@@ -9187,6 +9607,46 @@ mod tests {
         assert_eq!(stats.batched, 3);
         // Should be batched into 1 commit (3 non-conflicting paths, <= 5)
         assert_eq!(stats.commits, 1);
+    }
+
+    #[test]
+    fn test_commit_queue_normalizes_repo_root_identity() {
+        let tmp = TempDir::new().unwrap();
+        let repo_root = tmp.path().join("archive");
+        let mut config = test_config(tmp.path());
+        config.storage_root = repo_root.clone();
+        let archive = ensure_archive(&config, "normalized-queue-proj").unwrap();
+        let repo_root_alias = repo_root.join("alias").join("..");
+        fs::create_dir_all(repo_root.join("alias")).unwrap();
+        assert_ne!(
+            repo_root.as_os_str(),
+            repo_root_alias.as_os_str(),
+            "test setup requires a distinct textual alias for the same repo"
+        );
+
+        let queue = CommitQueue::default();
+        for (idx, root_variant) in [repo_root.clone(), repo_root_alias].into_iter().enumerate() {
+            let file = archive.root.join(format!("normalized-{idx}.txt"));
+            fs::write(&file, format!("content {idx}")).unwrap();
+            let rel = rel_path_cached(&archive.canonical_repo_root, &file).unwrap();
+            queue
+                .enqueue(
+                    root_variant,
+                    &config,
+                    format!("normalized commit {idx}"),
+                    vec![rel],
+                )
+                .unwrap();
+        }
+
+        queue.drain(&config).unwrap();
+
+        let stats = queue.stats();
+        assert_eq!(stats.enqueued, 2);
+        assert_eq!(
+            stats.commits, 1,
+            "different textual paths to the same repo should batch as one repo"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -11160,6 +11620,48 @@ mod tests {
         assert!(
             stats_b.unwrap().enqueued_total >= 1,
             "repo B should have enqueued >= 1"
+        );
+    }
+
+    #[test]
+    fn coalescer_normalizes_repo_root_identity() {
+        let tmp = TempDir::new().unwrap();
+        let repo_root = tmp.path().join("archive");
+        let repo_root_alias = repo_root.join("alias").join("..");
+
+        let mut config_a = test_config(tmp.path());
+        config_a.storage_root = repo_root.clone();
+        fs::create_dir_all(repo_root.join("alias")).unwrap();
+        let mut config_b = config_a.clone();
+        config_b.storage_root = repo_root_alias;
+
+        let archive_a = ensure_archive(&config_a, "canon-a").unwrap();
+        let archive_b = ensure_archive(&config_b, "canon-b").unwrap();
+
+        assert_ne!(
+            archive_a.repo_root.as_os_str(),
+            archive_b.repo_root.as_os_str(),
+            "test setup requires distinct textual repo roots"
+        );
+        assert_eq!(
+            archive_a.canonical_repo_root, archive_b.canonical_repo_root,
+            "test setup requires both paths to resolve to the same repo"
+        );
+
+        let agent = serde_json::json!({"name": "CanonAgent", "program": "test"});
+        write_agent_profile_with_config(&archive_a, &config_a, &agent).unwrap();
+        write_agent_profile_with_config(&archive_b, &config_b, &agent).unwrap();
+
+        flush_async_commits();
+
+        let per_repo = get_commit_coalescer().per_repo_stats();
+        assert!(
+            per_repo.contains_key(&archive_a.canonical_repo_root),
+            "canonical repo root should be the coalescer key"
+        );
+        assert!(
+            !per_repo.contains_key(&archive_b.repo_root),
+            "non-canonical repo-root aliases should not survive as separate queue keys"
         );
     }
 

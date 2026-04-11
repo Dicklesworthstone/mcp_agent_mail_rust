@@ -665,7 +665,6 @@ fn show_plan_and_confirm(plan: &DeploymentPlan) -> Result<bool, WizardError> {
 /// Format wizard result as JSON output.
 pub fn format_json_output(
     outcome: &WizardOutcome,
-    executed: bool,
     error: Option<&WizardError>,
 ) -> Result<String, WizardError> {
     let output = if let Some(err) = error {
@@ -673,8 +672,9 @@ pub fn format_json_output(
             .with_environment(outcome.environment.clone())
             .with_plan(outcome.plan.clone())
     } else {
+        let success = outcome.confirmed || outcome.inputs.dry_run;
         let result = WizardResult {
-            success: executed,
+            success,
             provider: outcome.plan.provider,
             bundle_path: outcome.plan.bundle_path.clone(),
             deployed_url: outcome.plan.expected_url.clone(),
@@ -1052,12 +1052,41 @@ mod tests {
         };
 
         let payload = serde_json::from_str::<serde_json::Value>(
-            &format_json_output(&outcome, false, None).expect("wizard output should encode"),
+            &format_json_output(&outcome, None).expect("wizard output should encode"),
         )
         .expect("wizard output should be valid json");
 
+        assert_eq!(payload["success"], serde_json::Value::Bool(true));
         assert_eq!(payload["result"]["metadata"]["mode"], "interactive");
         assert_eq!(payload["result"]["metadata"]["dry_run"], true);
+    }
+
+    #[test]
+    fn format_json_output_marks_cancelled_preview_unsuccessful() {
+        let outcome = WizardOutcome {
+            inputs: WizardInputs {
+                dry_run: false,
+                ..Default::default()
+            },
+            environment: DetectedEnvironment::default(),
+            plan: DeploymentPlan {
+                provider: HostingProvider::Custom,
+                bundle_path: PathBuf::from("/tmp/bundle"),
+                steps: vec![],
+                expected_url: None,
+                generated_files: vec![],
+                warnings: vec![],
+            },
+            mode: WizardMode::Interactive,
+            confirmed: false,
+        };
+
+        let payload = serde_json::from_str::<serde_json::Value>(
+            &format_json_output(&outcome, None).expect("wizard output should encode"),
+        )
+        .expect("wizard output should be valid json");
+
+        assert_eq!(payload["success"], serde_json::Value::Bool(false));
     }
 
     #[test]

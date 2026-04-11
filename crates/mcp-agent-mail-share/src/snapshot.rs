@@ -14,6 +14,8 @@ use sqlmodel_core::Value;
 
 use crate::ShareError;
 
+const SQLITE_SNAPSHOT_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
+
 #[cfg(test)]
 // Historical alias name retained in tests; this still uses FrankenSQLite `DbConn`.
 type SqliteConnection = DbConn;
@@ -194,7 +196,8 @@ const KNOWN_TABLES: &[KnownTable] = &[
 /// # Errors
 ///
 /// - [`ShareError::SnapshotSourceNotFound`] if `source` does not exist.
-/// - [`ShareError::SnapshotDestinationExists`] if `destination` already exists.
+/// - [`ShareError::SnapshotDestinationExists`] if `destination` or its SQLite
+///   sidecar artifacts already exist.
 /// - [`ShareError::Sqlite`] on any SQLite error.
 /// - [`ShareError::Io`] on filesystem errors.
 pub fn create_sqlite_snapshot(
@@ -244,6 +247,11 @@ pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(ShareError::Io(error)),
+    }
+    if sqlite_sidecar_artifacts_exist(&dest)? {
+        return Err(ShareError::SnapshotDestinationExists {
+            path: dest.display().to_string(),
+        });
     }
 
     // Create parent dirs
@@ -318,6 +326,20 @@ pub(crate) fn rebuild_sqlite_snapshot_with_pragmas(
     std::fs::rename(&staged_dest, &dest).map_err(ShareError::Io)?;
 
     Ok(dest)
+}
+
+fn sqlite_sidecar_artifacts_exist(path: &Path) -> Result<bool, ShareError> {
+    for suffix in SQLITE_SNAPSHOT_SIDECAR_SUFFIXES {
+        let mut sidecar_os = path.as_os_str().to_os_string();
+        sidecar_os.push(suffix);
+        let sidecar_path = PathBuf::from(sidecar_os);
+        match std::fs::symlink_metadata(&sidecar_path) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ShareError::Io(error)),
+        }
+    }
+    Ok(false)
 }
 
 fn ensure_real_directory(path: &Path) -> std::io::Result<()> {
@@ -732,6 +754,37 @@ mod tests {
             result,
             Err(ShareError::SnapshotDestinationExists { .. })
         ));
+    }
+
+    #[test]
+    fn snapshot_refuses_destination_with_stale_sidecar_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.sqlite3");
+        let dest = dir.path().join("dest.sqlite3");
+        let dest_journal = PathBuf::from(format!("{}-journal", dest.display()));
+
+        let conn = DbConn::open_file(source.display().to_string()).unwrap();
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT, human_key TEXT, created_at INTEGER)",
+        )
+        .unwrap();
+        conn.execute_raw("INSERT INTO projects VALUES (1, 'sidecar', '/sidecar', 0)")
+            .unwrap();
+        drop(conn);
+
+        std::fs::write(&dest_journal, b"stale-journal").unwrap();
+
+        let err = create_sqlite_snapshot(&source, &dest, false)
+            .expect_err("stale destination sidecars must block snapshot publish");
+        assert!(matches!(err, ShareError::SnapshotDestinationExists { .. }));
+        assert!(
+            !dest.exists(),
+            "snapshot must not publish a main database into a path with stale sidecars"
+        );
+        assert!(
+            dest_journal.exists(),
+            "blocking sidecar artifacts should be left untouched for explicit operator cleanup"
+        );
     }
 
     #[cfg(unix)]

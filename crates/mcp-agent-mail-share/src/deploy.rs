@@ -1388,6 +1388,12 @@ pub fn generate_netlify_config(bundle_dir: &str) -> String {
     .replace("__BUNDLE_DIR__", bundle_dir)
 }
 
+/// Generate a `_redirects` file for SPA-style static hosting.
+#[must_use]
+pub(crate) fn generate_redirects_file() -> String {
+    "/* /index.html 200\n".to_string()
+}
+
 /// Generate a deployment validation script (shell).
 #[must_use]
 pub fn generate_validation_script() -> String {
@@ -2482,7 +2488,10 @@ fn validate_bundle_tooling_path(relative: &str) -> ShareResult<()> {
     Ok(())
 }
 
-fn bundle_path_relative_to_repo(repo_root: &Path, bundle_dir: &Path) -> ShareResult<String> {
+pub(crate) fn bundle_path_relative_to_repo(
+    repo_root: &Path,
+    bundle_dir: &Path,
+) -> ShareResult<String> {
     let repo_root = repo_root
         .canonicalize()
         .map_err(|e| ShareError::Validation {

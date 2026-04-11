@@ -22,6 +22,10 @@ type SqliteConnection = DbConn;
 static FAIL_FINALIZE_SNAPSHOT_STAGE_BEFORE_PUBLISH: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(test)]
+static FAIL_FINALIZE_EXPORT_AFTER_FTS_BUILD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Result of the full finalization pipeline.
 #[derive(Debug, Clone)]
 pub struct FinalizeResult {
@@ -36,9 +40,12 @@ pub struct FinalizeResult {
 /// Returns `false` if FTS5 is not compiled into SQLite (graceful fallback).
 pub fn build_search_indexes(snapshot_path: &Path) -> Result<bool, ShareError> {
     let conn = open_conn(snapshot_path)?;
+    build_search_indexes_with_conn(&conn)
+}
 
+fn build_search_indexes_with_conn(conn: &Conn) -> Result<bool, ShareError> {
     // Check if thread_id column exists
-    let has_thread_id = column_exists(&conn, "messages", "thread_id")?;
+    let has_thread_id = column_exists(conn, "messages", "thread_id")?;
 
     // Create FTS5 virtual table
     let create_sql = "CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(\
@@ -80,7 +87,7 @@ pub fn build_search_indexes(snapshot_path: &Path) -> Result<bool, ShareError> {
         "thread_key",
         "created_ts",
     ] {
-        if !column_exists(&conn, "fts_messages", col)? {
+        if !column_exists(conn, "fts_messages", col)? {
             needs_rebuild = true;
             break;
         }
@@ -201,16 +208,23 @@ pub fn build_materialized_views(
     fts_enabled: bool,
 ) -> Result<Vec<String>, ShareError> {
     let conn = open_conn(snapshot_path)?;
+    build_materialized_views_with_conn(&conn, fts_enabled)
+}
+
+fn build_materialized_views_with_conn(
+    conn: &Conn,
+    fts_enabled: bool,
+) -> Result<Vec<String>, ShareError> {
     let mut created = Vec::new();
 
-    if !table_exists(&conn, "message_recipients")? {
+    if !table_exists(conn, "message_recipients")? {
         return Err(ShareError::Validation {
             message: "snapshot missing required table: message_recipients".to_string(),
         });
     }
 
-    let has_thread_id = column_exists(&conn, "messages", "thread_id")?;
-    let has_sender_id = column_exists(&conn, "messages", "sender_id")?;
+    let has_thread_id = column_exists(conn, "messages", "thread_id")?;
+    let has_sender_id = column_exists(conn, "messages", "sender_id")?;
 
     // --- message_overview_mv ---
     conn.execute_raw("DROP TABLE IF EXISTS message_overview_mv")
@@ -303,7 +317,7 @@ pub fn build_materialized_views(
          )",
     )
     .map_err(sql_err)?;
-    populate_attachments_by_message_mv(&conn, has_thread_id)?;
+    populate_attachments_by_message_mv(conn, has_thread_id)?;
 
     for idx in [
         "CREATE INDEX idx_attach_by_msg ON attachments_by_message_mv(message_id)",
@@ -476,10 +490,14 @@ fn populate_attachments_by_message_mv(conn: &Conn, has_thread_id: bool) -> Resul
 /// Step 6: Create performance indexes (lowercase columns + covering indexes).
 pub fn create_performance_indexes(snapshot_path: &Path) -> Result<Vec<String>, ShareError> {
     let conn = open_conn(snapshot_path)?;
+    create_performance_indexes_with_conn(&conn)
+}
+
+fn create_performance_indexes_with_conn(conn: &Conn) -> Result<Vec<String>, ShareError> {
     let mut indexes = Vec::new();
 
-    let has_sender_id = column_exists(&conn, "messages", "sender_id")?;
-    let has_thread_id = column_exists(&conn, "messages", "thread_id")?;
+    let has_sender_id = column_exists(conn, "messages", "sender_id")?;
+    let has_thread_id = column_exists(conn, "messages", "thread_id")?;
 
     // Export snapshots are static. Drop any legacy FTS triggers so our later `UPDATE messages ...`
     // statements can't fail if the snapshot rebuilds `fts_messages` with a different schema.
@@ -584,21 +602,51 @@ pub fn finalize_snapshot_for_export(snapshot_path: &Path) -> Result<(), ShareErr
 
 /// Run steps 4–7 in sequence on a scoped+scrubbed snapshot.
 pub fn finalize_export_db(snapshot_path: &Path) -> Result<FinalizeResult, ShareError> {
-    finalize_snapshot_for_export(snapshot_path)?;
-    let fts_enabled = build_search_indexes(snapshot_path)?;
-    let views_created = build_materialized_views(snapshot_path, fts_enabled)?;
-    let indexes_created = create_performance_indexes(snapshot_path)?;
-    let conn = open_conn(snapshot_path)?;
-    conn.execute_raw("PRAGMA analysis_limit=400")
-        .map_err(sql_err)?;
-    conn.execute_raw("ANALYZE").map_err(sql_err)?;
-    conn.execute_raw("PRAGMA optimize").map_err(sql_err)?;
+    let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
+    finalize_snapshot_for_export(&snapshot_path)?;
+    let (_rollback_stage, rollback_source_path, rollback_backup_path) =
+        prepare_post_finalize_rollback_snapshot(&snapshot_path)?;
 
-    Ok(FinalizeResult {
-        fts_enabled,
-        views_created,
-        indexes_created,
-    })
+    let result = (|| -> Result<FinalizeResult, ShareError> {
+        let fts_enabled = build_search_indexes(&snapshot_path)?;
+        #[cfg(test)]
+        if FAIL_FINALIZE_EXPORT_AFTER_FTS_BUILD.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(ShareError::Sqlite {
+                message: "forced finalize failure after FTS build".to_string(),
+            });
+        }
+        let views_created = build_materialized_views(&snapshot_path, fts_enabled)?;
+        let indexes_created = create_performance_indexes(&snapshot_path)?;
+        let conn = open_conn(&snapshot_path)?;
+        conn.execute_raw("PRAGMA analysis_limit=400")
+            .map_err(sql_err)?;
+        conn.execute_raw("ANALYZE").map_err(sql_err)?;
+        conn.execute_raw("PRAGMA optimize").map_err(sql_err)?;
+
+        Ok(FinalizeResult {
+            fts_enabled,
+            views_created,
+            indexes_created,
+        })
+    })();
+
+    match result {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            replace_snapshot_with_rebuilt_path(
+                &rollback_source_path,
+                &snapshot_path,
+                &rollback_backup_path,
+            )
+            .map_err(|rollback_error| {
+                ShareError::Io(std::io::Error::other(format!(
+                    "finalize export failed ({error}); restoring pre-FTS snapshot state also failed ({rollback_error})"
+                )))
+            })?;
+            cleanup_snapshot_sidecars(&snapshot_path);
+            Err(error)
+        }
+    }
 }
 
 fn prepare_rebuilt_snapshot_storage(
@@ -622,6 +670,27 @@ fn prepare_rebuilt_snapshot_storage(
 
     let backup_path = temp_dir.path().join("mailbox.backup.sqlite3");
     Ok((temp_dir, rebuilt_path, backup_path))
+}
+
+fn prepare_post_finalize_rollback_snapshot(
+    snapshot_path: &Path,
+) -> Result<(tempfile::TempDir, std::path::PathBuf, std::path::PathBuf), ShareError> {
+    let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
+    let parent = snapshot_path
+        .parent()
+        .ok_or_else(|| ShareError::Io(std::io::Error::other("snapshot path has no parent")))?;
+    let temp_dir = tempfile::Builder::new()
+        .prefix("am-share-finalize-rollback-")
+        .tempdir_in(parent)?;
+    let rollback_source_path = temp_dir.path().join("mailbox.pre-fts.sqlite3");
+    std::fs::copy(&snapshot_path, &rollback_source_path).map_err(|error| {
+        ShareError::Io(std::io::Error::other(format!(
+            "failed to snapshot pre-FTS export state from {}: {error}",
+            snapshot_path.display()
+        )))
+    })?;
+    let rollback_backup_path = temp_dir.path().join("mailbox.failed.sqlite3");
+    Ok((temp_dir, rollback_source_path, rollback_backup_path))
 }
 
 #[cfg(test)]
@@ -1408,6 +1477,46 @@ mod tests {
             err.to_string().contains("message_recipients"),
             "error should identify the missing required table: {err}"
         );
+    }
+
+    #[test]
+    fn finalize_export_db_rolls_back_partial_post_publish_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+
+        FAIL_FINALIZE_EXPORT_AFTER_FTS_BUILD.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = finalize_export_db(&db)
+            .expect_err("forced post-FTS failure should roll back partial finalization state");
+        assert!(
+            err.to_string()
+                .contains("forced finalize failure after FTS build"),
+            "unexpected error: {err}"
+        );
+
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        let rows = conn.query_sync("PRAGMA page_size", &[]).unwrap();
+        let page_size: i64 = rows[0].get_named("page_size").unwrap();
+        assert_eq!(
+            page_size, 1024,
+            "storage finalization should remain published even when later steps fail"
+        );
+
+        let rows = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'fts_messages'",
+                &[],
+            )
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "failed finalization should roll back partially created FTS tables"
+        );
+
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM messages", &[])
+            .unwrap();
+        let count: i64 = rows[0].get_named("cnt").unwrap();
+        assert_eq!(count, 2, "snapshot should remain queryable after rollback");
     }
 
     /// Create a test DB without sender_id column on messages.

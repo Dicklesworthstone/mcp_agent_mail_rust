@@ -1718,28 +1718,127 @@ fn probe_port(config: &Config) -> ProbeResult {
     }
 }
 
+fn path_is_real_directory(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+fn validate_real_existing_directory(path: &std::path::Path, label: &str) -> Result<(), String> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        use std::path::Component;
+
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(format!(
+                    "refusing to traverse {label} with parent traversal: {}",
+                    path.display()
+                ));
+            }
+            Component::Normal(segment) => {
+                current.push(segment);
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) if metadata.file_type().is_dir() => {}
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(format!(
+                            "{label} {} must not be a symlink",
+                            current.display()
+                        ));
+                    }
+                    Ok(_) => {
+                        return Err(format!(
+                            "{label} {} exists but is not a directory",
+                            current.display()
+                        ));
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(format!("{label} {} does not exist", current.display()));
+                    }
+                    Err(err) => return Err(err.to_string()),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_real_file_target_path(path: &std::path::Path, label: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        validate_real_existing_directory(parent, &format!("{label} parent"))?;
+    }
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(format!("{label} {} must not be a symlink", path.display()))
+        }
+        Ok(_) => Err(format!(
+            "{label} {} exists but is not a file",
+            path.display()
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn ensure_real_directory_tree(path: &std::path::Path, label: &str) -> Result<(), String> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        use std::path::Component;
+
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(format!(
+                    "refusing to traverse {label} with parent traversal: {}",
+                    path.display()
+                ));
+            }
+            Component::Normal(segment) => {
+                current.push(segment);
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) if metadata.file_type().is_dir() => {}
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(format!(
+                            "{label} {} must not be a symlink",
+                            current.display()
+                        ));
+                    }
+                    Ok(_) => {
+                        return Err(format!(
+                            "{label} {} exists but is not a directory",
+                            current.display()
+                        ));
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir(&current).map_err(|create_err| {
+                            format!("cannot create {label} {}: {create_err}", current.display())
+                        })?;
+                    }
+                    Err(err) => return Err(err.to_string()),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Check that the storage root directory exists (or can be created) and is writable.
 fn probe_storage_root(config: &Config) -> ProbeResult {
     let root = &config.storage_root;
 
-    // Try to create if it doesn't exist
-    if !root.exists()
-        && let Err(e) = std::fs::create_dir_all(root)
-    {
+    if let Err(problem) = ensure_real_directory_tree(root, "storage directory") {
         return ProbeResult::Fail(ProbeFailure {
             name: "storage",
-            problem: format!("Cannot create storage directory {}: {e}", root.display()),
-            fix: format!("Create the directory manually: mkdir -p {}", root.display()),
-        });
-    }
-
-    // Check it is a directory
-    if !root.is_dir() {
-        return ProbeResult::Fail(ProbeFailure {
-            name: "storage",
-            problem: format!("{} exists but is not a directory", root.display()),
+            problem,
             fix: format!(
-                "Remove the file at {} and let the server create the directory",
+                "Use a real, non-symlinked directory for STORAGE_ROOT: {}",
                 root.display()
             ),
         });
@@ -1806,17 +1905,14 @@ fn probe_database(config: &Config) -> ProbeResult {
                 fix: "Use a valid SQLite URL like 'sqlite:///./storage.sqlite3'".into(),
             });
         };
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-            && !parent.exists()
-        {
+        if let Err(problem) = validate_real_file_target_path(&path, "database path") {
             return ProbeResult::Fail(ProbeFailure {
                 name: "database",
-                problem: format!(
-                    "Database parent directory does not exist: {}",
-                    parent.display()
+                problem,
+                fix: format!(
+                    "Use a real, non-symlinked database path for {}",
+                    path.display()
                 ),
-                fix: format!("Create it: mkdir -p {}", parent.display()),
             });
         }
     }
@@ -1845,12 +1941,24 @@ fn probe_integrity(config: &Config) -> ProbeResult {
         return ProbeResult::Ok { name: "integrity" };
     }
 
+    let resolved_db_path = resolve_server_database_url_sqlite_path(&config.database_url);
+    if let Some(path) = resolved_db_path.as_ref() {
+        if let Err(problem) = validate_real_file_target_path(path, "database path") {
+            return ProbeResult::Fail(ProbeFailure {
+                name: "integrity",
+                problem,
+                fix: format!(
+                    "Use a real, non-symlinked database path for {}",
+                    path.display()
+                ),
+            });
+        }
+    }
+
     // Skip integrity probe for fresh installs to avoid noisy recovery warnings.
-    if let Some(path) = resolve_server_database_url_sqlite_path(&config.database_url)
+    if let Some(path) = resolved_db_path
         && !path.exists()
-        && !std::path::Path::new(&config.storage_root)
-            .join("projects")
-            .is_dir()
+        && !path_is_real_directory(&std::path::Path::new(&config.storage_root).join("projects"))
     {
         return ProbeResult::Ok { name: "integrity" };
     }
@@ -2066,6 +2174,16 @@ fn attempt_probe_recovery(config: &Config) -> ProbeResult {
             fix: "Check DATABASE_URL format".into(),
         });
     };
+    if let Err(problem) = validate_real_file_target_path(&db_path, "database path") {
+        return ProbeResult::Fail(ProbeFailure {
+            name: "integrity",
+            problem,
+            fix: format!(
+                "Use a real, non-symlinked database path for {}",
+                db_path.display()
+            ),
+        });
+    }
 
     let storage_root = std::path::Path::new(&config.storage_root);
 
@@ -2084,7 +2202,9 @@ fn attempt_probe_recovery(config: &Config) -> ProbeResult {
         "startup pre-recovery snapshot captured"
     );
 
-    let result = if storage_root.is_dir() {
+    let result = if path_is_real_directory(storage_root)
+        && path_is_real_directory(&storage_root.join("projects"))
+    {
         mcp_agent_mail_db::ensure_sqlite_file_healthy_with_archive(&db_path, storage_root)
     } else {
         mcp_agent_mail_db::ensure_sqlite_file_healthy(&db_path)
@@ -2570,6 +2690,27 @@ mod tests {
         assert!(matches!(result, ProbeResult::Fail(_)));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn probe_database_rejects_symlinked_database_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_db = dir.path().join("real.sqlite3");
+        let linked_db = dir.path().join("linked.sqlite3");
+        std::fs::write(&real_db, b"placeholder").unwrap();
+        symlink(&real_db, &linked_db).unwrap();
+
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", linked_db.display());
+        let result = probe_database(&config);
+
+        assert!(
+            matches!(result, ProbeResult::Fail(ProbeFailure { name: "database", ref problem, .. }) if problem.contains("must not be a symlink")),
+            "symlinked database path should fail: {result:?}"
+        );
+    }
+
     #[test]
     fn writable_storage_root_passes() {
         let tmp = std::env::temp_dir().join("am_test_startup_probe");
@@ -2593,6 +2734,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn probe_storage_root_rejects_symlinked_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_root = dir.path().join("real-root");
+        let linked_root = dir.path().join("linked-root");
+        std::fs::create_dir_all(&real_root).unwrap();
+        symlink(&real_root, &linked_root).unwrap();
+
+        let mut config = default_config();
+        config.storage_root = linked_root;
+        let result = probe_storage_root(&config);
+
+        assert!(
+            matches!(result, ProbeResult::Fail(ProbeFailure { name: "storage", ref problem, .. }) if problem.contains("must not be a symlink")),
+            "symlinked storage root should fail: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&real_root).unwrap().count(),
+            0,
+            "probe must not write through the symlinked storage root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_storage_root_rejects_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real-parent");
+        let linked_parent = dir.path().join("linked-parent");
+        std::fs::create_dir_all(&real_parent).unwrap();
+        symlink(&real_parent, &linked_parent).unwrap();
+
+        let mut config = default_config();
+        config.storage_root = linked_parent.join("mailbox");
+        let result = probe_storage_root(&config);
+
+        assert!(
+            matches!(result, ProbeResult::Fail(ProbeFailure { name: "storage", ref problem, .. }) if problem.contains("must not be a symlink")),
+            "symlinked storage parent should fail: {result:?}"
+        );
+        assert!(
+            !real_parent.join("mailbox").exists(),
+            "probe must not create storage directories through a symlinked parent"
+        );
+    }
+
     #[test]
     fn storage_probe_does_not_clobber_existing_probe_file() {
         let nonce = std::time::SystemTime::now()
@@ -2613,6 +2805,30 @@ mod tests {
         assert_eq!(std::fs::read(&existing).unwrap(), b"do-not-touch");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_database_rejects_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real-db-parent");
+        let linked_parent = dir.path().join("linked-db-parent");
+        std::fs::create_dir_all(&real_parent).unwrap();
+        symlink(&real_parent, &linked_parent).unwrap();
+
+        let mut config = default_config();
+        config.database_url = format!(
+            "sqlite:///{}",
+            linked_parent.join("storage.sqlite3").display()
+        );
+        let result = probe_database(&config);
+
+        assert!(
+            matches!(result, ProbeResult::Fail(ProbeFailure { name: "database", ref problem, .. }) if problem.contains("must not be a symlink")),
+            "symlinked database parent should fail: {result:?}"
+        );
     }
 
     #[test]
@@ -3620,6 +3836,90 @@ second body
             .unwrap();
         assert_eq!(rows[0].get_named::<i64>("count").expect("message count"), 2);
         assert_eq!(rows[0].get_named::<i64>("max_id").expect("max id"), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_integrity_does_not_recover_from_archive_through_symlinked_storage_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("corrupt.db");
+        let real_storage_root = dir.path().join("real-storage");
+        let linked_storage_root = dir.path().join("linked-storage");
+
+        std::fs::write(&db_path, b"not-a-sqlite-db").unwrap();
+
+        let proj = real_storage_root.join("projects").join("test");
+        let agent_dir = proj.join("agents").join("RedFox");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"RedFox","role":"Tester","model":"test","registered_ts":"2026-01-01T00:00:00"}"#,
+        )
+        .unwrap();
+        symlink(&real_storage_root, &linked_storage_root).unwrap();
+
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = linked_storage_root;
+
+        let result = probe_integrity(&config);
+        assert!(
+            matches!(result, ProbeResult::Ok { .. }),
+            "probe_integrity should still recover without trusting a symlinked archive root: {result:?}"
+        );
+
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref()).unwrap();
+        let table_rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'projects'",
+                &[],
+            )
+            .unwrap();
+        let has_projects_table = table_rows[0]
+            .get_named::<i64>("count")
+            .expect("projects table count")
+            > 0;
+        if has_projects_table {
+            let rows = conn
+                .query_sync("SELECT COUNT(*) AS count FROM projects", &[])
+                .unwrap();
+            assert_eq!(
+                rows[0].get_named::<i64>("count").expect("project count"),
+                0,
+                "startup recovery must not import archive state through a symlinked storage root"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_integrity_rejects_symlinked_database_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_db = dir.path().join("real-corrupt.db");
+        let linked_db = dir.path().join("linked-corrupt.db");
+        std::fs::write(&real_db, b"not-a-sqlite-db").unwrap();
+        symlink(&real_db, &linked_db).unwrap();
+
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", linked_db.display());
+
+        let result = probe_integrity(&config);
+        assert!(
+            matches!(result, ProbeResult::Fail(ProbeFailure { name: "integrity", ref problem, .. }) if problem.contains("must not be a symlink")),
+            "symlinked database path should fail integrity probe: {result:?}"
+        );
+        assert_eq!(std::fs::read(&real_db).unwrap(), b"not-a-sqlite-db");
+        assert!(
+            std::fs::symlink_metadata(&linked_db)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]

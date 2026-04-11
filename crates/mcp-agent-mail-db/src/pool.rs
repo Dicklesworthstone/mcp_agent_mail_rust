@@ -3371,6 +3371,7 @@ fn ensure_sqlite_parent_dir_exists(path: &str) -> Result<(), SqlError> {
     if path == ":memory:" {
         return Ok(());
     }
+    validate_sqlite_target_path(Path::new(path), "sqlite database path")?;
     if let Some(parent) = Path::new(path).parent()
         && !parent.as_os_str().is_empty()
         && !parent.exists()
@@ -3379,6 +3380,54 @@ fn ensure_sqlite_parent_dir_exists(path: &str) -> Result<(), SqlError> {
             SqlError::Custom(format!("failed to create db dir {}: {e}", parent.display()))
         })?;
     }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_validation_anchor(path: &Path) -> Result<PathBuf, SqlError> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .map_err(|e| {
+            SqlError::Custom(format!(
+                "failed to resolve current directory while validating sqlite path {}: {e}",
+                path.display()
+            ))
+        })
+}
+
+#[allow(clippy::result_large_err)]
+pub(crate) fn validate_sqlite_target_path(path: &Path, label: &str) -> Result<(), SqlError> {
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
+
+    let anchored = sqlite_validation_anchor(path)?;
+    let mut current = PathBuf::new();
+    for component in anchored.components() {
+        current.push(component.as_os_str());
+        let metadata = match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(SqlError::Custom(format!(
+                    "failed to inspect {label} {} at {}: {error}",
+                    path.display(),
+                    current.display()
+                )));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(SqlError::Custom(format!(
+                "refusing {label} {} because it traverses symlinked path {}",
+                path.display(),
+                current.display()
+            )));
+        }
+    }
+
     Ok(())
 }
 
@@ -4227,7 +4276,7 @@ fn is_real_file(path: &Path) -> bool {
 }
 
 fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
-    let mut candidates: Vec<(u8, SystemTime, PathBuf)> = Vec::new();
+    let mut candidates: Vec<(SystemTime, bool, u8, PathBuf)> = Vec::new();
     let Some(file_name) = primary_path.file_name() else {
         return Vec::new();
     };
@@ -4244,7 +4293,7 @@ fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
             .metadata()
             .and_then(|meta| meta.modified())
             .unwrap_or(SystemTime::UNIX_EPOCH);
-        candidates.push((0, modified, bak));
+        candidates.push((modified, true, 0, bak));
     }
 
     let backup_prefix = os_string_with_suffix(file_name, ".backup-");
@@ -4273,12 +4322,17 @@ fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
                 .metadata()
                 .and_then(|meta| meta.modified())
                 .unwrap_or(SystemTime::UNIX_EPOCH);
-            candidates.push((priority, modified, path));
+            candidates.push((modified, false, priority, path));
         }
     }
 
-    candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
-    candidates.into_iter().map(|(_, _, p)| p).collect()
+    candidates.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| b.3.cmp(&a.3))
+    });
+    candidates.into_iter().map(|(_, _, _, p)| p).collect()
 }
 
 fn find_healthy_backup(primary_path: &Path) -> Option<PathBuf> {
@@ -5532,7 +5586,7 @@ fn reinitialize_without_backup(primary_path: &Path) -> Result<(), SqlError> {
 /// Runs layered health probes (`quick_check`, `integrity_check(1)`, and
 /// a schema-aware query smoke test) on the file. If corruption is detected:
 ///
-/// 1. Search for a healthy `.bak` / `.bak.*` / `.backup-*` / `.recovery*` sibling.
+/// 1. Search for the freshest healthy `.bak` / `.bak.*` / `.backup-*` / `.recovery*` sibling.
 /// 2. Quarantine the corrupt file (rename to `*.corrupt-{timestamp}`).
 /// 3. Restore from the first healthy backup found.
 /// 4. If no healthy backup exists, reinitialize an empty database file.
@@ -5541,6 +5595,7 @@ fn reinitialize_without_backup(primary_path: &Path) -> Result<(), SqlError> {
 /// originally or after successful recovery).
 #[allow(clippy::result_large_err)]
 pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
+    validate_sqlite_target_path(primary_path, "sqlite recovery target")?;
     let exists = primary_path.exists();
     if exists {
         cleanup_empty_wal_sidecar(primary_path.to_string_lossy().as_ref());
@@ -5599,7 +5654,7 @@ pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
 /// database from the Git archive before falling back to a blank reinitialize.
 ///
 /// Recovery priority:
-/// 1. `.bak` / `.bak.*` / `.backup-*` / `.recovery*` backup files
+/// 1. The freshest healthy `.bak` / `.bak.*` / `.backup-*` / `.recovery*` backup file
 /// 2. Git archive reconstruction (recovers messages + agents)
 /// 3. Blank reinitialization (empty database)
 #[allow(clippy::too_many_lines)]
@@ -5608,6 +5663,7 @@ pub fn ensure_sqlite_file_healthy_with_archive(
     primary_path: &Path,
     storage_root: &Path,
 ) -> Result<(), SqlError> {
+    validate_sqlite_target_path(primary_path, "sqlite archive recovery target")?;
     if !archive_storage_root_is_authoritative_for_sqlite_path(storage_root, primary_path) {
         if !primary_path.exists() {
             return Ok(());
@@ -6714,20 +6770,21 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_backup_candidates_prioritize_dot_bak() {
+    fn sqlite_backup_candidates_prefer_newer_timestamped_backup_over_stale_dot_bak() {
         let dir = tempfile::tempdir().expect("tempdir");
         let primary = dir.path().join("storage.sqlite3");
         let dot_bak = dir.path().join("storage.sqlite3.bak");
-        let backup_series = dir.path().join("storage.sqlite3.backup-20260212_000000");
+        let backup_series = dir.path().join("storage.sqlite3.bak.20260212_000000");
         std::fs::write(&primary, b"primary").expect("write primary");
         std::fs::write(&dot_bak, b"bak").expect("write .bak");
-        std::fs::write(&backup_series, b"series").expect("write backup-");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&backup_series, b"series").expect("write timestamped .bak series");
 
         let candidates = sqlite_backup_candidates(&primary);
         assert_eq!(
             candidates.first().map(PathBuf::as_path),
-            Some(dot_bak.as_path()),
-            ".bak should be first-priority backup candidate"
+            Some(backup_series.as_path()),
+            "newer timestamped backups should outrank an older sibling .bak"
         );
     }
 
@@ -6798,9 +6855,8 @@ mod tests {
         std::fs::write(&backup_series, b"series").expect("write backup series");
 
         let candidates = sqlite_backup_candidates(&primary);
-        assert_eq!(
-            candidates.first().map(PathBuf::as_path),
-            Some(dot_bak.as_path()),
+        assert!(
+            candidates.iter().any(|candidate| candidate == &dot_bak),
             "non-UTF-8 primary names should still resolve their .bak candidate"
         );
         assert!(
@@ -6870,6 +6926,27 @@ mod tests {
         assert!(
             corrupt_artifacts >= 1,
             "expected quarantined corrupt artifact(s) after recovery"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_sqlite_file_healthy_rejects_symlinked_database_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_db = dir.path().join("real.sqlite3");
+        let conn = open_sqlite_file_with_recovery(real_db.to_str().unwrap()).unwrap();
+        drop(conn);
+
+        let linked_db = dir.path().join("linked.sqlite3");
+        symlink(&real_db, &linked_db).unwrap();
+
+        let err = ensure_sqlite_file_healthy(&linked_db)
+            .expect_err("symlinked sqlite recovery targets must be rejected");
+        assert!(
+            err.to_string().contains("symlinked path"),
+            "unexpected error: {err}"
         );
     }
 
@@ -9563,6 +9640,30 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn archive_recovery_rejects_symlinked_database_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_db = dir.path().join("real.sqlite3");
+        let linked_db = dir.path().join("linked.sqlite3");
+        let storage_root = dir.path().join("storage");
+
+        let conn = open_sqlite_file_with_recovery(real_db.to_str().unwrap()).unwrap();
+        drop(conn);
+
+        std::fs::create_dir_all(storage_root.join("projects")).unwrap();
+        symlink(&real_db, &linked_db).unwrap();
+
+        let err = ensure_sqlite_file_healthy_with_archive(&linked_db, &storage_root)
+            .expect_err("symlinked sqlite archive recovery targets must be rejected");
+        assert!(
+            err.to_string().contains("symlinked path"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// Archive-aware recovery must fail closed when a real DB was quarantined
     /// and no backup/archive path can produce a healthy replacement.
     #[test]
@@ -10276,6 +10377,26 @@ mod tests {
         assert!(ensure_sqlite_parent_dir_exists(db_path.to_str().unwrap()).is_ok());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ensure_parent_dir_rejects_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real_parent = tmp.path().join("real-parent");
+        let linked_parent = tmp.path().join("linked-parent");
+        std::fs::create_dir_all(&real_parent).unwrap();
+        symlink(&real_parent, &linked_parent).unwrap();
+        let db_path = linked_parent.join("test.sqlite3");
+
+        let err = ensure_sqlite_parent_dir_exists(db_path.to_str().unwrap())
+            .expect_err("symlinked parent directories must be rejected");
+        assert!(
+            err.to_string().contains("symlinked path"),
+            "unexpected error: {err}"
+        );
+    }
+
     // ── open_sqlite_file_with_recovery ──────────────────────────────────
 
     #[test]
@@ -10311,6 +10432,51 @@ mod tests {
         let conn = open_sqlite_file_with_recovery(db_path.to_str().unwrap()).unwrap();
         let rows = conn.query_sync("SELECT 1 AS val", &[]).unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_sqlite_file_with_recovery_rejects_symlinked_database_path() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real_db = tmp.path().join("real.sqlite3");
+        let conn = open_sqlite_file_with_recovery(real_db.to_str().unwrap()).unwrap();
+        drop(conn);
+
+        let linked_db = tmp.path().join("linked.sqlite3");
+        symlink(&real_db, &linked_db).unwrap();
+
+        let err = match open_sqlite_file_with_recovery(linked_db.to_str().unwrap()) {
+            Ok(_) => panic!("symlinked sqlite targets must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("symlinked path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_sqlite_file_with_recovery_rejects_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real_parent = tmp.path().join("real-parent");
+        let linked_parent = tmp.path().join("linked-parent");
+        std::fs::create_dir_all(&real_parent).unwrap();
+        symlink(&real_parent, &linked_parent).unwrap();
+        let db_path = linked_parent.join("test.sqlite3");
+
+        let err = match open_sqlite_file_with_recovery(db_path.to_str().unwrap()) {
+            Ok(_) => panic!("symlinked sqlite parent directories must be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("symlinked path"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
