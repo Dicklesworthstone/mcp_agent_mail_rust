@@ -3485,7 +3485,7 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
         result: &mut HealResult,
         metadata_candidates: &mut Vec<PathBuf>,
     ) -> std::io::Result<()> {
-        if !dir.is_dir() {
+        if path_existing_prefix_has_symlink(dir)? || !path_is_nonsymlink_dir(dir) {
             return Ok(());
         }
         for entry in fs::read_dir(dir)? {
@@ -3511,7 +3511,7 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
         result: &mut HealResult,
         metadata_candidates: &mut Vec<PathBuf>,
     ) -> std::io::Result<()> {
-        if !dir.is_dir() {
+        if path_existing_prefix_has_symlink(dir)? || !path_is_nonsymlink_dir(dir) {
             return Ok(());
         }
         for entry in fs::read_dir(dir)? {
@@ -3532,7 +3532,7 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
         let mut seen: HashSet<PathBuf> = HashSet::new();
 
         let mut push_dir = |dir: PathBuf| {
-            if dir.is_dir() && seen.insert(dir.clone()) {
+            if path_is_nonsymlink_dir(&dir) && seen.insert(dir.clone()) {
                 dirs.push(dir);
             }
         };
@@ -3542,11 +3542,11 @@ pub fn heal_archive_locks(config: &Config) -> Result<HealResult> {
 
         let projects_dir = root.join("projects");
         push_dir(projects_dir.clone());
-        if projects_dir.is_dir() {
+        if path_is_nonsymlink_dir(&projects_dir) {
             for entry in fs::read_dir(&projects_dir)? {
                 let entry = entry?;
                 let file_type = entry.file_type()?;
-                if file_type.is_dir() {
+                if file_type.is_dir() && !file_type.is_symlink() {
                     push_dir(entry.path());
                 }
             }
@@ -6709,7 +6709,7 @@ pub fn list_message_files(dir: &Path) -> Result<Vec<PathBuf>> {
 
 /// Recursively collect .md files from a directory tree.
 fn walk_md_files(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    if !dir.is_dir() {
+    if path_existing_prefix_has_symlink(dir)? || !path_is_nonsymlink_dir(dir) {
         return Ok(());
     }
     for entry in fs::read_dir(dir)? {
@@ -6745,6 +6745,9 @@ pub fn list_agent_outbox(archive: &ProjectArchive, agent_name: &str) -> Result<V
 /// List all agents with profiles in the archive.
 pub fn list_archive_agents(archive: &ProjectArchive) -> Result<Vec<String>> {
     let agents_dir = archive.root.join("agents");
+    if path_existing_prefix_has_symlink(&agents_dir).unwrap_or(true) {
+        return Ok(Vec::new());
+    }
 
     let mut agents = Vec::new();
     let iter = match fs::read_dir(&agents_dir) {
@@ -6753,9 +6756,10 @@ pub fn list_archive_agents(archive: &ProjectArchive) -> Result<Vec<String>> {
     };
     for entry in iter {
         let entry = entry?;
-        if entry.path().is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() && !file_type.is_symlink() {
             let profile = entry.path().join("profile.json");
-            if profile.exists()
+            if path_is_nonsymlink_file(&profile)
                 && let Some(name) = entry.file_name().to_str()
             {
                 agents.push(name.to_string());
@@ -6777,7 +6781,10 @@ pub fn read_agent_profile(
         .join("agents")
         .join(agent_name)
         .join("profile.json");
-    if !profile_path.exists() {
+    if path_existing_prefix_has_symlink(profile_path.parent().unwrap_or(Path::new(".")))
+        .unwrap_or(true)
+        || !path_is_nonsymlink_file(&profile_path)
+    {
         return Ok(None);
     }
     let content = fs::read_to_string(&profile_path)?;
@@ -6825,15 +6832,19 @@ pub fn collect_lock_status(config: &Config) -> Result<serde_json::Value> {
 
     // Walk the archive root looking for .lock files
     fn walk_locks(dir: &Path, locks: &mut Vec<serde_json::Value>) -> std::io::Result<()> {
-        if !dir.is_dir() {
+        if path_existing_prefix_has_symlink(dir)? || !path_is_nonsymlink_dir(dir) {
             return Ok(());
         }
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
             let path = entry.path();
-            if path.is_dir() {
+            if file_type.is_dir() {
                 walk_locks(&path, locks)?;
-            } else if path.extension().is_some_and(|e| e == "lock") {
+            } else if file_type.is_file() && path.extension().is_some_and(|e| e == "lock") {
                 let metadata = fs::metadata(&path)?;
                 let modified = metadata
                     .modified()
@@ -6849,7 +6860,8 @@ pub fn collect_lock_status(config: &Config) -> Result<serde_json::Value> {
 
                 // Check for owner metadata (read directly — avoids TOCTOU with exists())
                 let owner_path = path.with_extension("lock.owner.json");
-                if let Ok(content) = fs::read_to_string(&owner_path)
+                if path_is_nonsymlink_file(&owner_path)
+                    && let Ok(content) = fs::read_to_string(&owner_path)
                     && let Ok(owner) = serde_json::from_str::<serde_json::Value>(&content)
                     && let Some(obj) = locks.last_mut().and_then(|v| v.as_object_mut())
                 {
@@ -9733,6 +9745,34 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_heal_archive_locks_skips_symlinked_project_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        ensure_archive_root(&config).unwrap();
+
+        let outside = tmp.path().join("outside-project");
+        let outside_lock = outside.join("escape.lock");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(&outside_lock, "lock contents").unwrap();
+        let linked_project = tmp.path().join("projects").join("linked");
+        fs::create_dir_all(linked_project.parent().unwrap()).unwrap();
+        symlink(&outside, &linked_project).unwrap();
+
+        let result = heal_archive_locks(&config).unwrap();
+        assert!(
+            outside_lock.exists(),
+            "healer must not remove locks through a symlinked project directory"
+        );
+        assert!(
+            result.locks_removed.is_empty(),
+            "symlinked project directories must be skipped during healing"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Attachment pipeline tests
     // -----------------------------------------------------------------------
@@ -10390,6 +10430,30 @@ mod tests {
         assert!(empty.is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_list_agent_inbox_skips_symlinked_inbox_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "list-proj").unwrap();
+
+        let outside_inbox = tmp.path().join("outside-inbox").join("2026").join("01");
+        fs::create_dir_all(&outside_inbox).unwrap();
+        fs::write(outside_inbox.join("escape.md"), "outside message").unwrap();
+
+        let agent_dir = archive.root.join("agents").join("Recipient");
+        fs::create_dir_all(&agent_dir).unwrap();
+        symlink(outside_inbox.parent().unwrap().parent().unwrap(), agent_dir.join("inbox")).unwrap();
+
+        let inbox = list_agent_inbox(&archive, "Recipient").unwrap();
+        assert!(
+            inbox.is_empty(),
+            "symlinked inbox directories must not be traversed"
+        );
+    }
+
     #[test]
     fn test_list_archive_agents() {
         let tmp = TempDir::new().unwrap();
@@ -10403,6 +10467,47 @@ mod tests {
 
         let agents = list_archive_agents(&archive).unwrap();
         assert_eq!(agents, vec!["Alice", "Bob"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_list_archive_agents_skips_symlinked_entries() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "agents-proj").unwrap();
+
+        let real_agent = serde_json::json!({"name": "Alice", "program": "test"});
+        write_agent_profile_with_config(&archive, &config, &real_agent).unwrap();
+
+        let outside_agent = tmp.path().join("outside-agent");
+        fs::create_dir_all(&outside_agent).unwrap();
+        fs::write(
+            outside_agent.join("profile.json"),
+            serde_json::json!({"name": "Ghost", "program": "outside"}).to_string(),
+        )
+        .unwrap();
+        symlink(
+            &outside_agent,
+            archive.root.join("agents").join("Ghost"),
+        )
+        .unwrap();
+
+        let linked_profile_dir = archive.root.join("agents").join("LinkedProfile");
+        fs::create_dir_all(&linked_profile_dir).unwrap();
+        symlink(
+            outside_agent.join("profile.json"),
+            linked_profile_dir.join("profile.json"),
+        )
+        .unwrap();
+
+        let agents = list_archive_agents(&archive).unwrap();
+        assert_eq!(
+            agents,
+            vec!["Alice"],
+            "symlinked agent directories and profile files must be ignored"
+        );
     }
 
     #[test]
@@ -10423,6 +10528,33 @@ mod tests {
         // Non-existent agent
         let missing = read_agent_profile(&archive, "Ghost").unwrap();
         assert!(missing.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_agent_profile_returns_none_for_symlinked_profile() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "profile-proj").unwrap();
+
+        let outside_profile = tmp.path().join("outside-profile.json");
+        fs::write(
+            &outside_profile,
+            serde_json::json!({"name": "Ghost", "program": "outside"}).to_string(),
+        )
+        .unwrap();
+
+        let linked_profile_dir = archive.root.join("agents").join("Ghost");
+        fs::create_dir_all(&linked_profile_dir).unwrap();
+        symlink(&outside_profile, linked_profile_dir.join("profile.json")).unwrap();
+
+        let profile = read_agent_profile(&archive, "Ghost").unwrap();
+        assert!(
+            profile.is_none(),
+            "symlinked profile files must not be read"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -11009,6 +11141,29 @@ mod tests {
         let owner = &locks[0]["owner"];
         assert_eq!(owner["agent"].as_str().unwrap(), "BlueLake");
         assert_eq!(owner["pid"].as_u64().unwrap(), 1234);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_lock_status_skips_symlinked_lock_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+
+        let outside = tmp.path().join("outside-locks");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("escape.lock"), "lock").unwrap();
+        let linked_project = tmp.path().join("projects").join("linked");
+        fs::create_dir_all(linked_project.parent().unwrap()).unwrap();
+        symlink(&outside, &linked_project).unwrap();
+
+        let result = collect_lock_status(&config).unwrap();
+        let locks = result["locks"].as_array().unwrap();
+        assert!(
+            locks.is_empty(),
+            "symlinked directories must not contribute lock diagnostics"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -13353,6 +13508,25 @@ mod tests {
         for f in &files {
             assert!(f.extension().is_some_and(|e| e == "md"));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_message_files_skips_symlinked_root_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("escape.md"), "outside").unwrap();
+        let linked = dir.path().join("linked");
+        symlink(&outside, &linked).unwrap();
+
+        let files = list_message_files(&linked).unwrap();
+        assert!(
+            files.is_empty(),
+            "symlinked directory roots must not be traversed"
+        );
     }
 
     // -----------------------------------------------------------------------

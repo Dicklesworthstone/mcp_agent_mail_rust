@@ -759,7 +759,10 @@ mod tests {
         let output = base.with_environment(env).with_plan(plan.clone());
         assert!(output.environment.is_some());
         assert_eq!(output.provider, "github_pages");
-        assert_eq!(output.url.as_deref(), Some("https://example.github.io/repo"));
+        assert_eq!(
+            output.url.as_deref(),
+            Some("https://example.github.io/repo")
+        );
         assert_eq!(output.bundle_path, "/tmp/bundle");
         assert_eq!(
             output.plan.expect("plan should be set").provider,
@@ -798,7 +801,10 @@ mod tests {
         assert_eq!(output.provider, "github_pages");
         assert_eq!(output.url.as_deref(), Some("https://actual.example.test"));
         assert_eq!(output.bundle_path, "/tmp/actual-bundle");
-        assert_eq!(output.plan.expect("plan should be set").bundle_path, plan.bundle_path);
+        assert_eq!(
+            output.plan.expect("plan should be set").bundle_path,
+            plan.bundle_path
+        );
     }
 
     #[test]
