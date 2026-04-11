@@ -2513,6 +2513,7 @@ dependencies = [
  "arc-swap",
  "bitflags",
  "crossterm 0.29.0",
+ "libc",
  "signal-hook 0.4.3",
  "tracing",
  "unicode-display-width",

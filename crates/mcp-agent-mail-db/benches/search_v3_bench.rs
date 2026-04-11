@@ -19,34 +19,46 @@
 //! ```
 
 #![forbid(unsafe_code)]
-#![cfg(feature = "tantivy-engine")]
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_precision_loss
 )]
 
+#[cfg(feature = "tantivy-engine")]
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+#[cfg(feature = "tantivy-engine")]
 use mcp_agent_mail_db::search_planner::SearchQuery;
+#[cfg(feature = "tantivy-engine")]
 use mcp_agent_mail_db::search_v3::TantivyBridge;
+#[cfg(feature = "tantivy-engine")]
 use serde::Serialize;
+#[cfg(feature = "tantivy-engine")]
 use std::hint::black_box;
+#[cfg(feature = "tantivy-engine")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "tantivy-engine")]
 use std::sync::Once;
+#[cfg(feature = "tantivy-engine")]
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+#[cfg(feature = "tantivy-engine")]
 use tantivy::doc;
+#[cfg(feature = "tantivy-engine")]
 use tempfile::TempDir;
 
 // ── Constants ─────────────────────────────────────────────────────────
 
+#[cfg(feature = "tantivy-engine")]
 const VOCAB: [&str; 10] = [
     "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
 ];
 
+#[cfg(feature = "tantivy-engine")]
 const NEEDLE_INTERVAL: usize = 97;
 
 // ── Scenarios ─────────────────────────────────────────────────────────
 
+#[cfg(feature = "tantivy-engine")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LexicalScenario {
     Small,
@@ -54,6 +66,7 @@ enum LexicalScenario {
     Large,
 }
 
+#[cfg(feature = "tantivy-engine")]
 impl LexicalScenario {
     const fn name(self) -> &'static str {
         match self {
@@ -94,6 +107,7 @@ impl LexicalScenario {
 
 // ── Result types ──────────────────────────────────────────────────────
 
+#[cfg(feature = "tantivy-engine")]
 #[derive(Debug, Clone, Serialize)]
 struct ScenarioResult {
     scenario: String,
@@ -113,6 +127,7 @@ struct ScenarioResult {
     throughput_qps: f64,
 }
 
+#[cfg(feature = "tantivy-engine")]
 #[derive(Debug, Clone, Serialize)]
 struct IndexBuildResult {
     doc_count: usize,
@@ -122,6 +137,7 @@ struct IndexBuildResult {
     throughput_docs_per_sec: f64,
 }
 
+#[cfg(feature = "tantivy-engine")]
 #[derive(Debug, Clone, Serialize)]
 struct DiskOverhead {
     doc_count: usize,
@@ -129,6 +145,7 @@ struct DiskOverhead {
     bytes_per_doc: f64,
 }
 
+#[cfg(feature = "tantivy-engine")]
 #[derive(Debug, Clone, Serialize)]
 struct SearchV3BenchRun {
     run_id: String,
@@ -142,6 +159,7 @@ struct SearchV3BenchRun {
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
+#[cfg(feature = "tantivy-engine")]
 fn repo_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is `crates/mcp-agent-mail-db`.
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -150,6 +168,7 @@ fn repo_root() -> PathBuf {
         .expect("repo root")
 }
 
+#[cfg(feature = "tantivy-engine")]
 fn run_id() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -157,6 +176,7 @@ fn run_id() -> String {
     format!("{}_{}", now.as_secs(), std::process::id())
 }
 
+#[cfg(feature = "tantivy-engine")]
 fn artifact_dir(run_id: &str) -> PathBuf {
     repo_root()
         .join("tests")
@@ -166,6 +186,7 @@ fn artifact_dir(run_id: &str) -> PathBuf {
         .join(run_id)
 }
 
+#[cfg(feature = "tantivy-engine")]
 fn percentile_us(mut samples: Vec<u64>, pct: f64) -> u64 {
     if samples.is_empty() {
         return 0;
@@ -179,6 +200,7 @@ fn percentile_us(mut samples: Vec<u64>, pct: f64) -> u64 {
     samples[idx]
 }
 
+#[cfg(feature = "tantivy-engine")]
 fn dir_size_bytes(dir: &Path) -> u64 {
     if !dir.is_dir() {
         return 0;
@@ -204,6 +226,7 @@ fn dir_size_bytes(dir: &Path) -> u64 {
 /// Seed a Tantivy index via `TantivyBridge` with `count` documents.
 ///
 /// Every `NEEDLE_INTERVAL`-th document has "needle" in its subject (for selective queries).
+#[cfg(feature = "tantivy-engine")]
 fn seed_tantivy_bridge(bridge: &TantivyBridge, count: usize) {
     let handles = bridge.handles();
     let mut writer = bridge.index().writer(50_000_000).expect("tantivy writer");
@@ -235,6 +258,7 @@ fn seed_tantivy_bridge(bridge: &TantivyBridge, count: usize) {
     writer.commit().expect("commit");
 }
 
+#[cfg(feature = "tantivy-engine")]
 fn create_seeded_bridge(dir: &Path, count: usize) -> TantivyBridge {
     let bridge = TantivyBridge::open(dir).expect("open bridge");
     seed_tantivy_bridge(&bridge, count);
@@ -244,6 +268,7 @@ fn create_seeded_bridge(dir: &Path, count: usize) -> TantivyBridge {
 // ── Deterministic harness (p50/p95/p99 + artifacts + budget check) ────
 
 #[allow(clippy::too_many_lines)]
+#[cfg(feature = "tantivy-engine")]
 fn run_search_v3_harness_once() {
     static DID_RUN: Once = Once::new();
     DID_RUN.call_once(|| {
@@ -400,6 +425,7 @@ fn run_search_v3_harness_once() {
 
 // ── Criterion: Tantivy lexical search ─────────────────────────────────
 
+#[cfg(feature = "tantivy-engine")]
 fn bench_tantivy_lexical_search(c: &mut Criterion) {
     run_search_v3_harness_once();
 
@@ -437,6 +463,7 @@ fn bench_tantivy_lexical_search(c: &mut Criterion) {
 
 // ── Criterion: Tantivy search with varying query selectivity ──────────
 
+#[cfg(feature = "tantivy-engine")]
 fn bench_tantivy_query_selectivity(c: &mut Criterion) {
     let tmp = TempDir::new().expect("tempdir");
     let index_dir = tmp.path().join("idx");
@@ -469,6 +496,7 @@ fn bench_tantivy_query_selectivity(c: &mut Criterion) {
 
 // ── Criterion: Index build throughput ─────────────────────────────────
 
+#[cfg(feature = "tantivy-engine")]
 fn bench_tantivy_index_build(c: &mut Criterion) {
     let mut group = c.benchmark_group("tantivy_index_build");
     group.sample_size(10);
@@ -495,6 +523,7 @@ fn bench_tantivy_index_build(c: &mut Criterion) {
 
 // ── Criterion: Incremental document add ───────────────────────────────
 
+#[cfg(feature = "tantivy-engine")]
 fn bench_tantivy_incremental_add(c: &mut Criterion) {
     let tmp = TempDir::new().expect("tempdir");
     let index_dir = tmp.path().join("idx");
@@ -544,16 +573,22 @@ fn bench_tantivy_incremental_add(c: &mut Criterion) {
 
 // ── Criterion groups ──────────────────────────────────────────────────
 
+#[cfg(feature = "tantivy-engine")]
 criterion_group!(
     lexical_search,
     bench_tantivy_lexical_search,
     bench_tantivy_query_selectivity,
 );
 
+#[cfg(feature = "tantivy-engine")]
 criterion_group!(
     index_throughput,
     bench_tantivy_index_build,
     bench_tantivy_incremental_add,
 );
 
+#[cfg(feature = "tantivy-engine")]
 criterion_main!(lexical_search, index_throughput);
+
+#[cfg(not(feature = "tantivy-engine"))]
+fn main() {}

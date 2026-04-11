@@ -77,8 +77,6 @@ pub struct ProjectArchive {
     pub root: PathBuf,
     pub repo_root: PathBuf,
     pub lock_path: PathBuf,
-    /// Pre-canonicalized root path — avoids repeated `readlink` syscalls.
-    canonical_root: PathBuf,
     /// Pre-canonicalized repo root path — avoids repeated `readlink` syscalls.
     canonical_repo_root: PathBuf,
 }
@@ -736,10 +734,10 @@ type ArchiveProcessLockKey = PathBuf;
 static ARCHIVE_LOCK_MAP: OnceLock<OrderedRwLock<HashMap<ArchiveProcessLockKey, Arc<Mutex<()>>>>> =
     OnceLock::new();
 
-fn archive_process_lock(archive: &ProjectArchive) -> Arc<Mutex<()>> {
+fn archive_process_lock_for_root(root: PathBuf) -> Arc<Mutex<()>> {
     let map = ARCHIVE_LOCK_MAP
         .get_or_init(|| OrderedRwLock::new(LockLevel::StorageArchiveLockMap, HashMap::new()));
-    let key = archive.canonical_root.clone();
+    let key = root;
 
     // Fast path: read lock for existing entry.
     {
@@ -757,6 +755,12 @@ fn archive_process_lock(archive: &ProjectArchive) -> Arc<Mutex<()>> {
     let lock = Arc::new(Mutex::new(()));
     guard.insert(key, Arc::clone(&lock));
     lock
+}
+
+fn archive_process_lock(archive: &ProjectArchive) -> Result<Arc<Mutex<()>>> {
+    Ok(archive_process_lock_for_root(
+        archive_project_root_canonical_checked(archive)?,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1104,12 +1108,13 @@ pub fn with_project_lock<F, T>(archive: &ProjectArchive, f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
 {
-    let process_lock = archive_process_lock(archive);
+    let process_lock = archive_process_lock(archive)?;
+    let project_root = archive_project_root_checked(archive)?;
     let _guard = process_lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    let mut lock = FileLock::new(archive.lock_path.clone());
+    let mut lock = FileLock::new(project_root.join(".archive.lock"));
     let lock_start = std::time::Instant::now();
     lock.acquire()?;
     mcp_agent_mail_core::global_metrics()
@@ -3759,8 +3764,6 @@ pub fn open_archive(config: &Config, slug: &str) -> Result<Option<ProjectArchive
         return Ok(None);
     }
 
-    let canonical_root =
-        canonicalize_path_cached(&project_root).unwrap_or_else(|_| project_root.clone());
     let canonical_repo_root =
         canonicalize_path_cached(&repo_root).unwrap_or_else(|_| repo_root.clone());
 
@@ -3769,7 +3772,6 @@ pub fn open_archive(config: &Config, slug: &str) -> Result<Option<ProjectArchive
         root: project_root.clone(),
         repo_root,
         lock_path: project_root.join(".archive.lock"),
-        canonical_root,
         canonical_repo_root,
     }))
 }
@@ -3792,8 +3794,6 @@ pub fn ensure_archive(config: &Config, slug: &str) -> Result<ProjectArchive> {
     let project_root = repo_root.join("projects").join(slug);
     ensure_dir(&project_root)?;
 
-    let canonical_root =
-        canonicalize_path_cached(&project_root).unwrap_or_else(|_| project_root.clone());
     let canonical_repo_root =
         canonicalize_path_cached(&repo_root).unwrap_or_else(|_| repo_root.clone());
     Ok(ProjectArchive {
@@ -3801,7 +3801,6 @@ pub fn ensure_archive(config: &Config, slug: &str) -> Result<ProjectArchive> {
         root: project_root.clone(),
         repo_root,
         lock_path: project_root.join(".archive.lock"),
-        canonical_root,
         canonical_repo_root,
     })
 }
@@ -3821,7 +3820,8 @@ pub fn write_project_metadata_with_config(
         ));
     }
 
-    let metadata_path = archive.root.join("project.json");
+    let project_root = archive_project_root_checked(archive)?;
+    let metadata_path = project_root.join("project.json");
     let metadata = serde_json::json!({
         "slug": archive.slug,
         "human_key": human_key,
@@ -3938,7 +3938,8 @@ pub fn write_agent_profile_with_config(
         .unwrap_or("unknown");
     let name = validate_archive_component("agent name", name)?;
 
-    let profile_dir = archive.root.join("agents").join(name);
+    let project_root = archive_project_root_checked(archive)?;
+    let profile_dir = project_root.join("agents").join(name);
     ensure_dir(&profile_dir)?;
 
     let profile_path = profile_dir.join("profile.json");
@@ -4022,7 +4023,8 @@ pub fn write_file_reservation_records(
         normalized_reservations.push((normalized, path_pattern, agent_name));
     }
 
-    let reservation_dir = archive.root.join("file_reservations");
+    let project_root = archive_project_root_checked(archive)?;
+    let reservation_dir = project_root.join("file_reservations");
     ensure_dir(&reservation_dir)?;
 
     for (normalized, path_pattern, agent_name) in normalized_reservations {
@@ -4195,6 +4197,7 @@ pub fn message_paths(
     id: i64,
 ) -> Result<MessageArchivePaths> {
     let sender = validate_archive_component("sender", sender)?;
+    let project_root = archive_project_root_checked(archive)?;
 
     let y = created.format("%Y").to_string();
     let m = created.format("%m").to_string();
@@ -4208,14 +4211,12 @@ pub fn message_paths(
         format!("{iso}__{slug}.md")
     };
 
-    let canonical = archive
-        .root
+    let canonical = project_root
         .join("messages")
         .join(&y)
         .join(&m)
         .join(&filename);
-    let outbox = archive
-        .root
+    let outbox = project_root
         .join("agents")
         .join(sender)
         .join("outbox")
@@ -4226,8 +4227,7 @@ pub fn message_paths(
     for r in recipients {
         let r = validate_archive_component("recipient", r)?;
         inbox.push(
-            archive
-                .root
+            project_root
                 .join("agents")
                 .join(r)
                 .join("inbox")
@@ -4479,7 +4479,8 @@ fn update_thread_digest(
     body_md: &str,
     canonical_rel: &str,
 ) -> Result<String> {
-    let digest_dir = archive.root.join("messages").join("threads");
+    let project_root = archive_project_root_checked(archive)?;
+    let digest_dir = project_root.join("messages").join("threads");
     ensure_dir(&digest_dir)?;
 
     let safe_thread_id = sanitize_thread_id(thread_id);
@@ -4740,7 +4741,8 @@ pub fn store_attachment(
         .unwrap_or_default();
 
     // Ensure attachment directories
-    let attach_dir = archive.root.join("attachments");
+    let project_root = archive_project_root_checked(archive)?;
+    let attach_dir = project_root.join("attachments");
     let webp_dir = attach_dir.join(prefix);
     let manifest_dir = attach_dir.join("_manifests");
     let audit_dir = attach_dir.join("_audit");
@@ -4922,7 +4924,8 @@ pub fn store_raw_attachment(
         .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
         .unwrap_or_default();
 
-    let attach_dir = archive.root.join("attachments");
+    let project_root = archive_project_root_checked(archive)?;
+    let attach_dir = project_root.join("attachments");
     let file_dir = attach_dir.join("files").join(prefix);
     ensure_dir(&file_dir)?;
 
@@ -5561,7 +5564,10 @@ pub fn get_recent_commits(
     limit: usize,
     path_filter: Option<&str>,
 ) -> Result<Vec<CommitInfo>> {
-    let repo = Repository::open(&archive.repo_root)?;
+    let repo = open_archive_repo_checked(archive)?;
+    let path_filter = path_filter
+        .map(|filter| validate_repo_relative_path("path filter", filter))
+        .transpose()?;
 
     let mut revwalk = repo.revwalk()?;
     revwalk.push_head()?;
@@ -5656,7 +5662,8 @@ pub fn find_commit_for_path(
     archive: &ProjectArchive,
     rel_path_str: &str,
 ) -> Result<Option<CommitInfo>> {
-    let repo = Repository::open(&archive.repo_root)?;
+    let repo = open_archive_repo_checked(archive)?;
+    let rel_path_str = validate_repo_relative_path("repo-relative path", rel_path_str)?;
 
     let mut revwalk = repo.revwalk()?;
     revwalk.push_head()?;
@@ -5697,7 +5704,7 @@ pub fn get_commits_by_author(
     author_name: &str,
     limit: usize,
 ) -> Result<Vec<CommitInfo>> {
-    let repo = Repository::open(&archive.repo_root)?;
+    let repo = open_archive_repo_checked(archive)?;
 
     let mut revwalk = repo.revwalk()?;
     revwalk.push_head()?;
@@ -5818,6 +5825,7 @@ pub fn get_recent_commits_extended(
     archive_root: &Path,
     limit: usize,
 ) -> Result<Vec<ExtendedCommitInfo>> {
+    reject_symlinked_archive_root(archive_root)?;
     let repo = Repository::open(archive_root)?;
 
     let mut revwalk = repo.revwalk()?;
@@ -5939,6 +5947,7 @@ pub fn get_commit_detail(
         )));
     }
 
+    reject_symlinked_archive_root(archive_root)?;
     let repo = Repository::open(archive_root)?;
     let oid = git2::Oid::from_str(sha)?;
     let commit = repo.find_commit(oid)?;
@@ -6099,8 +6108,9 @@ pub struct TreeEntry {
 pub fn get_archive_tree(archive: &ProjectArchive, path: &str) -> Result<Vec<TreeEntry>> {
     // Sanitize path to prevent traversal
     let safe_path = sanitize_browse_path(path)?;
+    let project_slug = validate_archive_component("project slug", &archive.slug)?;
 
-    let repo = Repository::open(&archive.repo_root)?;
+    let repo = open_archive_repo_checked(archive)?;
     let head = match repo.head() {
         Ok(h) => h,
         Err(_) => return Ok(Vec::new()),
@@ -6110,9 +6120,9 @@ pub fn get_archive_tree(archive: &ProjectArchive, path: &str) -> Result<Vec<Tree
 
     // Navigate to projects/{slug}/{path}
     let tree_path = if safe_path.is_empty() {
-        format!("projects/{}", archive.slug)
+        format!("projects/{project_slug}")
     } else {
-        format!("projects/{}/{safe_path}", archive.slug)
+        format!("projects/{project_slug}/{safe_path}")
     };
 
     let tree_obj = match root_tree.get_path(std::path::Path::new(&tree_path)) {
@@ -6197,11 +6207,12 @@ pub fn get_archive_file_content(
     max_size_bytes: usize,
 ) -> Result<Option<String>> {
     let safe_path = sanitize_browse_path(path)?;
+    let project_slug = validate_archive_component("project slug", &archive.slug)?;
     if safe_path.is_empty() {
         return Ok(None);
     }
 
-    let repo = Repository::open(&archive.repo_root)?;
+    let repo = open_archive_repo_checked(archive)?;
     let head = match repo.head() {
         Ok(h) => h,
         Err(_) => return Ok(None),
@@ -6209,7 +6220,7 @@ pub fn get_archive_file_content(
     let commit = head.peel_to_commit()?;
     let root_tree = commit.tree()?;
 
-    let full_path = format!("projects/{}/{safe_path}", archive.slug);
+    let full_path = format!("projects/{project_slug}/{safe_path}");
 
     let entry = match root_tree.get_path(std::path::Path::new(&full_path)) {
         Ok(e) => e,
@@ -6249,6 +6260,7 @@ pub fn get_historical_inbox_snapshot(
     limit: usize,
 ) -> Result<serde_json::Value> {
     let limit = limit.clamp(1, 500);
+    let project_slug = validate_archive_component("project slug", &archive.slug)?;
     let agent_name = validate_archive_component("agent name", agent_name)?;
 
     let target_seconds = {
@@ -6277,8 +6289,8 @@ pub fn get_historical_inbox_snapshot(
         }
     };
 
-    let repo = Repository::open(&archive.repo_root)?;
-    let inbox_path = format!("projects/{}/agents/{agent_name}/inbox", archive.slug);
+    let repo = open_archive_repo_checked(archive)?;
+    let inbox_path = format!("projects/{project_slug}/agents/{agent_name}/inbox");
 
     let mut closest_oid: Option<git2::Oid> = None;
 
@@ -6489,6 +6501,8 @@ pub fn get_communication_graph(
     project_slug: &str,
     limit: usize,
 ) -> Result<CommunicationGraph> {
+    let project_slug = validate_archive_component("project slug", project_slug)?;
+    reject_symlinked_archive_root(archive_root)?;
     let repo = Repository::open(archive_root)?;
 
     let mut revwalk = repo.revwalk()?;
@@ -6593,6 +6607,8 @@ pub fn get_timeline_commits(
     project_slug: &str,
     limit: usize,
 ) -> Result<Vec<TimelineEntry>> {
+    let project_slug = validate_archive_component("project slug", project_slug)?;
+    reject_symlinked_archive_root(archive_root)?;
     let repo = Repository::open(archive_root)?;
 
     let mut revwalk = repo.revwalk()?;
@@ -6755,20 +6771,22 @@ fn walk_md_files(dir: &Path, files: &mut Vec<PathBuf>) -> std::io::Result<()> {
 /// Get inbox message files for a specific agent.
 pub fn list_agent_inbox(archive: &ProjectArchive, agent_name: &str) -> Result<Vec<PathBuf>> {
     let agent_name = validate_archive_component("agent name", agent_name)?;
-    let inbox_dir = archive.root.join("agents").join(agent_name).join("inbox");
+    let project_root = archive_project_root_checked(archive)?;
+    let inbox_dir = project_root.join("agents").join(agent_name).join("inbox");
     list_message_files(&inbox_dir)
 }
 
 /// Get outbox message files for a specific agent.
 pub fn list_agent_outbox(archive: &ProjectArchive, agent_name: &str) -> Result<Vec<PathBuf>> {
     let agent_name = validate_archive_component("agent name", agent_name)?;
-    let outbox_dir = archive.root.join("agents").join(agent_name).join("outbox");
+    let project_root = archive_project_root_checked(archive)?;
+    let outbox_dir = project_root.join("agents").join(agent_name).join("outbox");
     list_message_files(&outbox_dir)
 }
 
 /// List all agents with profiles in the archive.
 pub fn list_archive_agents(archive: &ProjectArchive) -> Result<Vec<String>> {
-    let agents_dir = archive.root.join("agents");
+    let agents_dir = archive_project_root_checked(archive)?.join("agents");
     if path_existing_prefix_has_symlink(&agents_dir).unwrap_or(true) {
         return Ok(Vec::new());
     }
@@ -6800,8 +6818,7 @@ pub fn read_agent_profile(
     agent_name: &str,
 ) -> Result<Option<serde_json::Value>> {
     let agent_name = validate_archive_component("agent name", agent_name)?;
-    let profile_path = archive
-        .root
+    let profile_path = archive_project_root_checked(archive)?
         .join("agents")
         .join(agent_name)
         .join("profile.json");
@@ -7192,8 +7209,7 @@ pub fn resolve_archive_relative_path(archive: &ProjectArchive, raw_path: &str) -
             "path must not be empty or root".to_string(),
         ));
     }
-    // Use pre-canonicalized root to avoid repeated readlink syscalls.
-    let root = &archive.canonical_root;
+    let root = archive_project_root_canonical_checked(archive)?;
 
     // Manually normalize the path components to prevent traversal
     // via `foo/../../../etc/passwd` patterns, avoiding the high syscall
@@ -7400,6 +7416,42 @@ fn path_is_nonsymlink_dir(path: &Path) -> bool {
 
 fn path_is_nonsymlink_file(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+}
+
+fn reject_symlinked_archive_root(archive_root: &Path) -> Result<()> {
+    if path_existing_prefix_has_symlink(archive_root)? {
+        return Err(StorageError::InvalidPath(
+            "archive root must not be symlinked".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn open_archive_repo_checked(archive: &ProjectArchive) -> Result<Repository> {
+    reject_symlinked_archive_root(&archive.repo_root)?;
+    Repository::open(&archive.repo_root).map_err(StorageError::from)
+}
+
+fn archive_project_root_checked(archive: &ProjectArchive) -> Result<PathBuf> {
+    let project_slug = validate_archive_component("project slug", &archive.slug)?;
+    reject_symlinked_archive_root(&archive.repo_root)?;
+    let project_root = archive.repo_root.join("projects").join(project_slug);
+    if path_existing_prefix_has_symlink(&project_root)? {
+        return Err(StorageError::InvalidPath(
+            "project archive root must not be symlinked".to_string(),
+        ));
+    }
+    Ok(project_root)
+}
+
+fn archive_project_root_canonical_checked(archive: &ProjectArchive) -> Result<PathBuf> {
+    let project_root = archive_project_root_checked(archive)?;
+    canonicalize_with_existing_prefix(&project_root).map_err(|err| {
+        StorageError::InvalidPath(format!(
+            "project archive root is not accessible: {} ({err})",
+            project_root.display()
+        ))
+    })
 }
 
 fn path_existing_prefix_has_symlink(path: &Path) -> std::io::Result<bool> {
@@ -7744,7 +7796,6 @@ mod tests {
 
         assert_eq!(opened.slug, created.slug);
         assert_eq!(opened.root, created.root);
-        assert_eq!(opened.canonical_root, created.canonical_root);
     }
 
     #[cfg(unix)]
@@ -7816,6 +7867,24 @@ mod tests {
     }
 
     #[test]
+    fn test_write_project_metadata_ignores_forged_archive_root() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "proj").unwrap();
+        let real_root = archive.root.clone();
+        let forged_root = tmp.path().join("outside-project");
+
+        archive.root = forged_root.clone();
+        write_project_metadata_with_config(&archive, &config, "/tmp/proj").unwrap();
+
+        assert!(real_root.join("project.json").exists());
+        assert!(
+            !forged_root.exists(),
+            "forged archive.root must not receive project metadata writes"
+        );
+    }
+
+    #[test]
     fn test_write_agent_profile() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -7851,6 +7920,31 @@ mod tests {
     }
 
     #[test]
+    fn test_write_agent_profile_ignores_forged_archive_root() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "proj").unwrap();
+        let real_root = archive.root.clone();
+        let forged_root = tmp.path().join("outside-project");
+
+        archive.root = forged_root.clone();
+
+        let agent = serde_json::json!({
+            "name": "TestAgent",
+            "program": "test",
+            "model": "test-model",
+        });
+
+        write_agent_profile_with_config(&archive, &config, &agent).unwrap();
+
+        assert!(real_root.join("agents/TestAgent/profile.json").exists());
+        assert!(
+            !forged_root.exists(),
+            "forged archive.root must not receive profile writes"
+        );
+    }
+
+    #[test]
     fn test_write_file_reservation_record() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -7871,6 +7965,32 @@ mod tests {
 
         let id_path = res_dir.join("id-42.json");
         assert!(id_path.exists());
+    }
+
+    #[test]
+    fn test_write_file_reservation_record_ignores_forged_archive_root() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "proj").unwrap();
+        let real_root = archive.root.clone();
+        let forged_root = tmp.path().join("outside-project");
+
+        archive.root = forged_root.clone();
+
+        let reservation = serde_json::json!({
+            "id": 42,
+            "agent": "TestAgent",
+            "path_pattern": "src/**/*.rs",
+            "exclusive": true,
+        });
+
+        write_file_reservation_record(&archive, &config, &reservation).unwrap();
+
+        assert!(real_root.join("file_reservations/id-42.json").exists());
+        assert!(
+            !forged_root.exists(),
+            "forged archive.root must not receive reservation writes"
+        );
     }
 
     #[test]
@@ -8446,6 +8566,50 @@ mod tests {
     }
 
     #[test]
+    fn test_write_message_bundle_ignores_forged_archive_root() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "proj").unwrap();
+        let real_root = archive.root.clone();
+        let forged_root = tmp.path().join("outside-project");
+
+        archive.root = forged_root.clone();
+
+        let message = serde_json::json!({
+            "id": 1,
+            "subject": "Test Message",
+            "created_ts": "2026-01-15T10:00:00Z",
+            "thread_id": "TKT-1",
+            "project": "proj",
+        });
+
+        write_message_bundle(
+            &archive,
+            &config,
+            &message,
+            "Hello world!",
+            "SenderAgent",
+            &["RecipientAgent".to_string()],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        assert!(real_root.join("messages/2026/01").exists());
+        assert!(real_root.join("agents/SenderAgent/outbox/2026/01").exists());
+        assert!(
+            real_root
+                .join("agents/RecipientAgent/inbox/2026/01")
+                .exists()
+        );
+        assert!(real_root.join("messages/threads/tkt-1.md").exists());
+        assert!(
+            !forged_root.exists(),
+            "forged archive.root must not receive message writes"
+        );
+    }
+
+    #[test]
     fn test_list_agent_inbox_rejects_path_traversal() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -8483,6 +8647,19 @@ mod tests {
 
         // Backslash normalization
         assert!(resolve_archive_relative_path(&archive, "..\\..\\etc\\passwd").is_err());
+    }
+
+    #[test]
+    fn test_resolve_archive_relative_path_uses_validated_project_slug() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "proj").unwrap();
+        let other = ensure_archive(&config, "other").unwrap();
+
+        archive.slug = "other".to_string();
+        let resolved = resolve_archive_relative_path(&archive, "target.txt").unwrap();
+        assert!(resolved.starts_with(&other.root));
+        assert!(!resolved.starts_with(tmp.path().join("projects").join("proj")));
     }
 
     #[cfg(unix)]
@@ -9540,6 +9717,88 @@ mod tests {
     }
 
     #[test]
+    fn test_with_project_lock_ignores_forged_lock_path() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "lock-proj").unwrap();
+        let real_lock_path = archive.lock_path.clone();
+        let forged_lock_path = tmp.path().join("outside-locks").join("forged.lock");
+
+        archive.lock_path = forged_lock_path.clone();
+
+        with_project_lock(&archive, || {
+            assert!(real_lock_path.exists(), "real project lock should be held");
+            assert!(
+                !forged_lock_path.exists(),
+                "forged archive.lock_path must not be used"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(
+            !real_lock_path.exists(),
+            "real project lock should be released"
+        );
+        assert!(
+            !forged_lock_path.exists(),
+            "forged archive.lock_path must remain untouched"
+        );
+    }
+
+    #[test]
+    fn test_with_project_lock_uses_validated_project_slug() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "lock-proj").unwrap();
+        let other = ensure_archive(&config, "other-proj").unwrap();
+        let original_lock_path = archive.lock_path.clone();
+
+        archive.slug = "other-proj".to_string();
+
+        with_project_lock(&archive, || {
+            assert!(
+                other.lock_path.exists(),
+                "lock should follow the validated current project slug"
+            );
+            assert!(
+                !original_lock_path.exists(),
+                "stale lock_path from the original archive handle must not be used"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(
+            !other.lock_path.exists(),
+            "other project lock should be released"
+        );
+        assert!(
+            !original_lock_path.exists(),
+            "original project lock path must remain untouched"
+        );
+    }
+
+    #[test]
+    fn test_with_project_lock_rejects_invalid_archive_slug() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "lock-proj").unwrap();
+
+        archive.slug = "../escape".to_string();
+        let err = with_project_lock(&archive, || Ok(()))
+            .expect_err("invalid project slug should be rejected");
+        assert!(
+            err.to_string().contains("project slug"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !archive.lock_path.exists(),
+            "invalid archive slug must not create lock artifacts"
+        );
+    }
+
+    #[test]
     fn test_with_project_lock_allows_same_slug_across_distinct_roots() {
         use std::sync::{
             Arc,
@@ -9555,7 +9814,7 @@ mod tests {
         let archive_b = Arc::new(ensure_archive(&config_b, "shared-slug").unwrap());
 
         assert_ne!(
-            archive_a.canonical_root, archive_b.canonical_root,
+            archive_a.root, archive_b.root,
             "distinct storage roots must produce distinct archive roots"
         );
 
@@ -9931,6 +10190,49 @@ mod tests {
     }
 
     #[test]
+    fn test_store_attachment_ignores_forged_archive_root() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "attach-proj").unwrap();
+        let real_root = archive.root.clone();
+        let forged_root = tmp.path().join("outside-project");
+        let img_path = tmp.path().join("source.png");
+        create_test_png(&img_path);
+
+        archive.root = forged_root.clone();
+        let stored = store_attachment(&archive, &config, &img_path, EmbedPolicy::File).unwrap();
+
+        let stored_rel = stored.meta.path.expect("file attachment path");
+        assert!(archive.repo_root.join(stored_rel).exists());
+        assert!(real_root.join("attachments").exists());
+        assert!(
+            !forged_root.exists(),
+            "forged archive.root must not receive attachment writes"
+        );
+    }
+
+    #[test]
+    fn test_store_raw_attachment_ignores_forged_archive_root() {
+        let tmp = TempDir::new().unwrap();
+        let mut archive = ensure_archive(&test_config(tmp.path()), "raw-attach-proj").unwrap();
+        let real_root = archive.root.clone();
+        let forged_root = tmp.path().join("outside-project");
+        let file_path = tmp.path().join("source.txt");
+        fs::write(&file_path, b"hello raw attachment").unwrap();
+
+        archive.root = forged_root.clone();
+        let stored = store_raw_attachment(&archive, &file_path, 1024 * 1024).unwrap();
+
+        let stored_rel = stored.meta.path.expect("raw attachment path");
+        assert!(archive.repo_root.join(stored_rel).exists());
+        assert!(real_root.join("attachments").exists());
+        assert!(
+            !forged_root.exists(),
+            "forged archive.root must not receive raw attachment writes"
+        );
+    }
+
+    #[test]
     fn test_process_attachments() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -10278,6 +10580,19 @@ mod tests {
     }
 
     #[test]
+    fn test_find_commit_for_path_rejects_invalid_repo_relative_path() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "read-invalid-path-proj").unwrap();
+
+        let err = find_commit_for_path(&archive, "../escape").expect_err("expected invalid path");
+        assert!(
+            err.to_string().contains("repo-relative path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_get_recent_commits_path_filter_includes_deletions() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -10313,6 +10628,60 @@ mod tests {
     }
 
     #[test]
+    fn test_get_recent_commits_rejects_invalid_path_filter() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "invalid-filter-proj").unwrap();
+
+        let err =
+            get_recent_commits(&archive, 10, Some("../escape")).expect_err("expected invalid path");
+        assert!(
+            err.to_string().contains("path filter"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_get_recent_commits_rejects_symlinked_archive_repo_root() {
+        use std::os::unix::fs as unix_fs;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "recent-symlinked-repo-root").unwrap();
+        let linked_root = tmp.path().join("linked-root");
+        unix_fs::symlink(tmp.path(), &linked_root).unwrap();
+        archive.repo_root = linked_root;
+
+        let err = get_recent_commits(&archive, 10, None)
+            .expect_err("expected symlinked archive repo root rejection");
+        assert!(
+            err.to_string().contains("archive root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_commit_for_path_rejects_symlinked_archive_repo_root() {
+        use std::os::unix::fs as unix_fs;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "find-symlinked-repo-root").unwrap();
+        let linked_root = tmp.path().join("linked-root");
+        unix_fs::symlink(tmp.path(), &linked_root).unwrap();
+        archive.repo_root = linked_root;
+
+        let err = find_commit_for_path(&archive, "project.json")
+            .expect_err("expected symlinked archive repo root rejection");
+        assert!(
+            err.to_string().contains("archive root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_get_commits_by_author() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -10325,6 +10694,26 @@ mod tests {
 
         let commits = get_commits_by_author(&archive, &config.git_author_name, 10).unwrap();
         assert!(!commits.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_get_commits_by_author_rejects_symlinked_archive_repo_root() {
+        use std::os::unix::fs as unix_fs;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "author-symlinked-repo-root").unwrap();
+        let linked_root = tmp.path().join("linked-root");
+        unix_fs::symlink(tmp.path(), &linked_root).unwrap();
+        archive.repo_root = linked_root;
+
+        let err = get_commits_by_author(&archive, &config.git_author_name, 10)
+            .expect_err("expected symlinked archive repo root rejection");
+        assert!(
+            err.to_string().contains("archive root"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -10482,6 +10871,213 @@ mod tests {
     }
 
     #[test]
+    fn test_get_archive_tree_rejects_invalid_archive_slug() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "tree-invalid-slug").unwrap();
+        archive.slug = "../escape".to_string();
+
+        let err = get_archive_tree(&archive, "").expect_err("expected invalid slug");
+        assert!(
+            err.to_string().contains("project slug"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_get_archive_tree_rejects_symlinked_archive_repo_root() {
+        use std::os::unix::fs as unix_fs;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "tree-symlinked-repo-root").unwrap();
+        let linked_root = tmp.path().join("linked-root");
+        unix_fs::symlink(tmp.path(), &linked_root).unwrap();
+        archive.repo_root = linked_root;
+
+        let err =
+            get_archive_tree(&archive, "").expect_err("expected symlinked repo root rejection");
+        assert!(
+            err.to_string().contains("archive root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_get_archive_file_content_rejects_invalid_archive_slug() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "file-invalid-slug").unwrap();
+        archive.slug = "../escape".to_string();
+
+        let err = get_archive_file_content(&archive, "project.json", 4096)
+            .expect_err("expected invalid slug");
+        assert!(
+            err.to_string().contains("project slug"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_get_historical_inbox_snapshot_rejects_invalid_archive_slug() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "snapshot-invalid-slug").unwrap();
+        archive.slug = "../escape".to_string();
+
+        let err = get_historical_inbox_snapshot(&archive, "RecipientAgent", "2100-01-01T00:00", 5)
+            .expect_err("expected invalid slug");
+        assert!(
+            err.to_string().contains("project slug"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_get_communication_graph_rejects_invalid_project_slug() {
+        let tmp = TempDir::new().unwrap();
+        let err = get_communication_graph(tmp.path(), "../escape", 10)
+            .expect_err("expected invalid slug");
+        assert!(
+            err.to_string().contains("project slug"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_get_timeline_commits_rejects_invalid_project_slug() {
+        let tmp = TempDir::new().unwrap();
+        let err =
+            get_timeline_commits(tmp.path(), "../escape", 10).expect_err("expected invalid slug");
+        assert!(
+            err.to_string().contains("project slug"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_get_recent_commits_extended_rejects_symlinked_archive_root() {
+        use std::os::unix::fs as unix_fs;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let _archive = ensure_archive(&config, "extended-symlink-root").unwrap();
+        flush_async_commits();
+
+        let linked_root = tmp.path().join("linked-root");
+        unix_fs::symlink(tmp.path(), &linked_root).unwrap();
+
+        let err = get_recent_commits_extended(&linked_root, 10)
+            .expect_err("expected symlinked archive root rejection");
+        assert!(
+            err.to_string().contains("archive root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_get_commit_detail_rejects_symlinked_archive_root() {
+        use std::os::unix::fs as unix_fs;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "commit-detail-symlink-root").unwrap();
+        let agent = serde_json::json!({"name": "CommitDetailAgent", "program": "test"});
+        write_agent_profile_with_config(&archive, &config, &agent).unwrap();
+        flush_async_commits();
+
+        let repo = Repository::open(tmp.path()).unwrap();
+        let head_sha = repo.head().unwrap().target().unwrap().to_string();
+
+        let linked_root = tmp.path().join("linked-root");
+        unix_fs::symlink(tmp.path(), &linked_root).unwrap();
+
+        let err = get_commit_detail(&linked_root, &head_sha, 4096)
+            .expect_err("expected symlinked archive root rejection");
+        assert!(
+            err.to_string().contains("archive root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_get_communication_graph_rejects_symlinked_archive_root() {
+        use std::os::unix::fs as unix_fs;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "graph-symlink-root").unwrap();
+        let message = serde_json::json!({
+            "id": 12,
+            "subject": "Graph test",
+            "created_ts": "2026-01-20T12:00:00Z",
+        });
+        write_message_bundle(
+            &archive,
+            &config,
+            &message,
+            "body",
+            "SenderAgent",
+            &["RecipientAgent".to_string()],
+            &[],
+            None,
+        )
+        .unwrap();
+        flush_async_commits();
+
+        let linked_root = tmp.path().join("linked-root");
+        unix_fs::symlink(tmp.path(), &linked_root).unwrap();
+
+        let err = get_communication_graph(&linked_root, "graph-symlink-root", 10)
+            .expect_err("expected symlinked archive root rejection");
+        assert!(
+            err.to_string().contains("archive root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_get_timeline_commits_rejects_symlinked_archive_root() {
+        use std::os::unix::fs as unix_fs;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "timeline-symlink-root").unwrap();
+        let message = serde_json::json!({
+            "id": 34,
+            "subject": "Timeline test",
+            "created_ts": "2026-01-20T12:00:00Z",
+        });
+        write_message_bundle(
+            &archive,
+            &config,
+            &message,
+            "body",
+            "SenderAgent",
+            &["RecipientAgent".to_string()],
+            &[],
+            None,
+        )
+        .unwrap();
+        flush_async_commits();
+
+        let linked_root = tmp.path().join("linked-root");
+        unix_fs::symlink(tmp.path(), &linked_root).unwrap();
+
+        let err = get_timeline_commits(&linked_root, "timeline-symlink-root", 10)
+            .expect_err("expected symlinked archive root rejection");
+        assert!(
+            err.to_string().contains("archive root"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_get_historical_inbox_snapshot_limit_returns_most_recent_messages() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -10590,6 +11186,30 @@ mod tests {
     }
 
     #[test]
+    fn test_list_agent_inbox_ignores_forged_archive_root() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "list-proj").unwrap();
+
+        let outside_root = tmp.path().join("outside-project");
+        let outside_inbox = outside_root
+            .join("agents")
+            .join("Recipient")
+            .join("inbox")
+            .join("2026")
+            .join("01");
+        fs::create_dir_all(&outside_inbox).unwrap();
+        fs::write(outside_inbox.join("escape.md"), "outside message").unwrap();
+
+        archive.root = outside_root;
+        let inbox = list_agent_inbox(&archive, "Recipient").unwrap();
+        assert!(
+            inbox.is_empty(),
+            "forged archive.root must not redirect inbox reads"
+        );
+    }
+
+    #[test]
     fn test_list_archive_agents() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -10642,6 +11262,29 @@ mod tests {
     }
 
     #[test]
+    fn test_list_archive_agents_ignores_forged_archive_root() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "agents-proj").unwrap();
+
+        let outside_root = tmp.path().join("outside-project");
+        let outside_agent = outside_root.join("agents").join("Ghost");
+        fs::create_dir_all(&outside_agent).unwrap();
+        fs::write(
+            outside_agent.join("profile.json"),
+            serde_json::json!({"name": "Ghost", "program": "outside"}).to_string(),
+        )
+        .unwrap();
+
+        archive.root = outside_root;
+        let agents = list_archive_agents(&archive).unwrap();
+        assert!(
+            agents.is_empty(),
+            "forged archive.root must not redirect agent enumeration"
+        );
+    }
+
+    #[test]
     fn test_read_agent_profile() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -10685,6 +11328,29 @@ mod tests {
         assert!(
             profile.is_none(),
             "symlinked profile files must not be read"
+        );
+    }
+
+    #[test]
+    fn test_read_agent_profile_ignores_forged_archive_root() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "profile-proj").unwrap();
+
+        let outside_root = tmp.path().join("outside-project");
+        let outside_profile_dir = outside_root.join("agents").join("Ghost");
+        fs::create_dir_all(&outside_profile_dir).unwrap();
+        fs::write(
+            outside_profile_dir.join("profile.json"),
+            serde_json::json!({"name": "Ghost", "program": "outside"}).to_string(),
+        )
+        .unwrap();
+
+        archive.root = outside_root;
+        let profile = read_agent_profile(&archive, "Ghost").unwrap();
+        assert!(
+            profile.is_none(),
+            "forged archive.root must not redirect profile reads"
         );
     }
 
@@ -13966,7 +14632,6 @@ mod tests {
             root: project_root.clone(),
             repo_root: dir.path().to_path_buf(),
             lock_path: project_root.join(".archive.lock"),
-            canonical_root: project_root.clone(),
             canonical_repo_root: dir.path().to_path_buf(),
         };
         let result = read_agent_profile(&archive, "RedFox").unwrap();
@@ -14005,7 +14670,6 @@ mod tests {
             root: project_root.clone(),
             repo_root: dir.path().to_path_buf(),
             lock_path: project_root.join(".archive.lock"),
-            canonical_root: project_root.clone(),
             canonical_repo_root: dir.path().to_path_buf(),
         };
         let result = read_agent_profile(&archive, "BlueLake").unwrap();
@@ -14290,7 +14954,6 @@ Test body.
             root: project_root.clone(),
             repo_root: dir.path().to_path_buf(),
             lock_path: project_root.join(".archive.lock"),
-            canonical_root: project_root.clone(),
             canonical_repo_root: dir.path().to_path_buf(),
         };
 
