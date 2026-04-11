@@ -19,6 +19,7 @@ use mcp_agent_mail_core::{
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::{Error as SqlError, Value};
 use sqlmodel_pool::{Pool, PoolConfig, PooledConnection};
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
@@ -420,7 +421,6 @@ pub struct RecoveryAdmissionController {
     /// counters and timestamps, never across the actual recovery I/O.
     state: Mutex<RecoveryAdmissionState>,
 }
-
 /// Interior state protected by the controller's `Mutex`.
 struct RecoveryAdmissionState {
     /// Number of consecutive failures (reset to 0 on success).
@@ -429,7 +429,7 @@ struct RecoveryAdmissionState {
     /// Instant of the most recent recovery attempt (success or failure).
     last_attempt: Option<Instant>,
 
-    /// Ring buffer of attempt timestamps within the current suppression window.
+    /// Ring buffer of failed-attempt timestamps within the current suppression window.
     window_attempts: std::collections::VecDeque<Instant>,
 
     /// If `Some`, the controller has entered suppression mode and will not
@@ -480,13 +480,10 @@ impl RecoveryAdmissionController {
     /// [`report_failure`](Self::report_failure) before the guard drops so
     /// the backoff/window state is updated correctly.
     pub fn try_acquire(&self) -> Option<RecoveryGuard<'_>> {
-        // Fast path: check suppression and backoff without acquiring the Mutex
-        // on every call — but we do need the Mutex to read timestamps safely.
         {
             let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             let now = Instant::now();
 
-            // Check loop suppression.
             if let Some(until) = state.suppressed_until
                 && now < until
             {
@@ -498,10 +495,8 @@ impl RecoveryAdmissionController {
                     "recovery admission suppressed — too many attempts in window"
                 );
                 return None;
-                // Window expired — suppression will be cleared on next state update.
             }
 
-            // Check exponential backoff.
             if state.consecutive_failures > 0
                 && let Some(last) = state.last_attempt
             {
@@ -521,7 +516,6 @@ impl RecoveryAdmissionController {
             }
         }
 
-        // Single-flight CAS.
         if self
             .in_progress
             .compare_exchange(
@@ -539,16 +533,15 @@ impl RecoveryAdmissionController {
         Some(RecoveryGuard { controller: self })
     }
 
-    /// Record a successful recovery. Resets consecutive-failure count and
-    /// clears any active suppression.
+    /// Record a successful recovery. Resets consecutive-failure count,
+    /// clears any active suppression, and forgets the prior failure window.
     pub fn report_success(&self) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
         state.consecutive_failures = 0;
         state.last_attempt = Some(now);
         state.suppressed_until = None;
-        Self::prune_window(&mut state.window_attempts, now);
-        state.window_attempts.push_back(now);
+        state.window_attempts.clear();
     }
 
     /// Record a failed recovery. Increments consecutive-failure count,
@@ -580,7 +573,6 @@ impl RecoveryAdmissionController {
         if consecutive_failures == 0 {
             return Duration::ZERO;
         }
-        // 2^(failures-1) * BASE, capped at BACKOFF_CAP.
         let exponent = (consecutive_failures - 1).min(30);
         let multiplier = 1u64.checked_shl(exponent).unwrap_or(u64::MAX);
         let delay_ms = Self::BACKOFF_BASE
@@ -657,7 +649,7 @@ pub struct RecoveryAdmissionStatus {
     pub in_progress: bool,
     /// Number of consecutive recovery failures.
     pub consecutive_failures: u32,
-    /// Number of recovery attempts within the current sliding window.
+    /// Number of failed recovery attempts within the current sliding window.
     pub attempts_in_window: usize,
     /// Whether loop suppression is currently active.
     pub suppressed: bool,
@@ -674,6 +666,89 @@ static RECOVERY_ADMISSION: OnceLock<RecoveryAdmissionController> = OnceLock::new
 #[must_use]
 pub fn recovery_admission() -> &'static RecoveryAdmissionController {
     RECOVERY_ADMISSION.get_or_init(RecoveryAdmissionController::default)
+}
+
+std::thread_local! {
+    static RECOVERY_ADMISSION_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+struct RecoveryAdmissionDepthGuard;
+
+impl RecoveryAdmissionDepthGuard {
+    fn enter() -> Self {
+        RECOVERY_ADMISSION_DEPTH.with(|depth| {
+            depth.set(depth.get().saturating_add(1));
+        });
+        Self
+    }
+
+    fn is_active() -> bool {
+        RECOVERY_ADMISSION_DEPTH.with(|depth| depth.get() > 0)
+    }
+}
+
+impl Drop for RecoveryAdmissionDepthGuard {
+    fn drop(&mut self) {
+        RECOVERY_ADMISSION_DEPTH.with(|depth| {
+            depth.set(depth.get().saturating_sub(1));
+        });
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn recovery_admission_blocked_error(primary_path: &Path, action: &str) -> SqlError {
+    let status = recovery_admission().status();
+    let detail = if status.in_progress {
+        format!(
+            "{action} for {} is already in progress in another caller",
+            primary_path.display()
+        )
+    } else if status.suppressed {
+        format!(
+            "{action} for {} is temporarily suppressed after {} consecutive failures ({} failed attempts in window)",
+            primary_path.display(),
+            status.consecutive_failures,
+            status.attempts_in_window
+        )
+    } else if status.consecutive_failures > 0 {
+        format!(
+            "{action} for {} is deferred by exponential backoff after {} consecutive failures (current backoff {}s)",
+            primary_path.display(),
+            status.consecutive_failures,
+            status.current_backoff.as_secs()
+        )
+    } else {
+        format!(
+            "{action} for {} was refused by the recovery admission controller",
+            primary_path.display()
+        )
+    };
+    SqlError::Custom(detail)
+}
+
+#[allow(clippy::result_large_err)]
+fn with_recovery_admission<T, F>(
+    primary_path: &Path,
+    action: &'static str,
+    operation: F,
+) -> Result<T, SqlError>
+where
+    F: FnOnce() -> Result<T, SqlError>,
+{
+    if RecoveryAdmissionDepthGuard::is_active() {
+        return operation();
+    }
+
+    let Some(_guard) = recovery_admission().try_acquire() else {
+        return Err(recovery_admission_blocked_error(primary_path, action));
+    };
+    let _depth_guard = RecoveryAdmissionDepthGuard::enter();
+    let result = operation();
+    match &result {
+        Ok(_) => recovery_admission().report_success(),
+        Err(_) => recovery_admission().report_failure(),
+    }
+    result
 }
 
 // ============================================================================
@@ -5447,7 +5522,9 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
     primary_path: &Path,
     storage_root: &Path,
 ) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
-    reconstruct_sqlite_file_with_archive_salvage_inner(primary_path, storage_root, true)
+    with_recovery_admission(primary_path, "archive salvage reconstruction", || {
+        reconstruct_sqlite_file_with_archive_salvage_inner(primary_path, storage_root, true)
+    })
 }
 
 #[allow(clippy::result_large_err)]
@@ -5599,6 +5676,24 @@ pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
     let exists = primary_path.exists();
     if exists {
         cleanup_empty_wal_sidecar(primary_path.to_string_lossy().as_ref());
+        if sqlite_file_is_healthy(primary_path)? {
+            return Ok(());
+        }
+    } else if find_healthy_backup(primary_path).is_none() {
+        return Ok(());
+    }
+
+    with_recovery_admission(primary_path, "automatic sqlite recovery", || {
+        ensure_sqlite_file_healthy_inner(primary_path)
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn ensure_sqlite_file_healthy_inner(primary_path: &Path) -> Result<(), SqlError> {
+    validate_sqlite_target_path(primary_path, "sqlite recovery target")?;
+    let exists = primary_path.exists();
+    if exists {
+        cleanup_empty_wal_sidecar(primary_path.to_string_lossy().as_ref());
     }
     if exists && sqlite_file_is_healthy(primary_path)? {
         return Ok(());
@@ -5634,9 +5729,7 @@ pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
                 backup_path.display()
             )));
         }
-        // If missing originally and restore failed, fall through to reinitialize
     } else if !exists {
-        // Missing file, no backup. Normal fresh startup.
         return Ok(());
     }
 
@@ -5660,6 +5753,38 @@ pub fn ensure_sqlite_file_healthy(primary_path: &Path) -> Result<(), SqlError> {
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::result_large_err)]
 pub fn ensure_sqlite_file_healthy_with_archive(
+    primary_path: &Path,
+    storage_root: &Path,
+) -> Result<(), SqlError> {
+    validate_sqlite_target_path(primary_path, "sqlite archive recovery target")?;
+    if !archive_storage_root_is_authoritative_for_sqlite_path(storage_root, primary_path) {
+        if !primary_path.exists() {
+            return Ok(());
+        }
+        return ensure_sqlite_file_healthy(primary_path);
+    }
+
+    let had_primary = primary_path.exists();
+    if had_primary {
+        cleanup_empty_wal_sidecar(primary_path.to_string_lossy().as_ref());
+        if sqlite_file_is_healthy(primary_path)? {
+            let _ = reconcile_archive_state_before_init(primary_path, storage_root)?;
+            return Ok(());
+        }
+    } else if find_healthy_backup(primary_path).is_none()
+        && (!is_real_directory(storage_root) || !is_real_directory(&storage_root.join("projects")))
+    {
+        return Ok(());
+    }
+
+    with_recovery_admission(primary_path, "automatic sqlite archive recovery", || {
+        ensure_sqlite_file_healthy_with_archive_inner(primary_path, storage_root)
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::result_large_err)]
+fn ensure_sqlite_file_healthy_with_archive_inner(
     primary_path: &Path,
     storage_root: &Path,
 ) -> Result<(), SqlError> {
@@ -5710,7 +5835,6 @@ pub fn ensure_sqlite_file_healthy_with_archive(
         None
     };
 
-    // Priority 1: Restore from backup
     if let Some(backup_path) = find_healthy_backup(primary_path) {
         restore_from_backup(primary_path, &backup_path)?;
         if sqlite_file_is_healthy(primary_path)? {
@@ -5721,7 +5845,6 @@ pub fn ensure_sqlite_file_healthy_with_archive(
             "backup restore didn't produce a healthy file; falling through to archive reconstruction"
         );
     } else if !had_primary {
-        // Missing file, no backup.
         if has_quarantined_primary_artifact(primary_path) {
             return Err(SqlError::Custom(format!(
                 "database file {} is missing but quarantined recovery artifact(s) exist; refusing blank reinitialization without operator action",
@@ -5729,15 +5852,12 @@ pub fn ensure_sqlite_file_healthy_with_archive(
             )));
         }
         if !is_real_directory(storage_root) || !is_real_directory(&storage_root.join("projects")) {
-            // Normal fresh startup (no projects directory).
             return Ok(());
         }
         let _bundle_dir =
             capture_automatic_recovery_bundle(primary_path, storage_root, "reconstruct")?;
-        // Missing file, but archive has projects. We want to reconstruct!
     }
 
-    // Priority 2: Reconstruct from Git archive
     tracing::warn!(
         storage_root = %storage_root.display(),
         "no healthy backup found; attempting database reconstruction from Git archive"
@@ -5791,7 +5911,6 @@ pub fn ensure_sqlite_file_healthy_with_archive(
         )));
     }
 
-    // Priority 3: Blank reinitialization
     reinitialize_without_backup(primary_path)?;
     if sqlite_file_is_healthy(primary_path)? {
         return Ok(());

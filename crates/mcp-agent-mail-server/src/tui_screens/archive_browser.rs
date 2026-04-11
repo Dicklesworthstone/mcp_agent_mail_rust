@@ -21,6 +21,7 @@ use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
 use crate::tui_screens::{HelpEntry, MailScreen, MailScreenMsg};
 use crate::tui_theme::TuiThemePalette;
 use crate::tui_widgets::fancy::SummaryFooter;
+use mcp_agent_mail_storage as storage;
 
 const MAX_PREVIEW_BYTES: u64 = 512 * 1024;
 const ARCHIVE_SPLIT_GAP_THRESHOLD: u16 = 70;
@@ -161,6 +162,43 @@ fn truncate_path_label(path: &str, max_chars: usize) -> String {
     let tail: String = path.chars().rev().take(max_chars - 1).collect();
     let tail: String = tail.chars().rev().collect();
     format!("…{tail}")
+}
+
+fn path_existing_prefix_has_symlink(path: &Path) -> bool {
+    let mut current = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        match std::env::current_dir() {
+            Ok(dir) => dir,
+            Err(_) => return true,
+        }
+    };
+
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            std::path::Component::RootDir => {
+                current.push(Path::new(std::path::MAIN_SEPARATOR_STR));
+            }
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir => current.push(".."),
+            std::path::Component::Normal(part) => current.push(part),
+        }
+
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return true,
+        }
+    }
+
+    false
+}
+
+fn path_is_real_directory(path: &Path) -> bool {
+    !path_existing_prefix_has_symlink(path)
+        && std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
 }
 
 /// Detect content type from file extension.
@@ -304,11 +342,17 @@ impl ArchiveBrowserScreen {
     }
 
     fn choose_archive_project_slug(
-        projects_root: &Path,
+        config: &mcp_agent_mail_core::Config,
         selected_project: Option<&str>,
         projects: &[crate::tui_events::ProjectSummary],
     ) -> Option<String> {
-        let archive_exists = |slug: &str| projects_root.join(slug).is_dir();
+        let projects_root = config.storage_root.join("projects");
+        if !path_is_real_directory(&projects_root) {
+            return None;
+        }
+
+        let archive_exists =
+            |slug: &str| storage::open_archive(config, slug).ok().flatten().is_some();
 
         if let Some(slug) = selected_project.filter(|slug| archive_exists(slug)) {
             return Some(slug.to_string());
@@ -322,13 +366,15 @@ impl ArchiveBrowserScreen {
             return Some(slug.to_string());
         }
 
-        let mut on_disk_projects = std::fs::read_dir(projects_root)
+        let mut on_disk_projects = std::fs::read_dir(&projects_root)
             .ok()?
             .filter_map(|entry| {
                 let entry = entry.ok()?;
-                entry.file_type().ok()?.is_dir().then_some(entry)
+                let file_type = entry.file_type().ok()?;
+                (file_type.is_dir() && !file_type.is_symlink()).then_some(entry)
             })
             .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|slug| archive_exists(slug))
             .collect::<Vec<_>>();
         on_disk_projects.sort();
         on_disk_projects.into_iter().next()
@@ -345,10 +391,12 @@ impl ArchiveBrowserScreen {
             return;
         }
 
-        let projects_root = PathBuf::from(&config.storage_root).join("projects");
+        let mut storage_config = mcp_agent_mail_core::Config::get();
+        storage_config.storage_root = PathBuf::from(&config.storage_root);
+
         let db = state.db_stats_snapshot().unwrap_or_default();
         let project_slug = Self::choose_archive_project_slug(
-            &projects_root,
+            &storage_config,
             self.selected_project.as_deref(),
             &db.projects_list,
         );
@@ -366,14 +414,14 @@ impl ArchiveBrowserScreen {
         let selected_rel_path = self.selected_rel_path();
         let had_preview = self.preview_content.is_some() || !self.preview_path.is_empty();
 
-        let archive_path = projects_root.join(&slug);
-        if !archive_path.is_dir() {
+        let Some(archive) = storage::open_archive(&storage_config, &slug).ok().flatten() else {
             self.archive_root = None;
             self.entries.clear();
             self.tree_state.selected = None;
             self.clear_preview();
             return;
-        }
+        };
+        let archive_path = archive.root;
         self.archive_root = Some(archive_path.clone());
 
         let filter_lower = self.filter.to_lowercase();
@@ -428,11 +476,42 @@ impl ArchiveBrowserScreen {
             self.clear_preview();
             return;
         };
-        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        if !path_is_real_directory(root) {
+            self.preview_path = entry.rel_path.display().to_string();
+            self.preview_type = ContentType::PlainText;
+            self.preview_scroll = 0;
+            self.preview_content =
+                Some("[Invalid archive path: archive root must not be symlinked]".into());
+            return;
+        }
+        let canonical_root = match root.canonicalize() {
+            Ok(path) => path,
+            Err(err) => {
+                self.preview_path = entry.rel_path.display().to_string();
+                self.preview_type = ContentType::PlainText;
+                self.preview_scroll = 0;
+                self.preview_content = Some(format!("[Error resolving archive root: {err}]"));
+                return;
+            }
+        };
 
         let rel_path = entry.rel_path.display().to_string();
-        let full_path = match root.join(&entry.rel_path).canonicalize() {
-            Ok(path) if path.starts_with(&canonical_root) => path,
+        let joined_path = root.join(&entry.rel_path);
+        if path_existing_prefix_has_symlink(&joined_path) {
+            self.preview_path = rel_path;
+            self.preview_type = ContentType::PlainText;
+            self.preview_scroll = 0;
+            self.preview_content = Some("[Invalid archive path: symlinks are not allowed]".into());
+            return;
+        }
+        let full_path = match joined_path.canonicalize() {
+            Ok(path)
+                if path.starts_with(&canonical_root)
+                    && std::fs::symlink_metadata(&path)
+                        .is_ok_and(|meta| meta.file_type().is_file()) =>
+            {
+                path
+            }
             Ok(_) => {
                 self.preview_path = rel_path;
                 self.preview_type = ContentType::PlainText;
@@ -560,6 +639,9 @@ impl ArchiveBrowserScreen {
         expanded_state: &HashSet<PathBuf>,
         entries: &mut Vec<ArchiveEntry>,
     ) {
+        if !path_is_real_directory(dir) {
+            return;
+        }
         if !filter_lower.is_empty() {
             Self::scan_directory_filtered(root, dir, depth, filter_lower, entries);
             return;
@@ -637,6 +719,9 @@ impl ArchiveBrowserScreen {
         filter_lower: &str,
         entries: &mut Vec<ArchiveEntry>,
     ) -> bool {
+        if !path_is_real_directory(dir) {
+            return false;
+        }
         let Ok(read_dir) = std::fs::read_dir(dir) else {
             return false;
         };
@@ -1648,7 +1733,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn load_preview_accepts_symlinked_archive_root() {
+    fn load_preview_rejects_symlinked_archive_root() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let real_root = tmp.path().join("real");
         std::fs::create_dir_all(&real_root).expect("create real root");
@@ -1676,8 +1761,72 @@ mod tests {
         assert_eq!(screen.preview_type, ContentType::PlainText);
         assert_eq!(
             screen.preview_content.as_deref(),
-            Some("hello from symlinked archive")
+            Some("[Invalid archive path: archive root must not be symlinked]")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_entries_skips_symlinked_archive_project_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outside_root = tmp.path().join("outside-project");
+        std::fs::create_dir_all(outside_root.join("messages")).expect("create outside archive");
+        std::fs::write(outside_root.join("messages/note.txt"), "outside")
+            .expect("write outside note");
+
+        let projects_root = tmp.path().join("projects");
+        std::fs::create_dir_all(&projects_root).expect("create projects root");
+        std::os::unix::fs::symlink(&outside_root, projects_root.join("demo"))
+            .expect("create project symlink");
+
+        let config = mcp_agent_mail_core::Config {
+            storage_root: tmp.path().to_path_buf(),
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let state = TuiSharedState::new(&config);
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 1,
+            projects_list: vec![crate::tui_events::ProjectSummary {
+                id: 1,
+                slug: "demo".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let mut screen = ArchiveBrowserScreen::new();
+        screen.refresh_entries(&state);
+
+        assert!(screen.archive_root.is_none());
+        assert!(screen.entries.is_empty());
+    }
+
+    #[test]
+    fn refresh_entries_rejects_invalid_project_slug_from_db_snapshot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outside_root = tmp.path().join("outside-project");
+        std::fs::create_dir_all(outside_root.join("messages")).expect("create outside archive");
+
+        let config = mcp_agent_mail_core::Config {
+            storage_root: tmp.path().to_path_buf(),
+            ..mcp_agent_mail_core::Config::default()
+        };
+        let state = TuiSharedState::new(&config);
+        state.update_db_stats(crate::tui_events::DbStatSnapshot {
+            projects: 1,
+            projects_list: vec![crate::tui_events::ProjectSummary {
+                id: 1,
+                slug: "../outside-project".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let mut screen = ArchiveBrowserScreen::new();
+        screen.refresh_entries(&state);
+
+        assert!(screen.archive_root.is_none());
+        assert!(screen.entries.is_empty());
     }
 
     #[test]

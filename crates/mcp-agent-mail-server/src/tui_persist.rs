@@ -10,7 +10,7 @@
 //! the envfile is written at most once per `SAVE_DEBOUNCE` interval.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -202,7 +202,7 @@ pub fn save_palette_usage(path: &Path, usage: &PaletteUsageMap) -> Result<(), st
 /// Returns an error if the file does not exist, cannot be read, or contains
 /// invalid JSON for the expected schema.
 pub fn load_palette_usage(path: &Path) -> Result<PaletteUsageMap, std::io::Error> {
-    let json = std::fs::read_to_string(path)?;
+    let json = read_persist_text(path)?;
     serde_json::from_str::<PaletteUsageMap>(&json)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
@@ -260,7 +260,7 @@ pub fn save_dismissed_hints(
 pub fn load_dismissed_hints(
     path: &Path,
 ) -> Result<std::collections::HashSet<String>, std::io::Error> {
-    let json = std::fs::read_to_string(path)?;
+    let json = read_persist_text(path)?;
     serde_json::from_str::<std::collections::HashSet<String>>(&json)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
@@ -346,7 +346,7 @@ pub fn save_screen_filter_presets(
 /// Returns an error if the file does not exist, cannot be read, or contains
 /// invalid JSON for the expected schema.
 pub fn load_screen_filter_presets(path: &Path) -> Result<ScreenFilterPresetStore, std::io::Error> {
-    let json = std::fs::read_to_string(path)?;
+    let json = read_persist_text(path)?;
     serde_json::from_str::<ScreenFilterPresetStore>(&json)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
@@ -542,7 +542,7 @@ impl PreferencePersister {
     /// Write preferences to disk.
     fn write_now(&mut self, prefs: &TuiPreferences) -> bool {
         let map = prefs.to_env_map();
-        match update_envfile(&self.path, &map) {
+        match validate_persist_path(&self.path).and_then(|_| update_envfile(&self.path, &map)) {
             Ok(()) => {
                 self.last_saved = Some(prefs.clone());
                 self.dirty_since = None;
@@ -599,7 +599,7 @@ impl PreferencePersister {
     /// Returns the imported preferences on success.
     pub fn import_json(&self) -> Result<TuiPreferences, std::io::Error> {
         let export_path = self.export_path();
-        let json = std::fs::read_to_string(&export_path)?;
+        let json = read_persist_text(&export_path)?;
         TuiPreferences::from_json(&json)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
@@ -614,9 +614,59 @@ impl PreferencePersister {
     }
 }
 
+fn path_existing_prefix_has_symlink(path: &Path) -> Result<bool, std::io::Error> {
+    let mut current = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir()?
+    };
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            Component::CurDir => continue,
+            Component::ParentDir => current.push(".."),
+            Component::Normal(part) => current.push(part),
+        }
+
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(false)
+}
+
+fn validate_persist_path(path: &Path) -> Result<(), std::io::Error> {
+    if path_existing_prefix_has_symlink(path)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("persist path must not include symlinks: {}", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn read_persist_text(path: &Path) -> Result<String, std::io::Error> {
+    validate_persist_path(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("persist path is not a regular file: {}", path.display()),
+        ));
+    }
+    std::fs::read_to_string(path)
+}
+
 fn atomic_write_text(path: &Path, contents: &str) -> Result<(), std::io::Error> {
     use std::io::Write as _;
 
+    validate_persist_path(path)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
     let file_name = path
@@ -939,6 +989,76 @@ mod tests {
                 .to_string_lossy()
                 .contains(".tmp-")
         }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_json_rejects_symlinked_export_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("outside.json");
+        std::fs::write(&outside, b"outside").unwrap();
+
+        let config = Config {
+            console_persist_path: dir.path().join("config.env"),
+            console_auto_save: true,
+            ..Config::default()
+        };
+        let persister = PreferencePersister::new(&config);
+        symlink(&outside, persister.export_path()).unwrap();
+
+        let err = persister
+            .export_json(&TuiPreferences::default())
+            .unwrap_err();
+        assert!(err.to_string().contains("must not include symlinks"));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_json_rejects_symlinked_export_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("outside.json");
+        std::fs::write(&outside, TuiPreferences::default().to_json().unwrap()).unwrap();
+
+        let config = Config {
+            console_persist_path: dir.path().join("config.env"),
+            console_auto_save: true,
+            ..Config::default()
+        };
+        let persister = PreferencePersister::new(&config);
+        symlink(&outside, persister.export_path()).unwrap();
+
+        let err = persister.import_json().unwrap_err();
+        assert!(err.to_string().contains("must not include symlinks"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_now_rejects_symlinked_console_persist_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("outside.env");
+        std::fs::write(&outside, b"OUTSIDE=1\n").unwrap();
+
+        let env_path = dir.path().join("config.env");
+        symlink(&outside, &env_path).unwrap();
+        let config = Config {
+            console_persist_path: env_path,
+            console_auto_save: true,
+            ..Config::default()
+        };
+        let mut persister = PreferencePersister::new(&config);
+
+        assert!(!persister.save_now(&TuiPreferences::default()));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"OUTSIDE=1\n");
     }
 
     #[test]
@@ -1502,6 +1622,46 @@ mod tests {
                 .to_string_lossy()
                 .contains(".tmp-")
         }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn palette_usage_save_rejects_symlinked_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("outside.json");
+        std::fs::write(&outside, b"outside").unwrap();
+
+        let usage_path = dir.path().join("palette_usage.json");
+        symlink(&outside, &usage_path).unwrap();
+
+        let mut usage = PaletteUsageMap::new();
+        usage.insert("screen:dashboard".to_string(), (7, 1_700_000_123_000_000));
+
+        let err = save_palette_usage(&usage_path, &usage).unwrap_err();
+        assert!(err.to_string().contains("must not include symlinks"));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn palette_usage_load_rejects_symlinked_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("outside.json");
+        let mut usage = PaletteUsageMap::new();
+        usage.insert("screen:messages".to_string(), (3, 1_700_000_001_000_000));
+        std::fs::write(&outside, serde_json::to_string_pretty(&usage).unwrap()).unwrap();
+
+        let usage_path = dir.path().join("palette_usage.json");
+        symlink(&outside, &usage_path).unwrap();
+
+        let err = load_palette_usage(&usage_path).unwrap_err();
+        assert!(err.to_string().contains("must not include symlinks"));
     }
 
     #[test]

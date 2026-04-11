@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::detection::detect_environment;
+use crate::detection::{detect_environment, normalize_github_repo_identifier};
 use crate::wizard::{
     DeploymentPlan, DetectedEnvironment, HostingProvider, PlanStep, WizardError, WizardErrorCode,
     WizardInputs,
@@ -117,7 +117,9 @@ pub fn generate_plan(
 
     // Generate provider-specific plan
     let plan = match provider {
-        HostingProvider::GithubPages => generate_github_pages_plan(inputs, &env, &bundle_path)?,
+        HostingProvider::GithubPages => {
+            generate_github_pages_plan(inputs, &env, &bundle_path, &detection_root)?
+        }
         HostingProvider::CloudflarePages => {
             generate_cloudflare_pages_plan(inputs, &env, &bundle_path)?
         }
@@ -134,6 +136,18 @@ pub fn validate_inputs(inputs: &WizardInputs) -> PlanResult<()> {
     // Check bundle path if provided
     if let Some(ref path) = inputs.bundle_path {
         validate_bundle_path(path)?;
+    }
+
+    if let Some(repo) = inputs.github_repo.as_deref()
+        && normalize_github_repo_identifier(repo).is_none()
+    {
+        return Err(WizardError::new(
+            WizardErrorCode::InvalidOption,
+            format!("Invalid GitHub repository identifier: {repo}"),
+        )
+        .with_hint(
+            "Use owner/repo (optionally ending with .git) without spaces or extra path segments",
+        ));
     }
 
     // Validate provider-specific options
@@ -254,6 +268,74 @@ fn has_strong_project_root_marker(path: &Path) -> bool {
 fn is_real_file_or_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
         .is_ok_and(|metadata| metadata.file_type().is_file() || metadata.file_type().is_dir())
+}
+
+fn resolve_path_against_root(root: &Path, path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut resolved = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        root.to_path_buf()
+    };
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::RootDir => resolved.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = resolved.pop();
+            }
+            Component::Normal(segment) => resolved.push(segment),
+        }
+    }
+
+    resolved
+}
+
+fn resolve_git_repo_root(project_root: &Path) -> PathBuf {
+    for ancestor in project_root.ancestors() {
+        if is_real_file_or_dir(&ancestor.join(".git")) {
+            return ancestor.to_path_buf();
+        }
+    }
+    project_root.to_path_buf()
+}
+
+fn validate_github_pages_output_dir(repo_root: &Path, output_dir: &Path) -> PlanResult<()> {
+    if output_dir.strip_prefix(repo_root).is_ok() {
+        return Ok(());
+    }
+
+    Err(WizardError::new(
+        WizardErrorCode::InvalidOption,
+        format!(
+            "GitHub Pages output directory must be inside the repository root: {}",
+            repo_root.display()
+        ),
+    )
+    .with_context(output_dir.display().to_string())
+    .with_hint(
+        "Choose an output directory under the repository root so workflow generation and git staging can include the deployed files",
+    ))
+}
+
+fn github_pages_expected_url(repo: &str) -> Option<String> {
+    let normalized = normalize_github_repo_identifier(repo)?;
+    let mut parts = normalized.split('/');
+    let owner = parts.next()?;
+    let repo_name = parts.next()?;
+    if parts.next().is_some() || owner.is_empty() || repo_name.is_empty() {
+        return None;
+    }
+
+    let pages_host = format!("{owner}.github.io");
+    if repo_name.eq_ignore_ascii_case(&pages_host) {
+        Some(format!("https://{pages_host}"))
+    } else {
+        Some(format!("https://{pages_host}/{repo_name}"))
+    }
 }
 
 fn resolve_provider(
@@ -385,23 +467,40 @@ fn generate_github_pages_plan(
     inputs: &WizardInputs,
     env: &DetectedEnvironment,
     bundle_path: &Path,
+    project_root: &Path,
 ) -> PlanResult<DeploymentPlan> {
     let mut steps = Vec::new();
     let mut generated_files = Vec::new();
     let mut warnings = Vec::new();
+    let repo_root = resolve_git_repo_root(project_root);
 
     // Determine output directory
     let output_dir = inputs
         .output_dir
         .clone()
         .unwrap_or_else(|| bundle_path.parent().unwrap_or(bundle_path).join("docs"));
+    let resolved_output_dir = resolve_path_against_root(project_root, &output_dir);
+    validate_github_pages_output_dir(&repo_root, &resolved_output_dir)?;
+    let output_dir_for_git = resolved_output_dir
+        .strip_prefix(&repo_root)
+        .map_err(|_| {
+            WizardError::new(
+                WizardErrorCode::InvalidOption,
+                format!(
+                    "GitHub Pages output directory must be inside the repository root: {}",
+                    repo_root.display()
+                ),
+            )
+            .with_context(resolved_output_dir.display().to_string())
+        })?
+        .to_path_buf();
 
     // Step 1: Create output directory
     steps.push(PlanStep {
         index: 1,
         id: "create_output_dir".to_string(),
-        description: format!("Create output directory: {}", output_dir.display()),
-        command: Some(format!("mkdir -p {}", quote_path(&output_dir))),
+        description: format!("Create output directory: {}", resolved_output_dir.display()),
+        command: Some(format!("mkdir -p {}", quote_path(&resolved_output_dir))),
         optional: false,
         requires_confirm: false,
     });
@@ -413,19 +512,19 @@ fn generate_github_pages_plan(
         description: format!(
             "Copy bundle from {} to {}",
             bundle_path.display(),
-            output_dir.display()
+            resolved_output_dir.display()
         ),
         command: Some(format!(
             "cp -a {} {}",
             quote_path(&bundle_path.join(".")),
-            quote_path(&output_dir)
+            quote_path(&resolved_output_dir)
         )),
         optional: false,
         requires_confirm: false,
     });
 
     // Step 3: Create .nojekyll
-    let nojekyll = output_dir.join(".nojekyll");
+    let nojekyll = resolved_output_dir.join(".nojekyll");
     steps.push(PlanStep {
         index: 3,
         id: "create_nojekyll".to_string(),
@@ -437,7 +536,7 @@ fn generate_github_pages_plan(
     generated_files.push(nojekyll);
 
     // Step 4: Generate _headers file
-    let headers_file = output_dir.join("_headers");
+    let headers_file = resolved_output_dir.join("_headers");
     steps.push(PlanStep {
         index: 4,
         id: "create_headers".to_string(),
@@ -449,7 +548,7 @@ fn generate_github_pages_plan(
     generated_files.push(headers_file);
 
     // Step 5: Generate GitHub Actions workflow (optional)
-    let workflow_path = PathBuf::from(".github/workflows/deploy-pages.yml");
+    let workflow_path = repo_root.join(".github/workflows/deploy-pages.yml");
     steps.push(PlanStep {
         index: 5,
         id: "create_workflow".to_string(),
@@ -458,45 +557,50 @@ fn generate_github_pages_plan(
         optional: true,
         requires_confirm: true,
     });
-    generated_files.push(workflow_path);
+    generated_files.push(workflow_path.clone());
 
     // Step 6: Git add and commit
+    let workflow_path_for_git = PathBuf::from(".github/workflows/deploy-pages.yml");
     steps.push(PlanStep {
         index: 6,
         id: "git_commit".to_string(),
         description: "Stage and commit changes".to_string(),
-        command: Some(
-            "git add . && git commit -m 'Deploy Agent Mail bundle to GitHub Pages'".to_string(),
-        ),
+        command: Some(format!(
+            "git -C {} add -- {} && if [ -e {} ]; then git -C {} add -- {}; fi && git -C {} commit -m 'Deploy Agent Mail bundle to GitHub Pages'",
+            quote_path(&repo_root),
+            quote_path(&output_dir_for_git),
+            quote_path(&workflow_path),
+            quote_path(&repo_root),
+            quote_path(&workflow_path_for_git),
+            quote_path(&repo_root),
+        )),
         optional: false,
         requires_confirm: true,
     });
 
     // Step 7: Git push
-    let branch = inputs.github_branch.as_deref().unwrap_or("gh-pages");
+    let branch = inputs.github_branch.as_deref().unwrap_or("main");
     steps.push(PlanStep {
         index: 7,
         id: "git_push".to_string(),
         description: format!("Push to {} branch", branch),
-        command: Some(format!("git push origin {}", quote_str(branch))),
+        command: Some(format!(
+            "git -C {} push origin {}",
+            quote_path(&repo_root),
+            quote_str(branch)
+        )),
         optional: false,
         requires_confirm: true,
     });
 
     // Calculate expected URL
-    let expected_url = inputs
-        .github_repo
-        .as_ref()
-        .or(env.github_repo.as_ref())
-        .and_then(|repo| {
-            let parts: Vec<&str> = repo.split('/').collect();
-            if parts.len() == 2 {
-                Some(format!("https://{}.github.io/{}", parts[0], parts[1]))
-            } else {
-                None
-            }
-        })
-        .or_else(|| inputs.base_url.clone());
+    let expected_url = inputs.base_url.clone().or_else(|| {
+        inputs
+            .github_repo
+            .as_ref()
+            .or(env.github_repo.as_ref())
+            .and_then(|repo| github_pages_expected_url(repo))
+    });
 
     // Add warnings
     if !env.is_git_repo {
@@ -570,7 +674,10 @@ fn generate_cloudflare_pages_plan(
         requires_confirm: true,
     });
 
-    let expected_url = Some(format!("https://{project}.pages.dev"));
+    let expected_url = inputs
+        .base_url
+        .clone()
+        .or_else(|| Some(format!("https://{project}.pages.dev")));
 
     Ok(DeploymentPlan {
         provider: HostingProvider::CloudflarePages,
@@ -634,7 +741,10 @@ fn generate_netlify_plan(
         requires_confirm: true,
     });
 
-    let expected_url = Some(format!("https://{site}.netlify.app"));
+    let expected_url = inputs
+        .base_url
+        .clone()
+        .or_else(|| Some(format!("https://{site}.netlify.app")));
 
     Ok(DeploymentPlan {
         provider: HostingProvider::Netlify,
@@ -718,10 +828,11 @@ fn generate_s3_plan(
     }
 
     let expected_url = inputs.base_url.clone().or_else(|| {
-        inputs
-            .cloudfront_id
-            .as_ref()
-            .map(|_| format!("https://{bucket}.s3.amazonaws.com"))
+        if inputs.cloudfront_id.is_none() {
+            Some(format!("https://{bucket}.s3.amazonaws.com"))
+        } else {
+            None
+        }
     });
 
     Ok(DeploymentPlan {
@@ -735,7 +846,7 @@ fn generate_s3_plan(
 }
 
 fn generate_custom_plan(
-    _inputs: &WizardInputs,
+    inputs: &WizardInputs,
     _env: &DetectedEnvironment,
     bundle_path: &Path,
 ) -> PlanResult<DeploymentPlan> {
@@ -782,7 +893,7 @@ fn generate_custom_plan(
         provider: HostingProvider::Custom,
         bundle_path: bundle_path.to_path_buf(),
         steps,
-        expected_url: None,
+        expected_url: inputs.base_url.clone(),
         generated_files,
         warnings,
     })
@@ -969,7 +1080,8 @@ mod tests {
         let bundle = tempfile::tempdir().unwrap();
         std::fs::write(bundle.path().join("manifest.json"), "{}").unwrap();
 
-        let plan = generate_github_pages_plan(&inputs, &env, bundle.path()).unwrap();
+        let project_root = bundle.path().parent().unwrap_or(bundle.path());
+        let plan = generate_github_pages_plan(&inputs, &env, bundle.path(), project_root).unwrap();
         assert_eq!(plan.provider, HostingProvider::GithubPages);
         assert!(!plan.steps.is_empty());
         assert!(plan.steps.iter().any(|s| s.id == "create_nojekyll"));
@@ -1110,6 +1222,18 @@ mod tests {
         };
         let result = validate_inputs(&inputs);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_inputs_rejects_invalid_github_repo_identifier() {
+        let inputs = WizardInputs {
+            github_repo: Some("owner /repo".to_string()),
+            ..Default::default()
+        };
+
+        let err = validate_inputs(&inputs).expect_err("invalid github repo should fail");
+        assert_eq!(err.code, WizardErrorCode::InvalidOption);
+        assert!(err.message.contains("Invalid GitHub repository identifier"));
     }
 
     #[test]
@@ -1390,7 +1514,8 @@ mod tests {
         };
         let bundle = tempfile::tempdir().unwrap();
 
-        let plan = generate_github_pages_plan(&inputs, &env, bundle.path()).unwrap();
+        let project_root = bundle.path().parent().unwrap_or(bundle.path());
+        let plan = generate_github_pages_plan(&inputs, &env, bundle.path(), project_root).unwrap();
         assert!(
             plan.warnings.iter().any(|w| w.contains("Git repository")),
             "should warn when not in a git repo"
@@ -1407,7 +1532,8 @@ mod tests {
         };
         let bundle = tempfile::tempdir().unwrap();
 
-        let plan = generate_github_pages_plan(&inputs, &env, bundle.path()).unwrap();
+        let project_root = bundle.path().parent().unwrap_or(bundle.path());
+        let plan = generate_github_pages_plan(&inputs, &env, bundle.path(), project_root).unwrap();
         assert_eq!(
             plan.expected_url,
             Some("https://myuser.github.io/myrepo".to_string())
@@ -1426,10 +1552,71 @@ mod tests {
         };
         let bundle = tempfile::tempdir().unwrap();
 
-        let plan = generate_github_pages_plan(&inputs, &env, bundle.path()).unwrap();
+        let project_root = bundle.path().parent().unwrap_or(bundle.path());
+        let plan = generate_github_pages_plan(&inputs, &env, bundle.path(), project_root).unwrap();
         assert_eq!(
             plan.expected_url,
             Some("https://explicit.github.io/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn github_plan_expected_url_for_user_pages_repo() {
+        let inputs = WizardInputs::default();
+        let env = DetectedEnvironment {
+            is_git_repo: true,
+            github_repo: Some("myuser/myuser.github.io".to_string()),
+            ..Default::default()
+        };
+        let bundle = tempfile::tempdir().unwrap();
+
+        let project_root = bundle.path().parent().unwrap_or(bundle.path());
+        let plan = generate_github_pages_plan(&inputs, &env, bundle.path(), project_root).unwrap();
+        assert_eq!(
+            plan.expected_url,
+            Some("https://myuser.github.io".to_string())
+        );
+    }
+
+    #[test]
+    fn github_plan_expected_url_for_explicit_user_pages_repo() {
+        let inputs = WizardInputs {
+            github_repo: Some("octo/octo.github.io".to_string()),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment {
+            is_git_repo: true,
+            ..Default::default()
+        };
+        let bundle = tempfile::tempdir().unwrap();
+
+        let project_root = bundle.path().parent().unwrap_or(bundle.path());
+        let plan = generate_github_pages_plan(&inputs, &env, bundle.path(), project_root).unwrap();
+        assert_eq!(
+            plan.expected_url,
+            Some("https://octo.github.io".to_string())
+        );
+    }
+
+    #[test]
+    fn github_plan_prefers_explicit_base_url_over_repo_prediction() {
+        let inputs = WizardInputs {
+            github_repo: Some("owner/repo".to_string()),
+            base_url: Some("https://docs.example.com".to_string()),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment {
+            is_git_repo: true,
+            github_repo: Some("owner/repo".to_string()),
+            ..Default::default()
+        };
+        let bundle = tempfile::tempdir().unwrap();
+
+        let project_root = bundle.path().parent().unwrap_or(bundle.path());
+        let plan = generate_github_pages_plan(&inputs, &env, bundle.path(), project_root).unwrap();
+        assert_eq!(
+            plan.expected_url,
+            Some("https://docs.example.com".to_string())
         );
     }
 
@@ -1445,9 +1632,125 @@ mod tests {
         };
         let bundle = tempfile::tempdir().unwrap();
 
-        let plan = generate_github_pages_plan(&inputs, &env, bundle.path()).unwrap();
+        let project_root = bundle.path().parent().unwrap_or(bundle.path());
+        let plan = generate_github_pages_plan(&inputs, &env, bundle.path(), project_root).unwrap();
         let push_step = plan.steps.iter().find(|s| s.id == "git_push").unwrap();
         assert!(push_step.command.as_ref().unwrap().contains("main"));
+    }
+
+    #[test]
+    fn github_plan_defaults_push_to_main_branch() {
+        let inputs = WizardInputs {
+            github_branch: None,
+            ..Default::default()
+        };
+        let env = DetectedEnvironment {
+            is_git_repo: true,
+            ..Default::default()
+        };
+        let bundle = tempfile::tempdir().unwrap();
+
+        let project_root = bundle.path().parent().unwrap_or(bundle.path());
+        let plan = generate_github_pages_plan(&inputs, &env, bundle.path(), project_root).unwrap();
+        let push_step = plan.steps.iter().find(|s| s.id == "git_push").unwrap();
+        assert_eq!(
+            push_step.command,
+            Some(format!(
+                "git -C {} push origin main",
+                quote_path(project_root)
+            ))
+        );
+    }
+
+    #[test]
+    fn github_plan_scopes_git_steps_to_repo_root_and_deploy_artifacts() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        let crate_root = repo.path().join("app");
+        std::fs::create_dir_all(&crate_root).unwrap();
+        std::fs::write(
+            crate_root.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let bundle = crate_root.join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("manifest.json"), "{}").unwrap();
+
+        let inputs = WizardInputs {
+            provider: Some(HostingProvider::GithubPages),
+            github_repo: Some("owner/repo".to_string()),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment {
+            is_git_repo: true,
+            github_repo: Some("owner/repo".to_string()),
+            ..Default::default()
+        };
+
+        let plan = generate_github_pages_plan(&inputs, &env, &bundle, &crate_root).unwrap();
+        let commit_step = plan.steps.iter().find(|s| s.id == "git_commit").unwrap();
+        let push_step = plan.steps.iter().find(|s| s.id == "git_push").unwrap();
+        let workflow_path = repo.path().join(".github/workflows/deploy-pages.yml");
+
+        assert!(plan.generated_files.contains(&workflow_path));
+        assert_eq!(
+            commit_step.command,
+            Some(format!(
+                "git -C {} add -- {} && if [ -e {} ]; then git -C {} add -- {}; fi && git -C {} commit -m 'Deploy Agent Mail bundle to GitHub Pages'",
+                quote_path(repo.path()),
+                quote_path(Path::new("app/docs")),
+                quote_path(&workflow_path),
+                quote_path(repo.path()),
+                quote_path(Path::new(".github/workflows/deploy-pages.yml")),
+                quote_path(repo.path()),
+            ))
+        );
+        assert_eq!(
+            push_step.command,
+            Some(format!(
+                "git -C {} push origin main",
+                quote_path(repo.path())
+            ))
+        );
+        assert!(
+            !commit_step
+                .command
+                .as_deref()
+                .unwrap_or_default()
+                .contains("git add ."),
+            "git commit step should not stage unrelated worktree changes"
+        );
+    }
+
+    #[test]
+    fn generate_plan_rejects_github_output_dir_outside_project_root() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        let bundle = repo.path().join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("manifest.json"), "{}").unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        let inputs = WizardInputs {
+            provider: Some(HostingProvider::GithubPages),
+            bundle_path: Some(bundle),
+            output_dir: Some(outside.path().join("docs")),
+            github_repo: Some("owner/repo".to_string()),
+            ..Default::default()
+        };
+        let env = DetectedEnvironment {
+            is_git_repo: true,
+            github_repo: Some("owner/repo".to_string()),
+            ..Default::default()
+        };
+
+        let err = generate_plan(&inputs, Some(env)).unwrap_err();
+        assert_eq!(err.code, WizardErrorCode::InvalidOption);
+        assert!(
+            err.message.contains("inside the repository root"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

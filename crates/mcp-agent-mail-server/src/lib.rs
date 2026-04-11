@@ -182,7 +182,7 @@ use std::fs;
 use std::future::Future;
 use std::io::IsTerminal;
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1206,6 +1206,12 @@ fn acquire_runtime_mailbox_activity_locks(
         _sqlite_lock: sqlite_lock,
     })
 }
+fn ensure_stdio_startup_probes_pass(report: &startup_checks::StartupReport) -> std::io::Result<()> {
+    if report.is_ok() {
+        return Ok(());
+    }
+    Err(std::io::Error::other(report.format_errors()))
+}
 
 pub fn run_stdio(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     // Initialize console theme from parsed config (includes persisted envfile values).
@@ -1219,12 +1225,7 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     // If we already hold a shared flock (from `acquire_runtime_mailbox_activity_locks`),
     // the exclusive attempt will fail with EAGAIN, deadlocking startup.
     let probe_report = startup_checks::run_stdio_startup_probes(config);
-    if !probe_report.is_ok() {
-        ftui_runtime::ftui_eprintln!(
-            "warning: startup probes detected potential issues: {}",
-            probe_report.format_errors()
-        );
-    }
+    ensure_stdio_startup_probes_pass(&probe_report)?;
 
     // Now that probes have confirmed no other process holds the locks,
     // acquire our runtime shared lock for the duration of the process.
@@ -2104,6 +2105,66 @@ impl SnapshotDirGuard {
     }
 }
 
+fn path_existing_prefix_has_symlink(path: &Path) -> std::io::Result<bool> {
+    let mut current = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir()?
+    };
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            Component::CurDir => continue,
+            Component::ParentDir => current.push(".."),
+            Component::Normal(part) => current.push(part),
+        }
+
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(false)
+}
+
+fn validate_snapshot_temp_dir(candidate: &Path, source: &str) -> std::io::Result<PathBuf> {
+    if path_existing_prefix_has_symlink(candidate)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{source} points to symlinked snapshot directory {}",
+                candidate.display()
+            ),
+        ));
+    }
+
+    let metadata = std::fs::symlink_metadata(candidate).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "{source} points to unusable snapshot directory {}: {error}",
+                candidate.display()
+            ),
+        )
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{source} points to {} which is not a directory",
+                candidate.display()
+            ),
+        ));
+    }
+
+    Ok(candidate.to_path_buf())
+}
+
 fn preferred_snapshot_temp_dir() -> std::io::Result<PathBuf> {
     for key in ["TMPDIR", "TEMP", "TMP"] {
         let Some(value) = mcp_agent_mail_core::config::env_value(key) else {
@@ -2114,28 +2175,10 @@ fn preferred_snapshot_temp_dir() -> std::io::Result<PathBuf> {
             continue;
         }
 
-        let metadata = std::fs::metadata(&candidate).map_err(|error| {
-            std::io::Error::new(
-                error.kind(),
-                format!(
-                    "{key} points to unusable snapshot directory {}: {error}",
-                    candidate.display()
-                ),
-            )
-        })?;
-        if !metadata.is_dir() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "{key} points to {} which is not a directory",
-                    candidate.display()
-                ),
-            ));
-        }
-        return Ok(candidate);
+        return validate_snapshot_temp_dir(&candidate, key);
     }
 
-    Ok(std::env::temp_dir())
+    validate_snapshot_temp_dir(&std::env::temp_dir(), "system temp dir")
 }
 
 impl Drop for SnapshotDirGuard {
@@ -10552,6 +10595,90 @@ fn startup_integrity_cache_path(
     )
 }
 
+fn validate_startup_integrity_cache_path(path: &Path) -> std::io::Result<()> {
+    if path_existing_prefix_has_symlink(path)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "startup integrity cache path must not include symlinks: {}",
+                path.display()
+            ),
+        ));
+    }
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "startup integrity cache path must not include symlinks: {}",
+                path.display()
+            ),
+        )),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "startup integrity cache path {} exists but is not a file",
+                path.display()
+            ),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_startup_integrity_cache_atomic(path: &Path, payload: &str) -> std::io::Result<()> {
+    validate_startup_integrity_cache_path(path)?;
+    let Some(parent) = path.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "startup integrity cache path {} has no parent directory",
+                path.display()
+            ),
+        ));
+    };
+    fs::create_dir_all(parent)?;
+    validate_startup_integrity_cache_path(path)?;
+
+    let file_stem = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("startup-integrity-cache");
+    for attempt in 0..16_u32 {
+        let staged_path = parent.join(format!(
+            ".{file_stem}.tmp-{}-{}-{attempt}",
+            std::process::id(),
+            startup_integrity_now_micros()
+        ));
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&staged_path)
+        {
+            Ok(mut file) => {
+                use std::io::Write as _;
+
+                file.write_all(payload.as_bytes())?;
+                file.sync_all()?;
+                drop(file);
+                validate_startup_integrity_cache_path(path)?;
+                return fs::rename(&staged_path, path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "failed to allocate startup integrity cache staging path under {}",
+            parent.display()
+        ),
+    ))
+}
+
 fn read_pragma_i64(
     conn: &mcp_agent_mail_db::DbConn,
     pragma_sql: &str,
@@ -10587,7 +10714,8 @@ fn read_startup_integrity_cache(
     config: &mcp_agent_mail_core::Config,
 ) -> Option<StartupIntegrityCacheEntry> {
     let cache_path = startup_integrity_cache_path(config)?;
-    let raw = std::fs::read_to_string(cache_path).ok()?;
+    validate_startup_integrity_cache_path(&cache_path).ok()?;
+    let raw = fs::read_to_string(cache_path).ok()?;
     serde_json::from_str::<StartupIntegrityCacheEntry>(&raw).ok()
 }
 
@@ -10599,12 +10727,6 @@ fn write_startup_integrity_cache(
     let Some(cache_path) = startup_integrity_cache_path(config) else {
         return;
     };
-    let Some(parent) = cache_path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
-    }
 
     let entry = StartupIntegrityCacheEntry {
         schema_version: STARTUP_INTEGRITY_CACHE_SCHEMA_VERSION,
@@ -10615,7 +10737,7 @@ fn write_startup_integrity_cache(
     let Ok(payload) = serde_json::to_string_pretty(&entry) else {
         return;
     };
-    let _ = std::fs::write(cache_path, payload);
+    let _ = write_startup_integrity_cache_atomic(&cache_path, &payload);
 }
 
 fn startup_integrity_cache_is_fresh(
@@ -11895,6 +12017,37 @@ mod tests {
     }
 
     #[test]
+    fn stdio_startup_probe_success_is_allowed() {
+        let report = startup_checks::StartupReport {
+            results: vec![startup_checks::ProbeResult::Ok { name: "integrity" }],
+        };
+
+        ensure_stdio_startup_probes_pass(&report).expect("successful probes should pass");
+    }
+
+    #[test]
+    fn stdio_startup_probe_failure_is_fatal() {
+        let report = startup_checks::StartupReport {
+            results: vec![startup_checks::ProbeResult::Fail(
+                startup_checks::ProbeFailure {
+                    name: "integrity",
+                    problem: "sqlite corruption remains".to_string(),
+                    fix: "run repair".to_string(),
+                },
+            )],
+        };
+
+        let err = ensure_stdio_startup_probes_pass(&report)
+            .expect_err("failing probes should stop stdio startup");
+        let message = err.to_string();
+        assert!(
+            message.contains("sqlite corruption remains"),
+            "got: {message}"
+        );
+        assert!(message.contains("run repair"), "got: {message}");
+    }
+
+    #[test]
     fn tui_readiness_warmup_failure_records_console_log() {
         let _guard = TUI_STATE_TEST_LOCK
             .lock()
@@ -11959,6 +12112,112 @@ mod tests {
         assert!(
             db_path.exists(),
             "readiness check should leave behind an initialized sqlite file"
+        );
+    }
+
+    #[test]
+    fn startup_integrity_cache_is_not_fresh_when_cache_file_is_symlinked() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let diagnostics_dir = storage_root.join("diagnostics");
+        let outside_cache = temp.path().join("outside-cache.json");
+        std::fs::create_dir_all(&diagnostics_dir).expect("create diagnostics dir");
+
+        let sqlite_path = "/tmp/mailbox.sqlite3";
+        let fingerprint = StartupIntegrityFingerprint {
+            schema_version: 7,
+            user_version: 11,
+        };
+        let entry = StartupIntegrityCacheEntry {
+            schema_version: STARTUP_INTEGRITY_CACHE_SCHEMA_VERSION,
+            sqlite_path: sqlite_path.to_string(),
+            fingerprint,
+            checked_at_micros: startup_integrity_now_micros(),
+        };
+        std::fs::write(
+            &outside_cache,
+            serde_json::to_string_pretty(&entry).expect("serialize cache entry"),
+        )
+        .expect("write outside cache");
+        symlink(
+            &outside_cache,
+            diagnostics_dir.join("startup_integrity_cache.json"),
+        )
+        .expect("symlink cache file");
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.storage_root = storage_root;
+
+        assert!(
+            read_startup_integrity_cache(&config).is_none(),
+            "symlinked cache file must be ignored"
+        );
+        assert!(
+            !startup_integrity_cache_is_fresh(&config, sqlite_path, fingerprint),
+            "symlinked cache file must not suppress the startup integrity check"
+        );
+    }
+
+    #[test]
+    fn write_startup_integrity_cache_ignores_symlinked_cache_file() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let diagnostics_dir = storage_root.join("diagnostics");
+        let outside_cache = temp.path().join("outside-cache.json");
+        std::fs::create_dir_all(&diagnostics_dir).expect("create diagnostics dir");
+        std::fs::write(&outside_cache, "sentinel").expect("write sentinel cache");
+        symlink(
+            &outside_cache,
+            diagnostics_dir.join("startup_integrity_cache.json"),
+        )
+        .expect("symlink cache file");
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.storage_root = storage_root;
+
+        write_startup_integrity_cache(
+            &config,
+            "/tmp/mailbox.sqlite3",
+            StartupIntegrityFingerprint {
+                schema_version: 3,
+                user_version: 5,
+            },
+        );
+
+        let sentinel = std::fs::read_to_string(&outside_cache).expect("read sentinel cache");
+        assert_eq!(sentinel, "sentinel");
+    }
+
+    #[test]
+    fn write_startup_integrity_cache_ignores_symlinked_diagnostics_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let outside_dir = temp.path().join("outside-diagnostics");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        std::fs::create_dir_all(&outside_dir).expect("create outside diagnostics dir");
+        symlink(&outside_dir, storage_root.join("diagnostics")).expect("symlink diagnostics dir");
+
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.storage_root = storage_root;
+
+        write_startup_integrity_cache(
+            &config,
+            "/tmp/mailbox.sqlite3",
+            StartupIntegrityFingerprint {
+                schema_version: 13,
+                user_version: 21,
+            },
+        );
+
+        assert!(
+            !outside_dir.join("startup_integrity_cache.json").exists(),
+            "cache writes must not traverse a symlinked diagnostics directory"
         );
     }
 
@@ -20908,6 +21167,103 @@ first body
 
         assert!(
             err.contains("failed to allocate observability snapshot dir"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_snapshot_temp_dir_rejects_symlinked_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_tmpdir = dir.path().join("real-tmp");
+        let linked_tmpdir = dir.path().join("linked-tmp");
+        std::fs::create_dir_all(&real_tmpdir).expect("create real tmpdir");
+        symlink(&real_tmpdir, &linked_tmpdir).expect("symlink tmpdir");
+
+        let err = validate_snapshot_temp_dir(&linked_tmpdir, "system temp dir")
+            .expect_err("symlinked temp dir should be rejected");
+
+        assert!(
+            err.to_string().contains("symlinked snapshot directory"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_snapshot_temp_dir_rejects_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_parent = dir.path().join("real-parent");
+        let real_tmpdir = real_parent.join("child");
+        let linked_parent = dir.path().join("linked-parent");
+        std::fs::create_dir_all(&real_tmpdir).expect("create real tmpdir");
+        symlink(&real_parent, &linked_parent).expect("symlink tmpdir parent");
+
+        let err = validate_snapshot_temp_dir(&linked_parent.join("child"), "system temp dir")
+            .expect_err("temp dir reached through symlinked parent should be rejected");
+
+        assert!(
+            err.to_string().contains("symlinked snapshot directory"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preferred_snapshot_temp_dir_rejects_symlinked_tmpdir_override() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_tmpdir = dir.path().join("real-tmp");
+        let linked_tmpdir = dir.path().join("linked-tmp");
+        std::fs::create_dir_all(&real_tmpdir).expect("create real tmpdir");
+        symlink(&real_tmpdir, &linked_tmpdir).expect("symlink tmpdir");
+        let linked_tmpdir = linked_tmpdir
+            .to_str()
+            .expect("linked tmpdir utf-8")
+            .to_string();
+
+        let err = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("TMPDIR", linked_tmpdir.as_str())],
+            preferred_snapshot_temp_dir,
+        )
+        .expect_err("symlinked TMPDIR should be rejected");
+
+        assert!(
+            err.to_string().contains("symlinked snapshot directory"),
+            "{err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preferred_snapshot_temp_dir_rejects_symlinked_parent_override() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_parent = dir.path().join("real-parent");
+        let real_tmpdir = real_parent.join("child");
+        let linked_parent = dir.path().join("linked-parent");
+        std::fs::create_dir_all(&real_tmpdir).expect("create real tmpdir");
+        symlink(&real_parent, &linked_parent).expect("symlink tmpdir parent");
+        let linked_tmpdir = linked_parent.join("child");
+        let linked_tmpdir = linked_tmpdir
+            .to_str()
+            .expect("linked child utf-8")
+            .to_string();
+
+        let err = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("TMPDIR", linked_tmpdir.as_str())],
+            preferred_snapshot_temp_dir,
+        )
+        .expect_err("TMPDIR reached through a symlinked parent should be rejected");
+
+        assert!(
+            err.to_string().contains("symlinked snapshot directory"),
             "{err}"
         );
     }

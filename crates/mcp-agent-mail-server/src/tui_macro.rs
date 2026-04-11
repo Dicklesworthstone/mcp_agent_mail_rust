@@ -11,9 +11,12 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
+
+static MACRO_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 // ── Macro Step ─────────────────────────────────────────────────────────
 
@@ -660,8 +663,15 @@ impl MacroEngine {
         }
 
         let path = self.macro_path(name);
-        if path.exists() {
-            std::fs::remove_file(path).map_err(MacroError::Io)?;
+        validate_macro_storage_path(&path)?;
+        if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+            if !metadata.file_type().is_file() {
+                return Err(MacroError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("macro path is not a regular file: {}", path.display()),
+                )));
+            }
+            std::fs::remove_file(&path).map_err(MacroError::Io)?;
         }
         self.macros.remove(name);
         Ok(())
@@ -686,15 +696,25 @@ impl MacroEngine {
         }
 
         let old_path = self.macro_path(old_name);
+        let new_path = self.macro_path(new_name);
+        validate_macro_storage_path(&old_path)?;
+        if let Ok(metadata) = std::fs::symlink_metadata(&old_path) {
+            if !metadata.file_type().is_file() {
+                return Err(MacroError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("macro path is not a regular file: {}", old_path.display()),
+                )));
+            }
+        }
+        validate_macro_storage_path(&new_path)?;
         let mut renamed = existing;
         renamed.name = new_name.to_string();
         renamed.updated_at = chrono::Utc::now().to_rfc3339();
         self.save_macro(&renamed)?;
 
-        if old_path.exists() {
+        if std::fs::symlink_metadata(&old_path).is_ok() {
             if let Err(error) = std::fs::remove_file(&old_path) {
-                let new_path = self.macro_path(new_name);
-                let _ = std::fs::remove_file(new_path);
+                let _ = std::fs::remove_file(&new_path);
                 return Err(MacroError::Io(error));
             }
         }
@@ -722,17 +742,31 @@ impl MacroEngine {
     }
 
     fn save_macro(&self, def: &MacroDef) -> Result<(), MacroError> {
-        std::fs::create_dir_all(&self.storage_dir).map_err(MacroError::Io)?;
         let path = self.macro_path(&def.name);
+        validate_macro_storage_path(&path)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(MacroError::Io)?;
+        }
         let json = serde_json::to_string_pretty(def).map_err(MacroError::Serialize)?;
-        std::fs::write(path, json).map_err(MacroError::Io)
+        atomic_write_text(&path, &json).map_err(MacroError::Io)
     }
 
     fn load_all(&mut self) {
+        if path_existing_prefix_has_symlink(&self.storage_dir).unwrap_or(true)
+            || !path_is_nonsymlink_dir(&self.storage_dir)
+        {
+            return;
+        }
         let Ok(entries) = std::fs::read_dir(&self.storage_dir) else {
             return;
         };
         for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() || !file_type.is_file() {
+                continue;
+            }
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "json")
                 && let Ok(data) = std::fs::read_to_string(&path)
@@ -786,6 +820,89 @@ fn validate_macro_name(name: &str) -> Result<(), MacroError> {
         return Err(MacroError::InvalidName(name.to_string()));
     }
     Ok(())
+}
+
+fn path_existing_prefix_has_symlink(path: &Path) -> std::io::Result<bool> {
+    let mut current = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir()?
+    };
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            Component::CurDir => continue,
+            Component::ParentDir => current.push(".."),
+            Component::Normal(part) => current.push(part),
+        }
+
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(false)
+}
+
+fn path_is_nonsymlink_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+fn validate_macro_storage_path(path: &Path) -> Result<(), MacroError> {
+    if path_existing_prefix_has_symlink(path).map_err(MacroError::Io)? {
+        return Err(MacroError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("macro path must not include symlinks: {}", path.display()),
+        )));
+    }
+    Ok(())
+}
+
+fn atomic_write_text(path: &Path, contents: &str) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("macro");
+
+    for _ in 0..64 {
+        let seq = MACRO_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = parent.join(format!(".{file_name}.tmp-{}-{seq}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+        {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                let write_result = (|| -> std::io::Result<()> {
+                    file.write_all(contents.as_bytes())?;
+                    file.sync_data()?;
+                    drop(file);
+                    std::fs::rename(&tmp_path, path)?;
+                    Ok(())
+                })();
+                if let Err(error) = write_result {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(error);
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("failed to allocate unique temp file for {}", path.display()),
+    ))
 }
 
 #[must_use]
@@ -1141,6 +1258,115 @@ mod tests {
         assert!(engine.rename_macro("old-name", "new-name").is_ok());
         assert!(engine.get_macro("old-name").is_none());
         assert_eq!(engine.get_macro("new-name").unwrap().name, "new-name");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_all_skips_symlinked_macro_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside_dir = tempfile::tempdir().expect("outside tempdir");
+        let outside = outside_dir.path().join("linked.json");
+        let def = MacroDef::new(
+            "linked",
+            vec![MacroStep::new("screen:Messages", "Go to Messages")],
+        );
+        std::fs::write(&outside, serde_json::to_string_pretty(&def).unwrap()).unwrap();
+        symlink(&outside, dir.path().join("linked.json")).unwrap();
+
+        let engine = MacroEngine::with_dir(dir.path().to_path_buf());
+        assert!(
+            engine.get_macro("linked").is_none(),
+            "symlinked macro files must be ignored"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_recording_rejects_symlinked_macro_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside_dir = tempfile::tempdir().expect("outside tempdir");
+        let outside = outside_dir.path().join("outside.json");
+        std::fs::write(&outside, b"outside").unwrap();
+
+        let mut engine = MacroEngine::with_dir(dir.path().to_path_buf());
+        symlink(&outside, dir.path().join("my-custom.json")).unwrap();
+        engine.start_recording();
+        engine.record_step("screen:Messages", "Go to Messages");
+
+        let err = engine.stop_recording("my-custom").unwrap_err();
+        assert!(err.to_string().contains("must not include symlinks"));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+        assert!(engine.get_macro("my-custom").is_none());
+        assert!(engine.recorder_state().is_recording());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_macro_rejects_symlinked_macro_path_and_preserves_state() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut engine = MacroEngine::with_dir(dir.path().to_path_buf());
+        engine.start_recording();
+        engine.record_step("screen:Messages", "Go to Messages");
+        assert!(
+            engine
+                .stop_recording("to-delete")
+                .expect("save macro")
+                .is_some(),
+            "macro saved"
+        );
+
+        let macro_path = dir.path().join("to-delete.json");
+        std::fs::remove_file(&macro_path).unwrap();
+        let outside = dir.path().join("outside.json");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, &macro_path).unwrap();
+
+        let err = engine.delete_macro("to-delete").unwrap_err();
+        assert!(err.to_string().contains("must not include symlinks"));
+        assert!(
+            engine.get_macro("to-delete").is_some(),
+            "failed delete must not drop the macro from memory"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_macro_rejects_symlinked_source_without_writing_new_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside_dir = tempfile::tempdir().expect("outside tempdir");
+        let outside = outside_dir.path().join("outside.json");
+        std::fs::write(&outside, b"outside").unwrap();
+
+        let mut engine = MacroEngine::with_dir(dir.path().to_path_buf());
+        engine.start_recording();
+        engine.record_step("screen:Messages", "Go to Messages");
+        assert!(
+            engine
+                .stop_recording("old-name")
+                .expect("save macro")
+                .is_some(),
+            "macro saved"
+        );
+
+        let old_path = dir.path().join("old-name.json");
+        std::fs::remove_file(&old_path).unwrap();
+        symlink(&outside, &old_path).unwrap();
+
+        let err = engine.rename_macro("old-name", "new-name").unwrap_err();
+        assert!(err.to_string().contains("must not include symlinks"));
+        assert!(engine.get_macro("old-name").is_some());
+        assert!(engine.get_macro("new-name").is_none());
+        assert!(!dir.path().join("new-name.json").exists());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
     }
 
     #[test]

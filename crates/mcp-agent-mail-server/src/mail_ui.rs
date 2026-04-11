@@ -2247,6 +2247,80 @@ mod auth_route_hardening_regression_suite {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn resolve_archive_project_ignores_symlinked_project_metadata() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        let storage_root_str = storage_root
+            .to_str()
+            .expect("storage root utf-8")
+            .to_string();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", storage_root_str.as_str())],
+            || {
+                let config = Config::from_env();
+                let archive =
+                    storage::ensure_archive(&config, "demo").expect("archive should initialize");
+                storage::write_project_metadata_with_config(&archive, &config, "/tmp/demo")
+                    .expect("archive metadata should persist");
+
+                let outside = dir.path().join("outside-project.json");
+                std::fs::write(&outside, r#"{"human_key":"/tmp/evil"}"#)
+                    .expect("outside metadata should persist");
+
+                let metadata_path = archive.root.join("project.json");
+                std::fs::remove_file(&metadata_path).expect("remove committed metadata copy");
+                symlink(&outside, &metadata_path).expect("metadata symlink should persist");
+
+                let project =
+                    resolve_archive_project("demo").expect("project resolution should succeed");
+                assert_eq!(project.slug, "demo");
+                assert_eq!(
+                    project.human_key, "demo",
+                    "symlinked project.json must be ignored"
+                );
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_archive_projects_skips_symlinked_projects_directory() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        let storage_root_str = storage_root
+            .to_str()
+            .expect("storage root utf-8")
+            .to_string();
+        let outside_projects = dir.path().join("outside-projects");
+        std::fs::create_dir_all(&storage_root).expect("storage root dir");
+        std::fs::create_dir_all(&outside_projects).expect("outside projects dir");
+        std::fs::set_permissions(&outside_projects, std::fs::Permissions::from_mode(0o000))
+            .expect("outside permissions");
+        symlink(&outside_projects, storage_root.join("projects"))
+            .expect("projects symlink should persist");
+
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", storage_root_str.as_str())],
+            list_archive_projects,
+        );
+
+        std::fs::set_permissions(&outside_projects, std::fs::Permissions::from_mode(0o755))
+            .expect("restore outside permissions");
+
+        let projects = result.expect("symlinked projects dir must be skipped");
+        assert!(
+            projects.is_empty(),
+            "symlinked projects directory must not be traversed"
+        );
+    }
+
     // -- Cross-project route scoping (F1 scope) --
 
     #[test]
@@ -4301,6 +4375,14 @@ fn get_project_archive(slug: &str) -> Result<storage::ProjectArchive, (u16, Stri
         .ok_or_else(|| (404, "Archive not found".to_string()))
 }
 
+fn path_is_nonsymlink_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_dir())
+}
+
+fn path_is_nonsymlink_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file())
+}
+
 #[derive(Debug, Clone)]
 struct ArchiveProjectSummary {
     slug: String,
@@ -4314,8 +4396,10 @@ struct ArchiveProjectMetadataFile {
 }
 
 fn archive_project_human_key(archive: &storage::ProjectArchive) -> String {
-    std::fs::read_to_string(archive.root.join("project.json"))
+    storage::resolve_archive_relative_path(archive, "project.json")
         .ok()
+        .filter(|path| path_is_nonsymlink_file(path))
+        .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|raw| serde_json::from_str::<ArchiveProjectMetadataFile>(&raw).ok())
         .map(|metadata| metadata.human_key.trim().to_string())
         .filter(|human_key| !human_key.is_empty())
@@ -4325,7 +4409,7 @@ fn archive_project_human_key(archive: &storage::ProjectArchive) -> String {
 fn list_archive_projects() -> Result<Vec<ArchiveProjectSummary>, (u16, String)> {
     let root = get_archive_root()?;
     let projects_root = root.join("projects");
-    if !projects_root.is_dir() {
+    if !path_is_nonsymlink_dir(&projects_root) {
         return Ok(Vec::new());
     }
 
@@ -4338,7 +4422,7 @@ fn list_archive_projects() -> Result<Vec<ArchiveProjectSummary>, (u16, String)> 
         let file_type = entry
             .file_type()
             .map_err(|err| (500, format!("Archive error: {err}")))?;
-        if !file_type.is_dir() {
+        if !file_type.is_dir() || file_type.is_symlink() {
             continue;
         }
 

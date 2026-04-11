@@ -946,8 +946,8 @@ pub struct ShareWizardArgs {
     /// GitHub repository (owner/repo) for GitHub Pages.
     #[arg(long)]
     pub github_repo: Option<String>,
-    /// GitHub branch for Pages (default: gh-pages).
-    #[arg(long, default_value = "gh-pages")]
+    /// GitHub branch for Pages workflow triggers (default: main).
+    #[arg(long, default_value = "main")]
     pub github_branch: String,
     /// Cloudflare Pages project name.
     #[arg(long)]
@@ -3755,8 +3755,9 @@ fn handle_serve_http(
     // find them by port.  This also handles Codex-spawned `am serve-http`.
     auto_clear_port(&config.http_host, config.http_port)?;
     // Kill any remaining stale Agent Mail processes holding the database
-    // file and clean up stale lock/WAL artifacts.
-    auto_clear_db_blockers(&config)?;
+    // file and clean up stale lock/WAL artifacts, then run doctor-grade
+    // startup self-heal before boot.
+    prepare_runtime_server_startup(&config)?;
     let preflight_report =
         mcp_agent_mail_server::startup_checks::run_http_startup_preflight_probes(&config);
     if !preflight_report.is_ok() {
@@ -3781,6 +3782,95 @@ fn running_under_managed_service() -> bool {
     managed_service_env_detected(|key| std::env::var(key).ok())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StartupDatabaseSelfHealAction {
+    None(String),
+    Repair(String),
+    Reconstruct(String),
+}
+
+fn startup_database_self_heal_action(
+    database_url: &str,
+    storage_root: &Path,
+) -> CliResult<StartupDatabaseSelfHealAction> {
+    Ok(
+        match doctor_database_fix_strategy(database_url, storage_root)? {
+            DoctorDatabaseFixStrategy::None(detail) => StartupDatabaseSelfHealAction::None(detail),
+            DoctorDatabaseFixStrategy::Repair(detail) => {
+                StartupDatabaseSelfHealAction::Repair(detail)
+            }
+            DoctorDatabaseFixStrategy::Reconstruct(detail) => {
+                StartupDatabaseSelfHealAction::Reconstruct(detail)
+            }
+        },
+    )
+}
+
+fn run_startup_database_self_heal_with<F, G>(
+    database_url: &str,
+    storage_root: &Path,
+    mut run_repair: F,
+    mut run_reconstruct: G,
+) -> CliResult<()>
+where
+    F: FnMut() -> CliResult<()>,
+    G: FnMut() -> CliResult<()>,
+{
+    match startup_database_self_heal_action(database_url, storage_root)? {
+        StartupDatabaseSelfHealAction::None(_) => Ok(()),
+        StartupDatabaseSelfHealAction::Repair(detail) => {
+            output::info(&format!(
+                "Startup detected mailbox database issues; running automatic repair ({detail})"
+            ));
+            run_repair()?;
+            output::info("Automatic mailbox repair completed; continuing startup");
+            Ok(())
+        }
+        StartupDatabaseSelfHealAction::Reconstruct(detail) => {
+            output::info(&format!(
+                "Startup detected mailbox database issues; reconstructing from archive ({detail})"
+            ));
+            run_reconstruct()?;
+            output::info("Automatic mailbox reconstruction completed; continuing startup");
+            Ok(())
+        }
+    }
+}
+
+fn run_startup_database_self_heal(config: &Config) -> CliResult<()> {
+    let database_url = config.database_url.clone();
+    let storage_root = config.storage_root.clone();
+    let backup_dir = storage_root.join("backups");
+    run_startup_database_self_heal_with(
+        &database_url,
+        &storage_root,
+        || handle_doctor_repair_with(&database_url, &storage_root, &backup_dir, None, false, true),
+        || handle_doctor_reconstruct_with(None, Some(&storage_root), false, true, false),
+    )
+}
+
+fn run_runtime_server_startup_prep_with<F, G>(
+    config: &Config,
+    mut auto_clear: F,
+    mut self_heal: G,
+) -> CliResult<()>
+where
+    F: FnMut(&Config) -> CliResult<()>,
+    G: FnMut(&Config) -> CliResult<()>,
+{
+    auto_clear(config)?;
+    self_heal(config)
+}
+
+/// Prepare a server runtime to start against the mailbox by clearing stale
+/// blockers and running doctor-grade database self-heal before boot.
+pub fn prepare_runtime_server_startup(config: &Config) -> CliResult<()> {
+    run_runtime_server_startup_prep_with(
+        config,
+        auto_clear_db_blockers,
+        run_startup_database_self_heal,
+    )
+}
 fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
     use mcp_agent_mail_core::setup;
 
@@ -4036,7 +4126,6 @@ fn token_fingerprint(token: &str) -> String {
     }
     format!("{hash:016x}")
 }
-
 fn setup_self_heal_cache_path(config: &Config, project_dir: &Path) -> PathBuf {
     let key = token_fingerprint(&project_dir.display().to_string());
     config
@@ -4104,7 +4193,7 @@ fn build_setup_run_command_for_http_server(config: &Config) -> SetupCommand {
 
 fn handle_serve_stdio() -> CliResult<()> {
     let config = Config::from_env();
-    auto_clear_db_blockers(&config)?;
+    prepare_runtime_server_startup(&config)?;
     mcp_agent_mail_server::run_stdio(&config)?;
     Ok(())
 }
@@ -11628,15 +11717,28 @@ fn handle_e2e(action: E2eCommand) -> CliResult<()> {
 fn run_native_wizard(args: ShareWizardArgs) -> CliResult<()> {
     let fmt = output::CliOutputFormat::resolve(args.format, args.json);
 
-    // Parse provider if specified
-    let provider = args.provider.as_ref().and_then(|s| {
-        share::HostingProvider::parse(s).or_else(|| {
-            ftui_runtime::ftui_eprintln!(
-                "Unknown provider: {s}. Valid options: github, cloudflare, netlify, s3, custom"
-            );
-            None
-        })
-    });
+    // Parse provider if specified.
+    let provider = match args.provider.as_deref() {
+        Some(raw) => match share::HostingProvider::parse(raw) {
+            Some(provider) => Some(provider),
+            None => {
+                let err = share::WizardError::new(
+                    share::WizardErrorCode::ProviderUnknown,
+                    format!("Unknown provider: {raw}"),
+                )
+                .with_hint("Valid options: github, cloudflare, netlify, s3, custom");
+                let output = share::WizardJsonOutput::failure(err.clone(), args.bundle.clone());
+                output::emit_output(&output, fmt, || {
+                    ftui_runtime::ftui_eprintln!("Error: {err}");
+                    if let Some(ref hint) = err.hint {
+                        ftui_runtime::ftui_eprintln!("Hint: {hint}");
+                    }
+                });
+                return Err(CliError::ExitCode(err.exit_code()));
+            }
+        },
+        None => None,
+    };
 
     // Build wizard config
     let config = share::WizardConfig {
@@ -11803,17 +11905,22 @@ fn resolve_deploy_tooling_repo_root(bundle_dir: &Path) -> CliResult<PathBuf> {
         return Ok(root);
     }
 
-    let cwd =
-        std::env::current_dir().map_err(|e| CliError::Other(format!("current_dir failed: {e}")))?;
-    if let Some(root) = git_repo_root(&cwd).or_else(|| marker_discovered_repo_root(&cwd)) {
-        return Ok(root);
-    }
+    let resolved_bundle = bundle_dir.canonicalize().or_else(|_| {
+        let cwd = std::env::current_dir()
+            .map_err(|e| CliError::Other(format!("current_dir failed: {e}")))?;
+        Ok::<PathBuf, CliError>(if bundle_dir.is_absolute() {
+            bundle_dir.to_path_buf()
+        } else {
+            cwd.join(bundle_dir)
+        })
+    })?;
 
-    cwd.canonicalize()
-        .or(Ok(cwd))
-        .map_err(|e: std::io::Error| CliError::Other(format!("current_dir failed: {e}")))
+    Ok(resolved_bundle
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(resolved_bundle.as_path())
+        .to_path_buf())
 }
-
 fn git_common_dir(path: &Path) -> Option<PathBuf> {
     let value = git_output_text(path, &["rev-parse", "--git-common-dir"])?;
     let common = PathBuf::from(value);
@@ -24766,7 +24873,7 @@ http_headers = { Authorization = "Bearer secret" }
             bundle: Some(PathBuf::from("/tmp/nonexistent")),
             provider: None,
             github_repo: None,
-            github_branch: "gh-pages".to_string(),
+            github_branch: "main".to_string(),
             cloudflare_project: None,
             netlify_site: None,
             s3_bucket: None,
@@ -24785,6 +24892,55 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn native_wizard_json_rejects_unknown_provider_before_autodetect() {
+        let _capture_lock = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let _cwd = CwdGuard::chdir(temp.path());
+        let bundle_dir = temp.path().join("bundle");
+        std::fs::create_dir_all(&bundle_dir).expect("create bundle dir");
+        std::fs::write(bundle_dir.join("manifest.json"), "{}").expect("write manifest");
+        std::fs::write(temp.path().join("wrangler.toml"), "name = \"demo\"\n")
+            .expect("write wrangler config");
+
+        let args = ShareWizardArgs {
+            bundle: Some(bundle_dir),
+            provider: Some("bogus".to_string()),
+            github_repo: None,
+            github_branch: "main".to_string(),
+            cloudflare_project: Some("demo-project".to_string()),
+            netlify_site: None,
+            s3_bucket: None,
+            cloudfront_id: None,
+            base_url: None,
+            output: None,
+            yes: true,
+            dry_run: true,
+            non_interactive: true,
+            format: None,
+            json: true,
+        };
+
+        let result = run_native_wizard(args);
+        let expected_code = i32::from(share::WizardErrorCode::ProviderUnknown.code());
+        assert!(
+            matches!(result, Err(CliError::ExitCode(code)) if code == expected_code),
+            "expected provider-unknown exit code, got: {result:?}"
+        );
+
+        let output = capture.drain_to_string();
+        let json_str = extract_json_block(&output)
+            .unwrap_or_else(|| panic!("no JSON object found in wizard output: {output}"));
+        let parsed: serde_json::Value = serde_json::from_str(json_str)
+            .unwrap_or_else(|_| panic!("failed to parse wizard JSON failure output: {json_str}"));
+        assert_eq!(parsed["success"], serde_json::Value::Bool(false));
+        assert_eq!(parsed["error_code"], "PROVIDER_UNKNOWN");
+    }
+
+    #[test]
     fn native_wizard_json_failure_reports_missing_required_option_code() {
         let _capture_lock = stdio_capture_lock()
             .lock()
@@ -24800,7 +24956,7 @@ http_headers = { Authorization = "Bearer secret" }
             bundle: Some(bundle_dir),
             provider: Some("github".to_string()),
             github_repo: None, // required for github provider
-            github_branch: "gh-pages".to_string(),
+            github_branch: "main".to_string(),
             cloudflare_project: None,
             netlify_site: None,
             s3_bucket: None,
@@ -24848,7 +25004,7 @@ http_headers = { Authorization = "Bearer secret" }
             bundle: Some(bundle_dir),
             provider: Some("custom".to_string()),
             github_repo: None,
-            github_branch: "gh-pages".to_string(),
+            github_branch: "main".to_string(),
             cloudflare_project: None,
             netlify_site: None,
             s3_bucket: None,
@@ -24890,7 +25046,7 @@ http_headers = { Authorization = "Bearer secret" }
             bundle: Some(bundle_dir.clone()),
             provider: Some("custom".to_string()),
             github_repo: None,
-            github_branch: "gh-pages".to_string(),
+            github_branch: "main".to_string(),
             cloudflare_project: None,
             netlify_site: None,
             s3_bucket: None,
@@ -24946,7 +25102,7 @@ http_headers = { Authorization = "Bearer secret" }
             bundle: Some(bundle_dir.clone()),
             provider: Some("github".to_string()),
             github_repo: Some("owner/repo".to_string()),
-            github_branch: "gh-pages".to_string(),
+            github_branch: "main".to_string(),
             cloudflare_project: None,
             netlify_site: None,
             s3_bucket: None,
@@ -25004,7 +25160,7 @@ http_headers = { Authorization = "Bearer secret" }
             bundle: Some(bundle_dir),
             provider: Some("github".to_string()),
             github_repo: Some("owner/repo".to_string()),
-            github_branch: "gh-pages".to_string(),
+            github_branch: "main".to_string(),
             cloudflare_project: None,
             netlify_site: None,
             s3_bucket: None,
@@ -25042,7 +25198,7 @@ http_headers = { Authorization = "Bearer secret" }
             bundle: Some(PathBuf::from("/nonexistent/bundle/path")),
             provider: Some("custom".to_string()),
             github_repo: None,
-            github_branch: "gh-pages".to_string(),
+            github_branch: "main".to_string(),
             cloudflare_project: None,
             netlify_site: None,
             s3_bucket: None,
@@ -29430,6 +29586,209 @@ startup_timeout_sec = 42
                 );
             },
         );
+    }
+
+    #[test]
+    fn startup_database_self_heal_dispatches_reconstruct_for_missing_db_with_archive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("projects")).expect("create archive root");
+        let db_path = dir.path().join("missing.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let repair_called = std::cell::Cell::new(false);
+        let reconstruct_called = std::cell::Cell::new(false);
+
+        run_startup_database_self_heal_with(
+            &db_url,
+            dir.path(),
+            || {
+                repair_called.set(true);
+                Ok(())
+            },
+            |_| {
+                reconstruct_called.set(true);
+                Ok(())
+            },
+        )
+        .expect("startup self-heal should succeed");
+
+        assert!(!repair_called.get(), "repair runner should not be used");
+        assert!(
+            reconstruct_called.get(),
+            "reconstruct runner should be used for missing archive-backed DB"
+        );
+    }
+
+    #[test]
+    fn startup_database_self_heal_reconstruct_uses_configured_database_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("projects")).expect("create archive root");
+        let db_path = dir.path().join("custom.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let captured_path = std::cell::RefCell::new(None::<std::path::PathBuf>);
+
+        run_startup_database_self_heal_with(
+            &db_url,
+            dir.path(),
+            || Ok(()),
+            |reconstruct_db_path| {
+                *captured_path.borrow_mut() = Some(reconstruct_db_path.to_path_buf());
+                Ok(())
+            },
+        )
+        .expect("startup self-heal should succeed");
+
+        assert_eq!(
+            captured_path.into_inner().as_deref(),
+            Some(db_path.as_path()),
+            "startup reconstruction must target the configured database path"
+        );
+    }
+
+    #[test]
+    fn startup_database_self_heal_suppresses_doctor_stdout_output() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("projects")).expect("create archive root");
+        let db_path = dir.path().join("missing.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+
+        run_startup_database_self_heal_with(
+            &db_url,
+            dir.path(),
+            || Ok(()),
+            |_| {
+                ftui_runtime::ftui_println!("doctor stdout noise");
+                Ok(())
+            },
+        )
+        .expect("startup self-heal should succeed");
+
+        let output = capture.drain_to_string();
+        assert!(
+            !output.contains("doctor stdout noise"),
+            "startup self-heal must not leak doctor stdout output: {output}"
+        );
+    }
+
+    #[test]
+    fn startup_database_self_heal_dispatches_repair_for_corrupt_db_without_archive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("corrupt.sqlite3");
+        std::fs::write(&db_path, b"not-a-sqlite-database").expect("write corrupt db");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let repair_called = std::cell::Cell::new(false);
+        let reconstruct_called = std::cell::Cell::new(false);
+
+        run_startup_database_self_heal_with(
+            &db_url,
+            dir.path(),
+            || {
+                repair_called.set(true);
+                Ok(())
+            },
+            |_| {
+                reconstruct_called.set(true);
+                Ok(())
+            },
+        )
+        .expect("startup self-heal should succeed");
+
+        assert!(repair_called.get(), "repair runner should be used");
+        assert!(
+            !reconstruct_called.get(),
+            "reconstruct runner should not be used without archive"
+        );
+    }
+
+    #[test]
+    fn startup_database_self_heal_skips_healthy_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("healthy.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open healthy sqlite db");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("init healthy db schema");
+        drop(conn);
+
+        let repair_called = std::cell::Cell::new(false);
+        let reconstruct_called = std::cell::Cell::new(false);
+
+        run_startup_database_self_heal_with(
+            &db_url,
+            dir.path(),
+            || {
+                repair_called.set(true);
+                Ok(())
+            },
+            |_| {
+                reconstruct_called.set(true);
+                Ok(())
+            },
+        )
+        .expect("startup self-heal should succeed");
+
+        assert!(!repair_called.get(), "healthy db should not trigger repair");
+        assert!(
+            !reconstruct_called.get(),
+            "healthy db should not trigger reconstruction"
+        );
+    }
+
+    #[test]
+    fn prepare_runtime_server_startup_runs_auto_clear_before_self_heal() {
+        let config = Config::default();
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        run_runtime_server_startup_prep_with(
+            &config,
+            |_| {
+                calls.borrow_mut().push("clear");
+                Ok(())
+            },
+            |_| {
+                calls.borrow_mut().push("heal");
+                Ok(())
+            },
+        )
+        .expect("startup prep should succeed");
+
+        assert_eq!(calls.into_inner(), vec!["clear", "heal"]);
+    }
+
+    #[test]
+    fn prepare_runtime_server_startup_stops_when_auto_clear_fails() {
+        let config = Config::default();
+        let self_heal_called = std::cell::Cell::new(false);
+
+        let err = run_runtime_server_startup_prep_with(
+            &config,
+            |_| Err(CliError::Other("db blockers".to_string())),
+            |_| {
+                self_heal_called.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("startup prep should fail when auto-clear fails");
+
+        assert!(matches!(err, CliError::Other(msg) if msg == "db blockers"));
+        assert!(
+            !self_heal_called.get(),
+            "self-heal should not run after auto-clear failure"
+        );
+    }
+    #[test]
+    fn prepare_runtime_server_startup_propagates_self_heal_failure() {
+        let config = Config::default();
+
+        let err = run_runtime_server_startup_prep_with(
+            &config,
+            |_| Ok(()),
+            |_| Err(CliError::Other("self-heal failed".to_string())),
+        )
+        .expect_err("startup prep should fail when self-heal fails");
+
+        assert!(matches!(err, CliError::Other(msg) if msg == "self-heal failed"));
     }
 
     #[test]
@@ -45530,16 +45889,27 @@ fn attempt_best_doctor_salvage_artifact(current_db: &Path) -> DoctorSalvageAttem
     }))
 }
 
-fn run_doctor_subcommand_quietly<F>(json: bool, operation: F) -> CliResult<()>
+fn run_startup_doctor_subcommand_quietly<F>(operation: F) -> CliResult<()>
 where
     F: FnOnce() -> CliResult<()>,
 {
-    if json && let Ok(capture) = ftui_runtime::StdioCapture::install() {
+    if let Ok(capture) = ftui_runtime::StdioCapture::install() {
         let result = operation();
         let _ = capture.drain_to_string();
         return result;
     }
     operation()
+}
+
+fn run_doctor_subcommand_quietly<F>(json: bool, operation: F) -> CliResult<()>
+where
+    F: FnOnce() -> CliResult<()>,
+{
+    if json {
+        return run_startup_doctor_subcommand_quietly(operation);
+    }
+    operation()
+}
 }
 
 fn handle_doctor_reconstruct_with(
@@ -51419,6 +51789,42 @@ fn resolve_deploy_tooling_repo_root_uses_bundle_ancestors_instead_of_cwd() {
 
     let resolved = resolve_deploy_tooling_repo_root(&bundle).unwrap();
     assert_eq!(resolved, repo_root);
+}
+#[test]
+fn resolve_deploy_tooling_repo_root_does_not_fall_back_to_unrelated_cwd_repo() {
+    static CWD_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    struct LocalCwdGuard {
+        original: PathBuf,
+    }
+
+    impl LocalCwdGuard {
+        fn chdir(path: &Path) -> Self {
+            let original = std::env::current_dir().expect("get cwd");
+            std::env::set_current_dir(path).expect("set cwd");
+            Self { original }
+        }
+    }
+
+    impl Drop for LocalCwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
+    let _cwd_lock = CWD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let cwd_repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(cwd_repo.path().join(".git")).unwrap();
+
+    let bundle_root = tempfile::tempdir().unwrap();
+    let bundle_parent = bundle_root.path().join("exports");
+    let bundle = bundle_parent.join("bundle");
+    std::fs::create_dir_all(&bundle).unwrap();
+
+    let _cwd = LocalCwdGuard::chdir(cwd_repo.path());
+    let resolved = resolve_deploy_tooling_repo_root(&bundle).unwrap();
+    assert_eq!(resolved, bundle_parent);
 }
 
 #[test]

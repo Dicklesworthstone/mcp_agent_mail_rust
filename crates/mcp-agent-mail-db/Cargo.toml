@@ -100,6 +100,7 @@ harness = false
 [[bench]]
 name = "search_v3_bench"
 harness = false
+required-features = ["tantivy-engine"]
 
 [[bench]]
 name = "two_tier_bench"

@@ -338,6 +338,15 @@ pub fn success(msg: &str) {
     }
 }
 
+/// Print an informational message to stderr.
+pub fn info(msg: &str) {
+    if is_tty() {
+        ftui_runtime::ftui_eprintln!("\x1b[34mi\x1b[0m {msg}");
+    } else {
+        ftui_runtime::ftui_eprintln!("{msg}");
+    }
+}
+
 /// Print a warning message.
 pub fn warn(msg: &str) {
     if is_tty() {

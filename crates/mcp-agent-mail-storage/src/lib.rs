@@ -880,12 +880,28 @@ impl FileLock {
         self
     }
 
+    fn validate_paths(&self) -> Result<()> {
+        for (label, path) in [
+            ("lock path", self.path.as_path()),
+            ("lock metadata path", self.metadata_path.as_path()),
+        ] {
+            if path_existing_prefix_has_symlink(path)? {
+                return Err(StorageError::InvalidPath(format!(
+                    "{label} must not include symlinks: {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Acquire the lock with retry and stale detection.
     pub fn acquire(&mut self) -> Result<()> {
         use fs2::FileExt;
 
         let start = Instant::now();
 
+        self.validate_paths()?;
         ensure_parent_dir(&self.path)?;
 
         for attempt in 0..=self.max_retries {
@@ -971,6 +987,7 @@ impl FileLock {
 
     /// Write owner metadata alongside the lock file.
     fn write_metadata(&self) -> Result<()> {
+        self.validate_paths()?;
         let meta = LockOwnerMeta {
             pid: std::process::id(),
             created_ts: SystemTime::now()
@@ -978,15 +995,14 @@ impl FileLock {
                 .unwrap_or_default()
                 .as_secs_f64(),
         };
-        let content = serde_json::to_string(&meta)?;
-        fs::write(&self.metadata_path, content)?;
-        Ok(())
+        write_json(&self.metadata_path, &serde_json::to_value(&meta)?, false)
     }
 
     /// Verify that the locked file handle corresponds to the file currently at `self.path`.
     fn verify_lock_identity(&self, file: &fs::File) -> Result<bool> {
         let file_meta = file.metadata()?;
-        let path_meta = match fs::metadata(&self.path) {
+        let path_meta = match fs::symlink_metadata(&self.path) {
+            Ok(m) if m.file_type().is_symlink() => return Ok(false),
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e.into()),
@@ -1016,6 +1032,7 @@ impl FileLock {
     fn cleanup_if_stale(&self) -> Result<bool> {
         use fs2::FileExt;
 
+        self.validate_paths()?;
         if !self.path.exists() {
             return Ok(false);
         }
@@ -1039,12 +1056,15 @@ impl FileLock {
             .unwrap_or_default()
             .as_secs_f64();
 
-        let meta = if self.metadata_path.exists() {
-            fs::read_to_string(&self.metadata_path)
-                .ok()
-                .and_then(|s| serde_json::from_str::<LockOwnerMeta>(&s).ok())
-        } else {
-            None
+        let meta = match fs::symlink_metadata(&self.metadata_path) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                fs::read_to_string(&self.metadata_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<LockOwnerMeta>(&s).ok())
+            }
+            Ok(_) => None,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err.into()),
         };
 
         let owner_alive = meta.as_ref().map(|m| pid_alive(m.pid)).unwrap_or(false);
@@ -2980,12 +3000,35 @@ fn is_git_index_lock_error(err: &git2::Error) -> bool {
 #[expect(dead_code)]
 const STALE_LOCK_AGE_SECONDS: f64 = 120.0;
 
+fn git_index_lock_paths_checked(repo_root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let git_dir = repo_root.join(".git");
+    let lock_path = git_dir.join("index.lock");
+    let owner_path = git_dir.join("index.lock.owner");
+
+    for (label, path) in [
+        ("git index lock path", lock_path.as_path()),
+        ("git index lock owner path", owner_path.as_path()),
+    ] {
+        if path_existing_prefix_has_symlink(path).unwrap_or(true) {
+            tracing::warn!(
+                "[git-lock] refusing to use {label} through symlinked path: {}",
+                path.display()
+            );
+            return None;
+        }
+    }
+
+    Some((lock_path, owner_path))
+}
+
 /// Write a `.git/index.lock.owner` file with our PID and timestamp.
 ///
 /// This allows other processes to check if the lock holder is still alive
 /// before forcibly removing a lock.
 fn write_lock_owner(repo_root: &Path) {
-    let owner_path = repo_root.join(".git").join("index.lock.owner");
+    let Some((_lock_path, owner_path)) = git_index_lock_paths_checked(repo_root) else {
+        return;
+    };
     let pid = std::process::id();
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2998,7 +3041,9 @@ fn write_lock_owner(repo_root: &Path) {
 
 /// Remove the `.git/index.lock.owner` file after a successful commit.
 fn remove_lock_owner(repo_root: &Path) {
-    let owner_path = repo_root.join(".git").join("index.lock.owner");
+    let Some((_lock_path, owner_path)) = git_index_lock_paths_checked(repo_root) else {
+        return;
+    };
     let _ = fs::remove_file(&owner_path);
 }
 
@@ -3069,14 +3114,17 @@ pub fn clean_stale_git_index_lock(repo_root: &Path, max_age_seconds: f64) -> boo
 ///
 /// See [`clean_stale_git_index_lock`] for the supported cleanup semantics.
 fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
-    let lock_path = repo_root.join(".git").join("index.lock");
-    if !lock_path.exists() {
+    let Some((lock_path, owner_path)) = git_index_lock_paths_checked(repo_root) else {
+        return false;
+    };
+    if !path_is_nonsymlink_file(&lock_path) {
         return false;
     }
 
     // Check PID-based ownership first
-    let owner_path = repo_root.join(".git").join("index.lock.owner");
-    if let Ok(content) = fs::read_to_string(&owner_path) {
+    if path_is_nonsymlink_file(&owner_path)
+        && let Ok(content) = fs::read_to_string(&owner_path)
+    {
         let lines: Vec<&str> = content.lines().collect();
         if let Some(pid_str) = lines.first()
             && let Ok(pid) = pid_str.trim().parse::<u32>()
@@ -3820,6 +3868,7 @@ pub fn write_project_metadata_with_config(
         ));
     }
 
+    let repo_root = archive_repo_root_checked(archive)?;
     let project_root = archive_project_root_checked(archive)?;
     let metadata_path = project_root.join("project.json");
     let metadata = serde_json::json!({
@@ -3838,7 +3887,7 @@ pub fn write_project_metadata_with_config(
     write_json(&metadata_path, &metadata, true)?;
     let rel = rel_path_cached(&archive.canonical_repo_root, &metadata_path)?;
     enqueue_async_commit(
-        &archive.repo_root,
+        repo_root,
         config,
         &format!("project: metadata {}", archive.slug),
         &[rel],
@@ -3938,6 +3987,7 @@ pub fn write_agent_profile_with_config(
         .unwrap_or("unknown");
     let name = validate_archive_component("agent name", name)?;
 
+    let repo_root = archive_repo_root_checked(archive)?;
     let project_root = archive_project_root_checked(archive)?;
     let profile_dir = project_root.join("agents").join(name);
     ensure_dir(&profile_dir)?;
@@ -3946,12 +3996,7 @@ pub fn write_agent_profile_with_config(
     write_json(&profile_path, agent, true)?;
 
     let rel = rel_path_cached(&archive.canonical_repo_root, &profile_path)?;
-    enqueue_async_commit(
-        &archive.repo_root,
-        config,
-        &format!("agent: profile {name}"),
-        &[rel],
-    );
+    enqueue_async_commit(repo_root, config, &format!("agent: profile {name}"), &[rel]);
 
     Ok(())
 }
@@ -3987,6 +4032,7 @@ pub fn write_file_reservation_records(
         return Ok(());
     }
 
+    let repo_root = archive_repo_root_checked(archive)?;
     let mut rel_paths = Vec::new();
     let mut entries = Vec::new();
     let mut normalized_reservations = Vec::with_capacity(reservations.len());
@@ -4049,7 +4095,7 @@ pub fn write_file_reservation_records(
     }
 
     let commit_msg = build_file_reservation_commit_message(&entries);
-    enqueue_async_commit(&archive.repo_root, config, &commit_msg, &rel_paths);
+    enqueue_async_commit(repo_root, config, &commit_msg, &rel_paths);
 
     Ok(())
 }
@@ -4276,6 +4322,7 @@ pub fn write_message_bundle(
     extra_paths: &[String],
     commit_text: Option<&str>,
 ) -> Result<()> {
+    let repo_root = archive_repo_root_checked(archive)?;
     // Parse timestamp
     let created = parse_message_timestamp(message);
     let timestamp_str = created.to_rfc3339();
@@ -4405,7 +4452,7 @@ pub fn write_message_bundle(
         format!("{subject}\n\n{}\n", body_lines.join("\n"))
     };
 
-    enqueue_async_commit(&archive.repo_root, config, &commit_message, &rel_paths);
+    enqueue_async_commit(repo_root, config, &commit_message, &rel_paths);
 
     Ok(())
 }
@@ -4634,15 +4681,70 @@ fn store_attachment_from_cache(
 ) -> Result<StoredAttachment> {
     use base64::Engine;
 
+    if path_existing_prefix_has_symlink(webp_path)? || !path_is_nonsymlink_file(webp_path) {
+        return Err(StorageError::InvalidPath(format!(
+            "cached attachment WebP is missing or invalid: {}",
+            webp_path.display()
+        )));
+    }
+    if path_existing_prefix_has_symlink(manifest_path)? || !path_is_nonsymlink_file(manifest_path) {
+        return Err(StorageError::InvalidPath(format!(
+            "cached attachment manifest is missing or invalid: {}",
+            manifest_path.display()
+        )));
+    }
+
     let manifest_str = fs::read_to_string(manifest_path)?;
     let manifest: AttachmentManifest = serde_json::from_str(&manifest_str)?;
+    let project_root = archive_project_root_checked(archive)?;
+    let repo_root = archive_repo_root_checked(archive)?;
 
     let webp_rel = rel_path_cached(&archive.canonical_repo_root, webp_path)?;
+    let manifest_rel = rel_path_cached(&archive.canonical_repo_root, manifest_path)?;
+    let webp_bytes_len = fs::metadata(webp_path)?.len() as usize;
+
+    let original_rel = if config.keep_original_images {
+        match manifest.original_path.as_deref() {
+            Some(raw_rel) => {
+                let raw_rel =
+                    validate_repo_relative_path("cached attachment original path", raw_rel)?;
+                let original_path = repo_root.join(raw_rel);
+                if path_existing_prefix_has_symlink(&original_path)?
+                    || !path_is_nonsymlink_file(&original_path)
+                {
+                    return Err(StorageError::InvalidPath(format!(
+                        "cached attachment original is missing or invalid: {}",
+                        original_path.display()
+                    )));
+                }
+                Some(raw_rel.to_string())
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let mut rel_paths = vec![webp_rel.clone(), manifest_rel];
+    if let Some(ref original_rel) = original_rel {
+        rel_paths.push(original_rel.clone());
+    }
+
+    // Cache artifacts may exist on disk even if a previous run crashed before
+    // they were committed. Re-stage any deterministic sidecars that already
+    // exist so a retry cannot publish a message without its cached attachment.
+    let audit_path = project_root
+        .join("attachments")
+        .join("_audit")
+        .join(format!("{digest}.log"));
+    if !path_existing_prefix_has_symlink(&audit_path)? && path_is_nonsymlink_file(&audit_path) {
+        rel_paths.push(rel_path_cached(&archive.canonical_repo_root, &audit_path)?);
+    }
 
     let should_inline = match embed_policy {
         EmbedPolicy::Inline => true,
         EmbedPolicy::File => false,
-        EmbedPolicy::Auto => manifest.bytes_webp <= config.inline_image_max_bytes,
+        EmbedPolicy::Auto => webp_bytes_len <= config.inline_image_max_bytes,
     };
 
     let meta = if should_inline {
@@ -4651,33 +4753,29 @@ fn store_attachment_from_cache(
         AttachmentMeta {
             kind: "inline".to_string(),
             media_type: "image/webp".to_string(),
-            bytes: manifest.bytes_webp,
+            bytes: webp_bytes_len,
             sha1: digest.to_string(),
             width: manifest.width,
             height: manifest.height,
             data_base64: Some(encoded),
             path: None,
-            original_path: manifest.original_path.clone(),
+            original_path: original_rel.clone(),
         }
     } else {
         AttachmentMeta {
             kind: "file".to_string(),
             media_type: "image/webp".to_string(),
-            bytes: manifest.bytes_webp,
+            bytes: webp_bytes_len,
             sha1: digest.to_string(),
             width: manifest.width,
             height: manifest.height,
             data_base64: None,
             path: Some(webp_rel),
-            original_path: manifest.original_path.clone(),
+            original_path: original_rel.clone(),
         }
     };
 
-    // Return empty rel_paths — files are already on disk and committed.
-    Ok(StoredAttachment {
-        meta,
-        rel_paths: Vec::new(),
-    })
+    Ok(StoredAttachment { meta, rel_paths })
 }
 
 /// Store an image attachment in the archive.
@@ -4932,7 +5030,26 @@ pub fn store_raw_attachment(
     let filename = format!("{digest}{ext}");
     let target_path = file_dir.join(&filename);
 
-    if !target_path.exists() {
+    if path_existing_prefix_has_symlink(&target_path)? {
+        return Err(StorageError::InvalidPath(format!(
+            "raw attachment target path must not include symlinks: {}",
+            target_path.display()
+        )));
+    }
+
+    let needs_write = match fs::symlink_metadata(&target_path) {
+        Ok(meta) if meta.file_type().is_file() => fs::read(&target_path)? != bytes,
+        Ok(_) => {
+            return Err(StorageError::InvalidPath(format!(
+                "raw attachment target is not a regular file: {}",
+                target_path.display()
+            )));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(err) => return Err(err.into()),
+    };
+
+    if needs_write {
         atomic_write_bytes(&target_path, &bytes, true)?;
     }
 
@@ -7428,14 +7545,19 @@ fn reject_symlinked_archive_root(archive_root: &Path) -> Result<()> {
 }
 
 fn open_archive_repo_checked(archive: &ProjectArchive) -> Result<Repository> {
-    reject_symlinked_archive_root(&archive.repo_root)?;
-    Repository::open(&archive.repo_root).map_err(StorageError::from)
+    Repository::open(archive_repo_root_checked(archive)?).map_err(StorageError::from)
+}
+
+fn archive_repo_root_checked(archive: &ProjectArchive) -> Result<&Path> {
+    reject_symlinked_archive_root(&archive.canonical_repo_root)?;
+    Ok(&archive.canonical_repo_root)
 }
 
 fn archive_project_root_checked(archive: &ProjectArchive) -> Result<PathBuf> {
     let project_slug = validate_archive_component("project slug", &archive.slug)?;
-    reject_symlinked_archive_root(&archive.repo_root)?;
-    let project_root = archive.repo_root.join("projects").join(project_slug);
+    let project_root = archive_repo_root_checked(archive)?
+        .join("projects")
+        .join(project_slug);
     if path_existing_prefix_has_symlink(&project_root)? {
         return Err(StorageError::InvalidPath(
             "project archive root must not be symlinked".to_string(),
@@ -8610,6 +8732,43 @@ mod tests {
     }
 
     #[test]
+    fn test_write_message_bundle_ignores_forged_archive_repo_root() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "proj").unwrap();
+        let real_root = archive.root.clone();
+        let forged_repo_root = tmp.path().join("outside-repo");
+
+        archive.repo_root = forged_repo_root.clone();
+
+        let message = serde_json::json!({
+            "id": 1,
+            "subject": "Test Message",
+            "created_ts": "2026-01-15T10:00:00Z",
+            "thread_id": "TKT-1",
+            "project": "proj",
+        });
+
+        write_message_bundle(
+            &archive,
+            &config,
+            &message,
+            "Hello world!",
+            "SenderAgent",
+            &["RecipientAgent".to_string()],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        assert!(real_root.join("messages/2026/01").exists());
+        assert!(
+            !forged_repo_root.exists(),
+            "forged archive.repo_root must not receive message writes"
+        );
+    }
+
+    #[test]
     fn test_list_agent_inbox_rejects_path_traversal() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -9523,6 +9682,52 @@ mod tests {
         assert!(!lock_path.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_file_lock_acquire_rejects_symlinked_lock_path() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("symlink.lock");
+        let outside = tmp.path().join("outside.lock");
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, &lock_path).unwrap();
+
+        let mut lock = FileLock::new(lock_path.clone());
+        let err = lock.acquire().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("lock path must not include symlinks")
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+        assert!(!lock_path.with_file_name("symlink.lock.owner.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_file_lock_acquire_rejects_symlinked_metadata_path() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("metadata.lock");
+        let metadata_path = tmp.path().join("metadata.lock.owner.json");
+        let outside = tmp.path().join("outside-owner.json");
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, &metadata_path).unwrap();
+
+        let mut lock = FileLock::new(lock_path.clone());
+        let err = lock.acquire().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("lock metadata path must not include symlinks")
+        );
+        assert!(
+            !lock_path.exists(),
+            "failed acquire must not create a lock file"
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+    }
+
     #[test]
     fn test_file_lock_stale_cleanup() {
         let tmp = TempDir::new().unwrap();
@@ -9743,6 +9948,37 @@ mod tests {
         assert!(
             !forged_lock_path.exists(),
             "forged archive.lock_path must remain untouched"
+        );
+    }
+
+    #[test]
+    fn test_with_project_lock_ignores_forged_repo_root() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "lock-proj").unwrap();
+        let real_lock_path = archive.lock_path.clone();
+        let forged_repo_root = tmp.path().join("outside-repo");
+        let forged_lock_path = forged_repo_root.join("projects/lock-proj/.archive.lock");
+
+        archive.repo_root = forged_repo_root.clone();
+
+        with_project_lock(&archive, || {
+            assert!(real_lock_path.exists(), "real project lock should be held");
+            assert!(
+                !forged_lock_path.exists(),
+                "forged archive.repo_root must not control lock placement"
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(
+            !real_lock_path.exists(),
+            "real project lock should be released"
+        );
+        assert!(
+            !forged_repo_root.exists(),
+            "forged archive.repo_root must remain untouched"
         );
     }
 
@@ -10233,6 +10469,68 @@ mod tests {
     }
 
     #[test]
+    fn test_store_raw_attachment_rewrites_mismatched_existing_target() {
+        let tmp = TempDir::new().unwrap();
+        let archive = ensure_archive(&test_config(tmp.path()), "raw-attach-repair-proj").unwrap();
+        let file_path = tmp.path().join("source.txt");
+        let source_bytes = b"hello raw attachment";
+        fs::write(&file_path, source_bytes).unwrap();
+
+        let digest = {
+            let mut hasher = sha1::Sha1::new();
+            hasher.update(source_bytes);
+            hex::encode(hasher.finalize())
+        };
+        let target_path = archive
+            .root
+            .join("attachments")
+            .join("files")
+            .join(&digest[..2])
+            .join(format!("{digest}.txt"));
+        fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+        fs::write(&target_path, b"corrupt raw attachment").unwrap();
+
+        let stored = store_raw_attachment(&archive, &file_path, 1024 * 1024).unwrap();
+
+        assert_eq!(fs::read(&target_path).unwrap(), source_bytes);
+        assert_eq!(stored.meta.bytes, source_bytes.len());
+        assert_eq!(stored.rel_paths.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_store_raw_attachment_rejects_symlinked_existing_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let archive = ensure_archive(&test_config(tmp.path()), "raw-attach-symlink-proj").unwrap();
+        let file_path = tmp.path().join("source.txt");
+        let source_bytes = b"hello raw attachment";
+        fs::write(&file_path, source_bytes).unwrap();
+
+        let digest = {
+            let mut hasher = sha1::Sha1::new();
+            hasher.update(source_bytes);
+            hex::encode(hasher.finalize())
+        };
+        let target_path = archive
+            .root
+            .join("attachments")
+            .join("files")
+            .join(&digest[..2])
+            .join(format!("{digest}.txt"));
+        fs::create_dir_all(target_path.parent().unwrap()).unwrap();
+
+        let outside = tmp.path().join("outside.txt");
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, &target_path).unwrap();
+
+        let err = store_raw_attachment(&archive, &file_path, 1024 * 1024).unwrap_err();
+        assert!(err.to_string().contains("must not include symlinks"));
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+    }
+
+    #[test]
     fn test_process_attachments() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -10426,16 +10724,40 @@ mod tests {
         assert!(!first.rel_paths.is_empty(), "cold miss writes files");
         let first_sha1 = first.meta.sha1.clone();
 
-        // Second call: cache hit — skips conversion, returns empty rel_paths.
+        // Second call: cache hit — skips conversion, but still returns the
+        // deterministic cache artifacts so retries can commit them if a prior
+        // run crashed after writing them but before staging/committing.
         let second = store_attachment(&archive, &config, &img_path, EmbedPolicy::File).unwrap();
-        assert!(
-            second.rel_paths.is_empty(),
-            "cache hit should return empty rel_paths"
-        );
+        let mut first_rel_paths = first.rel_paths.clone();
+        let mut second_rel_paths = second.rel_paths.clone();
+        first_rel_paths.sort();
+        second_rel_paths.sort();
+        assert_eq!(second_rel_paths, first_rel_paths);
         assert_eq!(second.meta.sha1, first_sha1);
         assert_eq!(second.meta.width, first.meta.width);
         assert_eq!(second.meta.height, first.meta.height);
         assert_eq!(second.meta.kind, "file");
+    }
+
+    #[test]
+    fn test_store_attachment_cache_hit_respects_keep_original_images_setting() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(tmp.path());
+        config.keep_original_images = true;
+        let archive = ensure_archive(&config, "cache-original-toggle-proj").unwrap();
+
+        let img_path = archive.root.join("cached_original_toggle.png");
+        create_test_png(&img_path);
+
+        let first = store_attachment(&archive, &config, &img_path, EmbedPolicy::File).unwrap();
+        assert!(first.meta.original_path.is_some());
+
+        config.keep_original_images = false;
+        let second = store_attachment(&archive, &config, &img_path, EmbedPolicy::File).unwrap();
+        assert!(
+            second.meta.original_path.is_none(),
+            "cache hits must follow the current keep_original_images setting"
+        );
     }
 
     #[test]
@@ -11281,6 +11603,37 @@ mod tests {
         assert!(
             agents.is_empty(),
             "forged archive.root must not redirect agent enumeration"
+        );
+    }
+
+    #[test]
+    fn test_list_archive_agents_ignores_forged_archive_repo_root() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let mut archive = ensure_archive(&config, "agents-proj").unwrap();
+
+        let real_agent = serde_json::json!({"name": "Alice", "program": "test"});
+        write_agent_profile_with_config(&archive, &config, &real_agent).unwrap();
+
+        let forged_repo_root = tmp.path().join("outside-repo");
+        let outside_agent = forged_repo_root
+            .join("projects")
+            .join("agents-proj")
+            .join("agents")
+            .join("Ghost");
+        fs::create_dir_all(&outside_agent).unwrap();
+        fs::write(
+            outside_agent.join("profile.json"),
+            serde_json::json!({"name": "Ghost", "program": "outside"}).to_string(),
+        )
+        .unwrap();
+
+        archive.repo_root = forged_repo_root;
+        let agents = list_archive_agents(&archive).unwrap();
+        assert_eq!(
+            agents,
+            vec!["Alice"],
+            "forged archive.repo_root must not redirect agent enumeration"
         );
     }
 
@@ -13407,6 +13760,64 @@ mod tests {
         // Remove owner file
         remove_lock_owner(&archive.repo_root);
         assert!(!owner_path.exists(), "owner file should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_owner_tracking_skips_symlinked_owner_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let repo_root = tmp.path().join("repo");
+        let git_dir = repo_root.join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+
+        let owner_path = git_dir.join("index.lock.owner");
+        let outside = tmp.path().join("outside-owner.txt");
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, &owner_path).unwrap();
+
+        write_lock_owner(&repo_root);
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+
+        remove_lock_owner(&repo_root);
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+        assert!(owner_path.exists(), "symlink leaf should be left untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_lock_cleanup_skips_symlinked_git_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let repo_root = tmp.path().join("repo");
+        fs::create_dir_all(&repo_root).unwrap();
+
+        let outside_git = tmp.path().join("outside-git");
+        fs::create_dir_all(&outside_git).unwrap();
+        let outside_lock = outside_git.join("index.lock");
+        let outside_owner = outside_git.join("index.lock.owner");
+        fs::write(&outside_lock, b"fake lock").unwrap();
+        fs::write(
+            &outside_owner,
+            b"999999999
+1000000000
+",
+        )
+        .unwrap();
+
+        symlink(&outside_git, repo_root.join(".git")).unwrap();
+
+        let removed = try_clean_stale_git_lock(&repo_root, 0.0);
+        assert!(!removed, "symlinked .git directory must be ignored");
+        assert_eq!(fs::read(&outside_lock).unwrap(), b"fake lock");
+        assert_eq!(
+            fs::read(&outside_owner).unwrap(),
+            b"999999999
+1000000000
+"
+        );
     }
 
     #[test]

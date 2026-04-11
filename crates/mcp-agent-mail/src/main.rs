@@ -503,6 +503,10 @@ fn main() {
     match cli.command {
         None => {
             // Default: start MCP server in stdio mode
+            if let Err(err) = mcp_agent_mail_cli::prepare_runtime_server_startup(&config) {
+                tracing::error!("startup preparation failed: {err}");
+                std::process::exit(1);
+            }
             tracing::info!("Starting MCP Agent Mail server (stdio mode)");
             if let Err(err) = mcp_agent_mail_server::run_stdio(&config) {
                 tracing::error!("stdio server failed: {err}");
@@ -587,6 +591,10 @@ fn main() {
                 }
             }
 
+            if let Err(err) = mcp_agent_mail_cli::prepare_runtime_server_startup(&config) {
+                tracing::error!("startup preparation failed: {err}");
+                std::process::exit(1);
+            }
             // Build and display startup diagnostics
             let mut summary = config.bootstrap_summary();
 

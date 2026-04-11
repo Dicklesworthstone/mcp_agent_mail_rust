@@ -13,7 +13,8 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +26,7 @@ use crate::tui_layout::{
 
 /// Current preset schema version for forward compatibility.
 const SCHEMA_VERSION: u32 = 1;
+static PRESET_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 // ── Widget slot configuration ───────────────────────────────────────────
 
@@ -478,9 +480,18 @@ impl PresetManager {
         }
 
         // Load user presets from disk (non-fatal on errors).
-        if let Ok(entries) = std::fs::read_dir(&storage_dir) {
+        if !path_existing_prefix_has_symlink(&storage_dir).unwrap_or(true)
+            && path_is_nonsymlink_dir(&storage_dir)
+            && let Ok(entries) = std::fs::read_dir(&storage_dir)
+        {
             for entry in entries.flatten() {
                 let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if file_type.is_symlink() || !file_type.is_file() {
+                    continue;
+                }
                 if path.extension().is_some_and(|ext| ext == "json")
                     && let Ok(data) = std::fs::read_to_string(&path)
                     && let Ok(preset) = DashboardPreset::from_json(&data)
@@ -589,12 +600,13 @@ impl PresetManager {
         }
 
         let path = self.preset_path(&preset.name);
+        validate_preset_storage_path(&path)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(PresetError::Io)?;
         }
 
         let json = preset.to_json().map_err(PresetError::Serialize)?;
-        std::fs::write(&path, json).map_err(PresetError::Io)?;
+        atomic_write_text(&path, &json).map_err(PresetError::Io)?;
 
         self.presets.insert(preset.name.clone(), preset);
         Ok(())
@@ -620,16 +632,23 @@ impl PresetManager {
                 existing_name,
             });
         }
+        let path = self.preset_path(name);
+        validate_preset_storage_path(&path)?;
+        if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+            if !metadata.file_type().is_file() {
+                return Err(PresetError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("preset path is not a regular file: {}", path.display()),
+                )));
+            }
+            std::fs::remove_file(&path).map_err(PresetError::Io)?;
+        }
+
         self.presets.remove(name);
 
         // If the active preset was deleted, fall back to default.
         if self.active == name {
             self.active = "default".to_string();
-        }
-
-        let path = self.preset_path(name);
-        if path.exists() {
-            std::fs::remove_file(&path).map_err(PresetError::Io)?;
         }
 
         Ok(())
@@ -740,6 +759,89 @@ fn validate_preset_name(name: &str) -> Result<(), PresetError> {
         return Err(PresetError::InvalidName(name.to_string()));
     }
     Ok(())
+}
+
+fn path_existing_prefix_has_symlink(path: &Path) -> std::io::Result<bool> {
+    let mut current = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir()?
+    };
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            Component::CurDir => continue,
+            Component::ParentDir => current.push(".."),
+            Component::Normal(part) => current.push(part),
+        }
+
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(false)
+}
+
+fn path_is_nonsymlink_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+fn validate_preset_storage_path(path: &Path) -> Result<(), PresetError> {
+    if path_existing_prefix_has_symlink(path).map_err(PresetError::Io)? {
+        return Err(PresetError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("preset path must not include symlinks: {}", path.display()),
+        )));
+    }
+    Ok(())
+}
+
+fn atomic_write_text(path: &Path, contents: &str) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("preset");
+
+    for _ in 0..64 {
+        let seq = PRESET_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = parent.join(format!(".{file_name}.tmp-{}-{seq}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+        {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                let write_result = (|| -> std::io::Result<()> {
+                    file.write_all(contents.as_bytes())?;
+                    file.sync_data()?;
+                    drop(file);
+                    std::fs::rename(&tmp_path, path)?;
+                    Ok(())
+                })();
+                if let Err(error) = write_result {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(error);
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("failed to allocate unique temp file for {}", path.display()),
+    ))
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -1065,6 +1167,88 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut mgr = PresetManager::new(dir.path().to_path_buf(), None);
         assert!(mgr.delete("nonexistent").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manager_load_skips_symlinked_preset_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("outside.json");
+        let preset = DashboardPreset::new(
+            "linked",
+            PanelLayoutConfig::default_two_panel(),
+            vec![BandConfig::new("main", 0)],
+        );
+        std::fs::write(&outside, preset.to_json().unwrap()).unwrap();
+        symlink(&outside, dir.path().join("linked.json")).unwrap();
+
+        let mgr = PresetManager::new(dir.path().to_path_buf(), None);
+        assert!(
+            mgr.get("linked").is_none(),
+            "symlinked preset files must be ignored"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manager_save_rejects_symlinked_preset_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("outside.json");
+        std::fs::write(&outside, b"outside").unwrap();
+
+        let mut mgr = PresetManager::new(dir.path().to_path_buf(), None);
+        let symlink_path = mgr.preset_path("my-custom");
+        symlink(&outside, &symlink_path).unwrap();
+        let preset = DashboardPreset::new(
+            "my-custom",
+            PanelLayoutConfig::default_two_panel(),
+            vec![BandConfig::new("main", 0)],
+        );
+        let err = mgr.save(preset).unwrap_err();
+        assert!(err.to_string().contains("must not include symlinks"));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+        assert!(mgr.get("my-custom").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manager_delete_failure_preserves_in_memory_state() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = PresetManager::new(dir.path().to_path_buf(), None);
+        let preset = DashboardPreset::new(
+            "to-delete",
+            PanelLayoutConfig::default_two_panel(),
+            vec![BandConfig::new("main", 0)],
+        );
+        mgr.save(preset).unwrap();
+        mgr.activate("to-delete");
+
+        let preset_path = dir.path().join("to-delete.json");
+        std::fs::remove_file(&preset_path).unwrap();
+        let outside = dir.path().join("outside.json");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, &preset_path).unwrap();
+
+        let err = mgr.delete("to-delete").unwrap_err();
+        assert!(err.to_string().contains("must not include symlinks"));
+        assert!(
+            mgr.get("to-delete").is_some(),
+            "failed delete must not drop the preset from memory"
+        );
+        assert_eq!(
+            mgr.active_name(),
+            "to-delete",
+            "failed delete must not change active preset"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
     }
 
     #[test]

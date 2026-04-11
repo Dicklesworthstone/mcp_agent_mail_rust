@@ -371,6 +371,20 @@ fn normalize_github_repo_path(path: &str) -> Option<String> {
     Some(format!("{owner}/{repo}"))
 }
 
+pub(crate) fn normalize_github_repo_identifier(repo: &str) -> Option<String> {
+    let trimmed = repo.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    let normalized = normalize_github_repo_path(trimmed)?;
+    if normalized == trimmed || trimmed.strip_suffix(".git") == Some(normalized.as_str()) {
+        return Some(normalized);
+    }
+
+    None
+}
+
 fn detect_env_vars(env: &mut DetectedEnvironment) {
     // GitHub
     let github_repository = std::env::var("GITHUB_REPOSITORY").ok();
@@ -1158,6 +1172,19 @@ mod tests {
     #[test]
     fn extract_github_repo_empty_string() {
         assert_eq!(extract_github_repo(""), None);
+    }
+
+    #[test]
+    fn normalize_github_repo_identifier_rejects_whitespace_and_extra_segments() {
+        assert_eq!(normalize_github_repo_identifier("owner /repo"), None);
+        assert_eq!(
+            normalize_github_repo_identifier("owner/repo/issues/1"),
+            None
+        );
+        assert_eq!(
+            normalize_github_repo_identifier("owner/repo.git"),
+            Some("owner/repo".to_string())
+        );
     }
 
     #[test]

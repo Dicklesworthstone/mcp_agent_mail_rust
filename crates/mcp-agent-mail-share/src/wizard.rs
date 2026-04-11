@@ -109,7 +109,7 @@ pub struct WizardInputs {
     pub output_dir: Option<PathBuf>,
     /// GitHub repository (owner/repo) for GitHub Pages.
     pub github_repo: Option<String>,
-    /// GitHub branch for Pages (default: gh-pages).
+    /// GitHub branch for Pages workflow triggers (default: main).
     pub github_branch: Option<String>,
     /// Cloudflare project name.
     pub cloudflare_project: Option<String>,
@@ -134,7 +134,7 @@ impl Default for WizardInputs {
             bundle_path: None,
             output_dir: None,
             github_repo: None,
-            github_branch: Some("gh-pages".to_string()),
+            github_branch: Some("main".to_string()),
             cloudflare_project: None,
             netlify_site: None,
             s3_bucket: None,
@@ -824,7 +824,7 @@ mod tests {
         assert!(inputs.provider.is_none());
         assert!(!inputs.skip_confirm);
         assert!(!inputs.dry_run);
-        assert_eq!(inputs.github_branch, Some("gh-pages".to_string()));
+        assert_eq!(inputs.github_branch, Some("main".to_string()));
     }
 
     // ── Additional alias coverage ────────────────────────────────────────

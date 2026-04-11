@@ -65,6 +65,9 @@ impl WebRoot {
     }
 
     fn read_relative_file(&self, relative_path: &Path) -> FileLookup {
+        if path_existing_prefix_has_symlink(&self.root) {
+            return FileLookup::Blocked;
+        }
         match open_relative_file(&self.root, relative_path) {
             RelativeFile::Found(file) => {
                 Self::read_file(relative_path, file).map_or(FileLookup::Blocked, FileLookup::Found)
@@ -166,12 +169,44 @@ fn is_valid_web_root_candidate(candidate: &Path) -> bool {
         && is_safe_path(candidate, &candidate.join("index.html"))
 }
 
+fn path_existing_prefix_has_symlink(path: &Path) -> bool {
+    let mut current = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        match std::env::current_dir() {
+            Ok(dir) => dir,
+            Err(_) => return true,
+        }
+    };
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            Component::CurDir => continue,
+            Component::ParentDir => current.push(".."),
+            Component::Normal(part) => current.push(part),
+        }
+
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return true,
+        }
+    }
+
+    false
+}
+
 fn is_real_directory(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+    !path_existing_prefix_has_symlink(path)
+        && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
 }
 
 fn is_real_file(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+    !path_existing_prefix_has_symlink(path)
+        && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
 }
 
 fn normalized_relative_path(relative: &str) -> Option<PathBuf> {
@@ -507,6 +542,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn web_root_blocks_symlinked_parent_prefix() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real-parent");
+        let web = real_parent.join("web");
+        std::fs::create_dir_all(&web).unwrap();
+        std::fs::write(web.join("index.html"), "<h1>home</h1>").unwrap();
+
+        let linked_parent = dir.path().join("linked-parent");
+        symlink(&real_parent, &linked_parent).unwrap();
+
+        let root = WebRoot {
+            root: linked_parent.join("web"),
+        };
+        assert!(root.serve("").is_none());
+        assert!(root.serve("index.html").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn web_root_blocks_symlinked_directory_component_escape() {
         use std::os::unix::fs::symlink;
 
@@ -661,6 +717,23 @@ mod tests {
         symlink(&real_web, &symlinked_web).unwrap();
 
         assert!(!is_valid_web_root_candidate(&symlinked_web));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn valid_web_root_candidate_rejects_symlinked_parent_prefix() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real-parent");
+        let real_web = real_parent.join("web");
+        std::fs::create_dir_all(&real_web).unwrap();
+        std::fs::write(real_web.join("index.html"), "ok").unwrap();
+
+        let linked_parent = dir.path().join("linked-parent");
+        symlink(&real_parent, &linked_parent).unwrap();
+
+        assert!(!is_valid_web_root_candidate(&linked_parent.join("web")));
     }
 
     #[cfg(unix)]

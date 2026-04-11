@@ -141,8 +141,41 @@ fn sleep_with_shutdown(duration: std::time::Duration) -> bool {
     false
 }
 
+fn path_existing_prefix_has_symlink(path: &Path) -> bool {
+    let mut current = if path.is_absolute() {
+        std::path::PathBuf::new()
+    } else {
+        match std::env::current_dir() {
+            Ok(dir) => dir,
+            Err(_) => return true,
+        }
+    };
+
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            std::path::Component::RootDir => {
+                current.push(Path::new(std::path::MAIN_SEPARATOR_STR));
+            }
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir => current.push(".."),
+            std::path::Component::Normal(part) => current.push(part),
+        }
+
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return true,
+        }
+    }
+
+    false
+}
+
 fn is_real_directory(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+    !path_existing_prefix_has_symlink(path)
+        && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
 }
 
 /// Summary of a retention/quota report cycle.
@@ -687,6 +720,33 @@ mod tests {
         symlink(&real, &linked).unwrap();
 
         assert_eq!(dir_size(&linked), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_cycle_skips_symlinked_storage_root_prefix() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real_storage = tmp.path().join("real-storage");
+        let project_dir = real_storage.join("projects").join("demo");
+        std::fs::create_dir_all(project_dir.join("attachments")).unwrap();
+        std::fs::create_dir_all(project_dir.join("agents/RedFox/inbox")).unwrap();
+        std::fs::write(project_dir.join("attachments/blob.bin"), vec![0u8; 32]).unwrap();
+        std::fs::write(project_dir.join("agents/RedFox/inbox/msg.md"), "message").unwrap();
+
+        let linked_storage = tmp.path().join("linked-storage");
+        symlink(&real_storage, &linked_storage).unwrap();
+
+        let mut config = Config::default();
+        config.storage_root = linked_storage;
+        config.retention_report_enabled = true;
+        config.quota_enabled = true;
+
+        let report = run_retention_cycle(&config).unwrap();
+        assert_eq!(report.projects_scanned, 0);
+        assert_eq!(report.total_attachment_bytes, 0);
+        assert_eq!(report.total_inbox_count, 0);
     }
 
     #[test]

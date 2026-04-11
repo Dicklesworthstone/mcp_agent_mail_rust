@@ -22,7 +22,7 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
-use crate::detection::detect_environment;
+use crate::detection::{detect_environment, normalize_github_repo_identifier};
 use crate::planner::{
     format_plan_human, generate_plan, infer_provider_from_inputs, resolve_detection_root,
     validate_inputs,
@@ -248,12 +248,21 @@ fn validate_provider_requirements(
 ) -> Result<(), WizardError> {
     match provider {
         HostingProvider::GithubPages => {
-            if inputs.github_repo.is_none() {
+            let Some(repo) = inputs.github_repo.as_deref() else {
                 return Err(WizardError::new(
                     WizardErrorCode::MissingRequiredOption,
                     "GitHub repository not specified for GitHub Pages deployment",
                 )
                 .with_hint("Use --github-repo owner/repo to specify the repository"));
+            };
+            if normalize_github_repo_identifier(repo).is_none() {
+                return Err(WizardError::new(
+                    WizardErrorCode::InvalidOption,
+                    format!("Invalid GitHub repository identifier: {repo}"),
+                )
+                .with_hint(
+                    "Use owner/repo (optionally ending with .git) without spaces or extra path segments",
+                ));
             }
         }
         HostingProvider::CloudflarePages => {
@@ -502,12 +511,13 @@ fn prompt_github_options(
                 continue;
             }
 
-            // Validate format
-            if trimmed.contains('/') && trimmed.matches('/').count() == 1 {
-                inputs.github_repo = Some(trimmed.to_string());
+            if let Some(normalized) = normalize_github_repo_identifier(trimmed) {
+                inputs.github_repo = Some(normalized);
                 break;
             }
-            eprintln!("Invalid format. Use owner/repo (e.g., myuser/myrepo).");
+            eprintln!(
+                "Invalid format. Use owner/repo (optionally ending with .git) without spaces."
+            );
         }
     }
 
@@ -515,7 +525,7 @@ fn prompt_github_options(
     let default_branch = inputs
         .github_branch
         .clone()
-        .unwrap_or_else(|| "gh-pages".to_string());
+        .unwrap_or_else(|| "main".to_string());
     let prompt = format!("Branch [{}]: ", default_branch);
     let input = prompt_line(&prompt)?;
     let trimmed = input.trim();
@@ -790,6 +800,18 @@ mod tests {
         let result = validate_provider_requirements(HostingProvider::GithubPages, &inputs);
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("GitHub repository"));
+    }
+
+    #[test]
+    fn validate_provider_requirements_rejects_invalid_github_repo_identifier() {
+        let inputs = WizardInputs {
+            github_repo: Some("owner /repo".to_string()),
+            ..Default::default()
+        };
+        let err = validate_provider_requirements(HostingProvider::GithubPages, &inputs)
+            .expect_err("invalid github repo should fail");
+        assert_eq!(err.code, WizardErrorCode::InvalidOption);
+        assert!(err.message.contains("Invalid GitHub repository identifier"));
     }
 
     #[test]
