@@ -6330,97 +6330,106 @@ pub fn get_historical_inbox_snapshot(
     let commit = repo.find_commit(closest_oid)?;
     let mut messages: Vec<serde_json::Value> = Vec::new();
 
+    fn collect_historical_inbox_messages(
+        repo: &Repository,
+        tree: &git2::Tree<'_>,
+        depth: usize,
+        limit: usize,
+        messages: &mut Vec<serde_json::Value>,
+    ) {
+        if messages.len() >= limit || depth > 3 {
+            return;
+        }
+
+        let entries: Vec<_> = tree.iter().collect();
+        for item in entries.into_iter().rev() {
+            if messages.len() >= limit {
+                break;
+            }
+
+            match item.kind() {
+                Some(git2::ObjectType::Tree) if depth < 3 => {
+                    if let Ok(child_tree) = repo.find_tree(item.id()) {
+                        collect_historical_inbox_messages(
+                            repo,
+                            &child_tree,
+                            depth + 1,
+                            limit,
+                            messages,
+                        );
+                    }
+                }
+                Some(git2::ObjectType::Blob) => {
+                    let Some(name) = item.name() else {
+                        continue;
+                    };
+                    if !name.ends_with(".md") {
+                        continue;
+                    }
+
+                    let mut from_agent = "unknown".to_string();
+                    let mut importance = "normal".to_string();
+
+                    let filename = name.strip_suffix(".md").unwrap_or(name);
+                    let parts: Vec<&str> = filename.rsplitn(3, "__").collect();
+                    let (date_str, subject_slug, msg_id) = match parts.as_slice() {
+                        [id, subject, date] => (*date, *subject, *id),
+                        [subject, date] => (*date, *subject, "unknown"),
+                        _ => continue,
+                    };
+
+                    let mut subject = subject_slug.replace(['-', '_'], " ").trim().to_string();
+                    if subject.is_empty() {
+                        subject = "Unknown".to_string();
+                    }
+
+                    if let Ok(blob) = repo.find_blob(item.id()) {
+                        let blob_content = String::from_utf8_lossy(blob.content()).to_string();
+                        if let Some(rest) = blob_content.strip_prefix("---json\n")
+                            && let Some(end_idx) = rest.find("\n---\n")
+                        {
+                            let json_str = &rest[..end_idx];
+                            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                if let Some(from) =
+                                    meta.get("from").and_then(serde_json::Value::as_str)
+                                {
+                                    from_agent = from.to_string();
+                                }
+                                if let Some(imp) =
+                                    meta.get("importance").and_then(serde_json::Value::as_str)
+                                {
+                                    importance = imp.to_string();
+                                }
+                                if let Some(subj) = meta
+                                    .get("subject")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    subject = subj.to_string();
+                                }
+                            }
+                        }
+                    }
+
+                    messages.push(serde_json::json!({
+                        "id": msg_id,
+                        "subject": subject,
+                        "date": date_str,
+                        "from": from_agent,
+                        "importance": importance,
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
     if let Ok(root_tree) = commit.tree()
         && let Ok(inbox_entry) = root_tree.get_path(Path::new(&inbox_path))
         && let Ok(inbox_tree) = repo.find_tree(inbox_entry.id())
     {
-        let mut stack: Vec<(git2::Oid, usize)> = vec![(inbox_tree.id(), 0)];
-        while let Some((tree_oid, depth)) = stack.pop() {
-            if messages.len() >= limit || depth > 3 {
-                continue;
-            }
-
-            let tree = match repo.find_tree(tree_oid) {
-                Ok(tree) => tree,
-                Err(_) => continue,
-            };
-
-            for item in tree.iter() {
-                if messages.len() >= limit {
-                    break;
-                }
-
-                match item.kind() {
-                    Some(git2::ObjectType::Tree) if depth < 3 => {
-                        stack.push((item.id(), depth + 1));
-                    }
-                    Some(git2::ObjectType::Blob) => {
-                        let Some(name) = item.name() else {
-                            continue;
-                        };
-                        if !name.ends_with(".md") {
-                            continue;
-                        }
-
-                        let mut from_agent = "unknown".to_string();
-                        let mut importance = "normal".to_string();
-
-                        let filename = name.strip_suffix(".md").unwrap_or(name);
-                        let parts: Vec<&str> = filename.rsplitn(3, "__").collect();
-                        let (date_str, subject_slug, msg_id) = match parts.as_slice() {
-                            [id, subject, date] => (*date, *subject, *id),
-                            [subject, date] => (*date, *subject, "unknown"),
-                            _ => continue,
-                        };
-
-                        let mut subject = subject_slug.replace(['-', '_'], " ").trim().to_string();
-                        if subject.is_empty() {
-                            subject = "Unknown".to_string();
-                        }
-
-                        if let Ok(blob) = repo.find_blob(item.id()) {
-                            let blob_content = String::from_utf8_lossy(blob.content()).to_string();
-                            if let Some(rest) = blob_content.strip_prefix("---json\n")
-                                && let Some(end_idx) = rest.find("\n---\n")
-                            {
-                                let json_str = &rest[..end_idx];
-                                if let Ok(meta) =
-                                    serde_json::from_str::<serde_json::Value>(json_str)
-                                {
-                                    if let Some(from) =
-                                        meta.get("from").and_then(serde_json::Value::as_str)
-                                    {
-                                        from_agent = from.to_string();
-                                    }
-                                    if let Some(imp) =
-                                        meta.get("importance").and_then(serde_json::Value::as_str)
-                                    {
-                                        importance = imp.to_string();
-                                    }
-                                    if let Some(subj) = meta
-                                        .get("subject")
-                                        .and_then(serde_json::Value::as_str)
-                                        .map(str::trim)
-                                        .filter(|s| !s.is_empty())
-                                    {
-                                        subject = subj.to_string();
-                                    }
-                                }
-                            }
-                        }
-
-                        messages.push(serde_json::json!({
-                            "id": msg_id,
-                            "subject": subject,
-                            "date": date_str,
-                            "from": from_agent,
-                            "importance": importance,
-                        }));
-                    }
-                    _ => {}
-                }
-            }
-        }
+        collect_historical_inbox_messages(&repo, &inbox_tree, 0, limit, &mut messages);
     }
 
     messages.sort_by(|a, b| {
@@ -7468,10 +7477,18 @@ pub fn check_archive_consistency(
         // whose filename matches the subject slug and whose frontmatter still
         // matches the DB row's subject, sender, and created second.
         // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/10
-        let found_file = if messages_dir.is_dir() {
+        let found_file = if path_existing_prefix_has_symlink(&messages_dir).unwrap_or(true) {
+            false
+        } else if path_is_nonsymlink_dir(&messages_dir) {
             let id_suffix = format!("__{}.md", msg.message_id);
             match std::fs::read_dir(&messages_dir) {
                 Ok(entries) => entries.flatten().any(|entry| {
+                    let Ok(file_type) = entry.file_type() else {
+                        return false;
+                    };
+                    if file_type.is_symlink() || !file_type.is_file() {
+                        return false;
+                    }
                     let path = entry.path();
                     let name = entry.file_name();
                     let name_str = name.to_string_lossy();
@@ -9751,10 +9768,11 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let tmp = TempDir::new().unwrap();
+        let outside_tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
         ensure_archive_root(&config).unwrap();
 
-        let outside = tmp.path().join("outside-project");
+        let outside = outside_tmp.path().join("outside-project");
         let outside_lock = outside.join("escape.lock");
         fs::create_dir_all(&outside).unwrap();
         fs::write(&outside_lock, "lock contents").unwrap();
@@ -10396,6 +10414,51 @@ mod tests {
     }
 
     #[test]
+    fn test_get_historical_inbox_snapshot_limit_returns_most_recent_messages() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "snapshot-limit-order").unwrap();
+
+        for (id, subject, created_ts) in [
+            (1, "Oldest", "2026-01-20T12:00:00Z"),
+            (2, "Middle", "2026-01-20T12:01:00Z"),
+            (3, "Newest", "2026-01-20T12:02:00Z"),
+        ] {
+            let message = serde_json::json!({
+                "id": id,
+                "from": "SenderAgent",
+                "subject": subject,
+                "importance": "normal",
+                "created_ts": created_ts,
+                "thread_id": "SNAP-LIMIT",
+            });
+            write_message_bundle(
+                &archive,
+                &config,
+                &message,
+                "snapshot body",
+                "SenderAgent",
+                &["RecipientAgent".to_string()],
+                &[],
+                None,
+            )
+            .unwrap();
+        }
+        flush_async_commits();
+
+        let snapshot =
+            get_historical_inbox_snapshot(&archive, "RecipientAgent", "2100-01-01T00:00", 2)
+                .unwrap();
+        let messages = snapshot
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .expect("messages array");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["subject"], "Newest");
+        assert_eq!(messages[1]["subject"], "Middle");
+    }
+
+    #[test]
     fn test_list_agent_inbox_outbox() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
@@ -10445,7 +10508,11 @@ mod tests {
 
         let agent_dir = archive.root.join("agents").join("Recipient");
         fs::create_dir_all(&agent_dir).unwrap();
-        symlink(outside_inbox.parent().unwrap().parent().unwrap(), agent_dir.join("inbox")).unwrap();
+        symlink(
+            outside_inbox.parent().unwrap().parent().unwrap(),
+            agent_dir.join("inbox"),
+        )
+        .unwrap();
 
         let inbox = list_agent_inbox(&archive, "Recipient").unwrap();
         assert!(
@@ -10488,11 +10555,7 @@ mod tests {
             serde_json::json!({"name": "Ghost", "program": "outside"}).to_string(),
         )
         .unwrap();
-        symlink(
-            &outside_agent,
-            archive.root.join("agents").join("Ghost"),
-        )
-        .unwrap();
+        symlink(&outside_agent, archive.root.join("agents").join("Ghost")).unwrap();
 
         let linked_profile_dir = archive.root.join("agents").join("LinkedProfile");
         fs::create_dir_all(&linked_profile_dir).unwrap();
@@ -11149,9 +11212,10 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let tmp = TempDir::new().unwrap();
+        let outside_tmp = TempDir::new().unwrap();
         let config = test_config(tmp.path());
 
-        let outside = tmp.path().join("outside-locks");
+        let outside = outside_tmp.path().join("outside-locks");
         fs::create_dir_all(&outside).unwrap();
         fs::write(outside.join("escape.lock"), "lock").unwrap();
         let linked_project = tmp.path().join("projects").join("linked");
@@ -13653,6 +13717,112 @@ mod tests {
             20,
             "missing_ids should be capped at 20"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn consistency_symlinked_storage_root_counts_message_as_missing() {
+        use std::os::unix::fs as unix_fs;
+
+        let outside = tempfile::tempdir().unwrap();
+        let msg_dir = outside
+            .path()
+            .join("projects")
+            .join("proj")
+            .join("messages")
+            .join("2026")
+            .join("02");
+        fs::create_dir_all(&msg_dir).unwrap();
+        fs::write(
+            msg_dir.join("2026-02-08T03-29-30+00-00__hello__42.md"),
+            "content",
+        )
+        .unwrap();
+
+        let wrapper = tempfile::tempdir().unwrap();
+        let storage_root = wrapper.path().join("linked-root");
+        unix_fs::symlink(outside.path(), &storage_root).unwrap();
+
+        let refs = vec![ConsistencyMessageRef {
+            project_slug: "proj".into(),
+            message_id: 42,
+            sender_name: "BlueLake".into(),
+            subject: "hello".into(),
+            created_ts_iso: "2026-02-08T03:29:30+00:00".into(),
+        }];
+
+        let report = check_archive_consistency(&storage_root, &refs);
+        assert_eq!(report.sampled, 1);
+        assert_eq!(report.found, 0);
+        assert_eq!(report.missing, 1);
+        assert_eq!(report.missing_ids, vec![42]);
+    }
+
+    #[test]
+    fn consistency_matching_directory_is_not_treated_as_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let msg_dir = dir
+            .path()
+            .join("projects")
+            .join("proj")
+            .join("messages")
+            .join("2026")
+            .join("02");
+        fs::create_dir_all(&msg_dir).unwrap();
+        fs::create_dir(msg_dir.join("2026-02-08T03-29-30+00-00__hello__42.md")).unwrap();
+
+        let refs = vec![ConsistencyMessageRef {
+            project_slug: "proj".into(),
+            message_id: 42,
+            sender_name: "BlueLake".into(),
+            subject: "hello".into(),
+            created_ts_iso: "2026-02-08T03:29:30+00:00".into(),
+        }];
+
+        let report = check_archive_consistency(dir.path(), &refs);
+        assert_eq!(report.sampled, 1);
+        assert_eq!(report.found, 0);
+        assert_eq!(report.missing, 1);
+        assert_eq!(report.missing_ids, vec![42]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn consistency_matching_symlink_file_is_not_treated_as_present() {
+        use std::os::unix::fs as unix_fs;
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("message.md");
+        fs::write(&outside_file, "content").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let msg_dir = dir
+            .path()
+            .join("projects")
+            .join("proj")
+            .join("messages")
+            .join("2026")
+            .join("02");
+        fs::create_dir_all(&msg_dir).unwrap();
+        unix_fs::symlink(
+            &outside_file,
+            msg_dir.join("2026-02-08T03-29-30+00-00__hello__42.md"),
+        )
+        .unwrap();
+
+        let refs = vec![ConsistencyMessageRef {
+            project_slug: "proj".into(),
+            message_id: 42,
+            sender_name: "BlueLake".into(),
+            subject: "hello".into(),
+            created_ts_iso: "2026-02-08T03:29:30+00:00".into(),
+        }];
+
+        let report = check_archive_consistency(dir.path(), &refs);
+        assert_eq!(report.sampled, 1);
+        assert_eq!(report.found, 0);
+        assert_eq!(report.missing, 1);
+        assert_eq!(report.missing_ids, vec![42]);
     }
 
     // ── Python archive compatibility verification (br-28mgh.5.1) ──────────

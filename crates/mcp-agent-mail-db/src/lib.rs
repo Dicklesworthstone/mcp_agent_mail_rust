@@ -68,10 +68,97 @@ pub mod search_rollout;
 pub mod search_scope;
 pub mod search_service;
 pub mod search_updater;
+#[cfg(feature = "tantivy-engine")]
 pub mod search_v3;
 pub mod sync;
 #[cfg(feature = "tantivy-engine")]
 pub mod tantivy_schema;
+
+#[cfg(not(feature = "tantivy-engine"))]
+pub mod search_v3 {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use crate::search_planner::{SearchQuery as PlannerQuery, SearchResult as PlannerResult};
+
+    /// No-op lexical bridge used when the Tantivy engine feature is disabled.
+    #[derive(Debug, Default)]
+    pub struct TantivyBridge;
+
+    impl TantivyBridge {
+        /// Return no lexical results when the Tantivy engine is unavailable.
+        #[must_use]
+        pub fn search(&self, _query: &PlannerQuery) -> Vec<PlannerResult> {
+            Vec::new()
+        }
+
+        /// Feature-disabled builds do not maintain a Tantivy index directory.
+        #[must_use]
+        pub fn index_dir(&self) -> &Path {
+            Path::new("")
+        }
+    }
+
+    /// Message projection normally written into the lexical index.
+    #[derive(Debug, Clone)]
+    pub struct IndexableMessage {
+        pub id: i64,
+        pub project_id: i64,
+        pub project_slug: String,
+        pub sender_name: String,
+        pub subject: String,
+        pub body_md: String,
+        pub thread_id: Option<String>,
+        pub importance: String,
+        pub created_ts: i64,
+    }
+
+    /// Tantivy is disabled, so bridge initialization is a deterministic no-op.
+    pub fn init_bridge(_index_dir: &Path) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Tantivy is disabled, so bridge switching is a deterministic no-op.
+    pub fn init_or_switch_bridge(_index_dir: &Path) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Tantivy is disabled, so no bridge is ever active.
+    #[must_use]
+    pub fn is_bridge_initialized_for(_index_dir: &Path) -> bool {
+        false
+    }
+
+    /// Tantivy is disabled, so no bridge is available.
+    #[must_use]
+    pub fn get_bridge() -> Option<Arc<TantivyBridge>> {
+        None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_bridge_for_tests() {}
+
+    /// Tantivy is disabled, so lexical indexing is skipped deterministically.
+    pub fn index_message(_msg: &IndexableMessage) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Tantivy is disabled, so batch lexical indexing is skipped deterministically.
+    pub fn index_messages_batch(_messages: &[IndexableMessage]) -> Result<usize, String> {
+        Ok(0)
+    }
+
+    pub(crate) fn resolve_search_sqlite_path_from_database_url(db_url: &str) -> Option<String> {
+        crate::pool::resolve_mailbox_sqlite_path(db_url)
+            .ok()
+            .map(|resolved| resolved.canonical_path)
+    }
+
+    /// Tantivy is disabled, so lexical backfill is a deterministic no-op.
+    pub fn backfill_from_db(_db_url: &str) -> Result<(usize, usize), String> {
+        Ok((0, 0))
+    }
+}
 
 // Semantic/hybrid search modules (feature-gated)
 #[cfg(feature = "hybrid")]
