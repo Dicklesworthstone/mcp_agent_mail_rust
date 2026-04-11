@@ -6666,17 +6666,32 @@ pub fn get_timeline_commits(
 ///
 /// Returns `(frontmatter_json, body_markdown)`.
 pub fn read_message_file(path: &Path) -> Result<(serde_json::Value, String)> {
-    if let Ok(meta) = fs::metadata(path) {
-        if meta.len() > 50 * 1024 * 1024 {
-            // 50MB safety limit
-            return Err(StorageError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "message file {} exceeds maximum size of 50MB",
-                    path.display()
-                ),
-            )));
-        }
+    if path_existing_prefix_has_symlink(path)? {
+        return Err(StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to read message through symlinked path: {}",
+                path.display()
+            ),
+        )));
+    }
+
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("message path is not a regular file: {}", path.display()),
+        )));
+    }
+    if meta.len() > 50 * 1024 * 1024 {
+        // 50MB safety limit
+        return Err(StorageError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "message file {} exceeds maximum size of 50MB",
+                path.display()
+            ),
+        )));
     }
 
     let content = fs::read_to_string(path)?;
@@ -7443,9 +7458,19 @@ pub fn check_archive_consistency(
     let mut missing_ids: Vec<i64> = Vec::new();
 
     for msg in messages {
+        let project_slug = match validate_archive_component("project slug", &msg.project_slug) {
+            Ok(project_slug) => project_slug,
+            Err(_) => {
+                missing += 1;
+                if missing_ids.len() < 20 {
+                    missing_ids.push(msg.message_id);
+                }
+                continue;
+            }
+        };
         // Build the expected canonical path:
         // {storage_root}/projects/{slug}/messages/{YYYY}/{MM}/{iso}__{slug}__{id}.md
-        let project_dir = storage_root.join("projects").join(&msg.project_slug);
+        let project_dir = storage_root.join("projects").join(project_slug);
 
         // Parse the ISO timestamp to extract year/month
         let (year, month) = match parse_year_month(&msg.created_ts_iso) {
@@ -10352,6 +10377,49 @@ mod tests {
         let (frontmatter, body) = read_message_file(&msg_path).unwrap();
         assert!(frontmatter.is_null());
         assert_eq!(body, "Just plain text.");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_message_file_rejects_symlinked_path() {
+        use std::os::unix::fs as unix_fs;
+
+        let outside = TempDir::new().unwrap();
+        let outside_path = outside.path().join("outside.md");
+        fs::write(&outside_path, "outside").unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        let msg_path = tmp.path().join("linked.md");
+        unix_fs::symlink(&outside_path, &msg_path).unwrap();
+
+        let err = read_message_file(&msg_path).expect_err("expected symlink rejection");
+        assert!(
+            err.to_string().contains("symlinked path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_message_file_rejects_symlinked_parent_directory() {
+        use std::os::unix::fs as unix_fs;
+
+        let outside = TempDir::new().unwrap();
+        let outside_dir = outside.path().join("messages");
+        fs::create_dir_all(&outside_dir).unwrap();
+        let outside_path = outside_dir.join("outside.md");
+        fs::write(&outside_path, "outside").unwrap();
+
+        let tmp = TempDir::new().unwrap();
+        let linked_dir = tmp.path().join("linked");
+        unix_fs::symlink(&outside_dir, &linked_dir).unwrap();
+        let msg_path = linked_dir.join("outside.md");
+
+        let err = read_message_file(&msg_path).expect_err("expected symlink-parent rejection");
+        assert!(
+            err.to_string().contains("symlinked path"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -13717,6 +13785,24 @@ mod tests {
             20,
             "missing_ids should be capped at 20"
         );
+    }
+
+    #[test]
+    fn consistency_invalid_project_slug_counted_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let refs = vec![ConsistencyMessageRef {
+            project_slug: "../escape".into(),
+            message_id: 7,
+            sender_name: "Agent".into(),
+            subject: "test".into(),
+            created_ts_iso: "2026-01-01T00:00:00+00:00".into(),
+        }];
+
+        let report = check_archive_consistency(dir.path(), &refs);
+        assert_eq!(report.sampled, 1);
+        assert_eq!(report.found, 0);
+        assert_eq!(report.missing, 1);
+        assert_eq!(report.missing_ids, vec![7]);
     }
 
     #[cfg(unix)]

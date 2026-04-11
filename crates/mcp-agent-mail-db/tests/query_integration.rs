@@ -19,6 +19,7 @@ mod common;
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_core::config::SearchEngine;
+#[cfg(feature = "tantivy-engine")]
 use mcp_agent_mail_core::metrics::global_metrics;
 use mcp_agent_mail_db::queries;
 use mcp_agent_mail_db::search_planner::{DocKind, SearchQuery};
@@ -27,11 +28,14 @@ use mcp_agent_mail_db::search_scope::{
     ViewerIdentity,
 };
 use mcp_agent_mail_db::search_service::{SearchOptions, execute_search, execute_search_simple};
+#[cfg(feature = "tantivy-engine")]
 use mcp_agent_mail_db::search_v3::{get_bridge, init_bridge};
 use mcp_agent_mail_db::{DbError, DbPool, DbPoolConfig};
 use sqlmodel_core::{Connection, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "tantivy-engine")]
 use std::sync::{Mutex, Once};
+#[cfg(feature = "tantivy-engine")]
 use tantivy::doc;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -40,11 +44,13 @@ fn unique_suffix() -> u64 {
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+#[cfg(feature = "tantivy-engine")]
 fn tantivy_test_lock() -> &'static Mutex<()> {
     static LOCK: Mutex<()> = Mutex::new(());
     &LOCK
 }
 
+#[cfg(feature = "tantivy-engine")]
 fn ensure_tantivy_bridge_initialized() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
@@ -54,6 +60,7 @@ fn ensure_tantivy_bridge_initialized() {
     });
 }
 
+#[cfg(feature = "tantivy-engine")]
 fn insert_tantivy_message_doc(
     doc_id: i64,
     project_id: i64,
@@ -787,6 +794,7 @@ fn search_pagination_cursor() {
 }
 
 #[test]
+#[cfg(feature = "tantivy-engine")]
 fn search_engine_lexical_routes_to_tantivy_bridge() {
     let _guard = tantivy_test_lock()
         .lock()
@@ -837,6 +845,7 @@ fn search_engine_lexical_routes_to_tantivy_bridge() {
 }
 
 #[test]
+#[cfg(feature = "tantivy-engine")]
 fn search_engine_legacy_routes_to_fts_even_with_bridge_available() {
     let _guard = tantivy_test_lock()
         .lock()
@@ -880,6 +889,7 @@ fn search_engine_legacy_routes_to_fts_even_with_bridge_available() {
 
 #[test]
 #[allow(deprecated)]
+#[cfg(feature = "tantivy-engine")]
 fn search_engine_shadow_records_parity_comparison_metrics() {
     let _guard = tantivy_test_lock()
         .lock()
@@ -1550,6 +1560,7 @@ fn set_contact_policy_contacts_only() {
 // =============================================================================
 
 /// Insert a Tantivy doc for scope tests with a unique token.
+#[cfg(feature = "tantivy-engine")]
 fn insert_scope_tantivy_doc(
     doc_id: i64,
     project_id: i64,
@@ -1575,6 +1586,7 @@ fn scope_viewer(agent_id: i64, project_id: i64) -> ScopeContext {
 }
 
 #[test]
+#[cfg(feature = "tantivy-engine")]
 fn v3_lexical_scope_denies_cross_project_messages() {
     let _guard = tantivy_test_lock()
         .lock()
@@ -1634,6 +1646,7 @@ fn v3_lexical_scope_denies_cross_project_messages() {
 }
 
 #[test]
+#[cfg(feature = "tantivy-engine")]
 fn v3_lexical_scope_allows_same_project_auto_policy() {
     let _guard = tantivy_test_lock()
         .lock()
@@ -1696,6 +1709,7 @@ fn v3_lexical_scope_allows_same_project_auto_policy() {
 }
 
 #[test]
+#[cfg(feature = "tantivy-engine")]
 fn v3_lexical_scope_contacts_only_denies_unlinked() {
     let _guard = tantivy_test_lock()
         .lock()
@@ -1747,6 +1761,7 @@ fn v3_lexical_scope_contacts_only_denies_unlinked() {
 }
 
 #[test]
+#[cfg(feature = "tantivy-engine")]
 fn v3_lexical_scope_recipient_always_allowed() {
     let _guard = tantivy_test_lock()
         .lock()
@@ -1802,6 +1817,7 @@ fn v3_lexical_scope_recipient_always_allowed() {
 }
 
 #[test]
+#[cfg(feature = "tantivy-engine")]
 fn v3_lexical_allowed_results_not_redacted() {
     // Verify that results with Allow verdict keep their original body
     // even when a redaction policy is set. Redaction only applies to Redact verdicts.
@@ -1849,6 +1865,7 @@ fn v3_lexical_allowed_results_not_redacted() {
 }
 
 #[test]
+#[cfg(feature = "tantivy-engine")]
 fn v3_scope_redaction_on_deny_excludes_from_results() {
     // Verify that Deny-verdict results are fully excluded (not just redacted)
     // when searching through the V3 Tantivy path.
@@ -1905,6 +1922,7 @@ fn v3_scope_redaction_on_deny_excludes_from_results() {
 }
 
 #[test]
+#[cfg(feature = "tantivy-engine")]
 fn v3_lexical_operator_mode_no_audit_no_filtering() {
     let _guard = tantivy_test_lock()
         .lock()
@@ -1954,6 +1972,7 @@ fn v3_lexical_operator_mode_no_audit_no_filtering() {
 }
 
 #[test]
+#[cfg(feature = "tantivy-engine")]
 fn v3_lexical_audit_summary_counts_match_verdicts() {
     let _guard = tantivy_test_lock()
         .lock()

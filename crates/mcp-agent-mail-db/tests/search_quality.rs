@@ -22,6 +22,7 @@ use mcp_agent_mail_core::config::SearchEngine;
 use mcp_agent_mail_db::queries;
 use mcp_agent_mail_db::search_planner::{DocKind, Importance, RankingMode, SearchQuery};
 use mcp_agent_mail_db::search_service::{SearchOptions, execute_search, execute_search_simple};
+#[cfg(feature = "tantivy-engine")]
 use mcp_agent_mail_db::search_v3;
 use mcp_agent_mail_db::{DbPool, DbPoolConfig};
 use serde::Serialize;
@@ -29,6 +30,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "tantivy-engine")]
 use tantivy::doc;
 
 // ────────────────────────────────────────────────────────────────────
@@ -780,6 +782,7 @@ struct SeededCorpus {
     _dir: tempfile::TempDir,
 }
 
+#[cfg(feature = "tantivy-engine")]
 fn ensure_v3_tantivy_index(corpus: &SeededCorpus) {
     let index_dir = std::env::temp_dir().join(format!(
         "am_search_quality_v3_index_{}_{}",
@@ -1169,6 +1172,7 @@ fn save_search_quality_artifact(artifact: &SearchQualityArtifact) {
 /// Produces machine-readable per-query/per-mode metrics and validates baseline
 /// quality floors for lexical/semantic/hybrid (plus hybrid+rerkank diagnostics).
 #[test]
+#[cfg(feature = "tantivy-engine")]
 fn search_quality_multimode_harness() {
     let corpus = seed_corpus();
     ensure_v3_tantivy_index(&corpus);

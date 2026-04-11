@@ -19,6 +19,7 @@
 //! ```
 
 #![forbid(unsafe_code)]
+#![cfg(feature = "tantivy-engine")]
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,

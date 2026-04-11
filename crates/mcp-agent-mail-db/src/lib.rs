@@ -76,7 +76,7 @@ pub mod tantivy_schema;
 
 #[cfg(not(feature = "tantivy-engine"))]
 pub mod search_v3 {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Arc;
 
     use crate::search_planner::{SearchQuery as PlannerQuery, SearchResult as PlannerResult};
