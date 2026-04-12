@@ -626,7 +626,15 @@ fn path_existing_prefix_has_symlink(path: &Path) -> Result<bool, std::io::Error>
             Component::Prefix(prefix) => current.push(prefix.as_os_str()),
             Component::RootDir => current.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
             Component::CurDir => continue,
-            Component::ParentDir => current.push(".."),
+            Component::ParentDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "persist path must not contain parent traversal: {}",
+                        path.display()
+                    ),
+                ));
+            }
             Component::Normal(part) => current.push(part),
         }
 
@@ -1059,6 +1067,23 @@ mod tests {
 
         assert!(!persister.save_now(&TuiPreferences::default()));
         assert_eq!(std::fs::read(&outside).unwrap(), b"OUTSIDE=1\n");
+    }
+
+    #[test]
+    fn validate_persist_path_rejects_parent_traversal() {
+        let err = validate_persist_path(Path::new("../config.env")).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("parent traversal"));
+    }
+
+    #[test]
+    fn save_palette_usage_rejects_parent_traversal_path() {
+        let mut usage = PaletteUsageMap::new();
+        usage.insert("screen:dashboard".to_string(), (7, 1_700_000_123_000_000));
+
+        let err = save_palette_usage(Path::new("../palette_usage.json"), &usage).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("parent traversal"));
     }
 
     #[test]

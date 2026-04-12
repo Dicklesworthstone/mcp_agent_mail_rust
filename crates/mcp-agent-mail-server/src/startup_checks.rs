@@ -649,9 +649,42 @@ fn write_listener_pid_hint_atomic(path: &Path, content: &str) -> Result<(), Stri
                     })?;
                     drop(file);
                     validate_real_file_target_path(path, "listener PID hint path")?;
-                    std::fs::rename(&tmp_path, path).map_err(|error| {
-                        format!("publish listener PID hint {}: {error}", path.display())
-                    })?;
+                    match std::fs::rename(&tmp_path, path) {
+                        Ok(()) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::AlreadyExists
+                                    | std::io::ErrorKind::PermissionDenied
+                            ) =>
+                        {
+                            let publish_error = error.to_string();
+                            validate_real_file_target_path(path, "listener PID hint path")?;
+                            match std::fs::remove_file(path) {
+                                Ok(()) => {}
+                                Err(remove_error)
+                                    if remove_error.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(remove_error) => {
+                                    return Err(format!(
+                                        "replace existing listener PID hint {} after rename failure ({publish_error}): {remove_error}",
+                                        path.display()
+                                    ));
+                                }
+                            }
+                            std::fs::rename(&tmp_path, path).map_err(|rename_error| {
+                                format!(
+                                    "publish replacement listener PID hint {} after rename failure ({publish_error}): {rename_error}",
+                                    path.display()
+                                )
+                            })?;
+                        }
+                        Err(error) => {
+                            return Err(format!(
+                                "publish listener PID hint {}: {error}",
+                                path.display()
+                            ));
+                        }
+                    }
                     Ok(())
                 })();
                 if let Err(error) = write_result {
@@ -3668,6 +3701,32 @@ mod tests {
                     read_listener_pid_hint("127.0.0.1", 8765).is_none(),
                     "symlinked listener PID hint files must be ignored"
                 );
+            },
+        );
+    }
+
+    #[test]
+    fn write_listener_pid_hint_replaces_existing_hint_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmpdir = dir.path().to_string_lossy().into_owned();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("TMPDIR", tmpdir.as_str())],
+            || {
+                let path = listener_pid_hint_path("127.0.0.1", 8765);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let stale_hint = "1\n/usr/bin/other\n1\n";
+                std::fs::write(&path, stale_hint).unwrap();
+
+                let written = write_listener_pid_hint("127.0.0.1", 8765);
+                assert_eq!(written, path);
+
+                let updated = std::fs::read_to_string(&path).unwrap();
+                assert_ne!(updated, stale_hint);
+                let hint =
+                    parse_listener_pid_hint(&updated).expect("parse refreshed listener PID hint");
+                assert_eq!(hint.pid, std::process::id());
+                assert!(hint.created_epoch_secs.is_some());
             },
         );
     }
