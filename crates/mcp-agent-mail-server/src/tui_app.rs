@@ -8,7 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -532,6 +532,101 @@ fn resolve_export_dir_from_sources(
         return home.join(".mcp_agent_mail").join("exports");
     }
     PathBuf::from(".mcp_agent_mail").join("exports")
+}
+
+fn path_existing_prefix_has_symlink(path: &Path) -> std::io::Result<bool> {
+    let mut current = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir()?
+    };
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
+            Component::CurDir => continue,
+            Component::ParentDir => current.push(".."),
+            Component::Normal(part) => current.push(part),
+        }
+
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(false)
+}
+
+fn validate_export_path(path: &Path) -> std::io::Result<()> {
+    if path_existing_prefix_has_symlink(path)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("export path must not include symlinks: {}", path.display()),
+        ));
+    }
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("export path must not include symlinks: {}", path.display()),
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_export_file_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    validate_export_path(parent)?;
+    std::fs::create_dir_all(parent)?;
+    validate_export_path(path)?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("export");
+
+    for attempt in 0..64 {
+        let tmp_path = parent.join(format!(
+            ".{file_name}.tmp-{}-{}-{attempt}",
+            std::process::id(),
+            now_micros()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+        {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                let write_result = (|| -> std::io::Result<()> {
+                    file.write_all(contents.as_bytes())?;
+                    file.sync_data()?;
+                    drop(file);
+                    validate_export_path(path)?;
+                    std::fs::rename(&tmp_path, path)?;
+                    Ok(())
+                })();
+                if let Err(error) = write_result {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(error);
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("failed to allocate unique temp file for {}", path.display()),
+    ))
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -1973,6 +2068,8 @@ impl MailAppModel {
             .clone()
             .ok_or_else(|| "no rendered frame available yet".to_string())?;
 
+        validate_export_path(export_dir)
+            .map_err(|e| format!("failed to prepare export directory: {e}"))?;
         std::fs::create_dir_all(export_dir)
             .map_err(|e| format!("failed to create export directory: {e}"))?;
 
@@ -1985,7 +2082,8 @@ impl MailAppModel {
         let file_name = format!("am_export_{screen_slug}_{timestamp}.{}", format.extension());
         let path = export_dir.join(file_name);
         let rendered = format.render(&snapshot);
-        std::fs::write(&path, rendered).map_err(|e| format!("failed to write export file: {e}"))?;
+        write_export_file_atomic(&path, &rendered)
+            .map_err(|e| format!("failed to write export file: {e}"))?;
         Ok(path)
     }
 
@@ -7603,6 +7701,82 @@ mod tests {
         assert!(
             !text_body.contains('\u{001b}'),
             "plain text export should not include ANSI escapes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_snapshot_to_dir_rejects_symlinked_export_directory() {
+        use std::os::unix::fs::symlink;
+
+        let model = test_model();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(100, 30, &mut pool);
+        model.view(&mut frame);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside export dir");
+        let linked_export_dir = tmp.path().join("linked-export-dir");
+        symlink(outside.path(), &linked_export_dir).expect("symlink export dir");
+
+        let err = model
+            .export_snapshot_to_dir(ExportFormat::Html, &linked_export_dir)
+            .expect_err("symlinked export dir should be rejected");
+        assert!(err.contains("must not include symlinks"));
+        assert!(
+            std::fs::read_dir(outside.path())
+                .expect("read outside dir")
+                .next()
+                .is_none(),
+            "export must not traverse a symlinked export directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_snapshot_to_dir_rejects_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let model = test_model();
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = ftui::Frame::new(100, 30, &mut pool);
+        model.view(&mut frame);
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_parent = tmp.path().join("real-parent");
+        std::fs::create_dir_all(&real_parent).expect("create real parent");
+        let linked_parent = tmp.path().join("linked-parent");
+        symlink(&real_parent, &linked_parent).expect("symlink parent dir");
+        let export_dir = linked_parent.join("exports");
+
+        let err = model
+            .export_snapshot_to_dir(ExportFormat::Svg, &export_dir)
+            .expect_err("export dir through symlinked parent should be rejected");
+        assert!(err.contains("must not include symlinks"));
+        assert!(
+            !real_parent.join("exports").exists(),
+            "export must not create directories through a symlinked parent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_export_file_atomic_rejects_symlinked_target_file() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outside = tmp.path().join("outside.html");
+        std::fs::write(&outside, "outside").expect("seed outside file");
+        let linked_target = tmp.path().join("linked-target.html");
+        symlink(&outside, &linked_target).expect("symlink target file");
+
+        let err = write_export_file_atomic(&linked_target, "new payload")
+            .expect_err("symlinked target file should be rejected");
+        assert!(err.to_string().contains("must not include symlinks"));
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("read outside file"),
+            "outside",
+            "atomic export writes must not follow a symlinked target file"
         );
     }
 

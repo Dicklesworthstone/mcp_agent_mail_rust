@@ -41390,6 +41390,87 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn doctor_repair_recovers_corrupt_db_without_archive_from_sibling_backup() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("repair_recover.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let backup_dir = dir.path().join("backups");
+
+        handle_migrate_with_database_url(&db_url).expect("migrate");
+        let conn = open_db_sync_with_database_url(&db_url).expect("open");
+        conn.query_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES ('recover', '/tmp/recover', 0)",
+            &[],
+        )
+        .expect("insert project");
+        drop(conn);
+
+        let sibling_bak = PathBuf::from(format!("{}.bak", db_path.display()));
+        std::fs::copy(&db_path, &sibling_bak).expect("create sibling backup");
+        std::fs::write(&db_path, b"NOT A SQLITE DATABASE").expect("corrupt primary db");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        handle_doctor_repair_with(&db_url, dir.path(), &backup_dir, None, false, true)
+            .expect("repair should recover from sibling backup");
+        let output = capture.drain_to_string();
+
+        assert!(
+            output.contains("No archive is available under"),
+            "repair should report in-place recovery when archive is unavailable: {output}"
+        );
+        assert!(
+            !output.contains("Nothing to reconstruct"),
+            "repair should not pretend reconstruction ran when no archive exists: {output}"
+        );
+
+        let repaired = open_db_sync_with_database_url(&db_url).expect("reopen repaired db");
+        let rows = repaired
+            .query_sync("SELECT COUNT(*) AS cnt FROM projects", &[])
+            .expect("query repaired db");
+        let count: i64 = rows.first().unwrap().get_named("cnt").unwrap();
+        assert_eq!(count, 1, "repaired db should preserve backup contents");
+    }
+
+    #[test]
+    fn doctor_repair_fails_closed_for_corrupt_db_without_archive_or_backup() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("repair_fail_closed.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let backup_dir = dir.path().join("backups");
+        std::fs::write(&db_path, b"NOT A SQLITE DATABASE").expect("write corrupt db");
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_doctor_repair_with(&db_url, dir.path(), &backup_dir, None, false, true);
+        let output = capture.drain_to_string();
+        let err = result.expect_err("repair should fail closed when no archive or backup exists");
+        let err_text = err.to_string();
+
+        assert!(
+            output.contains("No archive is available under"),
+            "repair should explain why it is staying on the in-place path: {output}"
+        );
+        assert!(
+            !output.contains("Nothing to reconstruct"),
+            "repair should not silently skip via reconstruct when no archive exists: {output}"
+        );
+        assert!(
+            err_text.contains("no healthy backup was found")
+                || err_text.contains("auto-recovery failed"),
+            "unexpected fail-closed error: {err_text}"
+        );
+        assert!(
+            db_path.exists(),
+            "corrupt primary file should remain in place on failure"
+        );
+    }
+
+    #[test]
     fn doctor_repair_removes_orphaned_message_recipients_and_rebuilds_inbox_stats() {
         let _guard = stdio_capture_lock()
             .lock()
@@ -45109,17 +45190,24 @@ fn handle_doctor_repair_with(
         ftui_runtime::ftui_println!("  Forensics: {}", bundle_dir.display());
     }
 
+    let archive_projects_dir = storage_root.join("projects");
+    let archive_available = path_is_real_directory(&archive_projects_dir);
     if !integrity_ok && !dry_run {
+        if archive_available {
+            ftui_runtime::ftui_eprintln!(
+                "  Database corruption detected ({integrity_detail}). Automatically falling back to archive reconstruction..."
+            );
+            return handle_doctor_reconstruct_with(
+                Some(&reconstruct_db_path),
+                Some(storage_root),
+                false,
+                yes,
+                false,
+            );
+        }
         ftui_runtime::ftui_eprintln!(
-            "  Database corruption detected ({integrity_detail}). Automatically falling back to archive reconstruction..."
-        );
-        // Fall back to reconstruction from archive
-        return handle_doctor_reconstruct_with(
-            Some(&reconstruct_db_path),
-            Some(storage_root),
-            false,
-            yes,
-            false,
+            "  Database corruption detected ({integrity_detail}). No archive is available under {}; repair will attempt in-place recovery from the database file and any healthy backups...",
+            archive_projects_dir.display(),
         );
     }
 
