@@ -3809,12 +3809,12 @@ fn startup_database_self_heal_action(
 fn run_startup_database_self_heal_with<F, G>(
     database_url: &str,
     storage_root: &Path,
-    mut run_repair: F,
+    run_repair: F,
     mut run_reconstruct: G,
 ) -> CliResult<()>
 where
     F: FnMut() -> CliResult<()>,
-    G: FnMut() -> CliResult<()>,
+    G: FnMut(&Path) -> CliResult<()>,
 {
     match startup_database_self_heal_action(database_url, storage_root)? {
         StartupDatabaseSelfHealAction::None(_) => Ok(()),
@@ -3822,15 +3822,16 @@ where
             output::info(&format!(
                 "Startup detected mailbox database issues; running automatic repair ({detail})"
             ));
-            run_repair()?;
+            run_startup_doctor_subcommand_quietly(run_repair)?;
             output::info("Automatic mailbox repair completed; continuing startup");
             Ok(())
         }
         StartupDatabaseSelfHealAction::Reconstruct(detail) => {
+            let reconstruct_db_path = resolve_mailbox_activity_sqlite_path(database_url)?;
             output::info(&format!(
                 "Startup detected mailbox database issues; reconstructing from archive ({detail})"
             ));
-            run_reconstruct()?;
+            run_startup_doctor_subcommand_quietly(|| run_reconstruct(&reconstruct_db_path))?;
             output::info("Automatic mailbox reconstruction completed; continuing startup");
             Ok(())
         }
@@ -3845,7 +3846,15 @@ fn run_startup_database_self_heal(config: &Config) -> CliResult<()> {
         &database_url,
         &storage_root,
         || handle_doctor_repair_with(&database_url, &storage_root, &backup_dir, None, false, true),
-        || handle_doctor_reconstruct_with(None, Some(&storage_root), false, true, false),
+        |reconstruct_db_path| {
+            handle_doctor_reconstruct_with(
+                Some(reconstruct_db_path),
+                Some(&storage_root),
+                false,
+                true,
+                false,
+            )
+        },
     )
 }
 
@@ -29645,28 +29654,31 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn startup_database_self_heal_suppresses_doctor_stdout_output() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(dir.path().join("projects")).expect("create archive root");
-        let db_path = dir.path().join("missing.sqlite3");
-        let db_url = format!("sqlite:///{}", db_path.display());
-        let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+    fn startup_doctor_subcommand_quietly_installs_capture_for_doctor_output() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let saw_capture = std::cell::Cell::new(false);
 
-        run_startup_database_self_heal_with(
-            &db_url,
-            dir.path(),
-            || Ok(()),
-            |_| {
-                ftui_runtime::ftui_println!("doctor stdout noise");
-                Ok(())
-            },
-        )
-        .expect("startup self-heal should succeed");
-
-        let output = capture.drain_to_string();
         assert!(
-            !output.contains("doctor stdout noise"),
-            "startup self-heal must not leak doctor stdout output: {output}"
+            !ftui_runtime::StdioCapture::is_installed(),
+            "test must start without a pre-existing capture"
+        );
+
+        run_startup_doctor_subcommand_quietly(|| {
+            saw_capture.set(ftui_runtime::StdioCapture::is_installed());
+            ftui_runtime::ftui_println!("doctor stdout noise");
+            Ok(())
+        })
+        .expect("startup quiet runner should succeed");
+
+        assert!(
+            saw_capture.get(),
+            "startup quiet runner must install stdio capture before doctor output runs"
+        );
+        assert!(
+            !ftui_runtime::StdioCapture::is_installed(),
+            "startup quiet runner must release the capture after completion"
         );
     }
 
@@ -45909,7 +45921,6 @@ where
         return run_startup_doctor_subcommand_quietly(operation);
     }
     operation()
-}
 }
 
 fn handle_doctor_reconstruct_with(

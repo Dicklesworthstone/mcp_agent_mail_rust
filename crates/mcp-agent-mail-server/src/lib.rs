@@ -10665,7 +10665,7 @@ fn write_startup_integrity_cache_atomic(path: &Path, payload: &str) -> std::io::
                 validate_startup_integrity_cache_path(path)?;
                 return fs::rename(&staged_path, path);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
     }
