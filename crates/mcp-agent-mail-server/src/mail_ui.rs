@@ -5109,18 +5109,18 @@ fn handle_overseer_send(
     let pid = p.id.unwrap_or(0);
 
     // Ensure HumanOverseer agent exists.
+    // Uses insert_system_agent (no name validation) because "HumanOverseer"
+    // is not in the adjective+noun vocabulary enforced by register_agent.
     let overseer = block_on_outcome(
         cx,
-        queries::register_agent(
+        queries::insert_system_agent(
             cx,
             pool,
             pid,
             "HumanOverseer",
             "WebUI",
             "Human",
-            Some("Human operator providing guidance and oversight to agents"),
-            Some("auto"),
-            None,
+            "Human operator providing guidance and oversight to agents",
         ),
     )?;
     let overseer_id = overseer.id.unwrap_or(0);
