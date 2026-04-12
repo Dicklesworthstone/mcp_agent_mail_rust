@@ -302,6 +302,7 @@ dependencies = [
  "parking_lot",
  "pin-project",
  "polling",
+ "prost",
  "ring",
  "rmp-serde",
  "rustls",
@@ -2477,7 +2478,7 @@ dependencies = [
 
 [[package]]
 name = "ftui"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ftui-core",
  "ftui-extras",
@@ -2491,7 +2492,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-a11y"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "ahash",
  "ftui-core",
@@ -2499,7 +2500,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-backend"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ftui-core",
  "ftui-render",
@@ -2507,7 +2508,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2524,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-extras"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "ftui-core",
@@ -2544,7 +2545,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-harness"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "ftui-core",
@@ -2562,11 +2563,11 @@ dependencies = [
 
 [[package]]
 name = "ftui-i18n"
-version = "0.2.1"
+version = "0.3.0"
 
 [[package]]
 name = "ftui-layout"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ftui-core",
  "rustc-hash",
@@ -2576,7 +2577,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-render"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ahash",
  "bitflags",
@@ -2591,7 +2592,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-runtime"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "arc-swap",
  "ftui-backend",
@@ -2610,7 +2611,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-style"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2620,7 +2621,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-text"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ftui-core",
  "ftui-layout",
@@ -2637,7 +2638,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-tty"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ftui-backend",
  "ftui-core",
@@ -2649,7 +2650,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-widgets"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "ahash",
  "bitflags",
@@ -4704,7 +4705,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail"
-version = "0.2.38"
+version = "0.2.39"
 dependencies = [
  "clap",
  "criterion",
@@ -4730,7 +4731,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-cli"
-version = "0.2.38"
+version = "0.2.39"
 dependencies = [
  "asupersync",
  "beads_rust",
@@ -4771,7 +4772,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-conformance"
-version = "0.2.38"
+version = "0.2.39"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4794,7 +4795,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-core"
-version = "0.2.38"
+version = "0.2.39"
 dependencies = [
  "chrono",
  "criterion",
@@ -4819,7 +4820,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-db"
-version = "0.2.38"
+version = "0.2.39"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4862,7 +4863,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-guard"
-version = "0.2.38"
+version = "0.2.39"
 dependencies = [
  "chrono",
  "git2",
@@ -4877,7 +4878,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-search-core"
-version = "0.2.38"
+version = "0.2.39"
 dependencies = [
  "chrono",
  "criterion",
@@ -4907,7 +4908,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-server"
-version = "0.2.38"
+version = "0.2.39"
 dependencies = [
  "ammonia",
  "asupersync",
@@ -4950,7 +4951,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-share"
-version = "0.2.38"
+version = "0.2.39"
 dependencies = [
  "atty",
  "base64 0.22.1",
@@ -4971,7 +4972,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-storage"
-version = "0.2.38"
+version = "0.2.39"
 dependencies = [
  "asupersync",
  "base64 0.22.1",
@@ -4996,7 +4997,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-tools"
-version = "0.2.38"
+version = "0.2.39"
 dependencies = [
  "asupersync",
  "chrono",
@@ -5022,7 +5023,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-wasm"
-version = "0.2.38"
+version = "0.2.39"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",
@@ -6048,6 +6049,29 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
+]
+
+[[package]]
+name = "prost"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
+dependencies = [
+ "anyhow",
+ "itertools 0.14.0",
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

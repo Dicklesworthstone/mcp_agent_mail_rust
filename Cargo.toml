@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.38"
+version = "0.2.39"
 edition = "2024"
 license = "LicenseRef-MIT-Rider"
 license-file = "LICENSE"
@@ -43,14 +43,14 @@ sqlmodel-pool = "0.2.1"
 sqlmodel-frankensqlite = "0.2.1"
 sqlmodel-sqlite = "0.2.1"
 
-ftui = "0.2.1"
-ftui-runtime = { version = "0.2.1", features = ["native-backend"] }
-ftui-extras = { version = "0.2.1", features = ["theme", "syntax", "export", "markdown", "charts", "text-effects", "diagram", "forms", "clipboard", "image", "visual-fx"] }
-ftui-widgets = { version = "0.2.1", features = ["debug-overlay", "regex-search"] }
-ftui-tty = "0.2.1"
-ftui-harness = "0.2.1"
-ftui-render = "0.2.1"
-beads_rust = "0.1.14"
+ftui = "0.3.0"
+ftui-runtime = { version = "0.3.0", features = ["native-backend"] }
+ftui-extras = { version = "0.3.0", features = ["theme", "syntax", "export", "markdown", "charts", "text-effects", "diagram", "forms", "clipboard", "image", "visual-fx"] }
+ftui-widgets = { version = "0.3.0", features = ["debug-overlay", "regex-search"] }
+ftui-tty = "0.3.0"
+ftui-harness = "0.3.0"
+ftui-render = "0.3.0"
+beads_rust = "0.1.38"
 toon = { version = "0.2.0", package = "tru" }
 
 # Internal workspace crates

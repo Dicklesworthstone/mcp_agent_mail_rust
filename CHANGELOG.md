@@ -12,7 +12,73 @@ No changes yet.
 
 ---
 
-## [v0.2.13](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.2.13) — 2026-03-22 **[Release — Latest]**
+## [v0.2.39](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.2.39) — 2026-04-12 **[Release — Latest]**
+
+81+ commits since v0.2.38 | [Compare](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.2.38...v0.2.39)
+
+Comprehensive security hardening, FrankenSQLite migration completion, orphaned-data resilience, and SQLite recovery sidecar infrastructure. This release makes Agent Mail significantly more robust against symlink escape attacks, crashed-agent data corruption, and production database recovery scenarios.
+
+### Security Hardening
+
+- Reject symlink escape attacks across all filesystem I/O surfaces: share bundles, deploy verification, archive paths, TUI persistence, crypto signing, PID hint files, and database paths
+- Harden listener PID hint file writes against `AlreadyExists`/`PermissionDenied` race conditions with atomic retry
+- Reject parent directory traversal (`..`) in TUI persist paths to prevent path escape
+- Validate TUI preset names against empty/collision and reject symlinked DB paths in share operations
+- Extend symlink-safe validation to age crypto, deploy history, and bundle export config paths
+- Stop swallowing serde errors; fail hard on chmod errors in share operations
+
+### FrankenSQLite Migration
+
+- Complete FrankenSQLite migration: remove sqlmodel-sqlite/libsqlite3-sys C dependency
+- Replace sqlite3 CLI usage in installer/scripts with FrankenSQLite-backed `am` tooling helpers
+- Route file-backed ATC experience IO through canonical SQLite path
+- Use `open_sqlite_file_with_lock_retry` instead of recovery opener for WAL checkpoint
+
+### Orphaned-Data Resilience
+
+- Comprehensive orphaned-agent, orphaned-project, and orphaned-sender resilience across all query and rendering paths (db, cli, server, tools, storage)
+- Tolerate orphaned project metadata and recipient rows in inbound/outbound queries, mail explorer, and global inbox
+- Trim agent names and drop blank entries during `recipients_json` sync
+- Keep `recipients_json` visible when agent row is missing during reconstruct
+- Route project resolution through `context::resolve_project` for synthetic-id tolerance
+
+### SQLite Recovery & Sidecar Infrastructure
+
+- SQLite recovery sidecar consolidation: stage-then-swap archive restore with rollback-journal awareness
+- Mailbox health verdict with archive snapshot fallback for suspect live-db reads
+- Transactional salvage merge and ATC schema repair migrations
+- Embedded-database archive support with symlink-safe reset
+- `am doctor` repair preservation improvements and temp artifact tracking
+
+### Server & Web UI
+
+- Staged static export pipeline with Ed25519 signing
+- Auth-helper URL generation for inbox and unified-inbox client-side actions
+- Consume mailbox verdict for primary read surface + `ack_filter` query param
+- Parse repeated + comma-separated importance filter params for `/search`
+- Convert `mail_claims.html` from layout-extending block to standalone partial
+- Filesystem-first project resolution for archive routes
+- Filtered archive directory scan with symlink-safe snapshot rebuilds
+
+### CLI & Robot Mode
+
+- Extended malformed-attachments sentinel to robot output + TUI attachment/message/thread views
+- Safe atomic share-update pipeline with expanded robot mode
+- Doctor sidecar cleanup, temp artifact tracking, and migrate open path
+- Shared malformed-JSON sentinels + synthetic-project-id tolerance across tools/doctor/TUI
+
+### Build & Infrastructure
+
+- Updated frankentui dependency versions from 0.2.1 to 0.3.0
+- Updated beads_rust dependency version from 0.1.14 to 0.1.38
+- Conditional compilation fixes for tantivy benches and featureless builds
+- Runtime warnings and documentation for concurrent mode snapshot drift (GH#65)
+- Installer TOML config writer made idempotent with duplicate entry handling
+- Install-local.sh added with jq-first JSON parsing
+
+---
+
+## [v0.2.13](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.2.13) — 2026-03-22 **[Release]**
 
 8 commits since v0.2.12 | [Compare](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.2.12...v0.2.13)
 
