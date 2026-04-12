@@ -14,7 +14,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 // ──────────────────────────────────────────────────────────────────────
@@ -586,19 +586,99 @@ fn is_agent_mail_by_pid(host: &str, port: u16) -> bool {
     !agent_mail_port_holder_pids_with_hint(host, port).is_empty()
 }
 
+fn path_existing_prefix_has_symlink(path: &Path) -> Result<bool, String> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        use std::path::Component;
+
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(format!(
+                    "refusing to traverse listener PID hint path with parent traversal: {}",
+                    path.display()
+                ));
+            }
+            Component::Normal(segment) => current.push(segment),
+        }
+
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(false)
+}
+
+fn write_listener_pid_hint_atomic(path: &Path, content: &str) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    ensure_real_directory_tree(parent, "listener PID hint directory")?;
+    validate_real_file_target_path(path, "listener PID hint path")?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("listener-pid-hint");
+
+    for attempt in 0..64 {
+        let tmp_path = parent.join(format!(".{file_name}.tmp-{}-{attempt}", std::process::id()));
+        validate_real_file_target_path(&tmp_path, "listener PID hint temp path")?;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+        {
+            Ok(mut file) => {
+                let write_result = (|| -> Result<(), String> {
+                    file.write_all(content.as_bytes()).map_err(|error| {
+                        format!(
+                            "write staged listener PID hint {}: {error}",
+                            tmp_path.display()
+                        )
+                    })?;
+                    file.sync_data().map_err(|error| {
+                        format!(
+                            "sync staged listener PID hint {}: {error}",
+                            tmp_path.display()
+                        )
+                    })?;
+                    drop(file);
+                    validate_real_file_target_path(path, "listener PID hint path")?;
+                    std::fs::rename(&tmp_path, path).map_err(|error| {
+                        format!("publish listener PID hint {}: {error}", path.display())
+                    })?;
+                    Ok(())
+                })();
+                if let Err(error) = write_result {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(error);
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!(
+                    "open staged listener PID hint {}: {error}",
+                    tmp_path.display()
+                ));
+            }
+        }
+    }
+
+    Err(format!(
+        "failed to allocate unique staged listener PID hint next to {}",
+        path.display()
+    ))
+}
+
 #[must_use]
 pub fn write_listener_pid_hint(host: &str, port: u16) -> PathBuf {
     let path = listener_pid_hint_path(host, port);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-        // Restrict directory permissions to owner-only (0o700) so other
-        // users cannot plant symlinks inside it.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-        }
-    }
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -608,18 +688,14 @@ pub fn write_listener_pid_hint(host: &str, port: u16) -> PathBuf {
         created_epoch_secs: Some(now_secs),
     };
     let content = format_listener_pid_hint(&hint);
-    // Write via temp file + rename to avoid symlink TOCTOU attacks:
-    // rename() is atomic on POSIX, so there's no window for an attacker
-    // to substitute a symlink between creation and write.
-    let tmp_path = path.with_extension("pid.tmp");
-    // Remove stale symlinks or files at the target path first.
-    let _ = std::fs::remove_file(&path);
-    if std::fs::write(&tmp_path, &content).is_ok() {
-        if std::fs::rename(&tmp_path, &path).is_err() {
-            let _ = std::fs::write(&path, &content);
+    if let Err(error) = write_listener_pid_hint_atomic(&path, &content) {
+        tracing::debug!(path = %path.display(), %error, "failed to write listener PID hint");
+    } else if let Some(parent) = path.parent() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
-    } else {
-        let _ = std::fs::write(&path, &content);
     }
     path
 }
@@ -747,7 +823,28 @@ fn parse_listener_pid_hint(content: &str) -> Option<ListenerPidHint> {
 }
 
 fn read_listener_pid_hint(host: &str, port: u16) -> Option<ListenerPidHint> {
-    let content = std::fs::read_to_string(listener_pid_hint_path(host, port)).ok()?;
+    let path = listener_pid_hint_path(host, port);
+    match path_existing_prefix_has_symlink(&path) {
+        Ok(true) => {
+            tracing::debug!(path = %path.display(), "rejecting symlinked listener PID hint path");
+            return None;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            tracing::debug!(path = %path.display(), %error, "failed to validate listener PID hint path");
+            return None;
+        }
+    }
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            tracing::debug!(path = %path.display(), %error, "failed to stat listener PID hint path");
+            return None;
+        }
+    }
+    let content = std::fs::read_to_string(&path).ok()?;
     let hint = parse_listener_pid_hint(&content)?;
     // Reject stale hints to prevent PID recycling attacks.
     // If no timestamp is present (old format), accept the hint but log a warning.
@@ -3510,6 +3607,69 @@ mod tests {
         let dotted = listener_pid_hint_path("127.0.0.1", 8765);
         let underscored = listener_pid_hint_path("127_0_0_1", 8765);
         assert_ne!(dotted, underscored);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_listener_pid_hint_rejects_symlinked_hint_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let tmpdir = dir.path().to_string_lossy().into_owned();
+        symlink(outside.path(), dir.path().join(LISTENER_PID_HINT_DIR)).unwrap();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("TMPDIR", tmpdir.as_str())],
+            || {
+                let path = write_listener_pid_hint("127.0.0.1", 8765);
+                assert_eq!(path, listener_pid_hint_path("127.0.0.1", 8765));
+                assert!(
+                    !path.exists(),
+                    "listener PID hint should not be written through a symlinked hint directory"
+                );
+                assert!(
+                    outside.path().read_dir().unwrap().next().is_none(),
+                    "listener PID hint write must not traverse a symlinked directory"
+                );
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_listener_pid_hint_ignores_symlinked_hint_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tmpdir = dir.path().to_string_lossy().into_owned();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("TMPDIR", tmpdir.as_str())],
+            || {
+                let path = listener_pid_hint_path("127.0.0.1", 8765);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let outside = dir.path().join("outside.pid");
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                std::fs::write(
+                    &outside,
+                    format_listener_pid_hint(&ListenerPidHint {
+                        pid: 4242,
+                        exe_path: Some("/usr/bin/am".to_string()),
+                        created_epoch_secs: Some(now_secs),
+                    }),
+                )
+                .unwrap();
+                symlink(&outside, &path).unwrap();
+
+                assert!(
+                    read_listener_pid_hint("127.0.0.1", 8765).is_none(),
+                    "symlinked listener PID hint files must be ignored"
+                );
+            },
+        );
     }
 
     #[test]
