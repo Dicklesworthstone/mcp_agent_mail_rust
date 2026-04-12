@@ -5109,18 +5109,18 @@ fn handle_overseer_send(
     let pid = p.id.unwrap_or(0);
 
     // Ensure HumanOverseer agent exists.
+    // Uses insert_system_agent (no name validation) because "HumanOverseer"
+    // is not in the adjective+noun vocabulary enforced by register_agent.
     let overseer = block_on_outcome(
         cx,
-        queries::register_agent(
+        queries::insert_system_agent(
             cx,
             pool,
             pid,
             "HumanOverseer",
             "WebUI",
             "Human",
-            Some("Human operator providing guidance and oversight to agents"),
-            Some("auto"),
-            None,
+            "Human operator providing guidance and oversight to agents",
         ),
     )?;
     let overseer_id = overseer.id.unwrap_or(0);
@@ -5702,6 +5702,92 @@ mod fresh_eyes_regression_tests {
         assert!(
             payload.contains("not implemented"),
             "unexpected payload: {payload}"
+        );
+    }
+
+    /// Regression: `handle_overseer_send` previously called `register_agent`
+    /// which rejected "HumanOverseer" because it is not in the adjective+noun
+    /// vocabulary, causing a 500.  Now uses `insert_system_agent` instead.
+    /// This test verifies that `insert_system_agent` accepts "HumanOverseer"
+    /// and that the full overseer send flow (create agent → send message)
+    /// works end-to-end.
+    #[test]
+    fn overseer_send_insert_system_agent_accepts_human_overseer() {
+        let cx = Cx::for_request_with_budget(Budget::with_deadline_secs(30));
+        let pool = make_test_pool("mail-ui-overseer-send");
+
+        let project = outcome_ok(block_on(queries::ensure_project(
+            &cx,
+            &pool,
+            "/tmp/mail-ui-overseer-send",
+        )));
+        let project_id = project.id.expect("project id");
+
+        // register_agent rejects "HumanOverseer" (the old bug).
+        let rejected = block_on(queries::register_agent(
+            &cx,
+            &pool,
+            project_id,
+            "HumanOverseer",
+            "WebUI",
+            "Human",
+            None,
+            None,
+            None,
+        ));
+        assert!(
+            matches!(rejected, Outcome::Err(_)),
+            "register_agent should reject HumanOverseer"
+        );
+
+        // insert_system_agent accepts it (the fix).
+        let overseer = outcome_ok(block_on(queries::insert_system_agent(
+            &cx,
+            &pool,
+            project_id,
+            "HumanOverseer",
+            "WebUI",
+            "Human",
+            "Human operator providing guidance and oversight to agents",
+        )));
+        assert!(overseer.id.unwrap_or(0) > 0, "overseer should have an id");
+        assert_eq!(overseer.name, "HumanOverseer");
+
+        // Idempotent: second call returns the same agent.
+        let overseer2 = outcome_ok(block_on(queries::insert_system_agent(
+            &cx,
+            &pool,
+            project_id,
+            "HumanOverseer",
+            "WebUI",
+            "Human",
+            "Human operator providing guidance and oversight to agents",
+        )));
+        assert_eq!(overseer2.id, overseer.id, "idempotent re-insert");
+
+        // Full send: create a recipient and send a message as overseer.
+        let recipient = outcome_ok(block_on(queries::register_agent(
+            &cx, &pool, project_id, "BlueLake", "test", "test", None, None, None,
+        )));
+        let recipient_id = recipient.id.expect("recipient id");
+        let overseer_id = overseer.id.expect("overseer id");
+
+        let msg = outcome_ok(block_on(queries::create_message_with_recipients(
+            &cx,
+            &pool,
+            project_id,
+            overseer_id,
+            "Operator notice",
+            "Please check the logs.",
+            None,
+            "high",
+            false,
+            "[]",
+            &[(recipient_id, "to")],
+        )));
+        assert!(
+            msg.id.unwrap_or(0) > 0,
+            "overseer message should be created"
         );
     }
 }
