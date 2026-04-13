@@ -4867,6 +4867,52 @@ fn sqlite_conn_check_ok(
     Ok(sqlite_pragma_check_rows_ok(&rows, kind))
 }
 
+fn sqlite_conn_check_ok_with_canonical_confirmation(
+    opened_path: &str,
+    conn: &mcp_agent_mail_db::DbConn,
+    kind: mcp_agent_mail_db::CheckKind,
+) -> CliResult<bool> {
+    match sqlite_conn_check_ok(conn, kind) {
+        Ok(true) => Ok(true),
+        Ok(false) => {
+            if opened_path == ":memory:" {
+                return Ok(false);
+            }
+            let canonical =
+                mcp_agent_mail_db::CanonicalDbConn::open_file(opened_path).map_err(|e| {
+                    CliError::Other(format!(
+                        "cannot open canonical database at {opened_path}: {e}"
+                    ))
+                })?;
+            let canonical_ok = sqlite_conn_check_ok_canonical(&canonical, kind)?;
+            if canonical_ok {
+                output::info(&format!(
+                    "Startup {kind} false positive confirmed by canonical SQLite for {opened_path}; skipping automatic reconstruction"
+                ));
+            }
+            Ok(canonical_ok)
+        }
+        Err(runtime_error) => {
+            if opened_path == ":memory:" {
+                return Err(runtime_error);
+            }
+            let canonical = match mcp_agent_mail_db::CanonicalDbConn::open_file(opened_path) {
+                Ok(conn) => conn,
+                Err(_) => return Err(runtime_error),
+            };
+            match sqlite_conn_check_ok_canonical(&canonical, kind) {
+                Ok(true) => {
+                    output::info(&format!(
+                        "Startup {kind} false positive confirmed by canonical SQLite for {opened_path}; skipping automatic reconstruction"
+                    ));
+                    Ok(true)
+                }
+                Ok(false) | Err(_) => Err(runtime_error),
+            }
+        }
+    }
+}
+
 fn sqlite_conn_check_ok_canonical(
     conn: &mcp_agent_mail_db::CanonicalDbConn,
     kind: mcp_agent_mail_db::CheckKind,
@@ -15731,8 +15777,11 @@ fn doctor_database_fix_strategy(
         }
     }
 
-    let integrity_ok = match sqlite_conn_check_ok(&opened.conn, mcp_agent_mail_db::CheckKind::Full)
-    {
+    let integrity_ok = match sqlite_conn_check_ok_with_canonical_confirmation(
+        &opened.opened_path,
+        &opened.conn,
+        mcp_agent_mail_db::CheckKind::Full,
+    ) {
         Ok(ok) => ok,
         Err(error) => {
             let detail = format!(
