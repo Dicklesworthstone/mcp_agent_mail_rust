@@ -2326,16 +2326,13 @@ impl DbPool {
             "startup integrity check connection",
         );
 
-        match integrity::quick_check(&conn) {
+        match run_runtime_integrity_check_with_confirmation(
+            &conn,
+            &self.sqlite_path,
+            integrity::CheckKind::Quick,
+        ) {
             Ok(res) => Ok(res),
-            Err(DbError::IntegrityCorruption { details, .. }) => {
-                if let Some(verified_healthy) = confirm_runtime_integrity_false_positive(
-                    &self.sqlite_path,
-                    integrity::CheckKind::Quick,
-                    &details,
-                )? {
-                    return Ok(verified_healthy);
-                }
+            Err(DbError::IntegrityCorruption { .. }) => {
                 tracing::warn!(
                     path = %self.sqlite_path,
                     "startup integrity check failed; attempting auto-recovery from backup"
@@ -2356,7 +2353,11 @@ impl DbPool {
                     })?,
                     "startup integrity check post-recovery connection",
                 );
-                integrity::quick_check(&conn)
+                run_runtime_integrity_check_with_confirmation(
+                    &conn,
+                    &self.sqlite_path,
+                    integrity::CheckKind::Quick,
+                )
             }
             Err(e) => Err(e),
         }
@@ -2410,20 +2411,11 @@ impl DbPool {
             "full integrity check connection",
         );
 
-        match integrity::full_check(&conn) {
-            Ok(res) => Ok(res),
-            Err(DbError::IntegrityCorruption { message, details }) => {
-                if let Some(verified_healthy) = confirm_runtime_integrity_false_positive(
-                    &self.sqlite_path,
-                    integrity::CheckKind::Full,
-                    &details,
-                )? {
-                    return Ok(verified_healthy);
-                }
-                Err(DbError::IntegrityCorruption { message, details })
-            }
-            Err(e) => Err(e),
-        }
+        run_runtime_integrity_check_with_confirmation(
+            &conn,
+            &self.sqlite_path,
+            integrity::CheckKind::Full,
+        )
     }
 
     /// Sample the N most recent messages from the DB for consistency checking.
@@ -3822,10 +3814,46 @@ fn sqlite_canonical_incremental_check_is_ok(
     sqlite_pragma_check_is_ok_canonical(conn, integrity::CheckKind::Incremental)
 }
 
+fn run_runtime_integrity_check_with_confirmation(
+    conn: &DbConn,
+    sqlite_path: &str,
+    kind: integrity::CheckKind,
+) -> DbResult<integrity::IntegrityCheckResult> {
+    let start = std::time::Instant::now();
+    let runtime_rows = sqlite_check_rows_with(|sql| conn.query_sync(sql, &[]), kind)
+        .map_err(|error| DbError::Sqlite(format!("{kind} failed: {error}")))?;
+    let duration_us =
+        u64::try_from(start.elapsed().as_micros().min(u128::from(u64::MAX))).unwrap_or(u64::MAX);
+
+    resolve_runtime_integrity_rows_with_confirmation(sqlite_path, kind, runtime_rows, duration_us)
+}
+
+fn resolve_runtime_integrity_rows_with_confirmation(
+    sqlite_path: &str,
+    kind: integrity::CheckKind,
+    runtime_rows: Vec<sqlmodel_core::Row>,
+    duration_us: u64,
+) -> DbResult<integrity::IntegrityCheckResult> {
+    let runtime_details = integrity::extract_check_details(&runtime_rows, kind);
+
+    if integrity::details_indicate_ok(&runtime_details) {
+        return integrity::evaluate_check_rows(&runtime_rows, kind, duration_us);
+    }
+
+    if let Some(verified_healthy) =
+        confirm_runtime_integrity_false_positive(sqlite_path, kind, &runtime_details, duration_us)?
+    {
+        return Ok(verified_healthy);
+    }
+
+    integrity::evaluate_check_rows(&runtime_rows, kind, duration_us)
+}
+
 fn confirm_runtime_integrity_false_positive(
     sqlite_path: &str,
     kind: integrity::CheckKind,
     runtime_details: &[String],
+    duration_us: u64,
 ) -> DbResult<Option<integrity::IntegrityCheckResult>> {
     let canonical = match open_sqlite_file_with_lock_retry_canonical(sqlite_path) {
         Ok(conn) => conn,
@@ -3896,12 +3924,7 @@ fn confirm_runtime_integrity_false_positive(
         "runtime integrity probe reported corruption, but canonical sqlite verified the database as healthy; treating it as a compatibility false positive"
     );
 
-    Ok(Some(integrity::IntegrityCheckResult {
-        ok: true,
-        details: canonical_details,
-        duration_us: 0,
-        kind,
-    }))
+    integrity::evaluate_check_details(canonical_details, kind, duration_us).map(Some)
 }
 
 /// Remove corrupt or truncated WAL/SHM sidecars that cause "WAL file too
@@ -6426,6 +6449,10 @@ pub fn canary_mailbox_destroyed() {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{LazyLock, Mutex};
+
+    static TEST_METRICS_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
     use super::*;
     #[cfg(unix)]
     use std::ffi::OsString;
@@ -7515,6 +7542,7 @@ mod tests {
             &[String::from(
                 "database disk image is malformed: index sqlite_autoindex_projects_1 entry for rowid 1 does not match the table row payload",
             )],
+            123,
         )
         .expect("confirmation should not error")
         .expect("canonical sqlite should confirm healthy db");
@@ -7537,12 +7565,67 @@ mod tests {
             db_path.to_string_lossy().as_ref(),
             integrity::CheckKind::Quick,
             &[String::from("database disk image is malformed")],
+            123,
         )
         .expect("canonical confirmation should normalize corruption to no override");
 
         assert!(
             result.is_none(),
             "canonical confirmation should not override real corruption"
+        );
+    }
+
+    #[test]
+    fn runtime_false_positive_confirmation_preserves_success_metrics() {
+        let _guard = TEST_METRICS_LOCK.lock().expect("metrics lock");
+
+        let before = integrity::integrity_metrics();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime_false_positive_metrics.db");
+        let db_path_str = db_path.to_string_lossy();
+        let healthy = DbConn::open_file(db_path_str.as_ref()).expect("open healthy db");
+        healthy
+            .execute_raw(
+                "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE)",
+            )
+            .expect("create projects");
+        healthy
+            .execute_raw("INSERT INTO projects(id, slug) VALUES (1, 'demo')")
+            .expect("insert project");
+        drop(healthy);
+
+        let runtime = DbConn::open_memory().expect("open runtime probe db");
+        let runtime_rows = runtime
+            .query_sync(
+                "SELECT 'database disk image is malformed: index sqlite_autoindex_projects_1 entry for rowid 1 does not match the table row payload' AS quick_check",
+                &[],
+            )
+            .expect("build synthetic runtime corruption row");
+        drop(runtime);
+
+        let result = resolve_runtime_integrity_rows_with_confirmation(
+            db_path_str.as_ref(),
+            integrity::CheckKind::Quick,
+            runtime_rows,
+            321,
+        )
+        .expect("confirmed false positive should return success");
+
+        let after = integrity::integrity_metrics();
+        assert!(result.ok, "confirmed false positive should be healthy");
+        assert_eq!(result.duration_us, 321);
+        assert!(
+            after.checks_total >= before.checks_total.saturating_add(1),
+            "confirmed false positive should count as a completed check"
+        );
+        assert_eq!(
+            after.failures_total, before.failures_total,
+            "confirmed false positive must not increment integrity failure metrics"
+        );
+        assert!(
+            after.last_ok_ts >= after.last_check_ts,
+            "confirmed false positive should leave the latest integrity state healthy"
         );
     }
 

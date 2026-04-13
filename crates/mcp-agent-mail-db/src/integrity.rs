@@ -337,12 +337,11 @@ fn run_check(conn: &DbConn, kind: CheckKind) -> DbResult<IntegrityCheckResult> {
 /// Evaluate integrity/quick-check pragma rows and update global integrity metrics.
 ///
 /// Shared helper to keep integrity semantics consistent across all callers.
-pub fn evaluate_check_rows(
-    rows: &[Row],
+pub(crate) fn evaluate_check_details(
+    details: Vec<String>,
     kind: CheckKind,
     duration_us: u64,
 ) -> DbResult<IntegrityCheckResult> {
-    let details = extract_check_details(rows, kind);
     let ok = details_indicate_ok(&details);
 
     // Update global state.
@@ -377,6 +376,18 @@ pub fn evaluate_check_rows(
     }
 
     Ok(result)
+}
+
+/// Evaluate integrity/quick-check pragma rows and update global integrity metrics.
+///
+/// Shared helper to keep integrity semantics consistent across all callers.
+pub fn evaluate_check_rows(
+    rows: &[Row],
+    kind: CheckKind,
+    duration_us: u64,
+) -> DbResult<IntegrityCheckResult> {
+    let details = extract_check_details(rows, kind);
+    evaluate_check_details(details, kind, duration_us)
 }
 
 /// Attempt recovery by checkpointing then copying the database file.
