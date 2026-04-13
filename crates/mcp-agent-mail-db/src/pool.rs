@@ -2328,7 +2328,14 @@ impl DbPool {
 
         match integrity::quick_check(&conn) {
             Ok(res) => Ok(res),
-            Err(DbError::IntegrityCorruption { .. }) => {
+            Err(DbError::IntegrityCorruption { details, .. }) => {
+                if let Some(verified_healthy) = confirm_runtime_integrity_false_positive(
+                    &self.sqlite_path,
+                    integrity::CheckKind::Quick,
+                    &details,
+                )? {
+                    return Ok(verified_healthy);
+                }
                 tracing::warn!(
                     path = %self.sqlite_path,
                     "startup integrity check failed; attempting auto-recovery from backup"
@@ -2403,7 +2410,20 @@ impl DbPool {
             "full integrity check connection",
         );
 
-        integrity::full_check(&conn)
+        match integrity::full_check(&conn) {
+            Ok(res) => Ok(res),
+            Err(DbError::IntegrityCorruption { message, details }) => {
+                if let Some(verified_healthy) = confirm_runtime_integrity_false_positive(
+                    &self.sqlite_path,
+                    integrity::CheckKind::Full,
+                    &details,
+                )? {
+                    return Ok(verified_healthy);
+                }
+                Err(DbError::IntegrityCorruption { message, details })
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Sample the N most recent messages from the DB for consistency checking.
@@ -3800,6 +3820,88 @@ fn sqlite_canonical_incremental_check_is_ok(
     conn: &crate::CanonicalDbConn,
 ) -> Result<bool, SqlError> {
     sqlite_pragma_check_is_ok_canonical(conn, integrity::CheckKind::Incremental)
+}
+
+fn confirm_runtime_integrity_false_positive(
+    sqlite_path: &str,
+    kind: integrity::CheckKind,
+    runtime_details: &[String],
+) -> DbResult<Option<integrity::IntegrityCheckResult>> {
+    let canonical = match open_sqlite_file_with_lock_retry_canonical(sqlite_path) {
+        Ok(conn) => conn,
+        Err(err) => {
+            let msg = err.to_string();
+            if is_lock_error(&msg) {
+                tracing::warn!(
+                    path = %sqlite_path,
+                    check = %kind,
+                    error = %err,
+                    "canonical sqlite integrity confirmation hit lock/busy error; preserving runtime integrity verdict"
+                );
+                return Ok(None);
+            }
+            if is_corruption_error_message(&msg) || is_sqlite_recovery_error_message(&msg) {
+                tracing::warn!(
+                    path = %sqlite_path,
+                    check = %kind,
+                    error = %err,
+                    "canonical sqlite could not confirm runtime integrity failure as a false positive"
+                );
+                return Ok(None);
+            }
+            return Err(DbError::Sqlite(format!(
+                "canonical sqlite integrity confirmation failed: {err}"
+            )));
+        }
+    };
+
+    let canonical_details = match sqlite_pragma_check_details_canonical(&canonical, kind) {
+        Ok(details) => details,
+        Err(err) => {
+            let msg = err.to_string();
+            if is_lock_error(&msg)
+                || is_corruption_error_message(&msg)
+                || is_sqlite_recovery_error_message(&msg)
+            {
+                tracing::warn!(
+                    path = %sqlite_path,
+                    check = %kind,
+                    error = %err,
+                    "canonical sqlite integrity probe could not confirm runtime integrity failure as a false positive"
+                );
+                return Ok(None);
+            }
+            return Err(DbError::Sqlite(format!(
+                "canonical sqlite integrity probe failed: {err}"
+            )));
+        }
+    };
+
+    if !integrity::details_indicate_ok(&canonical_details) {
+        tracing::warn!(
+            path = %sqlite_path,
+            check = %kind,
+            runtime_details = ?runtime_details,
+            canonical_details = ?canonical_details,
+            "runtime and canonical sqlite integrity probes both reported problems"
+        );
+        return Ok(None);
+    }
+
+    tracing::info!(
+        path = %sqlite_path,
+        check = %kind,
+        runtime_details = ?runtime_details,
+        canonical_details = ?canonical_details,
+        "runtime integrity probe reported corruption, but canonical sqlite verified the database as healthy; treating it as a compatibility false positive"
+    );
+
+    Ok(Some(integrity::IntegrityCheckResult {
+        ok: true,
+        details: canonical_details,
+        duration_us: 0,
+        kind,
+    }))
 }
 
 /// Remove corrupt or truncated WAL/SHM sidecars that cause "WAL file too
@@ -7390,6 +7492,57 @@ mod tests {
         assert!(
             result.details.contains(&"ok".to_string()),
             "details should contain 'ok'"
+        );
+    }
+
+    #[test]
+    fn canonical_confirmation_accepts_runtime_integrity_false_positive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("canonical_confirms_false_positive.db");
+        let db_path_str = db_path.to_string_lossy();
+        let conn = DbConn::open_file(db_path_str.as_ref()).expect("open healthy db");
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE)",
+        )
+        .expect("create projects");
+        conn.execute_raw("INSERT INTO projects(id, slug) VALUES (1, 'demo')")
+            .expect("insert project");
+        drop(conn);
+
+        let result = confirm_runtime_integrity_false_positive(
+            db_path_str.as_ref(),
+            integrity::CheckKind::Quick,
+            &[String::from(
+                "database disk image is malformed: index sqlite_autoindex_projects_1 entry for rowid 1 does not match the table row payload",
+            )],
+        )
+        .expect("confirmation should not error")
+        .expect("canonical sqlite should confirm healthy db");
+
+        assert!(
+            result.ok,
+            "canonical confirmation should treat DB as healthy"
+        );
+        assert_eq!(result.kind, integrity::CheckKind::Quick);
+        assert_eq!(result.details, vec!["ok".to_string()]);
+    }
+
+    #[test]
+    fn canonical_confirmation_preserves_runtime_verdict_for_corrupt_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("canonical_confirms_corrupt.db");
+        std::fs::write(&db_path, b"not-a-database").expect("write corrupt db");
+
+        let result = confirm_runtime_integrity_false_positive(
+            db_path.to_string_lossy().as_ref(),
+            integrity::CheckKind::Quick,
+            &[String::from("database disk image is malformed")],
+        )
+        .expect("canonical confirmation should normalize corruption to no override");
+
+        assert!(
+            result.is_none(),
+            "canonical confirmation should not override real corruption"
         );
     }
 
