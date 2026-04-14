@@ -288,3 +288,7 @@ release-artifacts/
 storage.sqlite3.activity.lock
 test_bug
 test_dotenv
+
+# Release preparation build artifacts
+.cargo-home-release-prep/
+target-release-prep/
