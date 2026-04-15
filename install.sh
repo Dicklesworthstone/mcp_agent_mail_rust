@@ -4828,6 +4828,9 @@ if [ "$PYTHON_DETECTED" -eq 1 ]; then
     elif [ "$FORCE_MIGRATE" -eq 1 ]; then
       MIGRATE_PYTHON=1
       info "Forcing Python displacement due to --migrate."
+    elif [ "${ASSUME_YES:-0}" -eq 1 ]; then
+      MIGRATE_PYTHON=1
+      info "Auto-accepting Python→Rust migration (--yes)."
     elif [ "$EASY" -eq 0 ] && [ -t 0 ]; then
       # Interactive mode: ask the user
       echo ""
@@ -4872,6 +4875,20 @@ if [ "$PYTHON_DETECTED" -eq 1 ]; then
       # PYTHON_DB_MIGRATED_PATH is set only when a DB was copied and needs migration.
       if [ -n "$PYTHON_DB_MIGRATED_PATH" ]; then
         migrate_env_config
+      else
+        # No Python DB to migrate — alias/binary displacement was the entire migration.
+        # Write the marker now so future runs skip the migration prompt entirely.
+        # (Without this, the clone directory still triggers PYTHON_DETECTED=1 and the
+        # user is prompted on every `acfs update` — see GitHub issue #258.)
+        if [ ! -f "$PYTHON_MIGRATION_MARKER" ]; then
+          mkdir -p "$(dirname "$PYTHON_MIGRATION_MARKER")" 2>/dev/null || true
+          printf 'migrated_at=%s\nnote=no Python DB found; alias/binary displacement only\ninstaller_version=%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "${VERSION:-unknown}" \
+            > "$PYTHON_MIGRATION_MARKER" 2>/dev/null || true
+          verbose "python_migration_marker:written path=${PYTHON_MIGRATION_MARKER} (no-db displacement-only)"
+          ok "Migration marker saved (no Python database found; alias/binary displaced)"
+        fi
       fi
     fi
   fi
