@@ -2019,6 +2019,13 @@ impl SearchCockpitScreen {
         let results = match search_result {
             Ok(results) => results,
             Err(error) => {
+                // Self-heal: drop the connection on structural errors so the
+                // next tick re-opens a fresh one (with schema guarantee).
+                if error.contains("table not found") || error.contains("no such table") {
+                    self.db_conn = None;
+                    self._db_snapshot_dir = None;
+                    self.db_conn_attempted = false;
+                }
                 self.last_error = Some(error);
                 let preserved_stale =
                     self.can_preserve_previous_results_on_failure(&search_signature);

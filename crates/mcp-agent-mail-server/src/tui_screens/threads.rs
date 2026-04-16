@@ -782,6 +782,21 @@ impl ThreadExplorerScreen {
         self.list_dirty = false;
         self.last_loaded_filter_text.clone_from(&self.filter_text);
 
+        // Self-heal: if the DB returned no threads but the poller knows
+        // messages exist, the connection is likely stale or broken.  Drop
+        // it so the next tick re-opens a fresh one (with schema guarantee).
+        if self.threads.is_empty()
+            && global_thread_count == 0
+            && self.filter_text.is_empty()
+            && state
+                .db_stats_snapshot()
+                .is_some_and(|stats| stats.messages > 0)
+        {
+            self.db_conn = None;
+            self._db_snapshot_dir = None;
+            self.db_conn_attempted = false;
+        }
+
         // Preserve selection by thread id so resorting does not silently jump to
         // a different thread when activity changes reorder the list.
         if self.threads.is_empty() {

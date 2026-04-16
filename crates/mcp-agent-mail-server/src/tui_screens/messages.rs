@@ -2782,6 +2782,21 @@ impl MessageBrowserScreen {
         };
         self.search_method = method;
 
+        // Self-heal: if the DB query returned nothing but the poller knows
+        // messages exist, the connection is likely stale or broken.  Drop it
+        // so the next tick re-opens a fresh one (with schema guarantee).
+        if results.is_empty()
+            && total == 0
+            && query.is_empty()
+            && state
+                .db_stats_snapshot()
+                .is_some_and(|stats| stats.messages > 0)
+        {
+            self.db_conn = None;
+            self._db_snapshot_dir = None;
+            self.db_conn_attempted = false;
+        }
+
         // Merge live events from the event ring buffer.
         // Live events may contain messages not yet committed to the DB.
         let live = Self::search_live_events(state, &query, show_project);
