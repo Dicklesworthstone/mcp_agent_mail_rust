@@ -2332,7 +2332,7 @@ fn fetch_threads(
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!(error = %e, "threads screen fetch query failed");
-            return build_thread_summaries(conn, Vec::new());
+            return Vec::new();
         }
     };
     let rows: Vec<RawThreadSummaryRow> = query_rows

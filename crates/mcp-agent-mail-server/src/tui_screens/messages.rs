@@ -4196,12 +4196,18 @@ fn count_messages(conn: &DbConn, project_filter: Option<&str>) -> usize {
         None => ("SELECT COUNT(*) AS c FROM messages", Vec::new()),
     };
 
-    conn.query_sync(sql, &params)
-        .ok()
-        .and_then(|rows| rows.into_iter().next())
-        .and_then(|row| row.get_named::<i64>("c").ok())
-        .and_then(|v| usize::try_from(v).ok())
-        .unwrap_or(0)
+    match conn.query_sync(sql, &params) {
+        Ok(rows) => rows
+            .into_iter()
+            .next()
+            .and_then(|row| row.get_named::<i64>("c").ok())
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or(0),
+        Err(e) => {
+            tracing::warn!(error = %e, "messages screen count query failed");
+            0
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────

@@ -1941,17 +1941,23 @@ fn ensure_base_schema_on_sync_connection(conn: &DbConn) {
         return;
     }
     let base_ddl = mcp_agent_mail_db::schema::init_schema_sql_base();
+    let mut applied = 0usize;
     for stmt in base_ddl.split(';') {
         let stmt = stmt.trim();
         if stmt.is_empty() {
             continue;
         }
         if let Err(e) = conn.execute_raw(&format!("{stmt};")) {
+            // Stop on first failure to avoid a cascade of dependent errors
+            // (e.g. read-only filesystem or locked database).
             tracing::warn!(
                 error = %e,
-                "ensure_base_schema_on_sync_connection: DDL statement failed"
+                applied,
+                "ensure_base_schema_on_sync_connection: aborting DDL after first failure"
             );
+            return;
         }
+        applied += 1;
     }
 }
 
