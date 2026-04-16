@@ -2253,12 +2253,17 @@ fn fetch_total_thread_count(conn: &DbConn) -> usize {
     let sql = "SELECT COUNT(DISTINCT thread_id) AS cnt \
         FROM messages \
         WHERE thread_id IS NOT NULL AND thread_id != ''";
-    conn.query_sync(sql, &[])
-        .ok()
-        .and_then(|mut rows| rows.pop())
-        .and_then(|row| row.get_named::<i64>("cnt").ok())
-        .and_then(|v| usize::try_from(v).ok())
-        .unwrap_or(0)
+    match conn.query_sync(sql, &[]) {
+        Ok(mut rows) => rows
+            .pop()
+            .and_then(|row| row.get_named::<i64>("cnt").ok())
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or(0),
+        Err(e) => {
+            tracing::warn!(error = %e, "threads screen total count query failed");
+            0
+        }
+    }
 }
 
 /// Fetch thread summaries grouped by `thread_id`, sorted by last activity.
@@ -2323,10 +2328,14 @@ fn fetch_threads(
          LIMIT {limit}"
     );
 
-    let rows: Vec<RawThreadSummaryRow> = conn
-        .query_sync(&sql, &params)
-        .ok()
-        .unwrap_or_default()
+    let query_rows = match conn.query_sync(&sql, &params) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "threads screen fetch query failed");
+            return build_thread_summaries(conn, Vec::new());
+        }
+    };
+    let rows: Vec<RawThreadSummaryRow> = query_rows
         .into_iter()
         .filter_map(|row| {
             let thread_id = row.get_named::<String>("thread_id").ok()?;

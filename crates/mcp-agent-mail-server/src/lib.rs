@@ -1919,7 +1919,40 @@ pub(crate) fn open_live_metadata_sync_db_connection(database_url: &str) -> Optio
 }
 
 pub(crate) fn open_best_effort_sync_db_connection(path: &str) -> std::io::Result<DbConn> {
-    open_sync_db_connection_with_busy_timeout(path, BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS)
+    let conn =
+        open_sync_db_connection_with_busy_timeout(path, BEST_EFFORT_SYNC_DB_BUSY_TIMEOUT_MS)?;
+    ensure_base_schema_on_sync_connection(&conn);
+    Ok(conn)
+}
+
+/// Ensure the base schema (tables, indexes) exists on a raw sync connection.
+///
+/// TUI observability connections bypass the pool's startup-init gate, so the
+/// database file may not have any tables yet (startup race) or FrankenConnection
+/// may not see schema created by a concurrent pool connection.  Running the
+/// idempotent `CREATE TABLE IF NOT EXISTS` DDL guarantees the connection can
+/// execute queries against core tables like `messages`, `agents`, etc.
+fn ensure_base_schema_on_sync_connection(conn: &DbConn) {
+    // Quick probe: if the core `messages` table exists we can skip the DDL.
+    if conn
+        .query_sync("SELECT 1 FROM messages LIMIT 0", &[])
+        .is_ok()
+    {
+        return;
+    }
+    let base_ddl = mcp_agent_mail_db::schema::init_schema_sql_base();
+    for stmt in base_ddl.split(';') {
+        let stmt = stmt.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        if let Err(e) = conn.execute_raw(&format!("{stmt};")) {
+            tracing::warn!(
+                error = %e,
+                "ensure_base_schema_on_sync_connection: DDL statement failed"
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

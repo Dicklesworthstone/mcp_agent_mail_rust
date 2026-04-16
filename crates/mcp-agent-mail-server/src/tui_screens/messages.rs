@@ -4033,37 +4033,39 @@ fn recipient_names_by_message(
 }
 
 fn query_raw_message_rows(conn: &DbConn, sql: &str, params: &[Value]) -> Vec<RawMessageRow> {
-    conn.query_sync(sql, params)
-        .ok()
-        .map(|rows| {
-            rows.into_iter()
-                .filter_map(|row| {
-                    let created_ts = row.get_named::<i64>("created_ts").ok()?;
-                    Some(RawMessageRow {
-                        id: row.get_named::<i64>("id").ok()?,
-                        subject: row.get_named::<String>("subject").ok().unwrap_or_default(),
-                        sender_id: row.get_named::<i64>("sender_id").ok()?,
-                        project_id: row.get_named::<i64>("project_id").ok()?,
-                        thread_id: row
-                            .get_named::<String>("thread_id")
-                            .ok()
-                            .unwrap_or_default(),
-                        body_md: row.get_named::<String>("body_md").ok().unwrap_or_default(),
-                        importance: row
-                            .get_named::<String>("importance")
-                            .ok()
-                            .unwrap_or_else(|| "normal".to_string()),
-                        ack_required: row.get_named::<i64>("ack_required").ok().unwrap_or(0) != 0,
-                        created_ts,
-                        recipients_json: row
-                            .get_named::<String>("recipients_json")
-                            .ok()
-                            .unwrap_or_default(),
-                    })
-                })
-                .collect()
+    let rows = match conn.query_sync(sql, params) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "messages screen query failed");
+            return Vec::new();
+        }
+    };
+    rows.into_iter()
+        .filter_map(|row| {
+            let created_ts = row.get_named::<i64>("created_ts").ok()?;
+            Some(RawMessageRow {
+                id: row.get_named::<i64>("id").ok()?,
+                subject: row.get_named::<String>("subject").ok().unwrap_or_default(),
+                sender_id: row.get_named::<i64>("sender_id").ok()?,
+                project_id: row.get_named::<i64>("project_id").ok()?,
+                thread_id: row
+                    .get_named::<String>("thread_id")
+                    .ok()
+                    .unwrap_or_default(),
+                body_md: row.get_named::<String>("body_md").ok().unwrap_or_default(),
+                importance: row
+                    .get_named::<String>("importance")
+                    .ok()
+                    .unwrap_or_else(|| "normal".to_string()),
+                ack_required: row.get_named::<i64>("ack_required").ok().unwrap_or(0) != 0,
+                created_ts,
+                recipients_json: row
+                    .get_named::<String>("recipients_json")
+                    .ok()
+                    .unwrap_or_default(),
+            })
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 fn message_entries_from_rows(

@@ -186,7 +186,7 @@ fn recover_agent_rows_from_sqlite(
 
 fn fetch_agent_rows_from_sqlite(conn: &DbConn) -> Vec<AgentRow> {
     let last_active_sort = crate::tui_poller::timestamp_sort_expr("a.last_active_ts");
-    conn.query_sync(
+    let query_rows = match conn.query_sync(
         &format!(
             "WITH agent_messages AS ( \
                SELECT a.id AS agent_id, m.id AS message_id \
@@ -214,64 +214,67 @@ fn fetch_agent_rows_from_sqlite(conn: &DbConn) -> Vec<AgentRow> {
              LIMIT {SQLITE_AGENT_RECOVERY_LIMIT}"
         ),
         &[],
-    )
-    .ok()
-    .map(|rows| {
-        rows.into_iter()
-            .filter_map(|row| {
-                let agent_id = row
-                    .get_named::<i64>("raw_agent_id")
+    ) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "agents screen query failed");
+            return Vec::new();
+        }
+    };
+    query_rows
+        .into_iter()
+        .filter_map(|row| {
+            let agent_id = row
+                .get_named::<i64>("raw_agent_id")
+                .ok()
+                .or_else(|| row.get_as::<i64>(0).ok())?;
+            let project_id = row
+                .get_named::<i64>("raw_project_id")
+                .ok()
+                .or_else(|| row.get_as::<i64>(1).ok())
+                .unwrap_or(0);
+            let project = row
+                .get_named::<String>("project_slug")
+                .ok()
+                .or_else(|| row.get_as::<String>(2).ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| format!("[unknown-project-{project_id}]"));
+            let name = row
+                .get_named::<String>("name")
+                .ok()
+                .or_else(|| row.get_as::<String>(3).ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| format!("[unknown-agent-{agent_id}]"));
+            let program = row
+                .get_named::<String>("program")
+                .ok()
+                .or_else(|| row.get_as::<String>(4).ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "[unknown-program]".to_string());
+            let model = row
+                .get_named::<String>("model")
+                .ok()
+                .or_else(|| row.get_as::<String>(5).ok())
+                .unwrap_or_default();
+            Some(AgentRow {
+                identity: AgentIdentity::new(project.clone(), name.clone()),
+                name,
+                project,
+                program,
+                model,
+                last_active_ts: crate::tui_poller::parse_raw_ts(&row, "last_active_ts"),
+                message_count: row
+                    .get_named::<i64>("cnt")
                     .ok()
-                    .or_else(|| row.get_as::<i64>(0).ok())?;
-                let project_id = row
-                    .get_named::<i64>("raw_project_id")
-                    .ok()
-                    .or_else(|| row.get_as::<i64>(1).ok())
-                    .unwrap_or(0);
-                let project = row
-                    .get_named::<String>("project_slug")
-                    .ok()
-                    .or_else(|| row.get_as::<String>(2).ok())
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| format!("[unknown-project-{project_id}]"));
-                let name = row
-                    .get_named::<String>("name")
-                    .ok()
-                    .or_else(|| row.get_as::<String>(3).ok())
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| format!("[unknown-agent-{agent_id}]"));
-                let program = row
-                    .get_named::<String>("program")
-                    .ok()
-                    .or_else(|| row.get_as::<String>(4).ok())
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| "[unknown-program]".to_string());
-                let model = row
-                    .get_named::<String>("model")
-                    .ok()
-                    .or_else(|| row.get_as::<String>(5).ok())
-                    .unwrap_or_default();
-                Some(AgentRow {
-                    identity: AgentIdentity::new(project.clone(), name.clone()),
-                    name,
-                    project,
-                    program,
-                    model,
-                    last_active_ts: crate::tui_poller::parse_raw_ts(&row, "last_active_ts"),
-                    message_count: row
-                        .get_named::<i64>("cnt")
-                        .ok()
-                        .or_else(|| row.get_as::<i64>(7).ok())
-                        .and_then(|count| u64::try_from(count.max(0)).ok())
-                        .unwrap_or(0),
-                })
+                    .or_else(|| row.get_as::<i64>(7).ok())
+                    .and_then(|count| u64::try_from(count.max(0)).ok())
+                    .unwrap_or(0),
             })
-            .collect()
-    })
-    .unwrap_or_default()
+        })
+        .collect()
 }
 
 /// Truth assertion: when the DB reports non-zero agents but the rendered

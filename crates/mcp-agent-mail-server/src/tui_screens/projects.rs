@@ -171,38 +171,41 @@ fn fetch_recent_projects_minimal(conn: &DbConn) -> Vec<ProjectSummary> {
          ORDER BY {created_at_sort} DESC, id DESC \
          LIMIT {PROJECT_RECOVERY_LIMIT}"
     );
-    conn.query_sync(&sql, &[])
-        .ok()
-        .map(|rows| {
-            rows.into_iter()
-                .filter_map(|row| {
-                    let id = row
-                        .get_named::<i64>("id")
-                        .ok()
-                        .or_else(|| row.get_as::<i64>(0).ok())?;
-                    Some(ProjectSummary {
-                        id,
-                        slug: row
-                            .get_named::<String>("slug")
-                            .ok()
-                            .or_else(|| row.get_as::<String>(1).ok())
-                            .map(|value| value.trim().to_string())
-                            .filter(|value| !value.is_empty())
-                            .unwrap_or_else(|| format!("[unknown-project-{id}]")),
-                        human_key: row
-                            .get_named::<String>("human_key")
-                            .ok()
-                            .or_else(|| row.get_as::<String>(2).ok())
-                            .map(|value| value.trim().to_string())
-                            .filter(|value| !value.is_empty())
-                            .unwrap_or_else(|| format!("[unknown-human-key-{id}]")),
-                        created_at: parse_recovered_created_at(&row),
-                        ..ProjectSummary::default()
-                    })
-                })
-                .collect()
+    let query_rows = match conn.query_sync(&sql, &[]) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "projects screen query failed");
+            return Vec::new();
+        }
+    };
+    query_rows
+        .into_iter()
+        .filter_map(|row| {
+            let id = row
+                .get_named::<i64>("id")
+                .ok()
+                .or_else(|| row.get_as::<i64>(0).ok())?;
+            Some(ProjectSummary {
+                id,
+                slug: row
+                    .get_named::<String>("slug")
+                    .ok()
+                    .or_else(|| row.get_as::<String>(1).ok())
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| format!("[unknown-project-{id}]")),
+                human_key: row
+                    .get_named::<String>("human_key")
+                    .ok()
+                    .or_else(|| row.get_as::<String>(2).ok())
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| format!("[unknown-human-key-{id}]")),
+                created_at: parse_recovered_created_at(&row),
+                ..ProjectSummary::default()
+            })
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 fn parse_recovered_created_at(row: &mcp_agent_mail_db::sqlmodel::Row) -> i64 {

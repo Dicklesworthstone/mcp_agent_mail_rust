@@ -455,7 +455,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "beads_rust"
-version = "0.1.38"
+version = "0.1.40"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2149,6 +2149,7 @@ dependencies = [
  "frankensearch-core",
  "ort",
  "serde",
+ "serde_json",
  "tokenizers",
  "tracing",
 ]
@@ -2478,7 +2479,7 @@ dependencies = [
 
 [[package]]
 name = "ftui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ftui-core",
  "ftui-extras",
@@ -2492,7 +2493,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-a11y"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ahash",
  "ftui-core",
@@ -2500,7 +2501,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-backend"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ftui-core",
  "ftui-render",
@@ -2508,7 +2509,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2525,7 +2526,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-extras"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "base64 0.22.1",
  "ftui-core",
@@ -2545,7 +2546,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-harness"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "blake3",
  "ftui-core",
@@ -2563,11 +2564,11 @@ dependencies = [
 
 [[package]]
 name = "ftui-i18n"
-version = "0.3.0"
+version = "0.3.1"
 
 [[package]]
 name = "ftui-layout"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ftui-core",
  "rustc-hash",
@@ -2577,7 +2578,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-render"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ahash",
  "bitflags",
@@ -2592,7 +2593,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-runtime"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "arc-swap",
  "ftui-backend",
@@ -2611,7 +2612,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-style"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2621,7 +2622,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-text"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ftui-core",
  "ftui-layout",
@@ -2638,7 +2639,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-tty"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ftui-backend",
  "ftui-core",
@@ -2650,7 +2651,7 @@ dependencies = [
 
 [[package]]
 name = "ftui-widgets"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ahash",
  "bitflags",
@@ -6068,7 +6069,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn",
