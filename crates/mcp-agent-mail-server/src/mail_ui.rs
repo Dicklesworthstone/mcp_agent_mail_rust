@@ -54,15 +54,12 @@ pub fn dispatch(
     } else {
         Some(get_pool()?)
     };
-    let live_pool = live_pool_owner.as_ref().map_or_else(
-        || {
-            read_pool_owner
-                .as_ref()
-                .map(crate::ObservabilityDbPool::pool)
-                .expect("GET requests with no live pool fallback must already have a read pool")
-        },
-        |pool| pool,
-    );
+    let live_pool = live_pool_owner.as_ref().unwrap_or_else(|| {
+        read_pool_owner
+            .as_ref()
+            .map(crate::ObservabilityDbPool::pool)
+            .expect("GET requests with no live pool fallback must already have a read pool")
+    });
     let read_pool = read_pool_owner
         .as_ref()
         .map_or(live_pool, crate::ObservabilityDbPool::pool);
