@@ -2200,6 +2200,7 @@ impl DbPool {
                         if sqlite_path == ":memory:"
                             || !is_sqlite_recovery_error_message(&first_init_err.to_string())
                         {
+                            crate::close_db_conn(conn, "pool connection init failed (non-recoverable)");
                             return Outcome::Err(first_init_err);
                         }
 
@@ -2224,6 +2225,7 @@ impl DbPool {
                             &init_sql,
                             "pool connection init pragmas after recovery",
                         ) {
+                            crate::close_db_conn(conn, "pool connection init failed after recovery");
                             return Outcome::Err(second_init_err);
                         }
                     }

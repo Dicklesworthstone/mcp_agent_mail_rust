@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use std::future::Future;
-use std::task::{Context, Poll, Wake};
+use std::task::{Context, Poll, Waker};
 
 use asupersync::{Budget, Cx};
 // Tests run outside the HTTP server's async runtime, so `fastmcp_core::block_on`
@@ -1130,14 +1130,6 @@ fn get_pool() -> Result<DbPool, (u16, String)> {
     get_or_create_pool(&cfg).map_err(|e| (500, format!("Database error: {e}")))
 }
 
-/// No-op waker: `spin_block_on` re-polls unconditionally, so the waker
-/// never needs to do anything.
-struct SpinWaker;
-
-impl Wake for SpinWaker {
-    fn wake(self: std::sync::Arc<Self>) {}
-}
-
 /// Drive a future to completion using a spin loop.
 ///
 /// **Why not `fastmcp_core::block_on`?**
@@ -1164,8 +1156,8 @@ impl Wake for SpinWaker {
 fn spin_block_on<F: Future>(future: F) -> F::Output {
     const MAX_POLLS: u64 = 500_000;
 
-    let waker = std::task::Waker::from(std::sync::Arc::new(SpinWaker));
-    let mut cx = Context::from_waker(&waker);
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
     let mut future = Box::pin(future);
 
     for _ in 0..MAX_POLLS {

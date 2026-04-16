@@ -17,13 +17,7 @@
 
 use asupersync::{Budget, Cx};
 use std::future::Future;
-use std::sync::Arc;
-use std::task::{Context, Poll, Wake, Waker};
-
-struct SpinWaker;
-impl Wake for SpinWaker {
-    fn wake(self: Arc<Self>) {}
-}
+use std::task::{Context, Poll, Waker};
 
 /// Drive a future to completion using a spin loop.
 ///
@@ -32,8 +26,8 @@ impl Wake for SpinWaker {
 fn spin_block_on_future<F: Future>(future: F) -> F::Output {
     const MAX_POLLS: u64 = 500_000;
 
-    let waker = Waker::from(Arc::new(SpinWaker));
-    let mut cx = Context::from_waker(&waker);
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
     let mut future = Box::pin(future);
 
     for poll_count in 0..MAX_POLLS {

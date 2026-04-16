@@ -111,7 +111,7 @@ impl ParticipationFeatures {
 
         // Coordination pressure: geometric mean of thread count and co-participants,
         // scaled to basis points. An agent in 10 threads with 10 co-participants
-        // would score ~10000 bp. An agent in 1 thread with 1 co-participant scores ~100 bp.
+        // would score ~10000 bp. An agent in 1 thread with 1 co-participant scores ~1000 bp.
         let pressure_raw =
             f64::from(snapshot.thread_count) * f64::from(snapshot.co_participant_count);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

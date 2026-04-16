@@ -485,9 +485,12 @@ function overseerComposer() {
           if (typeof DOMPurify !== 'undefined') {
             this.renderedPreview = DOMPurify.sanitize(rawHtml);
           } else {
-            // Fallback if DOMPurify fails to load
-            this.renderedPreview = rawHtml;
-            console.warn('DOMPurify not loaded - preview may contain unsanitized HTML');
+            // Fallback if DOMPurify fails to load — escape HTML instead of rendering raw
+            const escaped = (this.body || '_No content yet..._')
+              .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+              .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+            this.renderedPreview = '<pre class="whitespace-pre-wrap break-words text-sm font-mono">' + escaped + '</pre>';
+            console.warn('DOMPurify not loaded - rendering plain text fallback');
           }
 
           this.$nextTick(() => {

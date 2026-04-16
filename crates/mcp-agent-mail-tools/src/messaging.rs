@@ -2297,9 +2297,10 @@ pub async fn reply_message(
         }
     }
 
-    // ── Per-message size limits (fail fast before any DB/archive work) ──
-    // Reply has no subject yet (inherited below) and no attachment_paths, so
-    // validate body only here; subject is checked after construction.
+    // ── Per-message body limit (fail fast before any DB/archive work) ──
+    // Subject is not yet known (inherited from the original message below) and
+    // attachment sizes are validated later via validate_message_size_limits,
+    // so only check the body size here for an early exit on oversized bodies.
     validate_reply_body_limit(config, &body_md)?;
 
     if config.disk_space_monitor_enabled {
@@ -2435,6 +2436,16 @@ effective_free_bytes={free}"
         subject
     };
 
+    // Validate attachment + total sizes with project-relative path resolution,
+    // matching send_message's enforcement (fail fast before processing).
+    validate_message_size_limits(
+        config,
+        &subject,
+        &body_md,
+        attachment_paths.as_deref(),
+        Some(Path::new(&project.human_key)),
+    )?;
+
     let embed_policy =
         mcp_agent_mail_storage::EmbedPolicy::from_str_policy(&sender.attachments_policy);
     let sender_forces_convert = matches!(
@@ -2467,43 +2478,8 @@ effective_free_bytes={free}"
         "[]".to_string()
     });
 
-    // ── Per-message size limits (subject/total) ──
-    if config.max_subject_bytes > 0 && subject.len() > config.max_subject_bytes {
-        return Err(legacy_tool_error(
-            "INVALID_ARGUMENT",
-            format!(
-                "Reply subject exceeds size limit: {} bytes > {} byte limit. Shorten the subject.",
-                subject.len(),
-                config.max_subject_bytes,
-            ),
-            true,
-            json!({
-                "field": "subject",
-                "size_bytes": subject.len(),
-                "limit_bytes": config.max_subject_bytes,
-            }),
-        ));
-    }
-
-    if config.max_total_message_bytes > 0 {
-        let total_size = subject.len().saturating_add(final_body.len());
-        if total_size > config.max_total_message_bytes {
-            return Err(legacy_tool_error(
-                "INVALID_ARGUMENT",
-                format!(
-                    "Total message size exceeds limit: {} bytes > {} byte limit. \
-                     Reduce body or attachment sizes.",
-                    total_size, config.max_total_message_bytes,
-                ),
-                true,
-                json!({
-                    "field": "total",
-                    "size_bytes": total_size,
-                    "limit_bytes": config.max_total_message_bytes,
-                }),
-            ));
-        }
-    }
+    // Subject and total size limits (including attachments) are already
+    // enforced by validate_message_size_limits above.
 
     // Default to to original sender if not specified
     let to_names = to.unwrap_or_else(|| vec![original_sender.name.clone()]);

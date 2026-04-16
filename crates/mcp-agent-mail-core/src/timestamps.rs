@@ -37,8 +37,10 @@ pub fn naive_to_micros(dt: NaiveDateTime) -> i64 {
 
 /// Convert microseconds since Unix epoch to chrono `NaiveDateTime`.
 ///
-/// For extreme values outside chrono's representable range, returns the
-/// Unix epoch (1970-01-01 00:00:00) as a safe fallback instead of panicking.
+/// For extreme values outside chrono's representable range, returns
+/// `DateTime::<Utc>::MIN_UTC` for negative timestamps or
+/// `DateTime::<Utc>::MAX_UTC` for positive timestamps as a safe fallback
+/// instead of panicking.
 #[inline]
 #[must_use]
 pub fn micros_to_naive(micros: i64) -> NaiveDateTime {
