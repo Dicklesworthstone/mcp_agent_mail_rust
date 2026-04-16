@@ -2019,13 +2019,8 @@ impl SearchCockpitScreen {
         let results = match search_result {
             Ok(results) => results,
             Err(error) => {
-                // Self-heal: drop the connection on structural errors so the
-                // next tick re-opens a fresh one (with schema guarantee).
-                if error.contains("table not found") || error.contains("no such table") {
-                    self.db_conn = None;
-                    self._db_snapshot_dir = None;
-                    self.db_conn_attempted = false;
-                }
+                let is_structural =
+                    error.contains("table not found") || error.contains("no such table");
                 self.last_error = Some(error);
                 let preserved_stale =
                     self.can_preserve_previous_results_on_failure(&search_signature);
@@ -2037,6 +2032,18 @@ impl SearchCockpitScreen {
                     self.last_search_ms = None;
                 }
                 self.search_dirty = false;
+                // Self-heal: drop the connection on structural errors so a
+                // fresh one is opened (with schema guarantee).  Schedule a
+                // delayed retry (~5 s) to avoid hot-looping on persistent
+                // failures while still recovering automatically.  This must
+                // run AFTER search_dirty=false so the retry flag sticks.
+                if is_structural {
+                    self.db_conn = None;
+                    self._db_snapshot_dir = None;
+                    self.db_conn_attempted = false;
+                    self.search_dirty = true;
+                    self.debounce_remaining = 50; // ~5 s at 100 ms/tick
+                }
                 return;
             }
         };

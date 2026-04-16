@@ -785,6 +785,8 @@ impl ThreadExplorerScreen {
         // Self-heal: if the DB returned no threads but the poller knows
         // messages exist, the connection is likely stale or broken.  Drop
         // it so the next tick re-opens a fresh one (with schema guarantee).
+        // Setting pending_list_refresh ensures the 5-second periodic check
+        // re-triggers a list refresh even if no new data arrives.
         if self.threads.is_empty()
             && global_thread_count == 0
             && self.filter_text.is_empty()
@@ -795,6 +797,7 @@ impl ThreadExplorerScreen {
             self.db_conn = None;
             self._db_snapshot_dir = None;
             self.db_conn_attempted = false;
+            self.pending_list_refresh = true;
         }
 
         // Preserve selection by thread id so resorting does not silently jump to

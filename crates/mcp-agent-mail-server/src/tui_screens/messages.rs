@@ -2785,6 +2785,8 @@ impl MessageBrowserScreen {
         // Self-heal: if the DB query returned nothing but the poller knows
         // messages exist, the connection is likely stale or broken.  Drop it
         // so the next tick re-opens a fresh one (with schema guarantee).
+        // Setting search_method=Live activates the tick handler's 5-second
+        // retry loop which resets db_conn_attempted and search_dirty.
         if results.is_empty()
             && total == 0
             && query.is_empty()
@@ -2795,6 +2797,7 @@ impl MessageBrowserScreen {
             self.db_conn = None;
             self._db_snapshot_dir = None;
             self.db_conn_attempted = false;
+            self.search_method = SearchMethod::Live;
         }
 
         // Merge live events from the event ring buffer.
