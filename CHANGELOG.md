@@ -12,7 +12,29 @@ No changes yet.
 
 ---
 
-## [v0.2.39](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.2.39) — 2026-04-12 **[Release — Latest]**
+## [v0.2.41](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.2.41) — 2026-04-16 **[Release — Latest]**
+
+Dependency refresh aligning with latest franken* sibling-repo versions.
+
+### Dependencies
+
+- Bump `ftui*` family from 0.3.0 to 0.3.1 (frankentui)
+- Bump `frankensearch-core` from 0.1.1 to 0.1.2
+- Bump `frankensearch-embed` from 0.1.2 to 0.1.3
+- Bump `frankensearch-index` from 0.1.1 to 0.1.2
+- Bump `toon` (tru) from 0.2.0 to 0.2.2
+- Bump `beads_rust` from 0.1.38 to 0.1.42
+- Bump `franken-agent-detection` from 0.1.0 to 0.1.3
+
+---
+
+## [v0.2.40](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.2.40) — 2026-04-16 **[Release]**
+
+Minor timestamp-normalization and attachment-badge fixes. See commits c3b26a77, 03516ddc, b1e4ddd7, 0baa17f4.
+
+---
+
+## [v0.2.39](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.2.39) — 2026-04-12 **[Release]**
 
 81+ commits since v0.2.38 | [Compare](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.2.38...v0.2.39)
 

@@ -455,7 +455,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "beads_rust"
-version = "0.1.40"
+version = "0.1.42"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2134,6 +2134,7 @@ version = "0.1.0"
 dependencies = [
  "asupersync",
  "frankensearch-core",
+ "rayon",
  "serde",
  "serde_json",
  "tantivy",
@@ -4706,7 +4707,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail"
-version = "0.2.40"
+version = "0.2.41"
 dependencies = [
  "clap",
  "criterion",
@@ -4732,7 +4733,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-cli"
-version = "0.2.40"
+version = "0.2.41"
 dependencies = [
  "asupersync",
  "beads_rust",
@@ -4773,7 +4774,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-conformance"
-version = "0.2.40"
+version = "0.2.41"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4796,7 +4797,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-core"
-version = "0.2.40"
+version = "0.2.41"
 dependencies = [
  "chrono",
  "criterion",
@@ -4821,7 +4822,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-db"
-version = "0.2.40"
+version = "0.2.41"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4864,7 +4865,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-guard"
-version = "0.2.40"
+version = "0.2.41"
 dependencies = [
  "chrono",
  "git2",
@@ -4879,7 +4880,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-search-core"
-version = "0.2.40"
+version = "0.2.41"
 dependencies = [
  "chrono",
  "criterion",
@@ -4909,7 +4910,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-server"
-version = "0.2.40"
+version = "0.2.41"
 dependencies = [
  "ammonia",
  "asupersync",
@@ -4952,7 +4953,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-share"
-version = "0.2.40"
+version = "0.2.41"
 dependencies = [
  "atty",
  "base64 0.22.1",
@@ -4973,7 +4974,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-storage"
-version = "0.2.40"
+version = "0.2.41"
 dependencies = [
  "asupersync",
  "base64 0.22.1",
@@ -4998,7 +4999,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-tools"
-version = "0.2.40"
+version = "0.2.41"
 dependencies = [
  "asupersync",
  "chrono",
@@ -5024,7 +5025,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-wasm"
-version = "0.2.40"
+version = "0.2.41"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",
@@ -6069,7 +6070,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn",
