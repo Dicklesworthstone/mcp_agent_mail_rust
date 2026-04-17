@@ -146,6 +146,9 @@ fn normalize_json(v: Value, tmp_root: &Path) -> Value {
                         _ => {}
                     }
                 }
+                if out.contains_key("generated_at") {
+                    out.insert("generated_at".to_string(), Value::String("<GENERATED_AT>".to_string()));
+                }
                 Value::Object(out)
             }
             other => other,

@@ -378,6 +378,7 @@ fn assert_success(
 #[test]
 fn migrate_then_list_projects_json_smoke() {
     let env = TestEnv::new();
+    init_cli_schema(&env.db_path);
 
     assert_success(&env, "migrate", Some(env.tmp.path()), &["migrate"], None);
 

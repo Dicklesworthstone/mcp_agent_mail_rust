@@ -4758,10 +4758,9 @@ fn handle_list_projects_with_database_url(
                     serde_json::json!({ "name": name, "program": program, "model": model })
                 })
                 .collect();
-            entry
-                .as_object_mut()
-                .unwrap()
-                .insert("agents".to_string(), serde_json::json!(agents_json));
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("agents".to_string(), serde_json::json!(agents_json));
+            }
         }
         output_data.push(entry);
     }
@@ -20518,10 +20517,12 @@ fn inbox_row_to_json(
         "thread_id": r.message.thread_id,
     });
     if include_body {
-        v.as_object_mut().unwrap().insert(
-            "body_md".to_string(),
-            serde_json::Value::String(r.message.body_md.clone()),
-        );
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert(
+                "body_md".to_string(),
+                serde_json::Value::String(r.message.body_md.clone()),
+            );
+        }
     }
     v
 }
@@ -20545,10 +20546,12 @@ fn product_inbox_row_to_json(
         "attachments": attachments,
     });
     if include_body {
-        v.as_object_mut().unwrap().insert(
-            "body_md".to_string(),
-            serde_json::Value::String(r.message.body_md.clone()),
-        );
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert(
+                "body_md".to_string(),
+                serde_json::Value::String(r.message.body_md.clone()),
+            );
+        }
     }
     v
 }
@@ -27949,6 +27952,9 @@ http_headers = { Authorization = "Bearer secret" }
             &[
                 ("DATABASE_URL", database_url),
                 ("STORAGE_ROOT", storage_root),
+                ("WORKTREES_ENABLED", "true"),
+                ("HTTP_PORT", "49151"), // Fake port to ensure server unavailable
+                ("AGENT_MAIL_URL", "http://127.0.0.1:49151/mcp/"), // Ensure fallback URL is also fake
             ],
             move || {
                 let runtime = RuntimeBuilder::current_thread().build().unwrap();
@@ -40997,17 +41003,25 @@ startup_timeout_sec = 42
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("storage.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
+        let storage_root = dir.path().join("mailbox");
+        std::fs::create_dir_all(storage_root.join("projects")).expect("projects dir");
 
         std::fs::write(&db_path, b"NOT A SQLITE DATABASE").expect("write corrupt db");
-        let conn = open_db_sync_with_database_url(&db_url).expect("open after quarantine");
-        let rows = conn
-            .query_sync("SELECT COUNT(*) AS c FROM projects", &[])
-            .expect("query projects count");
-        assert!(
-            !rows.is_empty(),
-            "schema init should recreate core tables after quarantine"
+        
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", &storage_root.display().to_string())],
+            || {
+                let conn = open_db_sync_with_database_url(&db_url).expect("open after quarantine");
+                let rows = conn
+                    .query_sync("SELECT COUNT(*) AS c FROM projects", &[])
+                    .expect("query projects count");
+                assert!(
+                    !rows.is_empty(),
+                    "schema init should recreate core tables after quarantine"
+                );
+                drop(conn);
+            }
         );
-        drop(conn);
 
         let quarantine_count = std::fs::read_dir(dir.path())
             .expect("read dir")
@@ -41403,40 +41417,50 @@ startup_timeout_sec = 42
         let db_path = dir.path().join("repair_recover.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
         let backup_dir = dir.path().join("backups");
+        let storage_root_str = dir.path().to_string_lossy().into_owned();
 
-        handle_migrate_with_database_url(&db_url).expect("migrate");
-        let conn = open_db_sync_with_database_url(&db_url).expect("open");
-        conn.query_sync(
-            "INSERT INTO projects (slug, human_key, created_at) VALUES ('recover', '/tmp/recover', 0)",
-            &[],
-        )
-        .expect("insert project");
-        drop(conn);
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &db_url),
+                ("STORAGE_ROOT", &storage_root_str),
+            ],
+            || {
+                handle_migrate_with_database_url(&db_url).expect("migrate");
+                let conn = open_db_sync_with_database_url(&db_url).expect("open");
+                conn.query_sync(
+                    "INSERT INTO projects (slug, human_key, created_at) VALUES ('recover', '/tmp/recover', 0)",
+                    &[],
+                )
+                .expect("insert project");
+                conn.execute_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[]).expect("checkpoint");
+                drop(conn);
 
-        let sibling_bak = PathBuf::from(format!("{}.bak", db_path.display()));
-        std::fs::copy(&db_path, &sibling_bak).expect("create sibling backup");
-        std::fs::write(&db_path, b"NOT A SQLITE DATABASE").expect("corrupt primary db");
+                let sibling_bak = PathBuf::from(format!("{}.bak", db_path.display()));
+                std::fs::copy(&db_path, &sibling_bak).expect("create sibling backup");
+                std::fs::write(&db_path, b"NOT A SQLITE DATABASE").expect("corrupt primary db");
 
-        let capture = ftui_runtime::StdioCapture::install().unwrap();
-        handle_doctor_repair_with(&db_url, dir.path(), &backup_dir, None, false, true)
-            .expect("repair should recover from sibling backup");
-        let output = capture.drain_to_string();
+                let capture = ftui_runtime::StdioCapture::install().unwrap();
+                handle_doctor_repair_with(&db_url, dir.path(), &backup_dir, None, false, true)
+                    .expect("repair should recover from sibling backup");
+                let output = capture.drain_to_string();
 
-        assert!(
-            output.contains("No archive is available under"),
-            "repair should report in-place recovery when archive is unavailable: {output}"
+                assert!(
+                    output.contains("No archive is available under"),
+                    "repair should report in-place recovery when archive is unavailable: {output}"
+                );
+                assert!(
+                    !output.contains("Nothing to reconstruct"),
+                    "repair should not pretend reconstruction ran when no archive exists: {output}"
+                );
+
+                let repaired = open_db_sync_with_database_url(&db_url).expect("reopen repaired db");
+                let rows = repaired
+                    .query_sync("SELECT COUNT(*) AS cnt FROM projects", &[])
+                    .expect("query repaired db");
+                let count: i64 = rows.first().unwrap().get_named("cnt").unwrap();
+                assert_eq!(count, 1, "repaired db should preserve backup contents");
+            }
         );
-        assert!(
-            !output.contains("Nothing to reconstruct"),
-            "repair should not pretend reconstruction ran when no archive exists: {output}"
-        );
-
-        let repaired = open_db_sync_with_database_url(&db_url).expect("reopen repaired db");
-        let rows = repaired
-            .query_sync("SELECT COUNT(*) AS cnt FROM projects", &[])
-            .expect("query repaired db");
-        let count: i64 = rows.first().unwrap().get_named("cnt").unwrap();
-        assert_eq!(count, 1, "repaired db should preserve backup contents");
     }
 
     #[test]
@@ -45344,7 +45368,7 @@ fn handle_doctor_repair_with(
     // 5. VACUUM + ANALYZE + REINDEX
     if !dry_run {
         drop(conn);
-        let vacuum_conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&reconstruct_db_path.display().to_string())
+        let vacuum_conn = mcp_agent_mail_db::CanonicalDbConn::open_file(reconstruct_db_path.display().to_string())
             .map_err(|e| CliError::Other(format!("Failed to open DB for VACUUM: {e}")))?;
         vacuum_conn.execute_raw("VACUUM")
             .map_err(|e| CliError::Other(format!("VACUUM failed: {e}")))?;
@@ -47207,7 +47231,7 @@ where
 }
 
 pub fn check_inbox_rpc_config_from_env() -> Option<CheckInboxRpcConfig> {
-    check_inbox_rpc_config_from_env_reader(|key| std::env::var(key).ok())
+    check_inbox_rpc_config_from_env_reader(mcp_agent_mail_core::config::process_env_value)
 }
 
 fn build_fetch_inbox_jsonrpc_request(config: &CheckInboxRpcConfig) -> serde_json::Value {

@@ -8189,10 +8189,9 @@ mod tests {
         );
         let output = capture.drain_to_string();
         result.expect("robot command should succeed");
-        let payload = output
-            .lines()
-            .find(|line| line.trim_start().starts_with('{'))
-            .expect("json payload line");
+        
+        let start_idx = output.find('{').expect("json payload start");
+        let payload = &output[start_idx..];
         serde_json::from_str(payload).expect("parse robot json output")
     }
 
