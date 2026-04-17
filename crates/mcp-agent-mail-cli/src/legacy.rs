@@ -1294,6 +1294,7 @@ fn detect_legacy_script_marker(search_root: &Path) -> Option<LegacyMarker> {
 fn detect_env_marker(search_root: &Path) -> Option<LegacyMarker> {
     let env_file = search_root.join(".env");
     if !env_file.exists() {
+        println!("detect_env_marker: .env not found");
         return None;
     }
     let map = read_env_file_map(&env_file);
@@ -1303,6 +1304,9 @@ fn detect_env_marker(search_root: &Path) -> Option<LegacyMarker> {
     let legacy_storage = map
         .get("STORAGE_ROOT")
         .is_some_and(|value| value.contains(".mcp_agent_mail_git_mailbox_repo"));
+    
+    println!("detect_env_marker: legacy_db={}, legacy_storage={}, map={:?}", legacy_db, legacy_storage, map);
+
     if legacy_db || legacy_storage {
         return Some(LegacyMarker {
             id: "legacy_env_defaults".to_string(),
@@ -2296,6 +2300,7 @@ mod tests {
         )
         .unwrap();
         let report = build_detect_report(tmp.path(), None, None).unwrap();
+        panic!("DEBUG MAP: {:?} MARKERS: {:?}", read_env_file_map(&tmp.path().join(".env")), report.markers);
         assert!(
             report
                 .markers

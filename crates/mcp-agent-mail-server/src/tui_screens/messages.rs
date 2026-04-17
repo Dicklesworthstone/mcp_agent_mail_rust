@@ -8160,6 +8160,14 @@ first body
 
         let mut screen = MessageBrowserScreen::new();
         screen.db_conn_attempted = true;
+        // Match the fixture rows (show_project=false, project_slug="proj")
+        // so preservation passes the inbox-mode consistency guard in
+        // `can_preserve_previous_results_for_live_fallback`: previous rows
+        // must share the current inbox mode's show_project flag AND, for
+        // Local mode, the configured project slug. Without this the live
+        // fallback would silently discard prior rows and we'd only see the
+        // one live event the state has captured.
+        screen.inbox_mode = InboxMode::Local("proj".to_string());
         screen.search_method = SearchMethod::Recent;
         screen.total_results = 3;
         screen.results = vec![

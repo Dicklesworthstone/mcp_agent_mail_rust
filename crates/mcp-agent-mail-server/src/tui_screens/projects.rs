@@ -2245,7 +2245,15 @@ mod tests {
         });
         let mut screen = ProjectsScreen::new();
 
-        screen.tick(1, &state);
+        // Tick past the startup grace window (POLLER_DB_GRACE_TICKS = 30) so
+        // the banner suppression during early boot does not hide the
+        // "waiting for first snapshot" signal this regression test is
+        // actually verifying. Use a non-multiple-of-10 tick so
+        // `rebuild_from_state` (which would bump `applied_db_stats_gen` and
+        // silence the banner) does not fire — we specifically want to
+        // observe the "available in state but not yet applied to screen"
+        // window.
+        screen.tick(31, &state);
 
         assert!(screen.db_context_unavailable);
         assert_eq!(
