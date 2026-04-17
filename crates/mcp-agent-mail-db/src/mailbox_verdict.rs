@@ -1310,6 +1310,18 @@ fn probe_schema_populated(db_path: &Path, archive_count: usize) -> ProbeResult {
         );
     }
 
+    // `DbConn::open_file` opens SQLite with `SQLITE_OPEN_CREATE`, which would
+    // silently materialize an empty database file when the mailbox is
+    // absent. Schema probing is read-only diagnostics — refuse gracefully so
+    // `health_check` doesn't leave behind a zero-byte `.sqlite3` stub when
+    // it runs against a missing mailbox.
+    if !db_path.exists() {
+        return ProbeResult::error(
+            "schema_populated",
+            "Database file not found; cannot inspect schema",
+        );
+    }
+
     let path_str = db_path.display().to_string();
     let conn = match crate::DbConn::open_file(&path_str) {
         Ok(conn) => conn,

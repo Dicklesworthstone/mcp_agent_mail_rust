@@ -157,10 +157,7 @@ fn sqlite_path_component(database_url: &str) -> Option<&str> {
             _ => false,
         })
         .map(|(idx, _)| idx);
-    Some(match cut {
-        Some(idx) => &stripped[..idx],
-        None => stripped,
-    })
+    Some(cut.map_or(stripped, |idx| &stripped[..idx]))
 }
 
 /// Return `true` if the byte at `idx` is the `?` inside a Windows UNC
@@ -247,7 +244,7 @@ pub fn sqlite_file_path_from_database_url(database_url: &str) -> Option<PathBuf>
 /// the prefix-strip, the literal `?` inside `\\?\` is interpreted as the URL
 /// query separator and the embedded path is truncated to garbage (issue #93).
 ///
-/// Use this everywhere a SQLite database URL is constructed from a `Path`
+/// Use this everywhere a `SQLite` database URL is constructed from a `Path`
 /// instead of `format!("sqlite:///{}", path.display())`.
 #[must_use]
 pub fn sqlite_url_from_path(path: &Path) -> String {

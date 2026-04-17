@@ -3265,6 +3265,18 @@ pub fn inspect_mailbox_db_inventory(primary_path: &Path) -> Result<MailboxDbInve
         ));
     }
 
+    // `DbConn::open_file` opens SQLite with `SQLITE_OPEN_CREATE`, which would
+    // silently materialize an empty database file when the mailbox is
+    // missing.  Inventory is a read-only probe — refuse when the file is
+    // absent so callers like `inspect_archive_drift` and `health_check` can
+    // observe "missing mailbox" without mutating the filesystem.
+    if !primary_path.exists() {
+        return Err(SqlError::Custom(format!(
+            "mailbox sqlite file not found at {}",
+            primary_path.display()
+        )));
+    }
+
     let conn = open_sqlite_file_with_lock_retry(primary_path.to_string_lossy().as_ref())?;
     let present = conn
         .query_sync(

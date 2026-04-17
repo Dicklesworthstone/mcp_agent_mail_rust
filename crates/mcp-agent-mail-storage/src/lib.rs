@@ -7549,7 +7549,14 @@ fn open_archive_repo_checked(archive: &ProjectArchive) -> Result<Repository> {
 }
 
 fn archive_repo_root_checked(archive: &ProjectArchive) -> Result<&Path> {
+    // `canonical_repo_root` is the pre-resolved form we actually operate on,
+    // but `repo_root` is a `pub` field that external callers (including the
+    // legacy shell installer and some migration paths) can mutate directly.
+    // Validate both so a post-construction mutation to `repo_root` (e.g.
+    // retargeting at a symlinked mount) cannot slip past the
+    // "archive root must not be symlinked" guard.
     reject_symlinked_archive_root(&archive.canonical_repo_root)?;
+    reject_symlinked_archive_root(&archive.repo_root)?;
     Ok(&archive.canonical_repo_root)
 }
 
