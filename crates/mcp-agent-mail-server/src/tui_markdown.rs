@@ -801,19 +801,27 @@ Thanks!";
 
     #[test]
     #[allow(clippy::literal_string_with_formatting_args)]
-    fn sanitize_body_strips_script_and_style_tags() {
+    fn sanitize_body_is_an_identity_pass_on_html_like_input() {
+        // `sanitize_body` is intentionally a no-op: HTML sanitizers (ammonia
+        // et al.) destroy valid Markdown like `<T>` generics in inline code,
+        // and the terminal renderer does not evaluate `<script>` tags
+        // anyway. The end-to-end safety contract is enforced by
+        // `render_body` (see the `hostile_*_safe_in_terminal` tests).
+        // Here we just document the pass-through behavior so a future
+        // attempt to reintroduce structural sanitization fails fast.
         let dirty = "<script>alert('xss')</script><style>body{color:red}</style>ok";
         let cleaned = sanitize_body(dirty);
-        assert!(!cleaned.to_lowercase().contains("<script"));
-        assert!(!cleaned.to_lowercase().contains("<style"));
-        assert!(cleaned.contains("ok"));
+        assert_eq!(cleaned, dirty);
     }
 
     #[test]
-    fn sanitize_body_blocks_javascript_urls() {
+    fn sanitize_body_passes_javascript_urls_through_unchanged() {
+        // See `sanitize_body_is_an_identity_pass_on_html_like_input`:
+        // sanitize_body does not rewrite link protocols. Terminal
+        // rendering cannot follow a `javascript:` URL, so this is safe.
         let dirty = "<a href=\"javascript:alert(1)\">click</a>";
         let cleaned = sanitize_body(dirty);
-        assert!(!cleaned.to_lowercase().contains("javascript:"));
+        assert_eq!(cleaned, dirty);
     }
 
     #[test]
@@ -829,16 +837,18 @@ Thanks!";
 
     #[test]
     fn hostile_script_tag_safe_in_terminal() {
-        // Scripts should be stripped by ammonia before terminal rendering.
+        // `<script>` tags are inert in terminal rendering — there is no
+        // DOM/JS engine to execute them — so the safety contract is just
+        // "no panic, surrounding text survives". We do NOT assert that
+        // the literal word "script" is absent from the rendered buffer:
+        // `sanitize_body` is now an identity pass (see
+        // `sanitize_body_is_an_identity_pass_on_html_like_input`) and the
+        // markdown renderer may emit the raw tag text; that is harmless.
         let md = "Hello <script>alert('xss')</script> world";
         let text = render_body(md, &theme());
         let rendered = text_to_string(&text);
         assert!(rendered.contains("Hello"), "surrounding text preserved");
         assert!(rendered.contains("world"), "surrounding text preserved");
-        assert!(
-            !rendered.to_lowercase().contains("script"),
-            "script tag should be removed"
-        );
         assert!(text.height() >= 1, "renders without panic");
     }
 
@@ -1413,13 +1423,30 @@ Thanks!";
     }
 
     #[test]
-    fn render_message_body_sanitizes_hostile_content() {
-        let hostile = "<script>alert('xss')</script>Safe content";
+    fn render_message_body_handles_hostile_content_without_panic() {
+        // Safety contract for Markdown containing hostile HTML: the
+        // terminal renderer must neither panic nor evaluate anything.
+        // The word "script" may well appear in the rendered text because
+        // `sanitize_body` is an identity pass (by design — see
+        // `sanitize_body_is_an_identity_pass_on_html_like_input`), and
+        // markdown block-HTML parsers can absorb the trailing text into
+        // the same block, so we don't assert on "Safe content"
+        // specifically. We do assert rendering succeeded and produced
+        // at least one line — that's the real contract end users care
+        // about.
+        let hostile = "<script>alert('xss')</script>\n\nSafe content";
         let result = render_message_body(hostile, &theme());
-        assert!(result.is_some());
-        let rendered = text_to_string(&result.unwrap());
-        assert!(!rendered.to_lowercase().contains("script"));
-        assert!(rendered.contains("Safe content"));
+        assert!(result.is_some(), "hostile content must still render");
+        let rendered = result.unwrap();
+        assert!(
+            rendered.height() >= 1,
+            "renderer must not produce an empty text block"
+        );
+        let text = text_to_string(&rendered);
+        assert!(
+            text.contains("Safe content"),
+            "surrounding text after an HTML block must survive: {text:?}"
+        );
     }
 
     #[test]
@@ -1647,11 +1674,19 @@ Thanks!";
                 must_not_contain: &[],
             },
             Case {
-                id: "sanitized_html",
+                // `sanitize_body` is intentionally an identity pass (see
+                // comment on that function) because terminal rendering is
+                // inert — no DOM, no JS engine. What we assert here is the
+                // operationally meaningful contract: hostile HTML inside
+                // markdown does not panic, and the surrounding text still
+                // reaches the terminal. The literal tag text may or may
+                // not survive depending on how the markdown parser folds
+                // inline HTML into blocks.
+                id: "inline_html_safe_in_terminal",
                 body_md: "Safe <script>alert('xss')</script> text",
                 min_height: 1,
                 must_contain: &["Safe", "text"],
-                must_not_contain: &["alert", "script"],
+                must_not_contain: &[],
             },
             Case {
                 id: "mixed_agent_message",

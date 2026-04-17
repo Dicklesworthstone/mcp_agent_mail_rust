@@ -6556,14 +6556,7 @@ fn build_atc_data(
 }
 
 fn emit_robot_output(out: &str) {
-    #[cfg(test)]
-    {
-        let _ = out;
-    }
-    #[cfg(not(test))]
-    {
-        println!("{out}");
-    }
+    ftui_runtime::ftui_println!("{out}");
 }
 
 fn build_navigate_config_environment() -> (NavigateResult, Option<String>) {
