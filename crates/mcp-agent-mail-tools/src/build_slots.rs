@@ -72,16 +72,26 @@ fn holder_identity(agent_name: &str, branch: Option<&str>) -> String {
     branch.map_or_else(|| agent_name.to_string(), |b| format!("{agent_name}:::{b}"))
 }
 
-fn lease_path_for_holder(slot_path: &Path, agent_name: &str, branch: Option<&str>) -> PathBuf {
-    let identity = holder_identity(agent_name, branch);
-    let digest = Sha256::digest(identity.as_bytes());
+fn lease_path_for_holder(slot_path: &Path, agent_name: &str, _branch: Option<&str>) -> PathBuf {
+    // The lease file is keyed by agent alone so the same agent reuses a
+    // single file across branch changes (see the one-agent-one-lease
+    // invariant enforced by `existing_agent_lease_path` and
+    // `collect_slot_conflicts`). The sha256 prefix keeps the on-disk name
+    // stable even when `safe_component` sanitizes the agent name.
+    let digest = Sha256::digest(agent_name.as_bytes());
     let short_hash = &hex::encode(digest)[..16];
     let holder_id = format!("{}--{short_hash}", safe_component(agent_name));
     slot_path.join(format!("{holder_id}.json"))
 }
 
-fn lease_matches_holder(lease: &BuildSlotLease, agent_name: &str, branch: Option<&str>) -> bool {
-    lease.agent == agent_name && lease.branch.as_deref() == branch
+fn lease_matches_holder(lease: &BuildSlotLease, agent_name: &str, _branch: Option<&str>) -> bool {
+    // A slot holds at most one active lease per agent (see
+    // `existing_agent_lease_path` and `collect_slot_conflicts`), so renew/
+    // release must match by agent identity only — the recorded branch on the
+    // lease can drift when the project's current branch changes after
+    // acquire, and strict equality would silently turn renew/release into
+    // no-ops.
+    lease.agent == agent_name
 }
 
 fn legacy_lease_path_for_holder(
