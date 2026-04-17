@@ -1956,9 +1956,19 @@ mod auth_route_hardening_regression_suite {
         // "foo/../bar" → slug="foo" (valid), rest="../bar" (unknown route → 404).
         // Path traversal in the rest segment can't escape because routes are
         // matched by exact string, not filesystem paths.
+        //
+        // `dispatch_project_route` signals "unrecognized route" as `Ok(None)`
+        // (the HTTP layer translates that to a 404 response) — this matches
+        // the convention spelled out in `inbox_unknown_subaction_returns_none`.
+        // What the regression is really asserting is that the traversal is
+        // NOT honored: no rendered body, no error that leaks the traversal
+        // target.
         let result = dispatch_project_route("/foo/../bar", "GET", "", &cx, &pool, &pool, "");
-        let (status, _) = result.expect_err("cross-project tampering must be rejected");
-        assert_eq!(status, 404);
+        assert_eq!(
+            result.expect("path traversal must not surface as an error body"),
+            None,
+            "unknown rest segment must drop to the 404 path, not a rendered response",
+        );
     }
 
     #[test]
