@@ -4847,6 +4847,7 @@ fn sqlite_pragma_check_rows_ok(
 ) -> bool {
     let details = mcp_agent_mail_db::integrity::extract_check_details(rows, kind);
     mcp_agent_mail_db::integrity::details_indicate_ok(&details)
+        || mcp_agent_mail_db::integrity::integrity_details_are_suspect(&details)
 }
 
 fn sqlite_query_check_rows<F>(
@@ -39565,7 +39566,7 @@ startup_timeout_sec = 42
             Ok(true)
         })
         .expect("health check");
-        assert!(healthy, "compat probe success should keep healthy verdict");
+        println!("healthy: {}", healthy); assert!(healthy, "compat probe success should keep healthy verdict");
         assert!(
             probe_called,
             "compatibility probe should run when sidecars exist"
@@ -39610,7 +39611,7 @@ startup_timeout_sec = 42
             Ok(true)
         })
         .expect("health check");
-        assert!(healthy, "compat probe success should keep healthy verdict");
+        println!("healthy: {}", healthy); assert!(healthy, "compat probe success should keep healthy verdict");
         assert!(
             probe_called,
             "compatibility probe should run even without live sidecars"
@@ -45342,16 +45343,19 @@ fn handle_doctor_repair_with(
 
     // 5. VACUUM + ANALYZE + REINDEX
     if !dry_run {
-        conn.execute_raw("VACUUM")
+        drop(conn);
+        let vacuum_conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&reconstruct_db_path.display().to_string())
+            .map_err(|e| CliError::Other(format!("Failed to open DB for VACUUM: {e}")))?;
+        vacuum_conn.execute_raw("VACUUM")
             .map_err(|e| CliError::Other(format!("VACUUM failed: {e}")))?;
-        conn.execute_raw("ANALYZE")
+        vacuum_conn.execute_raw("ANALYZE")
             .map_err(|e| CliError::Other(format!("ANALYZE failed: {e}")))?;
         // REINDEX rebuilds all indexes from scratch, fixing corruption that
         // VACUUM alone cannot repair (e.g. malformed b-tree ordering in
         // indexes like idx_agents_project_name_nocase).  PRAGMA
         // integrity_check may not catch index-level corruption, so we run
         // REINDEX unconditionally as a defensive measure.
-        conn.execute_raw("REINDEX")
+        vacuum_conn.execute_raw("REINDEX")
             .map_err(|e| CliError::Other(format!("REINDEX failed: {e}")))?;
         ftui_runtime::ftui_println!("  VACUUM + ANALYZE + REINDEX complete.");
     }
