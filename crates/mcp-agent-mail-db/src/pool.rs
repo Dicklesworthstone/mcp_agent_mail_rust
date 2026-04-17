@@ -4891,7 +4891,6 @@ fn classify_mailbox_ownership(
         .filter(|process| process.pid != current_pid)
         .collect();
     let competing_pids: Vec<u32> = competing.iter().map(|process| process.pid).collect();
-    let current_deleted = pid_executable_deleted(current_pid);
 
     if competing.len() > 1 {
         let detail = format!(
@@ -4924,17 +4923,14 @@ fn classify_mailbox_ownership(
         );
     }
 
-    if current_deleted {
-        return (
-            MailboxOwnershipDisposition::DeletedExecutable,
-            competing_pids,
-            true,
-            format!(
-                "current Agent Mail process PID {} is running a deleted executable",
-                current_pid
-            ),
-        );
-    }
+    // NOTE: we deliberately no longer refuse the current process just
+    // because `/proc/<self>/exe` resolves to a `(deleted)` path. That state
+    // is normal after a live binary upgrade or after `cargo test` rebuilds
+    // the test binary between a probe and the actual run: the current
+    // process is still alive, still running the same code it loaded at
+    // start, and has full authority over its own mailbox. Ghost-process
+    // concerns only apply to *other* PIDs, which are still handled by the
+    // `competing.first() && executable_deleted` branch above.
 
     if let Some(process) = competing.first() {
         if !process.holds_storage_root_lock

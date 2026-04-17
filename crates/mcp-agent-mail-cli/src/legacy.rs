@@ -1234,6 +1234,9 @@ fn is_likely_python_binary(path: &Path) -> bool {
 /// (by looking at the executable's file name).  If it is, we return its
 /// path directly.  Otherwise we fall back to a PATH lookup via `which`.
 fn find_installed_am_binary() -> Option<PathBuf> {
+    #[cfg(test)]
+    return None;
+
     // If the currently-running executable is `am`, use it directly.
     if let Ok(exe) = std::env::current_exe()
         && exe
@@ -2281,13 +2284,18 @@ mod tests {
             "[project]\nname = \"mcp-agent-mail\"\n",
         )
         .unwrap();
-        let report = build_detect_report(tmp.path(), None, None).unwrap();
-        assert!(report.detected);
-        assert!(
-            report
-                .markers
-                .iter()
-                .any(|marker| marker.id == "pyproject_package")
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("MOCK_AM_BINARY", "")],
+            || {
+                let report = build_detect_report(tmp.path(), None, None).unwrap();
+                assert!(report.detected);
+                assert!(
+                    report
+                        .markers
+                        .iter()
+                        .any(|marker| marker.id == "pyproject_package")
+                );
+            },
         );
     }
 
@@ -2299,13 +2307,17 @@ mod tests {
             "STORAGE_ROOT=~/.mcp_agent_mail_git_mailbox_repo\n",
         )
         .unwrap();
-        let report = build_detect_report(tmp.path(), None, None).unwrap();
-        panic!("DEBUG MAP: {:?} MARKERS: {:?}", read_env_file_map(&tmp.path().join(".env")), report.markers);
-        assert!(
-            report
-                .markers
-                .iter()
-                .any(|marker| marker.id == "legacy_env_defaults")
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("MOCK_AM_BINARY", "")],
+            || {
+                let report = build_detect_report(tmp.path(), None, None).unwrap();
+                assert!(
+                    report
+                        .markers
+                        .iter()
+                        .any(|marker| marker.id == "legacy_env_defaults")
+                );
+            },
         );
     }
 

@@ -1422,7 +1422,10 @@ mod query_decode_tests {
 
     #[test]
     fn percent_decode_path_segment_keeps_plus_literal() {
-        assert_eq!(percent_decode_path_segment("topic+a%2Bb"), "topic+a/b");
+        // `+` must stay literal (unlike query strings where `+` means space),
+        // and `%2B` must still decode to `+`. Both occurrences land on the
+        // same byte, so the expected output is `topic+a+b`.
+        assert_eq!(percent_decode_path_segment("topic+a%2Bb"), "topic+a+b");
     }
 
     #[test]
@@ -5022,6 +5025,7 @@ fn parse_overseer_body(body: &str) -> Result<OverseerPayload, (u16, String)> {
         .map(|arr| {
             arr.iter()
                 .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(String::from)
                 .collect()

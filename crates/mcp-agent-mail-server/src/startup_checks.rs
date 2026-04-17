@@ -792,8 +792,15 @@ pub fn agent_mail_pids_all_stopped(pids: &[u32]) -> bool {
 }
 
 fn listener_pid_hint_path(host: &str, port: u16) -> PathBuf {
-    std::env::temp_dir()
-        .join(LISTENER_PID_HINT_DIR)
+    // Prefer the core `TMPDIR` lookup so the process-env override machinery
+    // (used by tests via `with_process_env_overrides_for_test`) can isolate
+    // the listener hint directory from the real system `/tmp`. Otherwise
+    // concurrent test runs — and the symlink-safety regression tests in
+    // particular — collide on a shared path under `std::env::temp_dir()`.
+    let base = mcp_agent_mail_core::config::process_env_value("TMPDIR")
+        .filter(|value| !value.trim().is_empty())
+        .map_or_else(std::env::temp_dir, PathBuf::from);
+    base.join(LISTENER_PID_HINT_DIR)
         .join(format!("{}-{port}.pid", encode_pid_hint_component(host)))
 }
 
