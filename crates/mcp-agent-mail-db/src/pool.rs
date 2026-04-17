@@ -14,6 +14,7 @@ use mcp_agent_mail_core::{
     config::{env_value, infra_env_value},
     disk::{
         is_sqlite_memory_database_url, sqlite_file_path_from_database_url, sqlite_sidecar_path,
+        sqlite_url_from_path,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -4273,7 +4274,7 @@ fn capture_automatic_recovery_bundle(
     storage_root: &Path,
     command_name: &str,
 ) -> Result<PathBuf, SqlError> {
-    let database_url = format!("sqlite:///{}", primary_path.display());
+    let database_url = sqlite_url_from_path(primary_path);
     let bundle_dir = crate::capture_mailbox_forensic_bundle(crate::MailboxForensicCapture {
         command_name,
         trigger: "automatic-recovery",

@@ -3743,13 +3743,6 @@ fn handle_serve_http(
         config.http_port,
         config.tui_enabled,
     )?;
-    if !running_under_managed_service()
-        && let Err(e) = run_setup_self_heal_for_server(&config)
-    {
-        output::warn(&format!(
-            "Agent setup self-heal encountered an issue (non-fatal): {e}"
-        ));
-    }
     // Kill any existing Agent Mail server on the port FIRST — on macOS
     // we can't find processes by DB file handle (no /proc), but we CAN
     // find them by port.  This also handles Codex-spawned `am serve-http`.
@@ -3761,7 +3754,18 @@ fn handle_serve_http(
     let preflight_report =
         mcp_agent_mail_server::startup_checks::run_http_startup_preflight_probes(&config);
     if !preflight_report.is_ok() {
+        // Defer setup self-heal until after preflight passes. Otherwise a
+        // crashed startup (#93) would silently rewrite Codex/Gemini/Claude
+        // MCP client configs to point at a port that never opened, leaving
+        // every client wedged after a single failed `am serve-http` run.
         return Err(CliError::Other(preflight_report.format_errors()));
+    }
+    if !running_under_managed_service()
+        && let Err(e) = run_setup_self_heal_for_server(&config)
+    {
+        output::warn(&format!(
+            "Agent setup self-heal encountered an issue (non-fatal): {e}"
+        ));
     }
     if config.tui_enabled {
         emit_pre_tui_startup_banner(&config);

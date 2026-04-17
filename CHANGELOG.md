@@ -12,6 +12,43 @@ No changes yet.
 
 ---
 
+## [v0.2.42](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.2.42) — 2026-04-16 **[Release]**
+
+Fixes Windows-native `am.exe serve-http` startup (#93) and a related side-effect that
+silently corrupted MCP client configs on every failed boot.
+
+### Bug Fixes
+
+- **Windows native `am.exe serve-http` was unusable** (#93). On a fresh Windows install
+  with no prior `~/.mcp_agent_mail_git_mailbox_repo`, startup crashed with
+  `unable to open database file: 'C:/\\'` (os error 161, `ERROR_BAD_PATHNAME`).
+  Root cause: `fs::canonicalize` on Windows returns a `\\?\C:\…` UNC verbatim path;
+  embedding it into `sqlite:///{path.display()}` produced a URL whose literal `?` was
+  then split by the query-string parser, truncating the path to `/\\` (3 bytes).
+  - The URL parser (`sqlite_path_component`) now skips `?` markers that are part of a
+    `\\?\` UNC verbatim prefix.
+  - URL construction goes through a new helper, `disk::sqlite_url_from_path`, that
+    strips the UNC prefix and normalizes separators to `/`.
+  - The parser also peels a stray leading `/` before a Windows drive letter
+    (`/C:/...` → `C:/...`).
+- **Failed `serve-http` startup silently rewrote MCP client configs** to point at the
+  port that never opened (#93 secondary). The setup-self-heal step now runs *after*
+  the startup preflight passes — a crashed boot leaves Codex/Gemini/Claude Code MCP
+  configs untouched.
+
+### Internals
+
+- New helper: `mcp_agent_mail_core::disk::sqlite_url_from_path(&Path) -> String`. Use
+  this everywhere a SQLite database URL is built from a `Path` instead of
+  `format!("sqlite:///{}", path.display())`.
+- Runtime callsites updated to use the helper:
+  `Config::from_env` default `database_url` derivation,
+  `pool.rs::capture_automatic_recovery_bundle`,
+  `mcp-agent-mail-tools::lib` snapshot pool setup,
+  `mcp-agent-mail-tools::resources` snapshot pool setup.
+
+---
+
 ## [v0.2.41](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.2.41) — 2026-04-16 **[Release — Latest]**
 
 Dependency refresh aligning with latest franken* sibling-repo versions.

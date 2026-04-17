@@ -698,7 +698,7 @@ pub mod tool_util {
                 .map_err(|err| err.to_string())?;
         }
         let pool = create_pool(&mcp_agent_mail_db::DbPoolConfig {
-            database_url: format!("sqlite:///{}", snapshot_db.display()),
+            database_url: mcp_agent_mail_core::disk::sqlite_url_from_path(&snapshot_db),
             storage_root: Some(config.storage_root),
             ..Default::default()
         })

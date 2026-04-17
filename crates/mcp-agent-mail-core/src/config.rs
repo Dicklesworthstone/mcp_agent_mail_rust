@@ -2036,9 +2036,8 @@ impl Config {
         // database lives alongside the storage directory rather than relative
         // to an arbitrary CWD.
         if config.database_url == DEFAULT_LEGACY_DATABASE_URL {
-            config.database_url = format!(
-                "sqlite:///{}",
-                config.storage_root.join("storage.sqlite3").display()
+            config.database_url = crate::disk::sqlite_url_from_path(
+                &config.storage_root.join("storage.sqlite3"),
             );
         }
 

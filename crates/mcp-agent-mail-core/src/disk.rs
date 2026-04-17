@@ -145,7 +145,43 @@ fn sqlite_path_component(database_url: &str) -> Option<&str> {
     } else {
         url.strip_prefix("sqlite://")?
     };
-    Some(stripped.split(['?', '#']).next().unwrap_or(stripped))
+    // Find the query/fragment cut, skipping any `?` that is part of a Windows
+    // UNC verbatim prefix (`\\?\` or `\\?\UNC\`).  Without this guard, the
+    // literal `?` inside `\\?\` was treated as a URL query separator and the
+    // embedded Windows path was truncated to `/\\` (issue #93).
+    let cut = stripped
+        .char_indices()
+        .find(|(idx, ch)| match *ch {
+            '#' => true,
+            '?' => !is_unc_verbatim_question_mark(stripped.as_bytes(), *idx),
+            _ => false,
+        })
+        .map(|(idx, _)| idx);
+    Some(match cut {
+        Some(idx) => &stripped[..idx],
+        None => stripped,
+    })
+}
+
+/// Return `true` if the byte at `idx` is the `?` inside a Windows UNC
+/// verbatim prefix (`\\?\`).  Detection: preceded by `\\`, followed by `\`.
+fn is_unc_verbatim_question_mark(bytes: &[u8], idx: usize) -> bool {
+    idx >= 2
+        && bytes[idx] == b'?'
+        && bytes[idx - 1] == b'\\'
+        && bytes[idx - 2] == b'\\'
+        && bytes.get(idx + 1) == Some(&b'\\')
+}
+
+/// Return `true` if `path` is shaped like `/<drive>:[/\\]...` (Windows drive
+/// letter with a stray leading `/` from URL syntax).
+fn is_url_drive_letter_prefix(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 4
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+        && (bytes[3] == b'/' || bytes[3] == b'\\')
 }
 
 /// Return `true` when the database URL points to an in-memory `SQLite` database.
@@ -183,6 +219,11 @@ pub fn sqlite_file_path_from_database_url(database_url: &str) -> Option<PathBuf>
     } else if path.starts_with("/./") || path.starts_with("/../") {
         // Explicitly relative path (sqlite:///./path.db or sqlite:///../path.db).
         path.remove(0);
+    } else if is_url_drive_letter_prefix(&path) {
+        // sqlite:///C:/path -> C:/path. The leading `/` is URL syntax, not a
+        // filesystem component. Strip unconditionally (not behind `cfg!(windows)`)
+        // so Linux test suites and tooling can also parse captured Windows URLs.
+        path.remove(0);
     }
 
     if path.is_empty() {
@@ -190,6 +231,34 @@ pub fn sqlite_file_path_from_database_url(database_url: &str) -> Option<PathBuf>
     }
 
     Some(PathBuf::from(path))
+}
+
+/// Construct a `sqlite:///` URL from a filesystem path, applying the
+/// normalizations that `sqlite_file_path_from_database_url` expects.
+///
+/// On Windows this strips a leading `\\?\` (or `\\?\UNC\`) verbatim prefix
+/// returned by `fs::canonicalize` and converts path separators to `/`. Without
+/// the prefix-strip, the literal `?` inside `\\?\` is interpreted as the URL
+/// query separator and the embedded path is truncated to garbage (issue #93).
+///
+/// Use this everywhere a SQLite database URL is constructed from a `Path`
+/// instead of `format!("sqlite:///{}", path.display())`.
+#[must_use]
+pub fn sqlite_url_from_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    // Strip Windows UNC verbatim prefix (`\\?\` or `\\?\UNC\`).  Stripping
+    // these is always safe because the byte sequence is not a legal component
+    // of any normal Unix path; doing it unconditionally lets cross-platform
+    // tests on Linux exercise this branch without `cfg!(windows)` gating.
+    let stripped = raw
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| raw.strip_prefix(r"\\?\"));
+    let cleaned: std::borrow::Cow<'_, str> = match stripped {
+        Some(s) => std::borrow::Cow::Owned(s.replace('\\', "/")),
+        None if cfg!(windows) => std::borrow::Cow::Owned(raw.replace('\\', "/")),
+        None => raw,
+    };
+    format!("sqlite:///{cleaned}")
 }
 
 /// Return the sibling `SQLite` sidecar path for a `database` file.
@@ -606,6 +675,66 @@ mod tests {
             sqlite_path_component("sqlite:///path.db?mode=rwc#frag"),
             Some("/path.db")
         );
+    }
+
+    #[test]
+    fn sqlite_path_component_preserves_windows_unc_verbatim_prefix() {
+        // Issue #93: `\\?\C:\…` UNC verbatim paths embed a literal `?` at
+        // byte index 1.  Splitting on `?` truncated the path to `/\\` and
+        // produced `'C:/\\\\'` open errors on Windows native builds.
+        assert_eq!(
+            sqlite_path_component(r"sqlite:///\\?\C:\Users\me\db.sqlite3"),
+            Some(r"/\\?\C:\Users\me\db.sqlite3")
+        );
+        // Real query strings still get trimmed when they sit past the path.
+        assert_eq!(
+            sqlite_path_component(r"sqlite:///\\?\C:\Users\me\db.sqlite3?mode=ro"),
+            Some(r"/\\?\C:\Users\me\db.sqlite3")
+        );
+    }
+
+    #[test]
+    fn sqlite_url_from_path_strips_windows_unc_verbatim_prefix() {
+        // Issue #93: smoke test for the round-trip we now perform on Windows.
+        // On Unix this exercises the no-op branch.  On Windows it strips
+        // `\\?\` and normalizes to forward slashes.
+        let url = sqlite_url_from_path(Path::new(r"\\?\C:\Users\me\db.sqlite3"));
+        assert!(
+            !url.contains(r"\\?\"),
+            "URL {url:?} must not embed `\\\\?\\` verbatim prefix"
+        );
+        let parsed = sqlite_file_path_from_database_url(&url)
+            .expect("Windows-style URL should round-trip back to a path");
+        // Forward-slash form is canonical for our URLs.  Both Path::new(`C:/…`)
+        // and Path::new(`C:\…`) hit the same Win32 file APIs successfully.
+        assert!(
+            parsed.to_string_lossy().contains("C:/Users/me/db.sqlite3")
+                || parsed.to_string_lossy().contains(r"C:\Users\me\db.sqlite3"),
+            "round-trip lost path content: {parsed:?}",
+        );
+    }
+
+    #[test]
+    fn sqlite_file_path_from_database_url_peels_url_drive_letter_root() {
+        // Issue #93: when a URL embeds a Windows path with a stray leading
+        // `/` (URL syntax, not filesystem), parsing must strip the slash so
+        // Win32 sees `C:/...` rather than `\C:\...` (which it rejects).
+        let parsed = sqlite_file_path_from_database_url("sqlite:///C:/Users/me/db.sqlite3")
+            .expect("drive-letter URL should parse");
+        assert_eq!(parsed, PathBuf::from("C:/Users/me/db.sqlite3"));
+
+        // Backslash form (some Windows tooling emits this) parses identically.
+        let parsed = sqlite_file_path_from_database_url(r"sqlite:///C:\Users\me\db.sqlite3")
+            .expect("drive-letter URL with backslashes should parse");
+        assert_eq!(parsed, PathBuf::from(r"C:\Users\me\db.sqlite3"));
+    }
+
+    #[test]
+    fn sqlite_url_from_path_round_trips_on_unix() {
+        let url = sqlite_url_from_path(Path::new("/var/data/db.sqlite3"));
+        assert_eq!(url, "sqlite:////var/data/db.sqlite3");
+        let parsed = sqlite_file_path_from_database_url(&url).expect("round-trip");
+        assert_eq!(parsed, PathBuf::from("/var/data/db.sqlite3"));
     }
 
     #[test]
