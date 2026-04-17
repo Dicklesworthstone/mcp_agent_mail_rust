@@ -92,6 +92,9 @@ SilverFox:
 # Beads history snapshots
 .beads/.br_history/
 
+# Beads lock files (write/sync/bv/br advisory flocks)
+.beads/*.lock
+
 # Claude Code / AI agent ephemeral files
 .claude/
 
@@ -287,6 +290,7 @@ release-artifacts/
 # Ephemeral test/runtime artifacts
 storage.sqlite3.activity.lock
 test_bug
+test_dir
 test_dotenv
 
 # Release preparation build artifacts
