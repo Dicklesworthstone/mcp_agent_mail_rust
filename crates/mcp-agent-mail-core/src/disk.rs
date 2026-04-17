@@ -219,10 +219,16 @@ pub fn sqlite_file_path_from_database_url(database_url: &str) -> Option<PathBuf>
     } else if path.starts_with("/./") || path.starts_with("/../") {
         // Explicitly relative path (sqlite:///./path.db or sqlite:///../path.db).
         path.remove(0);
-    } else if is_url_drive_letter_prefix(&path) {
-        // sqlite:///C:/path -> C:/path. The leading `/` is URL syntax, not a
-        // filesystem component. Strip unconditionally (not behind `cfg!(windows)`)
-        // so Linux test suites and tooling can also parse captured Windows URLs.
+    }
+    // Always re-check for `/<drive>:/...` after the leading-slash trims above:
+    // the `sqlite:////C:/...` form (extra `//` then drive letter) needs both
+    // the `//` strip AND the drive-letter peel to land on `C:/...`.  Using
+    // separate `if` (not `else if`) makes the two trims compose.
+    if is_url_drive_letter_prefix(&path) {
+        // `sqlite:///C:/path` -> `C:/path`. The leading `/` is URL syntax, not
+        // a filesystem component. Strip unconditionally (not behind
+        // `cfg!(windows)`) so Linux test suites and tooling can also parse
+        // captured Windows URLs without surprise.
         path.remove(0);
     }
 
