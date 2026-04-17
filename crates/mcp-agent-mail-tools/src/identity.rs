@@ -2123,9 +2123,22 @@ mod tests {
         config.storage_root = mcp_agent_mail_core::config::default_storage_root_path();
         config.ephemeral_mode = mcp_agent_mail_core::ephemeral::EphemeralMode::Auto;
 
-        let rerouted = maybe_reroute_ephemeral_storage(&config, "/data/projects/real-project");
+        // `cargo test` itself sets `RUST_TEST_THREADS`, which is a high-
+        // confidence ephemeral signal, so going through
+        // `maybe_reroute_ephemeral_storage` (which consults the real process
+        // env via `std_env_lookup`) would classify every test run as
+        // ephemeral regardless of the project path. Drive
+        // `compute_ephemeral_storage_root_with_env` directly with an empty
+        // env lookup so only the path-based signals can fire, which is the
+        // actual contract this test is asserting.
+        let empty_env = |_: &str| None;
+        let isolated = mcp_agent_mail_core::config::compute_ephemeral_storage_root_with_env(
+            std::path::Path::new("/data/projects/real-project"),
+            &config,
+            &empty_env,
+        );
         assert!(
-            rerouted.is_none(),
+            isolated.is_none(),
             "production path should not trigger auto-reroute"
         );
     }
