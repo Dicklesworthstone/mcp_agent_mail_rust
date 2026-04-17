@@ -720,7 +720,7 @@ impl ExperimentBudgetTable {
             window_start_micros: now_micros,
             window_duration_micros: DEFAULT_EXPERIMENT_WINDOW_MICROS,
         });
-        self.entries.last_mut().unwrap()
+        self.entries.last_mut().expect("just pushed")
     }
 
     /// Whether the global experiment fraction is within limits.

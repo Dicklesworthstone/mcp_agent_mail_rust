@@ -325,15 +325,15 @@ impl GateError {
 fn classify_stderr(stderr: &str) -> (Option<String>, Option<u32>, Option<String>) {
     use std::sync::LazyLock;
     static RE_COMPILER: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"^error\[E\d+\]: (.+)$").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"^error\[E\d+\]: (.+)$").expect("valid regex"));
     static RE_PANIC: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"thread '(.+)' panicked").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"thread '(.+)' panicked").expect("valid regex"));
     static RE_TEST_FAIL: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"^---- (.+) ----$").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"^---- (.+) ----$").expect("valid regex"));
     static RE_CLIPPY: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"^warning: (.+)$").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"^warning: (.+)$").expect("valid regex"));
     static RE_FORMAT: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"^Diff in (.+):$").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"^Diff in (.+):$").expect("valid regex"));
 
     let compiler_pattern = Some(&*RE_COMPILER);
     let test_panic = Some(&*RE_PANIC);
@@ -456,7 +456,7 @@ fn extract_affected_files(stderr: &str) -> Vec<String> {
         regex::Regex::new(
             r"(?:^|\s)([\w./\-]+\.(?:rs|py|js|ts|tsx|jsx|md|toml|json|yaml|yml|sh|sql|css|html)):(\d+)",
         )
-        .unwrap()
+        .expect("valid regex")
     });
     let file_pattern = Some(&*RE_FILE);
 

@@ -21,20 +21,25 @@ use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::time::Instant;
 
-const TWO_POW_32_F64: f64 = 4_294_967_296.0;
-
 fn u64_to_f64(value: u64) -> f64 {
-    let upper = u32::try_from(value >> 32).unwrap_or(u32::MAX);
-    let lower = u32::try_from(value & u64::from(u32::MAX)).unwrap_or(u32::MAX);
-    f64::from(upper).mul_add(TWO_POW_32_F64, f64::from(lower))
+    #[allow(clippy::cast_precision_loss)]
+    {
+        value as f64
+    }
 }
 
 fn usize_to_f64(value: usize) -> f64 {
-    u64_to_f64(u64::try_from(value).unwrap_or(u64::MAX))
+    #[allow(clippy::cast_precision_loss)]
+    {
+        value as f64
+    }
 }
 
 fn nonnegative_i64_to_f64(value: i64) -> f64 {
-    u64_to_f64(u64::try_from(value.max(0)).unwrap_or(0))
+    #[allow(clippy::cast_precision_loss)]
+    {
+        value.max(0) as f64
+    }
 }
 
 fn micros_f64_to_i64(value: f64) -> i64 {
@@ -3417,8 +3422,34 @@ struct AtcLivenessPolicyBundle {
 
 impl AtcLivenessPolicyArtifact {
     fn compute_artifact_hash(&self) -> String {
+        // IMPORTANT: format every f64 with a fixed number of decimals instead
+        // of using Debug/Display. The candidate bundle derives some losses
+        // via binary-inexact multiplications (e.g. `6.0 * 0.9`), and both
+        // `{:?}` and `{}` render those values at their shortest-round-trip
+        // form — which can flip by 1 ULP across a JSON serialize/deserialize
+        // pair. That would turn a perfectly round-trippable bundle into a
+        // `invalid_candidate_policy_hash` on load. A fixed-precision
+        // formatter (6 decimals is what all the other hashed scalar fields
+        // already use) keeps the hash input stable across the pipeline.
+        let mut losses_str = String::with_capacity(64);
+        losses_str.push('[');
+        for (i, row) in self.losses.iter().enumerate() {
+            if i > 0 {
+                losses_str.push(';');
+            }
+            losses_str.push('[');
+            for (j, v) in row.iter().enumerate() {
+                if j > 0 {
+                    losses_str.push(',');
+                }
+                use std::fmt::Write as _;
+                let _ = write!(losses_str, "{v:.6}");
+            }
+            losses_str.push(']');
+        }
+        losses_str.push(']');
         let serialized = format!(
-            "{}|{}|{:.6}|{}|{:.6}|{:.6}|{:.6}|{:.6}|{}|{:?}",
+            "{}|{}|{:.6}|{}|{:.6}|{:.6}|{:.6}|{:.6}|{}|{}",
             self.schema_version,
             self.policy_id,
             self.suspicion_k,
@@ -3428,7 +3459,7 @@ impl AtcLivenessPolicyArtifact {
             self.probe_budget_fraction,
             self.conservative_probe_budget_fraction,
             self.release_guard_enabled,
-            self.losses,
+            losses_str,
         );
         format!("{:016x}", stable_fnv1a64(serialized.as_bytes()))
     }
@@ -10598,13 +10629,21 @@ mod alien_enhancement_tests {
         let mut engine = AtcEngine::new_for_testing();
         let mut graph = ProjectConflictGraph::default();
         graph.generation = 1;
+        // `HardEdge::since` must be within `conflict_edge_ttl_micros()` of
+        // `now_micros`; anything older gets pruned by
+        // `prune_stale_conflicts` at the top of `run_tick`, which would
+        // erase the cycle before `detect_deadlocks` ever ran and leave
+        // `actions`/`effects` empty. Anchor both edges slightly before
+        // `now_micros` so the cycle survives into the deadlock stage.
+        let now_micros = 1_700_000_000_000_000_i64;
+        let fresh_since = now_micros - 1_000_000; // 1s old → well inside TTL
         graph.hard_edges.insert(
             "AgentA".to_string(),
             vec![HardEdge {
                 holder: "AgentA".to_string(),
                 blocked: "AgentB".to_string(),
                 contested_patterns: vec!["src/lib.rs".to_string()],
-                since: 1,
+                since: fresh_since,
             }],
         );
         graph.hard_edges.insert(
@@ -10613,7 +10652,7 @@ mod alien_enhancement_tests {
                 holder: "AgentB".to_string(),
                 blocked: "AgentA".to_string(),
                 contested_patterns: vec!["src/main.rs".to_string()],
-                since: 2,
+                since: fresh_since,
             }],
         );
         engine
@@ -10621,7 +10660,7 @@ mod alien_enhancement_tests {
             .insert("deadlock-project".to_string(), graph);
         engine.dirty_projects.insert("deadlock-project".to_string());
 
-        let report = engine.run_tick(1_700_000_000_000_000);
+        let report = engine.run_tick(now_micros);
         assert!(
             !report
                 .actions
