@@ -2767,7 +2767,7 @@ mod tests {
              INSERT INTO file_reservations
                 (id, project_id, agent_id, path_pattern, \"exclusive\", expires_ts, released_ts)
              VALUES
-                (1, 1, 77, 'src/**', 1, 5_000_000_000, NULL);",
+                (1, 1, 77, 'src/**', 1, 5000000000, NULL);",
         )
         .expect("seed pressure rows");
 

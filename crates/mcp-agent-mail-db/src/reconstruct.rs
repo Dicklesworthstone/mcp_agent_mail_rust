@@ -632,6 +632,18 @@ pub fn collect_db_message_ids(db_path: &Path) -> Result<BTreeSet<i64>, SqlError>
         ));
     }
 
+    // `DbConn::open_file` opens SQLite with `SQLITE_OPEN_CREATE`, which would
+    // silently materialize an empty DB stub for a missing mailbox.  This is
+    // a read-only inventory probe used by `compute_archive_drift_report` and
+    // `scan_archive_anomalies_with_db`, so refuse cleanly rather than mutate
+    // the filesystem for the caller.
+    if !db_path.exists() {
+        return Err(SqlError::Custom(format!(
+            "collect_db_message_ids: database file not found at {}",
+            db_path.display()
+        )));
+    }
+
     let db_str = db_path.to_string_lossy();
     let conn = DbConn::open_file(db_str.as_ref()).map_err(|e| {
         SqlError::Custom(format!(

@@ -148,6 +148,20 @@ pub fn inspect_mailbox_integrity(db_path: &Path, kind: CheckKind) -> MailboxInte
         };
     }
 
+    // `DbConn::open_file` opens SQLite with `SQLITE_OPEN_CREATE`, which would
+    // silently materialize an empty DB stub for a missing mailbox.  Integrity
+    // inspection is read-only diagnostics — refuse gracefully so external
+    // callers of this `pub` surface can't inadvertently leave behind a
+    // zero-byte `.sqlite3` file.
+    if !db_path.exists() {
+        return MailboxIntegrityVerdict {
+            status: MailboxIntegrityStatus::Skipped,
+            metrics: metrics_before,
+            check: None,
+            detail: format!("Database file not found: {}", db_path.display()),
+        };
+    }
+
     let path_str = db_path.display().to_string();
     let conn = match crate::DbConn::open_file(&path_str) {
         Ok(conn) => conn,

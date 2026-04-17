@@ -7252,9 +7252,15 @@ mod tests {
     }
 
     #[test]
-    fn console_log_panel_auto_mode_requires_content() {
+    fn console_log_panel_auto_mode_is_disabled_by_design() {
+        // Auto-enable on "mega-dense" surfaces was intentionally disabled so
+        // the console log panel never displaces the recent-message preview
+        // rail on big terminals; surface size and line count must no longer
+        // drive visibility.  See `should_render_console_log_panel` comment.
         assert!(!should_render_console_log_panel(false, true, 0));
-        assert!(should_render_console_log_panel(false, true, 1));
+        assert!(!should_render_console_log_panel(false, true, 1));
+        assert!(!should_render_console_log_panel(false, false, 0));
+        assert!(!should_render_console_log_panel(false, false, 1_000));
     }
 
     #[test]
