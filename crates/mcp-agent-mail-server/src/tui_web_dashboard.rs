@@ -207,7 +207,7 @@ impl WebDashboardFrameStore {
             ",\"active_viewers\":{},\"journal_depth\":{},\"idle_skip_total\":{}",
             active_viewers, journal_depth, idle_skip_total
         )
-        .unwrap();
+        .expect("write failed");
     }
 
     fn prune_stale_viewers(state: &mut FrameState, now_us: i64) {
@@ -303,7 +303,7 @@ impl WebDashboardFrameStore {
             state.viewers.len(),
             state.journal.len()
         )
-        .unwrap();
+        .expect("write failed");
         let mut first = true;
         for entry in entries {
             if !first {
@@ -399,11 +399,11 @@ impl WebDashboardFrameStore {
             snap,
             "{{\"mode\":\"snapshot\",\"seq\":{new_seq},\"cols\":{cols},\"rows\":{rows},\"screen_id\":{screen_id},\"screen_key\":"
         )
-        .unwrap();
+        .expect("write failed");
         push_json_string(&mut snap, screen_key);
         snap.push_str(",\"screen_title\":");
         push_json_string(&mut snap, screen_title);
-        write!(snap, ",\"timestamp_us\":{ts},\"cells\":\"").unwrap();
+        write!(snap, ",\"timestamp_us\":{ts},\"cells\":\"").expect("write failed");
         base64_encode_into(&next_bytes, &mut snap);
         snap.push('"');
         Self::append_runtime_metadata(
@@ -412,7 +412,7 @@ impl WebDashboardFrameStore {
             idle_skip_total,
             &mut snap,
         );
-        write!(snap, ",\"changed_cells\":{n_cells}}}").unwrap();
+        write!(snap, ",\"changed_cells\":{n_cells}}}").expect("write failed");
         let snapshot_payload: Arc<str> = Arc::from(snap.as_str());
 
         // ── Build delta response (only changed cell indices) ────────
@@ -423,11 +423,11 @@ impl WebDashboardFrameStore {
                 delta,
                 "{{\"mode\":\"delta\",\"seq\":{new_seq},\"cols\":{cols},\"rows\":{rows},\"screen_id\":{screen_id},\"screen_key\":"
             )
-            .unwrap();
+            .expect("write failed");
             push_json_string(&mut delta, screen_key);
             delta.push_str(",\"screen_title\":");
             push_json_string(&mut delta, screen_title);
-            write!(delta, ",\"timestamp_us\":{ts},\"changed\":[").unwrap();
+            write!(delta, ",\"timestamp_us\":{ts},\"changed\":[").expect("write failed");
             let mut first = true;
             let mut changed_cells = 0_usize;
             let prev = &guard.published_bytes;
@@ -464,7 +464,7 @@ impl WebDashboardFrameStore {
                         next_bytes[off + 14],
                         next_bytes[off + 15],
                     ]);
-                    write!(delta, "[{i},{c},{f},{b},{a}]").unwrap();
+                    write!(delta, "[{i},{c},{f},{b},{a}]").expect("write failed");
                 }
             }
             delta.push(']');
@@ -474,7 +474,7 @@ impl WebDashboardFrameStore {
                 idle_skip_total,
                 &mut delta,
             );
-            write!(delta, ",\"changed_cells\":{changed_cells}}}").unwrap();
+            write!(delta, ",\"changed_cells\":{changed_cells}}}").expect("write failed");
             Arc::from(delta.as_str())
         } else {
             // Dimensions changed — no valid delta, use snapshot.
@@ -612,7 +612,7 @@ fn push_json_string(out: &mut String, value: &str) {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c if c <= '\u{1F}' => {
-                write!(out, "\\u{:04X}", c as u32).unwrap();
+                write!(out, "\\u{:04X}", c as u32).expect("write failed");
             }
             c => out.push(c),
         }
@@ -2137,7 +2137,7 @@ mod tests {
     #[test]
     fn unchanged_response_format() {
         let resp = unchanged_response(42, 3, 9);
-        let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&resp).expect("write failed");
         assert_eq!(v["mode"], "unchanged");
         assert_eq!(v["seq"], 42);
         assert_eq!(v["active_viewers"], 3);
@@ -2171,7 +2171,7 @@ mod tests {
         let config = mcp_agent_mail_core::Config::default();
         let fallback = TuiSharedState::new(&config);
         let (_ok_status, payload) = handle_state_response(None, &fallback, Some("limit=5"));
-        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&payload).expect("write failed");
         assert_eq!(v["mode"], "inactive");
         assert_eq!(v["reason"], "tui_inactive");
         assert_eq!(v["retry_ms"], INACTIVE_RETRY_MS);
@@ -2184,7 +2184,7 @@ mod tests {
         let live = TuiSharedState::new(&config);
         let fallback = TuiSharedState::new(&config);
         let (_ok_status, payload) = handle_state_response(Some(&live), &fallback, None);
-        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&payload).expect("write failed");
         assert_eq!(v["mode"], "warming");
         assert_eq!(v["reason"], "tui_warming");
         assert_eq!(v["retry_ms"], WARMING_RETRY_MS);
@@ -2203,7 +2203,7 @@ mod tests {
         assert_eq!(store.snapshot_seq(), 1);
 
         let payload = store.cached_snapshot();
-        let v: serde_json::Value = serde_json::from_str(payload.as_ref()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(payload.as_ref()).expect("write failed");
         assert_eq!(v["seq"], 1);
         assert_eq!(v["screen_id"], 3);
         assert_eq!(v["screen_key"], "agents");
@@ -2233,7 +2233,7 @@ mod tests {
         store.capture(&buffer, 9, "ops\\qa", "Ops \"QA\"\nLive");
 
         let payload = store.cached_snapshot();
-        let v: serde_json::Value = serde_json::from_str(payload.as_ref()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(payload.as_ref()).expect("write failed");
         assert_eq!(v["screen_key"], "ops\\qa");
         assert_eq!(v["screen_title"], "Ops \"QA\"\nLive");
     }
@@ -2254,7 +2254,7 @@ mod tests {
         store.capture(&second, 1, "messages", "Messages");
 
         let payload = handle_state(&state, Some("since=1"));
-        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&payload).expect("write failed");
         assert_eq!(v["mode"], "delta");
         assert_eq!(v["seq"], 2);
         assert_eq!(v["screen_key"], "messages");
@@ -2286,7 +2286,7 @@ mod tests {
         store.capture(&third, 2, "threads", "Threads");
 
         let payload = handle_state(&state, Some("since=1"));
-        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&payload).expect("write failed");
         assert_eq!(v["mode"], "replay");
         assert_eq!(v["from_seq"], 1);
         assert_eq!(v["to_seq"], 3);
@@ -2311,8 +2311,8 @@ mod tests {
         second.set(0, 0, ftui::Cell::from_char('B'));
         store.capture(&second, 1, "messages", "Messages");
 
-        let payload = handle.join().unwrap();
-        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let payload = handle.join().expect("write failed");
+        let v: serde_json::Value = serde_json::from_str(&payload).expect("write failed");
         assert_eq!(v["seq"], 2);
         assert_eq!(v["screen_key"], "messages");
     }
@@ -2327,7 +2327,7 @@ mod tests {
         ]}"#;
         let (status, payload) = handle_input(&state, body);
         assert_eq!(status, 202);
-        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&payload).expect("write failed");
         assert_eq!(v["accepted"], 1);
         assert_eq!(v["ignored"], 1);
     }
@@ -2353,7 +2353,7 @@ mod tests {
     fn handle_inactive_input_returns_503() {
         let (status, payload) = handle_inactive_input();
         assert_eq!(status, 503);
-        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&payload).expect("write failed");
         assert_eq!(v["status"], "inactive");
         assert_eq!(v["retry_ms"], INACTIVE_RETRY_MS);
     }

@@ -1962,7 +1962,17 @@ mod tests {
     #[test]
     fn tab_hit_slots_cover_all_visible_tabs_normal_width() {
         let dispatcher = crate::tui_hit_regions::MouseDispatcher::new();
-        let area = Rect::new(0, 0, 240, 1); // Wide enough for all 15 tabs
+        // Must be wide enough for every entry in `ALL_SCREEN_IDS`. The
+        // registry grew from 15 (the original width this test assumed) to
+        // 16 when the `Atc` screen shipped, and `compute_tab_window_plan`
+        // starts hiding tabs as soon as the cumulative tab+separator width
+        // overflows. Derive the width from the registry so future screen
+        // additions don't silently fall off the right edge again.
+        let nominal_tab_width: u16 = 16;
+        let area_width = u16::try_from(ALL_SCREEN_IDS.len())
+            .unwrap_or(u16::MAX)
+            .saturating_mul(nominal_tab_width);
+        let area = Rect::new(0, 0, area_width, 1);
         record_tab_hit_slots(area, MailScreenId::Dashboard, &dispatcher);
         let mut found = 0;
         for i in 0..ALL_SCREEN_IDS.len() {
@@ -1973,7 +1983,7 @@ mod tests {
         assert_eq!(
             found,
             ALL_SCREEN_IDS.len(),
-            "all tabs should have hit slots at width 200"
+            "every registered screen should get a tab hit slot at width {area_width}",
         );
     }
 

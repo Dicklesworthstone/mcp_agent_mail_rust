@@ -4640,11 +4640,28 @@ mod tests {
         screen.threads.push(make_thread("t2", 2, 2));
         screen.detail_messages.push(make_message(77));
         screen.focus = Focus::DetailPanel;
-        screen.last_list_area.set(Rect::new(0, 1, 40, 10));
-        screen.last_detail_area.set(Rect::new(40, 1, 40, 10));
+        // `thread_index_at_list_y` compresses the visible rows into
+        // 2-line per-thread cells when the inner width is at least
+        // `THREAD_SUBJECT_LINE_MIN_WIDTH` (40). With the previous width
+        // of 40 the bordered inner region was only 38 wide, which
+        // flipped `show_subject` off and then `y=4` mapped past the end
+        // of the visible range — so no `hovered_thread_id` was resolved
+        // and the drop silently produced `Cmd::None` instead of a
+        // rethread. Widen the list area so the 2-line cells are active
+        // and `y=4` lands squarely on row 1 (thread `t2`).
+        screen
+            .last_list_area
+            .set(Rect::new(0, 1, THREAD_SUBJECT_LINE_MIN_WIDTH as u16 + 2, 10));
+        screen.last_detail_area.set(Rect::new(
+            THREAD_SUBJECT_LINE_MIN_WIDTH as u16 + 2,
+            1,
+            40,
+            10,
+        ));
         let state = TuiSharedState::new(&mcp_agent_mail_core::Config::default());
 
-        let down = mouse_event(MouseEventKind::Down(MouseButton::Left), 45, 3);
+        let down_x = (THREAD_SUBJECT_LINE_MIN_WIDTH as u16) + 5;
+        let down = mouse_event(MouseEventKind::Down(MouseButton::Left), down_x, 3);
         let _ = screen.update(&down, &state);
         assert!(matches!(screen.message_drag, MessageDragState::Pending(_)));
         if let MessageDragState::Pending(pending) = &mut screen.message_drag {

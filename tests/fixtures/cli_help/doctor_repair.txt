@@ -5,6 +5,6 @@ Arguments:
 
 Options:
       --dry-run
-  -y, --yes
+  -y, --yes                      Skip confirmation prompts (also accepted as --force)
       --backup-dir <BACKUP_DIR>
   -h, --help                     Print help

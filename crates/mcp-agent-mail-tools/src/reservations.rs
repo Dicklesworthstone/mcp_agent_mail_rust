@@ -1143,7 +1143,7 @@ pub async fn force_release_file_reservation(
     {
         Outcome::Ok(agent) => Some(agent),
         Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => None,
-        other => return Err(db_outcome_to_mcp_result(other).unwrap_err()),
+        other => return Err(db_outcome_to_mcp_result(other).expect_err("non-ok outcome")),
     };
     let holder_agent_name = holder_agent.as_ref().map_or_else(
         || format!("[unknown-agent-{}]", reservation.agent_id),

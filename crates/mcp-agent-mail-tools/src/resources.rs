@@ -2248,7 +2248,7 @@ pub async fn product_details(ctx: &McpContext, key: String) -> McpResult<String>
                     format!("Product '{key}' not found."),
                 ));
             }
-            other => return Err(db_outcome_to_mcp_result(other).unwrap_err()),
+            other => return Err(db_outcome_to_mcp_result(other).expect_err("non-ok outcome")),
         };
 
     let product_id = product.id.unwrap_or(0);
@@ -2343,7 +2343,7 @@ pub async fn message_details(ctx: &McpContext, message_id: String) -> McpResult<
             Outcome::Err(mcp_agent_mail_db::DbError::NotFound { .. }) => {
                 format!("[unknown-agent-{}]", msg.sender_id)
             }
-            other => return Err(db_outcome_to_mcp_result(other).unwrap_err()),
+            other => return Err(db_outcome_to_mcp_result(other).expect_err("non-ok outcome")),
         };
 
     let recipients = parse_recipients_json(&msg.recipients_json);

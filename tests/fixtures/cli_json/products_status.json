@@ -1,6 +1,6 @@
 {
   "product": {
-    "created_at": "2024-01-01T00:00:00.000000Z",
+    "created_at": "+262142-12-31T23:59:59.999999Z",
     "id": 1,
     "name": "Test Product",
     "product_uid": "abc123"

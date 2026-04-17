@@ -7018,13 +7018,22 @@ mod tests {
 
     #[test]
     fn ensure_recipes_loaded_preserves_stale_data_and_retries_after_failure() {
+        // Regression: `ensure_recipes_loaded` must (a) preserve stale
+        // in-memory recipe/history state when the metadata DB cannot be
+        // reached, (b) not latch `recipes_loaded=true` on such a failure,
+        // and (c) re-read successfully once the backing file becomes
+        // usable. Previously this was exercised by pointing at an open DB
+        // with missing tables; the underlying `list_recipes` helper now
+        // auto-creates its schema on first read, so we instead simulate
+        // the "can't even open the file" failure mode and then fix it.
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("search-metadata-retry.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
         let mut screen = SearchCockpitScreen::new();
-        screen.metadata_db_conn = crate::open_live_metadata_sync_db_connection(&db_url)
-            .map(Some)
-            .expect("open metadata db");
+        // No DB file on disk, no prior connection — `open_live_metadata_operation_db_connection`
+        // will short-circuit to `Err("Search metadata database unavailable")`.
+        screen.metadata_database_url = db_url.clone();
+        assert!(!db_path.exists(), "test precondition: DB file is absent");
         screen.saved_recipes = vec![SearchRecipe {
             id: Some(7),
             name: "stale recipe".to_string(),
@@ -7042,7 +7051,11 @@ mod tests {
             !screen.recipes_loaded,
             "failed metadata reads must not latch recipes_loaded=true"
         );
-        assert_eq!(screen.saved_recipes.len(), 1, "stale recipe should survive");
+        assert_eq!(
+            screen.saved_recipes.len(),
+            1,
+            "stale recipe should survive a failed open"
+        );
         assert_eq!(
             screen.saved_recipes[0].name, "stale recipe",
             "failed load must preserve stale saved recipe state"
@@ -7050,73 +7063,41 @@ mod tests {
         assert_eq!(
             screen.query_history.len(),
             1,
-            "stale history should survive"
+            "stale history should survive a failed open"
         );
         assert_eq!(
             screen.query_history[0].query_text, "stale query",
             "failed load must preserve stale query history"
         );
 
-        let recipe_id = {
-            let conn = screen
-                .metadata_db_conn
-                .as_ref()
-                .expect("metadata connection should remain available");
-            conn.execute_raw(
-                "CREATE TABLE search_recipes ( \
-                     id INTEGER PRIMARY KEY AUTOINCREMENT, \
-                     name TEXT NOT NULL, \
-                     description TEXT NOT NULL DEFAULT '', \
-                     query_text TEXT NOT NULL DEFAULT '', \
-                     doc_kind TEXT NOT NULL DEFAULT 'messages', \
-                     scope_mode TEXT NOT NULL DEFAULT 'global', \
-                     scope_id INTEGER, \
-                     importance_filter TEXT NOT NULL DEFAULT '', \
-                     ack_filter TEXT NOT NULL DEFAULT 'any', \
-                     sort_mode TEXT NOT NULL DEFAULT 'newest', \
-                     thread_filter TEXT, \
-                     created_ts INTEGER NOT NULL, \
-                     updated_ts INTEGER NOT NULL, \
-                     pinned INTEGER NOT NULL DEFAULT 0, \
-                     use_count INTEGER NOT NULL DEFAULT 0 \
-                 )",
-            )
-            .expect("create search_recipes");
-            conn.execute_raw(
-                "CREATE TABLE query_history ( \
-                     id INTEGER PRIMARY KEY AUTOINCREMENT, \
-                     query_text TEXT NOT NULL, \
-                     doc_kind TEXT NOT NULL DEFAULT 'messages', \
-                     scope_mode TEXT NOT NULL DEFAULT 'global', \
-                     scope_id INTEGER, \
-                     result_count INTEGER NOT NULL DEFAULT 0, \
-                     executed_ts INTEGER NOT NULL \
-                 )",
-            )
-            .expect("create query_history");
-
-            let recipe_id = insert_recipe(
-                conn,
-                &SearchRecipe {
-                    name: "fresh recipe".to_string(),
-                    query_text: "fresh".to_string(),
-                    updated_ts: now_micros(),
-                    created_ts: now_micros(),
-                    ..Default::default()
-                },
-            )
-            .expect("insert recipe");
-            insert_history(
-                conn,
-                &QueryHistoryEntry {
-                    query_text: "fresh query".to_string(),
-                    executed_ts: now_micros(),
-                    ..Default::default()
-                },
-            )
-            .expect("insert history");
-            recipe_id
-        };
+        // Bring the metadata DB up: create an empty file, open it, and
+        // seed it with fresh rows. `list_recipes` / `list_recent_history`
+        // self-heal the schema on first read, so we don't need to create
+        // tables explicitly — just insert via the public helpers.
+        std::fs::write(&db_path, b"").expect("create sqlite placeholder");
+        let seed_conn = crate::open_live_metadata_sync_db_connection(&db_url)
+            .expect("open seed conn after creating file");
+        let recipe_id = insert_recipe(
+            &seed_conn,
+            &SearchRecipe {
+                name: "fresh recipe".to_string(),
+                query_text: "fresh".to_string(),
+                updated_ts: now_micros(),
+                created_ts: now_micros(),
+                ..Default::default()
+            },
+        )
+        .expect("insert recipe");
+        insert_history(
+            &seed_conn,
+            &QueryHistoryEntry {
+                query_text: "fresh query".to_string(),
+                executed_ts: now_micros(),
+                ..Default::default()
+            },
+        )
+        .expect("insert history");
+        drop(seed_conn);
 
         screen.ensure_recipes_loaded();
 

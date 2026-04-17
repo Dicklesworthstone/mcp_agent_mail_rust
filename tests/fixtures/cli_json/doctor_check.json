@@ -1,145 +1,218 @@
 {
   "checks": [
     {
+      "category": "live_incident",
       "check": "database",
       "detail": "SQLite database accessible at <TMP_ROOT>/mailbox.sqlite3",
       "status": "ok"
     },
     {
+      "category": "live_incident",
       "check": "db_file_sanity",
-      "detail": "quick_check OK (290816 bytes); canonical quick_check OK",
+      "detail": "quick_check OK (430080 bytes)",
       "status": "ok"
     },
     {
+      "category": "live_incident",
       "check": "pool_init",
       "detail": "Database reopen probe OK (doctor check kept non-mutating)",
       "status": "ok"
     },
     {
+      "category": "live_incident",
       "check": "foreign_key_integrity",
       "detail": "No foreign key violations detected",
       "status": "ok"
     },
     {
+      "category": "archive_hygiene",
       "check": "storage_root",
       "detail": "<TMP_ROOT>/storage_root",
       "status": "warn"
     },
     {
+      "category": "live_incident",
       "check": "storage_root_writable",
       "detail": "Skipped: storage root missing",
       "status": "warn"
     },
     {
+      "category": "live_incident",
       "check": "archive_db_parity",
       "detail": "Skipped: storage root missing",
       "status": "warn"
     },
     {
+      "category": "archive_hygiene",
       "check": "storage_root_disk_space",
       "detail": "Skipped: storage root missing",
       "status": "warn"
     },
     {
+      "category": "archive_hygiene",
       "check": "storage_root_git_repo",
       "detail": "Skipped: storage root missing",
       "status": "warn"
     },
     {
+      "category": "archive_hygiene",
       "check": "storage_root_git_index_lock",
       "detail": "Skipped: storage root missing",
       "status": "warn"
     },
     {
+      "category": "environment",
       "check": "guard_hooks",
       "detail": "Missing hooks (pre-commit=false, pre-push=false) in <TMP_ROOT>/doctor_repo/.git/hooks",
       "status": "warn"
     },
     {
+      "category": "environment",
       "check": "installed_agents",
       "detail": "<INSTALLED_AGENTS_SUMMARY>",
       "status": "ok"
     },
     {
+      "category": "environment",
       "check": "binary_resolution",
       "detail": "'am' resolves to <TMP_ROOT>/home/.local/bin/am (zsh)",
       "status": "ok"
     },
     {
+      "category": "environment",
       "check": "legacy_python_alias",
       "detail": "No legacy Python `alias am=...` entries found in shell rc files",
       "status": "ok"
     },
     {
+      "category": "environment",
       "check": "stale_python_processes",
       "detail": "No legacy mcp_agent_mail Python processes detected",
       "status": "ok"
     },
     {
+      "category": "environment",
       "check": "path_order",
       "detail": "<TMP_ROOT>/home/.local/bin in PATH at position 1 of 4",
       "status": "ok"
     },
     {
+      "category": "environment",
       "check": "binary_version",
-      "detail": "am 0.2.28 (expected v0.2.28)",
+      "detail": "am 0.2.42 (expected v0.2.42)",
       "status": "ok"
     },
     {
+      "category": "environment",
       "check": "mcp_config",
       "detail": "No MCP config files found. Run `am setup` to configure agent tools",
       "status": "warn"
     },
     {
+      "category": "environment",
       "check": "update_available",
       "detail": "No recent update-check cache. Run `am self-update --check`",
       "status": "warn"
     },
     {
+      "category": "live_incident",
       "check": "server_port",
       "detail": "<SERVER_PORT_SUMMARY>",
       "status": "warn"
     },
     {
+      "category": "live_incident",
       "check": "server_http_health",
       "detail": "<SERVER_HTTP_HEALTH_SUMMARY>",
       "status": "warn"
     },
     {
+      "category": "live_incident",
       "check": "server_jsonrpc_health",
       "detail": "<SERVER_JSONRPC_HEALTH_SUMMARY>",
       "status": "warn"
     },
     {
+      "category": "live_incident",
       "check": "server_process_cpu",
       "detail": "<SERVER_PROCESS_CPU_SUMMARY>",
       "status": "warn"
     },
     {
+      "category": "environment",
       "check": "timestamp_format",
       "detail": "i64 microseconds (Rust native)",
       "status": "ok"
     },
     {
+      "category": "environment",
       "check": "wal_mode",
-      "detail": "WAL mode enabled",
-      "status": "ok"
+      "detail": "WAL mode not enabled. Fix: run `am migrate` or restart the server",
+      "status": "warn"
     },
     {
+      "category": "environment",
       "check": "schema_version",
       "detail": "user_version = 0",
       "status": "warn"
     },
     {
+      "category": "environment",
       "check": "fts5",
-      "detail": "No FTS5 virtual tables found",
-      "status": "warn"
+      "detail": "No legacy SQLite FTS5 tables found (expected; Search V3/Tantivy is authoritative)",
+      "status": "ok"
     },
     {
+      "category": "environment",
       "check": "beads_issue_awareness",
       "detail": "<BEADS_ISSUE_AWARENESS_SUMMARY>",
       "status": "warn"
     }
   ],
-  "healthy": true
+  "diagnostic_payload": {
+    "artifacts": [
+      {
+        "detail": "bytes=430080",
+        "kind": "sqlite_db",
+        "label": "SQLite database",
+        "path": "<TMP_ROOT>/mailbox.sqlite3",
+        "status": "referenced"
+      }
+    ],
+    "finding_counts": {
+      "critical": 0,
+      "info": 0,
+      "total": 16,
+      "warning": 16
+    },
+    "generated_at": "<GENERATED_AT>",
+    "headline": "All doctor checks passed.",
+    "next_action": "Run `am doctor fix --dry-run` to preview remediation.",
+    "schema": {
+      "major": 1,
+      "minor": 0,
+      "name": "mcp-agent-mail-diagnostic-payload"
+    },
+    "source": "doctor-check",
+    "status": "warn"
+  },
+  "healthy": true,
+  "summary": {
+    "archive_hygiene": null,
+    "category_breakdown": {
+      "archive_hygiene_findings": 4,
+      "environment_findings": 6,
+      "live_incident_findings": 6
+    },
+    "overall_status": "warn",
+    "primary_issue": {
+      "check": "storage_root_writable",
+      "class": "live_mailbox_incident",
+      "detail": "Skipped: storage root missing",
+      "next_action": "No database repair action is currently recommended.",
+      "status": "warn"
+    },
+    "secondary_fail_count": 0,
+    "secondary_warning_count": 15
+  }
 }

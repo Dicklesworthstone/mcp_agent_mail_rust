@@ -19098,6 +19098,7 @@ first body
         let config = mcp_agent_mail_core::Config {
             http_request_log_enabled: true,
             log_json_enabled: false,
+            log_rich_enabled: false,
             ..Default::default()
         };
         let state = build_state(config);
@@ -19145,6 +19146,7 @@ first body
         let config = mcp_agent_mail_core::Config {
             http_request_log_enabled: true,
             log_json_enabled: true,
+            log_rich_enabled: false,
             http_otel_enabled: true,
             http_otel_service_name: "mcp-agent-mail-test".to_string(),
             http_otel_exporter_otlp_endpoint: "http://127.0.0.1:4318".to_string(),
@@ -20658,6 +20660,7 @@ first body
         let config = mcp_agent_mail_core::Config {
             http_request_log_enabled: true,
             log_json_enabled: true,
+            log_rich_enabled: false,
             http_otel_enabled: true,
             http_otel_service_name: "test-service".to_string(),
             http_otel_exporter_otlp_endpoint: "http://127.0.0.1:4318".to_string(),
@@ -20831,6 +20834,7 @@ first body
         let config = mcp_agent_mail_core::Config {
             http_request_log_enabled: true,
             log_json_enabled: false,
+            log_rich_enabled: false,
             ..Default::default()
         };
         let state = build_state(config);
@@ -25221,11 +25225,24 @@ first body
             runtime
                 .handle()
                 .try_spawn(async move {
-                    while task_shutdown.phase()
-                        != asupersync::server::shutdown::ShutdownPhase::ForceClosing
-                    {
-                        sleep(wall_now(), Duration::from_millis(10)).await;
-                    }
+                    // Use the notification-based `wait_for_phase` API
+                    // instead of a polling sleep loop. A 10ms sleep loop
+                    // here was brittle in two ways: (a) the reactor can
+                    // schedule the sleep wake-up later than expected
+                    // under load, stretching the drain window past the
+                    // test's timeout, and (b) the task could miss the
+                    // `ForceClosing` transition if it happened to be
+                    // asleep when the signal fired and the phase later
+                    // moved on to `Stopped`. `wait_for_phase` is a
+                    // direct, deterministic wake-up on the same atomic
+                    // that `begin_force_close` flips, so the task exits
+                    // on the first scheduler tick after force-close is
+                    // requested.
+                    task_shutdown
+                        .wait_for_phase(
+                            asupersync::server::shutdown::ShutdownPhase::ForceClosing,
+                        )
+                        .await;
                     Ok::<(), std::io::Error>(())
                 })
                 .expect("spawn force-close aware task"),
@@ -25235,9 +25252,9 @@ first body
         runtime.block_on(async {
             stop_http_server_instance_with_timeouts(
                 instance,
-                Duration::from_millis(50),
-                Duration::from_millis(250),
-                Duration::from_millis(50),
+                Duration::from_millis(200),
+                Duration::from_secs(1),
+                Duration::from_millis(200),
             )
             .await
             .expect("force-close should unblock shutdown");

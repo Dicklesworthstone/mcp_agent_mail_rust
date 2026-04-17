@@ -1020,6 +1020,11 @@ fn restore_missing_detail_lists_from_previous(
         &previous.agents_list,
         sqlite_path,
     );
+    restore_missing_agent_fields_from_previous(
+        &mut snapshot.agents_list,
+        &previous.agents_list,
+        sqlite_path,
+    );
     maybe_reuse_previous_detail_list(
         "projects",
         snapshot.projects,
@@ -1036,6 +1041,50 @@ fn restore_missing_detail_lists_from_previous(
         &previous.contacts_list,
         sqlite_path,
     );
+}
+
+/// Patch per-row holes in `current_agents` by looking up the matching agent
+/// in `previous_agents` by name. This handles the case where the batched
+/// fetch lands intact (same row count, same identities) but an individual
+/// column came back NULL/empty because of a concurrent writer race or a
+/// planner-specific truncation path. Without this, the TUI would regress
+/// "RedStone/claude" to "RedStone/" the instant the poller sampled mid-write.
+fn restore_missing_agent_fields_from_previous(
+    current_agents: &mut [AgentSummary],
+    previous_agents: &[AgentSummary],
+    sqlite_path: Option<&str>,
+) {
+    if current_agents.is_empty() || previous_agents.is_empty() {
+        return;
+    }
+    let mut patched = 0_usize;
+    for agent in current_agents.iter_mut() {
+        if agent.name.is_empty() {
+            continue;
+        }
+        if !agent.program.is_empty() && agent.last_active_ts != 0 {
+            continue;
+        }
+        let Some(prev) = previous_agents.iter().find(|prev| prev.name == agent.name)
+        else {
+            continue;
+        };
+        if agent.program.is_empty() && !prev.program.is_empty() {
+            agent.program.clone_from(&prev.program);
+            patched = patched.saturating_add(1);
+        }
+        if agent.last_active_ts == 0 && prev.last_active_ts != 0 {
+            agent.last_active_ts = prev.last_active_ts;
+            patched = patched.saturating_add(1);
+        }
+    }
+    if patched > 0 {
+        tracing::warn!(
+            path = sqlite_path.unwrap_or("<unknown>"),
+            patched_fields = patched,
+            "tui poller backfilled empty agent fields from previous snapshot"
+        );
+    }
 }
 
 fn unique_previous_project_summary<F>(
@@ -1135,6 +1184,19 @@ fn restore_missing_contact_rows_from_previous(
     if snapshot.contacts_list.is_empty() || previous.contacts_list.is_empty() {
         return;
     }
+
+    // Row-level repair: even if the snapshot row count matches, individual
+    // contacts may come back with `[unknown-project-N]` placeholders when a
+    // concurrent project delete/rename races the join-backfill.  Use the
+    // previous snapshot to restore the real slug on a per-(from_agent,
+    // to_agent, from_project_slug) basis.  This is before the whole-list
+    // truncation path so preservation happens even when list sizes match.
+    restore_missing_contact_project_slugs_from_previous(
+        &mut snapshot.contacts_list,
+        &previous.contacts_list,
+        sqlite_path,
+    );
+
     if snapshot.contact_links == 0 || snapshot.contact_links > MAX_CONTACTS as u64 {
         return;
     }
@@ -1154,6 +1216,53 @@ fn restore_missing_contact_rows_from_previous(
         expected_rows,
         "tui poller contacts list came back partially truncated while summary count stayed within the uncapped window; preserving previous contact rows"
     );
+}
+
+/// Swap `[unknown-project-N]` placeholder slugs back to the real slug from
+/// the previous snapshot. Matches contacts by the stable identity fields
+/// (`from_agent`, `to_agent`, `from_project_slug`) so we only patch rows
+/// that clearly correspond to the same link — a genuinely different
+/// project shows up as a different `from_project_slug` and is left alone.
+fn restore_missing_contact_project_slugs_from_previous(
+    current_contacts: &mut [ContactSummary],
+    previous_contacts: &[ContactSummary],
+    sqlite_path: Option<&str>,
+) {
+    let mut patched = 0_usize;
+    for contact in current_contacts.iter_mut() {
+        let to_placeholder = contact.to_project_slug.starts_with("[unknown-project-");
+        let from_placeholder = contact.from_project_slug.starts_with("[unknown-project-");
+        if !to_placeholder && !from_placeholder {
+            continue;
+        }
+        // Match on identity fields that shouldn't change across polls:
+        // from_agent + to_agent, plus the non-placeholder project slug
+        // when available (to avoid collapsing a pair that genuinely lives
+        // across two projects).
+        let Some(prev) = previous_contacts.iter().find(|prev| {
+            prev.from_agent == contact.from_agent
+                && prev.to_agent == contact.to_agent
+                && (from_placeholder || prev.from_project_slug == contact.from_project_slug)
+                && (to_placeholder || prev.to_project_slug == contact.to_project_slug)
+        }) else {
+            continue;
+        };
+        if to_placeholder && !prev.to_project_slug.starts_with("[unknown-project-") {
+            contact.to_project_slug.clone_from(&prev.to_project_slug);
+            patched = patched.saturating_add(1);
+        }
+        if from_placeholder && !prev.from_project_slug.starts_with("[unknown-project-") {
+            contact.from_project_slug.clone_from(&prev.from_project_slug);
+            patched = patched.saturating_add(1);
+        }
+    }
+    if patched > 0 {
+        tracing::warn!(
+            path = sqlite_path.unwrap_or("<unknown>"),
+            patched_slugs = patched,
+            "tui poller repaired `[unknown-project-*]` placeholder slugs in contacts list from previous snapshot"
+        );
+    }
 }
 
 fn refill_missing_detail_lists_from_sqlite(

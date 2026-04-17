@@ -2121,7 +2121,16 @@ mod tests {
     }
 
     #[test]
-    fn screen_diagnostics_panic_on_silent_false_empty_without_filter() {
+    fn screen_diagnostics_warn_on_silent_false_empty_without_filter() {
+        // `assert_screen_truth` used to panic on a silent "false empty"
+        // (raw rows present, rendered 0, no active user filter), but that
+        // tripled the blast radius of any transient poller/render race
+        // into a full TUI crash. The function now downgrades that signal
+        // to a `tracing::warn!` so operators still see the alert without
+        // killing the process. This test guards that downgrade — pushing
+        // a false-empty diagnostic must NOT panic. Silent-false-empty
+        // detection itself is exercised by
+        // `query_params_explain_empty_state` unit tests.
         let state = TuiSharedState::new(&Config::default());
         let mut snapshot = sample_screen_diag("agents");
         snapshot.query_params = r#"filter="";sort_col=name;sort_asc=true"#.to_string();
@@ -2132,7 +2141,10 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             state.push_screen_diagnostic(snapshot);
         }));
-        assert!(result.is_err(), "expected truth assertion to panic");
+        assert!(
+            result.is_ok(),
+            "truth assertion must stay non-fatal to avoid crashing the TUI on transient poller/render races"
+        );
     }
 
     #[test]
@@ -2170,7 +2182,12 @@ mod tests {
     }
 
     #[test]
-    fn screen_diagnostics_panic_when_filter_is_all() {
+    fn screen_diagnostics_warn_when_filter_is_all() {
+        // `filter=all` is a permissive filter and MUST NOT suppress the
+        // false-empty warning in `query_params_explain_empty_state`. The
+        // truth assertion is now a `tracing::warn!` (see
+        // `screen_diagnostics_warn_on_silent_false_empty_without_filter`
+        // for the rationale), so the call-through must stay non-fatal.
         let state = TuiSharedState::new(&Config::default());
         let mut snapshot = sample_screen_diag("agents");
         snapshot.query_params = "filter=all;sort_col=name;sort_asc=true".to_string();
@@ -2182,16 +2199,28 @@ mod tests {
             state.push_screen_diagnostic(snapshot);
         }));
         assert!(
-            result.is_err(),
-            "filter=all should not suppress truth assertion"
+            result.is_ok(),
+            "filter=all must trigger the warn path, not a panic"
         );
+        // Verify the filter=all case is still classified as non-explanatory
+        // so the warn branch actually fires.
+        assert!(!query_params_explain_empty_state(
+            "filter=all;sort_col=name;sort_asc=true"
+        ));
     }
 
     #[test]
-    fn screen_diagnostics_panic_for_messages_global_all_signature() {
+    fn screen_diagnostics_warn_for_messages_global_all_signature() {
+        // Same contract as `screen_diagnostics_warn_when_filter_is_all`,
+        // specialized to the exact query-params shape the messages screen
+        // produces in Global/All mode. This used to assert that pushing
+        // the diagnostic panics; the assertion was downgraded to a warn,
+        // so we instead guard that the call stays non-fatal AND that the
+        // signature is still classified as "not explanatory".
         let state = TuiSharedState::new(&Config::default());
+        let query_params = "raw=4;rendered=0;filter=all;mode=global;project=all;method=LocalCache;live_added=0;total_results=4".to_string();
         let mut snapshot = sample_screen_diag("messages");
-        snapshot.query_params = "raw=4;rendered=0;filter=all;mode=global;project=all;method=LocalCache;live_added=0;total_results=4".to_string();
+        snapshot.query_params.clone_from(&query_params);
         snapshot.raw_count = 4;
         snapshot.rendered_count = 0;
         snapshot.dropped_count = 4;
@@ -2200,9 +2229,10 @@ mod tests {
             state.push_screen_diagnostic(snapshot);
         }));
         assert!(
-            result.is_err(),
-            "messages global/all signature should not suppress truth assertion"
+            result.is_ok(),
+            "messages global/all must trigger the warn path, not a panic"
         );
+        assert!(!query_params_explain_empty_state(&query_params));
     }
 
     #[test]
@@ -2845,9 +2875,14 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "truth_assertion")]
-    fn e8_truth_assertion_catches_false_empty() {
-        // raw=10, rendered=0, no filter → PANIC (false-empty state)
+    fn e8_truth_assertion_is_nonfatal_on_false_empty() {
+        // Historically this test asserted that `assert_screen_truth`
+        // panics on a false-empty state (raw > 0, rendered == 0, no
+        // filter). The assertion was intentionally downgraded to
+        // `tracing::warn!` (see `screen_diagnostics_warn_on_silent_false_empty_without_filter`)
+        // because a panic here took the whole TUI process down on a
+        // transient poller/render race. Re-assert the non-fatal contract
+        // directly so any future regression that flips it back would trip this test.
         let snap = ScreenDiagnosticSnapshot {
             screen: "test".into(),
             scope: "test".into(),
@@ -2861,6 +2896,12 @@ mod tests {
             transport_mode: String::new(),
             auth_enabled: false,
         };
-        super::assert_screen_truth(&snap);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::assert_screen_truth(&snap);
+        }));
+        assert!(
+            result.is_ok(),
+            "assert_screen_truth must stay non-fatal to avoid crashing the TUI on transient races"
+        );
     }
 }

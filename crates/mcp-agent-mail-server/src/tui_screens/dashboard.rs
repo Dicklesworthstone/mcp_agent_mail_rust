@@ -949,9 +949,16 @@ impl DashboardScreen {
     fn should_render_bottom_rail(
         quick_query: &str,
         preview: Option<&RecentMessagePreview>,
-        force_dense_surface: bool,
+        _force_dense_surface: bool,
     ) -> bool {
-        !quick_query.trim().is_empty() || preview.is_some() || force_dense_surface
+        // `force_dense_surface` is intentionally ignored: a wide/dense
+        // terminal surface on its own is not a reason to reserve the
+        // bottom rail — doing so leaves an empty panel taking vertical
+        // space away from the primary event log when the user has no
+        // query and no recent preview. Visibility must be driven by
+        // actual content only. See
+        // `bottom_rail_requires_query_or_preview_even_on_dense_surface`.
+        !quick_query.trim().is_empty() || preview.is_some()
     }
 
     /// Build the `ReactiveLayout` for the main content area.

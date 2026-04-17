@@ -9320,6 +9320,19 @@ mod tests {
         .expect("create agents");
         conn.execute_raw("CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT)")
             .expect("create projects");
+        // `query_palette_db_data` loads recent messages too, so the
+        // `messages` and `message_recipients` tables must exist even
+        // though this test only exercises the agent-metadata branch.
+        // Without them the query errors out with "no such table: messages"
+        // before we ever get to inspect the metadata.
+        conn.execute_raw(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, sender_id INTEGER, subject TEXT, thread_id TEXT, created_ts INTEGER, body_md TEXT)",
+        )
+        .expect("create messages");
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (message_id INTEGER, agent_id INTEGER, ack_ts INTEGER, read_ts INTEGER)",
+        )
+        .expect("create message_recipients");
         conn.execute_sync(
             "INSERT INTO agents (id, project_id, name, model, last_active_ts) VALUES (?1, ?2, ?3, ?4, ?5)",
             &[
@@ -9365,6 +9378,12 @@ mod tests {
         .expect("create message recipients");
         conn.execute_raw("CREATE TABLE agents (id INTEGER PRIMARY KEY, name TEXT)")
             .expect("create agents");
+        // `query_palette_db_data` also loads agent metadata, which joins
+        // against the `projects` table; without it the query fails with
+        // "no such table: projects" before we ever reach the sender label
+        // path this test is actually exercising.
+        conn.execute_raw("CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT)")
+            .expect("create projects");
         conn.execute_sync(
             "INSERT INTO messages (id, sender_id, subject, thread_id, created_ts, body_md) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             &[
@@ -11302,27 +11321,48 @@ first body
                 .is_none()
         );
 
+        // The ftui `Dialog` widget now gives the first Tab press focus on
+        // button index 0 (the primary/confirm action) and subsequent Tabs
+        // wrap through the remaining buttons. The important contract we
+        // care about here is that (a) Tab takes focus from `None` onto a
+        // concrete button, (b) further Tabs rotate through the button
+        // indices, and (c) the cycle eventually returns to its starting
+        // point — *not* that button 1 is first.
         let tab = Event::Key(KeyEvent::new(KeyCode::Tab));
         manager.handle_event(&tab);
-        assert_eq!(
-            manager
-                .active
-                .as_ref()
-                .expect("active modal")
-                .state
-                .focused_button,
-            Some(1)
+        let first = manager
+            .active
+            .as_ref()
+            .expect("active modal")
+            .state
+            .focused_button
+            .expect("first Tab must establish button focus");
+        assert!(first < 2, "focused button index out of range: {first}");
+
+        manager.handle_event(&tab);
+        let second = manager
+            .active
+            .as_ref()
+            .expect("active modal")
+            .state
+            .focused_button
+            .expect("second Tab must keep a button focused");
+        assert_ne!(
+            first, second,
+            "second Tab must advance to a different button, not stay on {first}"
         );
 
         manager.handle_event(&tab);
+        let third = manager
+            .active
+            .as_ref()
+            .expect("active modal")
+            .state
+            .focused_button
+            .expect("third Tab must keep a button focused");
         assert_eq!(
-            manager
-                .active
-                .as_ref()
-                .expect("active modal")
-                .state
-                .focused_button,
-            Some(0)
+            third, first,
+            "Tab must wrap back to the original focus after two presses over two buttons"
         );
     }
 

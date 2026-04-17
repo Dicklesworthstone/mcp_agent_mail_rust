@@ -3847,11 +3847,11 @@ fn map_planned_rows(rows: Vec<sqlmodel_core::Row>, doc_kind: DocKind) -> Vec<Sea
             .into_iter()
             .map(|row| SearchResult {
                 doc_kind,
-                id: row.get_as::<i64>(0).unwrap_or(0),
+                id: row.get(0).and_then(crate::queries::value_as_i64).unwrap_or(0),
                 title: row.get_as::<String>(1).unwrap_or_default(),
                 importance: Some(row.get_as::<String>(2).unwrap_or_default()),
-                ack_required: Some(row.get_as::<i64>(3).unwrap_or(0) != 0),
-                created_ts: Some(row.get_as::<i64>(4).unwrap_or(0)),
+                ack_required: Some(row.get(3).and_then(crate::queries::value_as_i64).unwrap_or(0) != 0),
+                created_ts: Some(row.get(4).and_then(crate::queries::value_as_i64).unwrap_or(0)),
                 thread_id: row.get_as::<Option<String>>(5).unwrap_or_default(),
                 from_agent: Some(
                     row.get_as::<String>(6)
@@ -3861,9 +3861,9 @@ fn map_planned_rows(rows: Vec<sqlmodel_core::Row>, doc_kind: DocKind) -> Vec<Sea
                 )
                 .filter(|value| !value.is_empty())
                 .or_else(|| Some(UNKNOWN_SENDER_DISPLAY.to_string())),
-                from_agent_id: row.get_as::<Option<i64>>(7).unwrap_or_default(),
+                from_agent_id: row.get(7).and_then(crate::queries::value_as_i64),
                 body: row.get_as::<String>(8).unwrap_or_default(),
-                project_id: Some(row.get_as::<i64>(9).unwrap_or(0)),
+                project_id: Some(row.get(9).and_then(crate::queries::value_as_i64).unwrap_or(0)),
                 score: Some(row.get_as::<f64>(10).unwrap_or(0.0)),
                 ..SearchResult::default()
             })

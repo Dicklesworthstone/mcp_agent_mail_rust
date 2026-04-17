@@ -708,7 +708,7 @@ fn decode_agent_row_indexed(row: &SqlRow) -> AgentRow {
 }
 
 #[allow(clippy::cast_possible_truncation)]
-fn value_as_i64(value: &Value) -> Option<i64> {
+pub(crate) fn value_as_i64(value: &Value) -> Option<i64> {
     match value {
         Value::BigInt(n) => Some(*n),
         Value::Int(n) => Some(i64::from(*n)),
@@ -4382,17 +4382,30 @@ pub async fn get_messages_details_by_ids(
         match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
             Outcome::Ok(rows) => {
                 for row in rows {
-                    let id: i64 = match row.get_as(0) {
-                        Ok(v) => v,
-                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    let get_i64 = |idx: usize| -> std::result::Result<i64, DbError> {
+                        match row.get_as(idx) {
+                            Ok(v) => Ok(v),
+                            Err(e) => {
+                                if let Some(v) = row.get(idx) {
+                                    value_as_i64(v).ok_or_else(|| map_sql_error(&e))
+                                } else {
+                                    Err(map_sql_error(&e))
+                                }
+                            }
+                        }
                     };
-                    let project_id: i64 = match row.get_as(1) {
+
+                    let id: i64 = match get_i64(0) {
                         Ok(v) => v,
-                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                        Err(e) => return Outcome::Err(e),
                     };
-                    let sender_id: i64 = match row.get_as(2) {
+                    let project_id: i64 = match get_i64(1) {
                         Ok(v) => v,
-                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                        Err(e) => return Outcome::Err(e),
+                    };
+                    let sender_id: i64 = match get_i64(2) {
+                        Ok(v) => v,
+                        Err(e) => return Outcome::Err(e),
                     };
                     let thread_id: Option<String> = match row.get_as(3) {
                         Ok(v) => v,
@@ -4410,13 +4423,13 @@ pub async fn get_messages_details_by_ids(
                         Ok(v) => v,
                         Err(e) => return Outcome::Err(map_sql_error(&e)),
                     };
-                    let ack_required: i64 = match row.get_as(7) {
+                    let ack_required: i64 = match get_i64(7) {
                         Ok(v) => v,
-                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                        Err(e) => return Outcome::Err(e),
                     };
-                    let created_ts: i64 = match row.get_as(8) {
+                    let created_ts: i64 = match get_i64(8) {
                         Ok(v) => v,
-                        Err(e) => return Outcome::Err(map_sql_error(&e)),
+                        Err(e) => return Outcome::Err(e),
                     };
                     let recipients: String = match row.get_as::<Option<String>>(9) {
                         Ok(v) => v.unwrap_or_else(|| "{}".to_string()),
@@ -5612,11 +5625,20 @@ pub async fn search_messages_for_product(
                 // created_ts(5), thread_id(6), from_name(7), body_md(8), project_id(9)
                 let id: i64 = match row.get_named("id") {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(_) => match row.get_as(0) {
+                        Ok(v) => v,
+                        Err(_) => match row.get(0) {
+                            Some(v) => value_as_i64(v).unwrap_or(0),
+                            None => 0,
+                        },
+                    },
                 };
                 let sender_id: i64 = match row.get_as(1) {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(_) => match row.get(1) {
+                        Some(v) => value_as_i64(v).unwrap_or(0),
+                        None => 0,
+                    }
                 };
                 let subject: String = match row.get_named("subject") {
                     Ok(v) => v,
@@ -5628,11 +5650,23 @@ pub async fn search_messages_for_product(
                 };
                 let ack_required: i64 = match row.get_named("ack_required") {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(_) => match row.get_by_name("ack_required") {
+                        Some(v) => value_as_i64(v).unwrap_or(0),
+                        None => 0,
+                    }
                 };
                 let created_ts: i64 = match row.get_named("created_ts") {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(_) => match row.get_by_name("created_ts") {
+                        Some(val) => value_as_i64(val).unwrap_or(0),
+                        None => match row.get_as(5) {
+                            Ok(v) => v,
+                            Err(_) => match row.get(5) {
+                                Some(val) => value_as_i64(val).unwrap_or(0),
+                                None => 0,
+                            }
+                        }
+                    }
                 };
                 let thread_id: Option<String> = match row.get_named("thread_id") {
                     Ok(v) => v,
@@ -5645,7 +5679,10 @@ pub async fn search_messages_for_product(
                 let body_md: String = row.get_as(8).unwrap_or_default();
                 let project_id: i64 = match row.get_as(9) {
                     Ok(v) => v,
-                    Err(e) => return Outcome::Err(map_sql_error(&e)),
+                    Err(_) => match row.get(9) {
+                        Some(v) => value_as_i64(v).unwrap_or(0),
+                        None => 0,
+                    }
                 };
 
                 out.push(SearchRowWithProject {
@@ -8552,7 +8589,7 @@ pub async fn get_product_by_key(cx: &Cx, pool: &DbPool, key: &str) -> Outcome<Pr
                 return Outcome::Err(DbError::not_found("Product", key));
             };
 
-            let placeholder_sql = "SELECT COALESCE(MIN(created_at), 0) AS created_at \
+            let placeholder_sql = "SELECT CAST(COALESCE(MIN(created_at), 0) AS INTEGER) AS created_at \
                                    FROM product_project_links WHERE product_id = ?";
             let placeholder_params = [Value::BigInt(product_id)];
 
@@ -8688,7 +8725,7 @@ pub async fn list_product_projects(
     let sql = "SELECT ppl.project_id AS id, \
                       COALESCE(NULLIF(TRIM(p.slug), ''), '[unknown-project-' || ppl.project_id || ']') AS slug, \
                       COALESCE(NULLIF(TRIM(p.human_key), ''), '[unknown-project-' || ppl.project_id || ']') AS human_key, \
-                      COALESCE(p.created_at, ppl.created_at) AS created_at \
+                      CAST(COALESCE(p.created_at, ppl.created_at) AS INTEGER) AS created_at \
                FROM product_project_links ppl \
                LEFT JOIN projects p ON p.id = ppl.project_id \
                WHERE ppl.product_id = ?";

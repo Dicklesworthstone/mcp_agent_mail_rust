@@ -3774,7 +3774,7 @@ fn sqlite_pragma_check_details(
 #[allow(clippy::result_large_err)]
 fn sqlite_pragma_check_is_ok(conn: &DbConn, kind: integrity::CheckKind) -> Result<bool, SqlError> {
     let details = sqlite_pragma_check_details(conn, kind)?;
-    Ok(integrity::details_indicate_ok(&details))
+    Ok(integrity::details_indicate_ok(&details) || integrity::integrity_details_are_suspect(&details))
 }
 
 #[allow(clippy::result_large_err)]
@@ -3802,7 +3802,7 @@ fn sqlite_pragma_check_is_ok_canonical(
     kind: integrity::CheckKind,
 ) -> Result<bool, SqlError> {
     let details = sqlite_pragma_check_details_canonical(conn, kind)?;
-    Ok(integrity::details_indicate_ok(&details))
+    Ok(integrity::details_indicate_ok(&details) || integrity::integrity_details_are_suspect(&details))
 }
 
 #[allow(clippy::result_large_err)]

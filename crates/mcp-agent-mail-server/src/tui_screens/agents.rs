@@ -315,7 +315,17 @@ fn enrich_lossy_agent_summary_rows_from_previous(
     }
 
     for row in rows {
-        if !row.project.is_empty() {
+        // A row qualifies as "lossy" when the project is either empty or
+        // a synthetic `[unknown-project-N]` placeholder — the latter is
+        // what `recover_agent_rows_from_sqlite` emits when the agent row
+        // references a project_id that doesn't resolve (e.g. because the
+        // `projects` table is lagging the `agents` table, or the project
+        // was just deleted). Without the placeholder check this function
+        // skips rows that still carry the placeholder string and the TUI
+        // regresses a previously-correct "alpha" project back to
+        // "[unknown-project-99]" on every subsequent rebuild.
+        let project_is_placeholder = row.project.starts_with("[unknown-project-");
+        if !row.project.is_empty() && !project_is_placeholder {
             continue;
         }
         let previous = unique_previous_agent_row(previous_rows, |candidate| {
@@ -334,8 +344,17 @@ fn enrich_lossy_agent_summary_rows_from_previous(
         let Some(previous) = previous else {
             continue;
         };
-        row.identity = previous.identity.clone();
-        row.project = previous.project.clone();
+        // Only restore from previous when its project is actually real;
+        // otherwise we'd just swap one placeholder for another.
+        let previous_project_is_placeholder =
+            previous.project.starts_with("[unknown-project-");
+        if !previous.project.is_empty() && !previous_project_is_placeholder {
+            row.identity = previous.identity.clone();
+            row.project = previous.project.clone();
+        } else if row.project.is_empty() {
+            row.identity = previous.identity.clone();
+            row.project = previous.project.clone();
+        }
         if row.model.is_empty() {
             row.model = previous.model.clone();
         }
@@ -2372,7 +2391,14 @@ mod tests {
         });
         let mut screen = AgentsScreen::new();
 
-        screen.tick(1, &state);
+        // Tick past the startup grace window (POLLER_DB_GRACE_TICKS = 30)
+        // so the banner suppression during early boot does not hide the
+        // "waiting for first snapshot" signal. Use a non-multiple-of-10
+        // tick so `rebuild_from_state` (which would bump
+        // `applied_db_stats_gen` and silence the banner) does not fire —
+        // we specifically want to observe the "available in state but
+        // not yet applied to screen" window.
+        screen.tick(31, &state);
 
         assert!(screen.db_context_unavailable);
         assert_eq!(

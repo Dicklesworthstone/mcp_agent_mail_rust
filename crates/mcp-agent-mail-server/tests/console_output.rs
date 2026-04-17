@@ -33,7 +33,7 @@ fn startup_banner_sections_present_after_normalization() {
     assert!(joined.contains("Web UI:"));
     assert!(joined.contains("Tool logs:"));
     assert!(joined.contains("Tool panels:"));
-    assert!(joined.contains("Stats:"));
+    assert!(joined.contains("Database Statistics"));
 
     // Ensure banner sanitization is applied (userinfo password redaction).
     assert!(joined.contains("postgres://user:<redacted>@localhost/db"));
