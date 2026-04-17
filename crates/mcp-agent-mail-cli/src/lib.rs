@@ -47607,10 +47607,12 @@ fn fetch_mail_inbox_direct_with_database_url(
             "thread_id": row.message.thread_id.clone(),
         });
         if include_bodies {
-            value.as_object_mut().unwrap().insert(
-                "body_md".to_string(),
-                serde_json::Value::String(row.message.body_md.clone()),
-            );
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "body_md".to_string(),
+                    serde_json::Value::String(row.message.body_md.clone()),
+                );
+            }
         }
         data.push(value);
     }
