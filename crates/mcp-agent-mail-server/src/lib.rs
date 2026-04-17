@@ -14339,7 +14339,14 @@ first body
     }
 
     #[test]
-    fn conflict_reservation_resolution_updates_file_backed_mailboxes() {
+    fn conflict_reservation_resolution_is_noop_on_file_backed_mailboxes() {
+        // Mirrors `capture_atc_execution_result_is_noop_on_file_backed_mailboxes`:
+        // `resolve_conflict_experiences_on_reservation_event` also checks
+        // `atc_durable_experience_store_writable`, which is gated off for
+        // file-backed pools while ATC state migrates to an isolated store.
+        // The pre-existing open experience must therefore remain visible
+        // instead of being transitioned to `Resolved`. When the gate flips,
+        // restore the resolution assertion.
         let cx = Cx::for_testing();
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("conflict-resolution-file-backed.db");
@@ -14351,6 +14358,12 @@ first body
             ..Default::default()
         })
         .expect("create file-backed pool");
+
+        assert!(
+            !atc_durable_experience_store_writable(&pool),
+            "file-backed ATC writes are intentionally gated off right now; \
+             if this assert flips, re-enable the resolution assertion below",
+        );
 
         let row = ExperienceRow {
             experience_id: 0,
@@ -14400,6 +14413,9 @@ first body
             serde_json::json!({ "signal": "grant" }),
         );
 
+        // The resolution is gated off, so the Executed experience is still
+        // visible to `fetch_open_atc_experiences` (which filters to
+        // `executed`/`open`) — that is the no-op contract.
         let remaining = block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
             &cx,
             &pool,
@@ -14408,14 +14424,26 @@ first body
         ))
         .into_result()
         .expect("fetch remaining open experiences");
-        assert!(
-            remaining.is_empty(),
-            "file-backed ATC experiences should resolve once the reservation conflict clears"
+        assert_eq!(
+            remaining.len(),
+            1,
+            "file-backed resolve must stay a no-op while the gate is off; got {remaining:?}",
         );
+        assert_eq!(remaining[0].state, ExperienceState::Executed);
     }
 
     #[test]
-    fn capture_atc_execution_result_updates_file_backed_mailboxes() {
+    fn capture_atc_execution_result_is_noop_on_file_backed_mailboxes() {
+        // File-backed ATC writes are currently disabled by
+        // `atc_durable_experience_store_writable`, which now returns true
+        // only for `:memory:` pools while the ATC state migration to an
+        // isolated canonical store is in flight. Verify that
+        // `capture_atc_execution_result` correctly short-circuits on a
+        // file-backed pool so the planned-but-not-transitioned experience
+        // stays in `Planned` and `fetch_open_atc_experiences` (which
+        // filters to `executed`/`open`) returns an empty set. When the
+        // migration lands and the writable-gate re-enables file-backed
+        // pools, this test should flip back to asserting the transition.
         let cx = Cx::for_testing();
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("capture-file-backed.db");
@@ -14427,6 +14455,12 @@ first body
             ..Default::default()
         })
         .expect("create file-backed pool");
+
+        assert!(
+            !atc_durable_experience_store_writable(&pool),
+            "file-backed ATC writes are intentionally gated off right now; \
+             if this assert flips, re-enable the transition assertions below",
+        );
 
         let row = ExperienceRow {
             experience_id: 0,
@@ -14475,6 +14509,9 @@ first body
             1_700_000_000_004_100,
         );
 
+        // `fetch_open_atc_experiences` filters to `executed`/`open`, so a
+        // short-circuited capture (experience still in `Planned`) surfaces
+        // as an empty result set. That's the no-op contract we're asserting.
         let open = block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
             &cx,
             &pool,
@@ -14483,11 +14520,10 @@ first body
         ))
         .into_result()
         .expect("fetch open experiences");
-        assert_eq!(open.len(), 1);
-        assert_eq!(open[0].experience_id, stored.experience_id);
-        assert_eq!(open[0].state, ExperienceState::Executed);
-        assert_eq!(open[0].dispatched_ts_micros, Some(1_700_000_000_004_100));
-        assert_eq!(open[0].executed_ts_micros, Some(1_700_000_000_004_100));
+        assert!(
+            open.is_empty(),
+            "file-backed capture must be a no-op while the gate is off; got {open:?}",
+        );
     }
 
     #[test]
