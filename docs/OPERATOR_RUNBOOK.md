@@ -5,6 +5,10 @@ the AgentMailTUI interactive operations console.
 
 For copy-paste CLI workflows, see
 [`docs/OPERATOR_COOKBOOK.md`](OPERATOR_COOKBOOK.md).
+For release sequencing across multiple bead tracks, see
+[`docs/RELEASE_TRAIN_PLAN.md`](RELEASE_TRAIN_PLAN.md). For the per-release
+promotion packet, start from
+[`docs/RELEASE_READINESS_TEMPLATE.md`](RELEASE_READINESS_TEMPLATE.md).
 
 ---
 
