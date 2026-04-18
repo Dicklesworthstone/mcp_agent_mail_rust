@@ -465,6 +465,9 @@ jobs:
       - name: E2E static export conformance suite
         run: am e2e run --project . share
 
+      - name: E2E cross-epic integration suite
+        run: am e2e run --project . cross_epic_integration
+
       - name: Validate artifact bundles
         if: always()
         run: |
