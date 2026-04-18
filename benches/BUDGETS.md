@@ -60,6 +60,45 @@ Current blocker on `2026-04-18`:
 - Cross-host comparisons are advisory only; NVMe model, filesystem, mount options, and kernel materially affect `fsync`-heavy workloads.
 - If a same-host rerun breaches the envelope after an archive-path change, follow [docs/OPERATOR_RUNBOOK.md](/data/projects/mcp_agent_mail_rust/docs/OPERATOR_RUNBOOK.md#emergency-roll-back-archive-batch-write-optimization).
 
+### Cross-Filesystem Fsync Matrix (br-8qdh0.11)
+
+Cross-filesystem archive verification is driven by:
+
+- `crates/mcp-agent-mail-storage/tests/fsync_matrix.rs`
+- `scripts/bench_archive_fsync_matrix.sh`
+- `.github/workflows/archive-fsync-matrix.yml`
+
+The probe records:
+
+1. single-message write latency (`p50`/`p95`/`p99`)
+2. batch-100 write latency (`p50`/`p95`/`p99`)
+3. a crash-after-`flush_async_commits()` durability check that reopens the archive after a forced child-process kill
+
+CI-covered budgets:
+
+| Filesystem | CI coverage | fsync mode | Single p95 | Batch-100 p95 | Notes |
+|-----------|-------------|------------|------------|---------------|-------|
+| ext4 (`data=ordered`) | Linux loopback | `normal` | < 25ms | < 250ms | Baseline Linux recommendation |
+| ext4 (`data=journal`) | Linux loopback | `normal` | < 40ms | < 350ms | Higher journal cost; use when durability policy is stricter than latency policy |
+| xfs | Linux loopback | `normal` | < 25ms | < 250ms | Recommended for low-variance Linux server writes |
+| btrfs | Linux loopback | `normal` | < 50ms | < 500ms | Supported but slower under CoW + metadata pressure |
+| APFS | macOS runner | `barrier_only` | < 35ms | < 300ms | Durable rename + barrier semantics differ from Linux flush semantics |
+| tmpfs | Linux tmpfs | `buffered` | < 15ms | < 150ms | Canary only; not durable and still pays Git/process overhead, so treat it as a logic floor rather than a near-zero write budget |
+
+Documented but not yet CI-gated:
+
+| Filesystem | Current stance | Notes |
+|-----------|----------------|-------|
+| NTFS / WSL | Manual spot-check only | Use for portability evidence, not for release gating yet |
+| ZFS | Unsupported initially | Add only when a stable runner or dedicated lab host exists |
+
+Operator rules of thumb:
+
+- Use ext4 (`data=ordered`) or xfs when archive write latency is the deciding constraint.
+- Treat btrfs as supported-but-slower; compare against the btrfs row above instead of the ext4 baseline.
+- Treat tmpfs results as a logic/CPU canary only. A tmpfs pass does **not** say anything about crash durability.
+- If only one filesystem regresses, use the per-FS artifact bundle from the workflow before widening the global budget or rolling back the whole archive-path change.
+
 ## Tool Handler Budgets
 
 Targets based on initial baseline (2026-02-05). Budgets are 2x the measured baseline to absorb variance.

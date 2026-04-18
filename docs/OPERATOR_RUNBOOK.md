@@ -781,6 +781,50 @@ Use this when the storage-native batch archive write path regresses edge cases i
 production: missing canonical files, archive/DB parity drift after bursts,
 unexpected commit-coalescer behavior, or durability concerns after crashes.
 
+### Filesystem Guidance for Archive Perf and Durability
+
+The archive batch path is portable across supported filesystems, but `fsync` cost
+and durability semantics are not identical. Use the cross-filesystem probe
+before concluding that a regression is universal:
+
+```bash
+scripts/bench_archive_fsync_matrix.sh --filesystem ext4-ordered
+scripts/bench_archive_fsync_matrix.sh --filesystem btrfs
+```
+
+Use these rules when choosing or diagnosing a host filesystem:
+
+- **Prefer ext4 (`data=ordered`) or xfs for lowest archive write latency.**
+  These are the reference Linux targets for the `<250ms` batch-100 `p95`
+  budget.
+- **ext4 (`data=journal`) is supported when stronger journal guarantees matter
+  more than latency.** Expect slower burst writes and compare against the
+  journal-specific budget rather than the ordered-mode baseline.
+- **btrfs is supported but slower.** CoW + metadata updates amplify the batch
+  path, so the CI gate allows up to `<500ms` batch-100 `p95` on btrfs. If only
+  btrfs regresses, check snapshot churn, compression settings, and other
+  metadata-heavy workload interference before rolling back a global archive
+  change.
+- **APFS is supported with different semantics.** Treat the macOS probe as a
+  barrier-style durability signal, not a byte-for-byte match for Linux
+  `fdatasync` behavior. Use APFS results to catch macOS-specific regressions,
+  not to rewrite Linux budgets.
+- **tmpfs is a negative control only.** Use it to separate logic/allocator
+  regressions from disk regressions. Never treat tmpfs success as durable
+  storage evidence.
+
+Known quirks:
+
+- ext4/xfs typically fail only when the archive path truly regresses.
+- btrfs is the most sensitive to metadata churn and background snapshotting.
+- APFS can look healthy on latency while still having different flush/barrier
+  semantics than Linux; keep manual macOS spot-checks in the release checklist.
+
+If the cross-filesystem matrix shows a regression on only one filesystem, keep
+the incident scoped to that filesystem row in `benches/BUDGETS.md` first. If
+multiple filesystems fail, treat it as a real archive-path regression and use
+the rollback procedure below.
+
 ### Current reality
 
 - The archive perf fix shipped in commit `99bc2663` (`fix(archive): batch 100 p95=238ms under budget (br-8qdh0.4)`).

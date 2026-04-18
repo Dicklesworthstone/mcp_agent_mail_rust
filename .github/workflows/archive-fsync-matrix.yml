@@ -1,0 +1,95 @@
+name: Archive Fsync Matrix
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/archive-fsync-matrix.yml"
+      - "scripts/bench_archive_fsync_matrix.sh"
+      - "crates/mcp-agent-mail-storage/**"
+      - "benches/BUDGETS.md"
+      - "docs/OPERATOR_RUNBOOK.md"
+  workflow_dispatch:
+  schedule:
+    - cron: "0 15 * * 2"
+
+concurrency:
+  group: archive-fsync-matrix-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux-fsync:
+    name: Archive Fsync (${{ matrix.fs }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        fs: [ext4-ordered, ext4-journal, xfs, btrfs, tmpfs]
+    env:
+      MATRIX_OUTPUT_DIR: tests/artifacts/perf/archive_fsync_matrix/${{ github.run_id }}-${{ github.run_attempt }}/${{ matrix.fs }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install filesystem tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y btrfs-progs e2fsprogs xfsprogs
+
+      - name: Run archive fsync matrix probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/bench_archive_fsync_matrix.sh
+          scripts/bench_archive_fsync_matrix.sh \
+            --filesystem "${{ matrix.fs }}" \
+            --output-dir "${MATRIX_OUTPUT_DIR}"
+
+      - name: Upload archive fsync artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-fsync-${{ matrix.fs }}
+          path: ${{ env.MATRIX_OUTPUT_DIR }}/
+          retention-days: 30
+          if-no-files-found: error
+
+  macos-apfs:
+    name: Archive Fsync (apfs)
+    runs-on: macos-latest
+    timeout-minutes: 35
+    env:
+      MATRIX_OUTPUT_DIR: tests/artifacts/perf/archive_fsync_matrix/${{ github.run_id }}-${{ github.run_attempt }}/apfs
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run archive fsync matrix probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/bench_archive_fsync_matrix.sh
+          scripts/bench_archive_fsync_matrix.sh \
+            --filesystem apfs \
+            --output-dir "${MATRIX_OUTPUT_DIR}"
+
+      - name: Upload archive fsync artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-fsync-apfs
+          path: ${{ env.MATRIX_OUTPUT_DIR }}/
+          retention-days: 30
+          if-no-files-found: error
