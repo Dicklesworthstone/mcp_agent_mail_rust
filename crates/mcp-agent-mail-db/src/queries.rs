@@ -15,8 +15,8 @@ use crate::models::{
 };
 use crate::pool::DbPool;
 use crate::timestamps::now_micros;
-use asupersync::Outcome;
 use asupersync::time::{sleep, wall_now};
+use asupersync::{CancelReason, Outcome};
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 use mcp_agent_mail_core::{
     ExperienceOutcome, ExperienceRow, ExperienceState, FEATURE_SCHEMA_VERSION, FeatureExtension,
@@ -30,11 +30,14 @@ use sqlmodel_core::{Row as SqlRow, TransactionOps, Value};
 use sqlmodel_query::{raw_execute, raw_query};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 fn cache_scope_for_pool(pool: &DbPool) -> String {
     pool.sqlite_identity_key()
 }
+
+static MESSAGE_WRITE_SERIALIZER: LazyLock<asupersync::sync::Mutex<()>> =
+    LazyLock::new(|| asupersync::sync::Mutex::new(()));
 
 // =============================================================================
 // ATC Leader Lease types
@@ -1454,26 +1457,118 @@ fn normalize_expected_recipients(recipients: &[(i64, &str)]) -> Vec<(i64, String
     pairs
 }
 
-/// Verify message + recipient rows are query-visible after commit.
-///
-/// This guards against ghost success where the API returns success but
-/// `message_recipients` rows are missing.
-async fn verify_message_recipients_visible_after_commit(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MessageVisibilityProbeMode {
+    FreshHandle,
+    PooledHandle,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WriterPostCommitCounts {
+    message_count: Option<i64>,
+    recipient_count: Option<i64>,
+}
+
+async fn message_visibility_probe_query(
+    cx: &Cx,
+    pool: &DbPool,
+    sql: &str,
+    params: &[Value],
+    mode: MessageVisibilityProbeMode,
+) -> Outcome<Vec<SqlRow>, DbError> {
+    match mode {
+        MessageVisibilityProbeMode::FreshHandle => {
+            durability_probe_query(cx, pool, sql, params).await
+        }
+        MessageVisibilityProbeMode::PooledHandle => {
+            let conn = match acquire_conn(cx, pool).await {
+                Outcome::Ok(c) => c,
+                Outcome::Err(e) => return Outcome::Err(e),
+                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+                Outcome::Panicked(p) => return Outcome::Panicked(p),
+            };
+            let tracked = tracked(&*conn);
+            map_sql_outcome(traw_query(cx, &tracked, sql, params).await)
+        }
+    }
+}
+
+fn decode_message_recipient_pairs(
+    message_id: i64,
+    recipient_rows: &[SqlRow],
+) -> std::result::Result<Vec<(i64, String)>, DbError> {
+    let mut actual: Vec<(i64, String)> = Vec::with_capacity(recipient_rows.len());
+    for row in recipient_rows {
+        let Some(agent_id) = row.get(0).and_then(value_as_i64) else {
+            return Err(DbError::Internal(format!(
+                "message recipient durability check failed: missing agent_id for message_id={message_id}"
+            )));
+        };
+        let Some(kind) = row.get(1).and_then(|value| match value {
+            Value::Text(text) => Some(text.clone()),
+            _ => None,
+        }) else {
+            return Err(DbError::Internal(format!(
+                "message recipient durability check failed: missing kind for message_id={message_id}"
+            )));
+        };
+        actual.push((agent_id, kind));
+    }
+    actual.sort_unstable();
+    actual.dedup();
+    Ok(actual)
+}
+
+fn is_message_visibility_probe_consistency_error(error: &DbError) -> bool {
+    match error {
+        DbError::Internal(message) => {
+            message.contains("message row not visible after commit")
+                || message.contains("message recipient rows not visible after commit")
+        }
+        _ => false,
+    }
+}
+
+fn annotate_message_visibility_error_with_writer_counts(
+    error: DbError,
+    writer_counts: WriterPostCommitCounts,
+) -> DbError {
+    if !is_message_visibility_probe_consistency_error(&error) {
+        return error;
+    }
+    match error {
+        DbError::Internal(message) => DbError::Internal(format!(
+            "{message}; writer_handle_message_count={:?}; writer_handle_recipient_count={:?}",
+            writer_counts.message_count, writer_counts.recipient_count
+        )),
+        other => other,
+    }
+}
+
+async fn verify_message_recipients_visible_with_probe_mode(
     cx: &Cx,
     pool: &DbPool,
     project_id: i64,
     message_id: i64,
     expected_recipients: &[(i64, &str)],
+    probe_mode: MessageVisibilityProbeMode,
 ) -> Outcome<(), DbError> {
     let message_count_sql = "SELECT COUNT(*) FROM messages WHERE id = ? AND project_id = ?";
     let message_count_params = [Value::BigInt(message_id), Value::BigInt(project_id)];
-    let message_count_rows =
-        match durability_probe_query(cx, pool, message_count_sql, &message_count_params).await {
-            Outcome::Ok(rows) => rows,
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        };
+    let message_count_rows = match message_visibility_probe_query(
+        cx,
+        pool,
+        message_count_sql,
+        &message_count_params,
+        probe_mode,
+    )
+    .await
+    {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
     let message_count = message_count_rows
         .first()
         .and_then(row_first_i64)
@@ -1486,34 +1581,25 @@ async fn verify_message_recipients_visible_after_commit(
 
     let recipient_sql = "SELECT agent_id, kind FROM message_recipients WHERE message_id = ? ORDER BY agent_id, kind";
     let recipient_params = [Value::BigInt(message_id)];
-    let recipient_rows =
-        match durability_probe_query(cx, pool, recipient_sql, &recipient_params).await {
-            Outcome::Ok(rows) => rows,
-            Outcome::Err(e) => return Outcome::Err(e),
-            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-            Outcome::Panicked(p) => return Outcome::Panicked(p),
-        };
+    let recipient_rows = match message_visibility_probe_query(
+        cx,
+        pool,
+        recipient_sql,
+        &recipient_params,
+        probe_mode,
+    )
+    .await
+    {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
 
-    let mut actual: Vec<(i64, String)> = Vec::with_capacity(recipient_rows.len());
-    for row in &recipient_rows {
-        let Some(agent_id) = row.get(0).and_then(value_as_i64) else {
-            return Outcome::Err(DbError::Internal(format!(
-                "message recipient durability check failed: missing agent_id for message_id={message_id}"
-            )));
-        };
-        let Some(kind) = row.get(1).and_then(|v| match v {
-            Value::Text(s) => Some(s.clone()),
-            _ => None,
-        }) else {
-            return Outcome::Err(DbError::Internal(format!(
-                "message recipient durability check failed: missing kind for message_id={message_id}"
-            )));
-        };
-        actual.push((agent_id, kind));
-    }
-    actual.sort_unstable();
-    actual.dedup();
-
+    let actual = match decode_message_recipient_pairs(message_id, &recipient_rows) {
+        Ok(actual) => actual,
+        Err(error) => return Outcome::Err(error),
+    };
     let expected = normalize_expected_recipients(expected_recipients);
     if actual != expected {
         return Outcome::Err(DbError::Internal(format!(
@@ -1524,6 +1610,69 @@ async fn verify_message_recipients_visible_after_commit(
     }
 
     Outcome::Ok(())
+}
+
+/// Verify message + recipient rows are query-visible after commit.
+///
+/// This guards against ghost success where the API returns success but
+/// `message_recipients` rows are missing.
+async fn verify_message_recipients_visible_after_commit(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    message_id: i64,
+    expected_recipients: &[(i64, &str)],
+) -> Outcome<(), DbError> {
+    let fresh_result = verify_message_recipients_visible_with_probe_mode(
+        cx,
+        pool,
+        project_id,
+        message_id,
+        expected_recipients,
+        MessageVisibilityProbeMode::FreshHandle,
+    )
+    .await;
+    let Outcome::Err(fresh_error) = &fresh_result else {
+        return fresh_result;
+    };
+    if pool.sqlite_path() == ":memory:"
+        || !is_message_visibility_probe_consistency_error(fresh_error)
+    {
+        return fresh_result;
+    }
+
+    match verify_message_recipients_visible_with_probe_mode(
+        cx,
+        pool,
+        project_id,
+        message_id,
+        expected_recipients,
+        MessageVisibilityProbeMode::PooledHandle,
+    )
+    .await
+    {
+        Outcome::Ok(()) => {
+            tracing::warn!(
+                project_id,
+                message_id,
+                fresh_error = %fresh_error,
+                "fresh durability probe missed committed message visibility; pooled runtime handle confirmed rows"
+            );
+            Outcome::Ok(())
+        }
+        Outcome::Err(pooled_error) => {
+            tracing::warn!(
+                project_id,
+                message_id,
+                fresh_error = %fresh_error,
+                pooled_error = %pooled_error,
+                "fresh and pooled message visibility probes both failed after commit"
+            );
+            fresh_result
+        }
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
 }
 
 async fn fetch_durable_atc_experience_by_decision_effect(
@@ -4716,23 +4865,25 @@ pub async fn create_message(
         map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
     );
 
-    let rows = try_in_tx!(
+    let message_id = try_in_tx!(
         cx,
         &tracked,
-        map_sql_outcome(traw_query(cx, &tracked, "SELECT last_insert_rowid()", &[]).await)
+        fetch_inserted_message_id_in_tx(
+            cx,
+            &tracked,
+            project_id,
+            sender_id,
+            subject,
+            body_md,
+            thread_id,
+            importance,
+            ack_required,
+            attachments,
+            now,
+            None,
+        )
+        .await
     );
-    let message_id = rows
-        .first()
-        .and_then(row_first_i64)
-        .ok_or_else(|| DbError::Internal("Message INSERT last_insert_rowid() failed".to_string()));
-
-    let message_id = match message_id {
-        Ok(id) => id,
-        Err(e) => {
-            rollback_tx(cx, &tracked).await;
-            return Outcome::Err(e);
-        }
-    };
 
     let row = MessageRow {
         id: Some(message_id),
@@ -4750,6 +4901,72 @@ pub async fn create_message(
 
     try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
     Outcome::Ok(row)
+}
+
+/// Resolve the message row inserted earlier in the current transaction.
+///
+/// We intentionally avoid `last_insert_rowid()` here. Under file-backed
+/// concurrent-writer load on the FrankenSQLite path, rowid lookup can drift
+/// and attach recipient inserts to the wrong message id. Looking the row back
+/// up by its exact inserted values keeps the lookup transaction-local and
+/// deterministic.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_inserted_message_id_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    project_id: i64,
+    sender_id: i64,
+    subject: &str,
+    body_md: &str,
+    thread_id: Option<&str>,
+    importance: &str,
+    ack_required: bool,
+    attachments: &str,
+    created_ts: i64,
+    recipients_json: Option<&str>,
+) -> Outcome<i64, DbError> {
+    let sql = "SELECT id FROM messages \
+               WHERE project_id = ? \
+                 AND sender_id = ? \
+                 AND created_ts = ? \
+                 AND subject = ? \
+                 AND body_md = ? \
+                 AND importance = ? \
+                 AND ack_required = ? \
+                 AND attachments = ? \
+                 AND ((? IS NULL AND thread_id IS NULL) OR thread_id = ?) \
+                 AND (? IS NULL OR recipients_json = ?) \
+               ORDER BY id DESC LIMIT 1";
+    let thread_value =
+        thread_id.map_or_else(|| Value::Null, |value| Value::Text(value.to_string()));
+    let recipients_json_value =
+        recipients_json.map_or_else(|| Value::Null, |value| Value::Text(value.to_string()));
+    let params = vec![
+        Value::BigInt(project_id),
+        Value::BigInt(sender_id),
+        Value::BigInt(created_ts),
+        Value::Text(subject.to_string()),
+        Value::Text(body_md.to_string()),
+        Value::Text(importance.to_string()),
+        Value::BigInt(i64::from(ack_required)),
+        Value::Text(attachments.to_string()),
+        thread_value.clone(),
+        thread_value,
+        recipients_json_value.clone(),
+        recipients_json_value,
+    ];
+    let rows = match map_sql_outcome(traw_query(cx, tracked, sql, &params).await) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let Some(message_id) = rows.first().and_then(row_first_i64) else {
+        return Outcome::Err(DbError::Internal(format!(
+            "message insert succeeded but deterministic id lookup failed for project_id={project_id} sender_id={sender_id} created_ts={created_ts}"
+        )));
+    };
+    Outcome::Ok(message_id)
 }
 
 /// Create a message AND insert all recipients in a single `SQLite` transaction.
@@ -4774,8 +4991,21 @@ pub async fn create_message_with_recipients(
     attachments: &str,
     recipients: &[(i64, &str)], // (agent_id, kind)
 ) -> Outcome<MessageRow, DbError> {
+    let _serializer_guard = match MESSAGE_WRITE_SERIALIZER.lock(cx).await {
+        Ok(guard) => guard,
+        Err(asupersync::sync::LockError::Cancelled) => {
+            return Outcome::Cancelled(CancelReason::user(
+                "create_message_with_recipients serializer lock cancelled",
+            ));
+        }
+        Err(error) => {
+            return Outcome::Err(DbError::Internal(format!(
+                "create_message_with_recipients serializer lock failed: {error}"
+            )));
+        }
+    };
     let now = now_micros();
-    let row = {
+    let (row, writer_post_commit_counts) = {
         let conn = match acquire_conn(cx, pool).await {
             Outcome::Ok(c) => c,
             Outcome::Err(e) => return Outcome::Err(e),
@@ -4783,41 +5013,73 @@ pub async fn create_message_with_recipients(
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
 
-        let row = {
-            let tracked = tracked(&*conn);
-            match run_with_mvcc_retry(cx, "create_message_with_recipients", || {
-                create_message_with_recipients_tx(
+        let tracked = tracked(&*conn);
+        let row = match run_with_mvcc_retry(cx, "create_message_with_recipients", || {
+            create_message_with_recipients_tx(
+                cx,
+                &tracked,
+                project_id,
+                sender_id,
+                subject,
+                body_md,
+                thread_id,
+                importance,
+                ack_required,
+                attachments,
+                recipients,
+                now,
+            )
+        })
+        .await
+        {
+            Outcome::Ok(created) => {
+                let Some(_message_id) = created.id else {
+                    return Outcome::Err(DbError::Internal(
+                        "message commit succeeded but returned row has no id".to_string(),
+                    ));
+                };
+                created
+            }
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        };
+
+        let writer_post_commit_counts = if let Some(message_id) = row.id {
+            let message_rows = match map_sql_outcome(
+                traw_query(
                     cx,
                     &tracked,
-                    project_id,
-                    sender_id,
-                    subject,
-                    body_md,
-                    thread_id,
-                    importance,
-                    ack_required,
-                    attachments,
-                    recipients,
-                    now,
+                    "SELECT COUNT(*) FROM messages WHERE id = ? AND project_id = ?",
+                    &[Value::BigInt(message_id), Value::BigInt(project_id)],
                 )
-            })
-            .await
-            {
-                Outcome::Ok(created) => {
-                    let Some(_message_id) = created.id else {
-                        return Outcome::Err(DbError::Internal(
-                            "message commit succeeded but returned row has no id".to_string(),
-                        ));
-                    };
-                    created
-                }
-                Outcome::Err(e) => return Outcome::Err(e),
-                Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-                Outcome::Panicked(p) => return Outcome::Panicked(p),
+                .await,
+            ) {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(_) | Outcome::Cancelled(_) | Outcome::Panicked(_) => Vec::new(),
+            };
+            let recipient_rows = match map_sql_outcome(
+                traw_query(
+                    cx,
+                    &tracked,
+                    "SELECT COUNT(*) FROM message_recipients WHERE message_id = ?",
+                    &[Value::BigInt(message_id)],
+                )
+                .await,
+            ) {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(_) | Outcome::Cancelled(_) | Outcome::Panicked(_) => Vec::new(),
+            };
+            WriterPostCommitCounts {
+                message_count: message_rows.first().and_then(row_first_i64),
+                recipient_count: recipient_rows.first().and_then(row_first_i64),
             }
+        } else {
+            WriterPostCommitCounts::default()
         };
+
         drop(conn);
-        row
+        (row, writer_post_commit_counts)
     };
 
     let Some(message_id) = row.id else {
@@ -4848,6 +5110,8 @@ pub async fn create_message_with_recipients(
         )),
     };
     if let Some(error) = post_commit_probe_error {
+        let error =
+            annotate_message_visibility_error_with_writer_counts(error, writer_post_commit_counts);
         return Outcome::Err(
             cleanup_message_after_post_commit_probe_failure(
                 cx,
@@ -4957,23 +5221,25 @@ async fn create_message_with_recipients_tx(
         map_sql_outcome(traw_execute(cx, tracked, sql, &params).await)
     );
 
-    let rows = try_in_tx!(
+    let message_id = try_in_tx!(
         cx,
         tracked,
-        map_sql_outcome(traw_query(cx, tracked, "SELECT last_insert_rowid()", &[]).await)
+        fetch_inserted_message_id_in_tx(
+            cx,
+            tracked,
+            project_id,
+            sender_id,
+            subject,
+            body_md,
+            thread_id,
+            importance,
+            ack_required,
+            attachments,
+            now,
+            Some(&recipients_json_val),
+        )
+        .await
     );
-    let message_id = rows
-        .first()
-        .and_then(row_first_i64)
-        .ok_or_else(|| DbError::Internal("Message INSERT last_insert_rowid() failed".to_string()));
-
-    let message_id = match message_id {
-        Ok(id) => id,
-        Err(e) => {
-            rollback_tx(cx, tracked).await;
-            return Outcome::Err(e);
-        }
-    };
 
     let row = MessageRow {
         id: Some(message_id),
@@ -4999,11 +5265,36 @@ async fn create_message_with_recipients_tx(
             Value::BigInt(*agent_id),
             Value::Text((*kind).to_string()),
         ];
-        try_in_tx!(
-            cx,
-            tracked,
-            map_sql_outcome(traw_execute(cx, tracked, insert_recipient_sql, &params).await)
-        );
+        match map_sql_outcome(traw_execute(cx, tracked, insert_recipient_sql, &params).await) {
+            Outcome::Ok(_) => {}
+            Outcome::Err(error) => {
+                let existing_rows = match map_sql_outcome(
+                    traw_query(
+                        cx,
+                        tracked,
+                        "SELECT agent_id, kind FROM message_recipients WHERE message_id = ? ORDER BY agent_id, kind",
+                        &[Value::BigInt(message_id)],
+                    )
+                    .await,
+                ) {
+                    Outcome::Ok(rows) => rows,
+                    Outcome::Err(_) | Outcome::Cancelled(_) | Outcome::Panicked(_) => Vec::new(),
+                };
+                rollback_tx(cx, tracked).await;
+                return Outcome::Err(DbError::Internal(format!(
+                    "message recipient insert failed for message_id={message_id} agent_id={agent_id} kind={kind}: {error}; existing_rows_after_failure={:?}; subject={subject:?} thread_id={thread_id:?}",
+                    decode_message_recipient_pairs(message_id, &existing_rows)
+                )));
+            }
+            Outcome::Cancelled(reason) => {
+                rollback_tx(cx, tracked).await;
+                return Outcome::Cancelled(reason);
+            }
+            Outcome::Panicked(payload) => {
+                rollback_tx(cx, tracked).await;
+                return Outcome::Panicked(payload);
+            }
+        }
     }
 
     let recipient_agent_ids: Vec<i64> = recipients.iter().map(|(id, _)| *id).collect();
@@ -16814,6 +17105,271 @@ mod tests {
             }
 
             rollback_tx(&cx, &tracked).await;
+        });
+    }
+
+    #[test]
+    fn message_visibility_probe_consistency_error_classifier_is_narrow() {
+        assert!(is_message_visibility_probe_consistency_error(
+            &DbError::Internal(
+                "message row not visible after commit for message_id=7 project_id=1".to_string()
+            )
+        ));
+        assert!(is_message_visibility_probe_consistency_error(&DbError::Internal(
+            "message recipient rows not visible after commit for message_id=7: expected=1 actual=0"
+                .to_string()
+        )));
+        assert!(!is_message_visibility_probe_consistency_error(
+            &DbError::Internal(
+                "message recipient durability check failed: missing kind for message_id=7"
+                    .to_string()
+            )
+        ));
+        assert!(!is_message_visibility_probe_consistency_error(
+            &DbError::Sqlite("database is locked".to_string())
+        ));
+    }
+
+    #[test]
+    fn verify_message_recipients_visible_with_pooled_handle_sees_committed_rows() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("message_visibility_probe_pooled.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        init_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) \
+                 VALUES (1, 'durability-project', '/tmp/am-message-pooled-visibility', 0)",
+            )
+            .expect("seed project");
+        init_conn
+            .execute_raw(
+                "INSERT INTO agents \
+                 (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES (1, 1, 'BlueLake', 'codex-cli', 'gpt-5', 'sender', 0, 0, 'auto', 'auto')",
+            )
+            .expect("seed sender");
+        init_conn
+            .execute_raw(
+                "INSERT INTO agents \
+                 (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES (2, 1, 'GreenStone', 'codex-cli', 'gpt-5', 'recipient', 0, 0, 'auto', 'auto')",
+            )
+            .expect("seed recipient");
+        init_conn
+            .execute_raw(
+                "INSERT INTO messages \
+                 (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+                 VALUES (1, 1, 1, 'THREAD-DURABILITY', 'durability-test', 'body', 'normal', 0, 0, '[]')",
+            )
+            .expect("seed committed message");
+        init_conn
+            .execute_raw(
+                "INSERT INTO message_recipients \
+                 (message_id, agent_id, kind, read_ts, ack_ts) VALUES (1, 2, 'to', NULL, NULL)",
+            )
+            .expect("seed committed recipient");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 2,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            verify_message_recipients_visible_with_probe_mode(
+                &cx,
+                &pool,
+                1,
+                1,
+                &[(2, "to")],
+                MessageVisibilityProbeMode::PooledHandle,
+            )
+            .await
+            .into_result()
+            .expect("pooled handle should confirm committed message visibility");
+        });
+    }
+
+    #[test]
+    fn create_message_with_recipients_file_backed_survives_concurrent_writers() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join("create_message_with_recipients_concurrent_writers.db");
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 4,
+            max_connections: 12,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+
+        let (project_id, sender_id, recipient_id) = rt.block_on(async {
+            let project = ensure_project(&cx, &pool, "/tmp/am-concurrent-message-durability")
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let sender = create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("concurrent sender"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create sender");
+            let recipient = create_agent(
+                &cx,
+                &pool,
+                project_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                Some("concurrent recipient"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create recipient");
+            (
+                project_id,
+                sender.id.expect("sender id"),
+                recipient.id.expect("recipient id"),
+            )
+        });
+
+        let thread_count = 8usize;
+        let messages_per_thread = 8usize;
+        let start_barrier = std::sync::Arc::new(std::sync::Barrier::new(thread_count));
+        let failures = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+        let handles: Vec<_> = (0..thread_count)
+            .map(|thread_idx| {
+                let pool = pool.clone();
+                let start_barrier = std::sync::Arc::clone(&start_barrier);
+                let failures = std::sync::Arc::clone(&failures);
+                std::thread::spawn(move || {
+                    let rt = RuntimeBuilder::current_thread()
+                        .build()
+                        .expect("build thread runtime");
+                    start_barrier.wait();
+                    for message_idx in 0..messages_per_thread {
+                        let cx = Cx::for_testing();
+                        let subject = format!("writer-{thread_idx}-message-{message_idx}");
+                        let body = format!("body-{thread_idx}-{message_idx}");
+                        match rt.block_on(async {
+                            create_message_with_recipients(
+                                &cx,
+                                &pool,
+                                project_id,
+                                sender_id,
+                                &subject,
+                                &body,
+                                Some("THREAD-CONCURRENT-DURABILITY"),
+                                "normal",
+                                false,
+                                "[]",
+                                &[(recipient_id, "to")],
+                            )
+                            .await
+                        }) {
+                            Outcome::Ok(row) => {
+                                assert!(row.id.is_some(), "created message must include id");
+                            }
+                            Outcome::Err(error) => {
+                                failures
+                                    .lock()
+                                    .expect("failures mutex")
+                                    .push(format!(
+                                        "thread {thread_idx} message {message_idx}: {error:?}"
+                                    ));
+                                break;
+                            }
+                            Outcome::Cancelled(reason) => {
+                                failures
+                                    .lock()
+                                    .expect("failures mutex")
+                                    .push(format!(
+                                        "thread {thread_idx} message {message_idx}: cancelled {reason:?}"
+                                    ));
+                                break;
+                            }
+                            Outcome::Panicked(payload) => {
+                                panic!("thread {thread_idx} message {message_idx} panicked: {payload}");
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("writer thread join");
+        }
+
+        let failures = failures.lock().expect("failures mutex");
+        assert!(
+            failures.is_empty(),
+            "concurrent create_message_with_recipients failures:\n{}",
+            failures.join("\n")
+        );
+        drop(failures);
+
+        rt.block_on(async {
+            let rows = durability_probe_query(
+                &cx,
+                &pool,
+                "SELECT COUNT(*) FROM messages WHERE project_id = ?",
+                &[Value::BigInt(project_id)],
+            )
+            .await
+            .into_result()
+            .expect("count committed messages");
+            let count = rows
+                .first()
+                .and_then(row_first_i64)
+                .expect("message count row");
+            assert_eq!(
+                count,
+                i64::try_from(thread_count * messages_per_thread)
+                    .expect("message count fits in i64"),
+                "all committed messages must remain visible after concurrent writes"
+            );
         });
     }
 
