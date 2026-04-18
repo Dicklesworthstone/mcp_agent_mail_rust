@@ -1,0 +1,72 @@
+{
+  "version": "rust-native@2026-04-18",
+  "generated_at": "2026-04-18T09:45:00Z",
+  "tool": "list_agents",
+  "classification": "rust_native",
+  "cases": [
+    {
+      "name": "zero_agents_returns_empty_array",
+      "input": {
+        "project_key": "__FIXTURE_ROOT__/projects/list-agents-zero"
+      },
+      "setup": {
+        "tool_calls": [
+          {
+            "name": "ensure_project",
+            "input": {
+              "human_key": "__FIXTURE_ROOT__/projects/list-agents-zero"
+            }
+          }
+        ]
+      },
+      "expect": {
+        "ok_golden_output_path": "rust_native/list_agents/zero_agents_returns_empty_array.output.json"
+      }
+    },
+    {
+      "name": "multiple_agents_return_stable_array",
+      "input": {
+        "project_key": "__FIXTURE_ROOT__/projects/list-agents-multiple"
+      },
+      "setup": {
+        "tool_calls": [
+          {
+            "name": "ensure_project",
+            "input": {
+              "human_key": "__FIXTURE_ROOT__/projects/list-agents-multiple"
+            }
+          },
+          {
+            "name": "register_agent",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/list-agents-multiple",
+              "program": "codex-cli",
+              "model": "gpt-5",
+              "name": "GreenPeak"
+            }
+          },
+          {
+            "name": "register_agent",
+            "input": {
+              "project_key": "__FIXTURE_ROOT__/projects/list-agents-multiple",
+              "program": "claude-code",
+              "model": "opus-4.1",
+              "name": "BlueLake"
+            }
+          }
+        ]
+      },
+      "expect": {
+        "ok_golden_output_path": "rust_native/list_agents/multiple_agents_return_stable_array.output.json"
+      },
+      "normalize": {
+        "ignore_json_pointers": [
+          "/0/inception_ts",
+          "/0/last_active_ts",
+          "/1/inception_ts",
+          "/1/last_active_ts"
+        ]
+      }
+    }
+  ]
+}

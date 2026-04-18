@@ -7,6 +7,7 @@ This crate keeps the live Rust router honest against the legacy Python reference
 ## What lives here
 
 - Behavior parity fixtures in `tests/conformance/fixtures/python_reference.json`
+- Rust-native golden fixtures in `tests/conformance/fixtures/rust_native/`
 - Tool description parity against `../../tests/conformance/fixtures/tool_descriptions.json`
 - Resource description drift guards for shared resource templates
 - Focused regression checks for tool filtering, error envelopes, and outage behavior
@@ -16,13 +17,11 @@ This crate keeps the live Rust router honest against the legacy Python reference
 - The live Rust router exposes 37 tools.
 - 34 tools have Python behavior fixtures in `tests/conformance/fixtures/python_reference.json`.
 - 3 tools are Rust-native extensions: `resolve_pane_identity`, `cleanup_pane_identities`, and `list_agents`.
-- 2 Rust-native tools, `resolve_pane_identity` and `cleanup_pane_identities`, are covered today by `tests/conformance/fixtures/tool_filter/cases.json`.
-- `list_agents` is classified Rust-native but still has no conformance fixture. It is only unit-tested in `mcp-agent-mail-tools` and is tracked by `br-a2k3h.3` and `br-a2k3h.6`.
+- All 3 Rust-native tools are covered by dedicated golden fixtures under `tests/conformance/fixtures/rust_native/`.
 - The live Rust router exposes 25 logical resource templates after collapsing `?{query}` variants.
 - 23 resource templates have Python behavior fixtures.
 - 2 Rust-only resources, `resource://tooling/metrics_core` and `resource://tooling/diagnostics`, are unit-tested in `mcp-agent-mail-tools` but still lack conformance fixtures. They are tracked by `br-a2k3h.4` and `br-a2k3h.6`.
-- The current failing lanes in `cargo test -p mcp-agent-mail-conformance` are `health_check` fixture drift plus the missing `list_agents`/rust-native tool coverage updates in `tests/conformance.rs`.
-- A transient server compile blocker (`br-0ijq8`, unresolved `BROWSER_TUI_DEFERRED_JSON` / `BROWSER_TUI_DEFERRED_HTML`) interrupted an earlier audit rerun, but later reruns compiled past it and showed that it was already fixed elsewhere.
+- The next conformance follow-ups are resource parity coverage (`br-a2k3h.4`) and a CI drift guard for new fixtures (`br-a2k3h.6`).
 
 ## Tool Classification
 
@@ -71,7 +70,7 @@ the audit record in [docs/CONFORMANCE_AUDIT_2026-04-18.md](../../docs/CONFORMANC
 
 - `resolve_pane_identity` - Resolve the canonical agent name for a tmux pane from Rust-side identity files; there is no Python pane-identity analogue.
 - `cleanup_pane_identities` - Remove stale per-pane identity files for dead tmux panes; this is Rust-only operational cleanup tied to the pane identity model.
-- `list_agents` - List all registered agents in a project; this Rust-native identity surface has no Python behavior fixture yet and is tracked by `br-a2k3h.3` and `br-a2k3h.6`.
+- `list_agents` - List all registered agents in a project; this Rust-native identity surface is now covered by the dedicated `rust_native/` golden fixtures.
 
 Full inventory and the current blocker record live in [docs/CONFORMANCE_AUDIT_2026-04-18.md](../../docs/CONFORMANCE_AUDIT_2026-04-18.md).
 

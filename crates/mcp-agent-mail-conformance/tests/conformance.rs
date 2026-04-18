@@ -7,12 +7,16 @@ use mcp_agent_mail_conformance::{Case, ExpectedError, Fixtures, Normalize};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 /// Auto-increment ID field names that are non-deterministic across test runs.
 const AUTO_INCREMENT_ID_KEYS: &[&str] = &["id", "message_id", "reply_to"];
 const TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS: &str = "3600";
 const TEST_SEARCH_ENGINE: &str = "legacy";
+const RUST_NATIVE_FIXTURE_DIR: &str = "tests/conformance/fixtures/rust_native";
 
 /// Tests in this file mutate process-wide environment variables (Rust has no per-test env isolation).
 /// The Rust test harness runs tests in parallel by default, so serialize any env mutations and
@@ -20,6 +24,14 @@ const TEST_SEARCH_ENGINE: &str = "legacy";
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn crate_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn conformance_fixture_root() -> PathBuf {
+    crate_root().join("tests/conformance/fixtures")
 }
 
 /// Recursively null out auto-increment integer ID fields in a JSON value.
@@ -245,6 +257,115 @@ struct ToolFilterCase {
     expected_tools: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RustNativeToolFixtureFile {
+    version: String,
+    generated_at: String,
+    tool: String,
+    classification: String,
+    cases: Vec<RustNativeCase>,
+}
+
+impl RustNativeToolFixtureFile {
+    fn validate(&self) {
+        assert!(
+            !self.version.trim().is_empty(),
+            "rust-native fixture {} must have a non-empty version",
+            self.tool
+        );
+        assert!(
+            !self.generated_at.trim().is_empty(),
+            "rust-native fixture {} must have a non-empty generated_at",
+            self.tool
+        );
+        assert_eq!(
+            self.classification, "rust_native",
+            "rust-native fixture {} must declare classification=rust_native",
+            self.tool
+        );
+        assert!(
+            !self.cases.is_empty(),
+            "rust-native fixture {} must contain at least one case",
+            self.tool
+        );
+        for case in &self.cases {
+            case.validate(&self.tool);
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RustNativeCase {
+    name: String,
+    #[serde(default)]
+    input: Value,
+    #[serde(default)]
+    setup: RustNativeSetup,
+    expect: RustNativeExpectation,
+    #[serde(default)]
+    normalize: Normalize,
+}
+
+impl RustNativeCase {
+    fn validate(&self, tool_name: &str) {
+        assert!(
+            !self.name.trim().is_empty(),
+            "rust-native fixture {tool_name} has an empty case name"
+        );
+        self.expect.validate(tool_name, &self.name);
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RustNativeSetup {
+    #[serde(default)]
+    tool_calls: Vec<RustNativeSetupToolCall>,
+    #[serde(default)]
+    identity_writes: Vec<RustNativeIdentityWrite>,
+    #[serde(default)]
+    tmux_list_panes_lines: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RustNativeSetupToolCall {
+    name: String,
+    #[serde(default)]
+    input: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct RustNativeIdentityWrite {
+    project_key: String,
+    pane_id: String,
+    agent_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RustNativeExpectation {
+    #[serde(default)]
+    ok_golden_output_path: Option<String>,
+    #[serde(default)]
+    err: Option<ExpectedError>,
+}
+
+impl RustNativeExpectation {
+    fn validate(&self, tool_name: &str, case_name: &str) {
+        match (&self.ok_golden_output_path, &self.err) {
+            (Some(path), None) => assert!(
+                !path.trim().is_empty(),
+                "rust-native fixture {tool_name} case {case_name} must use a non-empty golden path"
+            ),
+            (None, Some(_)) => {}
+            (None, None) => panic!(
+                "rust-native fixture {tool_name} case {case_name} must set exactly one of ok_golden_output_path or err"
+            ),
+            (Some(_), Some(_)) => panic!(
+                "rust-native fixture {tool_name} case {case_name} cannot set both ok_golden_output_path and err"
+            ),
+        }
+    }
+}
+
 struct ToolFilterEnvGuard {
     previous: Vec<(String, Option<String>)>,
 }
@@ -385,6 +506,35 @@ fn load_tool_filter_fixtures() -> ToolFilterFixtures {
     fixtures
 }
 
+fn load_rust_native_tool_fixtures() -> Vec<RustNativeToolFixtureFile> {
+    let fixture_dir = crate_root().join(RUST_NATIVE_FIXTURE_DIR);
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&fixture_dir)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", fixture_dir.display()))
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    paths.sort();
+
+    assert!(
+        !paths.is_empty(),
+        "expected at least one rust-native fixture in {}",
+        fixture_dir.display()
+    );
+
+    paths
+        .into_iter()
+        .map(|path| {
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+            let fixture: RustNativeToolFixtureFile = serde_json::from_str(&raw)
+                .unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()));
+            fixture.validate();
+            fixture
+        })
+        .collect()
+}
+
 fn extract_tool_names_from_directory(value: &Value) -> Vec<String> {
     let mut names = Vec::new();
     let Some(clusters) = value.get("clusters").and_then(|v| v.as_array()) else {
@@ -404,11 +554,119 @@ fn extract_tool_names_from_directory(value: &Value) -> Vec<String> {
 }
 
 fn args_from_case(case: &Case) -> Option<Value> {
-    match &case.input {
+    args_from_value(&case.input)
+}
+
+fn args_from_value(input: &Value) -> Option<Value> {
+    match input {
         Value::Null => None,
         Value::Object(map) if map.is_empty() => None,
         other => Some(other.clone()),
     }
+}
+
+fn resolve_tokens_in_string(input: &str, tokens: &BTreeMap<String, String>) -> String {
+    let mut out = input.to_string();
+    for (token, replacement) in tokens {
+        out = out.replace(token, replacement);
+    }
+    out
+}
+
+fn resolve_tokens_in_value(value: &mut Value, tokens: &BTreeMap<String, String>) {
+    match value {
+        Value::String(text) => {
+            *text = resolve_tokens_in_string(text, tokens);
+        }
+        Value::Array(items) => {
+            for item in items {
+                resolve_tokens_in_value(item, tokens);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                resolve_tokens_in_value(item, tokens);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn resolved_value(value: &Value, tokens: &BTreeMap<String, String>) -> Value {
+    let mut out = value.clone();
+    resolve_tokens_in_value(&mut out, tokens);
+    out
+}
+
+fn load_rust_native_golden(path: &str) -> Value {
+    let full_path = conformance_fixture_root().join(path);
+    let raw = std::fs::read_to_string(&full_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", full_path.display()));
+    serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("failed to parse {} as JSON: {e}", full_path.display()))
+}
+
+fn execute_tool(
+    router: &fastmcp::Router,
+    cx: &Cx,
+    budget: &Budget,
+    req_id: &mut u64,
+    tool_name: &str,
+    arguments: Option<Value>,
+) -> Result<Result<Value, String>, String> {
+    let params = CallToolParams {
+        name: tool_name.to_string(),
+        arguments,
+        meta: None,
+    };
+    let result = router
+        .handle_tools_call(cx, *req_id, params, budget, SessionState::new(), None, None)
+        .map_err(|e| e.message)?;
+    *req_id += 1;
+
+    if result.is_error {
+        let text = result
+            .content
+            .first()
+            .and_then(|content| match content {
+                Content::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "<non-text error>".to_string());
+        Ok(Err(text))
+    } else {
+        let decoded = decode_json_from_tool_content(&result.content)?;
+        Ok(Ok(decoded))
+    }
+}
+
+#[cfg(unix)]
+fn write_fake_tmux_script(path: &Path, lines: &[String]) {
+    let stdout = if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    };
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"list-panes\" ]; then\ncat <<'EOF'\n{stdout}EOF\nexit 0\nfi\nif [ \"$1\" = \"display-message\" ]; then\nexit 1\nfi\nexit 1\n"
+    );
+    std::fs::write(path, script)
+        .unwrap_or_else(|e| panic!("failed to write fake tmux {}: {e}", path.display()));
+    let mut permissions = std::fs::metadata(path)
+        .unwrap_or_else(|e| panic!("failed to stat fake tmux {}: {e}", path.display()))
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).unwrap_or_else(|e| {
+        panic!(
+            "failed to set executable permissions on fake tmux {}: {e}",
+            path.display()
+        )
+    });
+}
+
+#[cfg(not(unix))]
+fn write_fake_tmux_script(_path: &Path, _lines: &[String]) {
+    panic!("rust-native tmux fixture helpers require unix permissions support");
 }
 
 struct FixtureEnv {
@@ -1346,6 +1604,170 @@ fn tool_filter_profiles_match_fixtures() {
             "tooling/directory mismatch for case {}",
             case.name
         );
+    }
+}
+
+#[test]
+fn rust_native_fixture_coverage_matches_classification() {
+    let fixtures = load_rust_native_tool_fixtures();
+    let actual: BTreeSet<String> = fixtures.into_iter().map(|fixture| fixture.tool).collect();
+    let expected: BTreeSet<String> = [
+        "cleanup_pane_identities",
+        "list_agents",
+        "resolve_pane_identity",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+
+    assert_eq!(
+        actual, expected,
+        "rust-native fixture coverage drifted from the conformance classification matrix"
+    );
+}
+
+#[test]
+fn run_rust_native_fixtures_against_rust_server_router() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let env = setup_fixture_env();
+    let fixtures = load_rust_native_tool_fixtures();
+    let router = &env.router;
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+    let mut req_id: u64 = 50_000;
+
+    for fixture in fixtures {
+        for case in fixture.cases {
+            let case_root = env
+                .tmp
+                .path()
+                .join("rust-native")
+                .join(&fixture.tool)
+                .join(&case.name);
+            let xdg_config_home = case_root.join("xdg");
+            let home_dir = case_root.join("home");
+            let tmux_bin_dir = case_root.join("bin");
+            std::fs::create_dir_all(&xdg_config_home)
+                .unwrap_or_else(|e| panic!("create {}: {e}", xdg_config_home.display()));
+            std::fs::create_dir_all(&home_dir)
+                .unwrap_or_else(|e| panic!("create {}: {e}", home_dir.display()));
+            std::fs::create_dir_all(&tmux_bin_dir)
+                .unwrap_or_else(|e| panic!("create {}: {e}", tmux_bin_dir.display()));
+            write_fake_tmux_script(
+                &tmux_bin_dir.join("tmux"),
+                &case.setup.tmux_list_panes_lines,
+            );
+
+            let mut tokens = BTreeMap::new();
+            tokens.insert(
+                "__FIXTURE_ROOT__".to_string(),
+                case_root.to_string_lossy().to_string(),
+            );
+            tokens.insert(
+                "__XDG_CONFIG_HOME__".to_string(),
+                xdg_config_home.to_string_lossy().to_string(),
+            );
+            tokens.insert(
+                "__HOME__".to_string(),
+                home_dir.to_string_lossy().to_string(),
+            );
+
+            let existing_path = std::env::var("PATH").unwrap_or_default();
+            let path_env = if existing_path.is_empty() {
+                tmux_bin_dir.to_string_lossy().to_string()
+            } else {
+                format!("{}:{existing_path}", tmux_bin_dir.to_string_lossy())
+            };
+            let xdg_config_home_str = xdg_config_home.to_string_lossy().to_string();
+            let home_dir_str = home_dir.to_string_lossy().to_string();
+            let _case_env = EnvVarGuard::set(&[
+                ("XDG_CONFIG_HOME", &xdg_config_home_str),
+                ("HOME", &home_dir_str),
+                ("PATH", &path_env),
+            ]);
+
+            for identity in &case.setup.identity_writes {
+                let project_key = resolve_tokens_in_string(&identity.project_key, &tokens);
+                let pane_id = resolve_tokens_in_string(&identity.pane_id, &tokens);
+                let agent_name = resolve_tokens_in_string(&identity.agent_name, &tokens);
+                mcp_agent_mail_core::write_identity(&project_key, &pane_id, &agent_name)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "rust-native tool {} case {} failed writing identity ({project_key}, {pane_id}, {agent_name}): {e}",
+                            fixture.tool, case.name
+                        )
+                    });
+            }
+
+            for tool_call in &case.setup.tool_calls {
+                let arguments = args_from_value(&resolved_value(&tool_call.input, &tokens));
+                match execute_tool(
+                    router,
+                    &cx,
+                    &budget,
+                    &mut req_id,
+                    &tool_call.name,
+                    arguments,
+                ) {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(err_text)) => panic!(
+                        "rust-native tool {} case {} setup call {} returned error: {err_text}",
+                        fixture.tool, case.name, tool_call.name
+                    ),
+                    Err(err_text) => panic!(
+                        "rust-native tool {} case {} setup call {} hit router error: {err_text}",
+                        fixture.tool, case.name, tool_call.name
+                    ),
+                }
+            }
+
+            let arguments = args_from_value(&resolved_value(&case.input, &tokens));
+            match (&case.expect.ok_golden_output_path, &case.expect.err) {
+                (Some(golden_path), None) => {
+                    let actual = match execute_tool(
+                        router,
+                        &cx,
+                        &budget,
+                        &mut req_id,
+                        &fixture.tool,
+                        arguments,
+                    ) {
+                        Ok(Ok(value)) => value,
+                        Ok(Err(err_text)) => panic!(
+                            "rust-native tool {} case {} expected ok, got error: {err_text}",
+                            fixture.tool, case.name
+                        ),
+                        Err(err_text) => panic!(
+                            "rust-native tool {} case {} router error: {err_text}",
+                            fixture.tool, case.name
+                        ),
+                    };
+                    let expected = load_rust_native_golden(golden_path);
+                    let (actual, expected) = normalize_pair(actual, expected, &case.normalize);
+                    assert_eq!(
+                        actual, expected,
+                        "Rust-native golden mismatch for tool {} case {}",
+                        fixture.tool, case.name
+                    );
+                }
+                (None, Some(expected_err)) => {
+                    match execute_tool(router, &cx, &budget, &mut req_id, &fixture.tool, arguments)
+                    {
+                        Ok(Ok(value)) => panic!(
+                            "rust-native tool {} case {} expected error, got ok: {value}",
+                            fixture.tool, case.name
+                        ),
+                        Ok(Err(err_text)) => {
+                            assert_expected_error(&err_text, expected_err);
+                        }
+                        Err(err_text) => {
+                            assert_expected_error(&err_text, expected_err);
+                        }
+                    }
+                }
+                _ => unreachable!("rust-native fixture validation enforces one expectation shape"),
+            }
+        }
     }
 }
 

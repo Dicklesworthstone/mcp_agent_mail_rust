@@ -1,0 +1,20 @@
+[
+  {
+    "name": "BlueLake",
+    "program": "claude-code",
+    "model": "opus-4.1",
+    "task_description": "",
+    "inception_ts": null,
+    "last_active_ts": null,
+    "contact_policy": "auto"
+  },
+  {
+    "name": "GreenPeak",
+    "program": "codex-cli",
+    "model": "gpt-5",
+    "task_description": "",
+    "inception_ts": null,
+    "last_active_ts": null,
+    "contact_policy": "auto"
+  }
+]

@@ -1,0 +1,44 @@
+{
+  "version": "rust-native@2026-04-18",
+  "generated_at": "2026-04-18T09:45:00Z",
+  "tool": "resolve_pane_identity",
+  "classification": "rust_native",
+  "cases": [
+    {
+      "name": "known_pane_canonical_identity",
+      "input": {
+        "project_key": "__FIXTURE_ROOT__/projects/resolve-known",
+        "pane_id": "main:0:2"
+      },
+      "setup": {
+        "identity_writes": [
+          {
+            "project_key": "__FIXTURE_ROOT__/projects/resolve-known",
+            "pane_id": "main:0:2",
+            "agent_name": "BlueLake"
+          }
+        ]
+      },
+      "expect": {
+        "ok_golden_output_path": "rust_native/resolve_pane_identity/known_pane_canonical_identity.output.json"
+      },
+      "normalize": {
+        "replace": {
+          "/identity_path": "__CANONICAL_IDENTITY_PATH__"
+        }
+      }
+    },
+    {
+      "name": "unknown_pane_reports_not_found",
+      "input": {
+        "project_key": "__FIXTURE_ROOT__/projects/resolve-missing",
+        "pane_id": "main:0:9"
+      },
+      "expect": {
+        "err": {
+          "message_contains": "No identity file found for pane 'main:0:9'"
+        }
+      }
+    }
+  ]
+}

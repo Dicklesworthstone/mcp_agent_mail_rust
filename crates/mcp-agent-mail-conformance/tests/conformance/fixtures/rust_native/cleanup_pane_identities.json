@@ -1,0 +1,58 @@
+{
+  "version": "rust-native@2026-04-18",
+  "generated_at": "2026-04-18T09:45:00Z",
+  "tool": "cleanup_pane_identities",
+  "classification": "rust_native",
+  "cases": [
+    {
+      "name": "global_cleanup_skips_live_identity",
+      "input": {},
+      "setup": {
+        "identity_writes": [
+          {
+            "project_key": "__FIXTURE_ROOT__/projects/cleanup-global",
+            "pane_id": "main:0:1",
+            "agent_name": "BlueLake"
+          }
+        ],
+        "tmux_list_panes_lines": [
+          "main:0:1:%1"
+        ]
+      },
+      "expect": {
+        "ok_golden_output_path": "rust_native/cleanup_pane_identities/global_cleanup_skips_live_identity.output.json"
+      }
+    },
+    {
+      "name": "scoped_cleanup_removes_stale_identity",
+      "input": {
+        "project_key": "__FIXTURE_ROOT__/projects/cleanup-scoped"
+      },
+      "setup": {
+        "identity_writes": [
+          {
+            "project_key": "__FIXTURE_ROOT__/projects/cleanup-scoped",
+            "pane_id": "live:0:0",
+            "agent_name": "LiveLake"
+          },
+          {
+            "project_key": "__FIXTURE_ROOT__/projects/cleanup-scoped",
+            "pane_id": "dead:0:9",
+            "agent_name": "DeadPeak"
+          }
+        ],
+        "tmux_list_panes_lines": [
+          "live:0:0:%1"
+        ]
+      },
+      "expect": {
+        "ok_golden_output_path": "rust_native/cleanup_pane_identities/scoped_cleanup_removes_stale_identity.output.json"
+      },
+      "normalize": {
+        "replace": {
+          "/removed_paths/0": "__STALE_IDENTITY_PATH__"
+        }
+      }
+    }
+  ]
+}

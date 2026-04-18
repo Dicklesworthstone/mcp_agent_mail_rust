@@ -3,6 +3,10 @@
 This directory contains fixture-based conformance tests that compare Rust outputs
 against the legacy Python MCP Agent Mail behavior.
 
+Alongside the Python reference lane, the Rust harness also loads dedicated
+Rust-native fixtures from `tests/conformance/fixtures/rust_native/*.json` for
+tools that intentionally have no Python analogue.
+
 ## Fixture Schema
 
 ```json
@@ -52,6 +56,46 @@ Notes:
 - Each tool/resource can have multiple `cases` (happy path + error cases).
 - `input` is the tool args object (for tools) or resource query input (for resources).
 - `expect` must contain exactly one of `ok` or `err`.
+
+## Rust-native Fixture Schema
+
+Rust-native fixtures keep the same router execution path, but compare against
+Rust-owned golden outputs instead of Python parity data.
+
+```json
+{
+  "version": "rust-native@2026-04-18",
+  "generated_at": "ISO-8601",
+  "tool": "resolve_pane_identity",
+  "classification": "rust_native",
+  "cases": [
+    {
+      "name": "known_pane_canonical_identity",
+      "input": {
+        "project_key": "__FIXTURE_ROOT__/projects/resolve-known",
+        "pane_id": "main:0:2"
+      },
+      "setup": {
+        "identity_writes": [
+          {
+            "project_key": "__FIXTURE_ROOT__/projects/resolve-known",
+            "pane_id": "main:0:2",
+            "agent_name": "BlueLake"
+          }
+        ]
+      },
+      "expect": {
+        "ok_golden_output_path": "rust_native/resolve_pane_identity/known_pane_canonical_identity.output.json"
+      }
+    }
+  ]
+}
+```
+
+Rust-native `setup` supports:
+- `tool_calls`: seed the database/archive through real MCP tool dispatch
+- `identity_writes`: create canonical pane identity files before the tool runs
+- `tmux_list_panes_lines`: feed a deterministic fake `tmux list-panes` output to cleanup cases
 
 ## Generating Fixtures (Python Reference)
 
