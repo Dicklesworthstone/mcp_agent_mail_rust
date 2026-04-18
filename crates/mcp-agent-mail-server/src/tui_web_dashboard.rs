@@ -2203,7 +2203,7 @@ mod tests {
         assert_eq!(store.snapshot_seq(), 1);
 
         let payload = store.cached_snapshot();
-        let v: serde_json::Value = serde_json::from_str(payload.as_ref()).expect("write failed");
+        let v: serde_json::Value = serde_json::from_str(payload.as_ref()).expect("valid json");
         assert_eq!(v["seq"], 1);
         assert_eq!(v["screen_id"], 3);
         assert_eq!(v["screen_key"], "agents");
@@ -2233,7 +2233,7 @@ mod tests {
         store.capture(&buffer, 9, "ops\\qa", "Ops \"QA\"\nLive");
 
         let payload = store.cached_snapshot();
-        let v: serde_json::Value = serde_json::from_str(payload.as_ref()).expect("write failed");
+        let v: serde_json::Value = serde_json::from_str(payload.as_ref()).expect("valid json");
         assert_eq!(v["screen_key"], "ops\\qa");
         assert_eq!(v["screen_title"], "Ops \"QA\"\nLive");
     }
@@ -2353,7 +2353,7 @@ mod tests {
     fn handle_inactive_input_returns_503() {
         let (status, payload) = handle_inactive_input();
         assert_eq!(status, 503);
-        let v: serde_json::Value = serde_json::from_str(&payload).expect("write failed");
+        let v: serde_json::Value = serde_json::from_str(&payload).expect("valid json");
         assert_eq!(v["status"], "inactive");
         assert_eq!(v["retry_ms"], INACTIVE_RETRY_MS);
     }
