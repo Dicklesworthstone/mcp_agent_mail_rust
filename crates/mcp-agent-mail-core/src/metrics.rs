@@ -10,9 +10,9 @@
 
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Primitives
@@ -1537,8 +1537,8 @@ mod tests {
 
     #[test]
     fn histogram_snapshot_benchmark_concurrent_read_write() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::sync::Arc;
 
         const NUM_WRITERS: usize = 4;
         const NUM_READERS: usize = 4;
