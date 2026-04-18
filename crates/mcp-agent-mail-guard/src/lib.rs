@@ -1266,12 +1266,19 @@ fn check_path_conflicts(
         // modifying `modules/submod` conflicts with reservation `modules/submod/**`
         // because the directory itself is within the reserved scope.
         for res in &active_indices {
+            let res_pattern_lower;
+            let res_pattern = if ignorecase {
+                res_pattern_lower = res.normalized_pattern.to_lowercase();
+                &res_pattern_lower
+            } else {
+                &res.normalized_pattern
+            };
+
             // Check if the path is a prefix of the pattern's base directory
             // (e.g. path "src", pattern "src/main.rs" or "src/**")
-            if res.normalized_pattern.starts_with(&normalized)
+            if res_pattern.starts_with(&normalized)
                 && (normalized.is_empty()
-                    || res
-                        .normalized_pattern
+                    || res_pattern
                         .as_bytes()
                         .get(normalized.len())
                         .is_some_and(|&c| c == b'/'))
@@ -1291,7 +1298,7 @@ fn check_path_conflicts(
             // We do NOT do this if the pattern has a glob, because globs like "src/*"
             // should not recursively lock subdirectories (that's what "src/**" is for).
             if !res.has_glob {
-                let literal_base = &res.normalized_pattern;
+                let literal_base = res_pattern;
                 if normalized.starts_with(literal_base)
                     && (literal_base.is_empty()
                         || normalized
