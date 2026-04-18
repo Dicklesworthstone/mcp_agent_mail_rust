@@ -2191,6 +2191,27 @@ impl DbPool {
                         }
                     };
 
+                    if sqlite_path == ":memory:" && !skip_startup_init {
+                        match initialize_in_memory_connection(&cx2, &conn, run_migrations).await {
+                            Outcome::Ok(()) => {}
+                            Outcome::Err(error) => {
+                                crate::close_db_conn(conn, "pool in-memory schema init failed");
+                                return Outcome::Err(error);
+                            }
+                            Outcome::Cancelled(reason) => {
+                                crate::close_db_conn(
+                                    conn,
+                                    "pool in-memory schema init cancelled",
+                                );
+                                return Outcome::Cancelled(reason);
+                            }
+                            Outcome::Panicked(payload) => {
+                                crate::close_db_conn(conn, "pool in-memory schema init panicked");
+                                return Outcome::Panicked(payload);
+                            }
+                        }
+                    }
+
                     // Per-connection PRAGMAs matching legacy Python `db.py` event listeners.
                     if let Err(first_init_err) = execute_sql_with_lock_retry(
                         &conn,
@@ -3106,6 +3127,64 @@ async fn run_sqlite_init_once(
     }
 
     drop(runtime_conn);
+    Outcome::Ok(())
+}
+
+async fn initialize_in_memory_connection(
+    cx: &Cx,
+    conn: &DbConn,
+    run_migrations: bool,
+) -> Outcome<(), SqlError> {
+    if let Err(err) = conn.execute_raw(schema::PRAGMA_DB_INIT_SQL) {
+        return Outcome::Err(SqlError::Custom(format!(
+            "sqlite memory init stage=base_pragmas failed: {err}"
+        )));
+    }
+
+    if !run_migrations {
+        return Outcome::Ok(());
+    }
+
+    if let Err(err) = conn.execute_raw(&schema::init_schema_sql_base()) {
+        return Outcome::Err(SqlError::Custom(format!(
+            "sqlite memory init stage=init_schema_sql_base failed: {err}"
+        )));
+    }
+
+    match schema::migrate_to_latest_base(cx, conn).await {
+        Outcome::Ok(_) => {}
+        Outcome::Err(err) => {
+            return Outcome::Err(SqlError::Custom(format!(
+                "sqlite memory init stage=migrate_to_latest_base failed: {err}"
+            )));
+        }
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    }
+
+    match schema::migrate_runtime_canonical_followup(cx, conn).await {
+        Outcome::Ok(_) => {}
+        Outcome::Err(err) => {
+            return Outcome::Err(SqlError::Custom(format!(
+                "sqlite memory init stage=migrate_runtime_canonical_followup failed: {err}"
+            )));
+        }
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    }
+
+    if let Err(err) = schema::enforce_runtime_fts_cleanup(conn) {
+        return Outcome::Err(SqlError::Custom(format!(
+            "sqlite memory init stage=enforce_runtime_fts_cleanup failed: {err}"
+        )));
+    }
+
+    if let Err(err) = conn.execute_raw(&schema::schema_user_version_sql()) {
+        return Outcome::Err(SqlError::Custom(format!(
+            "sqlite memory init stage=schema_user_version failed: {err}"
+        )));
+    }
+
     Outcome::Ok(())
 }
 
@@ -6002,6 +6081,53 @@ pub fn get_or_create_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
     Ok(pool)
 }
 
+fn compatible_cached_memory_pool(config: &DbPoolConfig) -> DbResult<Option<Arc<Pool<DbConn>>>> {
+    if config.sqlite_path()? != ":memory:" {
+        return Ok(None);
+    }
+
+    let storage_root = config.resolved_storage_root();
+    let storage_root_identity = normalize_sqlite_identity_path(&storage_root.to_string_lossy());
+    let key_prefix = format!(":memory:|storage_root={storage_root_identity}|");
+    let cache =
+        POOL_CACHE.get_or_init(|| OrderedRwLock::new(LockLevel::DbPoolCache, HashMap::new()));
+    let guard = cache.read();
+
+    let mut candidate: Option<Arc<Pool<DbConn>>> = None;
+    for (key, weak) in guard.iter() {
+        if !key.starts_with(&key_prefix) {
+            continue;
+        }
+        let Some(shared_pool) = weak.upgrade() else {
+            continue;
+        };
+        if shared_pool.is_closed() {
+            continue;
+        }
+        match &candidate {
+            None => candidate = Some(shared_pool),
+            Some(existing) if Arc::ptr_eq(existing, &shared_pool) => {}
+            Some(_) => return Ok(None),
+        }
+    }
+
+    Ok(candidate)
+}
+
+/// Get a pool for the given config, reusing an existing compatible in-memory
+/// pool when one is already live under the same storage root.
+///
+/// This avoids splitting `sqlite:///:memory:` state across multiple pool-shape
+/// variants inside the same process. File-backed databases retain exact-shape
+/// isolation because they already share durable state through the underlying
+/// SQLite file.
+pub fn get_or_reuse_compatible_memory_pool(config: &DbPoolConfig) -> DbResult<DbPool> {
+    if let Some(shared_pool) = compatible_cached_memory_pool(config)? {
+        return DbPool::from_shared_pool(config, shared_pool);
+    }
+    get_or_create_pool(config)
+}
+
 /// Create (or reuse) a pool for the given config.
 ///
 /// This is kept for backwards compatibility with earlier skeleton code.
@@ -6507,6 +6633,51 @@ mod tests {
         assert!(table_names.contains(&"projects".to_string()));
         assert!(table_names.contains(&"agents".to_string()));
         assert!(table_names.contains(&"messages".to_string()));
+    }
+
+    #[test]
+    fn memory_pool_acquire_initializes_base_and_atc_schema() {
+        let cfg = DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = create_pool(&cfg).expect("create in-memory pool");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let conn = rt
+            .block_on(pool.acquire(&cx))
+            .into_result()
+            .expect("acquire initialized in-memory pool connection");
+
+        conn.query_sync("SELECT 1 FROM projects LIMIT 0", &[])
+            .expect("projects table should exist after acquire");
+        conn.query_sync("SELECT 1 FROM agents LIMIT 0", &[])
+            .expect("agents table should exist after acquire");
+        conn.query_sync("SELECT 1 FROM atc_experiences LIMIT 0", &[])
+            .expect("ATC follow-up schema should exist after acquire");
+
+        let fts_artifact_rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS n FROM sqlite_master \
+                 WHERE (type='table' AND name = 'fts_messages') \
+                    OR (type='trigger' AND name IN ('messages_ai', 'messages_ad', 'messages_au'))",
+                &[],
+            )
+            .expect("query runtime FTS artifacts");
+        let fts_artifact_count = fts_artifact_rows
+            .first()
+            .and_then(|row| row.get_named::<i64>("n").ok())
+            .unwrap_or_default();
+        assert_eq!(
+            fts_artifact_count, 0,
+            "in-memory pool acquire should remove legacy message FTS artifacts after runtime follow-up migrations"
+        );
     }
 
     // ── DbPoolConfig coverage ─────────────────────────────────────────
@@ -7797,6 +7968,39 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&pool_a.pool, &pool_b.pool),
             "pool cache must not alias the same sqlite file across distinct storage roots"
+        );
+    }
+
+    #[test]
+    fn get_or_reuse_compatible_memory_pool_reuses_existing_live_memory_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage_root = dir.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).unwrap();
+
+        let existing_cfg = DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            storage_root: Some(storage_root.clone()),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let reused_cfg = DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            storage_root: Some(storage_root),
+            min_connections: 25,
+            max_connections: 100,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+
+        let existing = create_pool(&existing_cfg).expect("create existing in-memory pool");
+        let reused = get_or_reuse_compatible_memory_pool(&reused_cfg)
+            .expect("reuse compatible in-memory pool");
+
+        assert!(
+            Arc::ptr_eq(&existing.pool, &reused.pool),
+            "compatible in-memory pool lookup should reuse the existing live pool"
         );
     }
 

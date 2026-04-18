@@ -1834,12 +1834,7 @@ impl Config {
         }
         let persisted_console = load_dotenv_file(&config.console_persist_path);
         let console_value = |key: &str| -> Option<String> {
-            #[cfg(test)]
-            if let Some(v) = test_env_override_value(key) {
-                return Some(v);
-            }
-            env::var(key)
-                .ok()
+            real_env_value(key)
                 .or_else(|| persisted_console.get(key).cloned())
                 .or_else(|| user_env_value(key))
         };

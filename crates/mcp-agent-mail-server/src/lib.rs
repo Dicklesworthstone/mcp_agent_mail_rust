@@ -154,8 +154,7 @@ use mcp_agent_mail_core::{
     ExperienceSubsystem, FeatureVector, NonExecutionReason, loss_to_bp, prob_to_bp,
 };
 use mcp_agent_mail_db::{
-    DbConn, DbPoolConfig, QueryTracker, active_tracker, create_pool, get_or_create_pool,
-    set_active_tracker,
+    DbConn, DbPoolConfig, QueryTracker, active_tracker, create_pool, set_active_tracker,
 };
 use mcp_agent_mail_tools::{
     AcknowledgeMessage, AcquireBuildSlot, AgentsListResource, CleanupPaneIdentities,
@@ -5613,6 +5612,15 @@ fn sweep_open_experiences_for_resolution(
     );
 }
 
+#[doc(hidden)]
+pub fn run_atc_resolution_sweep_for_integration_test(
+    pool: &mcp_agent_mail_db::DbPool,
+    now_micros: i64,
+    resolution_window_micros: i64,
+) {
+    sweep_open_experiences_for_resolution(pool, now_micros, resolution_window_micros);
+}
+
 #[allow(dead_code)]
 fn looks_like_project_slug(value: &str) -> bool {
     let trimmed = value.trim();
@@ -6119,7 +6127,9 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
         .transpose()
         .ok()
         .flatten();
-    let atc_db_pool = get_or_create_pool(&DbPoolConfig::from_env()).ok();
+    let atc_db_pool =
+        mcp_agent_mail_db::pool::get_or_reuse_compatible_memory_pool(&DbPoolConfig::from_env())
+            .ok();
     if atc_db_pool.is_none() {
         tracing::warn!("ATC durable experience append disabled: failed to acquire DB pool");
     }
@@ -11004,7 +11014,7 @@ fn record_atc_message_observations_from_tool_payload(
         return;
     }
     let atc_db_pool = if config.atc_write_mode.is_live() {
-        get_or_create_pool(&DbPoolConfig::from_env()).ok()
+        mcp_agent_mail_db::pool::get_or_reuse_compatible_memory_pool(&DbPoolConfig::from_env()).ok()
     } else {
         None
     };
@@ -11682,7 +11692,7 @@ fn record_atc_message_outcomes_from_tool_payload(
         return;
     }
     let atc_db_pool = if config.atc_write_mode.is_live() {
-        get_or_create_pool(&DbPoolConfig::from_env()).ok()
+        mcp_agent_mail_db::pool::get_or_reuse_compatible_memory_pool(&DbPoolConfig::from_env()).ok()
     } else {
         None
     };
@@ -11869,7 +11879,7 @@ fn resolve_domain_event_context(
     project_hint: Option<&str>,
     agent_hint: Option<&str>,
 ) -> DomainEventContext {
-    let project = project_hint.map(str::to_string).or_else(|| {
+    let project = project_hint.map(|value| normalize_project_value(value.to_string())).or_else(|| {
         extract_arg_str(
             call_args,
             &["project_key", "project", "human_key", "project_slug"],
@@ -15893,7 +15903,7 @@ first body
     fn atc_durable_experience_store_is_disabled_for_file_backed_mailboxes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("atc-file-backed.sqlite3");
-        let pool = get_or_create_pool(&DbPoolConfig {
+        let pool = mcp_agent_mail_db::get_or_create_pool(&DbPoolConfig {
             database_url: format!("sqlite:///{}", db_path.display()),
             min_connections: 0,
             max_connections: 1,
@@ -16316,7 +16326,7 @@ first body
         let cx = Cx::for_testing();
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("conflict-resolution-file-backed.db");
-        let pool = get_or_create_pool(&DbPoolConfig {
+        let pool = mcp_agent_mail_db::get_or_create_pool(&DbPoolConfig {
             database_url: format!("sqlite:///{}", db_path.display()),
             min_connections: 0,
             max_connections: 1,
@@ -24092,6 +24102,267 @@ first body
     }
 
     #[test]
+    fn send_message_atc_observation_appends_once_from_tool_contents() {
+        let _guard = atc::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_atc_message_observation_cache_for_test();
+        mcp_agent_mail_core::Config::reset_cached();
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let storage_root_str = storage_root
+            .to_str()
+            .expect("utf8 storage root")
+            .to_string();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_ATC_WRITE_MODE", "live"),
+                ("DATABASE_URL", "sqlite:///:memory:"),
+                ("DATABASE_POOL_SIZE", "1"),
+                ("DATABASE_MAX_OVERFLOW", "0"),
+                ("STORAGE_ROOT", storage_root_str.as_str()),
+            ],
+            || {
+                mcp_agent_mail_core::Config::reset_cached();
+                let pool = mcp_agent_mail_db::get_or_create_pool(&DbPoolConfig::from_env())
+                    .expect("create shared pool");
+                let cx = Cx::for_testing();
+                let call_args = serde_json::json!({
+                    "project_key": "/tmp/alpha",
+                    "sender_name": "RedFox"
+                });
+                let payload = serde_json::json!({
+                    "deliveries": [{
+                        "project": "/tmp/alpha",
+                        "payload": {
+                            "id": 4202,
+                            "from": "RedFox",
+                            "to": ["BlueLake"],
+                            "subject": "From tool contents",
+                            "thread_id": "br-bn0vb.14",
+                            "ack_required": true,
+                            "importance": "high"
+                        }
+                    }],
+                    "count": 1
+                });
+                let contents = vec![Content::Text {
+                    text: payload.to_string(),
+                }];
+
+                record_atc_message_observations_from_tool_contents(
+                    "send_message",
+                    Some(&call_args),
+                    &contents,
+                    None,
+                    Some("RedFox"),
+                );
+
+                let rows = block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
+                    &cx,
+                    &pool,
+                    Some("RedFox"),
+                    10,
+                ))
+                .into_result()
+                .expect("fetch send ATC experiences from tool contents");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].decision_class, "message_sent");
+                assert_eq!(rows[0].state, ExperienceState::Executed);
+                assert_eq!(
+                    rows[0]
+                        .context
+                        .as_ref()
+                        .and_then(|value| value.get("message_id"))
+                        .and_then(serde_json::Value::as_i64),
+                    Some(4202)
+                );
+            },
+        );
+
+        mcp_agent_mail_core::Config::reset_cached();
+        reset_atc_message_observation_cache_for_test();
+    }
+
+    #[test]
+    fn send_message_atc_observation_appends_once_from_tool_payload_via_env_pool() {
+        let _guard = atc::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_atc_message_observation_cache_for_test();
+        mcp_agent_mail_core::Config::reset_cached();
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let storage_root_str = storage_root
+            .to_str()
+            .expect("utf8 storage root")
+            .to_string();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_ATC_WRITE_MODE", "live"),
+                ("DATABASE_URL", "sqlite:///:memory:"),
+                ("DATABASE_POOL_SIZE", "1"),
+                ("DATABASE_MAX_OVERFLOW", "0"),
+                ("STORAGE_ROOT", storage_root_str.as_str()),
+            ],
+            || {
+                mcp_agent_mail_core::Config::reset_cached();
+                let pool = mcp_agent_mail_db::get_or_create_pool(&DbPoolConfig::from_env())
+                    .expect("create shared pool");
+                assert!(mcp_agent_mail_core::Config::get().atc_write_mode.is_live());
+                let cx = Cx::for_testing();
+                let call_args = serde_json::json!({
+                    "project_key": "/tmp/alpha",
+                    "sender_name": "RedFox"
+                });
+                let payload = serde_json::json!({
+                    "deliveries": [{
+                        "project": "/tmp/alpha",
+                        "payload": {
+                            "id": 4203,
+                            "from": "RedFox",
+                            "to": ["BlueLake"],
+                            "subject": "From tool payload",
+                            "thread_id": "br-bn0vb.14",
+                            "ack_required": true,
+                            "importance": "high"
+                        }
+                    }],
+                    "count": 1
+                });
+
+                record_atc_message_observations_from_tool_payload(
+                    "send_message",
+                    Some(&call_args),
+                    &payload,
+                    None,
+                    Some("RedFox"),
+                );
+
+                let rows = block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
+                    &cx,
+                    &pool,
+                    Some("RedFox"),
+                    10,
+                ))
+                .into_result()
+                .expect("fetch send ATC experiences from tool payload via env pool");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].decision_class, "message_sent");
+                assert_eq!(rows[0].state, ExperienceState::Executed);
+                assert_eq!(
+                    rows[0]
+                        .context
+                        .as_ref()
+                        .and_then(|value| value.get("message_id"))
+                        .and_then(serde_json::Value::as_i64),
+                    Some(4203)
+                );
+            },
+        );
+
+        mcp_agent_mail_core::Config::reset_cached();
+        reset_atc_message_observation_cache_for_test();
+    }
+
+    #[test]
+    fn send_message_atc_observation_appends_once_with_explicit_env_pool_and_call_args() {
+        let _guard = atc::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_atc_message_observation_cache_for_test();
+        mcp_agent_mail_core::Config::reset_cached();
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage-root");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        let storage_root_str = storage_root
+            .to_str()
+            .expect("utf8 storage root")
+            .to_string();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_ATC_WRITE_MODE", "live"),
+                ("DATABASE_URL", "sqlite:///:memory:"),
+                ("DATABASE_POOL_SIZE", "1"),
+                ("DATABASE_MAX_OVERFLOW", "0"),
+                ("STORAGE_ROOT", storage_root_str.as_str()),
+            ],
+            || {
+                mcp_agent_mail_core::Config::reset_cached();
+                let pool = mcp_agent_mail_db::get_or_create_pool(&DbPoolConfig::from_env())
+                    .expect("create shared pool");
+                let helper_pool = mcp_agent_mail_db::pool::get_or_reuse_compatible_memory_pool(
+                    &DbPoolConfig::from_env(),
+                )
+                .expect("reuse compatible env pool");
+                assert_eq!(helper_pool.sqlite_path(), ":memory:");
+                assert!(mcp_agent_mail_core::Config::get().atc_write_mode.is_live());
+
+                let cx = Cx::for_testing();
+                let call_args = serde_json::json!({
+                    "project_key": "/tmp/alpha",
+                    "sender_name": "RedFox"
+                });
+                let payload = serde_json::json!({
+                    "deliveries": [{
+                        "project": "/tmp/alpha",
+                        "payload": {
+                            "id": 4204,
+                            "from": "RedFox",
+                            "to": ["BlueLake"],
+                            "subject": "From explicit env pool",
+                            "thread_id": "br-bn0vb.14",
+                            "ack_required": true,
+                            "importance": "high"
+                        }
+                    }],
+                    "count": 1
+                });
+
+                record_atc_message_observations_from_tool_payload_with_pool(
+                    "send_message",
+                    Some(&call_args),
+                    &payload,
+                    None,
+                    Some("RedFox"),
+                    Some(&helper_pool),
+                );
+
+                let rows = block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
+                    &cx,
+                    &pool,
+                    Some("RedFox"),
+                    10,
+                ))
+                .into_result()
+                .expect("fetch send ATC experiences with explicit env pool and call args");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].decision_class, "message_sent");
+                assert_eq!(rows[0].state, ExperienceState::Executed);
+                assert_eq!(
+                    rows[0]
+                        .context
+                        .as_ref()
+                        .and_then(|value| value.get("message_id"))
+                        .and_then(serde_json::Value::as_i64),
+                    Some(4204)
+                );
+            },
+        );
+
+        mcp_agent_mail_core::Config::reset_cached();
+        reset_atc_message_observation_cache_for_test();
+    }
+
+    #[test]
     fn fetch_inbox_atc_observation_appends_one_row_per_message() {
         let _guard = atc::GLOBAL_ATC_TEST_LOCK
             .lock()
@@ -24183,6 +24454,68 @@ first body
                 .into_result()
                 .expect("fetch replayed inbox ATC experiences");
                 assert_eq!(replay_rows.len(), 3);
+            },
+        );
+
+        mcp_agent_mail_core::Config::reset_cached();
+        reset_atc_message_observation_cache_for_test();
+    }
+
+    #[test]
+    fn fetch_inbox_atc_observation_dedupes_raw_and_normalized_project_hints() {
+        let _guard = atc::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_atc_message_observation_cache_for_test();
+        mcp_agent_mail_core::Config::reset_cached();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ATC_WRITE_MODE", "live")],
+            || {
+                mcp_agent_mail_core::Config::reset_cached();
+                let pool = atc_message_test_pool();
+                let cx = Cx::for_testing();
+                let raw_project = "/tmp/alpha";
+                let normalized_project = normalize_project_value(raw_project.to_string());
+                let call_args = serde_json::json!({
+                    "project_key": raw_project,
+                    "agent_name": "BlueLake"
+                });
+                let payload = serde_json::json!([{
+                    "id": 5104,
+                    "from": "RedFox",
+                    "subject": "one",
+                    "thread_id": "br-bn0vb.14"
+                }]);
+
+                record_atc_message_observations_from_tool_payload_with_pool(
+                    "fetch_inbox",
+                    Some(&call_args),
+                    &payload,
+                    Some(raw_project),
+                    None,
+                    Some(&pool),
+                );
+                record_atc_message_observations_from_tool_payload_with_pool(
+                    "fetch_inbox",
+                    Some(&call_args),
+                    &payload,
+                    Some(&normalized_project),
+                    None,
+                    Some(&pool),
+                );
+
+                let rows = block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
+                    &cx,
+                    &pool,
+                    Some("BlueLake"),
+                    10,
+                ))
+                .into_result()
+                .expect("fetch inbox ATC experiences after mixed project hints");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].decision_class, "message_received");
+                assert_eq!(rows[0].project_key.as_deref(), Some(normalized_project.as_str()));
             },
         );
 
