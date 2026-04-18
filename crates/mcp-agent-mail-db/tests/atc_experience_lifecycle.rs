@@ -19,11 +19,11 @@ use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use mcp_agent_mail_core::experience::{
     EffectKind, ExperienceOutcome, ExperienceRow, ExperienceState, ExperienceSubsystem,
-    FeatureVector, NonExecutionReason,
+    FeatureVector, NonExecutionReason, ResolutionKind,
 };
 use mcp_agent_mail_db::queries::{
     append_atc_experience, fetch_open_atc_experiences, resolve_atc_experience,
-    transition_atc_experience, update_atc_experience_rollup,
+    resolve_experience, transition_atc_experience, update_atc_experience_rollup,
 };
 use mcp_agent_mail_db::{DbConn, DbPool, DbPoolConfig, create_pool};
 
@@ -452,6 +452,253 @@ fn idempotent_append() {
         eprintln!(
             "[IDEMPOTENT] OK: same experience_id={}",
             first.experience_id
+        );
+    });
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// resolve_experience() tests
+// ──────────────────────────────────────────────────────────────────────
+
+fn advance_to_open(
+    rt: &asupersync::runtime::Runtime,
+    cx: &Cx,
+    pool: &DbPool,
+    decision_id: u64,
+    effect_id: u64,
+    subject: &str,
+) -> u64 {
+    rt.block_on(async {
+        let row = make_probe_experience(decision_id, effect_id, subject);
+        let stored = append_atc_experience(cx, pool, &row)
+            .await
+            .into_result()
+            .expect("append");
+        let eid = stored.experience_id;
+        for (state, ts) in [
+            (ExperienceState::Dispatched, 1_700_000_000_100_000i64),
+            (ExperienceState::Executed, 1_700_000_000_200_000),
+            (ExperienceState::Open, 1_700_000_000_300_000),
+        ] {
+            transition_atc_experience(cx, pool, eid, state, ts, None, None)
+                .await
+                .into_result()
+                .expect("transition");
+        }
+        eid
+    })
+}
+
+#[test]
+fn resolve_experience_resolved_happy_path() {
+    let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+    let (cx, pool, _dir) = setup_real_db(&rt, "resolve_exp_resolved.db");
+    let eid = advance_to_open(&rt, &cx, &pool, 2000, 2001, "Agent_R1");
+
+    rt.block_on(async {
+        let outcome = ExperienceOutcome {
+            observed_ts_micros: 1_700_000_000_500_000,
+            label: "probe_responded".to_string(),
+            correct: true,
+            actual_loss: Some(0.3),
+            regret: Some(0.0),
+            evidence: None,
+        };
+        let kind = ResolutionKind::Resolved(outcome);
+        resolve_experience(&cx, &pool, eid, &kind)
+            .await
+            .into_result()
+            .expect("resolve resolved");
+
+        let open = fetch_open_atc_experiences(&cx, &pool, Some("Agent_R1"), 10)
+            .await
+            .into_result()
+            .expect("fetch open");
+        assert_eq!(open.len(), 0, "resolved experience must not appear in open list");
+    });
+}
+
+#[test]
+fn resolve_experience_censored_happy_path() {
+    let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+    let (cx, pool, _dir) = setup_real_db(&rt, "resolve_exp_censored.db");
+    let eid = advance_to_open(&rt, &cx, &pool, 2100, 2101, "Agent_C1");
+
+    rt.block_on(async {
+        let kind = ResolutionKind::Censored {
+            ts_micros: 1_700_000_000_600_000,
+        };
+        resolve_experience(&cx, &pool, eid, &kind)
+            .await
+            .into_result()
+            .expect("resolve censored");
+
+        let open = fetch_open_atc_experiences(&cx, &pool, Some("Agent_C1"), 10)
+            .await
+            .into_result()
+            .expect("fetch open");
+        assert_eq!(open.len(), 0);
+    });
+}
+
+#[test]
+fn resolve_experience_expired_happy_path() {
+    let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+    let (cx, pool, _dir) = setup_real_db(&rt, "resolve_exp_expired.db");
+    let eid = advance_to_open(&rt, &cx, &pool, 2200, 2201, "Agent_E1");
+
+    rt.block_on(async {
+        let kind = ResolutionKind::Expired {
+            ts_micros: 1_700_000_000_700_000,
+        };
+        resolve_experience(&cx, &pool, eid, &kind)
+            .await
+            .into_result()
+            .expect("resolve expired");
+
+        let open = fetch_open_atc_experiences(&cx, &pool, Some("Agent_E1"), 10)
+            .await
+            .into_result()
+            .expect("fetch open");
+        assert_eq!(open.len(), 0);
+    });
+}
+
+#[test]
+fn resolve_experience_idempotent_same_outcome() {
+    let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+    let (cx, pool, _dir) = setup_real_db(&rt, "resolve_exp_idempotent.db");
+    let eid = advance_to_open(&rt, &cx, &pool, 2300, 2301, "Agent_I1");
+
+    rt.block_on(async {
+        let outcome = ExperienceOutcome {
+            observed_ts_micros: 1_700_000_000_500_000,
+            label: "probe_responded".to_string(),
+            correct: true,
+            actual_loss: Some(0.1),
+            regret: Some(0.0),
+            evidence: None,
+        };
+        let kind = ResolutionKind::Resolved(outcome.clone());
+
+        resolve_experience(&cx, &pool, eid, &kind)
+            .await
+            .into_result()
+            .expect("first resolve");
+
+        resolve_experience(&cx, &pool, eid, &kind)
+            .await
+            .into_result()
+            .expect("idempotent second resolve must succeed");
+    });
+}
+
+#[test]
+fn resolve_experience_idempotent_censored() {
+    let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+    let (cx, pool, _dir) = setup_real_db(&rt, "resolve_exp_idem_censor.db");
+    let eid = advance_to_open(&rt, &cx, &pool, 2400, 2401, "Agent_IC");
+
+    rt.block_on(async {
+        let kind = ResolutionKind::Censored { ts_micros: 1_700_000_001_000_000 };
+        resolve_experience(&cx, &pool, eid, &kind)
+            .await
+            .into_result()
+            .expect("first censor");
+        resolve_experience(&cx, &pool, eid, &kind)
+            .await
+            .into_result()
+            .expect("idempotent censor must succeed");
+    });
+}
+
+#[test]
+fn resolve_experience_conflicting_re_resolve_rejected() {
+    let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+    let (cx, pool, _dir) = setup_real_db(&rt, "resolve_exp_conflict.db");
+    let eid = advance_to_open(&rt, &cx, &pool, 2500, 2501, "Agent_X1");
+
+    rt.block_on(async {
+        let outcome = ExperienceOutcome {
+            observed_ts_micros: 1_700_000_000_500_000,
+            label: "correct".to_string(),
+            correct: true,
+            actual_loss: Some(0.0),
+            regret: Some(0.0),
+            evidence: None,
+        };
+        resolve_experience(&cx, &pool, eid, &ResolutionKind::Resolved(outcome))
+            .await
+            .into_result()
+            .expect("first resolve");
+
+        let conflict = resolve_experience(
+            &cx,
+            &pool,
+            eid,
+            &ResolutionKind::Expired { ts_micros: 1_700_000_002_000_000 },
+        )
+        .await;
+
+        assert!(
+            matches!(conflict, asupersync::Outcome::Err(ref e) if matches!(e, mcp_agent_mail_db::DbError::InvalidArgument { .. })),
+            "conflicting re-resolve must be rejected, got: {conflict:?}"
+        );
+    });
+}
+
+#[test]
+fn resolve_experience_not_open_rejected() {
+    let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+    let (cx, pool, _dir) = setup_real_db(&rt, "resolve_exp_not_open.db");
+
+    rt.block_on(async {
+        let row = make_probe_experience(2600, 2601, "Agent_N1");
+        let stored = append_atc_experience(&cx, &pool, &row)
+            .await
+            .into_result()
+            .expect("append");
+        let eid = stored.experience_id;
+
+        transition_atc_experience(
+            &cx, &pool, eid, ExperienceState::Dispatched, 1_700_000_000_100_000, None, None,
+        )
+        .await
+        .into_result()
+        .expect("dispatch");
+
+        let result = resolve_experience(
+            &cx,
+            &pool,
+            eid,
+            &ResolutionKind::Expired { ts_micros: 1_700_000_002_000_000 },
+        )
+        .await;
+
+        assert!(
+            matches!(result, asupersync::Outcome::Err(ref e) if matches!(e, mcp_agent_mail_db::DbError::InvalidArgument { .. })),
+            "resolving non-open experience must be rejected, got: {result:?}"
+        );
+    });
+}
+
+#[test]
+fn resolve_experience_not_found() {
+    let rt = RuntimeBuilder::current_thread().build().expect("runtime");
+    let (cx, pool, _dir) = setup_real_db(&rt, "resolve_exp_notfound.db");
+
+    rt.block_on(async {
+        let result = resolve_experience(
+            &cx,
+            &pool,
+            999_999,
+            &ResolutionKind::Expired { ts_micros: 1_700_000_000_000_000 },
+        )
+        .await;
+
+        assert!(
+            matches!(result, asupersync::Outcome::Err(ref e) if matches!(e, mcp_agent_mail_db::DbError::NotFound { .. })),
+            "non-existent experience must return NotFound, got: {result:?}"
         );
     });
 }

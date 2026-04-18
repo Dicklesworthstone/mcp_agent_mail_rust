@@ -406,6 +406,46 @@ pub struct ExperienceOutcome {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Resolution kind (unified terminal Open→ transition)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Which terminal state an Open experience should transition to.
+///
+/// Used by `resolve_experience()` in the DB layer to unify the three
+/// Open→{Resolved, Censored, Expired} transitions behind a single
+/// entry point with idempotency and conflict detection.
+#[derive(Debug, Clone)]
+pub enum ResolutionKind {
+    /// Outcome observed — carries the full attribution record.
+    Resolved(ExperienceOutcome),
+    /// Outcome unobservable (agent departed, project closed, etc).
+    Censored { ts_micros: i64 },
+    /// Resolution window elapsed without observation.
+    Expired { ts_micros: i64 },
+}
+
+impl ResolutionKind {
+    /// The target [`ExperienceState`] for this resolution.
+    #[must_use]
+    pub const fn target_state(&self) -> ExperienceState {
+        match self {
+            Self::Resolved(_) => ExperienceState::Resolved,
+            Self::Censored { .. } => ExperienceState::Censored,
+            Self::Expired { .. } => ExperienceState::Expired,
+        }
+    }
+
+    /// The resolution timestamp (microseconds since epoch).
+    #[must_use]
+    pub fn ts_micros(&self) -> i64 {
+        match self {
+            Self::Resolved(outcome) => outcome.observed_ts_micros,
+            Self::Censored { ts_micros } | Self::Expired { ts_micros } => *ts_micros,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // Canonical experience row
 // ──────────────────────────────────────────────────────────────────────
 

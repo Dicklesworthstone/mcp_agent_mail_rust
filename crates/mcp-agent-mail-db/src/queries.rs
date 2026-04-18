@@ -20,7 +20,7 @@ use asupersync::time::{sleep, wall_now};
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 use mcp_agent_mail_core::{
     ExperienceOutcome, ExperienceRow, ExperienceState, FeatureExtension, FeatureVector,
-    NonExecutionReason, validate_transition,
+    NonExecutionReason, ResolutionKind, validate_transition,
 };
 use serde::de::DeserializeOwned;
 use sqlmodel::prelude::*;
@@ -1750,6 +1750,107 @@ fn resolve_atc_experience_file_backed(
         rollback_canonical_atc_write_tx(&conn);
     }
     close_canonical_db_conn(conn, "canonical ATC resolve connection");
+    result
+}
+
+fn resolve_experience_file_backed(
+    pool: &DbPool,
+    experience_id: u64,
+    resolution: &ResolutionKind,
+) -> std::result::Result<(), DbError> {
+    let id = i64::try_from(experience_id).map_err(|_| {
+        DbError::Internal(format!(
+            "experience_id exceeds SQLite INTEGER range: {experience_id}"
+        ))
+    })?;
+
+    let conn = open_canonical_atc_conn(pool, "resolve_experience")?;
+    let result = (|| {
+        begin_canonical_atc_write_tx(&conn)?;
+
+        let select_sql =
+            "SELECT state FROM atc_experiences WHERE experience_id = ? LIMIT 1";
+        let rows = canonical_query_atc_rows(
+            &conn,
+            select_sql,
+            &[Value::BigInt(id)],
+            "resolve_experience select",
+        )?;
+        let row = rows.first().ok_or_else(|| {
+            DbError::not_found("experience", experience_id.to_string())
+        })?;
+        let current_state: ExperienceState =
+            parse_enum(row_text(row, 0, "state")?, "state")?;
+        let target = resolution.target_state();
+
+        if current_state == target {
+            return Ok(());
+        }
+        if current_state.is_terminal() {
+            return Err(DbError::invalid(
+                "state",
+                format!(
+                    "experience {experience_id} already terminal as {current_state}, \
+                     cannot re-resolve as {target}"
+                ),
+            ));
+        }
+        if current_state != ExperienceState::Open {
+            return Err(DbError::invalid(
+                "state",
+                format!(
+                    "experience {experience_id} is {current_state}, must be open to resolve"
+                ),
+            ));
+        }
+
+        match resolution {
+            ResolutionKind::Resolved(outcome) => {
+                let outcome_json = encode_json(outcome, "outcome_json")?;
+                let sql = "UPDATE atc_experiences \
+                           SET state = 'resolved', resolved_ts = ?, outcome_json = ? \
+                           WHERE experience_id = ?";
+                canonical_execute_atc(
+                    &conn,
+                    sql,
+                    &[
+                        Value::BigInt(outcome.observed_ts_micros),
+                        Value::Text(outcome_json),
+                        Value::BigInt(id),
+                    ],
+                    "resolve_experience resolved",
+                )?;
+            }
+            ResolutionKind::Censored { ts_micros } => {
+                let sql = "UPDATE atc_experiences \
+                           SET state = 'censored', resolved_ts = ? \
+                           WHERE experience_id = ?";
+                canonical_execute_atc(
+                    &conn,
+                    sql,
+                    &[Value::BigInt(*ts_micros), Value::BigInt(id)],
+                    "resolve_experience censored",
+                )?;
+            }
+            ResolutionKind::Expired { ts_micros } => {
+                let sql = "UPDATE atc_experiences \
+                           SET state = 'expired', resolved_ts = ? \
+                           WHERE experience_id = ?";
+                canonical_execute_atc(
+                    &conn,
+                    sql,
+                    &[Value::BigInt(*ts_micros), Value::BigInt(id)],
+                    "resolve_experience expired",
+                )?;
+            }
+        }
+
+        commit_canonical_atc_write_tx(&conn)
+    })();
+    if result.is_err() {
+        rollback_canonical_atc_write_tx(&conn);
+    }
+    close_canonical_db_conn(conn, "canonical ATC resolve_experience connection");
     result
 }
 
@@ -9908,6 +10009,147 @@ pub async fn resolve_atc_experience(
         Value::Text(outcome_json),
         Value::BigInt(id),
     ];
+
+    match traw_execute(cx, &tracked, sql, &params).await {
+        Outcome::Ok(_) => Outcome::Ok(()),
+        Outcome::Err(error) => Outcome::Err(DbError::Internal(format!(
+            "failed to resolve experience {experience_id}: {error}"
+        ))),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
+/// Resolve an ATC experience to any terminal resolution state.
+///
+/// Handles Open → {Resolved, Censored, Expired} transitions with:
+///
+/// - **Idempotent same-outcome**: If the experience is already in the
+///   requested terminal state, returns `Ok(())` without mutation.
+/// - **Conflict rejection**: If the experience is already in a *different*
+///   terminal state, returns `InvalidArgument`.
+/// - **Pre-condition check**: If the experience is not in `Open` state
+///   (and not already terminal), returns `InvalidArgument`.
+/// - **Not-found**: If the experience_id doesn't exist, returns `NotFound`.
+pub async fn resolve_experience(
+    cx: &Cx,
+    pool: &DbPool,
+    experience_id: u64,
+    resolution: &ResolutionKind,
+) -> Outcome<(), DbError> {
+    if pool.sqlite_path() != ":memory:" {
+        match ensure_file_backed_atc_pool_initialized(cx, pool).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+        return match resolve_experience_file_backed(pool, experience_id, resolution) {
+            Ok(()) => Outcome::Ok(()),
+            Err(error) => Outcome::Err(error),
+        };
+    }
+
+    let id = match i64::try_from(experience_id) {
+        Ok(value) => value,
+        Err(_) => {
+            return Outcome::Err(DbError::Internal(format!(
+                "experience_id exceeds SQLite INTEGER range: {experience_id}"
+            )));
+        }
+    };
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    let select_sql = "SELECT state FROM atc_experiences WHERE experience_id = ? LIMIT 1";
+    let rows = match traw_query(cx, &tracked, select_sql, &[Value::BigInt(id)]).await {
+        Outcome::Ok(r) => r,
+        Outcome::Err(error) => {
+            return Outcome::Err(DbError::Internal(format!(
+                "resolve_experience select failed: {error}"
+            )));
+        }
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let row = match rows.first() {
+        Some(r) => r,
+        None => {
+            return Outcome::Err(DbError::not_found(
+                "experience",
+                experience_id.to_string(),
+            ));
+        }
+    };
+
+    let current_state: ExperienceState = match row_text(row, 0, "state")
+        .and_then(|raw| parse_enum(raw, "state"))
+    {
+        Ok(s) => s,
+        Err(e) => return Outcome::Err(e),
+    };
+
+    let target = resolution.target_state();
+
+    if current_state == target {
+        return Outcome::Ok(());
+    }
+    if current_state.is_terminal() {
+        return Outcome::Err(DbError::invalid(
+            "state",
+            format!(
+                "experience {experience_id} already terminal as {current_state}, \
+                 cannot re-resolve as {target}"
+            ),
+        ));
+    }
+    if current_state != ExperienceState::Open {
+        return Outcome::Err(DbError::invalid(
+            "state",
+            format!(
+                "experience {experience_id} is {current_state}, must be open to resolve"
+            ),
+        ));
+    }
+
+    let (sql, params) = match resolution {
+        ResolutionKind::Resolved(outcome) => {
+            let outcome_json = match encode_json(outcome, "outcome_json") {
+                Ok(v) => v,
+                Err(e) => return Outcome::Err(e),
+            };
+            (
+                "UPDATE atc_experiences \
+                 SET state = 'resolved', resolved_ts = ?, outcome_json = ? \
+                 WHERE experience_id = ?",
+                vec![
+                    Value::BigInt(outcome.observed_ts_micros),
+                    Value::Text(outcome_json),
+                    Value::BigInt(id),
+                ],
+            )
+        }
+        ResolutionKind::Censored { ts_micros } => (
+            "UPDATE atc_experiences \
+             SET state = 'censored', resolved_ts = ? \
+             WHERE experience_id = ?",
+            vec![Value::BigInt(*ts_micros), Value::BigInt(id)],
+        ),
+        ResolutionKind::Expired { ts_micros } => (
+            "UPDATE atc_experiences \
+             SET state = 'expired', resolved_ts = ? \
+             WHERE experience_id = ?",
+            vec![Value::BigInt(*ts_micros), Value::BigInt(id)],
+        ),
+    };
 
     match traw_execute(cx, &tracked, sql, &params).await {
         Outcome::Ok(_) => Outcome::Ok(()),
