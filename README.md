@@ -639,7 +639,7 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 | `am robot contacts` | Contact graph and policy surface | `--format`, `--project`, `--agent` |
 | `am robot projects` | Per-project aggregate stats | `--format`, `--project`, `--agent` |
 | `am robot attachments` | Attachment inventory and provenance | `--format`, `--project`, `--agent` |
-| `am robot atc` | Lightweight ATC availability and requested-subsystem snapshot | `--decisions`, `--liveness`, `--conflicts`, `--summary`, `--limit` |
+| `am robot atc` | Live ATC snapshot with local DB fallback when the server is unavailable | `--since`, `--stratum`, `--summary-only`, `--limit` |
 
 ### Output Formats
 
@@ -647,7 +647,7 @@ Non-interactive, agent-first CLI surface for TUI-equivalent situational awarenes
 - **`json`** (default when piped): Machine-readable envelope with `_meta`, `_alerts`, `_actions`
 - **`md`** (thread/message-focused): Human-readable narrative for deep context
 
-`am robot atc` is intentionally lightweight today. The ATC engine runs inside the server process, so the robot CLI reports availability and intent flags, while the live TUI/System Health surface remains the authoritative UI for current ATC state.
+`am robot atc` reads the live ATC snapshot over `/mail/ws-state` when the local server is running and falls back to a local SQLite rollup/liveness view when that snapshot is unavailable. Use `--since` to trim recent decisions/executions, `--stratum` to focus open-stratum counts, and `--summary-only` for the compact health view.
 
 ### Agent Workflow Recipes
 

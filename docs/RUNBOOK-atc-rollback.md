@@ -187,7 +187,7 @@ am serve-http
   (e.g., releasing reservations for active agents, sending advisories to
   non-existent agents)
 - Operators observe ATC actions that contradict known agent state
-- `am robot atc --summary` shows high regret or anomalous decision counts
+- `am robot atc --summary-only` shows high regret or anomalous decision counts
 
 ### Rollback procedure
 

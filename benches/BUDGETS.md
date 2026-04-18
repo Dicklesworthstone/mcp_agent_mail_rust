@@ -25,6 +25,7 @@ treated as portable absolutes.
 - **Canonical wrapper**: `scripts/bench_baseline.sh`
 - **Latest successful cold-harness bundle**: `tests/artifacts/bench/archive/1776505951_367469/summary.json`
 - **Latest warm-path profile artifacts**: `tests/artifacts/perf/archive_batch_100_profile.md`, `tests/artifacts/perf/archive_batch_scaling.csv`, `tests/artifacts/perf/archive_batch_100_spans.json`
+- **Latest dated supplement copies**: `tests/artifacts/perf/archive_batch_100_flamegraph_2026-04-18.svg`, `tests/artifacts/perf/archive_batch_scaling_2026-04-18.csv`, `tests/artifacts/perf/archive_batch_100_spans_2026-04-18.json`
 
 ### Re-running the archive baseline
 
@@ -47,6 +48,9 @@ The wrapper:
 2. Runs `MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 rch exec -- cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch`
 3. Copies the `archive_batch_*` raw artifacts into `tests/artifacts/bench/archive_baseline/<run_id>/`
 4. Emits `fingerprint.json` and `summary.json` for machine diffing / future perf-gate ingestion
+
+Artifact supplement note (`br-8qdh0.10`):
+- the warm-path profile contract now requires six scaling points (`1/10/50/100/500/1000`), Chrome-trace-compatible span JSON (`traceEvents`), and explicit `perf.profile.*` structured logging fields for reruns
 
 Current blocker on `2026-04-18`:
 - fresh reruns from the shared checkout and clean detached worktrees at `f19dd828`, `1d83c6b7`, and `99bc2663` all fail before measurement because `mcp-agent-mail-server` expects `metrics::AtcMetricsSnapshot` / `global_metrics().atc`

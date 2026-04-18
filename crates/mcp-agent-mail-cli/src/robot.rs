@@ -1107,7 +1107,15 @@ struct AtcRobotSnapshot {
     enabled: bool,
     source: String,
     safe_mode: bool,
+    #[serde(default)]
+    kill_switch_enabled: bool,
     tick_count: u64,
+    #[serde(default)]
+    experiences_open: usize,
+    #[serde(default)]
+    experiences_resolved: u64,
+    #[serde(default)]
+    policy_revision: u64,
     #[serde(default)]
     tracked_agents: Vec<AtcRobotAgent>,
     deadlock_cycles: usize,
@@ -1136,6 +1144,8 @@ struct AtcRobotSnapshot {
     budget: AtcRobotBudget,
     #[serde(default)]
     policy: AtcRobotPolicy,
+    #[serde(default)]
+    observability: AtcRobotObservability,
     #[serde(default)]
     note: Option<String>,
 }
@@ -1177,6 +1187,49 @@ struct AtcRobotBudget {
     utilization_ratio: f64,
     slow_window_utilization: f64,
     kernel_total_micros: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AtcRobotHistogramSnapshot {
+    count: u64,
+    sum: u64,
+    min: u64,
+    max: u64,
+    p50: u64,
+    p95: u64,
+    p99: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AtcRobotObservability {
+    #[serde(default)]
+    experiences_written_total: u64,
+    #[serde(default)]
+    experiences_written_by_kind: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    experiences_resolved_total: u64,
+    #[serde(default)]
+    experiences_resolved_by_outcome: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    experiences_open_by_stratum: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    sweep_duration_micros: std::collections::BTreeMap<String, AtcRobotHistogramSnapshot>,
+    #[serde(default)]
+    sweep_rows_resolved_total: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    rollup_refresh_latency_micros: AtcRobotHistogramSnapshot,
+    #[serde(default)]
+    retention_rows_deleted_total: u64,
+    #[serde(default)]
+    kill_switch_enabled_gauge: u64,
+    #[serde(default)]
+    decision_latency_micros: std::collections::BTreeMap<String, AtcRobotHistogramSnapshot>,
+    #[serde(default)]
+    safe_mode_transitions_total: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    shadow_events_total: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    derivation_errors_total: std::collections::BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1287,8 +1340,14 @@ struct AtcSummaryData {
     enabled: bool,
     source: String,
     safe_mode: bool,
+    kill_switch_enabled: bool,
     tick_count: u64,
     decisions_total: u64,
+    experiences_total: u64,
+    experiences_open: u64,
+    experiences_resolved: u64,
+    experiences_censored: u64,
+    experiences_expired: u64,
     tracked_agents: usize,
     degraded_agents: usize,
     deadlock_cycles: usize,
@@ -1299,6 +1358,7 @@ struct AtcSummaryData {
     last_tick_budget_micros: u64,
     last_tick_budget_exceeded: bool,
     outer_loop_overhead_micros: u64,
+    write_mode: String,
     executor_mode: String,
     executor_pending_effects: usize,
     budget_mode: String,
@@ -1339,6 +1399,18 @@ struct AtcSummaryData {
     gating_stage_micros: u64,
     slow_control_micros: u64,
     summary_stage_micros: u64,
+    policy_revision: u64,
+    policy_version: String,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    resolved_outcomes: std::collections::BTreeMap<String, u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    open_strata: Vec<AtcStratumData>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AtcStratumData {
+    stratum: String,
+    open_experiences: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1407,6 +1479,10 @@ struct AtcData {
     source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stratum: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     summary: Option<AtcSummaryData>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1576,20 +1652,17 @@ pub enum RobotSubcommand {
     Attachments,
 
     // ── Track 5: Air Traffic Controller ─────────────────────────────────
-    /// ATC status: liveness assessments, conflicts, calibration, decisions.
+    /// ATC snapshot: live server state with local DB fallback when unavailable.
     Atc {
-        /// Show recent ATC decisions.
+        /// Show only decisions/executions at or after this ISO-8601 timestamp.
         #[arg(long)]
-        decisions: bool,
-        /// Show agent liveness assessments.
+        since: Option<String>,
+        /// Filter open-stratum counters to a matching canonical stratum key.
         #[arg(long)]
-        liveness: bool,
-        /// Show conflict graph.
+        stratum: Option<String>,
+        /// Only render the summary block.
         #[arg(long)]
-        conflicts: bool,
-        /// Show session summary.
-        #[arg(long)]
-        summary: bool,
+        summary_only: bool,
         /// Maximum items to show.
         #[arg(long)]
         limit: Option<usize>,
@@ -6205,6 +6278,7 @@ fn build_local_atc_fallback_snapshot(
     });
 
     let reservation_conflicts = atc_reservation_conflicts(scope, focus_agent)?;
+    let observability = atc_rollup_observability_from_conn(scope.conn())?;
     let note = if config.atc_enabled {
         format!(
             "Live ATC snapshot unavailable; using local DB heuristics with a {}s probe interval.",
@@ -6218,13 +6292,94 @@ fn build_local_atc_fallback_snapshot(
     Ok((
         AtcRobotSnapshot {
             enabled: config.atc_enabled,
-            source: "local_db_fallback".to_string(),
+            source: "local_db".to_string(),
+            kill_switch_enabled: false,
+            experiences_open: observability
+                .experiences_open_by_stratum
+                .values()
+                .copied()
+                .sum::<u64>() as usize,
+            experiences_resolved: observability
+                .experiences_resolved_by_outcome
+                .get("resolved")
+                .copied()
+                .unwrap_or(0),
+            observability,
             tracked_agents,
             note: Some(note),
             ..AtcRobotSnapshot::default()
         },
         reservation_conflicts,
     ))
+}
+
+fn atc_rollup_observability_from_conn(conn: &DbConn) -> Result<AtcRobotObservability, CliError> {
+    let rows = match conn.query_sync(
+        "SELECT stratum_key, total_count, resolved_count, censored_count, expired_count \
+         FROM atc_experience_rollups ORDER BY stratum_key",
+        &[],
+    ) {
+        Ok(rows) => rows,
+        Err(error) => {
+            let message = error.to_string();
+            if (message.contains("no such table") || message.contains("table not found"))
+                && message.contains("atc_experience_rollups")
+            {
+                return Ok(AtcRobotObservability::default());
+            }
+            return Err(CliError::Other(format!(
+                "ATC fallback rollup query failed: {error}"
+            )));
+        }
+    };
+
+    let mut observability = AtcRobotObservability::default();
+    let mut resolved_total = 0_u64;
+    let mut censored_total = 0_u64;
+    let mut expired_total = 0_u64;
+
+    for row in &rows {
+        let stratum_key: String = row.get_named("stratum_key").unwrap_or_default();
+        let total = row.get_named::<i64>("total_count").unwrap_or(0).max(0) as u64;
+        let resolved = row.get_named::<i64>("resolved_count").unwrap_or(0).max(0) as u64;
+        let censored = row.get_named::<i64>("censored_count").unwrap_or(0).max(0) as u64;
+        let expired = row.get_named::<i64>("expired_count").unwrap_or(0).max(0) as u64;
+        let open = total.saturating_sub(resolved + censored + expired);
+
+        observability.experiences_written_total = observability
+            .experiences_written_total
+            .saturating_add(total);
+        resolved_total = resolved_total.saturating_add(resolved);
+        censored_total = censored_total.saturating_add(censored);
+        expired_total = expired_total.saturating_add(expired);
+
+        if open > 0 && !stratum_key.is_empty() {
+            observability
+                .experiences_open_by_stratum
+                .insert(stratum_key, open);
+        }
+    }
+
+    if resolved_total > 0 {
+        observability
+            .experiences_resolved_by_outcome
+            .insert("resolved".to_string(), resolved_total);
+    }
+    if censored_total > 0 {
+        observability
+            .experiences_resolved_by_outcome
+            .insert("censored".to_string(), censored_total);
+    }
+    if expired_total > 0 {
+        observability
+            .experiences_resolved_by_outcome
+            .insert("expired".to_string(), expired_total);
+    }
+    observability.experiences_resolved_total = resolved_total
+        .saturating_add(censored_total)
+        .saturating_add(expired_total);
+
+    Ok(observability)
 }
 
 fn build_unavailable_atc_snapshot(live_error: &str) -> AtcRobotSnapshot {
@@ -6277,6 +6432,7 @@ fn atc_filtered_decisions(
     snapshot: &AtcRobotSnapshot,
     focus_agent: Option<&str>,
     category: Option<&str>,
+    since_micros: Option<i64>,
     limit: usize,
 ) -> Vec<AtcDecisionData> {
     if snapshot.recent_decisions.is_empty() {
@@ -6284,6 +6440,7 @@ fn atc_filtered_decisions(
             .recent_actions
             .iter()
             .filter(|action| category.is_none_or(|value| action.category == value))
+            .filter(|action| atc_timestamp_matches_since(action.timestamp_micros, since_micros))
             .cloned()
             .collect();
         let has_focus_match = focus_agent.is_some_and(|focus| {
@@ -6334,6 +6491,7 @@ fn atc_filtered_decisions(
         .recent_decisions
         .iter()
         .filter(|decision| category.is_none_or(|value| atc_decision_category(decision) == value))
+        .filter(|decision| atc_timestamp_matches_since(decision.timestamp_micros, since_micros))
         .cloned()
         .collect();
     let has_focus_match = focus_agent.is_some_and(|focus| {
@@ -6363,9 +6521,15 @@ fn atc_filtered_decisions(
 fn atc_execution_data(
     snapshot: &AtcRobotSnapshot,
     focus_agent: Option<&str>,
+    since_micros: Option<i64>,
     limit: usize,
 ) -> Vec<AtcExecutionData> {
-    let mut executions = snapshot.recent_executions.clone();
+    let mut executions: Vec<AtcRobotExecution> = snapshot
+        .recent_executions
+        .iter()
+        .filter(|execution| atc_timestamp_matches_since(execution.timestamp_micros, since_micros))
+        .cloned()
+        .collect();
     let has_focus_match = focus_agent.is_some_and(|focus| {
         executions
             .iter()
@@ -6457,13 +6621,108 @@ fn atc_liveness_data(
         .collect()
 }
 
-fn atc_summary_data(snapshot: &AtcRobotSnapshot) -> AtcSummaryData {
+fn atc_timestamp_matches_since(timestamp_micros: i64, since_micros: Option<i64>) -> bool {
+    since_micros.is_none_or(|since| timestamp_micros >= since)
+}
+
+fn atc_stratum_matches(candidate: &str, filter: Option<&str>) -> bool {
+    filter.is_none_or(|needle| {
+        let needle = needle.trim().to_ascii_lowercase();
+        !needle.is_empty() && candidate.to_ascii_lowercase().contains(&needle)
+    })
+}
+
+fn atc_open_strata_data(
+    snapshot: &AtcRobotSnapshot,
+    stratum_filter: Option<&str>,
+    limit: usize,
+) -> Vec<AtcStratumData> {
+    let mut rows: Vec<AtcStratumData> = snapshot
+        .observability
+        .experiences_open_by_stratum
+        .iter()
+        .filter(|(stratum, _)| atc_stratum_matches(stratum, stratum_filter))
+        .map(|(stratum, count)| AtcStratumData {
+            stratum: stratum.clone(),
+            open_experiences: *count,
+        })
+        .collect();
+    rows.sort_by(|left, right| {
+        right
+            .open_experiences
+            .cmp(&left.open_experiences)
+            .then_with(|| left.stratum.cmp(&right.stratum))
+    });
+    rows.truncate(limit);
+    rows
+}
+
+fn atc_summary_data(
+    snapshot: &AtcRobotSnapshot,
+    stratum_filter: Option<&str>,
+    limit: usize,
+) -> AtcSummaryData {
+    let open_strata = atc_open_strata_data(snapshot, stratum_filter, limit);
+    let open_total = if stratum_filter.is_some() {
+        open_strata.iter().map(|entry| entry.open_experiences).sum()
+    } else if snapshot.experiences_open > 0 {
+        snapshot.experiences_open as u64
+    } else {
+        snapshot
+            .observability
+            .experiences_open_by_stratum
+            .values()
+            .copied()
+            .sum()
+    };
+    let resolved_total = if snapshot.experiences_resolved > 0 {
+        snapshot.experiences_resolved
+    } else {
+        snapshot
+            .observability
+            .experiences_resolved_by_outcome
+            .get("resolved")
+            .copied()
+            .unwrap_or(0)
+    };
+    let censored_total = snapshot
+        .observability
+        .experiences_resolved_by_outcome
+        .get("censored")
+        .copied()
+        .unwrap_or(0);
+    let expired_total = snapshot
+        .observability
+        .experiences_resolved_by_outcome
+        .get("expired")
+        .copied()
+        .unwrap_or(0);
+    let experiences_total = if snapshot.observability.experiences_written_total > 0 {
+        snapshot.observability.experiences_written_total
+    } else {
+        open_total
+            .saturating_add(resolved_total)
+            .saturating_add(censored_total)
+            .saturating_add(expired_total)
+    };
+    let policy_version = if !snapshot.policy.bundle_id.is_empty() {
+        snapshot.policy.bundle_id.clone()
+    } else {
+        format!("rev-{}", snapshot.policy_revision)
+    };
     AtcSummaryData {
         enabled: snapshot.enabled,
         source: snapshot.source.clone(),
         safe_mode: snapshot.safe_mode,
+        kill_switch_enabled: snapshot.kill_switch_enabled
+            || snapshot.observability.kill_switch_enabled_gauge > 0,
         tick_count: snapshot.tick_count,
         decisions_total: snapshot.decisions_total,
+        experiences_total,
+        experiences_open: open_total,
+        experiences_resolved: resolved_total,
+        experiences_censored: censored_total,
+        experiences_expired: expired_total,
         tracked_agents: snapshot.tracked_agents.len(),
         degraded_agents: snapshot
             .tracked_agents
@@ -6482,6 +6741,11 @@ fn atc_summary_data(snapshot: &AtcRobotSnapshot) -> AtcSummaryData {
         last_tick_budget_micros: snapshot.last_tick_budget_micros,
         last_tick_budget_exceeded: snapshot.last_tick_budget_exceeded,
         outer_loop_overhead_micros: snapshot.outer_loop_overhead_micros,
+        write_mode: if snapshot.executor_mode.is_empty() {
+            snapshot.policy.decision_mode.clone()
+        } else {
+            snapshot.executor_mode.clone()
+        },
         executor_mode: snapshot.executor_mode.clone(),
         executor_pending_effects: snapshot.executor_pending_effects,
         budget_mode: snapshot.budget.mode.clone(),
@@ -6521,6 +6785,13 @@ fn atc_summary_data(snapshot: &AtcRobotSnapshot) -> AtcSummaryData {
         gating_stage_micros: snapshot.stage_timings.gating_micros,
         slow_control_micros: snapshot.stage_timings.slow_control_micros,
         summary_stage_micros: snapshot.stage_timings.summary_micros,
+        policy_revision: snapshot.policy_revision,
+        policy_version,
+        resolved_outcomes: snapshot
+            .observability
+            .experiences_resolved_by_outcome
+            .clone(),
+        open_strata,
     }
 }
 
@@ -6528,6 +6799,7 @@ fn atc_conflict_data(
     snapshot: &AtcRobotSnapshot,
     mut reservation_conflicts: Vec<ReservationConflict>,
     focus_agent: Option<&str>,
+    since_micros: Option<i64>,
     limit: usize,
 ) -> AtcConflictData {
     if let Some(focus_agent) = focus_agent {
@@ -6554,7 +6826,13 @@ fn atc_conflict_data(
     AtcConflictData {
         deadlock_cycles: snapshot.deadlock_cycles,
         reservation_conflicts,
-        recent_actions: atc_filtered_decisions(snapshot, focus_agent, Some("conflict"), limit),
+        recent_actions: atc_filtered_decisions(
+            snapshot,
+            focus_agent,
+            Some("conflict"),
+            since_micros,
+            limit,
+        ),
     }
 }
 
@@ -6563,38 +6841,45 @@ fn build_atc_data(
     snapshot: AtcRobotSnapshot,
     reservation_conflicts: Vec<ReservationConflict>,
     focus_agent: Option<&str>,
-    decisions_flag: bool,
-    liveness_flag: bool,
-    conflicts_flag: bool,
-    summary_flag: bool,
+    since: Option<&str>,
+    stratum_filter: Option<&str>,
+    summary_only: bool,
     limit: usize,
 ) -> AtcData {
-    let default_sections = !(decisions_flag || liveness_flag || conflicts_flag || summary_flag);
-    let show_summary = summary_flag || default_sections;
-    let show_decisions = decisions_flag || default_sections;
-    let show_executions = default_sections && !snapshot.recent_executions.is_empty();
-    let show_liveness = liveness_flag
-        || (default_sections && snapshot.tracked_agents.iter().any(atc_agent_is_degraded));
+    let since_micros = since.and_then(|value| parse_since_micros(value).ok());
+    let show_summary = true;
+    let show_decisions = !summary_only;
+    let show_executions = !summary_only && !snapshot.recent_executions.is_empty();
+    let show_liveness = !summary_only && snapshot.tracked_agents.iter().any(atc_agent_is_degraded);
     let has_conflicts = snapshot.deadlock_cycles > 0
         || !reservation_conflicts.is_empty()
         || snapshot
             .recent_actions
             .iter()
             .any(|action| action.category == "conflict");
-    let show_conflicts = conflicts_flag || (default_sections && has_conflicts);
+    let show_conflicts = !summary_only && has_conflicts;
 
     AtcData {
         enabled: snapshot.enabled,
         source: snapshot.source.clone(),
         note: snapshot.note.clone(),
-        summary: show_summary.then(|| atc_summary_data(&snapshot)),
+        since: since.map(ToString::to_string),
+        stratum: stratum_filter.map(ToString::to_string),
+        summary: show_summary.then(|| atc_summary_data(&snapshot, stratum_filter, limit)),
         decisions: show_decisions
-            .then(|| atc_filtered_decisions(&snapshot, focus_agent, None, limit)),
-        executions: show_executions.then(|| atc_execution_data(&snapshot, focus_agent, limit)),
-        liveness: show_liveness
-            .then(|| atc_liveness_data(&snapshot, focus_agent, limit, default_sections)),
-        conflicts: show_conflicts
-            .then(|| atc_conflict_data(&snapshot, reservation_conflicts, focus_agent, limit)),
+            .then(|| atc_filtered_decisions(&snapshot, focus_agent, None, since_micros, limit)),
+        executions: show_executions
+            .then(|| atc_execution_data(&snapshot, focus_agent, since_micros, limit)),
+        liveness: show_liveness.then(|| atc_liveness_data(&snapshot, focus_agent, limit, true)),
+        conflicts: show_conflicts.then(|| {
+            atc_conflict_data(
+                &snapshot,
+                reservation_conflicts,
+                focus_agent,
+                since_micros,
+                limit,
+            )
+        }),
     }
 }
 
@@ -8048,14 +8333,14 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             format_output(&env, format)?
         }
         RobotSubcommand::Atc {
-            decisions,
-            liveness,
-            conflicts,
-            summary,
+            since,
+            stratum,
+            summary_only,
             limit,
         } => {
             let focus_agent = atc_focus_agent_name(args.agent.as_deref());
             let limit = atc_default_limit(limit);
+            since.as_deref().map(parse_since_micros).transpose()?;
             let live_endpoint =
                 atc_live_endpoint_from_config(&mcp_agent_mail_core::Config::from_env());
             let maybe_scope =
@@ -8064,6 +8349,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let (snapshot, reservation_conflicts, project_slug, live_error) =
                 match fetch_live_atc_snapshot(&live_endpoint) {
                     Ok(snapshot) => {
+                        tracing::debug!(
+                            event = "robot.atc.read_snapshot_source",
+                            source = "live_server"
+                        );
                         let project_slug =
                             maybe_scope.as_ref().map(|scope| scope.project_slug.clone());
                         let reservation_conflicts = if let Some(scope) = maybe_scope.as_ref() {
@@ -8079,6 +8368,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                             let project_slug = Some(scope.project_slug.clone());
                             let (mut snapshot, reservation_conflicts) =
                                 build_local_atc_fallback_snapshot(&scope, focus_agent.as_deref())?;
+                            tracing::debug!(
+                                event = "robot.atc.read_snapshot_source",
+                                source = "local_db"
+                            );
                             let fallback_note = snapshot.note.take().unwrap_or_default();
                             snapshot.note = Some(if fallback_note.is_empty() {
                                 format!("Live ATC snapshot unavailable: {error_text}")
@@ -8092,6 +8385,10 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                                 Some(error_text),
                             )
                         } else {
+                            tracing::debug!(
+                                event = "robot.atc.read_snapshot_source",
+                                source = "unavailable"
+                            );
                             (
                                 build_unavailable_atc_snapshot(&error_text),
                                 Vec::new(),
@@ -8101,22 +8398,24 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                         }
                     }
                 };
+            let snapshot_age_micros = (snapshot.last_tick_micros > 0).then(|| {
+                mcp_agent_mail_db::now_micros().saturating_sub(snapshot.last_tick_micros) as u64
+            });
 
             let data = build_atc_data(
                 snapshot,
                 reservation_conflicts,
                 focus_agent.as_deref(),
-                decisions,
-                liveness,
-                conflicts,
-                summary,
+                since.as_deref(),
+                stratum.as_deref(),
+                summary_only,
                 limit,
             );
 
             let mut env = RobotEnvelope::new(cmd_name, format, data);
             env._meta.project = project_slug;
             if let Some(error) = live_error {
-                let alert_summary = if env.data.source == "local_db_fallback" {
+                let alert_summary = if env.data.source == "local_db" {
                     "Live ATC snapshot unavailable; using local DB fallback"
                 } else {
                     "Live ATC snapshot unavailable"
@@ -8182,7 +8481,16 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     .unwrap_or_else(|| "deterministic conservative fallback active".to_string());
                 env = env.with_alert("warn", "ATC fallback mode active", Some(detail));
             }
-            format_output(&env, format)?
+            if let Some(age) = snapshot_age_micros {
+                tracing::debug!(event = "robot.atc.snapshot_age_micros", age_micros = age);
+            }
+            let rendered = format_output(&env, format)?;
+            tracing::debug!(
+                event = "robot.atc.format_rendered",
+                format = %format,
+                output_bytes = rendered.len()
+            );
+            rendered
         }
     };
 
@@ -8249,7 +8557,11 @@ mod tests {
             enabled: true,
             source: "live".to_string(),
             safe_mode: true,
+            kill_switch_enabled: true,
             tick_count: 7,
+            experiences_open: 4,
+            experiences_resolved: 9,
+            policy_revision: 17,
             tracked_agents: vec![
                 AtcRobotAgent {
                     name: "AlphaAgent".to_string(),
@@ -8412,6 +8724,21 @@ mod tests {
                 fallback_active: true,
                 fallback_reason: Some("budget_pressure".to_string()),
             },
+            observability: AtcRobotObservability {
+                experiences_written_total: 15,
+                experiences_resolved_total: 11,
+                experiences_resolved_by_outcome: std::collections::BTreeMap::from([
+                    ("resolved".to_string(), 9),
+                    ("censored".to_string(), 1),
+                    ("expired".to_string(), 1),
+                ]),
+                experiences_open_by_stratum: std::collections::BTreeMap::from([
+                    ("liveness:probe:0".to_string(), 3),
+                    ("conflict:release:2".to_string(), 1),
+                ]),
+                kill_switch_enabled_gauge: 1,
+                ..AtcRobotObservability::default()
+            },
             note: Some("live snapshot".to_string()),
         }
     }
@@ -8506,9 +8833,8 @@ mod tests {
                 path_b: "src/server/**".to_string(),
             }],
             None,
-            false,
-            false,
-            false,
+            None,
+            None,
             false,
             5,
         );
@@ -8546,6 +8872,24 @@ mod tests {
             Some("budget_pressure")
         );
         assert_eq!(
+            data.summary
+                .as_ref()
+                .map(|summary| summary.policy_version.as_str()),
+            Some("atc-liveness-bundle-r7")
+        );
+        assert_eq!(
+            data.summary
+                .as_ref()
+                .map(|summary| summary.experiences_open),
+            Some(4)
+        );
+        assert_eq!(
+            data.summary
+                .as_ref()
+                .map(|summary| summary.experiences_censored),
+            Some(1)
+        );
+        assert_eq!(
             data.conflicts
                 .as_ref()
                 .map_or(0, |item| item.deadlock_cycles),
@@ -8564,6 +8908,59 @@ mod tests {
                 .and_then(|executions| executions.first())
                 .map(|execution| execution.trace_id.as_str()),
             Some("atc-trace-12")
+        );
+    }
+
+    #[test]
+    fn build_atc_data_summary_only_filters_since_and_stratum() {
+        let data = build_atc_data(
+            sample_atc_snapshot(),
+            Vec::new(),
+            None,
+            Some("1970-01-01T00:00:02Z"),
+            Some("liveness:probe:0"),
+            true,
+            5,
+        );
+
+        assert!(data.summary.is_some(), "summary-only should keep summary");
+        assert!(
+            data.decisions.is_none(),
+            "summary-only should suppress decisions"
+        );
+        assert!(
+            data.executions.is_none(),
+            "summary-only should suppress executions"
+        );
+        assert!(
+            data.liveness.is_none(),
+            "summary-only should suppress liveness"
+        );
+        assert!(
+            data.conflicts.is_none(),
+            "summary-only should suppress conflicts"
+        );
+        assert_eq!(data.since.as_deref(), Some("1970-01-01T00:00:02Z"));
+        assert_eq!(data.stratum.as_deref(), Some("liveness:probe:0"));
+        assert_eq!(
+            data.summary
+                .as_ref()
+                .map(|summary| summary.open_strata.len()),
+            Some(1)
+        );
+        assert_eq!(
+            data.summary
+                .as_ref()
+                .and_then(|summary| summary.open_strata.first())
+                .map(|stratum| stratum.stratum.as_str()),
+            Some("liveness:probe:0")
+        );
+        assert_eq!(
+            data.summary
+                .as_ref()
+                .and_then(|summary| summary.resolved_outcomes.get("expired"))
+                .copied(),
+            Some(1)
         );
     }
 

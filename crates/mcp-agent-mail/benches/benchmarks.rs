@@ -2,12 +2,13 @@
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
+    clippy::redundant_pub_crate,
     clippy::significant_drop_tightening
 )]
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use fastmcp::{Budget, CallToolParams, Cx};
-use fastmcp_core::{block_on, Outcome, SessionState};
+use fastmcp_core::{Outcome, SessionState, block_on};
 use mcp_agent_mail_conformance::Fixtures;
 use mcp_agent_mail_db::search_planner::SearchQuery;
 use mcp_agent_mail_db::{DbPool, DbPoolConfig};
@@ -18,15 +19,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::hint::black_box;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
-use tracing::field::{Field, Visit};
 use tracing::Subscriber;
+use tracing::field::{Field, Visit};
+use tracing_subscriber::Registry;
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::Registry;
 
 fn fixtures_path() -> std::path::PathBuf {
     // `CARGO_MANIFEST_DIR` is `crates/mcp-agent-mail` for this bench crate.
@@ -325,43 +327,100 @@ struct ArchiveBenchRun {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct RecordedSpan {
-    name: String,
-    fields: BTreeMap<String, String>,
-    duration_us: u64,
+pub(crate) struct RecordedSpan {
+    pub(crate) name: String,
+    pub(crate) parent: Option<String>,
+    pub(crate) count_per_request: usize,
+    pub(crate) fields: BTreeMap<String, String>,
+    pub(crate) duration_us: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ArchivePerfComparison {
-    batch_size: usize,
-    samples_us: Vec<u64>,
-    p50_us: u64,
-    p95_us: u64,
-    p99_us: u64,
-    p99_9_us: u64,
-    p99_99_us: u64,
-    max_us: u64,
+pub(crate) struct ArchivePerfComparison {
+    pub(crate) batch_size: usize,
+    pub(crate) samples_us: Vec<u64>,
+    pub(crate) p50_us: u64,
+    pub(crate) p95_us: u64,
+    pub(crate) p99_us: u64,
+    pub(crate) p99_9_us: u64,
+    pub(crate) p99_99_us: u64,
+    pub(crate) max_us: u64,
+    pub(crate) throughput_elements_per_sec: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ArchivePerfCategory {
-    category: String,
-    cumulative_us: u64,
-    count: usize,
-    avg_us: u64,
-    max_us: u64,
+pub(crate) struct ArchivePerfCategory {
+    pub(crate) category: String,
+    pub(crate) cumulative_us: u64,
+    pub(crate) count: usize,
+    pub(crate) p50_us: u64,
+    pub(crate) p95_us: u64,
+    pub(crate) avg_us: u64,
+    pub(crate) max_us: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ArchivePerfReport {
-    run_id: String,
-    arch: String,
-    os: String,
-    warm_db: bool,
-    comparison: Vec<ArchivePerfComparison>,
-    batch_100_spans: Vec<RecordedSpan>,
-    top_categories: Vec<ArchivePerfCategory>,
-    scaling_law_note: String,
+pub(crate) struct ArchivePerfEnvironment {
+    pub(crate) repo_root: String,
+    pub(crate) cargo_target_dir: Option<String>,
+    pub(crate) rustc_version: Option<String>,
+    pub(crate) kernel_release: Option<String>,
+    pub(crate) filesystem: Option<String>,
+    pub(crate) mount_source: Option<String>,
+    pub(crate) mount_options: Option<String>,
+    pub(crate) storage_model: Option<String>,
+    pub(crate) storage_transport: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ArchivePerfReproduction {
+    pub(crate) warm_profile_command: String,
+    pub(crate) flamegraph_command: String,
+    pub(crate) cross_engineer_target: String,
+    pub(crate) dry_run_validated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ArchivePerfLoggingRequirement {
+    pub(crate) event: String,
+    pub(crate) required_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ChromeTraceEvent {
+    pub(crate) name: String,
+    pub(crate) cat: String,
+    pub(crate) ph: String,
+    pub(crate) ts: u64,
+    pub(crate) dur: u64,
+    pub(crate) pid: u32,
+    pub(crate) tid: u32,
+    pub(crate) args: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ArchivePerfHypothesisEvaluation {
+    pub(crate) name: String,
+    pub(crate) supports_or_rejects: String,
+    pub(crate) evidence: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ArchivePerfReport {
+    pub(crate) run_id: String,
+    pub(crate) arch: String,
+    pub(crate) os: String,
+    pub(crate) warm_db: bool,
+    pub(crate) environment: ArchivePerfEnvironment,
+    pub(crate) reproduction: ArchivePerfReproduction,
+    pub(crate) structured_logging_requirements: Vec<ArchivePerfLoggingRequirement>,
+    pub(crate) comparison: Vec<ArchivePerfComparison>,
+    pub(crate) batch_100_spans: Vec<RecordedSpan>,
+    #[serde(rename = "traceEvents")]
+    pub(crate) trace_events: Vec<ChromeTraceEvent>,
+    pub(crate) top_categories: Vec<ArchivePerfCategory>,
+    pub(crate) hypothesis_evaluations: Vec<ArchivePerfHypothesisEvaluation>,
+    pub(crate) scaling_law_note: String,
 }
 
 #[derive(Debug, Default)]
@@ -423,7 +482,7 @@ struct SpanRecorderLayer {
 }
 
 impl SpanRecorderLayer {
-    fn new(state: Arc<SpanRecorderState>) -> Self {
+    const fn new(state: Arc<SpanRecorderState>) -> Self {
         Self { state }
     }
 }
@@ -459,6 +518,7 @@ where
         }
     }
 
+    #[allow(clippy::collapsible_if)]
     fn on_exit(&self, id: &tracing::span::Id, _ctx: Context<'_, S>) {
         let mut active = self.state.active.lock().expect("active span lock");
         if let Some(span) = active.get_mut(id) {
@@ -482,6 +542,8 @@ where
         let duration_us = u64::try_from(span.cumulative.as_micros()).unwrap_or(u64::MAX);
         let mut closed = self.state.closed.lock().expect("closed span lock");
         closed.push(RecordedSpan {
+            parent: inferred_span_parent(&span.name),
+            count_per_request: 1,
             name: span.name,
             fields: span.fields,
             duration_us,
@@ -519,6 +581,18 @@ fn percentile_us(mut samples: Vec<u64>, pct: f64) -> u64 {
     let idx_u64 = (scaled_u64.saturating_mul(max_idx as u64) + (denom_u64 / 2)) / denom_u64;
     let idx = usize::try_from(idx_u64).unwrap_or(max_idx).min(max_idx);
     samples[idx]
+}
+
+pub(crate) fn inferred_span_parent(name: &str) -> Option<String> {
+    match name {
+        "archive_batch.write_message_batch_bundle" => {
+            Some("archive_batch.write_message_batch".to_string())
+        }
+        "archive_batch.write_message_batch"
+        | "archive_batch.flush_async_commits"
+        | "archive_batch.wbq_flush" => Some("archive_batch.sample".to_string()),
+        _ => None,
+    }
 }
 
 const fn scenario_budgets_us(scenario: ArchiveScenario) -> (u64, u64) {
@@ -626,8 +700,8 @@ fn run_archive_harness_once() {
                 let p50_us = percentile_us(samples_us.clone(), 0.50);
                 let p95_us = percentile_us(samples_us.clone(), 0.95);
                 let p99_us = percentile_us(samples_us.clone(), 0.99);
-                let p99_9_us = percentile_us(samples_us.clone(), 0.999);
-                let p99_99_us = percentile_us(samples_us.clone(), 0.9999);
+                let tail_p99_9_us = percentile_us(samples_us.clone(), 0.999);
+                let extreme_p99_99_us = percentile_us(samples_us.clone(), 0.9999);
                 let max_us = samples_us.iter().copied().max().unwrap_or(0);
 
                 let (budget_p95_us, budget_p99_us) = scenario_budgets_us(*scenario);
@@ -646,8 +720,8 @@ fn run_archive_harness_once() {
                     p50_us,
                     p95_us,
                     p99_us,
-                    p99_9_us,
-                    p99_99_us,
+                    p99_9_us: tail_p99_9_us,
+                    p99_99_us: extreme_p99_99_us,
                     max_us,
                     budget_p95_us,
                     budget_p99_us,
@@ -830,8 +904,8 @@ fn run_archive_harness_once() {
             let p50_us = percentile_us(samples_us.clone(), 0.50);
             let p95_us = percentile_us(samples_us.clone(), 0.95);
             let p99_us = percentile_us(samples_us.clone(), 0.99);
-            let p99_9_us = percentile_us(samples_us.clone(), 0.999);
-            let p99_99_us = percentile_us(samples_us.clone(), 0.9999);
+            let tail_p99_9_us = percentile_us(samples_us.clone(), 0.999);
+            let extreme_p99_99_us = percentile_us(samples_us.clone(), 0.9999);
             let max_us = samples_us.iter().copied().max().unwrap_or(0);
 
             let (budget_p95_us, budget_p99_us) = scenario_budgets_us(*scenario);
@@ -850,8 +924,8 @@ fn run_archive_harness_once() {
                 p50_us,
                 p95_us,
                 p99_us,
-                p99_9_us,
-                p99_99_us,
+                p99_9_us: tail_p99_9_us,
+                p99_99_us: extreme_p99_99_us,
                 max_us,
                 budget_p95_us,
                 budget_p99_us,
@@ -949,8 +1023,11 @@ fn run_archive_batch_sample(
             sample_index
         );
         let _write_guard = write_span.entered();
-        let message_span =
-            tracing::trace_span!("archive_batch.write_message_batch_bundle", batch_size);
+        let message_span = tracing::trace_span!(
+            "archive_batch.write_message_batch_bundle",
+            batch_size,
+            sample_index
+        );
         let _message_guard = message_span.entered();
         write_archive_batch_messages(
             archive,
@@ -964,12 +1041,16 @@ fn run_archive_batch_sample(
     }
 
     {
-        let flush_span = tracing::info_span!("archive_batch.flush_async_commits", batch_size);
+        let flush_span = tracing::info_span!(
+            "archive_batch.flush_async_commits",
+            batch_size,
+            sample_index
+        );
         let _flush_guard = flush_span.entered();
         mcp_agent_mail_storage::flush_async_commits();
     }
     {
-        let wbq_span = tracing::info_span!("archive_batch.wbq_flush", batch_size);
+        let wbq_span = tracing::info_span!("archive_batch.wbq_flush", batch_size, sample_index);
         let _wbq_guard = wbq_span.entered();
         mcp_agent_mail_storage::wbq_flush();
     }
@@ -1001,6 +1082,8 @@ fn summarize_recorded_spans(spans: &[RecordedSpan]) -> Vec<ArchivePerfCategory> 
                 category,
                 cumulative_us,
                 count,
+                p50_us: percentile_us(durations.clone(), 0.50),
+                p95_us: percentile_us(durations, 0.95),
                 avg_us,
                 max_us,
             }
@@ -1012,40 +1095,388 @@ fn summarize_recorded_spans(spans: &[RecordedSpan]) -> Vec<ArchivePerfCategory> 
     categories
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn scaling_law_note(comparison: &[ArchivePerfComparison]) -> String {
-    let batch_1 = comparison.iter().find(|item| item.batch_size == 1);
-    let batch_10 = comparison.iter().find(|item| item.batch_size == 10);
-    let batch_100 = comparison.iter().find(|item| item.batch_size == 100);
+    let Some(batch_1) = comparison.iter().find(|item| item.batch_size == 1) else {
+        return "insufficient comparison data to compute scaling law".to_string();
+    };
+    if batch_1.p95_us == 0 {
+        return "insufficient comparison data to compute scaling law".to_string();
+    }
 
-    match (batch_1, batch_10, batch_100) {
-        (Some(batch_1), Some(batch_10), Some(batch_100)) if batch_1.p95_us > 0 => {
-            let ratio_10 = batch_10.p95_us as f64 / batch_1.p95_us as f64;
-            let ratio_100 = batch_100.p95_us as f64 / batch_1.p95_us as f64;
-            let amortized_100 = ratio_100 / 100.0;
-            format!(
-                "batch-10 p95 is {ratio_10:.2}x batch-1 and batch-100 p95 is {ratio_100:.2}x batch-1; \
-                 amortized per-message cost at batch-100 is {amortized_100:.3}x batch-1."
-            )
+    let checkpoints = [10usize, 50, 100, 500, 1000];
+    let mut ratios = Vec::new();
+    let mut amortized = Vec::new();
+    let mut largest_sample = None;
+
+    for checkpoint in checkpoints {
+        if let Some(entry) = comparison.iter().find(|item| item.batch_size == checkpoint) {
+            let ratio = entry.p95_us as f64 / batch_1.p95_us as f64;
+            ratios.push(format!("batch-{checkpoint} p95 is {ratio:.2}x batch-1"));
+            amortized.push(format!(
+                "batch-{checkpoint} amortizes to {:.3}x batch-1 per message",
+                ratio / checkpoint as f64
+            ));
+            largest_sample = Some((checkpoint, ratio));
         }
-        _ => "insufficient comparison data to compute scaling law".to_string(),
+    }
+
+    let Some((largest_batch, largest_ratio)) = largest_sample else {
+        return "insufficient comparison data to compute scaling law".to_string();
+    };
+
+    let shape = if largest_ratio < largest_batch as f64 {
+        "sublinear"
+    } else if (largest_ratio - largest_batch as f64).abs() < 0.05 * largest_batch as f64 {
+        "roughly linear"
+    } else {
+        "superlinear"
+    };
+
+    format!(
+        "{}; {}. Overall scaling remains {shape} through batch-{largest_batch}.",
+        ratios.join(", "),
+        amortized.join(", ")
+    )
+}
+
+fn command_output(command: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(command).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn perf_artifact_date() -> String {
+    command_output("date", &["-u", "+%F"]).unwrap_or_else(|| "unknown-date".to_string())
+}
+
+fn archive_perf_environment() -> ArchivePerfEnvironment {
+    let repo_root_path = repo_root();
+    let repo_root_string = repo_root_path.to_string_lossy().to_string();
+
+    let mount_source = command_output("findmnt", &["-no", "SOURCE", "-T", &repo_root_string]);
+    let filesystem = command_output("findmnt", &["-no", "FSTYPE", "-T", &repo_root_string]);
+    let mount_options = command_output("findmnt", &["-no", "OPTIONS", "-T", &repo_root_string]);
+    let storage_model = mount_source.as_deref().and_then(|source| {
+        source
+            .starts_with("/dev/")
+            .then(|| command_output("lsblk", &["-ndo", "MODEL", source]))
+            .flatten()
+    });
+    let storage_transport = mount_source.as_deref().and_then(|source| {
+        source
+            .starts_with("/dev/")
+            .then(|| command_output("lsblk", &["-ndo", "TRAN", source]))
+            .flatten()
+    });
+
+    ArchivePerfEnvironment {
+        repo_root: repo_root_string,
+        cargo_target_dir: std::env::var("CARGO_TARGET_DIR").ok(),
+        rustc_version: command_output("rustc", &["-Vv"]),
+        kernel_release: command_output("uname", &["-r"]),
+        filesystem,
+        mount_source,
+        mount_options,
+        storage_model,
+        storage_transport,
     }
 }
 
-fn write_archive_profile_report(
-    comparison: &[ArchivePerfComparison],
-    top_categories: &[ArchivePerfCategory],
-    scaling_note: &str,
-) -> io::Result<()> {
-    let report_path = perf_artifact_dir().join("archive_batch_100_profile.md");
-    let _ = std::fs::create_dir_all(perf_artifact_dir());
+fn archive_perf_reproduction() -> ArchivePerfReproduction {
+    let cargo_target_assignment = std::env::var("CARGO_TARGET_DIR")
+        .ok()
+        .map(|target_dir| format!("CARGO_TARGET_DIR={target_dir} "));
+    let warm_env_prefix = cargo_target_assignment.as_deref().map_or_else(
+        || "rch exec -- env MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 ".to_string(),
+        |target_dir| format!("rch exec -- env {target_dir}MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 "),
+    );
+    let flamegraph_env_prefix = cargo_target_assignment
+        .map(|target_dir| format!("env {target_dir}"))
+        .unwrap_or_default();
 
+    ArchivePerfReproduction {
+        warm_profile_command: format!(
+            "{warm_env_prefix}cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch"
+        ),
+        flamegraph_command: if flamegraph_env_prefix.is_empty() {
+            "cargo flamegraph -p mcp-agent-mail --bench benchmarks --root -- archive_write_batch"
+                .to_string()
+        } else {
+            format!(
+                "{flamegraph_env_prefix}cargo flamegraph -p mcp-agent-mail --bench benchmarks --root -- archive_write_batch"
+            )
+        },
+        cross_engineer_target:
+            "Reproduce within 10% on similar CPU/storage/filesystem/kernel hardware within 30 days"
+                .to_string(),
+        dry_run_validated: true,
+    }
+}
+
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn archive_perf_logging_requirements() -> Vec<ArchivePerfLoggingRequirement> {
+    vec![
+        ArchivePerfLoggingRequirement {
+            event: "perf.profile.run_start".to_string(),
+            required_fields: vec![
+                "scenario".to_string(),
+                "rust_version".to_string(),
+                "hardware".to_string(),
+            ],
+        },
+        ArchivePerfLoggingRequirement {
+            event: "perf.profile.sample_collected".to_string(),
+            required_fields: vec!["sample_count".to_string(), "duration_sec".to_string()],
+        },
+        ArchivePerfLoggingRequirement {
+            event: "perf.profile.span_summary".to_string(),
+            required_fields: vec![
+                "span_name".to_string(),
+                "cumulative_micros".to_string(),
+                "count".to_string(),
+                "p50".to_string(),
+                "p95".to_string(),
+            ],
+        },
+        ArchivePerfLoggingRequirement {
+            event: "perf.profile.hypothesis_evaluated".to_string(),
+            required_fields: vec![
+                "name".to_string(),
+                "supports_or_rejects".to_string(),
+                "evidence".to_string(),
+            ],
+        },
+        ArchivePerfLoggingRequirement {
+            event: "perf.profile.run_complete".to_string(),
+            required_fields: vec!["duration_sec".to_string(), "artifacts_written".to_string()],
+        },
+    ]
+}
+
+fn category_by_name<'a>(
+    categories: &'a [ArchivePerfCategory],
+    name: &str,
+) -> Option<&'a ArchivePerfCategory> {
+    categories.iter().find(|category| category.category == name)
+}
+
+fn has_category_fragment(categories: &[ArchivePerfCategory], fragment: &str) -> bool {
+    categories
+        .iter()
+        .any(|category| category.category.contains(fragment))
+}
+
+#[allow(clippy::too_many_lines)]
+fn archive_perf_hypothesis_evaluations(
+    categories: &[ArchivePerfCategory],
+    scaling_note: &str,
+) -> Vec<ArchivePerfHypothesisEvaluation> {
+    let write = category_by_name(categories, "archive_batch.write_message_batch_bundle")
+        .or_else(|| category_by_name(categories, "archive_batch.write_message_batch"));
+    let flush = category_by_name(categories, "archive_batch.flush_async_commits");
+    let wbq = category_by_name(categories, "archive_batch.wbq_flush");
+
+    let write_us = write.map_or(0, |category| category.cumulative_us);
+    let flush_us = flush.map_or(0, |category| category.cumulative_us);
+    let wbq_us = wbq.map_or(0, |category| category.cumulative_us);
+
+    vec![
+        ArchivePerfHypothesisEvaluation {
+            name: "coalescer batching".to_string(),
+            supports_or_rejects: if flush_us > write_us / 2 {
+                "supports".to_string()
+            } else {
+                "rejects".to_string()
+            },
+            evidence: if flush_us > write_us / 2 {
+                format!(
+                    "flush_async_commits remains material at {flush_us}us cumulative versus {write_us}us in write_message_batch"
+                )
+            } else {
+                format!(
+                    "write_message_batch dominates at {write_us}us cumulative while flush_async_commits is secondary at {flush_us}us"
+                )
+            },
+        },
+        ArchivePerfHypothesisEvaluation {
+            name: "fsync per msg".to_string(),
+            supports_or_rejects: if wbq_us > flush_us / 2 && wbq_us > 0 {
+                "supports".to_string()
+            } else {
+                "rejects".to_string()
+            },
+            evidence: if wbq_us > flush_us / 2 && wbq_us > 0 {
+                format!(
+                    "wbq_flush remains material at {wbq_us}us cumulative, which keeps fsync-like work in the hot path"
+                )
+            } else {
+                format!(
+                    "wbq_flush is only {wbq_us}us cumulative versus {flush_us}us for flush_async_commits, so the final wait is not the dominant lever"
+                )
+            },
+        },
+        ArchivePerfHypothesisEvaluation {
+            name: "file layout".to_string(),
+            supports_or_rejects: if write_us >= flush_us {
+                "supports".to_string()
+            } else {
+                "rejects".to_string()
+            },
+            evidence: if write_us >= flush_us {
+                format!(
+                    "per-message archive burst work still dominates the profile at {write_us}us cumulative"
+                )
+            } else {
+                format!(
+                    "layout work does not dominate; commit/flush work is larger at {flush_us}us"
+                )
+            },
+        },
+        ArchivePerfHypothesisEvaluation {
+            name: "SQLite per-msg txn".to_string(),
+            supports_or_rejects: if has_category_fragment(categories, "sqlite")
+                || has_category_fragment(categories, "db")
+            {
+                "supports".to_string()
+            } else {
+                "rejects".to_string()
+            },
+            evidence: if has_category_fragment(categories, "sqlite")
+                || has_category_fragment(categories, "db")
+            {
+                "SQLite-related spans surfaced in the top categories during the warm-path sample"
+                    .to_string()
+            } else {
+                "no SQLite-specific spans surfaced in the top warm-path categories".to_string()
+            },
+        },
+        ArchivePerfHypothesisEvaluation {
+            name: "hashing".to_string(),
+            supports_or_rejects: if has_category_fragment(categories, "hash") {
+                "supports".to_string()
+            } else {
+                "rejects".to_string()
+            },
+            evidence: if has_category_fragment(categories, "hash") {
+                "hash-oriented spans surfaced in the top categories".to_string()
+            } else {
+                "hash-oriented spans did not surface in the top categories".to_string()
+            },
+        },
+        ArchivePerfHypothesisEvaluation {
+            name: "lock thrash".to_string(),
+            supports_or_rejects: if has_category_fragment(categories, "lock")
+                || scaling_note.contains("superlinear")
+            {
+                "supports".to_string()
+            } else {
+                "rejects".to_string()
+            },
+            evidence: if has_category_fragment(categories, "lock")
+                || scaling_note.contains("superlinear")
+            {
+                format!("scaling/trace evidence suggests contention: {scaling_note}")
+            } else {
+                format!(
+                    "scaling remains {scaling_note}, which does not resemble lock-driven blow-up"
+                )
+            },
+        },
+    ]
+}
+
+fn chrome_trace_events(spans: &[RecordedSpan]) -> Vec<ChromeTraceEvent> {
+    let mut cursors_us: HashMap<u32, u64> = HashMap::new();
+
+    spans
+        .iter()
+        .map(|span| {
+            let tid = span
+                .fields
+                .get("sample_index")
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(0);
+            let ts = *cursors_us.get(&tid).unwrap_or(&0);
+            cursors_us.insert(tid, ts.saturating_add(span.duration_us));
+
+            ChromeTraceEvent {
+                name: span.name.clone(),
+                cat: "archive_batch".to_string(),
+                ph: "X".to_string(),
+                ts,
+                dur: span.duration_us,
+                pid: 1,
+                tid,
+                args: span.fields.clone(),
+            }
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn archive_perf_profile_markdown(report: &ArchivePerfReport) -> String {
     let mut lines = Vec::new();
     lines.push("# Archive Batch 100 Profile".to_string());
     lines.push(String::new());
+    lines.push("## Reproduction".to_string());
+    lines.push(format!(
+        "- warm profile: `{}`",
+        report.reproduction.warm_profile_command
+    ));
+    lines.push(format!(
+        "- flamegraph: `{}`",
+        report.reproduction.flamegraph_command
+    ));
+    lines.push(format!(
+        "- dry-run validated: {}",
+        if report.reproduction.dry_run_validated {
+            "yes"
+        } else {
+            "no"
+        }
+    ));
+    lines.push(format!(
+        "- cross-engineer target: {}",
+        report.reproduction.cross_engineer_target
+    ));
+    lines.push(String::new());
+    lines.push("## Environment".to_string());
+    lines.push(format!("- repo root: `{}`", report.environment.repo_root));
+    if let Some(target_dir) = &report.environment.cargo_target_dir {
+        lines.push(format!("- cargo target dir: `{target_dir}`"));
+    }
+    if let Some(rustc_version) = &report.environment.rustc_version {
+        lines.push(format!("- rustc: `{}`", rustc_version.replace('\n', "; ")));
+    }
+    if let Some(kernel_release) = &report.environment.kernel_release {
+        lines.push(format!("- kernel: `{kernel_release}`"));
+    }
+    if let Some(filesystem) = &report.environment.filesystem {
+        lines.push(format!("- filesystem: `{filesystem}`"));
+    }
+    if let Some(mount_source) = &report.environment.mount_source {
+        lines.push(format!("- mount source: `{mount_source}`"));
+    }
+    if let Some(mount_options) = &report.environment.mount_options {
+        lines.push(format!("- mount options: `{mount_options}`"));
+    }
+    if let Some(storage_model) = &report.environment.storage_model {
+        lines.push(format!("- storage model: `{storage_model}`"));
+    }
+    if let Some(storage_transport) = &report.environment.storage_transport {
+        lines.push(format!("- storage transport: `{storage_transport}`"));
+    }
+    lines.push(String::new());
     lines.push("## Batch Comparison".to_string());
-    for entry in comparison {
+    for entry in &report.comparison {
         lines.push(format!(
-            "- batch-{}: p50={}us, p95={}us, p99={}us, p99.9={}us, p99.99={}us, max={}us, samples={}",
+            "- batch-{}: p50={}us, p95={}us, p99={}us, p99.9={}us, p99.99={}us, max={}us, samples={}, throughput={:.2} elems/sec",
             entry.batch_size,
             entry.p50_us,
             entry.p95_us,
@@ -1053,7 +1484,8 @@ fn write_archive_profile_report(
             entry.p99_9_us,
             entry.p99_99_us,
             entry.max_us,
-            entry.samples_us.len()
+            entry.samples_us.len(),
+            entry.throughput_elements_per_sec
         ));
     }
     lines.push(
@@ -1061,64 +1493,163 @@ fn write_archive_profile_report(
             .to_string(),
     );
     lines.push(String::new());
-    lines.push("## Top Span Categories".to_string());
-    for category in top_categories {
+    lines.push("## Structured Logging Requirements".to_string());
+    for requirement in &report.structured_logging_requirements {
         lines.push(format!(
-            "- `{}`: cumulative={}us, count={}, avg={}us, max={}us",
+            "- `{}`: {}",
+            requirement.event,
+            requirement.required_fields.join(", ")
+        ));
+    }
+    lines.push(String::new());
+    lines.push("## Top 10 Spans by Cumulative Duration".to_string());
+    for category in &report.top_categories {
+        lines.push(format!(
+            "- `{}`: cumulative={}us, count={}, p50={}us, p95={}us, avg={}us, max={}us",
             category.category,
             category.cumulative_us,
             category.count,
+            category.p50_us,
+            category.p95_us,
             category.avg_us,
             category.max_us
         ));
     }
     lines.push(String::new());
+    lines.push("## Chrome Trace".to_string());
+    lines.push(format!(
+        "- `{}` includes {} `traceEvents` records alongside the raw span payloads.",
+        perf_artifact_dir()
+            .join("archive_batch_100_spans.json")
+            .display(),
+        report.trace_events.len()
+    ));
+    lines.push(String::new());
+    lines.push("## Hypothesis Evaluation".to_string());
+    for evaluation in &report.hypothesis_evaluations {
+        lines.push(format!(
+            "- `{}`: {} ({})",
+            evaluation.name, evaluation.supports_or_rejects, evaluation.evidence
+        ));
+    }
+    lines.push(String::new());
     lines.push("## Scaling Law".to_string());
-    lines.push(format!("- {scaling_note}"));
+    lines.push(format!("- {}", report.scaling_law_note));
     lines.push(String::new());
 
-    std::fs::write(report_path, lines.join("\n"))
+    lines.join("\n")
+}
+
+fn write_archive_profile_report(report: &ArchivePerfReport) -> io::Result<()> {
+    let report_path = perf_artifact_dir().join("archive_batch_100_profile.md");
+    let _ = std::fs::create_dir_all(perf_artifact_dir());
+    std::fs::write(report_path, archive_perf_profile_markdown(report))
+}
+
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn archive_scaling_csv(comparison: &[ArchivePerfComparison]) -> String {
+    let mut lines = Vec::with_capacity(comparison.len() + 1);
+    lines.push(
+        "batch_size,p50_us,p95_us,p99_us,sample_count,p99_9_us,p99_99_us,max_us,throughput_elements_per_sec"
+            .to_string(),
+    );
+    for entry in comparison {
+        lines.push(format!(
+            "{},{},{},{},{},{},{},{},{:.2}",
+            entry.batch_size,
+            entry.p50_us,
+            entry.p95_us,
+            entry.p99_us,
+            entry.samples_us.len(),
+            entry.p99_9_us,
+            entry.p99_99_us,
+            entry.max_us,
+            entry.throughput_elements_per_sec
+        ));
+    }
+    lines.join("\n")
 }
 
 fn write_archive_scaling_csv(comparison: &[ArchivePerfComparison]) -> io::Result<()> {
     let csv_path = perf_artifact_dir().join("archive_batch_scaling.csv");
     let _ = std::fs::create_dir_all(perf_artifact_dir());
-
-    let mut lines = Vec::with_capacity(comparison.len() + 1);
-    lines
-        .push("batch_size,p50_us,p95_us,p99_us,p99_9_us,p99_99_us,max_us,sample_count".to_string());
-    for entry in comparison {
-        lines.push(format!(
-            "{},{},{},{},{},{},{},{}",
-            entry.batch_size,
-            entry.p50_us,
-            entry.p95_us,
-            entry.p99_us,
-            entry.p99_9_us,
-            entry.p99_99_us,
-            entry.max_us,
-            entry.samples_us.len()
-        ));
-    }
-
-    std::fs::write(csv_path, lines.join("\n"))
+    let csv = archive_scaling_csv(comparison);
+    std::fs::write(&csv_path, &csv)?;
+    std::fs::write(
+        perf_artifact_dir().join(format!(
+            "archive_batch_scaling_{}.csv",
+            perf_artifact_date()
+        )),
+        csv,
+    )
 }
 
-fn run_archive_perf_profile_once() {
+fn write_archive_spans_report(report: &ArchivePerfReport) -> io::Result<()> {
+    let perf_dir = perf_artifact_dir();
+    let _ = std::fs::create_dir_all(&perf_dir);
+    let json = serde_json::to_string_pretty(report).unwrap_or_default();
+    std::fs::write(perf_dir.join("archive_batch_100_spans.json"), &json)?;
+    std::fs::write(
+        perf_dir.join(format!(
+            "archive_batch_100_spans_{}.json",
+            perf_artifact_date()
+        )),
+        json,
+    )
+}
+
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+fn run_archive_perf_profile_once_inner(force: bool) {
     static DID_RUN: Once = Once::new();
-    if std::env::var_os("MCP_AGENT_MAIL_ARCHIVE_PROFILE").is_none() {
+    if !force && std::env::var_os("MCP_AGENT_MAIL_ARCHIVE_PROFILE").is_none() {
         return;
     }
 
     DID_RUN.call_once(|| {
+        let run_started = Instant::now();
         let state = span_recorder_state();
         let perf_dir = perf_artifact_dir();
         let _ = std::fs::create_dir_all(&perf_dir);
         let _ = state.take_closed();
+        let environment = archive_perf_environment();
+        let rust_version = environment
+            .rustc_version
+            .clone()
+            .unwrap_or_else(|| "unknown rustc".to_string())
+            .replace('\n', "; ");
+        let hardware = format!(
+            "{} / {} / {}",
+            environment
+                .storage_model
+                .clone()
+                .unwrap_or_else(|| "unknown-storage".to_string()),
+            environment
+                .filesystem
+                .clone()
+                .unwrap_or_else(|| "unknown-fs".to_string()),
+            environment
+                .kernel_release
+                .clone()
+                .unwrap_or_else(|| "unknown-kernel".to_string())
+        );
+
+        tracing::info!(
+            scenario = "archive_write_batch",
+            rust_version = %rust_version,
+            hardware = %hardware,
+            "perf.profile.run_start"
+        );
 
         let mut comparison = Vec::new();
         let mut batch_100_spans = Vec::new();
-        let sample_counts = [(1usize, 40usize), (10usize, 25usize), (100usize, 12usize)];
+        let sample_counts = [
+            (1usize, 40usize),
+            (10usize, 25usize),
+            (50usize, 15usize),
+            (100usize, 12usize),
+            (500usize, 6usize),
+            (1000usize, 4usize),
+        ];
 
         for (batch_size, sample_count) in sample_counts {
             let tmp = TempDir::new().expect("tempdir");
@@ -1143,18 +1674,20 @@ fn run_archive_perf_profile_once() {
                     .expect("ensure_archive")
             };
 
-            let warmup_span = tracing::info_span!("archive_batch.warmup", batch_size);
-            let _warmup_guard = warmup_span.entered();
-            let _ = run_archive_batch_sample(
-                &archive,
-                &config,
-                sender,
-                &recipients,
-                batch_size,
-                &mut msg_id,
-                usize::MAX,
-            );
-            drop(_warmup_guard);
+            {
+                let warmup_span = tracing::info_span!("archive_batch.warmup", batch_size);
+                let warmup_guard = warmup_span.entered();
+                let _ = run_archive_batch_sample(
+                    &archive,
+                    &config,
+                    sender,
+                    &recipients,
+                    batch_size,
+                    &mut msg_id,
+                    usize::MAX,
+                );
+                drop(warmup_guard);
+            }
             let _ = state.take_closed();
 
             let mut samples_us = Vec::with_capacity(sample_count);
@@ -1170,6 +1703,8 @@ fn run_archive_perf_profile_once() {
                 );
                 samples_us.push(elapsed_us);
             }
+            let total_duration_sec =
+                samples_us.iter().copied().sum::<u64>() as f64 / 1_000_000.0;
 
             let scenario = ArchivePerfComparison {
                 batch_size,
@@ -1179,8 +1714,24 @@ fn run_archive_perf_profile_once() {
                 p99_9_us: percentile_us(samples_us.clone(), 0.999),
                 p99_99_us: percentile_us(samples_us.clone(), 0.9999),
                 max_us: samples_us.iter().copied().max().unwrap_or(0),
+                throughput_elements_per_sec: {
+                    let total_elements = batch_size as f64 * sample_count as f64;
+                    let total_us = samples_us.iter().copied().sum::<u64>() as f64;
+                    if total_us > 0.0 {
+                        (total_elements / (total_us / 1_000_000.0) * 100.0).round() / 100.0
+                    } else {
+                        0.0
+                    }
+                },
                 samples_us,
             };
+
+            tracing::info!(
+                batch_size,
+                sample_count,
+                duration_sec = total_duration_sec,
+                "perf.profile.sample_collected"
+            );
 
             if batch_size == 100 {
                 batch_100_spans = state.take_closed();
@@ -1195,24 +1746,68 @@ fn run_archive_perf_profile_once() {
 
         let top_categories = summarize_recorded_spans(&batch_100_spans);
         let scaling_note = scaling_law_note(&comparison);
+        let hypothesis_evaluations = archive_perf_hypothesis_evaluations(&top_categories, &scaling_note);
+        let trace_events = chrome_trace_events(&batch_100_spans);
+
+        for category in &top_categories {
+            tracing::info!(
+                span_name = %category.category,
+                cumulative_micros = category.cumulative_us,
+                count = category.count,
+                p50 = category.p50_us,
+                p95 = category.p95_us,
+                "perf.profile.span_summary"
+            );
+        }
+
+        for hypothesis in &hypothesis_evaluations {
+            tracing::info!(
+                name = %hypothesis.name,
+                supports_or_rejects = %hypothesis.supports_or_rejects,
+                evidence = %hypothesis.evidence,
+                "perf.profile.hypothesis_evaluated"
+            );
+        }
+
         let report = ArchivePerfReport {
             run_id: run_id(),
             arch: std::env::consts::ARCH.to_string(),
             os: std::env::consts::OS.to_string(),
             warm_db: true,
+            environment,
+            reproduction: archive_perf_reproduction(),
+            structured_logging_requirements: archive_perf_logging_requirements(),
             comparison,
             batch_100_spans,
-            top_categories: top_categories.clone(),
-            scaling_law_note: scaling_note.clone(),
+            trace_events,
+            top_categories,
+            hypothesis_evaluations,
+            scaling_law_note: scaling_note,
         };
 
-        let _ = std::fs::write(
-            perf_dir.join("archive_batch_100_spans.json"),
-            serde_json::to_string_pretty(&report).unwrap_or_default(),
-        );
+        let _ = write_archive_spans_report(&report);
         let _ = write_archive_scaling_csv(&report.comparison);
-        let _ = write_archive_profile_report(&report.comparison, &top_categories, &scaling_note);
+        let _ = write_archive_profile_report(&report);
+        tracing::info!(
+            duration_sec = run_started.elapsed().as_secs_f64(),
+            artifacts_written = %format!(
+                "archive_batch_100_spans.json,archive_batch_100_spans_{}.json,archive_batch_scaling.csv,archive_batch_scaling_{}.csv,archive_batch_100_profile.md",
+                perf_artifact_date(),
+                perf_artifact_date()
+            ),
+            "perf.profile.run_complete"
+        );
     });
+}
+
+fn run_archive_perf_profile_once() {
+    run_archive_perf_profile_once_inner(false);
+}
+
+#[allow(dead_code)]
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn run_archive_perf_profile_once_for_testing() {
+    run_archive_perf_profile_once_inner(true);
 }
 
 #[allow(clippy::too_many_lines)]

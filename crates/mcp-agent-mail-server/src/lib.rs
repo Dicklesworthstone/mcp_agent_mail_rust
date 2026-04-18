@@ -4067,6 +4067,9 @@ pub(crate) struct AtcOperatorSnapshot {
     pub(crate) safe_mode: bool,
     pub(crate) kill_switch_enabled: bool,
     pub(crate) tick_count: u64,
+    pub(crate) experiences_open: usize,
+    pub(crate) experiences_resolved: u64,
+    pub(crate) policy_revision: u64,
     pub(crate) tracked_agents: Vec<AtcOperatorAgentSnapshot>,
     pub(crate) deadlock_cycles: usize,
     pub(crate) eprocess_value: f64,
@@ -5959,6 +5962,9 @@ fn build_atc_operator_snapshot(
             safe_mode: summary.safe_mode,
             kill_switch_enabled: atc::atc_kill_switch_active(),
             tick_count: summary.tick_count,
+            experiences_open: summary.experiences_open,
+            experiences_resolved: summary.experiences_resolved,
+            policy_revision: summary.policy_revision,
             tracked_agents: summary
                 .tracked_agents
                 .into_iter()
@@ -9050,8 +9056,7 @@ impl HttpState {
                     self.config.storage_root.as_path(),
                 ) {
                     Some(durability) => {
-                        body["durability_state"] =
-                            serde_json::json!(durability.to_string());
+                        body["durability_state"] = serde_json::json!(durability.to_string());
                         if matches!(
                             durability,
                             mcp_agent_mail_db::DurabilityState::Corrupt
@@ -9122,7 +9127,26 @@ impl HttpState {
         }
 
         if path == "/mail/ws-state" {
-            return Some(self.json_response(req, 501, &BROWSER_TUI_DEFERRED_JSON));
+            if !matches!(req.method, Http1Method::Get) {
+                return Some(self.error_response(req, 405, "Method Not Allowed"));
+            }
+            if header_value(req, "upgrade")
+                .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+            {
+                return Some(self.json_response(
+                    req,
+                    501,
+                    &serde_json::json!({
+                        "detail": "WebSocket upgrade is not supported for /mail/ws-state; use HTTP polling instead."
+                    }),
+                ));
+            }
+            let (_path, query_part) = split_path_query(&req.uri);
+            let observability_state =
+                tui_state_handle().unwrap_or_else(|| self.ws_state_fallback.clone());
+            let payload =
+                tui_ws_state::poll_payload(observability_state.as_ref(), query_part.as_deref());
+            return Some(self.json_response(req, 200, &payload));
         }
 
         if path == "/mail/api/locks" || path == "/mail/api/locks/" {
@@ -15694,19 +15718,23 @@ first body
     }
 
     #[test]
-    fn mail_ws_state_returns_501_deferred() {
+    fn mail_ws_state_returns_http_poll_snapshot() {
         let config = mcp_agent_mail_core::Config::default();
         let state = build_state(config);
         let req = make_request(Http1Method::Get, "/mail/ws-state?limit=5", &[]);
         let resp = block_on(state.handle(req));
-        assert_eq!(resp.status, 501);
+        assert_eq!(resp.status, 200);
         assert_eq!(
             response_header(&resp, "content-type"),
             Some("application/json")
         );
-        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("deferred json");
-        assert_eq!(body["error"], "not_implemented");
-        assert_eq!(body["tracker"], "br-il53l");
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("snapshot json");
+        assert_eq!(body["transport"], "http-poll");
+        assert_eq!(body["mode"], "snapshot");
+        assert!(
+            body.get("atc").is_some(),
+            "ws-state payload must include ATC state"
+        );
     }
 
     #[test]
@@ -16465,7 +16493,7 @@ first body
     }
 
     #[test]
-    fn mail_ws_state_upgrade_request_returns_501_deferred() {
+    fn mail_ws_state_upgrade_request_returns_not_supported_detail() {
         let config = mcp_agent_mail_core::Config::default();
         let state = build_state(config);
         let req = make_request(
@@ -16475,9 +16503,12 @@ first body
         );
         let resp = block_on(state.handle(req));
         assert_eq!(resp.status, 501);
-        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("deferred json");
-        assert_eq!(body["error"], "not_implemented");
-        assert_eq!(body["tracker"], "br-il53l");
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("HTTP polling"),
+            "unexpected 501 detail: {detail}"
+        );
     }
 
     #[test]

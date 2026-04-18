@@ -976,7 +976,7 @@ The ATC operator loop checks for this file every tick (~5 seconds). When present
 ### Verify
 
 ```bash
-am robot atc --toon | grep kill_switch
+am robot atc --summary-only --toon | grep kill_switch
 ```
 
 ### Behavior while disabled
