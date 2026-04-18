@@ -39,8 +39,8 @@ This pass does **not** try to finish the remaining substitute-compensation polic
 
 ## Current Topology At A Glance
 
-- Cargo workspace crates: `12`
-- Additional in-tree, non-workspace crate under `crates/`: `mcp-agent-mail-agent-detect`
+- Cargo workspace crates: `11`
+- Additional in-tree, non-workspace surfaces: `2` (`mcp-agent-mail-agent-detect` under `crates/`, `mcp-agent-mail-wasm` under `experimental/`)
 - Crates with dedicated `tests/*.rs` integration harnesses: `9`
 - Shell E2E suites under [tests/e2e](/data/projects/mcp_agent_mail_rust/tests/e2e): `129`
 - In-tree conformance fixture files under [tests/conformance](/data/projects/mcp_agent_mail_rust/tests/conformance): `1`
@@ -247,11 +247,11 @@ Dedicated `tests/*.rs` harness count by crate:
 - Coverage profile: light entrypoint coverage.
 - Obvious note: this binary relies heavily on lower-layer verification; if CLI/server launch semantics drift, there is little crate-local integration protection.
 
-### `mcp-agent-mail-wasm`
+### `mcp-agent-mail-wasm` (experimental, non-workspace)
 
 **Cluster: WASM surface**
 
-- Minimal inline coverage exists in [lib.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-wasm/src/lib.rs).
+- Minimal inline coverage exists in [lib.rs](/data/projects/mcp_agent_mail_rust/experimental/mcp-agent-mail-wasm/src/lib.rs).
 - No dedicated `tests/*.rs` harnesses.
 - Coverage profile: thin.
 - Obvious note: this is an explicit under-covered surface and already has a follow-on bead in the verification tree.
@@ -339,7 +339,7 @@ Dedicated `tests/*.rs` harness count by crate:
 | `R1 Deterministic local fixture` | Real subsystem over synthetic local data or controlled archive/repo layout | reconstruct/archive/share tests that synthesize archive trees or lock files; isolated guard/storage/share fixture-driven policy tests |
 | `R2 Sanctioned substitute` | Contract-preserving offline stand-in that is intentionally second-best evidence | [toon_integration.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-core/tests/toon_integration.rs), [test_toon.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_toon.sh) with [toon_stub_encoder.sh](/data/projects/mcp_agent_mail_rust/scripts/toon_stub_encoder.sh) |
 | `R3 Mock / stub / fake lane` | Explicitly mocked or fake behavior used to force branches or simulate unavailable services | [test_llm.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_llm.sh), [test_self_update.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_self_update.sh), search `StubEngine` / `StubEmbedder` harnesses in [engine.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-search-core/src/engine.rs) and [fs_bridge.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-search-core/src/fs_bridge.rs) |
-| `R4 Thin / fragmented / unowned` | Surface has little direct proof, or only indirect proof through lower layers | [crates/mcp-agent-mail/src/main.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail/src/main.rs), [crates/mcp-agent-mail-wasm/src/lib.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-wasm/src/lib.rs), [crates/mcp-agent-mail-agent-detect/src/lib.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-agent-detect/src/lib.rs) |
+| `R4 Thin / fragmented / unowned` | Surface has little direct proof, or only indirect proof through lower layers | [crates/mcp-agent-mail/src/main.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail/src/main.rs), [experimental/mcp-agent-mail-wasm/src/lib.rs](/data/projects/mcp_agent_mail_rust/experimental/mcp-agent-mail-wasm/src/lib.rs), [crates/mcp-agent-mail-agent-detect/src/lib.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-agent-detect/src/lib.rs) |
 
 ### How The Taxonomy Applies Across Test Lanes
 
@@ -366,7 +366,7 @@ Dedicated `tests/*.rs` harness count by crate:
 | LLM-assisted thread summarization E2E | `R3 Mock / stub / fake lane` | [test_llm.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_llm.sh) declares itself “stubbed, offline” and forces `MCP_AGENT_MAIL_LLM_STUB=1` for deterministic output | High: product surface exists, but current evidence is explicitly synthetic | `br-aazao.4` should separate sanctioned offline smoke from any real-model confidence claims |
 | Self-update / installer release-flow E2E | `R3 Mock / stub / fake lane` | [test_self_update.sh](/data/projects/mcp_agent_mail_rust/tests/e2e/test_self_update.sh) uses mocked release endpoints, local HTTP, and tiny synthetic payloads; related install/fresh-install suites also build fake destinations and fake tool installations | High: install/update failures are operator-facing and recent regressions proved this path is fragile | `br-aazao.3` should own real-path release/install inputs and demote the mock lane to explicit substitute coverage |
 | Share / reconstruct / archive salvage tests with synthetic repo data | `R1 Deterministic local fixture` | Share, deploy, storage, and reconstruct coverage often uses fake encrypted blobs, fake archive trees, or fake lock ownership to drive recovery logic, which is appropriate for fault isolation but not equivalent to full live archive round-trips | Medium | `br-aazao.5` and `br-aazao.7` should preserve the fixture lanes but add more end-to-end archive/recovery proof where the workflow matters |
-| Binary entrypoints, WASM, and agent-detect | `R4 Thin / fragmented / unowned` | [crates/mcp-agent-mail/src/main.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail/src/main.rs), [crates/mcp-agent-mail-wasm/src/lib.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-wasm/src/lib.rs), and [crates/mcp-agent-mail-agent-detect/src/lib.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-agent-detect/src/lib.rs) have notably lighter direct harness coverage than the mainline crates | Medium, but easy to forget | `br-aazao.7` is the obvious home for WASM/agent-detect closure; entrypoint/runtime surface follow-up should also feed `br-aazao.6` where CLI/server behavior is shared |
+| Binary entrypoints, WASM, and agent-detect | `R4 Thin / fragmented / unowned` | [crates/mcp-agent-mail/src/main.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail/src/main.rs), [experimental/mcp-agent-mail-wasm/src/lib.rs](/data/projects/mcp_agent_mail_rust/experimental/mcp-agent-mail-wasm/src/lib.rs), and [crates/mcp-agent-mail-agent-detect/src/lib.rs](/data/projects/mcp_agent_mail_rust/crates/mcp-agent-mail-agent-detect/src/lib.rs) have notably lighter direct harness coverage than the mainline crates | Medium, but easy to forget | `br-aazao.7` is the obvious home for WASM/agent-detect closure; entrypoint/runtime surface follow-up should also feed `br-aazao.6` where CLI/server behavior is shared |
 
 ### Critical-Path Gaps To Treat As Realism Debt, Not “More Tests”
 

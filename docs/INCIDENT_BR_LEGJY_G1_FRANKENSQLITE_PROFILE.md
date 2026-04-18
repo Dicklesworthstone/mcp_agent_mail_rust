@@ -7,7 +7,7 @@ Determine whether `/dp/frankensqlite` plausibly contributes to the tab-lag/flash
 - Bead: `br-legjy.7.1`
 - Run timestamp (UTC): `2026-03-02T18:43:32Z`
 - Deterministic scenario ID: `20260302_184332`
-- Primary workload: full 15-screen TUI traversal harness with baseline profile capture
+- Primary workload: full traversal harness for the then-current pre-16-screen TUI with baseline profile capture
 
 ## Reproduction Commands
 ```bash

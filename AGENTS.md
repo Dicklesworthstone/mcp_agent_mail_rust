@@ -450,7 +450,7 @@ For the full list of 100+ env vars, see `crates/mcp-agent-mail-core/src/config.r
 - **Write-behind cache** — dual-indexed ReadCache with deferred touch batching (30s flush)
 - **Async git commit coalescer** — batches writes to avoid commit storms
 - **i64 microseconds** for all timestamps — no chrono NaiveDateTime in storage layer
-- **Search V3 via frankensearch** with lexical/semantic/hybrid routing (no ad-hoc SQL fallback path)
+- **Search V3 via frankensearch** with lexical/semantic/hybrid routing
 - **Conformance testing** against Python reference — ensures format parity
 - **Dual-mode interface** — MCP server and CLI share tools but enforce surface separation
 - **Advisory file reservations** — symmetric fnmatch with archive reading and rename handling

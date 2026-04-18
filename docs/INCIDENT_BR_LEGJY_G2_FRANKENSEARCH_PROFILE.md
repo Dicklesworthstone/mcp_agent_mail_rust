@@ -9,7 +9,7 @@ Assess whether `/dp/frankensearch` contributes to TUI lag/flashing, with explici
 - Bead: `br-legjy.7.2`
 - Deterministic scenario ID: `20260302_184332`
 - Run timestamp (UTC): `2026-03-02T18:43:32Z`
-- Workload: 15-screen deterministic traversal with baseline profiling artifacts
+- Workload: deterministic traversal of the then-current pre-16-screen TUI with baseline profiling artifacts
 
 ## Reproduction Commands
 ```bash
