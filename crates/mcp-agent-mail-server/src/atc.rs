@@ -4040,6 +4040,10 @@ pub struct AtcEngine {
     /// Recent reservation lifecycle events for expiry sweep correlation (br-bn0vb.10).
     /// Ring buffer bounded to MAX_RESERVATION_EVENT_LOG entries.
     reservation_event_log: VecDeque<ReservationEvent>,
+    /// Per-agent last-outcome index. Survives ring buffer eviction so the
+    /// sweep can always find the most recent non-Granted outcome even after
+    /// a flood of events from other agents pushes the original event out.
+    reservation_last_outcome: HashMap<String, (ReservationEventKind, i64)>,
 }
 
 const MAX_RESERVATION_EVENT_LOG: usize = 512;
@@ -4055,7 +4059,7 @@ pub(crate) struct ReservationEvent {
     pub timestamp_micros: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReservationEventKind {
     Granted,
     Released,
@@ -4186,6 +4190,7 @@ impl AtcEngine {
             agent_intervention_counts: HashMap::new(),
             prev_snapshot_state: PrevSnapshotState::default(),
             reservation_event_log: VecDeque::new(),
+            reservation_last_outcome: HashMap::new(),
         }
     }
 
@@ -4521,6 +4526,12 @@ impl AtcEngine {
     }
 
     fn push_reservation_event(&mut self, event: ReservationEvent) {
+        if !matches!(event.kind, ReservationEventKind::Granted) {
+            self.reservation_last_outcome.insert(
+                event.agent.clone(),
+                (event.kind, event.timestamp_micros),
+            );
+        }
         if self.reservation_event_log.len() >= MAX_RESERVATION_EVENT_LOG {
             self.reservation_event_log.pop_front();
         }
@@ -4550,6 +4561,13 @@ impl AtcEngine {
                     ReservationEventKind::Renewed => return Some(ReservationEventKind::Renewed),
                     ReservationEventKind::Granted => {}
                 }
+            }
+        }
+        // Fallback: if the ring buffer evicted the event, consult the
+        // per-agent last-outcome cache (survives eviction).
+        for (cached_agent, (kind, ts)) in &self.reservation_last_outcome {
+            if cached_agent.eq_ignore_ascii_case(agent) && *ts >= since_micros {
+                return Some(*kind);
             }
         }
         None
@@ -7213,9 +7231,9 @@ mod synthesis_tests {
     }
 
     #[test]
-    fn reservation_outcome_lost_to_ring_buffer_eviction() {
+    fn reservation_outcome_survives_ring_buffer_eviction() {
         let mut engine = AtcEngine::new_for_testing();
-        // Agent releases a reservation — this is the outcome sweep needs.
+        // Agent force-releases a reservation — this is the outcome sweep needs.
         engine.note_reservation_force_released(
             "BlueLake",
             &["src/**".to_string()],
@@ -7233,13 +7251,13 @@ mod synthesis_tests {
                 (2_000_000 + i) as i64,
             );
         }
-        // BlueLake's force-release is now evicted. Sweep can never find it.
+        // BlueLake's event is evicted from the ring buffer, but the
+        // per-agent last-outcome cache preserves it.
         let outcome = engine.reservation_outcome_for_agent("BlueLake", 0);
-        // This returns None — the outcome is permanently lost.
-        // Documenting the behavior; not a fix, just evidence.
         assert_eq!(
-            outcome, None,
-            "force-release evicted by ring buffer flood — outcome permanently lost"
+            outcome,
+            Some(ReservationEventKind::ForceReleased),
+            "per-agent outcome cache must survive ring buffer eviction"
         );
     }
 
