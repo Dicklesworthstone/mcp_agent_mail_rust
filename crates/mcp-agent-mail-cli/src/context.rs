@@ -625,15 +625,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let url = format!("sqlite:///{}", db_path.display());
-        let ctx = CliContext::open_with_url(&url).unwrap();
+        let storage_root_str = dir.path().display().to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", &storage_root_str)],
+            || {
+                let ctx = CliContext::open_with_url(&url).unwrap();
 
-        // Should be able to query (tables exist from schema init)
-        let rows = ctx
-            .conn
-            .query_sync("SELECT COUNT(*) AS cnt FROM projects", &[])
-            .unwrap();
-        let cnt: i64 = rows.first().unwrap().get_named("cnt").unwrap();
-        assert_eq!(cnt, 0);
+                // Should be able to query (tables exist from schema init)
+                let rows = ctx
+                    .conn
+                    .query_sync("SELECT COUNT(*) AS cnt FROM projects", &[])
+                    .unwrap();
+                let cnt: i64 = rows.first().unwrap().get_named("cnt").unwrap();
+                assert_eq!(cnt, 0);
+            }
+        );
     }
 
     #[test]
@@ -641,12 +647,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let url = format!("sqlite:///{}", db_path.display());
-        let ctx = CliContext::open_with_url(&url).unwrap();
+        let storage_root_str = dir.path().display().to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", &storage_root_str)],
+            || {
+                let ctx = CliContext::open_with_url(&url).unwrap();
 
-        let err = ctx.resolve_project("nonexistent").unwrap_err();
-        assert!(
-            err.to_string().contains("project not found"),
-            "unexpected: {err}"
+            let err = ctx.resolve_project("nonexistent").unwrap_err();
+            assert!(
+                err.to_string().contains("project not found"),
+                "unexpected: {err}"
+        );
+        }
         );
     }
 
@@ -655,19 +667,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let url = format!("sqlite:///{}", db_path.display());
-        let ctx = CliContext::open_with_url(&url).unwrap();
+        let storage_root_str = dir.path().display().to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", &storage_root_str)],
+            || {
+                let ctx = CliContext::open_with_url(&url).unwrap();
 
-        // Insert a project
-        ctx.conn
-            .execute_raw(
-                "INSERT INTO projects (slug, human_key, created_at) VALUES ('test-proj', '/tmp/test', 1000000)",
-            )
-            .unwrap();
+            // Insert a project
+            ctx.conn
+                .execute_raw(
+                    "INSERT INTO projects (slug, human_key, created_at) VALUES ('test-proj', '/tmp/test', 1000000)",
+                )
+                .unwrap();
 
-        let proj = ctx.resolve_project("test-proj").unwrap();
-        assert_eq!(proj.slug, "test-proj");
-        assert_eq!(proj.human_key, "/tmp/test");
-        assert!(proj.id > 0);
+            let proj = ctx.resolve_project("test-proj").unwrap();
+            assert_eq!(proj.slug, "test-proj");
+            assert_eq!(proj.human_key, "/tmp/test");
+            assert!(proj.id > 0);
+        }
+        );
     }
 
     #[test]
@@ -675,17 +693,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let url = format!("sqlite:///{}", db_path.display());
-        let ctx = CliContext::open_with_url(&url).unwrap();
+        let storage_root_str = dir.path().display().to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", &storage_root_str)],
+            || {
+                let ctx = CliContext::open_with_url(&url).unwrap();
 
-        ctx.conn
-            .execute_raw(
-                "INSERT INTO projects (slug, human_key, created_at) VALUES ('my-slug', '/data/myproj', 1000000)",
-            )
-            .unwrap();
+            ctx.conn
+                .execute_raw(
+                    "INSERT INTO projects (slug, human_key, created_at) VALUES ('my-slug', '/data/myproj', 1000000)",
+                )
+                .unwrap();
 
-        let proj = ctx.resolve_project("/data/myproj").unwrap();
-        assert_eq!(proj.slug, "my-slug");
-        assert_eq!(proj.human_key, "/data/myproj");
+            let proj = ctx.resolve_project("/data/myproj").unwrap();
+            assert_eq!(proj.slug, "my-slug");
+            assert_eq!(proj.human_key, "/data/myproj");
+        }
+        );
     }
 
     #[test]
@@ -693,29 +717,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let url = format!("sqlite:///{}", db_path.display());
-        let ctx = CliContext::open_with_url(&url).unwrap();
+        let storage_root_str = dir.path().display().to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", &storage_root_str)],
+            || {
+                let ctx = CliContext::open_with_url(&url).unwrap();
 
-        ctx.conn
-            .execute_raw(
-                "INSERT INTO projects (slug, human_key, created_at) VALUES ('my-slug', '/data/myproj', 1000000)",
-            )
-            .unwrap();
-        let project_id = ctx.resolve_project("my-slug").unwrap().id;
-        ctx.conn
-            .execute_raw(&format!(
-                "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy) \
-                 VALUES ({project_id}, 'RedFox', 'test', 'test-model', '', 1000000, 1000000, 'auto')",
-            ))
-            .unwrap();
-        ctx.conn
-            .execute_raw(&format!("DELETE FROM projects WHERE id = {project_id}"))
-            .unwrap();
+            ctx.conn
+                .execute_raw(
+                    "INSERT INTO projects (slug, human_key, created_at) VALUES ('my-slug', '/data/myproj', 1000000)",
+                )
+                .unwrap();
+            let project_id = ctx.resolve_project("my-slug").unwrap().id;
+            ctx.conn
+                .execute_raw(&format!(
+                    "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy) \
+                     VALUES ({project_id}, 'RedFox', 'test', 'test-model', '', 1000000, 1000000, 'auto')",
+                ))
+                .unwrap();
+            ctx.conn
+                .execute_raw(&format!("DELETE FROM projects WHERE id = {project_id}"))
+                .unwrap();
 
-        let placeholder = format!("[unknown-project-{project_id}]");
-        let proj = ctx.resolve_project(&placeholder).unwrap();
-        assert_eq!(proj.id, project_id);
-        assert_eq!(proj.slug, placeholder);
-        assert_eq!(proj.human_key, format!("[unknown-project-{project_id}]"));
+            let placeholder = format!("[unknown-project-{project_id}]");
+            let proj = ctx.resolve_project(&placeholder).unwrap();
+            assert_eq!(proj.id, project_id);
+            assert_eq!(proj.slug, placeholder);
+            assert_eq!(proj.human_key, format!("[unknown-project-{project_id}]"));
+        }
+        );
     }
 
     #[test]
@@ -723,33 +753,39 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let url = format!("sqlite:///{}", db_path.display());
-        let ctx = CliContext::open_with_url(&url).unwrap();
+        let storage_root_str = dir.path().display().to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", &storage_root_str)],
+            || {
+                let ctx = CliContext::open_with_url(&url).unwrap();
 
-        ctx.conn
-            .execute_raw(
-                "INSERT INTO projects (slug, human_key, created_at) VALUES ('my-slug', '/data/myproj', 1000000)",
-            )
-            .unwrap();
-        let project_id = ctx.resolve_project("my-slug").unwrap().id;
-        ctx.conn
-            .execute_raw(
-                "INSERT INTO products (id, product_uid, name, created_at) VALUES (3, 'prod-3', 'prod-3', 1000000)",
-            )
-            .unwrap();
-        ctx.conn
-            .execute_raw(&format!(
-                "INSERT INTO product_project_links (product_id, project_id, created_at) VALUES (3, {project_id}, 1000000)"
-            ))
-            .unwrap();
-        ctx.conn
-            .execute_raw(&format!("DELETE FROM projects WHERE id = {project_id}"))
-            .unwrap();
+            ctx.conn
+                .execute_raw(
+                    "INSERT INTO projects (slug, human_key, created_at) VALUES ('my-slug', '/data/myproj', 1000000)",
+                )
+                .unwrap();
+            let project_id = ctx.resolve_project("my-slug").unwrap().id;
+            ctx.conn
+                .execute_raw(
+                    "INSERT INTO products (id, product_uid, name, created_at) VALUES (3, 'prod-3', 'prod-3', 1000000)",
+                )
+                .unwrap();
+            ctx.conn
+                .execute_raw(&format!(
+                    "INSERT INTO product_project_links (product_id, project_id, created_at) VALUES (3, {project_id}, 1000000)"
+                ))
+                .unwrap();
+            ctx.conn
+                .execute_raw(&format!("DELETE FROM projects WHERE id = {project_id}"))
+                .unwrap();
 
-        let placeholder = format!("[unknown-project-{project_id}]");
-        let proj = ctx.resolve_project(&placeholder).unwrap();
-        assert_eq!(proj.id, project_id);
-        assert_eq!(proj.slug, placeholder);
-        assert_eq!(proj.human_key, format!("[unknown-project-{project_id}]"));
+            let placeholder = format!("[unknown-project-{project_id}]");
+            let proj = ctx.resolve_project(&placeholder).unwrap();
+            assert_eq!(proj.id, project_id);
+            assert_eq!(proj.slug, placeholder);
+            assert_eq!(proj.human_key, format!("[unknown-project-{project_id}]"));
+        }
+        );
     }
 
     #[test]
@@ -757,36 +793,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let url = format!("sqlite:///{}", db_path.display());
-        let ctx = CliContext::open_with_url(&url).unwrap();
+        let storage_root_str = dir.path().display().to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", &storage_root_str)],
+            || {
+                let ctx = CliContext::open_with_url(&url).unwrap();
 
-        let project_a = dir.path().join("repo").join("a-b");
-        let project_b = dir.path().join("repo").join("a").join("b");
-        std::fs::create_dir_all(&project_a).unwrap();
-        std::fs::create_dir_all(&project_b).unwrap();
+            let project_a = dir.path().join("repo").join("a-b");
+            let project_b = dir.path().join("repo").join("a").join("b");
+            std::fs::create_dir_all(&project_a).unwrap();
+            std::fs::create_dir_all(&project_b).unwrap();
 
-        let project_a = project_a.canonicalize().unwrap();
-        let project_b = project_b.canonicalize().unwrap();
-        let project_a_key = project_a.display().to_string();
-        let project_b_key = project_b.display().to_string();
+            let project_a = project_a.canonicalize().unwrap();
+            let project_b = project_b.canonicalize().unwrap();
+            let project_a_key = project_a.display().to_string();
+            let project_b_key = project_b.display().to_string();
 
-        let identity_a = resolve_project_identity(&project_a_key);
-        let identity_b = resolve_project_identity(&project_b_key);
-        assert_eq!(
-            identity_a.slug, identity_b.slug,
-            "test setup requires a slug collision"
+            let identity_a = resolve_project_identity(&project_a_key);
+            let identity_b = resolve_project_identity(&project_b_key);
+            assert_eq!(
+                identity_a.slug, identity_b.slug,
+                "test setup requires a slug collision"
         );
 
-        ctx.conn
-            .execute_raw(&format!(
-                "INSERT INTO projects (slug, human_key, created_at) VALUES ('{}', '{}', 1000000)",
-                identity_a.slug, project_a_key
-            ))
-            .unwrap();
+            ctx.conn
+                .execute_raw(&format!(
+                    "INSERT INTO projects (slug, human_key, created_at) VALUES ('{}', '{}', 1000000)",
+                    identity_a.slug, project_a_key
+                ))
+                .unwrap();
 
-        let err = ctx.resolve_project(&project_b_key).unwrap_err();
-        assert!(
-            err.to_string().contains("project not found"),
-            "unexpected: {err}"
+            let err = ctx.resolve_project(&project_b_key).unwrap_err();
+            assert!(
+                err.to_string().contains("project not found"),
+                "unexpected: {err}"
+        );
+        }
         );
     }
 
@@ -795,19 +837,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let url = format!("sqlite:///{}", db_path.display());
-        let ctx = CliContext::open_with_url(&url).unwrap();
+        let storage_root_str = dir.path().display().to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", &storage_root_str)],
+            || {
+                let ctx = CliContext::open_with_url(&url).unwrap();
 
-        ctx.conn
-            .execute_raw(
-                "INSERT INTO projects (slug, human_key, created_at) VALUES ('p', '/tmp/p', 1000000)",
-            )
-            .unwrap();
-        let proj = ctx.resolve_project("p").unwrap();
+            ctx.conn
+                .execute_raw(
+                    "INSERT INTO projects (slug, human_key, created_at) VALUES ('p', '/tmp/p', 1000000)",
+                )
+                .unwrap();
+            let proj = ctx.resolve_project("p").unwrap();
 
-        let err = ctx.resolve_agent(proj.id, "NoSuchAgent").unwrap_err();
-        assert!(
-            err.to_string().contains("agent not found"),
-            "unexpected: {err}"
+            let err = ctx.resolve_agent(proj.id, "NoSuchAgent").unwrap_err();
+            assert!(
+                err.to_string().contains("agent not found"),
+                "unexpected: {err}"
+        );
+        }
         );
     }
 
@@ -816,27 +864,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let url = format!("sqlite:///{}", db_path.display());
-        let ctx = CliContext::open_with_url(&url).unwrap();
+        let storage_root_str = dir.path().display().to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", &storage_root_str)],
+            || {
+                let ctx = CliContext::open_with_url(&url).unwrap();
 
-        ctx.conn
-            .execute_raw(
-                "INSERT INTO projects (slug, human_key, created_at) VALUES ('p', '/tmp/p', 1000000)",
-            )
-            .unwrap();
-        let proj = ctx.resolve_project("p").unwrap();
+            ctx.conn
+                .execute_raw(
+                    "INSERT INTO projects (slug, human_key, created_at) VALUES ('p', '/tmp/p', 1000000)",
+                )
+                .unwrap();
+            let proj = ctx.resolve_project("p").unwrap();
 
-        ctx.conn
-            .execute_raw(&format!(
-                "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy) \
-                 VALUES ({}, 'RedFox', 'test', 'test-model', '', 1000000, 1000000, 'auto')",
-                proj.id
-            ))
-            .unwrap();
+            ctx.conn
+                .execute_raw(&format!(
+                    "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy) \
+                     VALUES ({}, 'RedFox', 'test', 'test-model', '', 1000000, 1000000, 'auto')",
+                    proj.id
+                ))
+                .unwrap();
 
-        let agent = ctx.resolve_agent(proj.id, "RedFox").unwrap();
-        assert_eq!(agent.name, "RedFox");
-        assert_eq!(agent.project_id, proj.id);
-        assert!(agent.id > 0);
+            let agent = ctx.resolve_agent(proj.id, "RedFox").unwrap();
+            assert_eq!(agent.name, "RedFox");
+            assert_eq!(agent.project_id, proj.id);
+            assert!(agent.id > 0);
+        }
+        );
     }
 
     #[test]
@@ -844,27 +898,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let url = format!("sqlite:///{}", db_path.display());
-        let ctx = CliContext::open_with_url(&url).unwrap();
+        let storage_root_str = dir.path().display().to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", &storage_root_str)],
+            || {
+                let ctx = CliContext::open_with_url(&url).unwrap();
 
-        ctx.conn
-            .execute_raw(
-                "INSERT INTO projects (slug, human_key, created_at) VALUES ('p', '/tmp/p', 1000000)",
-            )
-            .unwrap();
-        let proj = ctx.resolve_project("p").unwrap();
+            ctx.conn
+                .execute_raw(
+                    "INSERT INTO projects (slug, human_key, created_at) VALUES ('p', '/tmp/p', 1000000)",
+                )
+                .unwrap();
+            let proj = ctx.resolve_project("p").unwrap();
 
-        ctx.conn
-            .execute_raw(&format!(
-                "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy) \
-                 VALUES ({}, 'RedFox', 'test', 'test-model', '', 1000000, 1000000, 'auto')",
-                proj.id
-            ))
-            .unwrap();
+            ctx.conn
+                .execute_raw(&format!(
+                    "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy) \
+                     VALUES ({}, 'RedFox', 'test', 'test-model', '', 1000000, 1000000, 'auto')",
+                    proj.id
+                ))
+                .unwrap();
 
-        let agent = ctx.resolve_agent(proj.id, "redfox").unwrap();
-        assert_eq!(agent.name, "RedFox");
-        assert_eq!(agent.project_id, proj.id);
-        assert!(agent.id > 0);
+            let agent = ctx.resolve_agent(proj.id, "redfox").unwrap();
+            assert_eq!(agent.name, "RedFox");
+            assert_eq!(agent.project_id, proj.id);
+            assert!(agent.id > 0);
+        }
+        );
     }
 
     #[test]
@@ -872,41 +932,47 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let url = format!("sqlite:///{}", db_path.display());
-        let ctx = CliContext::open_with_url(&url).unwrap();
+        let storage_root_str = dir.path().display().to_string();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("STORAGE_ROOT", &storage_root_str)],
+            || {
+                let ctx = CliContext::open_with_url(&url).unwrap();
 
-        // Recreate a legacy pre-migration duplicate state so the resolver's
-        // ambiguity handling can be exercised on a migrated test database.
-        ctx.conn
-            .execute_raw("DROP INDEX IF EXISTS idx_agents_project_name_nocase")
-            .unwrap();
+            // Recreate a legacy pre-migration duplicate state so the resolver's
+            // ambiguity handling can be exercised on a migrated test database.
+            ctx.conn
+                .execute_raw("DROP INDEX IF EXISTS idx_agents_project_name_nocase")
+                .unwrap();
 
-        ctx.conn
-            .execute_raw(
-                "INSERT INTO projects (slug, human_key, created_at) VALUES ('p', '/tmp/p', 1000000)",
-            )
-            .unwrap();
-        let proj = ctx.resolve_project("p").unwrap();
+            ctx.conn
+                .execute_raw(
+                    "INSERT INTO projects (slug, human_key, created_at) VALUES ('p', '/tmp/p', 1000000)",
+                )
+                .unwrap();
+            let proj = ctx.resolve_project("p").unwrap();
 
-        ctx.conn
-            .execute_raw(&format!(
-                "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy) \
-                 VALUES ({}, 'RedFox', 'test', 'test-model', '', 1000000, 1000000, 'auto')",
-                proj.id
-            ))
-            .unwrap();
-        ctx.conn
-            .execute_raw(&format!(
-                "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy) \
-                 VALUES ({}, 'redfox', 'test', 'test-model', '', 1000000, 1000000, 'auto')",
-                proj.id
-            ))
-            .unwrap();
+            ctx.conn
+                .execute_raw(&format!(
+                    "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy) \
+                     VALUES ({}, 'RedFox', 'test', 'test-model', '', 1000000, 1000000, 'auto')",
+                    proj.id
+                ))
+                .unwrap();
+            ctx.conn
+                .execute_raw(&format!(
+                    "INSERT INTO agents (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy) \
+                     VALUES ({}, 'redfox', 'test', 'test-model', '', 1000000, 1000000, 'auto')",
+                    proj.id
+                ))
+                .unwrap();
 
-        let err = ctx.resolve_agent(proj.id, "ReDFoX").unwrap_err();
-        assert!(
-            err.to_string().contains("ambiguous agent name"),
-            "unexpected: {err}"
+            let err = ctx.resolve_agent(proj.id, "ReDFoX").unwrap_err();
+            assert!(
+                err.to_string().contains("ambiguous agent name"),
+                "unexpected: {err}"
         );
-        assert!(err.to_string().contains("am migrate"), "unexpected: {err}");
+            assert!(err.to_string().contains("am migrate"), "unexpected: {err}");
+        }
+        );
     }
 }
