@@ -8752,10 +8752,13 @@ impl KaplanMeierEstimator {
 
 // ── Global ATC Engine Singleton ─────────────────────────────────────
 
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Mutex, OnceLock};
 
 static ATC_ENGINE: OnceLock<Mutex<AtcEngine>> = OnceLock::new();
 static ATC_WRITE_MODE: OnceLock<mcp_agent_mail_core::AtcWriteMode> = OnceLock::new();
+static ATC_KILL_SWITCH: AtomicBool = AtomicBool::new(false);
+static ATC_KILL_SWITCH_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
 static ATC_POPULATION: OnceLock<Mutex<HierarchicalAgentModel>> = OnceLock::new();
 static ATC_CONFORMAL: OnceLock<Mutex<AtcConformalSet>> = OnceLock::new();
 static ATC_THRESHOLDS: OnceLock<Mutex<HashMap<String, AdaptiveThreshold>>> = OnceLock::new();
@@ -8916,6 +8919,9 @@ impl AtcEngine {
 /// Initialize the global ATC engine. Call once at server startup.
 pub fn init_global_atc(config: &mcp_agent_mail_core::Config) {
     let _ = ATC_WRITE_MODE.set(config.atc_write_mode);
+    let kill_switch_path = config.storage_root.join(".atc_kill_switch");
+    let _ = ATC_KILL_SWITCH_PATH.set(kill_switch_path);
+    refresh_kill_switch();
     let atc_config = AtcEngine::config_from_env(config);
     let engine_lock = ATC_ENGINE.get_or_init(|| Mutex::new(AtcEngine::new(atc_config.clone())));
     *engine_lock
@@ -9185,10 +9191,80 @@ pub struct AtcConflictObservation {
 }
 
 fn atc_write_mode() -> mcp_agent_mail_core::AtcWriteMode {
+    if ATC_KILL_SWITCH.load(AtomicOrdering::Relaxed) {
+        return mcp_agent_mail_core::AtcWriteMode::Off;
+    }
     ATC_WRITE_MODE
         .get()
         .copied()
         .unwrap_or(mcp_agent_mail_core::AtcWriteMode::Off)
+}
+
+pub fn refresh_kill_switch() {
+    let active = ATC_KILL_SWITCH_PATH
+        .get()
+        .is_some_and(|p| p.exists());
+    let was_active = ATC_KILL_SWITCH.swap(active, AtomicOrdering::Relaxed);
+    if active != was_active {
+        if active {
+            tracing::info!(
+                path = ?ATC_KILL_SWITCH_PATH.get(),
+                "ATC kill switch ACTIVATED — all experience writes suppressed"
+            );
+        } else {
+            tracing::info!(
+                path = ?ATC_KILL_SWITCH_PATH.get(),
+                "ATC kill switch DEACTIVATED — experience writes resume per AM_ATC_WRITE_MODE"
+            );
+        }
+    }
+}
+
+pub fn atc_kill_switch_active() -> bool {
+    ATC_KILL_SWITCH.load(AtomicOrdering::Relaxed)
+}
+
+pub fn activate_kill_switch(reason: &str) -> std::io::Result<()> {
+    let Some(path) = ATC_KILL_SWITCH_PATH.get() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "kill switch path not initialized",
+        ));
+    };
+    std::fs::write(path, reason)?;
+    tracing::info!(reason, path = ?path, "ATC kill switch file written");
+    refresh_kill_switch();
+    Ok(())
+}
+
+pub fn deactivate_kill_switch() -> std::io::Result<()> {
+    let Some(path) = ATC_KILL_SWITCH_PATH.get() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "kill switch path not initialized",
+        ));
+    };
+    if path.exists() {
+        std::fs::remove_file(path)?;
+        tracing::info!(path = ?path, "ATC kill switch file removed");
+    }
+    refresh_kill_switch();
+    Ok(())
+}
+
+pub fn kill_switch_status() -> serde_json::Value {
+    let active = atc_kill_switch_active();
+    let reason = ATC_KILL_SWITCH_PATH
+        .get()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    serde_json::json!({
+        "active": active,
+        "reason": if active { reason.as_str() } else { "" },
+        "path": ATC_KILL_SWITCH_PATH.get().map(|p| p.display().to_string()),
+        "write_mode": ATC_WRITE_MODE.get().copied().unwrap_or(mcp_agent_mail_core::AtcWriteMode::Off).to_string(),
+        "effective_mode": atc_write_mode().to_string(),
+    })
 }
 
 pub fn atc_note_message_sent(

@@ -2048,6 +2048,9 @@ impl Config {
         if let Some(v) = console_value("AM_ATC_WRITE_MODE") {
             config.atc_write_mode = AtcWriteMode::from_str_lossy(&v);
         }
+        if console_bool("ATC_LEARNING_DISABLED", false) {
+            config.atc_write_mode = AtcWriteMode::Off;
+        }
 
         // WBQ tuning
         config.wbq_channel_capacity =
@@ -3135,6 +3138,19 @@ mod tests {
         let _env = TestEnvOverrideGuard::set(&[("AM_ATC_WRITE_MODE", "shadow")]);
         let config = Config::from_env();
         assert!(config.atc_write_mode.is_shadow());
+    }
+
+    #[test]
+    fn test_atc_learning_disabled_overrides_write_mode() {
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_ATC_WRITE_MODE", "live"),
+            ("ATC_LEARNING_DISABLED", "1"),
+        ]);
+        let config = Config::from_env();
+        assert!(
+            config.atc_write_mode.is_off(),
+            "ATC_LEARNING_DISABLED=1 must force write mode to off even when AM_ATC_WRITE_MODE=live"
+        );
     }
 
     #[test]

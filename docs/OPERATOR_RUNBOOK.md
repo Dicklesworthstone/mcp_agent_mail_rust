@@ -772,3 +772,50 @@ INTEGRITY_CHECK_ON_STARTUP=true \
   INTEGRITY_CHECK_INTERVAL_HOURS=12 \
   am serve-http
 ```
+
+---
+
+## Emergency: Disable ATC Learning
+
+If ATC learning is causing production issues (latency spikes, DB errors, privacy concerns):
+
+### Option A — ENV override (fastest, requires restart)
+
+```bash
+ATC_LEARNING_DISABLED=1 am serve-http
+```
+
+This overrides `AM_ATC_WRITE_MODE` regardless of its value. All `atc_note_*` calls
+become immediate no-ops with zero compute.
+
+### Option B — Kill-switch file (no restart, effective within one ATC tick)
+
+```bash
+# Activate — create sentinel file in the storage root
+echo "latency spike incident 2026-04-18" > ~/.mcp_agent_mail_git_mailbox_repo/.atc_kill_switch
+
+# Deactivate — remove the file to resume
+rm ~/.mcp_agent_mail_git_mailbox_repo/.atc_kill_switch
+```
+
+The ATC operator loop checks for this file every tick (~5 seconds). When present,
+`atc_write_mode()` returns `Off` regardless of `AM_ATC_WRITE_MODE`.
+
+### Verify
+
+```bash
+am robot atc --toon | grep kill_switch
+```
+
+### Behavior while disabled
+
+- All `atc_note_*` return immediately (no engine lock, no compute, no log)
+- State transitions are logged at INFO level when the kill switch activates or deactivates
+- When re-enabled, the system resumes insertion without backfilling missed events (gaps are expected and documented in the ledger)
+
+### Related env vars
+
+| Variable | Values | Default | Purpose |
+|---|---|---|---|
+| `AM_ATC_WRITE_MODE` | `off`, `shadow`, `live` | `off` | Controls experience write pipeline |
+| `ATC_LEARNING_DISABLED` | `0`, `1` | `0` | Hard override: forces write mode to `off` |

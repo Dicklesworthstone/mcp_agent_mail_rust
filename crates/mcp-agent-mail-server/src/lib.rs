@@ -4523,6 +4523,40 @@ fn build_atc_feature_vector(
     features
 }
 
+fn atc_effect_project_slug(project_key: Option<&str>) -> String {
+    project_key
+        .map(mcp_agent_mail_core::resolve_project_identity)
+        .map(|identity| identity.slug)
+        .filter(|slug| !slug.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn atc_effect_sampled_input(effect: &atc::AtcEffectPlan) -> serde_json::Value {
+    serde_json::json!({
+        "decision_id": effect.decision_id,
+        "effect_id": effect.effect_id,
+        "kind": effect.kind,
+        "category": effect.category,
+        "agent": effect.agent,
+        "project_key": effect.project_key,
+        "policy_id": effect.policy_id,
+        "policy_revision": effect.policy_revision,
+        "has_message": effect.message.as_deref().is_some_and(|message| !message.trim().is_empty()),
+    })
+}
+
+fn atc_experience_stratum_key(row: &ExperienceRow) -> String {
+    row.features.stratum_key(&row.subsystem, &row.effect_kind)
+}
+
+fn atc_feature_vector_size(row: &ExperienceRow) -> usize {
+    std::mem::size_of_val(&row.features)
+        + row
+            .feature_ext
+            .as_ref()
+            .map_or(0, mcp_agent_mail_core::FeatureExtension::estimated_size)
+}
+
 fn build_atc_experience_row(effect: &atc::AtcEffectPlan) -> Result<ExperienceRow, String> {
     let decision = atc::atc_decision_record(effect.decision_id)
         .ok_or_else(|| format!("missing ATC decision record {}", effect.decision_id))?;
@@ -4597,15 +4631,76 @@ fn append_atc_experience_for_effect(
         );
     }
 
-    let row = build_atc_experience_row(effect)?;
+    let started_at = Instant::now();
+    let row = match build_atc_experience_row(effect) {
+        Ok(row) => row,
+        Err(error) => {
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_derivation_error("build_experience_row");
+            tracing::warn!(
+                event = "atc.insert_experience",
+                error_kind = "build_experience_row",
+                agent_name = %effect.agent,
+                project_slug = %atc_effect_project_slug(effect.project_key.as_deref()),
+                sampled_input = ?atc_effect_sampled_input(effect),
+                %error,
+                "failed to build ATC experience row"
+            );
+            return Err(error);
+        }
+    };
+    let stratum_key = atc_experience_stratum_key(&row);
+    let feature_vector_size = atc_feature_vector_size(&row);
     let cx = Cx::for_request_with_budget(Budget::INFINITE);
     match block_on(mcp_agent_mail_db::queries::append_atc_experience(
         &cx, pool, &row,
     )) {
-        asupersync::Outcome::Ok(value) => Ok(value),
-        asupersync::Outcome::Err(error) => Err(error.to_string()),
-        asupersync::Outcome::Cancelled(reason) => Err(format!("cancelled: {reason:?}")),
-        asupersync::Outcome::Panicked(payload) => Err(format!("panicked: {}", payload.message())),
+        asupersync::Outcome::Ok(value) => {
+            let latency_micros = elapsed_micros(started_at);
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_experience_written(&effect.kind, &stratum_key);
+            tracing::debug!(
+                event = "atc.insert_experience",
+                experience_id = value.experience_id,
+                event_kind = %effect.kind,
+                feature_vector_size,
+                project_slug = %atc_effect_project_slug(effect.project_key.as_deref()),
+                agent_name = %effect.agent,
+                stratum = %stratum_key,
+                latency_micros,
+                "ATC experience appended"
+            );
+            Ok(value)
+        }
+        asupersync::Outcome::Err(error) => {
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_derivation_error("append_experience");
+            tracing::warn!(
+                event = "atc.insert_experience",
+                error_kind = "append_experience",
+                agent_name = %effect.agent,
+                project_slug = %atc_effect_project_slug(effect.project_key.as_deref()),
+                sampled_input = ?atc_effect_sampled_input(effect),
+                %error,
+                "failed to append ATC experience row"
+            );
+            Err(error.to_string())
+        }
+        asupersync::Outcome::Cancelled(reason) => {
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_derivation_error("append_experience_cancelled");
+            Err(format!("cancelled: {reason:?}"))
+        }
+        asupersync::Outcome::Panicked(payload) => {
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_derivation_error("append_experience_panicked");
+            Err(format!("panicked: {}", payload.message()))
+        }
     }
 }
 
@@ -4799,6 +4894,9 @@ fn capture_atc_execution_result(
         // No experience ID means append_atc_experience_for_effect failed earlier.
         // The effect was still executed but has no durable experience record.
         // This is tracked as an ATC diagnostic gap, not silently swallowed.
+        mcp_agent_mail_core::global_metrics()
+            .atc
+            .record_derivation_error("capture_missing_experience_id");
         tracing::debug!("skipping execution capture: no experience_id (append may have failed)");
         return;
     };
@@ -4824,6 +4922,9 @@ fn capture_atc_execution_result(
             ..
         }) => {}
         asupersync::Outcome::Err(error) => {
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_derivation_error("transition_dispatched");
             tracing::warn!(experience_id = exp_id, %error, "failed to mark experience dispatched, continuing to final state");
             // Do NOT return — fall through to the second transition so the
             // execution result is still captured. An experience in Planned state
@@ -4844,8 +4945,21 @@ fn capture_atc_execution_result(
         capture.non_execution_reason.as_ref(),
         Some(&context_patch),
     )) {
-        asupersync::Outcome::Ok(()) => {}
+        asupersync::Outcome::Ok(()) => {
+            tracing::debug!(
+                event = "atc.resolve_experience",
+                experience_id = exp_id,
+                outcome = capture.snapshot_status,
+                latency_micros = 0_u64,
+                attribution_window_micros = 0_i64,
+                execution_mode,
+                "ATC execution result captured"
+            );
+        }
         asupersync::Outcome::Err(error) => {
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_derivation_error("transition_execution_result");
             tracing::warn!(
                 experience_id = exp_id,
                 ?capture.state,
@@ -4967,6 +5081,8 @@ fn sweep_open_experiences_for_resolution(
     }
 
     let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    let started_at = Instant::now();
+    let mut rows_resolved = 0_u64;
 
     // Fetch up to 50 open experiences per sweep to bound query cost.
     let open_experiences = match block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
@@ -4974,6 +5090,9 @@ fn sweep_open_experiences_for_resolution(
     )) {
         asupersync::Outcome::Ok(rows) => rows,
         asupersync::Outcome::Err(error) => {
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_derivation_error("sweep_fetch_open");
             tracing::debug!(%error, "failed to fetch open experiences for resolution sweep");
             return;
         }
@@ -5005,43 +5124,100 @@ fn sweep_open_experiences_for_resolution(
             // Positive resolution: the agent showed activity after the
             // advisory/probe, indicating the decision was correct.
             let cx = Cx::for_request_with_budget(Budget::INFINITE);
-            if let asupersync::Outcome::Err(error) =
-                block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
-                    &cx,
-                    pool,
-                    experience.experience_id,
-                    &outcome,
-                ))
-            {
-                tracing::warn!(
-                    experience_id = experience.experience_id,
-                    %error,
-                    "failed to resolve experience via later_activity"
-                );
+            match block_on(mcp_agent_mail_db::queries::resolve_atc_experience(
+                &cx,
+                pool,
+                experience.experience_id,
+                &outcome,
+            )) {
+                asupersync::Outcome::Ok(()) => {
+                    rows_resolved = rows_resolved.saturating_add(1);
+                    let stratum_key = atc_experience_stratum_key(experience);
+                    mcp_agent_mail_core::global_metrics()
+                        .atc
+                        .record_experience_resolved("later_activity", &stratum_key);
+                    tracing::debug!(
+                        event = "atc.resolve_experience",
+                        experience_id = experience.experience_id,
+                        outcome = "later_activity",
+                        latency_micros = 0_u64,
+                        attribution_window_micros = agent_active_since
+                            .saturating_sub(resolution_anchor_micros),
+                        agent_name = %experience.subject,
+                        project_slug = %atc_effect_project_slug(experience.project_key.as_deref()),
+                        stratum = %stratum_key,
+                        "resolved ATC experience from later activity"
+                    );
+                }
+                asupersync::Outcome::Err(error) => {
+                    mcp_agent_mail_core::global_metrics()
+                        .atc
+                        .record_derivation_error("resolve_later_activity");
+                    tracing::warn!(
+                        experience_id = experience.experience_id,
+                        %error,
+                        "failed to resolve experience via later_activity"
+                    );
+                }
+                _ => {}
             }
         } else if age_micros > resolution_window_micros {
             // Resolution window elapsed without activity signal → expire.
             let cx = Cx::for_request_with_budget(Budget::INFINITE);
-            if let asupersync::Outcome::Err(error) =
-                block_on(mcp_agent_mail_db::queries::transition_atc_experience(
-                    &cx,
-                    pool,
-                    experience.experience_id,
-                    ExperienceState::Expired,
-                    now_micros,
-                    None,
-                    None,
-                ))
-            {
-                tracing::warn!(
-                    experience_id = experience.experience_id,
-                    %error,
-                    "failed to expire experience after resolution window"
-                );
+            match block_on(mcp_agent_mail_db::queries::transition_atc_experience(
+                &cx,
+                pool,
+                experience.experience_id,
+                ExperienceState::Expired,
+                now_micros,
+                None,
+                None,
+            )) {
+                asupersync::Outcome::Ok(()) => {
+                    rows_resolved = rows_resolved.saturating_add(1);
+                    let stratum_key = atc_experience_stratum_key(experience);
+                    mcp_agent_mail_core::global_metrics()
+                        .atc
+                        .record_experience_resolved("expired", &stratum_key);
+                    tracing::debug!(
+                        event = "atc.resolve_experience",
+                        experience_id = experience.experience_id,
+                        outcome = "expired",
+                        latency_micros = 0_u64,
+                        attribution_window_micros = age_micros,
+                        agent_name = %experience.subject,
+                        project_slug = %atc_effect_project_slug(experience.project_key.as_deref()),
+                        stratum = %stratum_key,
+                        "expired ATC experience after resolution window"
+                    );
+                }
+                asupersync::Outcome::Err(error) => {
+                    mcp_agent_mail_core::global_metrics()
+                        .atc
+                        .record_derivation_error("expire_resolution_window");
+                    tracing::warn!(
+                        experience_id = experience.experience_id,
+                        %error,
+                        "failed to expire experience after resolution window"
+                    );
+                }
+                _ => {}
             }
         }
         // Otherwise: still within resolution window, leave as open.
     }
+
+    let duration_micros = elapsed_micros(started_at);
+    mcp_agent_mail_core::global_metrics()
+        .atc
+        .record_sweep("resolution_window", duration_micros, rows_resolved);
+    tracing::info!(
+        event = "atc.sweep.resolution_window",
+        rows_scanned = open_experiences.len(),
+        rows_resolved,
+        duration_micros,
+        "completed ATC resolution sweep"
+    );
 }
 
 #[allow(dead_code)]
@@ -5314,7 +5490,20 @@ fn execute_atc_effect(
     effect: &atc::AtcEffectPlan,
 ) -> String {
     match executor_mode {
-        AtcExecutorMode::Shadow => "suppressed:executor_mode_shadow".to_string(),
+        AtcExecutorMode::Shadow => {
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_shadow_event(&effect.kind);
+            tracing::trace!(
+                event = "atc.shadow.would_insert",
+                event_kind = %effect.kind,
+                project_slug = %atc_effect_project_slug(effect.project_key.as_deref()),
+                agent_name = %effect.agent,
+                trace_id = %effect.trace_id,
+                "ATC shadow mode would execute effect"
+            );
+            "suppressed:executor_mode_shadow".to_string()
+        }
         AtcExecutorMode::DryRun => "suppressed:executor_mode_dry_run".to_string(),
         AtcExecutorMode::Canary | AtcExecutorMode::Live => match effect.kind.as_str() {
             "send_advisory" if executor_mode.executes_advisories() => {
@@ -5554,6 +5743,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
     set_atc_operator_snapshot(AtcOperatorSnapshot::warming_up(true));
 
     while !stop.load(Ordering::Relaxed) {
+        atc::refresh_kill_switch();
         let started_at = Instant::now();
         let sync_check_micros = mcp_agent_mail_core::timestamps::now_micros();
         if let Some(pool) = atc_db_pool.as_ref()
@@ -5580,6 +5770,25 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
             Some(report) => (Some(report.summary), report.effects),
             None => (None, Vec::new()),
         };
+        if let Some(summary) = live_summary.as_ref() {
+            let decision_latency_micros = summary.stage_timings.total_micros;
+            for effect in &new_effects {
+                mcp_agent_mail_core::global_metrics()
+                    .atc
+                    .record_decision_latency(&effect.kind, decision_latency_micros);
+                tracing::debug!(
+                    event = "atc.decision",
+                    policy_version = summary.policy.policy_revision,
+                    decision_kind = %effect.kind,
+                    confidence = effect.expected_loss.unwrap_or(0.0),
+                    safe_mode_state = summary.safe_mode,
+                    project_slug = %atc_effect_project_slug(effect.project_key.as_deref()),
+                    agent_name = %effect.agent,
+                    latency_micros = decision_latency_micros,
+                    "ATC decision emitted effect"
+                );
+            }
+        }
         let tick_budget_micros = live_summary
             .as_ref()
             .map_or(atc_config.tick_budget_micros, |summary| {
