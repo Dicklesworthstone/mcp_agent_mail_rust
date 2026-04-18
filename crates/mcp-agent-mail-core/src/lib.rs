@@ -112,9 +112,9 @@ pub use evidence_ledger::{
 };
 pub use experience::{
     EffectKind, ExperienceBuilder, ExperienceOutcome, ExperienceRow, ExperienceState,
-    ExperienceSubsystem, FEATURE_VERSION, FeatureExtension, FeatureVector, NonExecutionReason,
-    ResolutionKind, contains_secret, loss_to_bp, prob_to_bp, saturating_u8, saturating_u16,
-    validate_transition,
+    ExperienceSubsystem, FEATURE_SCHEMA_VERSION, FEATURE_VERSION, FeatureExtension, FeatureVector,
+    NonExecutionReason, ResolutionKind, contains_secret, infer_feature_schema_version, loss_to_bp,
+    migrate_feature_payload, prob_to_bp, saturating_u8, saturating_u16, validate_transition,
 };
 pub use identity::{ProjectIdentity, compute_project_slug, resolve_project_identity, slugify};
 pub use intern::{InternedStr, intern, intern_count, pre_intern, pre_intern_policies};

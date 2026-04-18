@@ -263,7 +263,7 @@ pub use pool::{
     resolve_mailbox_sqlite_path,
     sqlite_primary_read_path_is_healthy,
 };
-pub use queries::{LeaseOutcome, MvccRetryMetrics, mvcc_retry_metrics};
+pub use queries::{LeaseOutcome, MvccRetryMetrics, RollupSnapshot, mvcc_retry_metrics};
 pub use reconstruct::{
     ArchiveDriftReport, ArchiveDriftReportSchema, ArchiveMessageInventory, MailboxProjectIdentity,
     ProjectIdentityMismatch, ReconstructStats, archive_missing_project_identities,

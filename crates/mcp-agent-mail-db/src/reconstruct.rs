@@ -182,6 +182,8 @@ pub struct ReconstructStats {
     pub salvaged_messages: usize,
     /// Number of recipient rows inserted or state rows updated from a salvaged database.
     pub salvaged_recipients: usize,
+    /// Number of ATC rollup rows restored from a salvaged database.
+    pub rollups_salvaged: usize,
     /// Number of archive files that failed to parse (skipped).
     pub parse_errors: usize,
     /// Human-readable warnings collected during reconstruction.
@@ -334,14 +336,16 @@ impl std::fmt::Display for ReconstructStats {
             || self.salvaged_agents > 0
             || self.salvaged_messages > 0
             || self.salvaged_recipients > 0
+            || self.rollups_salvaged > 0
         {
             write!(
                 f,
-                "; salvaged {} projects, {} agents, {} messages ({} recipients/state updates)",
+                "; salvaged {} projects, {} agents, {} messages ({} recipients/state updates, {} rollups)",
                 self.salvaged_projects,
                 self.salvaged_agents,
                 self.salvaged_messages,
-                self.salvaged_recipients
+                self.salvaged_recipients,
+                self.rollups_salvaged
             )?;
         }
         Ok(())
@@ -3570,6 +3574,79 @@ fn merge_salvaged_database(
             sync_reconstructed_message_recipients_json(&target_conn, message_id)?;
         }
 
+        if table_exists(&salvage_conn, "atc_experience_rollups")? {
+            let rollup_cols = table_columns(&salvage_conn, "atc_experience_rollups")?;
+            let has_stratum = rollup_cols
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case("stratum_key"));
+            if has_stratum {
+                let rollup_rows = salvage_conn
+                    .query_sync(
+                        "SELECT stratum_key, total_count, resolved_count, censored_count, \
+                         expired_count, correct_count, incorrect_count, total_regret, total_loss, \
+                         ewma_loss, ewma_weight FROM atc_experience_rollups ORDER BY stratum_key",
+                        &[],
+                    )
+                    .unwrap_or_default();
+                let now_ts = crate::timestamps::now_micros();
+                for row in &rollup_rows {
+                    let stratum_key = row.get_named::<String>("stratum_key").unwrap_or_default();
+                    if stratum_key.is_empty() {
+                        continue;
+                    }
+                    let total = row.get_named::<i64>("total_count").unwrap_or(0);
+                    let resolved = row.get_named::<i64>("resolved_count").unwrap_or(0);
+                    let censored = row.get_named::<i64>("censored_count").unwrap_or(0);
+                    let expired = row.get_named::<i64>("expired_count").unwrap_or(0);
+                    let correct = row.get_named::<i64>("correct_count").unwrap_or(0);
+                    let incorrect = row.get_named::<i64>("incorrect_count").unwrap_or(0);
+                    let regret = row.get_named::<f64>("total_regret").unwrap_or(0.0);
+                    let loss = row.get_named::<f64>("total_loss").unwrap_or(0.0);
+                    let ewma = row.get_named::<f64>("ewma_loss").unwrap_or(0.0);
+                    let weight = row.get_named::<f64>("ewma_weight").unwrap_or(0.0);
+                    let upsert_result = target_conn.execute_sync(
+                        "INSERT INTO atc_experience_rollups \
+                         (stratum_key, subsystem, effect_kind, risk_tier, \
+                          total_count, resolved_count, censored_count, expired_count, \
+                          correct_count, incorrect_count, total_regret, total_loss, \
+                          ewma_loss, ewma_weight, delay_sum_micros, delay_count, delay_max_micros, \
+                          last_updated_ts) \
+                         VALUES (?, '', '', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?) \
+                         ON CONFLICT(stratum_key) DO UPDATE SET \
+                          total_count = MAX(total_count, excluded.total_count), \
+                          resolved_count = MAX(resolved_count, excluded.resolved_count), \
+                          censored_count = MAX(censored_count, excluded.censored_count), \
+                          expired_count = MAX(expired_count, excluded.expired_count), \
+                          correct_count = MAX(correct_count, excluded.correct_count), \
+                          incorrect_count = MAX(incorrect_count, excluded.incorrect_count), \
+                          total_regret = MAX(total_regret, excluded.total_regret), \
+                          total_loss = MAX(total_loss, excluded.total_loss), \
+                          ewma_loss = CASE WHEN excluded.ewma_weight > ewma_weight \
+                                      THEN excluded.ewma_loss ELSE ewma_loss END, \
+                          ewma_weight = MAX(ewma_weight, excluded.ewma_weight), \
+                          last_updated_ts = MAX(last_updated_ts, excluded.last_updated_ts)",
+                        &[
+                            Value::Text(stratum_key),
+                            Value::BigInt(total),
+                            Value::BigInt(resolved),
+                            Value::BigInt(censored),
+                            Value::BigInt(expired),
+                            Value::BigInt(correct),
+                            Value::BigInt(incorrect),
+                            Value::Double(regret),
+                            Value::Double(loss),
+                            Value::Double(ewma),
+                            Value::Double(weight),
+                            Value::BigInt(now_ts),
+                        ],
+                    );
+                    if upsert_result.is_ok() {
+                        stats.rollups_salvaged += 1;
+                    }
+                }
+            }
+        }
+
         target_conn
             .execute_raw("REINDEX;")
             .map_err(|e| DbError::Sqlite(format!("reconstruct salvage: REINDEX: {e}")))?;
@@ -4345,6 +4422,7 @@ mod tests {
             salvaged_agents: 0,
             salvaged_messages: 0,
             salvaged_recipients: 0,
+            rollups_salvaged: 0,
             parse_errors: 3,
             warnings: vec![],
             duplicate_canonical_id_set: BTreeSet::new(),

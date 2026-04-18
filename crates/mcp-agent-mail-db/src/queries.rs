@@ -19,10 +19,11 @@ use asupersync::Outcome;
 use asupersync::time::{sleep, wall_now};
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
 use mcp_agent_mail_core::{
-    ExperienceOutcome, ExperienceRow, ExperienceState, FeatureExtension, FeatureVector,
-    NonExecutionReason, ResolutionKind, validate_transition,
+    ExperienceOutcome, ExperienceRow, ExperienceState, FEATURE_SCHEMA_VERSION, FeatureExtension,
+    FeatureVector, NonExecutionReason, ResolutionKind, infer_feature_schema_version,
+    migrate_feature_payload, validate_transition,
 };
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use sqlmodel::prelude::*;
 use sqlmodel_core::{Connection, Dialect, Error as SqlError, IsolationLevel, PreparedStatement};
 use sqlmodel_core::{Row as SqlRow, TransactionOps, Value};
@@ -59,6 +60,31 @@ impl LeaseOutcome {
     pub const fn is_leader(&self) -> bool {
         matches!(self, Self::Acquired)
     }
+}
+
+// =============================================================================
+// ATC Rollup Snapshot types
+// =============================================================================
+
+/// Result of taking an ATC rollup snapshot for backup/restore.
+#[derive(Debug, Clone)]
+pub struct RollupSnapshot {
+    pub captured_ts_micros: i64,
+    pub rollup_rows: i64,
+    pub payload_sha256: String,
+    pub payload: String,
+}
+
+fn sha256_hex(data: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data.as_bytes());
+    let result = hasher.finalize();
+    result.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
 }
 
 // =============================================================================
@@ -560,14 +586,21 @@ fn decode_atc_experience_row(row: &SqlRow) -> std::result::Result<ExperienceRow,
     let features = parse_json_optional::<FeatureVector>(row_opt_text(row, 23), "features_json")?;
     let feature_ext =
         parse_json_optional::<FeatureExtension>(row_opt_text(row, 24), "feature_ext_json")?;
-    let created_ts_micros = row
+    let feature_schema_version = row
         .get(25)
         .and_then(value_as_i64)
+        .and_then(|value| u16::try_from(value).ok())
+        .unwrap_or(FEATURE_SCHEMA_VERSION);
+    let feature_payload = migrate_feature_payload(feature_schema_version, features, feature_ext)
+        .map_err(|error| DbError::invalid("feature_schema_version", error.to_string()))?;
+    let created_ts_micros = row
+        .get(26)
+        .and_then(value_as_i64)
         .ok_or_else(|| DbError::Internal("missing created_ts in atc_experience row".to_string()))?;
-    let dispatched_ts_micros = row.get(26).and_then(value_as_i64);
-    let executed_ts_micros = row.get(27).and_then(value_as_i64);
-    let resolved_ts_micros = row.get(28).and_then(value_as_i64);
-    let context = parse_json_optional::<serde_json::Value>(row_opt_text(row, 29), "context_json")?;
+    let dispatched_ts_micros = row.get(27).and_then(value_as_i64);
+    let executed_ts_micros = row.get(28).and_then(value_as_i64);
+    let resolved_ts_micros = row.get(29).and_then(value_as_i64);
+    let context = parse_json_optional::<serde_json::Value>(row_opt_text(row, 30), "context_json")?;
 
     Ok(ExperienceRow {
         experience_id,
@@ -597,8 +630,8 @@ fn decode_atc_experience_row(row: &SqlRow) -> std::result::Result<ExperienceRow,
         dispatched_ts_micros,
         executed_ts_micros,
         resolved_ts_micros,
-        features,
-        feature_ext,
+        features: feature_payload.features,
+        feature_ext: feature_payload.feature_ext,
         context,
     })
 }
@@ -606,7 +639,7 @@ fn decode_atc_experience_row(row: &SqlRow) -> std::result::Result<ExperienceRow,
 const PROJECT_SELECT_ALL_SQL: &str =
     "SELECT id, slug, human_key, created_at FROM projects ORDER BY id ASC";
 pub type AtcRollupRow = (String, i64, i64, i64, i64, i64, i64, f64, f64, f64, f64);
-const ATC_EXPERIENCE_SELECT_COLUMNS_SQL: &str = "SELECT experience_id, decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem, decision_class, subject, project_key, policy_id, effect_kind, action, posterior_json, expected_loss, runner_up_action, runner_up_loss, evidence_summary, calibration_healthy, safe_mode_active, non_execution_json, outcome_json, features_json, feature_ext_json, created_ts, dispatched_ts, executed_ts, resolved_ts, context_json FROM atc_experiences";
+const ATC_EXPERIENCE_SELECT_COLUMNS_SQL: &str = "SELECT experience_id, decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem, decision_class, subject, project_key, policy_id, effect_kind, action, posterior_json, expected_loss, runner_up_action, runner_up_loss, evidence_summary, calibration_healthy, safe_mode_active, non_execution_json, outcome_json, features_json, feature_ext_json, feature_schema_version, created_ts, dispatched_ts, executed_ts, resolved_ts, context_json FROM atc_experiences";
 const FILE_RESERVATION_SELECT_COLUMNS_SQL: &str = "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts \
      FROM file_reservations";
 const AGENT_LINK_SELECT_COLUMNS_SQL: &str = "SELECT id, a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts \
@@ -838,6 +871,7 @@ const REQUIRED_ATC_EXPERIENCE_COLUMNS: &[&str] = &[
     "outcome_json",
     "features_json",
     "feature_ext_json",
+    "feature_schema_version",
     "created_ts",
     "dispatched_ts",
     "executed_ts",
@@ -999,6 +1033,150 @@ fn inspect_canonical_atc_schema(pool: &DbPool) -> std::result::Result<Vec<String
         Ok(missing)
     })();
     close_canonical_db_conn(conn, "canonical ATC schema inspection connection");
+    result
+}
+
+/// Summary returned by ATC feature-schema reprocessing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AtcFeatureSchemaReprocessSummary {
+    /// Rows scanned after filters were applied.
+    pub scanned: usize,
+    /// Rows whose payload needed rewriting.
+    pub updated: usize,
+    /// Rows already matching the current schema.
+    pub unchanged: usize,
+    /// Current supported feature schema version.
+    pub current_schema_version: u16,
+    /// Whether the command ran in preview mode.
+    pub dry_run: bool,
+}
+
+/// Reprocess persisted ATC feature payloads to the current schema contract.
+pub fn reprocess_atc_feature_schema(
+    conn: &crate::DbConn,
+    project_key: Option<&str>,
+    subject: Option<&str>,
+    limit: usize,
+    dry_run: bool,
+) -> std::result::Result<AtcFeatureSchemaReprocessSummary, DbError> {
+    if limit == 0 {
+        return Err(DbError::invalid("limit", "must be greater than zero"));
+    }
+
+    let limit = i64::try_from(limit)
+        .map_err(|_| DbError::invalid("limit", "exceeds SQLite INTEGER range"))?;
+    let mut sql = String::from(
+        "SELECT experience_id, feature_schema_version, features_json, feature_ext_json \
+         FROM atc_experiences",
+    );
+    let mut predicates = Vec::new();
+    let mut params = Vec::new();
+    if let Some(value) = project_key {
+        predicates.push("project_key = ?");
+        params.push(Value::Text(value.to_string()));
+    }
+    if let Some(value) = subject {
+        predicates.push("subject = ?");
+        params.push(Value::Text(value.to_string()));
+    }
+    if !predicates.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&predicates.join(" AND "));
+    }
+    sql.push_str(" ORDER BY experience_id ASC LIMIT ?");
+    params.push(Value::BigInt(limit));
+
+    let rows = conn
+        .query_sync(&sql, &params)
+        .map_err(|error| DbError::Sqlite(format!("reprocess ATC feature schema query: {error}")))?;
+
+    if !dry_run {
+        conn.execute_raw("BEGIN IMMEDIATE TRANSACTION")
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "begin ATC feature schema reprocess transaction: {error}"
+                ))
+            })?;
+    }
+
+    let result = (|| -> std::result::Result<AtcFeatureSchemaReprocessSummary, DbError> {
+        let mut updated = 0_usize;
+        for row in &rows {
+            let experience_id = row.get(0).and_then(value_as_i64).ok_or_else(|| {
+                DbError::Internal(
+                    "missing experience_id in ATC feature schema reprocess row".to_string(),
+                )
+            })?;
+            let stored_schema_version = row
+                .get(1)
+                .and_then(value_as_i64)
+                .and_then(|value| u16::try_from(value).ok())
+                .unwrap_or(FEATURE_SCHEMA_VERSION);
+            let features =
+                parse_json_optional::<FeatureVector>(row_opt_text(row, 2), "features_json")?;
+            let feature_ext =
+                parse_json_optional::<FeatureExtension>(row_opt_text(row, 3), "feature_ext_json")?;
+            let migrated = migrate_feature_payload(
+                stored_schema_version,
+                features.clone(),
+                feature_ext.clone(),
+            )
+            .map_err(|error| DbError::invalid("feature_schema_version", error.to_string()))?;
+            let needs_update = stored_schema_version != migrated.schema_version
+                || features != migrated.features
+                || feature_ext != migrated.feature_ext;
+            if !needs_update {
+                continue;
+            }
+
+            updated += 1;
+            if dry_run {
+                continue;
+            }
+
+            let features_json = encode_json_optional(&migrated.features, "features_json")?;
+            let feature_ext_json = encode_json_optional(&migrated.feature_ext, "feature_ext_json")?;
+            conn.execute_sync(
+                "UPDATE atc_experiences \
+                 SET feature_schema_version = ?, features_json = ?, feature_ext_json = ? \
+                 WHERE experience_id = ?",
+                &[
+                    Value::BigInt(i64::from(migrated.schema_version)),
+                    features_json.map_or(Value::Null, Value::Text),
+                    feature_ext_json.map_or(Value::Null, Value::Text),
+                    Value::BigInt(experience_id),
+                ],
+            )
+            .map_err(|error| {
+                DbError::Sqlite(format!(
+                    "update ATC feature payload for experience_id={experience_id}: {error}"
+                ))
+            })?;
+        }
+
+        Ok(AtcFeatureSchemaReprocessSummary {
+            scanned: rows.len(),
+            updated,
+            unchanged: rows.len().saturating_sub(updated),
+            current_schema_version: FEATURE_SCHEMA_VERSION,
+            dry_run,
+        })
+    })();
+
+    match (&result, dry_run) {
+        (Ok(_), false) => {
+            conn.execute_raw("COMMIT").map_err(|error| {
+                DbError::Sqlite(format!(
+                    "commit ATC feature schema reprocess transaction: {error}"
+                ))
+            })?;
+        }
+        (Err(_), false) => {
+            let _ = conn.execute_raw("ROLLBACK");
+        }
+        _ => {}
+    }
+
     result
 }
 
@@ -1531,19 +1709,25 @@ fn append_atc_experience_file_backed(
 
     let decision_id = sql_i64_id("decision_id", row.decision_id)?;
     let effect_id = sql_i64_id("effect_id", row.effect_id)?;
+    let feature_payload = migrate_feature_payload(
+        infer_feature_schema_version(row.features.as_ref(), row.feature_ext.as_ref()),
+        row.features,
+        row.feature_ext.clone(),
+    )
+    .map_err(|error| DbError::invalid("feature_schema_version", error.to_string()))?;
     let posterior_json = encode_json(&row.posterior, "posterior_json")?;
     let non_execution_json = encode_json_optional(&row.non_execution_reason, "non_execution_json")?;
     let outcome_json = encode_json_optional(&row.outcome, "outcome_json")?;
-    let features_json = encode_json_optional(&row.features, "features_json")?;
-    let feature_ext_json = encode_json_optional(&row.feature_ext, "feature_ext_json")?;
+    let features_json = encode_json_optional(&feature_payload.features, "features_json")?;
+    let feature_ext_json = encode_json_optional(&feature_payload.feature_ext, "feature_ext_json")?;
     let context_json = encode_json_optional(&row.context, "context_json")?;
 
     let conn = open_canonical_atc_conn(pool, "append_atc_experience")?;
     let write_result = (|| {
         begin_canonical_atc_write_tx(&conn)?;
         let insert_sql = "INSERT INTO atc_experiences \
-            (decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem, decision_class, subject, project_key, policy_id, effect_kind, action, posterior_json, expected_loss, runner_up_action, runner_up_loss, evidence_summary, calibration_healthy, safe_mode_active, non_execution_json, outcome_json, features_json, feature_ext_json, created_ts, dispatched_ts, executed_ts, resolved_ts, context_json) \
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+            (decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem, decision_class, subject, project_key, policy_id, effect_kind, action, posterior_json, expected_loss, runner_up_action, runner_up_loss, evidence_summary, calibration_healthy, safe_mode_active, non_execution_json, outcome_json, features_json, feature_ext_json, feature_schema_version, created_ts, dispatched_ts, executed_ts, resolved_ts, context_json) \
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
             ON CONFLICT(decision_id, effect_id) DO NOTHING";
         let insert_params = [
             Value::BigInt(decision_id),
@@ -1576,6 +1760,7 @@ fn append_atc_experience_file_backed(
             outcome_json.map_or(Value::Null, Value::Text),
             features_json.map_or(Value::Null, Value::Text),
             feature_ext_json.map_or(Value::Null, Value::Text),
+            Value::BigInt(i64::from(feature_payload.schema_version)),
             Value::BigInt(row.created_ts_micros),
             row.dispatched_ts_micros.map_or(Value::Null, Value::BigInt),
             row.executed_ts_micros.map_or(Value::Null, Value::BigInt),
@@ -2085,6 +2270,122 @@ fn fetch_atc_rollups_file_backed(pool: &DbPool) -> std::result::Result<Vec<AtcRo
     })();
     close_canonical_db_conn(conn, "canonical ATC rollups fetch connection");
     result
+}
+
+// ── File-backed ATC rollup snapshot ─────────────────────────────────────
+
+fn snapshot_atc_rollups_file_backed(
+    pool: &DbPool,
+    now_micros: i64,
+) -> std::result::Result<RollupSnapshot, DbError> {
+    let rollups = fetch_atc_rollups_file_backed(pool)?;
+    let payload = serde_json::to_string(&rollups)
+        .map_err(|e| DbError::Internal(format!("snapshot rollups serialize: {e}")))?;
+    let sha256 = sha256_hex(&payload);
+    let row_count = rollups.len() as i64;
+
+    let conn = open_canonical_atc_conn(pool, "snapshot_atc_rollups")?;
+    let result = (|| {
+        begin_canonical_atc_write_tx(&conn)?;
+        canonical_execute_atc(
+            &conn,
+            "INSERT INTO atc_rollup_snapshots (captured_ts, rollup_rows, payload_sha256) \
+             VALUES (?, ?, ?)",
+            &[
+                Value::BigInt(now_micros),
+                Value::BigInt(row_count),
+                Value::Text(sha256.clone()),
+            ],
+            "snapshot_rollups insert",
+        )?;
+        commit_canonical_atc_write_tx(&conn)
+    })();
+    if result.is_err() {
+        rollback_canonical_atc_write_tx(&conn);
+    }
+    close_canonical_db_conn(conn, "canonical ATC snapshot connection");
+    result?;
+    Ok(RollupSnapshot {
+        captured_ts_micros: now_micros,
+        rollup_rows: row_count,
+        payload_sha256: sha256,
+        payload,
+    })
+}
+
+const RESTORE_ROLLUP_UPSERT_SQL: &str = "\
+    INSERT INTO atc_experience_rollups \
+    (stratum_key, subsystem, effect_kind, risk_tier, \
+     total_count, resolved_count, censored_count, expired_count, \
+     correct_count, incorrect_count, total_regret, total_loss, \
+     ewma_loss, ewma_weight, delay_sum_micros, delay_count, delay_max_micros, \
+     last_updated_ts) \
+    VALUES (?, '', '', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?) \
+    ON CONFLICT(stratum_key) DO UPDATE SET \
+     total_count = excluded.total_count, \
+     resolved_count = excluded.resolved_count, \
+     censored_count = excluded.censored_count, \
+     expired_count = excluded.expired_count, \
+     correct_count = excluded.correct_count, \
+     incorrect_count = excluded.incorrect_count, \
+     total_regret = excluded.total_regret, \
+     total_loss = excluded.total_loss, \
+     ewma_loss = excluded.ewma_loss, \
+     ewma_weight = excluded.ewma_weight, \
+     last_updated_ts = excluded.last_updated_ts";
+
+fn restore_rollup_params(row: &AtcRollupRow, now_micros: i64) -> Vec<Value> {
+    vec![
+        Value::Text(row.0.clone()),
+        Value::BigInt(row.1),
+        Value::BigInt(row.2),
+        Value::BigInt(row.3),
+        Value::BigInt(row.4),
+        Value::BigInt(row.5),
+        Value::BigInt(row.6),
+        Value::Double(row.7),
+        Value::Double(row.8),
+        Value::Double(row.9),
+        Value::Double(row.10),
+        Value::BigInt(now_micros),
+    ]
+}
+
+fn parse_rollup_payload(payload: &str) -> std::result::Result<Vec<AtcRollupRow>, DbError> {
+    serde_json::from_str(payload)
+        .map_err(|e| DbError::Internal(format!("restore rollups deserialize: {e}")))
+}
+
+fn restore_atc_rollups_from_payload(
+    conn: &crate::CanonicalDbConn,
+    payload: &str,
+    now_micros: i64,
+) -> std::result::Result<usize, DbError> {
+    let rollups = parse_rollup_payload(payload)?;
+    let mut restored = 0usize;
+    for row in &rollups {
+        let params = restore_rollup_params(row, now_micros);
+        conn.execute_sync(RESTORE_ROLLUP_UPSERT_SQL, &params)
+            .map_err(|e| DbError::Sqlite(format!("restore rollup upsert: {e}")))?;
+        restored += 1;
+    }
+    Ok(restored)
+}
+
+fn restore_atc_rollups_from_payload_pooled(
+    conn: &crate::DbConn,
+    payload: &str,
+    now_micros: i64,
+) -> std::result::Result<usize, DbError> {
+    let rollups = parse_rollup_payload(payload)?;
+    let mut restored = 0usize;
+    for row in &rollups {
+        let params = restore_rollup_params(row, now_micros);
+        conn.execute_sync(RESTORE_ROLLUP_UPSERT_SQL, &params)
+            .map_err(|e| DbError::Sqlite(format!("restore rollup upsert: {e}")))?;
+        restored += 1;
+    }
+    Ok(restored)
 }
 
 // ── File-backed ATC leader lease ────────────────────────────────────────
@@ -9641,6 +9942,19 @@ pub async fn append_atc_experience(
         Ok(value) => value,
         Err(error) => return Outcome::Err(error),
     };
+    let feature_payload = match migrate_feature_payload(
+        infer_feature_schema_version(row.features.as_ref(), row.feature_ext.as_ref()),
+        row.features,
+        row.feature_ext.clone(),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return Outcome::Err(DbError::invalid(
+                "feature_schema_version",
+                error.to_string(),
+            ));
+        }
+    };
     let posterior_json = match encode_json(&row.posterior, "posterior_json") {
         Ok(value) => value,
         Err(error) => return Outcome::Err(error),
@@ -9654,14 +9968,15 @@ pub async fn append_atc_experience(
         Ok(value) => value,
         Err(error) => return Outcome::Err(error),
     };
-    let features_json = match encode_json_optional(&row.features, "features_json") {
+    let features_json = match encode_json_optional(&feature_payload.features, "features_json") {
         Ok(value) => value,
         Err(error) => return Outcome::Err(error),
     };
-    let feature_ext_json = match encode_json_optional(&row.feature_ext, "feature_ext_json") {
-        Ok(value) => value,
-        Err(error) => return Outcome::Err(error),
-    };
+    let feature_ext_json =
+        match encode_json_optional(&feature_payload.feature_ext, "feature_ext_json") {
+            Ok(value) => value,
+            Err(error) => return Outcome::Err(error),
+        };
     let context_json = match encode_json_optional(&row.context, "context_json") {
         Ok(value) => value,
         Err(error) => return Outcome::Err(error),
@@ -9680,8 +9995,8 @@ pub async fn append_atc_experience(
             try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
             let insert_sql = "INSERT INTO atc_experiences \
-                (decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem, decision_class, subject, project_key, policy_id, effect_kind, action, posterior_json, expected_loss, runner_up_action, runner_up_loss, evidence_summary, calibration_healthy, safe_mode_active, non_execution_json, outcome_json, features_json, feature_ext_json, created_ts, dispatched_ts, executed_ts, resolved_ts, context_json) \
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                (decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem, decision_class, subject, project_key, policy_id, effect_kind, action, posterior_json, expected_loss, runner_up_action, runner_up_loss, evidence_summary, calibration_healthy, safe_mode_active, non_execution_json, outcome_json, features_json, feature_ext_json, feature_schema_version, created_ts, dispatched_ts, executed_ts, resolved_ts, context_json) \
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                 ON CONFLICT(decision_id, effect_id) DO NOTHING";
             let insert_params = [
                 Value::BigInt(decision_id),
@@ -9723,6 +10038,7 @@ pub async fn append_atc_experience(
                 feature_ext_json
                     .as_ref()
                     .map_or(Value::Null, |value| Value::Text(value.clone())),
+                Value::BigInt(i64::from(feature_payload.schema_version)),
                 Value::BigInt(row.created_ts_micros),
                 row.dispatched_ts_micros
                     .map_or(Value::Null, Value::BigInt),
@@ -10881,6 +11197,202 @@ pub async fn release_atc_leader_lease(
 }
 
 // =============================================================================
+// ATC rollup snapshot / restore
+// =============================================================================
+
+/// Snapshot all current ATC rollup rows into JSON, record the snapshot
+/// metadata in `atc_rollup_snapshots`, and return the full snapshot.
+pub async fn snapshot_atc_rollups(
+    cx: &Cx,
+    pool: &DbPool,
+    now_micros: i64,
+) -> Outcome<RollupSnapshot, DbError> {
+    if pool.sqlite_path() != ":memory:" {
+        match ensure_file_backed_atc_pool_initialized(cx, pool).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+        return match snapshot_atc_rollups_file_backed(pool, now_micros) {
+            Ok(snap) => Outcome::Ok(snap),
+            Err(error) => Outcome::Err(error),
+        };
+    }
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+
+    let rows = match traw_query(
+        cx,
+        &tracked,
+        "SELECT stratum_key, total_count, resolved_count, censored_count, \
+         expired_count, correct_count, incorrect_count, total_regret, total_loss, \
+         ewma_loss, ewma_weight \
+         FROM atc_experience_rollups ORDER BY stratum_key",
+        &[],
+    )
+    .await
+    {
+        Outcome::Ok(r) => r,
+        Outcome::Err(e) => {
+            return Outcome::Err(DbError::Internal(format!(
+                "snapshot_atc_rollups select: {e}"
+            )));
+        }
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let mut rollups: Vec<AtcRollupRow> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let stratum_key = row
+            .get(0)
+            .and_then(|v| match v {
+                Value::Text(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let total = row.get(1).and_then(value_as_i64).unwrap_or(0);
+        let resolved = row.get(2).and_then(value_as_i64).unwrap_or(0);
+        let censored = row.get(3).and_then(value_as_i64).unwrap_or(0);
+        let expired = row.get(4).and_then(value_as_i64).unwrap_or(0);
+        let correct = row.get(5).and_then(value_as_i64).unwrap_or(0);
+        let incorrect = row.get(6).and_then(value_as_i64).unwrap_or(0);
+        let regret = row
+            .get(7)
+            .and_then(|v| match v {
+                Value::Double(f) => Some(*f),
+                Value::Float(f) => Some(f64::from(*f)),
+                _ => None,
+            })
+            .unwrap_or(0.0);
+        let loss = row
+            .get(8)
+            .and_then(|v| match v {
+                Value::Double(f) => Some(*f),
+                Value::Float(f) => Some(f64::from(*f)),
+                _ => None,
+            })
+            .unwrap_or(0.0);
+        let ewma = row
+            .get(9)
+            .and_then(|v| match v {
+                Value::Double(f) => Some(*f),
+                Value::Float(f) => Some(f64::from(*f)),
+                _ => None,
+            })
+            .unwrap_or(0.0);
+        let weight = row
+            .get(10)
+            .and_then(|v| match v {
+                Value::Double(f) => Some(*f),
+                Value::Float(f) => Some(f64::from(*f)),
+                _ => None,
+            })
+            .unwrap_or(0.0);
+        rollups.push((
+            stratum_key,
+            total,
+            resolved,
+            censored,
+            expired,
+            correct,
+            incorrect,
+            regret,
+            loss,
+            ewma,
+            weight,
+        ));
+    }
+
+    let payload = match serde_json::to_string(&rollups) {
+        Ok(p) => p,
+        Err(e) => {
+            return Outcome::Err(DbError::Internal(format!(
+                "snapshot rollups serialize: {e}"
+            )));
+        }
+    };
+    let sha256 = sha256_hex(&payload);
+    let row_count = rollups.len() as i64;
+
+    match traw_execute(
+        cx,
+        &tracked,
+        "INSERT INTO atc_rollup_snapshots (captured_ts, rollup_rows, payload_sha256) \
+         VALUES (?, ?, ?)",
+        &[
+            Value::BigInt(now_micros),
+            Value::BigInt(row_count),
+            Value::Text(sha256.clone()),
+        ],
+    )
+    .await
+    {
+        Outcome::Ok(_) => {}
+        Outcome::Err(e) => {
+            return Outcome::Err(DbError::Internal(format!("snapshot_rollups insert: {e}")));
+        }
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    }
+
+    Outcome::Ok(RollupSnapshot {
+        captured_ts_micros: now_micros,
+        rollup_rows: row_count,
+        payload_sha256: sha256,
+        payload,
+    })
+}
+
+/// Restore ATC rollup rows from a previously captured JSON payload.
+///
+/// Returns the number of rows upserted.
+pub async fn restore_atc_rollups(
+    cx: &Cx,
+    pool: &DbPool,
+    payload: &str,
+    now_micros: i64,
+) -> Outcome<usize, DbError> {
+    if pool.sqlite_path() != ":memory:" {
+        match ensure_file_backed_atc_pool_initialized(cx, pool).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+        let conn = match open_canonical_atc_conn(pool, "restore_atc_rollups") {
+            Ok(c) => c,
+            Err(e) => return Outcome::Err(e),
+        };
+        let result = restore_atc_rollups_from_payload(&conn, payload, now_micros);
+        close_canonical_db_conn(conn, "canonical ATC restore connection");
+        return match result {
+            Ok(count) => Outcome::Ok(count),
+            Err(error) => Outcome::Err(error),
+        };
+    }
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    match restore_atc_rollups_from_payload_pooled(&*conn, payload, now_micros) {
+        Ok(count) => Outcome::Ok(count),
+        Err(error) => Outcome::Err(error),
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -11304,6 +11816,327 @@ mod tests {
 
             assert_eq!(rows.first().and_then(row_first_i64), Some(1));
         });
+    }
+
+    #[test]
+    fn append_atc_experience_normalizes_feature_schema_version() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, dir) = setup_test_pool("append_atc_feature_schema_version.db");
+        let db_path = dir.path().join("append_atc_feature_schema_version.db");
+
+        rt.block_on(async {
+            let row = ExperienceRow {
+                experience_id: 0,
+                decision_id: 142,
+                effect_id: 242,
+                trace_id: "trc-append-feature-schema".to_string(),
+                claim_id: "clm-append-feature-schema".to_string(),
+                evidence_id: "evi-append-feature-schema".to_string(),
+                state: ExperienceState::Planned,
+                subsystem: ExperienceSubsystem::Liveness,
+                decision_class: "liveness_transition".to_string(),
+                subject: "BlueLake".to_string(),
+                project_key: Some("/tmp/append-feature-schema".to_string()),
+                policy_id: Some("liveness-incumbent-r1".to_string()),
+                effect_kind: EffectKind::Probe,
+                action: "ProbeAgent".to_string(),
+                posterior: vec![
+                    ("Alive".to_string(), 0.25),
+                    ("Flaky".to_string(), 0.50),
+                    ("Dead".to_string(), 0.25),
+                ],
+                expected_loss: 1.0,
+                runner_up_action: Some("DeferProbe".to_string()),
+                runner_up_loss: Some(1.5),
+                evidence_summary: "selected for probing".to_string(),
+                calibration_healthy: true,
+                safe_mode_active: false,
+                non_execution_reason: None,
+                outcome: None,
+                created_ts_micros: 1_700_000_000_200_000,
+                dispatched_ts_micros: None,
+                executed_ts_micros: None,
+                resolved_ts_micros: None,
+                features: Some(FeatureVector {
+                    version: 0,
+                    posterior_alive_bp: 2500,
+                    posterior_flaky_bp: 5000,
+                    risk_tier: FeatureVector::risk_tier_for(EffectKind::Probe),
+                    ..FeatureVector::zeroed()
+                }),
+                feature_ext: Some(FeatureExtension {
+                    ext_version: 0,
+                    fields: vec![("retry_budget".to_string(), 2)],
+                }),
+                context: None,
+            };
+
+            let stored = append_atc_experience(&cx, &pool, &row)
+                .await
+                .into_result()
+                .expect("append experience");
+            assert_eq!(
+                stored.features.expect("features").version,
+                FEATURE_SCHEMA_VERSION
+            );
+        });
+
+        let conn = crate::DbConn::open_file(db_path.display().to_string()).expect("open sqlite");
+        let rows = conn
+            .query_sync(
+                "SELECT feature_schema_version, features_json, feature_ext_json \
+                 FROM atc_experiences WHERE decision_id = ? AND effect_id = ?",
+                &[Value::BigInt(142), Value::BigInt(242)],
+            )
+            .expect("query persisted feature schema version");
+        assert_eq!(rows.len(), 1, "expected one stored ATC experience row");
+        assert_eq!(
+            rows[0]
+                .get_named::<i64>("feature_schema_version")
+                .expect("feature_schema_version"),
+            i64::from(FEATURE_SCHEMA_VERSION)
+        );
+        let features_json: String = rows[0].get_named("features_json").expect("features_json");
+        let feature_ext_json: String = rows[0]
+            .get_named("feature_ext_json")
+            .expect("feature_ext_json");
+        let persisted_features: FeatureVector =
+            serde_json::from_str(&features_json).expect("decode features_json");
+        let persisted_ext: FeatureExtension =
+            serde_json::from_str(&feature_ext_json).expect("decode feature_ext_json");
+        assert_eq!(persisted_features.version, FEATURE_SCHEMA_VERSION);
+        assert_eq!(persisted_ext.ext_version, 1);
+    }
+
+    #[test]
+    fn fetch_durable_atc_experience_by_id_migrates_legacy_feature_payloads() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, dir) = setup_test_pool("fetch_legacy_atc_feature_schema.db");
+        let db_path = dir.path().join("fetch_legacy_atc_feature_schema.db");
+
+        let conn = crate::DbConn::open_file(db_path.display().to_string()).expect("open sqlite");
+        conn.execute_sync(
+            "INSERT INTO atc_experiences (\
+                experience_id, decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem,\
+                decision_class, subject, project_key, policy_id, effect_kind, action, posterior_json,\
+                expected_loss, runner_up_action, runner_up_loss, evidence_summary, calibration_healthy,\
+                safe_mode_active, non_execution_json, outcome_json, features_json, feature_ext_json,\
+                feature_schema_version, created_ts, dispatched_ts, executed_ts, resolved_ts, context_json,\
+                contained_suspected_secret, privacy_classification\
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(5),
+                Value::BigInt(500),
+                Value::BigInt(600),
+                Value::Text("trace-legacy-feature".to_string()),
+                Value::Text("claim-legacy-feature".to_string()),
+                Value::Text("evidence-legacy-feature".to_string()),
+                Value::Text("open".to_string()),
+                Value::Text("liveness".to_string()),
+                Value::Text("probe".to_string()),
+                Value::Text("BlueLake".to_string()),
+                Value::Text("/tmp/legacy-feature".to_string()),
+                Value::Text("policy-v1".to_string()),
+                Value::Text("probe".to_string()),
+                Value::Text("ProbeAgent".to_string()),
+                Value::Text("[]".to_string()),
+                Value::Double(0.25),
+                Value::Null,
+                Value::Null,
+                Value::Text("legacy payload".to_string()),
+                Value::BigInt(1),
+                Value::BigInt(0),
+                Value::Null,
+                Value::Null,
+                Value::Text(
+                    serde_json::json!({
+                        "version": 0,
+                        "posterior_alive_bp": 2500,
+                        "posterior_flaky_bp": 5000,
+                        "silence_secs": 0,
+                        "observation_count": 0,
+                        "reservation_count": 0,
+                        "conflict_count": 0,
+                        "in_deadlock_cycle": false,
+                        "throughput_per_min": 0,
+                        "inbox_depth": 0,
+                        "expected_loss_bp": 0,
+                        "loss_gap_bp": 0,
+                        "calibration_healthy": true,
+                        "safe_mode_active": false,
+                        "tick_utilization_bp": 0,
+                        "controller_mode": 0,
+                        "risk_tier": 0
+                    })
+                    .to_string(),
+                ),
+                Value::Text(
+                    serde_json::json!({
+                        "ext_version": 0,
+                        "fields": [["retry_budget", 4]]
+                    })
+                    .to_string(),
+                ),
+                Value::BigInt(0),
+                Value::BigInt(1_700_000_000_300_000),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::BigInt(0),
+                Value::Text("legacy_unclassified".to_string()),
+            ],
+        )
+        .expect("insert legacy ATC experience row");
+
+        rt.block_on(async {
+            let stored = fetch_durable_atc_experience_by_id(&cx, &pool, 5)
+                .await
+                .into_result()
+                .expect("fetch durable ATC experience")
+                .expect("stored row");
+            assert_eq!(
+                stored.features.expect("features").version,
+                FEATURE_SCHEMA_VERSION
+            );
+            assert_eq!(stored.feature_ext.expect("feature ext").ext_version, 1);
+        });
+    }
+
+    #[test]
+    fn reprocess_atc_feature_schema_rewrites_legacy_rows() {
+        let (_cx, _pool, dir) = setup_test_pool("reprocess_atc_feature_schema.db");
+        let db_path = dir.path().join("reprocess_atc_feature_schema.db");
+        let conn = crate::DbConn::open_file(db_path.display().to_string()).expect("open sqlite");
+
+        conn.execute_sync(
+            "INSERT INTO atc_experiences (\
+                experience_id, decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem,\
+                decision_class, subject, project_key, policy_id, effect_kind, action, posterior_json,\
+                expected_loss, runner_up_action, runner_up_loss, evidence_summary, calibration_healthy,\
+                safe_mode_active, non_execution_json, outcome_json, features_json, feature_ext_json,\
+                feature_schema_version, created_ts, dispatched_ts, executed_ts, resolved_ts, context_json,\
+                contained_suspected_secret, privacy_classification\
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(7),
+                Value::BigInt(700),
+                Value::BigInt(800),
+                Value::Text("trace-reprocess-feature".to_string()),
+                Value::Text("claim-reprocess-feature".to_string()),
+                Value::Text("evidence-reprocess-feature".to_string()),
+                Value::Text("open".to_string()),
+                Value::Text("liveness".to_string()),
+                Value::Text("probe".to_string()),
+                Value::Text("BlueLake".to_string()),
+                Value::Text("/tmp/reprocess-feature".to_string()),
+                Value::Text("policy-v1".to_string()),
+                Value::Text("probe".to_string()),
+                Value::Text("ProbeAgent".to_string()),
+                Value::Text("[]".to_string()),
+                Value::Double(0.25),
+                Value::Null,
+                Value::Null,
+                Value::Text("legacy payload".to_string()),
+                Value::BigInt(1),
+                Value::BigInt(0),
+                Value::Null,
+                Value::Null,
+                Value::Text(
+                    serde_json::json!({
+                        "version": 0,
+                        "posterior_alive_bp": 2500,
+                        "posterior_flaky_bp": 5000,
+                        "silence_secs": 0,
+                        "observation_count": 0,
+                        "reservation_count": 0,
+                        "conflict_count": 0,
+                        "in_deadlock_cycle": false,
+                        "throughput_per_min": 0,
+                        "inbox_depth": 0,
+                        "expected_loss_bp": 0,
+                        "loss_gap_bp": 0,
+                        "calibration_healthy": true,
+                        "safe_mode_active": false,
+                        "tick_utilization_bp": 0,
+                        "controller_mode": 0,
+                        "risk_tier": 0
+                    })
+                    .to_string(),
+                ),
+                Value::Text(
+                    serde_json::json!({
+                        "ext_version": 0,
+                        "fields": [["retry_budget", 5]]
+                    })
+                    .to_string(),
+                ),
+                Value::BigInt(0),
+                Value::BigInt(1_700_000_000_400_000),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::BigInt(0),
+                Value::Text("legacy_unclassified".to_string()),
+            ],
+        )
+        .expect("insert reprocess target row");
+
+        let dry_run = reprocess_atc_feature_schema(&conn, None, Some("BlueLake"), 10, true)
+            .expect("dry-run reprocess");
+        assert_eq!(dry_run.scanned, 1);
+        assert_eq!(dry_run.updated, 1);
+        let before = conn
+            .query_sync(
+                "SELECT feature_schema_version FROM atc_experiences WHERE experience_id = 7",
+                &[],
+            )
+            .expect("query pre-update schema version");
+        assert_eq!(
+            before[0]
+                .get_named::<i64>("feature_schema_version")
+                .expect("feature_schema_version before"),
+            0
+        );
+
+        let applied = reprocess_atc_feature_schema(&conn, None, Some("BlueLake"), 10, false)
+            .expect("apply reprocess");
+        assert_eq!(applied.scanned, 1);
+        assert_eq!(applied.updated, 1);
+        assert_eq!(applied.current_schema_version, FEATURE_SCHEMA_VERSION);
+
+        let after = conn
+            .query_sync(
+                "SELECT feature_schema_version, features_json, feature_ext_json \
+                 FROM atc_experiences WHERE experience_id = 7",
+                &[],
+            )
+            .expect("query post-update row");
+        assert_eq!(
+            after[0]
+                .get_named::<i64>("feature_schema_version")
+                .expect("feature_schema_version after"),
+            i64::from(FEATURE_SCHEMA_VERSION)
+        );
+        let features_json: String = after[0].get_named("features_json").expect("features_json");
+        let feature_ext_json: String = after[0]
+            .get_named("feature_ext_json")
+            .expect("feature_ext_json");
+        let persisted_features: FeatureVector =
+            serde_json::from_str(&features_json).expect("decode features_json");
+        let persisted_ext: FeatureExtension =
+            serde_json::from_str(&feature_ext_json).expect("decode feature_ext_json");
+        assert_eq!(persisted_features.version, FEATURE_SCHEMA_VERSION);
+        assert_eq!(persisted_ext.ext_version, 1);
     }
 
     #[test]
