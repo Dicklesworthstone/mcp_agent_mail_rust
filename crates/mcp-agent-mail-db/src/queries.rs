@@ -905,6 +905,20 @@ const REQUIRED_ATC_ROLLUP_COLUMNS: &[&str] = &[
     "delay_count",
     "delay_max_micros",
     "last_updated_ts",
+    "compacted_total_count",
+    "compacted_resolved_count",
+    "compacted_censored_count",
+    "compacted_expired_count",
+    "compacted_correct_count",
+    "compacted_incorrect_count",
+    "compacted_total_regret",
+    "compacted_total_loss",
+    "compacted_ewma_loss",
+    "compacted_ewma_weight",
+    "compacted_delay_sum_micros",
+    "compacted_delay_count",
+    "compacted_delay_max_micros",
+    "compacted_last_updated_ts",
 ];
 
 const REQUIRED_ATC_AUXILIARY_TABLES: &[(&str, &[&str])] = &[

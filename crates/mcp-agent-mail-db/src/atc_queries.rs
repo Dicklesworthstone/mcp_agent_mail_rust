@@ -58,7 +58,14 @@ const ROLLUP_SELECT_SQL: &str = "\
            total_count, resolved_count, censored_count, expired_count, \
            correct_count, incorrect_count, total_regret, total_loss, \
            ewma_loss, ewma_weight, delay_sum_micros, delay_count, \
-           delay_max_micros, last_updated_ts \
+           delay_max_micros, last_updated_ts, \
+           compacted_total_count, compacted_resolved_count, \
+           compacted_censored_count, compacted_expired_count, \
+           compacted_correct_count, compacted_incorrect_count, \
+           compacted_total_regret, compacted_total_loss, \
+           compacted_ewma_loss, compacted_ewma_weight, \
+           compacted_delay_sum_micros, compacted_delay_count, \
+           compacted_delay_max_micros, compacted_last_updated_ts \
     FROM atc_experience_rollups";
 
 const TOUCHED_STRATA_SQL: &str = "\
@@ -72,6 +79,15 @@ const ROLLUP_REFRESH_SELECT_PREFIX_SQL: &str = "\
     SELECT experience_id, subsystem, effect_kind, state, outcome_json, \
            created_ts, resolved_ts \
     FROM atc_experiences WHERE ";
+
+const RETENTION_COMPACT_SELECT_SQL: &str = "\
+    SELECT experience_id, subsystem, effect_kind, state, outcome_json, \
+           created_ts, resolved_ts \
+    FROM atc_experiences \
+    WHERE state IN ('resolved', 'censored', 'expired') \
+      AND resolved_ts IS NOT NULL \
+      AND resolved_ts <= ? \
+    ORDER BY subsystem, effect_kind, COALESCE(resolved_ts, created_ts), experience_id";
 
 const ROLLUP_REFRESH_UPSERT_SQL: &str = "\
     INSERT INTO atc_experience_rollups \
@@ -100,6 +116,39 @@ const ROLLUP_REFRESH_UPSERT_SQL: &str = "\
         delay_max_micros = excluded.delay_max_micros, \
         last_updated_ts = excluded.last_updated_ts";
 
+const ROLLUP_COMPACTED_UPSERT_SQL: &str = "\
+    INSERT INTO atc_experience_rollups \
+        (stratum_key, subsystem, effect_kind, risk_tier, \
+         total_count, resolved_count, censored_count, expired_count, \
+         correct_count, incorrect_count, total_regret, total_loss, \
+         ewma_loss, ewma_weight, delay_sum_micros, delay_count, \
+         delay_max_micros, last_updated_ts, \
+         compacted_total_count, compacted_resolved_count, \
+         compacted_censored_count, compacted_expired_count, \
+         compacted_correct_count, compacted_incorrect_count, \
+         compacted_total_regret, compacted_total_loss, \
+         compacted_ewma_loss, compacted_ewma_weight, \
+         compacted_delay_sum_micros, compacted_delay_count, \
+         compacted_delay_max_micros, compacted_last_updated_ts) \
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+    ON CONFLICT(stratum_key) DO UPDATE SET \
+        compacted_total_count = excluded.compacted_total_count, \
+        compacted_resolved_count = excluded.compacted_resolved_count, \
+        compacted_censored_count = excluded.compacted_censored_count, \
+        compacted_expired_count = excluded.compacted_expired_count, \
+        compacted_correct_count = excluded.compacted_correct_count, \
+        compacted_incorrect_count = excluded.compacted_incorrect_count, \
+        compacted_total_regret = excluded.compacted_total_regret, \
+        compacted_total_loss = excluded.compacted_total_loss, \
+        compacted_ewma_loss = excluded.compacted_ewma_loss, \
+        compacted_ewma_weight = excluded.compacted_ewma_weight, \
+        compacted_delay_sum_micros = excluded.compacted_delay_sum_micros, \
+        compacted_delay_count = excluded.compacted_delay_count, \
+        compacted_delay_max_micros = excluded.compacted_delay_max_micros, \
+        compacted_last_updated_ts = excluded.compacted_last_updated_ts";
+
+const COMPACTED_ROLLUP_OFFSET: usize = 18;
+
 /// Summary of one rollup refresh pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RollupSummary {
@@ -117,9 +166,10 @@ struct TouchedStratum {
     risk_tier: i32,
 }
 
-#[derive(Debug, Clone, Default)]
-struct RollupAccumulator {
-    entry: Option<RollupEntry>,
+#[derive(Debug, Clone, PartialEq)]
+struct StoredRollupEntry {
+    visible: RollupEntry,
+    compacted: RollupEntry,
 }
 
 #[derive(Debug, Clone)]
@@ -207,6 +257,34 @@ fn row_f64_idx(row: &Row, idx: usize) -> f64 {
         .unwrap_or(0.0)
 }
 
+fn blank_rollup_entry(
+    stratum_key: String,
+    subsystem: String,
+    effect_kind: String,
+    risk_tier: i32,
+) -> RollupEntry {
+    RollupEntry {
+        stratum_key,
+        subsystem,
+        effect_kind,
+        risk_tier,
+        total_count: 0,
+        resolved_count: 0,
+        censored_count: 0,
+        expired_count: 0,
+        correct_count: 0,
+        incorrect_count: 0,
+        total_regret: 0.0,
+        total_loss: 0.0,
+        ewma_loss: 0.0,
+        ewma_weight: 0.0,
+        delay_sum_micros: 0,
+        delay_count: 0,
+        delay_max_micros: 0,
+        last_updated_ts: 0,
+    }
+}
+
 fn decode_rollup_row(row: &Row) -> RollupEntry {
     #[allow(clippy::cast_possible_truncation)]
     RollupEntry {
@@ -228,6 +306,40 @@ fn decode_rollup_row(row: &Row) -> RollupEntry {
         delay_count: row_i64_idx(row, 15),
         delay_max_micros: row_i64_idx(row, 16),
         last_updated_ts: row_i64_idx(row, 17),
+    }
+}
+
+fn decode_compacted_rollup_row(row: &Row, visible: &RollupEntry) -> RollupEntry {
+    blank_rollup_entry(
+        visible.stratum_key.clone(),
+        visible.subsystem.clone(),
+        visible.effect_kind.clone(),
+        visible.risk_tier,
+    )
+    .with_compacted_metrics(row)
+}
+
+trait RollupEntryCompactedExt {
+    fn with_compacted_metrics(self, row: &Row) -> Self;
+}
+
+impl RollupEntryCompactedExt for RollupEntry {
+    fn with_compacted_metrics(mut self, row: &Row) -> Self {
+        self.total_count = row_i64_idx(row, COMPACTED_ROLLUP_OFFSET);
+        self.resolved_count = row_i64_idx(row, COMPACTED_ROLLUP_OFFSET + 1);
+        self.censored_count = row_i64_idx(row, COMPACTED_ROLLUP_OFFSET + 2);
+        self.expired_count = row_i64_idx(row, COMPACTED_ROLLUP_OFFSET + 3);
+        self.correct_count = row_i64_idx(row, COMPACTED_ROLLUP_OFFSET + 4);
+        self.incorrect_count = row_i64_idx(row, COMPACTED_ROLLUP_OFFSET + 5);
+        self.total_regret = row_f64_idx(row, COMPACTED_ROLLUP_OFFSET + 6);
+        self.total_loss = row_f64_idx(row, COMPACTED_ROLLUP_OFFSET + 7);
+        self.ewma_loss = row_f64_idx(row, COMPACTED_ROLLUP_OFFSET + 8);
+        self.ewma_weight = row_f64_idx(row, COMPACTED_ROLLUP_OFFSET + 9);
+        self.delay_sum_micros = row_i64_idx(row, COMPACTED_ROLLUP_OFFSET + 10);
+        self.delay_count = row_i64_idx(row, COMPACTED_ROLLUP_OFFSET + 11);
+        self.delay_max_micros = row_i64_idx(row, COMPACTED_ROLLUP_OFFSET + 12);
+        self.last_updated_ts = row_i64_idx(row, COMPACTED_ROLLUP_OFFSET + 13);
+        self
     }
 }
 
@@ -263,16 +375,28 @@ fn stratum_for_row(subsystem: &str, effect_kind: &str) -> Option<TouchedStratum>
     })
 }
 
-fn query_touched_strata(rows: &[Row]) -> BTreeMap<String, TouchedStratum> {
+fn query_touched_strata_from_columns(
+    rows: &[Row],
+    subsystem_idx: usize,
+    effect_kind_idx: usize,
+) -> BTreeMap<String, TouchedStratum> {
     let mut strata = BTreeMap::new();
     for row in rows {
-        let subsystem = row_text_idx(row, 0);
-        let effect_kind = row_text_idx(row, 1);
+        let subsystem = row_text_idx(row, subsystem_idx);
+        let effect_kind = row_text_idx(row, effect_kind_idx);
         if let Some(stratum) = stratum_for_row(&subsystem, &effect_kind) {
             strata.insert(stratum.stratum_key.clone(), stratum);
         }
     }
     strata
+}
+
+fn query_touched_strata(rows: &[Row]) -> BTreeMap<String, TouchedStratum> {
+    query_touched_strata_from_columns(rows, 0, 1)
+}
+
+fn query_touched_strata_from_experience_rows(rows: &[Row]) -> BTreeMap<String, TouchedStratum> {
+    query_touched_strata_from_columns(rows, 1, 2)
 }
 
 fn build_rollup_refresh_scan_query(
@@ -303,10 +427,16 @@ fn build_existing_rollups_query(stratum_count: usize) -> String {
     format!("{ROLLUP_SELECT_SQL} WHERE stratum_key IN ({placeholders}) ORDER BY stratum_key")
 }
 
-fn decode_existing_rollups(rows: &[Row]) -> BTreeMap<String, RollupEntry> {
+fn decode_existing_rollups(rows: &[Row]) -> BTreeMap<String, StoredRollupEntry> {
     rows.iter()
-        .map(decode_rollup_row)
-        .map(|entry| (entry.stratum_key.clone(), entry))
+        .map(|row| {
+            let visible = decode_rollup_row(row);
+            let compacted = decode_compacted_rollup_row(row, &visible);
+            (
+                visible.stratum_key.clone(),
+                StoredRollupEntry { visible, compacted },
+            )
+        })
         .collect()
 }
 
@@ -351,37 +481,7 @@ fn apply_resolved_outcome(entry: &mut RollupEntry, outcome: Option<ExperienceOut
     entry.ewma_weight = EWMA_LAMBDA.mul_add(entry.ewma_weight, 1.0);
 }
 
-fn accumulate_rollup_row(
-    aggregates: &mut BTreeMap<String, RollupAccumulator>,
-    row: ExperienceAggregateRow,
-) {
-    if !tracked_rollup_state(&row.state) {
-        return;
-    }
-    let Some(stratum) = stratum_for_row(&row.subsystem, &row.effect_kind) else {
-        return;
-    };
-    let accumulator = aggregates.entry(stratum.stratum_key.clone()).or_default();
-    let entry = accumulator.entry.get_or_insert_with(|| RollupEntry {
-        stratum_key: stratum.stratum_key.clone(),
-        subsystem: stratum.subsystem.clone(),
-        effect_kind: stratum.effect_kind.clone(),
-        risk_tier: stratum.risk_tier,
-        total_count: 0,
-        resolved_count: 0,
-        censored_count: 0,
-        expired_count: 0,
-        correct_count: 0,
-        incorrect_count: 0,
-        total_regret: 0.0,
-        total_loss: 0.0,
-        ewma_loss: 0.0,
-        ewma_weight: 0.0,
-        delay_sum_micros: 0,
-        delay_count: 0,
-        delay_max_micros: 0,
-        last_updated_ts: 0,
-    });
+fn apply_rollup_row(entry: &mut RollupEntry, row: &ExperienceAggregateRow) {
     entry.total_count = entry.total_count.saturating_add(1);
     entry.last_updated_ts = entry
         .last_updated_ts
@@ -410,21 +510,46 @@ fn accumulate_rollup_row(
     }
 }
 
+fn accumulate_rollup_row(
+    aggregates: &mut BTreeMap<String, RollupEntry>,
+    row: ExperienceAggregateRow,
+) {
+    if !tracked_rollup_state(&row.state) {
+        return;
+    }
+    let Some(stratum) = stratum_for_row(&row.subsystem, &row.effect_kind) else {
+        return;
+    };
+    let entry = aggregates
+        .entry(stratum.stratum_key.clone())
+        .or_insert_with(|| {
+            blank_rollup_entry(
+                stratum.stratum_key,
+                stratum.subsystem,
+                stratum.effect_kind,
+                stratum.risk_tier,
+            )
+        });
+    apply_rollup_row(entry, &row);
+}
+
 fn finalize_rollups(rows: &[Row]) -> BTreeMap<String, RollupEntry> {
-    let mut aggregates = BTreeMap::new();
+    finalize_rollups_with_seed(rows, &BTreeMap::new())
+}
+
+fn finalize_rollups_with_seed(
+    rows: &[Row],
+    seed: &BTreeMap<String, RollupEntry>,
+) -> BTreeMap<String, RollupEntry> {
+    let mut aggregates = seed.clone();
     for row in rows {
         accumulate_rollup_row(&mut aggregates, decode_experience_aggregate_row(row));
     }
     aggregates
-        .into_iter()
-        .filter_map(|(stratum_key, accumulator)| {
-            accumulator.entry.map(|entry| (stratum_key, entry))
-        })
-        .collect()
 }
 
-fn upsert_rollup_entry(conn: &impl RollupConn, entry: &RollupEntry) -> Result<(), DbError> {
-    let params = vec![
+fn rollup_params(entry: &RollupEntry) -> Vec<Value> {
+    vec![
         Value::Text(entry.stratum_key.clone()),
         Value::Text(entry.subsystem.clone()),
         Value::Text(entry.effect_kind.clone()),
@@ -443,9 +568,42 @@ fn upsert_rollup_entry(conn: &impl RollupConn, entry: &RollupEntry) -> Result<()
         Value::BigInt(entry.delay_count),
         Value::BigInt(entry.delay_max_micros),
         Value::BigInt(entry.last_updated_ts),
-    ];
+    ]
+}
+
+fn compacted_rollup_params(entry: &RollupEntry) -> Vec<Value> {
+    vec![
+        Value::BigInt(entry.total_count),
+        Value::BigInt(entry.resolved_count),
+        Value::BigInt(entry.censored_count),
+        Value::BigInt(entry.expired_count),
+        Value::BigInt(entry.correct_count),
+        Value::BigInt(entry.incorrect_count),
+        Value::Double(entry.total_regret),
+        Value::Double(entry.total_loss),
+        Value::Double(entry.ewma_loss),
+        Value::Double(entry.ewma_weight),
+        Value::BigInt(entry.delay_sum_micros),
+        Value::BigInt(entry.delay_count),
+        Value::BigInt(entry.delay_max_micros),
+        Value::BigInt(entry.last_updated_ts),
+    ]
+}
+
+fn upsert_rollup_entry(conn: &impl RollupConn, entry: &RollupEntry) -> Result<(), DbError> {
+    let params = rollup_params(entry);
     conn.rollup_execute_sync(ROLLUP_REFRESH_UPSERT_SQL, &params)
         .map_err(|error| DbError::Sqlite(format!("refresh_rollups upsert: {error}")))
+}
+
+fn upsert_compacted_rollup_entry(
+    conn: &impl RollupConn,
+    entry: &RollupEntry,
+) -> Result<(), DbError> {
+    let mut params = rollup_params(entry);
+    params.extend(compacted_rollup_params(entry));
+    conn.rollup_execute_sync(ROLLUP_COMPACTED_UPSERT_SQL, &params)
+        .map_err(|error| DbError::Sqlite(format!("retention_compact baseline upsert: {error}")))
 }
 
 fn refresh_rollups_with_conn(
@@ -518,7 +676,11 @@ fn refresh_rollups_with_conn(
     let raw_rows = conn
         .rollup_query_sync(&refresh_sql, &refresh_params)
         .map_err(|error| DbError::Sqlite(format!("refresh_rollups scan: {error}")))?;
-    let refreshed = finalize_rollups(&raw_rows);
+    let compacted_seed = existing
+        .iter()
+        .map(|(stratum_key, row)| (stratum_key.clone(), row.compacted.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let refreshed = finalize_rollups_with_seed(&raw_rows, &compacted_seed);
 
     conn.rollup_execute_sync("BEGIN IMMEDIATE", &[])
         .map_err(|error| DbError::Sqlite(format!("refresh_rollups begin: {error}")))?;
@@ -527,7 +689,7 @@ fn refresh_rollups_with_conn(
         for (stratum_key, entry) in &refreshed {
             upsert_rollup_entry(conn, entry)?;
             rows_applied = rows_applied.saturating_add(1);
-            let previous = existing.get(stratum_key);
+            let previous = existing.get(stratum_key).map(|row| &row.visible);
             if previous != Some(entry) {
                 tracing::debug!(
                     event = "atc.rollup.stratum_updated",
@@ -576,10 +738,10 @@ fn refresh_rollups_with_conn(
 /// Refresh ATC rollups for any strata touched inside the lookback window.
 ///
 /// The refresh path scans recently touched experiences to find impacted
-/// strata, recomputes each impacted stratum from raw rows, and then
-/// performs absolute upserts into `atc_experience_rollups`. This keeps the
-/// write hot path append-friendly while still giving the policy engine a
-/// bounded, idempotent aggregate view.
+/// strata, recomputes each impacted stratum from surviving raw rows, and
+/// layers that scan on top of the durable compacted-history baseline for the
+/// same stratum. This keeps post-compaction rollups monotone even after the
+/// hot path trims raw terminal rows.
 pub async fn refresh_rollups(
     cx: &Cx,
     pool: &DbPool,
@@ -1038,26 +1200,69 @@ fn validate_retention_compaction(
     Ok(())
 }
 
-fn retention_compact_canonical(pool: &DbPool, cutoff_ts_micros: i64) -> Result<usize, DbError> {
-    let conn = crate::queries::open_canonical_atc_conn(pool, "retention_compact")?;
-    let result = (|| {
-        crate::queries::begin_canonical_atc_write_tx(&conn)?;
-        let deleted = crate::queries::canonical_execute_atc(
-            &conn,
+fn retention_compact_with_conn(
+    conn: &impl RollupConn,
+    cutoff_ts_micros: i64,
+) -> Result<usize, DbError> {
+    conn.rollup_execute_sync("BEGIN IMMEDIATE", &[])
+        .map_err(|error| DbError::Sqlite(format!("retention_compact begin: {error}")))?;
+    let result = (|| -> Result<usize, DbError> {
+        let doomed_rows = conn
+            .rollup_query_sync(
+                RETENTION_COMPACT_SELECT_SQL,
+                &[Value::BigInt(cutoff_ts_micros)],
+            )
+            .map_err(|error| DbError::Sqlite(format!("retention_compact select: {error}")))?;
+        if doomed_rows.is_empty() {
+            conn.rollup_execute_sync("COMMIT", &[])
+                .map_err(|error| DbError::Sqlite(format!("retention_compact commit: {error}")))?;
+            return Ok(0);
+        }
+
+        let touched = query_touched_strata_from_experience_rows(&doomed_rows);
+        let existing = if touched.is_empty() {
+            BTreeMap::new()
+        } else {
+            let existing_sql = build_existing_rollups_query(touched.len());
+            let existing_params = touched.keys().cloned().map(Value::Text).collect::<Vec<_>>();
+            let existing_rows = conn
+                .rollup_query_sync(&existing_sql, &existing_params)
+                .map_err(|error| {
+                    DbError::Sqlite(format!("retention_compact existing rows: {error}"))
+                })?;
+            decode_existing_rollups(&existing_rows)
+        };
+        let compacted_seed = existing
+            .iter()
+            .map(|(stratum_key, row)| (stratum_key.clone(), row.compacted.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let updated_compacted = finalize_rollups_with_seed(&doomed_rows, &compacted_seed);
+
+        for entry in updated_compacted.values() {
+            upsert_compacted_rollup_entry(conn, entry)?;
+        }
+        conn.rollup_execute_sync(
             "DELETE FROM atc_experiences \
              WHERE state IN ('resolved', 'censored', 'expired') \
                AND resolved_ts IS NOT NULL \
                AND resolved_ts <= ?",
             &[Value::BigInt(cutoff_ts_micros)],
-            "retention_compact delete",
-        )?;
-        crate::queries::commit_canonical_atc_write_tx(&conn)?;
-        #[allow(clippy::cast_possible_truncation)]
-        Ok(deleted as usize)
+        )
+        .map_err(|error| DbError::Sqlite(format!("retention_compact delete: {error}")))?;
+        conn.rollup_execute_sync("COMMIT", &[])
+            .map_err(|error| DbError::Sqlite(format!("retention_compact commit: {error}")))?;
+        Ok(doomed_rows.len())
     })();
-    if result.is_err() {
-        crate::queries::rollback_canonical_atc_write_tx(&conn);
+    if let Err(error) = result {
+        let _ = conn.rollup_execute_sync("ROLLBACK", &[]);
+        return Err(error);
     }
+    result
+}
+
+fn retention_compact_canonical(pool: &DbPool, cutoff_ts_micros: i64) -> Result<usize, DbError> {
+    let conn = crate::queries::open_canonical_atc_conn(pool, "retention_compact")?;
+    let result = retention_compact_with_conn(&conn, cutoff_ts_micros);
     crate::queries::close_canonical_db_conn(conn, "retention_compact connection");
     result
 }
@@ -1084,20 +1289,9 @@ pub async fn retention_compact(
             Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
             Outcome::Panicked(payload) => return Outcome::Panicked(payload),
         };
-        match conn.execute_sync(
-            "DELETE FROM atc_experiences \
-             WHERE state IN ('resolved', 'censored', 'expired') \
-               AND resolved_ts IS NOT NULL \
-               AND resolved_ts <= ?",
-            &[Value::BigInt(cutoff_ts_micros)],
-        ) {
-            #[allow(clippy::cast_possible_truncation)]
-            Ok(rows) => rows as usize,
-            Err(error) => {
-                return Outcome::Err(DbError::Sqlite(format!(
-                    "retention_compact delete: {error}"
-                )));
-            }
+        match retention_compact_with_conn(&conn, cutoff_ts_micros) {
+            Ok(rows) => rows,
+            Err(error) => return Outcome::Err(error),
         }
     } else {
         match crate::queries::ensure_file_backed_atc_pool_initialized(cx, pool).await {
@@ -1229,8 +1423,8 @@ pub fn find_expired_experiences(
             None => continue,
         };
         let window = attribution_window(kind);
-        let deadline = experience_resolution_anchor_micros(exp)
-            .saturating_add(window.max_window_micros);
+        let deadline =
+            experience_resolution_anchor_micros(exp).saturating_add(window.max_window_micros);
         if now_micros >= deadline {
             #[allow(clippy::cast_sign_loss)]
             candidates.push(ExpiredExperienceCandidate {
@@ -1889,7 +2083,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known design bug: refresh_rollups overwrites preserved compacted history"]
     fn refresh_rollups_can_erase_compacted_history_for_touched_stratum() {
         let pool = test_pool();
         let max_age_micros = minimum_retention_compaction_age_micros().expect("policy age");
@@ -1956,6 +2149,21 @@ mod tests {
             probe.resolved_count, 2,
             "refresh should retain compacted resolved counts instead of recomputing from surviving raw rows only"
         );
+        assert_eq!(probe.correct_count, 1);
+        assert_eq!(probe.incorrect_count, 1);
+        assert_eq!(probe.total_loss, 1.0);
+        assert_eq!(probe.total_regret, 0.25);
+
+        run_refresh(
+            &pool,
+            refreshed_now + 5_000_000,
+            (refreshed_now + 5_000_000).max(1),
+        );
+        let after_second_refresh = rollups_by_key(fetch_rollups(&pool));
+        let probe_second = after_second_refresh
+            .get("liveness:probe:0")
+            .expect("rollup should remain stable across repeated refreshes");
+        assert_eq!(probe_second, probe);
     }
 
     #[test]

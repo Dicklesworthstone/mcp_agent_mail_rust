@@ -1521,8 +1521,8 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
-    // Rollup table: per-stratum materialized sufficient statistics.
-    // Updated incrementally on resolution, never rescanned from raw.
+    // Rollup table: per-stratum materialized sufficient statistics plus
+    // durable compacted-history baselines for post-compaction refreshes.
     migrations.push(Migration::new(
         "v16_create_atc_experience_rollups".to_string(),
         "ATC experience rollups: per-stratum materialized statistics".to_string(),
@@ -1775,6 +1775,86 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    for (id, description, column_def) in [
+        (
+            "v22_rollup_compacted_total_count",
+            "add compacted total counter to ATC rollups",
+            "compacted_total_count INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "v22_rollup_compacted_resolved_count",
+            "add compacted resolved counter to ATC rollups",
+            "compacted_resolved_count INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "v22_rollup_compacted_censored_count",
+            "add compacted censored counter to ATC rollups",
+            "compacted_censored_count INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "v22_rollup_compacted_expired_count",
+            "add compacted expired counter to ATC rollups",
+            "compacted_expired_count INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "v22_rollup_compacted_correct_count",
+            "add compacted correct counter to ATC rollups",
+            "compacted_correct_count INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "v22_rollup_compacted_incorrect_count",
+            "add compacted incorrect counter to ATC rollups",
+            "compacted_incorrect_count INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "v22_rollup_compacted_total_regret",
+            "add compacted regret accumulator to ATC rollups",
+            "compacted_total_regret REAL NOT NULL DEFAULT 0.0",
+        ),
+        (
+            "v22_rollup_compacted_total_loss",
+            "add compacted loss accumulator to ATC rollups",
+            "compacted_total_loss REAL NOT NULL DEFAULT 0.0",
+        ),
+        (
+            "v22_rollup_compacted_ewma_loss",
+            "add compacted EWMA loss accumulator to ATC rollups",
+            "compacted_ewma_loss REAL NOT NULL DEFAULT 0.0",
+        ),
+        (
+            "v22_rollup_compacted_ewma_weight",
+            "add compacted EWMA weight accumulator to ATC rollups",
+            "compacted_ewma_weight REAL NOT NULL DEFAULT 0.0",
+        ),
+        (
+            "v22_rollup_compacted_delay_sum",
+            "add compacted delay sum accumulator to ATC rollups",
+            "compacted_delay_sum_micros INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "v22_rollup_compacted_delay_count",
+            "add compacted delay count accumulator to ATC rollups",
+            "compacted_delay_count INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "v22_rollup_compacted_delay_max",
+            "add compacted delay max accumulator to ATC rollups",
+            "compacted_delay_max_micros INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "v22_rollup_compacted_last_updated_ts",
+            "add compacted last-updated watermark to ATC rollups",
+            "compacted_last_updated_ts INTEGER NOT NULL DEFAULT 0",
+        ),
+    ] {
+        migrations.push(Migration::new(
+            id.to_string(),
+            description.to_string(),
+            format!("ALTER TABLE atc_experience_rollups ADD COLUMN {column_def}"),
+            String::new(),
+        ));
+    }
+
     migrations
 }
 
@@ -1820,6 +1900,7 @@ pub(crate) fn is_atc_runtime_canonical_migration(id: &str) -> bool {
         || id.starts_with("v16b_atc_rollups_add_")
         || id.starts_with("v17_atc_experiences_add_")
         || id.starts_with("v18_rollup_")
+        || id.starts_with("v22_rollup_compacted_")
 }
 
 #[must_use]
