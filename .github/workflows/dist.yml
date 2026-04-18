@@ -17,7 +17,9 @@ jobs:
       - name: Clone sibling dependencies
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
-          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
+          # asupersync main is transiently broken (trait-breaking API churn upstream); pin to last SHA known-good for mcp_agent_mail_rust builds. Unpin when upstream main cleanly compiles.
+          git clone https://github.com/Dicklesworthstone/asupersync ../asupersync
+          git -C ../asupersync checkout --quiet db186126b40d9d3028be731ff1bfea47614e2b1b
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
@@ -44,7 +46,9 @@ jobs:
       - name: Clone sibling dependencies
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
-          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
+          # asupersync main is transiently broken (trait-breaking API churn upstream); pin to last SHA known-good for mcp_agent_mail_rust builds. Unpin when upstream main cleanly compiles.
+          git clone https://github.com/Dicklesworthstone/asupersync ../asupersync
+          git -C ../asupersync checkout --quiet db186126b40d9d3028be731ff1bfea47614e2b1b
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
@@ -88,7 +92,9 @@ jobs:
       - name: Clone sibling dependencies
         run: |
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
-          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
+          # asupersync main is transiently broken (trait-breaking API churn upstream); pin to last SHA known-good for mcp_agent_mail_rust builds. Unpin when upstream main cleanly compiles.
+          git clone https://github.com/Dicklesworthstone/asupersync ../asupersync
+          git -C ../asupersync checkout --quiet db186126b40d9d3028be731ff1bfea47614e2b1b
           git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
