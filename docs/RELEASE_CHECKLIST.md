@@ -274,7 +274,7 @@ wc -l "${SOAK_TREND}"
    ```
 
 4. Start `am` and verify TUI:
-   - TUI renders correctly (all 11 screens load)
+   - TUI renders correctly (all 16 screens load)
    - Keybindings respond (Tab, 1-8, ?, q)
    - Command palette opens (Ctrl+P)
    - System Health shows green status

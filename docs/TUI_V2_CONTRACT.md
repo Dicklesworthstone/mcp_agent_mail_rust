@@ -1,5 +1,10 @@
 # TUI V2 Product Contract
 
+> Historical note (2026-04-18): This contract captures the 12-screen V2
+> milestone from `br-3vwi`. The live product now exposes a 16-screen TUI; use
+> `README.md`, `AGENTS.md`, and `docs/OPERATOR_RUNBOOK.md` for current screen
+> counts and operator-facing surface claims.
+
 > Canonical contract for AgentMailTUI v2 (br-3vwi epic).
 > Every downstream track references this document for screen IA, entity model,
 > navigation graph, operator journeys, layout principles, and done criteria.

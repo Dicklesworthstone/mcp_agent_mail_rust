@@ -1,5 +1,10 @@
 # Plan to Port MCP Agent Mail to Rust
 
+> Historical note (2026-04-18): This is an early port-planning artifact. Tool,
+> resource, and screen counts below do not describe the current live product;
+> use `README.md`, `AGENTS.md`, and `docs/DOC_SWEEP_AUDIT_2026-04-18.md` for
+> current surface claims.
+
 ## Scope (Explicit)
 - Goal: 100% feature and behavior parity with legacy Python `mcp_agent_mail`.
 - Exclusions: None. If any exclusions arise, they must be added here explicitly with rationale.

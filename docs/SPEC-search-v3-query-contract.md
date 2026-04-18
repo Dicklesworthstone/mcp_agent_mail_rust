@@ -1,5 +1,10 @@
 # Spec: Search V3 Query / Filter / Explain Contract
 
+> Historical note (2026-04-18): This proposed contract describes the earlier
+> Tantivy-first Search V3 design track. The live product now routes search
+> through frankensearch-backed infrastructure; preserve the content below as
+> design history unless a future bead revives this proposal.
+
 **Bead:** br-2tnl.1.3
 **Track:** br-2tnl.1
 **Date:** 2026-02-11

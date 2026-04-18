@@ -1,5 +1,10 @@
 # Migration Guide: Dual-Mode Interface
 
+> Historical note (2026-04-18): This guide documents the first dual-mode
+> cutover and predates the current `AM_INTERFACE_MODE` runtime switch. Use
+> `README.md`, `AGENTS.md`, and `docs/SPEC-interface-mode-switch.md` for the
+> current operator/server invocation rules.
+
 How to update your workflows for the dual-mode architecture (MCP server +
 CLI operator binary).
 

@@ -1,5 +1,10 @@
 # ADR-001: Dual-Mode Interface Invariants (MCP Default, CLI Opt-In)
 
+> Historical note (2026-04-18): This superseded ADR preserves the original
+> two-binary framing and includes `mcp-agent-mail-cli` operator examples that
+> are no longer the current operator entrypoint. Use `am`, ADR-002, and
+> `docs/SPEC-interface-mode-switch.md` for current behavior.
+
 **Status:** Superseded by ADR-002 (2026-02-09)
 **Date:** 2026-02-08
 **Authors:** WildGate (claude-code/opus-4.6)

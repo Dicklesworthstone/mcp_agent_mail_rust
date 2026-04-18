@@ -27,6 +27,29 @@ jobs:
         with:
           cache-on-failure: true
 
+      - name: Guard docs drift on live surfaces
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          live_docs=(
+            README.md
+            AGENTS.md
+            VISION.md
+            docs/OPERATOR_RUNBOOK.md
+            docs/OPERATOR_COOKBOOK.md
+            docs/RELEASE_CHECKLIST.md
+            docs/SPEC-interface-mode-switch.md
+            docs/SPEC-meta-command-allowlist.md
+          )
+
+          stale_pattern='(34 tools|36 tools|20\+ resources|33 resources|15 screens|11 screens|mcp-agent-mail serve-http|mcp-agent-mail serve-stdio|mcp-agent-mail-cli share|mcp-agent-mail-cli doctor|mcp-agent-mail-cli guard)'
+
+          if rg -n "${stale_pattern}" "${live_docs[@]}"; then
+            echo "Found stale live-doc phrases above." >&2
+            exit 1
+          fi
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

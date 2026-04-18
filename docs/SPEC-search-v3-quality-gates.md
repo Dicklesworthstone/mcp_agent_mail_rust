@@ -1,5 +1,10 @@
 # Spec: Search V3 Relevance / Performance SLOs and Quality Gates
 
+> Historical note (2026-04-18): This quality-gate document belongs to the
+> earlier Tantivy-focused Search V3 proposal. The live product now uses
+> frankensearch-backed search; treat the sections below as preserved design
+> history unless the old track is intentionally revived.
+
 **Bead:** br-2tnl.1.4
 **Track:** br-2tnl.1
 **Date:** 2026-02-11

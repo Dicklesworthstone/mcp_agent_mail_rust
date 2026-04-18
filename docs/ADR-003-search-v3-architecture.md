@@ -1,5 +1,10 @@
 # ADR-003: Search V3 Architecture — Tantivy + Semantic + Hybrid
 
+> Historical note (2026-04-18): This ADR captures the pre-frankensearch
+> Tantivy-focused Search V3 design track. The live product now uses
+> frankensearch-backed search; keep the sections below as design history unless
+> a future bead explicitly revives this track.
+
 **Status:** Proposed
 **Date:** 2026-02-12
 **Authors:** RubyPrairie (claude-code/opus-4.6)

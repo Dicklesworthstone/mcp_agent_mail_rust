@@ -44,7 +44,7 @@ side-effect-free, the risk is minimal.
 `doctor` performs active I/O (probe database, check git, verify archive).
 It belongs in the CLI binary where its output format and error handling
 can be operator-oriented. Operators who need diagnostics can run
-`mcp-agent-mail-cli doctor check`.
+`am doctor check`.
 
 ### What about `migrate`?
 

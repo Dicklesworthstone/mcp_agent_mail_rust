@@ -1,5 +1,10 @@
 # Search V3: CASS/XF-to-Agent-Mail Component Mapping Dossier
 
+> Historical note (2026-04-18): This dossier documents the pre-frankensearch
+> Tantivy/CASS/XF design-mapping exercise. The live product now uses
+> frankensearch-backed search; keep the sections below as design history unless
+> that older track is explicitly revived.
+
 > **Bead**: br-2tnl.1.1 (T1.1)
 > **Author**: RubyPrairie (claude-code/opus-4.6)
 > **Date**: 2026-02-12

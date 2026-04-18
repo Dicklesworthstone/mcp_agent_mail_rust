@@ -233,7 +233,7 @@ VS16 (U+FE0F) variation selectors must be stripped before width calculation in `
 2. **Fix ANSI garbling** — Zero garbled output anywhere in the TUI. Ever.
 3. **Search-as-you-type** — The most-requested missing feature. Must work like frankentui showcase search.
 4. **Visual polish to showcase quality** — Theme system, semantic colors, focus states, rounded borders, mouse support.
-5. **All 11 screens fully implemented** — No placeholder stubs. Every screen uses real widgets with real data.
+5. **All 16 screens fully implemented** — No placeholder stubs. Every screen uses real widgets with real data.
 6. **Robot mode CLI** — Agent-optimized `am robot` subcommands with JSON/TOON/Markdown output.
 7. **frankensqlite full migration** — Once triggers land, switch DbConn and unlock MVCC concurrent writes.
 

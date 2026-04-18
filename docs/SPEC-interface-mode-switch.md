@@ -97,7 +97,7 @@ Requirements:
   - quoted attempted subcommand (argv[1])
   - allowed MCP commands list
   - remediation path(s):
-    - use the `am` binary (or `mcp-agent-mail-cli`)
+    - use the `am` binary
     - OR set `AM_INTERFACE_MODE=cli` and rerun via `mcp-agent-mail`
 
 Template (exact phrasing can be tuned, but must remain deterministic):
@@ -138,8 +138,8 @@ To start the MCP server:
   mcp-agent-mail serve ...
 
 CLI equivalents:
-  mcp-agent-mail serve-http ...
-  mcp-agent-mail serve-stdio ...
+  am serve-http ...
+  am serve-stdio ...
 ```
 
 ## Exit Codes
