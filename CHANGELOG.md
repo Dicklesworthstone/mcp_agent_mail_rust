@@ -8,7 +8,22 @@ Versions marked **[Release]** have published [GitHub Releases](https://github.co
 
 ## Unreleased
 
-No changes yet.
+### Deferred
+
+- **Browser TUI mirror and WASM frontend deferred** (br-il53l). After evaluating the
+  ship-or-retire decision (br-il53l.1), the browser TUI mirror (`/web-dashboard/*`,
+  `/mail/ws-state`, `/mail/ws-input`) and the standalone `mcp-agent-mail-wasm` crate
+  are deferred indefinitely. All six browser-mirror HTTP endpoints now return
+  `501 Not Implemented` with a pointer to `docs/SPEC-browser-parity-contract-deferred.md`.
+  The underlying modules (`tui_ws_state.rs`, `tui_ws_input.rs`, `tui_web_dashboard.rs`)
+  remain in the codebase and are tested at the module level, so the feature can be
+  re-enabled when the browser parity contract is finalized.
+  - The `mcp-agent-mail-wasm` crate has been moved to `experimental/` and removed from
+    workspace members.
+  - README: "Browser State Sync Endpoint" section removed; "Web Dashboard" section
+    replaced with deferred notice.
+  - AGENTS.md: WASM mentions removed from shipped-surface claims.
+  - Commits: 087df379, 550f808f, 63abfcd4, 938dba54.
 
 ---
 
