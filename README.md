@@ -1338,7 +1338,7 @@ What `check` inspects:
 ## FAQ
 
 **Q: How is this different from the Python version?**
-A: This is a ground-up Rust rewrite with the same conceptual model but significant improvements: a 16-screen interactive TUI, robot mode CLI, hybrid search, build slots, the product bus for cross-project coordination, and substantially better performance. The conformance test suite ensures output format parity with the Python reference.
+A: This is a ground-up Rust rewrite with the same conceptual model but significant improvements: a 16-screen interactive TUI, robot mode CLI, hybrid search, build slots, the product bus for cross-project coordination, and substantially better performance. The conformance test suite exercises 34 Python-parity tools plus 3 Rust-native Identity tools, and all 25 MCP resources, against captured fixtures — ensuring format parity with the Python reference where parity is meaningful.
 
 **Q: Do I need to run a separate server for each project?**
 A: No. One server handles multiple projects. Each project is identified by its absolute filesystem path as the `project_key`.
