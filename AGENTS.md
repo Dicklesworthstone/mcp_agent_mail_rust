@@ -240,7 +240,7 @@ scripts/e2e_cli.sh            # CLI integration (99 assertions)
 | `mcp-agent-mail-db` | SQL queries, pool, cache coherency, FTS sanitization, stress tests (concurrent ops, pool exhaustion) |
 | `mcp-agent-mail-storage` | Git archive, commit coalescer, notification signals |
 | `mcp-agent-mail-guard` | Pre-commit reservation enforcement, symmetric fnmatch, archive reading, rename handling |
-| `mcp-agent-mail-tools` | 34 MCP tool implementations via conformance fixtures |
+| `mcp-agent-mail-tools` | 37 MCP tool implementations via conformance fixtures |
 | `mcp-agent-mail-share` | Snapshot, scrub, bundle, crypto pipeline |
 | `mcp-agent-mail-server` | HTTP handler, dispatch, TUI widgets, property tests |
 | `mcp-agent-mail-cli` | 40+ CLI commands, dual-mode matrix |
@@ -261,7 +261,7 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 ## MCP Agent Mail — This Project
 
-**This is the project you're working on.** MCP Agent Mail is a mail-like coordination layer for coding agents, providing an MCP server with 34 tools and 20+ resources, Git-backed archive, SQLite indexing, and an interactive TUI operations console.
+**This is the project you're working on.** MCP Agent Mail is a mail-like coordination layer for coding agents, providing an MCP server with 37 tools and 25 resources, Git-backed archive, SQLite indexing, and an interactive TUI operations console.
 
 ### What It Does
 
@@ -274,7 +274,7 @@ MCP Client (agent) ──── stdio/HTTP ────► mcp-agent-mail-server
                                               │
                                     ┌─────────┼─────────┐
                                     ▼         ▼         ▼
-                               34 Tools   20+ Resources  TUI
+                               37 Tools   25 Resources   TUI
                                     │         │
                               mcp-agent-mail-tools
                                     │
@@ -298,7 +298,7 @@ mcp_agent_mail_rust/
 │   ├── mcp-agent-mail-storage/             # Git archive, commit coalescer
 │   ├── mcp-agent-mail-guard/               # Pre-commit guard, reservation enforcement
 │   ├── mcp-agent-mail-share/               # Snapshot, scrub, bundle, crypto, export
-│   ├── mcp-agent-mail-tools/               # 34 MCP tool implementations
+│   ├── mcp-agent-mail-tools/               # 37 MCP tool implementations
 │   ├── mcp-agent-mail-server/              # HTTP/MCP runtime, dispatch, TUI
 │   ├── mcp-agent-mail/                     # Server binary (mcp-agent-mail)
 │   ├── mcp-agent-mail-cli/                 # CLI binary (am)
@@ -323,18 +323,18 @@ mcp_agent_mail_rust/
 | `mcp-agent-mail-storage` | `src/coalesce.rs` | Async git commit coalescer (WBQ) |
 | `mcp-agent-mail-guard` | `src/lib.rs` | Pre-commit hook, reservation conflict detection |
 | `mcp-agent-mail-share` | `src/` | 8 modules: snapshot, scrub, bundle, crypto, finalize, hosting, scope |
-| `mcp-agent-mail-tools` | `src/` | 34 MCP tool implementations across 9 clusters |
+| `mcp-agent-mail-tools` | `src/` | 37 MCP tool implementations across 9 clusters |
 | `mcp-agent-mail-server` | `src/lib.rs` | Server dispatch, HTTP handler |
-| `mcp-agent-mail-server` | `src/tui_*.rs` | TUI operations console (15 screens) |
+| `mcp-agent-mail-server` | `src/tui_*.rs` | TUI operations console (16 screens) |
 | `mcp-agent-mail` | `src/main.rs` | Server binary entry point (dual-mode) |
 | `mcp-agent-mail-cli` | `src/main.rs` | CLI binary (`am`) entry point |
 
-### 34 MCP Tools (9 Clusters)
+### 37 MCP Tools (9 Clusters)
 
 | Cluster | Count | Tools |
 |---------|-------|-------|
-| Infrastructure | 4 | health_check, ensure_project, ensure_product, products_link |
-| Identity | 3 | register_agent, create_agent_identity, whois |
+| Infrastructure | 4 | health_check, ensure_project, install_precommit_guard, uninstall_precommit_guard |
+| Identity | 6 | register_agent, create_agent_identity, whois, resolve_pane_identity, cleanup_pane_identities, list_agents |
 | Messaging | 5 | send_message, reply_message, fetch_inbox, acknowledge_message, mark_message_read |
 | Contacts | 4 | request_contact, respond_contact, list_contacts, set_contact_policy |
 | File Reservations | 4 | file_reservation_paths, renew_file_reservations, release_file_reservations, force_release_file_reservation |
@@ -343,7 +343,7 @@ mcp_agent_mail_rust/
 | Product Bus | 5 | ensure_product, products_link, search_messages_product, fetch_inbox_product, summarize_thread_product |
 | Build Slots | 3 | acquire_build_slot, renew_build_slot, release_build_slot |
 
-### 15-Screen TUI
+### 16-Screen TUI
 
 | # | Screen | Shows |
 |---|--------|-------|
@@ -362,6 +362,7 @@ mcp_agent_mail_rust/
 | 13 | Analytics | Anomaly insight feed with confidence scoring |
 | 14 | Attachments | Attachment browser with preview and provenance |
 | 15 | Archive Browser | Two-pane Git archive browser and file preview |
+| 16 | ATC | Air Traffic Controller decision engine status and transparency cards |
 
 Key bindings: `?` help, `Ctrl+P`/`:` command palette, `/` global search, `.` action menu, `Ctrl+N` compose overlay, `Ctrl+Y` toast focus, `Ctrl+T`/`Shift+T` cycle theme, `m` toggle MCP/API, `q` quit.
 Webapp-parity keys: Messages `g` (Local/Global inbox), Threads `e/c` (expand/collapse all), Timeline `V` (Events/Commits/Combined), Contacts `n` (Table/Graph).

@@ -49,8 +49,8 @@ Gating criteria for releasing the dual-mode Agent Mail (MCP server + CLI).
 - [x] `am serve-http --path api` / `am serve-http --path mcp` switches transport modes
 - [x] `am serve-http --no-auth` disables authentication for local dev
 - [x] Auth token auto-discovered from `~/.mcp_agent_mail/.env`
-- [x] All 34 MCP tools respond correctly
-- [x] All 20+ MCP resources return correct data
+- [x] All 37 MCP tools respond correctly
+- [x] All 25 MCP resources return correct data
 - [x] Startup probes catch and report common failures (port, storage, DB)
 - [x] Graceful shutdown flushes commit queue
 - [x] Native deploy verification path available: `am share deploy verify-live <url> --bundle <bundle_dir>`
@@ -285,7 +285,7 @@ wc -l "${SOAK_TREND}"
    curl -s http://127.0.0.1:8765/mcp/ \
      -H "Authorization: Bearer $HTTP_BEARER_TOKEN" \
      -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
-   # Should return 34 tools
+   # Should return 37 tools
    ```
 
 ---

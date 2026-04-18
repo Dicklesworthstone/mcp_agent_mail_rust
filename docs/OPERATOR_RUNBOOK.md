@@ -84,8 +84,8 @@ remediation hints and exits. Probes check:
 |-----|--------|-------|
 | `1`-`9` | Jump to screens 1-9 | Suppressed during text input |
 | `0` | Jump to screen 10 | Projects screen |
-| `! @ # $ %` | Jump to screens 11-15 | Contacts, Explorer, Analytics, Attachments, Archive Browser |
-| `Tab` / `Shift+Tab` | Next/previous screen | Cycles through all 15 screens |
+| `! @ # $ % ^` | Jump to screens 11-16 | Contacts, Explorer, Analytics, Attachments, Archive Browser, ATC |
+| `Tab` / `Shift+Tab` | Next/previous screen | Cycles through all 16 screens |
 | `Ctrl+P` | Command palette | Always available outside text-entry conflicts |
 | `:` | Command palette | Suppressed during text input |
 | `/` | Global search deep link | Opens Search with query focus |

@@ -20,7 +20,7 @@
 | **Thread** | A conversation keyed by `thread_id` string. Groups related messages chronologically. |
 | **Reservation** | An advisory file-path lease (`FileReservationRow`). Exclusive or shared, with TTL. |
 | **Contact** | A peer-to-peer trust link between agents (`AgentLinkRow`). Status: pending / approved / blocked. |
-| **Tool** | One of 34 MCP tool implementations. Tracked by call count, error count, and latency histogram. |
+| **Tool** | One of 37 MCP tool implementations. Tracked by call count, error count, and latency histogram. |
 | **Metric** | A `MetricsSnapshotEntry` combining call/error/latency data per tool. |
 | **Event** | A `MailEvent` from the ring buffer (tool calls, HTTP requests, lifecycle, health pulses). |
 | **Product** | A cross-project grouping for federated search and inbox aggregation. |

@@ -12,7 +12,7 @@
 
 > "It's like Gmail for your coding agents!"
 
-A mail-like coordination layer for AI coding agents, exposed as an MCP server with 36 tools and 33 resources, Git-backed archive, SQLite indexing, an interactive 15-screen TUI, a server-rendered web UI, and an agent-first robot CLI. The Rust rewrite of the [original Python project](https://github.com/Dicklesworthstone/mcp_agent_mail) (1,700+ stars).
+A mail-like coordination layer for AI coding agents, exposed as an MCP server with 37 tools and 25 resources, Git-backed archive, SQLite indexing, an interactive 16-screen TUI, a server-rendered web UI, and an agent-first robot CLI. The Rust rewrite of the [original Python project](https://github.com/Dicklesworthstone/mcp_agent_mail) (1,700+ stars).
 
 **Supported agents:** [Claude Code](https://claude.ai/code), [Codex CLI](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot), and any MCP-compatible client.
 
@@ -42,7 +42,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 - [Agent Configuration](#agent-configuration)
 - [Server Modes](#server-modes)
 - [Operator CLI Surface](#operator-cli-surface)
-- [The 36 MCP Tools](#the-36-mcp-tools)
+- [The 37 MCP Tools](#the-37-mcp-tools)
 - [TUI Operations Console](#tui-operations-console)
 - [Robot Mode (`am robot`)](#robot-mode-am-robot)
 - [File Reservations](#file-reservations-for-multi-agent-editing)
@@ -86,9 +86,9 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 | **Advisory File Reservations** | Agents declare exclusive or shared leases on file globs before editing, preventing conflicts with a pre-commit guard |
 | **Asynchronous Messaging** | Threaded inbox/outbox with subjects, CC/BCC, acknowledgments, and importance levels |
 | **Token-Efficient** | Messages stored in a per-project archive, not in agent context windows |
-| **33 MCP Resources** | Read-only inbox, thread, reservation, tooling, identity, and attention views for cheap lookups |
-| **36 MCP Tools** | Infrastructure, identity, messaging, contacts, reservations, search, macros, product bus, and build slots |
-| **15-Screen TUI** | Live operator cockpit for messages, threads, agents, search, reservations, metrics, health, analytics, attachments, and archive browsing |
+| **25 MCP Resources** | Read-only inbox, thread, reservation, tooling, identity, and attention views for cheap lookups |
+| **37 MCP Tools** | Infrastructure, identity, messaging, contacts, reservations, search, macros, product bus, and build slots |
+| **16-Screen TUI** | Live operator cockpit for messages, threads, agents, search, reservations, metrics, health, analytics, attachments, archive browsing, and ATC |
 | **Web UI** | Server-rendered `/mail/` routes for human oversight, unified inbox review, search, attachments, and overseer messaging |
 | **Robot Mode** | 17 agent-optimized CLI subcommands with `toon`/`json`/`md` output for non-interactive workflows |
 | **Git-Backed Archive** | Every message, reservation, and agent profile stored as files in per-project Git repos |
@@ -178,7 +178,7 @@ Agent Mail has been available since October 2025 and was designed around real mu
 
 **No "broadcast to all" mode.** Given the option, many agents will overuse broadcast-style messaging. That is the equivalent of default reply-all in email: lots of irrelevant noise and wasted context.
 
-**Carefully refined API ergonomics.** Bad MCP documentation and poor agent ergonomics quietly wreck reliability. Agent Mail's 36 tool definitions have gone through repeated real-world iteration so they work predictably without wasting tokens.
+**Carefully refined API ergonomics.** Bad MCP documentation and poor agent ergonomics quietly wreck reliability. Agent Mail's 37 tool definitions have gone through repeated real-world iteration so they work predictably without wasting tokens.
 
 **No git worktrees.** Worktrees can slow development velocity and create reconciliation debt when agents diverge. Agent Mail takes the opposite approach: keep agents in one shared space, surface conflicts quickly, and give them tools to coordinate through them.
 
@@ -542,14 +542,14 @@ Running CLI-only commands via the MCP binary produces a deterministic denial on 
 
 ---
 
-## The 36 MCP Tools
+## The 37 MCP Tools
 
 ### 9 Clusters
 
 | Cluster | Count | Tools |
 |---------|-------|-------|
 | Infrastructure | 4 | `health_check`, `ensure_project`, `install_precommit_guard`, `uninstall_precommit_guard` |
-| Identity | 5 | `register_agent`, `create_agent_identity`, `whois`, `resolve_pane_identity`, `cleanup_pane_identities` |
+| Identity | 6 | `register_agent`, `create_agent_identity`, `whois`, `resolve_pane_identity`, `cleanup_pane_identities`, `list_agents` |
 | Messaging | 5 | `send_message`, `reply_message`, `fetch_inbox`, `acknowledge_message`, `mark_message_read` |
 | Contacts | 4 | `request_contact`, `respond_contact`, `list_contacts`, `set_contact_policy` |
 | File Reservations | 4 | `file_reservation_paths`, `renew_file_reservations`, `release_file_reservations`, `force_release_file_reservation` |
@@ -558,7 +558,7 @@ Running CLI-only commands via the MCP binary produces a deterministic denial on 
 | Product Bus | 5 | `ensure_product`, `products_link`, `search_messages_product`, `fetch_inbox_product`, `summarize_thread_product` |
 | Build Slots | 3 | `acquire_build_slot`, `renew_build_slot`, `release_build_slot` |
 
-### 33 MCP Resources
+### 25 MCP Resources
 
 Read-only resources span environment/config inspection, project and agent discovery, inbox and thread views, reservation views, and tooling diagnostics. They are there so agents can fetch state cheaply without mutating anything.
 
@@ -584,7 +584,7 @@ resource://config/environment
 
 ## TUI Operations Console
 
-The interactive TUI has 15 screens. Jump directly with `1`-`9`, `0` (screen 10), and shifted digits `!`, `@`, `#`, `$`, `%` (screens 11-15). Use `Tab`/`Shift+Tab` to cycle in order.
+The interactive TUI has 16 screens. Jump directly with `1`-`9`, `0` (screen 10), and shifted digits `!`, `@`, `#`, `$`, `%`, `^` (screens 11-16). Use `Tab`/`Shift+Tab` to cycle in order.
 
 | # | Screen | Shows |
 |---|--------|-------|
@@ -603,6 +603,7 @@ The interactive TUI has 15 screens. Jump directly with `1`-`9`, `0` (screen 10),
 | 13 | Analytics | Anomaly insight feed with confidence and deep links |
 | 14 | Attachments | Attachment inventory with preview and provenance |
 | 15 | Archive Browser | Two-pane Git archive browser with tree + file preview |
+| 16 | ATC | Air Traffic Controller decision engine status and transparency cards |
 
 **Global keys:** `?` help, `Ctrl+P`/`:` command palette, `/` global search focus, `.` contextual action menu, `Ctrl+N` compose overlay, `Ctrl+Y` toast-focus mode, `Ctrl+T`/`Shift+T` cycle theme, `m` toggle MCP/API transport, `q` quit.
 
@@ -758,11 +759,18 @@ Use the Beads issue ID (`br-123`) as the Mail `thread_id` and prefix message sub
 
 ## Browser State Sync Endpoint
 
-For browser/WASM clients, Agent Mail exposes a polling-based state sync contract:
+For browser clients, and for the currently experimental standalone
+`mcp-agent-mail-wasm` client, Agent Mail exposes a polling-based state sync
+contract:
 
 - `GET /mail/ws-state` returns a snapshot payload
 - `GET /mail/ws-state?since=<seq>&limit=<n>` returns deltas since a sequence
 - `POST /mail/ws-input` accepts remote terminal ingress events (`Input`, `Resize`)
+
+The shipped browser surface today is `/web-dashboard`, which consumes these
+server endpoints directly. The separate `mcp-agent-mail-wasm` crate is still a
+thinner, under-covered standalone client surface and should not be read as
+feature-parity proof for the browser dashboard.
 
 Note: `/mail/ws-state` is intentionally HTTP polling, not WebSocket upgrade. WebSocket upgrade attempts return `501 Not Implemented`.
 
@@ -784,6 +792,10 @@ curl -sS -X POST 'http://127.0.0.1:8765/mail/ws-input' \
 ## Web Dashboard
 
 The server also exposes a browser TUI mirror at `/web-dashboard`.
+
+This page is a real shipped browser surface. It is served directly by the
+server with its own HTML/JS runtime and does not depend on the standalone
+`mcp-agent-mail-wasm` crate being production-ready.
 
 This is distinct from the server-rendered `/mail/*` web UI:
 
@@ -927,7 +939,7 @@ MCP Client / Operator / Browser
                      │
         ┌────────────┼────────────┬─────────────┐
         ▼            ▼            ▼             ▼
-   36 MCP Tools  33 Resources   TUI         Web UI
+   37 MCP Tools  25 Resources   TUI         Web UI
         │            │            │             │
         └────────────┴──────┬─────┴─────────────┘
                             ▼
@@ -954,12 +966,12 @@ mcp_agent_mail_rust/
 │   ├── mcp-agent-mail-search-core/         # Pluggable search traits
 │   ├── mcp-agent-mail-guard/               # Pre-commit guard, reservation enforcement
 │   ├── mcp-agent-mail-share/               # Snapshot, scrub, bundle, crypto, export
-│   ├── mcp-agent-mail-tools/               # 36 MCP tool implementations (9 clusters)
-│   ├── mcp-agent-mail-server/              # HTTP/MCP runtime, dispatch, TUI (15 screens)
+│   ├── mcp-agent-mail-tools/               # 37 MCP tool implementations (9 clusters)
+│   ├── mcp-agent-mail-server/              # HTTP/MCP runtime, dispatch, TUI (16 screens)
 │   ├── mcp-agent-mail/                     # Server binary (mcp-agent-mail)
 │   ├── mcp-agent-mail-cli/                 # CLI binary (am) with robot mode
 │   ├── mcp-agent-mail-conformance/         # Python parity tests
-│   └── mcp-agent-mail-wasm/                # Browser/WASM TUI frontend
+│   └── mcp-agent-mail-wasm/                # Experimental standalone WASM client surface
 ├── tests/e2e/                              # End-to-end test scripts
 ├── scripts/                                # CLI integration tests, utilities
 ├── docs/                                   # ADRs, specs, runbooks, migration guides
@@ -1158,7 +1170,7 @@ If the fast layer gets sick, the durable layer can rebuild it.
 | Audit trail | Full Git history of all communication | File timestamps | Depends | Chat logs (if saved) |
 | Cross-repo coordination | Product bus, contact system | Manual | Build yourself | Manual |
 | Search | Search V3 (lexical + semantic + hybrid) | `grep` | Build yourself | Limited |
-| Operational visibility | 15-screen TUI, robot CLI, metrics | None | None | None |
+| Operational visibility | 16-screen TUI, robot CLI, metrics | None | None | None |
 | Token efficiency | Messages stored externally, not in context | Files in context | Varies | All in context |
 
 ---
@@ -1395,7 +1407,7 @@ What `check` inspects:
 ## FAQ
 
 **Q: How is this different from the Python version?**
-A: This is a ground-up Rust rewrite with the same conceptual model but significant improvements: a 15-screen interactive TUI, robot mode CLI, hybrid search, build slots, the product bus for cross-project coordination, and substantially better performance. The conformance test suite ensures output format parity with the Python reference.
+A: This is a ground-up Rust rewrite with the same conceptual model but significant improvements: a 16-screen interactive TUI, robot mode CLI, hybrid search, build slots, the product bus for cross-project coordination, and substantially better performance. The conformance test suite ensures output format parity with the Python reference.
 
 **Q: Do I need to run a separate server for each project?**
 A: No. One server handles multiple projects. Each project is identified by its absolute filesystem path as the `project_key`.

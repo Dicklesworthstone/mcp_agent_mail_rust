@@ -152,7 +152,7 @@ SERVER_PID=$!
 curl -s http://127.0.0.1:8765/mcp/ \
   -H "Authorization: Bearer $HTTP_BEARER_TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
-# Should return 34 tools
+# Should return 37 tools
 kill $SERVER_PID
 
 # 3. Sensitive value masking
