@@ -1390,6 +1390,9 @@ pub struct ReplyMessageResponse {
 /// - `topic`: Reserved for future topic tags; non-blank values are currently rejected
 /// - `auto_contact_if_blocked`: Auto-request contact if blocked (optional)
 /// - `sender_token`: Registration token for sender identity verification (optional)
+///
+/// # Conformance
+/// Python-parity.
 #[allow(
     clippy::too_many_arguments,
     clippy::similar_names,
@@ -2231,6 +2234,9 @@ effective_free_bytes={free}"
 /// - `bcc`: BCC recipients
 /// - `subject_prefix`: Prefix for subject (default: "Re:")
 /// - `sender_token`: Registration token for sender identity verification (optional)
+///
+/// # Conformance
+/// Python-parity.
 #[allow(
     clippy::too_many_arguments,
     clippy::similar_names,
@@ -3018,6 +3024,9 @@ effective_free_bytes={free}"
 /// - `limit`: Max messages to return (default: 20)
 /// - `include_bodies`: Include full message bodies (default: false)
 /// - `topic`: Reserved for future topic filtering; non-blank values are currently rejected
+///
+/// # Conformance
+/// Python-parity.
 #[allow(
     clippy::items_after_statements,
     clippy::too_many_arguments,
@@ -3237,6 +3246,9 @@ pub async fn fetch_inbox(
 ///
 /// # Returns
 /// Read status with timestamp
+///
+/// # Conformance
+/// Python-parity.
 #[tool(
     description = "Mark a specific message as read for the given agent.\n\nNotes\n-----\n- Read receipts are per-recipient; this only affects the specified agent.\n- This does not send an acknowledgement; use `acknowledge_message` for that.\n- Safe to call multiple times; later calls return the original timestamp.\n\nIdempotency\n-----------\n- If `mark_message_read` has already been called earlier for the same (agent, message),\n  the original timestamp is returned and no error is raised.\n\nReturns\n-------\ndict\n    { message_id, read: bool, read_at: iso8601 | null }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"8\",\"method\":\"tools/call\",\"params\":{\"name\":\"mark_message_read\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"message_id\":1234\n}}}\n```"
 )]
@@ -3298,6 +3310,9 @@ pub async fn mark_message_read(
 ///
 /// # Returns
 /// Acknowledgement status with timestamps
+///
+/// # Conformance
+/// Python-parity.
 #[tool(
     description = "Acknowledge a message addressed to an agent (and mark as read).\n\nBehavior\n--------\n- Sets both read_ts and ack_ts for the (agent, message) pairing\n- Safe to call multiple times; subsequent calls will return the prior timestamps\n\nIdempotency\n-----------\n- If acknowledgement already exists, the previous timestamps are preserved and returned.\n\nWhen to use\n-----------\n- Respond to messages with `ack_required=true` to signal explicit receipt.\n- Agents can treat an acknowledgement as a lightweight, non-textual reply.\n\nReturns\n-------\ndict\n    { message_id, acknowledged: bool, acknowledged_at: iso8601 | null, read_at: iso8601 | null }\n\nExample\n-------\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"9\",\"method\":\"tools/call\",\"params\":{\"name\":\"acknowledge_message\",\"arguments\":{\n  \"project_key\":\"/abs/path/backend\",\"agent_name\":\"BlueLake\",\"message_id\":1234\n}}}\n```"
 )]

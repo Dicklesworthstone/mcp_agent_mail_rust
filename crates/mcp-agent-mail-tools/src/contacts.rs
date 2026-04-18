@@ -240,6 +240,9 @@ fn parse_contact_target(
 /// Request contact approval to message another agent.
 ///
 /// Creates or refreshes a pending `AgentLink` and sends a small `ack_required` intro message.
+///
+/// # Conformance
+/// Python-parity.
 #[allow(clippy::too_many_arguments)]
 #[tool(
     description = "Request contact approval to message another agent.\n\nCreates (or refreshes) a pending AgentLink and sends a small ack_required intro message.\n\nDiscovery\n---------\nTo discover available agent names, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nParameters\n----------\nproject_key : str\n    Project slug or human key.\nfrom_agent : str\n    Your agent name (must be registered in the project).\nto_agent : str\n    Target agent name (use resource://agents/{project_key} to discover names).\nto_project : Optional[str]\n    Target project if different from your project (cross-project coordination).\nreason : str\n    Optional explanation for the contact request.\nttl_seconds : int\n    Time to live for the contact approval request (default: 7 days)."
@@ -421,6 +424,9 @@ pub async fn request_contact(
 /// - `from_project`: Requester's project (if cross-project)
 /// - `accept`: true to approve, false to block
 /// - `ttl_seconds`: TTL for approved link (default: 30 days)
+///
+/// # Conformance
+/// Python-parity.
 #[tool(description = "Approve or deny a contact request.")]
 pub async fn respond_contact(
     ctx: &McpContext,
@@ -512,6 +518,9 @@ pub async fn respond_contact(
 ///
 /// # Returns
 /// Array of outgoing contacts with `to`, `status`, `reason`, `updated_ts`, `expires_ts`
+///
+/// # Conformance
+/// Python-parity.
 #[tool(description = "List contact links for an agent in a project.")]
 pub async fn list_contacts(
     ctx: &McpContext,
@@ -606,6 +615,9 @@ pub async fn list_contacts(
 ///
 /// # Returns
 /// Updated agent record
+///
+/// # Conformance
+/// Python-parity.
 #[tool(description = "Set contact policy for an agent: open | auto | contacts_only | block_all.")]
 pub async fn set_contact_policy(
     ctx: &McpContext,

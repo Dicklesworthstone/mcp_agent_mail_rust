@@ -286,6 +286,9 @@ fn worktrees_required() -> McpError {
 }
 
 /// Acquire a build slot (advisory), optionally exclusive. Returns conflicts when another holder is active.
+///
+/// # Conformance
+/// Python-parity.
 #[tool(
     description = "Acquire a build slot (advisory), optionally exclusive. Returns conflicts when another holder is active."
 )]
@@ -343,6 +346,9 @@ pub async fn acquire_build_slot(
 }
 
 /// Extend expiry for an existing build slot lease. No-op if missing.
+///
+/// # Conformance
+/// Python-parity.
 #[tool(description = "Extend expiry for an existing build slot lease. No-op if missing.")]
 pub async fn renew_build_slot(
     ctx: &McpContext,
@@ -397,6 +403,9 @@ pub async fn renew_build_slot(
 }
 
 /// Mark an active slot lease as released (non-destructive; keeps JSON with `released_ts`).
+///
+/// # Conformance
+/// Python-parity.
 #[tool(
     description = "Mark an active slot lease as released (non-destructive; keeps JSON with released_ts)."
 )]

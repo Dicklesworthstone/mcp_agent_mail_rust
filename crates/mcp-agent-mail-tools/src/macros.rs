@@ -88,6 +88,9 @@ fn parse_json<T: DeserializeOwned>(payload: String, label: &str) -> McpResult<T>
 /// - `file_reservation_reason`: Reason for reservations
 /// - `file_reservation_ttl_seconds`: TTL for reservations
 /// - `inbox_limit`: Max inbox messages to fetch
+///
+/// # Conformance
+/// Python-parity.
 #[allow(clippy::too_many_arguments)]
 #[tool(
     description = "Macro helper that boots a project session: ensure project, register agent,\noptionally file_reservation paths, and fetch the latest inbox snapshot."
@@ -219,6 +222,9 @@ pub async fn macro_start_session(
 /// - `llm_mode`: Use LLM for summary refinement
 /// - `llm_model`: Override LLM model
 /// - `inbox_limit`: Max inbox messages
+///
+/// # Conformance
+/// Python-parity.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[tool(
     description = "Macro helper that aligns an agent with an existing thread by ensuring registration,\nsummarising the thread, and fetching recent inbox context."
@@ -422,6 +428,9 @@ pub async fn macro_prepare_thread(
 /// - `exclusive`: Exclusive intent
 /// - `reason`: Reservation reason
 /// - `auto_release`: Release after operation
+///
+/// # Conformance
+/// Python-parity.
 #[allow(clippy::too_many_arguments)]
 #[tool(
     description = "Reserve a set of file paths and optionally release them at the end of the workflow."
@@ -542,6 +551,9 @@ pub async fn macro_file_reservation_cycle(
 /// - `program`: Program for registration
 /// - `model`: Model for registration
 /// - `task_description`: Task for registration
+///
+/// # Conformance
+/// Python-parity.
 #[tool(
     description = "Request contact permissions and optionally auto-approve plus send a welcome message."
 )]

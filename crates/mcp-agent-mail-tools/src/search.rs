@@ -672,6 +672,9 @@ pub(crate) fn parse_time_range_with_aliases(
 ///
 /// # Returns
 /// List of matching message summaries
+///
+/// # Conformance
+/// Python-parity.
 #[allow(
     clippy::too_many_arguments,
     clippy::fn_params_excessive_bools,
@@ -961,6 +964,9 @@ fn parse_iso_to_micros_with_boundary(
 /// - `llm_mode`: Refine summary with AI (if enabled)
 /// - `llm_model`: Override model for AI refinement
 /// - `per_thread_limit`: Max messages per thread (multi-thread mode)
+///
+/// # Conformance
+/// Python-parity.
 #[allow(clippy::too_many_lines)]
 #[tool(
     description = "Extract participants, key points, and action items for one or more threads.\n\nSingle-thread mode (thread_id is a single ID):\n- Returns detailed summary with optional example messages\n- Response: { thread_id, summary: {participants[], key_points[], action_items[]}, examples[] }\n\nMulti-thread mode (thread_id is comma-separated IDs like \"TKT-1,TKT-2,TKT-3\"):\n- Returns aggregate digest across all threads\n- Response: { threads: [{thread_id, summary}], aggregate: {top_mentions[], key_points[], action_items[]} }\n\nParameters\n----------\nproject_key : str\n    Project identifier.\nthread_id : str\n    Single thread ID for detailed summary, OR comma-separated IDs for aggregate digest.\ninclude_examples : bool\n    If true (single-thread mode only), include up to 3 sample messages.\nllm_mode : bool\n    If true and LLM is enabled, refine the summary with AI.\nllm_model : Optional[str]\n    Override model name for the LLM call.\nper_thread_limit : int\n    Max messages to consider per thread (multi-thread mode).\n\nExamples\n--------\nSingle thread:\n```json\n{\"thread_id\": \"TKT-123\", \"include_examples\": true}\n```\n\nMultiple threads:\n```json\n{\"thread_id\": \"TKT-1,TKT-2,TKT-3\"}\n```"

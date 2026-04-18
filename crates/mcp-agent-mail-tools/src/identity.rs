@@ -711,6 +711,9 @@ pub struct CommitInfo {
 /// Check infrastructure health and return configuration status.
 ///
 /// Returns basic server configuration and status information.
+///
+/// # Conformance
+/// Python-parity.
 #[tool(description = "Return basic readiness information for the Agent Mail server.")]
 #[allow(clippy::too_many_lines)]
 pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
@@ -897,6 +900,9 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
 ///
 /// # Returns
 /// Project descriptor with id, slug, `human_key`, `created_at`
+///
+/// # Conformance
+/// Python-parity.
 #[tool(
     description = "Idempotently create or ensure a project exists for the given human key.\n\nWhen to use\n-----------\n- First call in a workflow targeting a new repo/path identifier.\n- As a guard before registering agents or sending messages.\n\nHow it works\n------------\n- Validates that `human_key` is an absolute directory path (the agent's working directory).\n- Computes a stable slug from `human_key` (lowercased, safe characters) so\n  multiple agents can refer to the same project consistently.\n- Ensures DB row exists and that the on-disk archive is initialized\n  (e.g., `messages/`, `agents/`, `file_reservations/` directories).\n\nCRITICAL: Project Identity Rules\n---------------------------------\n- The `human_key` MUST be the absolute path to the agent's working directory\n- Two agents working in the SAME directory path are working on the SAME project\n- Example: Both agents in /data/projects/smartedgar_mcp \u{2192} SAME project\n- Sibling projects are DIFFERENT directories (e.g., /data/projects/smartedgar_mcp\n  vs /data/projects/smartedgar_mcp_frontend)\n\nParameters\n----------\nhuman_key : str\n    The absolute path to the agent's working directory (e.g., \"/data/projects/backend\").\n    This MUST be an absolute path, not a relative path or arbitrary slug.\n    This is the canonical identifier for the project - all agents working in this\n    directory will share the same project identity.\n\nReturns\n-------\ndict\n    Minimal project descriptor: { id, slug, human_key, created_at }.\n\nExamples\n--------\nJSON-RPC:\n```json\n{\n  \"jsonrpc\": \"2.0\",\n  \"id\": \"2\",\n  \"method\": \"tools/call\",\n  \"params\": {\"name\": \"ensure_project\", \"arguments\": {\"human_key\": \"/data/projects/backend\"}}\n}\n```\n\nCommon mistakes\n---------------\n- Passing a relative path (e.g., \"./backend\") instead of an absolute path\n- Using arbitrary slugs instead of the actual working directory path\n- Creating separate projects for the same directory with different slugs\n\nIdempotency\n-----------\n- Safe to call multiple times. If the project already exists, the existing\n  record is returned and the archive is ensured on disk (no destructive changes)."
 )]
@@ -984,6 +990,9 @@ Check that all parameters have valid values."
 ///
 /// # Returns
 /// Agent profile with all fields
+///
+/// # Conformance
+/// Python-parity.
 #[allow(clippy::too_many_lines)]
 #[expect(
     clippy::too_many_arguments,
@@ -1192,6 +1201,9 @@ Check that all parameters have valid values."
 ///
 /// # Returns
 /// New agent profile
+///
+/// # Conformance
+/// Python-parity.
 #[allow(clippy::too_many_lines)]
 #[tool(
     description = "Create a new, unique agent identity and persist its profile to Git.\n\nHow this differs from `register_agent`\n--------------------------------------\n- Always creates a new identity with a fresh unique name (never updates an existing one).\n- `name_hint`, if provided, MUST be a valid adjective+noun combination and must be available,\n  otherwise an error is raised. Without a hint, a random adjective+noun name is generated.\n\nCRITICAL: Agent Naming Rules\n-----------------------------\n- Agent names MUST be randomly generated adjective+noun combinations\n- Examples: \"GreenCastle\", \"BlueLake\", \"RedStone\", \"PurpleBear\"\n- Names should be unique, easy to remember, and NOT descriptive\n- INVALID examples: \"BackendHarmonizer\", \"DatabaseMigrator\", \"UIRefactorer\"\n- Best practice: Omit `name_hint` to auto-generate a valid name (RECOMMENDED)\n\nWhen to use\n-----------\n- Spawning a brand new worker agent that should not overwrite an existing profile.\n- Temporary task-specific identities (e.g., short-lived refactor assistants).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nAuto-generate name (RECOMMENDED):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c2\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\"\n}}}\n```\n\nWith valid name hint:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c1\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"name_hint\":\"GreenCastle\",\n  \"task_description\":\"DB migration spike\"\n}}}\n```"
@@ -1424,6 +1436,9 @@ pub fn is_valid_attachments_policy(policy: &str) -> bool {
 ///
 /// # Returns
 /// Agent profile with optional commit history
+///
+/// # Conformance
+/// Python-parity.
 #[tool(
     description = "Return enriched profile details for an agent, optionally including recent archive commits.\n\nDiscovery\n---------\nTo discover available agent names, use: resource://agents/{project_key}\nAgent names are NOT the same as program names or user names.\n\nParameters\n----------\nproject_key : str\n    Project slug or human key.\nagent_name : str\n    Agent name to look up (use resource://agents/{project_key} to discover names).\ninclude_recent_commits : bool\n    If true, include latest commits touching the project archive authored by the configured git author.\ncommit_limit : int\n    Maximum number of recent commits to include.\n\nReturns\n-------\ndict\n    Agent profile augmented with { recent_commits: [{hexsha, summary, authored_ts}] } when requested."
 )]
@@ -1542,6 +1557,9 @@ fn resolve_identity_from_project_keys(
 ///
 /// # Returns
 /// The agent name if found, or an error if no identity file exists.
+///
+/// # Conformance
+/// Rust-native.
 #[tool(
     description = "Resolve the agent name for a tmux pane from the canonical per-pane identity file.\n\nChecks the following locations in priority order:\n1. Canonical: ~/.config/agent-mail/identity/<project_hash>/<pane_id>\n2. Legacy Claude Code: ~/.claude/agent-mail/identity.<pane_id>\n3. Legacy NTM: /tmp/agent-mail-name.<project_hash>.<pane_id>\n\nParameters\n----------\nproject_key : str\n    Absolute path to the project directory (used to scope the lookup).\npane_id : Optional[str]\n    Tmux pane identifier (e.g., \"%0\", \"%3\"). If omitted, reads $TMUX_PANE.\n\nReturns\n-------\ndict\n    { agent_name, pane_id, identity_path }"
 )]
@@ -1614,6 +1632,9 @@ pub async fn resolve_pane_identity(
 ///
 /// # Returns
 /// List of removed file paths.
+///
+/// # Conformance
+/// Rust-native.
 #[tool(
     description = "Remove stale per-pane identity files for tmux panes that no longer exist.\n\nQueries tmux for live panes and removes identity files that reference dead panes.\nSafety: does nothing if tmux is not running (to avoid accidentally removing everything).\n\nParameters\n----------\nproject_key : Optional[str]\n    If provided, only clean up identity files for this project.\n    If omitted, clean up across all projects.\n\nReturns\n-------\ndict\n    { removed_count, removed_paths }"
 )]
@@ -1647,6 +1668,9 @@ pub fn cleanup_pane_identities(
 ///
 /// # Returns
 /// Array of agent entries with name, role (program), project scope, registration time, last seen
+///
+/// # Conformance
+/// Rust-native.
 #[tool(
     description = "List all registered agents in a project.\n\nReturns agent name, role (program), model, task description, registration time (inception_ts), and last seen (last_active_ts).\n\nParameters\n----------\nproject_key : str\n    Project slug or human key.\n\nReturns\n-------\nstr (JSON)\n    Array of agent objects with fields: name, program, model, task_description, inception_ts, last_active_ts, contact_policy."
 )]
