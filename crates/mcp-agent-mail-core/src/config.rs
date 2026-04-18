@@ -2656,7 +2656,7 @@ fn real_env_value(key: &str) -> Option<String> {
     env::var(key).ok()
 }
 
-fn load_dotenv_file(path: &Path) -> HashMap<String, String> {
+pub(crate) fn load_dotenv_file(path: &Path) -> HashMap<String, String> {
     let Ok(contents) = fs::read_to_string(path) else {
         return HashMap::new();
     };

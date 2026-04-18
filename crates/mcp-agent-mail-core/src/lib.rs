@@ -41,6 +41,7 @@ pub mod error;
 pub mod evidence_ledger;
 pub mod experience;
 pub mod flake_triage;
+pub mod flags;
 pub mod identity;
 pub mod intern;
 pub mod kpi;
