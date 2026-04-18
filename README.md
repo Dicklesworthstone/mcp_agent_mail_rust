@@ -1563,6 +1563,7 @@ Common pitfalls
 | [RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) | Pre-release validation |
 | [ROLLOUT_PLAYBOOK.md](docs/ROLLOUT_PLAYBOOK.md) | Staged rollout strategy |
 | [SPEC-browser-parity-contract-deferred.md](docs/SPEC-browser-parity-contract-deferred.md) | Deferred browser TUI mirror contract and future revisit checklist |
+| [SPEC-threat-model.md](docs/SPEC-threat-model.md) | Consolidated threat model covering assets, adversaries, attack surfaces, and mitigations |
 | [SPEC-search-v3-query-contract.md](docs/SPEC-search-v3-query-contract.md) | Query grammar, filters, and Search V3 contract |
 | [SPEC-web-ui-parity-contract.md](docs/SPEC-web-ui-parity-contract.md) | Web UI parity and route contract |
 | [SPEC-verify-live-contract.md](docs/SPEC-verify-live-contract.md) | Static bundle live-verification rules |
