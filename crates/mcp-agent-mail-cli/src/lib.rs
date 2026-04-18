@@ -20516,13 +20516,11 @@ fn inbox_row_to_json(
         "kind": r.kind,
         "thread_id": r.message.thread_id,
     });
-    if include_body {
-        if let Some(obj) = v.as_object_mut() {
-            obj.insert(
-                "body_md".to_string(),
-                serde_json::Value::String(r.message.body_md.clone()),
-            );
-        }
+    if include_body && let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "body_md".to_string(),
+            serde_json::Value::String(r.message.body_md.clone()),
+        );
     }
     v
 }
@@ -20545,13 +20543,11 @@ fn product_inbox_row_to_json(
         "kind": r.kind,
         "attachments": attachments,
     });
-    if include_body {
-        if let Some(obj) = v.as_object_mut() {
-            obj.insert(
-                "body_md".to_string(),
-                serde_json::Value::String(r.message.body_md.clone()),
-            );
-        }
+    if include_body && let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "body_md".to_string(),
+            serde_json::Value::String(r.message.body_md.clone()),
+        );
     }
     v
 }
@@ -39572,7 +39568,7 @@ startup_timeout_sec = 42
             Ok(true)
         })
         .expect("health check");
-        println!("healthy: {}", healthy); assert!(healthy, "compat probe success should keep healthy verdict");
+        assert!(healthy, "compat probe success should keep healthy verdict");
         assert!(
             probe_called,
             "compatibility probe should run when sidecars exist"
@@ -39617,7 +39613,7 @@ startup_timeout_sec = 42
             Ok(true)
         })
         .expect("health check");
-        println!("healthy: {}", healthy); assert!(healthy, "compat probe success should keep healthy verdict");
+        assert!(healthy, "compat probe success should keep healthy verdict");
         assert!(
             probe_called,
             "compatibility probe should run even without live sidecars"
@@ -47606,13 +47602,11 @@ fn fetch_mail_inbox_direct_with_database_url(
             "kind": row.kind.clone(),
             "thread_id": row.message.thread_id.clone(),
         });
-        if include_bodies {
-            if let Some(obj) = value.as_object_mut() {
-                obj.insert(
-                    "body_md".to_string(),
-                    serde_json::Value::String(row.message.body_md.clone()),
-                );
-            }
+        if include_bodies && let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "body_md".to_string(),
+                serde_json::Value::String(row.message.body_md.clone()),
+            );
         }
         data.push(value);
     }
@@ -49396,7 +49390,7 @@ fn start_preview_server(
                         let mut resp = if within_root
                             && resolved.as_ref().is_some_and(|p| p.is_file())
                         {
-                            let resolved = resolved.as_ref().unwrap();
+                            let resolved = resolved.as_ref().expect("within_root guarantees Some");
                             match std::fs::read(resolved) {
                                 Ok(content) => {
                                     let ct = guess_content_type(resolved);

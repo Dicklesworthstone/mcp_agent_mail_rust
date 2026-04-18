@@ -1235,30 +1235,35 @@ fn is_likely_python_binary(path: &Path) -> bool {
 /// path directly.  Otherwise we fall back to a PATH lookup via `which`.
 fn find_installed_am_binary() -> Option<PathBuf> {
     #[cfg(test)]
-    return None;
-
-    // If the currently-running executable is `am`, use it directly.
-    if let Ok(exe) = std::env::current_exe()
-        && exe
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|name| name == "am")
     {
-        return Some(exe);
+        None
     }
-    // Fallback: look up `am` in PATH via `which`.
-    if let Ok(output) = std::process::Command::new("which").arg("am").output()
-        && output.status.success()
+
+    #[cfg(not(test))]
     {
-        let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !path_str.is_empty() {
-            let p = PathBuf::from(path_str);
-            if p.exists() {
-                return Some(p);
+        // If the currently-running executable is `am`, use it directly.
+        if let Ok(exe) = std::env::current_exe()
+            && exe
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name == "am")
+        {
+            return Some(exe);
+        }
+        // Fallback: look up `am` in PATH via `which`.
+        if let Ok(output) = std::process::Command::new("which").arg("am").output()
+            && output.status.success()
+        {
+            let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path_str.is_empty() {
+                let p = PathBuf::from(path_str);
+                if p.exists() {
+                    return Some(p);
+                }
             }
         }
+        None
     }
-    None
 }
 
 fn detect_pyproject_marker(search_root: &Path) -> Option<LegacyMarker> {
@@ -1297,7 +1302,6 @@ fn detect_legacy_script_marker(search_root: &Path) -> Option<LegacyMarker> {
 fn detect_env_marker(search_root: &Path) -> Option<LegacyMarker> {
     let env_file = search_root.join(".env");
     if !env_file.exists() {
-        println!("detect_env_marker: .env not found");
         return None;
     }
     let map = read_env_file_map(&env_file);
@@ -1307,8 +1311,6 @@ fn detect_env_marker(search_root: &Path) -> Option<LegacyMarker> {
     let legacy_storage = map
         .get("STORAGE_ROOT")
         .is_some_and(|value| value.contains(".mcp_agent_mail_git_mailbox_repo"));
-    
-    println!("detect_env_marker: legacy_db={}, legacy_storage={}, map={:?}", legacy_db, legacy_storage, map);
 
     if legacy_db || legacy_storage {
         return Some(LegacyMarker {

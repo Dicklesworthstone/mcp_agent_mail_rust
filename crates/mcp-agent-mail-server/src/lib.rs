@@ -3852,7 +3852,6 @@ fn dispatch_compose_envelope(
             );
         }
         Err(e) => {
-            println!("ERR IN DISPATCH: {e:?}");
             tracing::error!("compose: failed to dispatch message: {e}");
         }
     }

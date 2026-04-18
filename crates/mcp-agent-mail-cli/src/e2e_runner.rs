@@ -121,9 +121,9 @@ impl SuiteRegistry {
             {
                 let suite_name = name
                     .strip_prefix("test_")
-                    .unwrap()
+                    .expect("already checked prefix")
                     .strip_suffix(".sh")
-                    .unwrap()
+                    .expect("already checked suffix")
                     .to_string();
 
                 let (description, tags) = Self::extract_metadata(&path);
@@ -1851,7 +1851,7 @@ impl Runner {
 
         // Strip ANSI escape codes (compiled once, reused across calls)
         static ANSI_RE: std::sync::LazyLock<regex::Regex> =
-            std::sync::LazyLock::new(|| regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap());
+            std::sync::LazyLock::new(|| regex::Regex::new(r"\x1b\[[0-9;]*m").expect("valid regex"));
         let ansi_regex = &*ANSI_RE;
 
         for line in output.lines() {

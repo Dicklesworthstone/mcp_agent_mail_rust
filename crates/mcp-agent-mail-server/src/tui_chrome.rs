@@ -1967,8 +1967,11 @@ mod tests {
         // 16 when the `Atc` screen shipped, and `compute_tab_window_plan`
         // starts hiding tabs as soon as the cumulative tab+separator width
         // overflows. Derive the width from the registry so future screen
-        // additions don't silently fall off the right edge again.
-        let nominal_tab_width: u16 = 16;
+        // additions don't silently fall off the right edge again. Use a
+        // generous per-tab budget (label cap of 12 + 2-digit key + padding
+        // + 1-cell separator) so tests tolerate any future screen within
+        // the documented 12-char short-label cap.
+        let nominal_tab_width: u16 = 20;
         let area_width = u16::try_from(ALL_SCREEN_IDS.len())
             .unwrap_or(u16::MAX)
             .saturating_mul(nominal_tab_width);

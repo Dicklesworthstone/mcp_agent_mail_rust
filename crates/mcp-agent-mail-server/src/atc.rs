@@ -3431,6 +3431,7 @@ impl AtcLivenessPolicyArtifact {
         // `invalid_candidate_policy_hash` on load. A fixed-precision
         // formatter (6 decimals is what all the other hashed scalar fields
         // already use) keeps the hash input stable across the pipeline.
+        use std::fmt::Write as _;
         let mut losses_str = String::with_capacity(64);
         losses_str.push('[');
         for (i, row) in self.losses.iter().enumerate() {
@@ -3442,7 +3443,6 @@ impl AtcLivenessPolicyArtifact {
                 if j > 0 {
                     losses_str.push(',');
                 }
-                use std::fmt::Write as _;
                 let _ = write!(losses_str, "{v:.6}");
             }
             losses_str.push(']');
