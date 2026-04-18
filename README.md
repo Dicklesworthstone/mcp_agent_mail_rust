@@ -754,21 +754,9 @@ Agent Mail pairs with [Beads](https://github.com/Dicklesworthstone/beads_rust) (
 
 Use the Beads issue ID (`br-123`) as the Mail `thread_id` and prefix message subjects with `[br-123]` to keep everything linked.
 
----
-
-## Web Dashboard (Deferred)
-
-The browser TUI mirror at `/web-dashboard` is deferred. All `/web-dashboard/*` endpoints currently return `501 Not Implemented`.
-
-The underlying modules (`tui_ws_state.rs`, `tui_ws_input.rs`, `tui_web_dashboard.rs`) remain in the codebase and are tested at the module level, so the feature can be re-enabled when the browser parity contract is finalized. See `docs/SPEC-browser-parity-contract-deferred.md` and tracker `br-il53l` for details.
-
-For human-facing web access, use the server-rendered `/mail/*` web UI described below.
-
----
-
 ## Web UI
 
-The server includes a lightweight, server-rendered web UI for humans at `/mail/`. Agents should continue using MCP tools and resources; the web UI is for human review and oversight. Use `/mail/*` for mailbox/task oversight and `/web-dashboard` for terminal-mirror situational awareness.
+The server includes a lightweight, server-rendered web UI for humans at `/mail/`. Agents should continue using MCP tools and resources; the web UI is for human review and oversight. Use `/mail/*` for mailbox and task oversight. The browser TUI mirror at `/web-dashboard` is deferred and not a supported surface; see `docs/SPEC-browser-parity-contract-deferred.md`.
 
 ### Routes
 
@@ -969,6 +957,8 @@ $STORAGE_ROOT/                              # e.g. ~/.local/share/mcp-agent-mail
 ---
 
 ## ATC Learning Implementation Map
+
+> Status: architecture-phase, not learning-phase. Scaffolding + schema + policy engine exist; hot-path experience writes + outcome resolution are tracked in `br-bn0vb`.
 
 The `br-0qt6e` ATC learning work is intentionally cross-cutting, but it should not be cross-owned. The codebase already has the right seams; future implementation should deepen those seams instead of spreading ATC state across tools, UI layers, or ad-hoc SQL in random crates.
 
