@@ -488,6 +488,16 @@ pub enum ContactsCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum AtcCommand {
+    /// Explain a persisted ATC decision from the durable experience ledger.
+    #[command(name = "explain")]
+    Explain {
+        /// Decision ID from `atc_experiences.decision_id`.
+        #[arg(value_name = "decision_id", value_parser = parse_positive_u64_arg)]
+        decision_id: u64,
+        /// Output JSON instead of human-readable text.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Reprocess persisted ATC feature payloads to the current schema version.
     #[command(name = "reprocess-features")]
     ReprocessFeatures {
@@ -8081,8 +8091,628 @@ fn handle_flake_triage(action: FlakeTriageCommand) -> CliResult<()> {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct AtcExplainMethodContract {
+    method_id: String,
+    name: String,
+    family: String,
+    status: String,
+    user_value: String,
+    failure_it_prevents: String,
+    what_happens_without: String,
+    degradation_behavior: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AtcExplainPolicyCard {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_id: Option<String>,
+    primary_method_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    primary_method: Option<AtcExplainMethodContract>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supporting_method: Option<AtcExplainMethodContract>,
+    rationale: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AtcExplainReasoning {
+    selected_action: String,
+    expected_loss: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runner_up_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runner_up_loss: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    loss_gap: Option<f64>,
+    evidence_summary: String,
+    calibration_healthy: bool,
+    safe_mode_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_posterior_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_posterior_probability: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AtcExplainInputs {
+    latest_state: String,
+    subsystem: String,
+    decision_class: String,
+    effect_kind: String,
+    subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_id: Option<String>,
+    trace_id: String,
+    claim_id: String,
+    evidence_id: String,
+    feature_schema_version: u16,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    posterior: Vec<(String, f64)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    features: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    feature_ext: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    non_execution_reason: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AtcExplainLedgerRow {
+    experience_id: u64,
+    effect_id: u64,
+    state: String,
+    effect_kind: String,
+    action: String,
+    expected_loss: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runner_up_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runner_up_loss: Option<f64>,
+    evidence_summary: String,
+    created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dispatched_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome_correct: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_loss: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    regret: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AtcExplainReport {
+    decision_id: u64,
+    effect_count: usize,
+    latest_experience_id: u64,
+    policy: AtcExplainPolicyCard,
+    reasoning: AtcExplainReasoning,
+    inputs: AtcExplainInputs,
+    ledger: Vec<AtcExplainLedgerRow>,
+}
+
+fn atc_row_opt_text_idx(row: &mcp_agent_mail_db::sqlmodel_core::Row, idx: usize) -> Option<String> {
+    row.get(idx)
+        .and_then(|value| match value {
+            mcp_agent_mail_db::sqlmodel_core::Value::Text(text) => Some(text.clone()),
+            mcp_agent_mail_db::sqlmodel_core::Value::BigInt(number) => Some(number.to_string()),
+            mcp_agent_mail_db::sqlmodel_core::Value::Int(number) => Some(number.to_string()),
+            mcp_agent_mail_db::sqlmodel_core::Value::Double(number) => Some(number.to_string()),
+            mcp_agent_mail_db::sqlmodel_core::Value::Float(number) => Some(number.to_string()),
+            mcp_agent_mail_db::sqlmodel_core::Value::Bool(flag) => Some(flag.to_string()),
+            _ => None,
+        })
+        .and_then(|value| {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+}
+
+fn atc_row_text_idx(row: &mcp_agent_mail_db::sqlmodel_core::Row, idx: usize) -> String {
+    atc_row_opt_text_idx(row, idx).unwrap_or_default()
+}
+
+fn atc_row_u64_idx(
+    row: &mcp_agent_mail_db::sqlmodel_core::Row,
+    idx: usize,
+    field: &str,
+) -> CliResult<u64> {
+    let value = row
+        .get(idx)
+        .and_then(|value| match value {
+            mcp_agent_mail_db::sqlmodel_core::Value::BigInt(number) => Some(*number),
+            mcp_agent_mail_db::sqlmodel_core::Value::Int(number) => Some(i64::from(*number)),
+            _ => None,
+        })
+        .ok_or_else(|| CliError::Other(format!("missing {field} in ATC explain row")))?;
+    u64::try_from(value)
+        .map_err(|_| CliError::Other(format!("invalid {field} in ATC explain row: {value}")))
+}
+
+fn atc_row_i64_idx(row: &mcp_agent_mail_db::sqlmodel_core::Row, idx: usize) -> Option<i64> {
+    row.get(idx).and_then(|value| match value {
+        mcp_agent_mail_db::sqlmodel_core::Value::BigInt(number) => Some(*number),
+        mcp_agent_mail_db::sqlmodel_core::Value::Int(number) => Some(i64::from(*number)),
+        mcp_agent_mail_db::sqlmodel_core::Value::Text(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    })
+}
+
+fn atc_row_f64_idx(row: &mcp_agent_mail_db::sqlmodel_core::Row, idx: usize) -> Option<f64> {
+    row.get(idx).and_then(|value| match value {
+        mcp_agent_mail_db::sqlmodel_core::Value::Double(number) => Some(*number),
+        mcp_agent_mail_db::sqlmodel_core::Value::Float(number) => Some(f64::from(*number)),
+        mcp_agent_mail_db::sqlmodel_core::Value::BigInt(number) => Some(*number as f64),
+        mcp_agent_mail_db::sqlmodel_core::Value::Int(number) => Some(f64::from(*number)),
+        mcp_agent_mail_db::sqlmodel_core::Value::Text(text) => text.trim().parse::<f64>().ok(),
+        _ => None,
+    })
+}
+
+fn atc_row_bool_idx(row: &mcp_agent_mail_db::sqlmodel_core::Row, idx: usize) -> bool {
+    row.get(idx)
+        .and_then(|value| match value {
+            mcp_agent_mail_db::sqlmodel_core::Value::Bool(flag) => Some(*flag),
+            mcp_agent_mail_db::sqlmodel_core::Value::BigInt(number) => Some(*number != 0),
+            mcp_agent_mail_db::sqlmodel_core::Value::Int(number) => Some(*number != 0),
+            mcp_agent_mail_db::sqlmodel_core::Value::Text(text) => {
+                let lowered = text.trim().to_ascii_lowercase();
+                match lowered.as_str() {
+                    "1" | "true" | "yes" => Some(true),
+                    "0" | "false" | "no" => Some(false),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
+fn atc_row_json_idx(
+    row: &mcp_agent_mail_db::sqlmodel_core::Row,
+    idx: usize,
+    field: &str,
+) -> CliResult<Option<serde_json::Value>> {
+    let Some(raw) = atc_row_opt_text_idx(row, idx) else {
+        return Ok(None);
+    };
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .map(|value| Some(sort_json_keys(&value)))
+        .map_err(|error| {
+            CliError::Other(format!("invalid {field} JSON in ATC explain row: {error}"))
+        })
+}
+
+fn atc_method_status_label(
+    status: mcp_agent_mail_core::atc_assumptions::MethodStatus,
+) -> &'static str {
+    match status {
+        mcp_agent_mail_core::atc_assumptions::MethodStatus::Active => "active",
+        mcp_agent_mail_core::atc_assumptions::MethodStatus::Available => "available",
+        mcp_agent_mail_core::atc_assumptions::MethodStatus::Shadow => "shadow",
+        mcp_agent_mail_core::atc_assumptions::MethodStatus::Gated => "gated",
+        mcp_agent_mail_core::atc_assumptions::MethodStatus::Retired => "retired",
+        mcp_agent_mail_core::atc_assumptions::MethodStatus::Placeholder => "placeholder",
+    }
+}
+
+fn atc_method_contract(method_id: &str) -> Option<AtcExplainMethodContract> {
+    let entry = mcp_agent_mail_core::atc_assumptions::find_method(method_id)?;
+    Some(AtcExplainMethodContract {
+        method_id: entry.method_id.to_string(),
+        name: entry.name.to_string(),
+        family: entry.family.to_string(),
+        status: atc_method_status_label(entry.status).to_string(),
+        user_value: entry.ev_gate.user_value.to_string(),
+        failure_it_prevents: entry.ev_gate.failure_it_prevents.to_string(),
+        what_happens_without: entry.ev_gate.what_happens_without.to_string(),
+        degradation_behavior: entry.degradation_behavior.to_string(),
+    })
+}
+
+fn infer_atc_explain_primary_method_id(
+    decision_class: &str,
+    subsystem: &str,
+    effect_kind: &str,
+    safe_mode_active: bool,
+) -> &'static str {
+    let decision_class = decision_class.to_ascii_lowercase();
+    let subsystem = subsystem.to_ascii_lowercase();
+    let effect_kind = effect_kind.to_ascii_lowercase();
+
+    if safe_mode_active || decision_class.contains("safe_mode") {
+        "atc.calibration.safe_mode"
+    } else if subsystem == "calibration" {
+        "atc.calibration.eprocess"
+    } else if subsystem == "conflict" && decision_class.contains("deadlock") {
+        "atc.conflict.deadlock"
+    } else if subsystem == "conflict" {
+        "atc.conflict.vcg"
+    } else if subsystem == "load_routing" {
+        "atc.load.queueing"
+    } else if subsystem == "liveness"
+        && (decision_class.contains("probe") || effect_kind == "probe")
+    {
+        "atc.liveness.probes"
+    } else if subsystem == "liveness" {
+        "atc.liveness.rhythm"
+    } else {
+        "atc.core.expected_loss"
+    }
+}
+
+fn format_atc_posterior_line(posterior: &[(String, f64)]) -> String {
+    posterior
+        .iter()
+        .map(|(label, probability)| format!("{label}={probability:.3}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_atc_json_value(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "<invalid json>".to_string())
+}
+
+fn query_atc_decision_rows(
+    conn: &mcp_agent_mail_db::DbConn,
+    decision_id: u64,
+) -> CliResult<Vec<mcp_agent_mail_db::sqlmodel_core::Row>> {
+    let sql_decision_id = i64::try_from(decision_id).map_err(|_| {
+        CliError::InvalidArgument(format!(
+            "decision_id exceeds SQLite INTEGER range: {decision_id}"
+        ))
+    })?;
+    conn.query_sync(
+        "SELECT \
+            experience_id, effect_id, state, subsystem, decision_class, subject, project_key, \
+            policy_id, effect_kind, action, expected_loss, runner_up_action, runner_up_loss, \
+            evidence_summary, calibration_healthy, safe_mode_active, outcome_json, features_json, \
+            feature_ext_json, feature_schema_version, created_ts, dispatched_ts, executed_ts, \
+            resolved_ts, context_json, claim_id, evidence_id, trace_id, posterior_json, \
+            non_execution_json \
+         FROM atc_experiences \
+         WHERE decision_id = ? \
+         ORDER BY experience_id ASC",
+        &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(
+            sql_decision_id,
+        )],
+    )
+    .map_err(|error| {
+        CliError::Other(format!(
+            "failed to query ATC decision {decision_id} from experience ledger: {error}"
+        ))
+    })
+}
+
+fn build_atc_explain_report(
+    decision_id: u64,
+    rows: &[mcp_agent_mail_db::sqlmodel_core::Row],
+) -> CliResult<AtcExplainReport> {
+    let latest = rows
+        .last()
+        .ok_or_else(|| CliError::Other(format!("ATC decision {decision_id} not found")))?;
+    let latest_experience_id = atc_row_u64_idx(latest, 0, "experience_id")?;
+    let latest_state = atc_row_text_idx(latest, 2);
+    let subsystem = atc_row_text_idx(latest, 3);
+    let decision_class = atc_row_text_idx(latest, 4);
+    let subject = atc_row_text_idx(latest, 5);
+    let project_key = atc_row_opt_text_idx(latest, 6);
+    let policy_id = atc_row_opt_text_idx(latest, 7);
+    let effect_kind = atc_row_text_idx(latest, 8);
+    let action = atc_row_text_idx(latest, 9);
+    let expected_loss = atc_row_f64_idx(latest, 10).unwrap_or(0.0);
+    let runner_up_action = atc_row_opt_text_idx(latest, 11);
+    let runner_up_loss = atc_row_f64_idx(latest, 12);
+    let evidence_summary = atc_row_text_idx(latest, 13);
+    let calibration_healthy = atc_row_bool_idx(latest, 14);
+    let safe_mode_active = atc_row_bool_idx(latest, 15);
+    let features = atc_row_json_idx(latest, 17, "features_json")?;
+    let feature_ext = atc_row_json_idx(latest, 18, "feature_ext_json")?;
+    let feature_schema_version = atc_row_i64_idx(latest, 19)
+        .and_then(|value| u16::try_from(value).ok())
+        .unwrap_or(mcp_agent_mail_core::FEATURE_SCHEMA_VERSION);
+    let context = atc_row_json_idx(latest, 24, "context_json")?;
+    let claim_id = atc_row_text_idx(latest, 25);
+    let evidence_id = atc_row_text_idx(latest, 26);
+    let trace_id = atc_row_text_idx(latest, 27);
+    let posterior = match atc_row_json_idx(latest, 28, "posterior_json")? {
+        Some(value) => serde_json::from_value::<Vec<(String, f64)>>(value).map_err(|error| {
+            CliError::Other(format!(
+                "invalid posterior_json in ATC explain row: {error}"
+            ))
+        })?,
+        None => Vec::new(),
+    };
+    let non_execution_reason = atc_row_json_idx(latest, 29, "non_execution_json")?;
+
+    let primary_method_id = infer_atc_explain_primary_method_id(
+        &decision_class,
+        &subsystem,
+        &effect_kind,
+        safe_mode_active,
+    );
+    let supporting_method = (primary_method_id != "atc.core.expected_loss")
+        .then(|| atc_method_contract("atc.core.expected_loss"))
+        .flatten();
+    let top_posterior = posterior.iter().max_by(|left, right| {
+        left.1
+            .partial_cmp(&right.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let loss_gap = runner_up_loss.map(|value| value - expected_loss);
+
+    let mut rationale_parts = Vec::new();
+    if let Some(policy_id) = &policy_id {
+        rationale_parts.push(format!("policy `{policy_id}`"));
+    } else {
+        rationale_parts.push("no persisted policy_id".to_string());
+    }
+    if let Some((label, probability)) = top_posterior {
+        rationale_parts.push(format!("top posterior `{label}`={probability:.3}"));
+    }
+    match (runner_up_action.as_deref(), runner_up_loss, loss_gap) {
+        (Some(runner_up_action), Some(runner_up_loss), Some(loss_gap)) => rationale_parts.push(
+            format!(
+                "selected `{action}` because expected loss {expected_loss:.3} beat `{runner_up_action}` at {runner_up_loss:.3} (gap {loss_gap:.3})"
+            ),
+        ),
+        _ => rationale_parts
+            .push(format!("selected `{action}` with expected loss {expected_loss:.3}")),
+    }
+    if !evidence_summary.is_empty() {
+        rationale_parts.push(format!("evidence: {evidence_summary}"));
+    }
+    if !calibration_healthy {
+        rationale_parts.push("calibration was unhealthy at decision time".to_string());
+    }
+    if safe_mode_active {
+        rationale_parts.push("safe mode was active at decision time".to_string());
+    }
+
+    let mut ledger = Vec::with_capacity(rows.len());
+    for row in rows {
+        let outcome = match atc_row_json_idx(row, 16, "outcome_json")? {
+            Some(value) => serde_json::from_value::<mcp_agent_mail_core::ExperienceOutcome>(value)
+                .map(Some)
+                .map_err(|error| {
+                    CliError::Other(format!("invalid outcome_json in ATC explain row: {error}"))
+                })?,
+            None => None,
+        };
+
+        ledger.push(AtcExplainLedgerRow {
+            experience_id: atc_row_u64_idx(row, 0, "experience_id")?,
+            effect_id: atc_row_u64_idx(row, 1, "effect_id")?,
+            state: atc_row_text_idx(row, 2),
+            effect_kind: atc_row_text_idx(row, 8),
+            action: atc_row_text_idx(row, 9),
+            expected_loss: atc_row_f64_idx(row, 10).unwrap_or(0.0),
+            runner_up_action: atc_row_opt_text_idx(row, 11),
+            runner_up_loss: atc_row_f64_idx(row, 12),
+            evidence_summary: atc_row_text_idx(row, 13),
+            created_at: atc_row_i64_idx(row, 20)
+                .map(iso_from_micros)
+                .unwrap_or_default(),
+            dispatched_at: atc_row_i64_idx(row, 21).map(iso_from_micros),
+            executed_at: atc_row_i64_idx(row, 22).map(iso_from_micros),
+            resolved_at: atc_row_i64_idx(row, 23).map(iso_from_micros),
+            outcome_label: outcome.as_ref().map(|value| value.label.clone()),
+            outcome_correct: outcome.as_ref().map(|value| value.correct),
+            actual_loss: outcome.as_ref().and_then(|value| value.actual_loss),
+            regret: outcome.as_ref().and_then(|value| value.regret),
+        });
+    }
+
+    Ok(AtcExplainReport {
+        decision_id,
+        effect_count: ledger.len(),
+        latest_experience_id,
+        policy: AtcExplainPolicyCard {
+            policy_id: policy_id.clone(),
+            primary_method_id: primary_method_id.to_string(),
+            primary_method: atc_method_contract(primary_method_id),
+            supporting_method,
+            rationale: rationale_parts.join("; "),
+        },
+        reasoning: AtcExplainReasoning {
+            selected_action: action.clone(),
+            expected_loss,
+            runner_up_action: runner_up_action.clone(),
+            runner_up_loss,
+            loss_gap,
+            evidence_summary: evidence_summary.clone(),
+            calibration_healthy,
+            safe_mode_active,
+            top_posterior_state: top_posterior.map(|(label, _)| label.clone()),
+            top_posterior_probability: top_posterior.map(|(_, probability)| *probability),
+        },
+        inputs: AtcExplainInputs {
+            latest_state,
+            subsystem,
+            decision_class,
+            effect_kind,
+            subject,
+            project_key,
+            policy_id,
+            trace_id,
+            claim_id,
+            evidence_id,
+            feature_schema_version,
+            posterior,
+            features,
+            feature_ext,
+            context,
+            non_execution_reason,
+        },
+        ledger,
+    })
+}
+
+fn render_atc_explain_report(report: &AtcExplainReport) {
+    ftui_runtime::ftui_println!("ATC decision {}", report.decision_id);
+    ftui_runtime::ftui_println!("  latest experience: {}", report.latest_experience_id);
+    ftui_runtime::ftui_println!("  effects recorded: {}", report.effect_count);
+    ftui_runtime::ftui_println!("  subject: {}", report.inputs.subject);
+    if let Some(project_key) = &report.inputs.project_key {
+        ftui_runtime::ftui_println!("  project: {project_key}");
+    }
+    ftui_runtime::ftui_println!("  subsystem: {}", report.inputs.subsystem);
+    ftui_runtime::ftui_println!("  decision class: {}", report.inputs.decision_class);
+    ftui_runtime::ftui_println!("  latest state: {}", report.inputs.latest_state);
+    ftui_runtime::ftui_println!("  effect kind: {}", report.inputs.effect_kind);
+    ftui_runtime::ftui_println!("  action: {}", report.reasoning.selected_action);
+    if let Some(policy_id) = &report.policy.policy_id {
+        ftui_runtime::ftui_println!("  policy: {policy_id}");
+    }
+
+    ftui_runtime::ftui_println!();
+    ftui_runtime::ftui_println!("Transparency card");
+    ftui_runtime::ftui_println!("  primary method: {}", report.policy.primary_method_id);
+    if let Some(method) = &report.policy.primary_method {
+        ftui_runtime::ftui_println!("  method name: {}", method.name);
+        ftui_runtime::ftui_println!("  method family: {}", method.family);
+        ftui_runtime::ftui_println!("  method status: {}", method.status);
+        ftui_runtime::ftui_println!("  user value: {}", method.user_value);
+        ftui_runtime::ftui_println!("  failure prevented: {}", method.failure_it_prevents);
+        ftui_runtime::ftui_println!("  without it: {}", method.what_happens_without);
+        ftui_runtime::ftui_println!("  degradation behavior: {}", method.degradation_behavior);
+    }
+    if let Some(method) = &report.policy.supporting_method {
+        ftui_runtime::ftui_println!(
+            "  supporting method: {} ({})",
+            method.method_id,
+            method.name
+        );
+    }
+    ftui_runtime::ftui_println!("  rationale: {}", report.policy.rationale);
+
+    ftui_runtime::ftui_println!();
+    ftui_runtime::ftui_println!("Decision inputs");
+    ftui_runtime::ftui_println!("  trace id: {}", report.inputs.trace_id);
+    ftui_runtime::ftui_println!("  claim id: {}", report.inputs.claim_id);
+    ftui_runtime::ftui_println!("  evidence id: {}", report.inputs.evidence_id);
+    ftui_runtime::ftui_println!(
+        "  feature schema version: {}",
+        report.inputs.feature_schema_version
+    );
+    if !report.inputs.posterior.is_empty() {
+        ftui_runtime::ftui_println!(
+            "  posterior: {}",
+            format_atc_posterior_line(&report.inputs.posterior)
+        );
+    }
+    if let Some(features) = &report.inputs.features {
+        ftui_runtime::ftui_println!("  features: {}", format_atc_json_value(features));
+    }
+    if let Some(feature_ext) = &report.inputs.feature_ext {
+        ftui_runtime::ftui_println!("  feature_ext: {}", format_atc_json_value(feature_ext));
+    }
+    if let Some(context) = &report.inputs.context {
+        ftui_runtime::ftui_println!("  context: {}", format_atc_json_value(context));
+    }
+    if let Some(reason) = &report.inputs.non_execution_reason {
+        ftui_runtime::ftui_println!("  non_execution_reason: {}", format_atc_json_value(reason));
+    }
+
+    ftui_runtime::ftui_println!();
+    ftui_runtime::ftui_println!("Reasoning");
+    ftui_runtime::ftui_println!("  expected loss: {:.3}", report.reasoning.expected_loss);
+    if let Some(runner_up_action) = &report.reasoning.runner_up_action {
+        if let Some(runner_up_loss) = report.reasoning.runner_up_loss {
+            ftui_runtime::ftui_println!(
+                "  runner-up: {} ({:.3})",
+                runner_up_action,
+                runner_up_loss
+            );
+        } else {
+            ftui_runtime::ftui_println!("  runner-up: {runner_up_action}");
+        }
+    }
+    if let Some(loss_gap) = report.reasoning.loss_gap {
+        ftui_runtime::ftui_println!("  loss gap: {:.3}", loss_gap);
+    }
+    if let Some(top_state) = &report.reasoning.top_posterior_state {
+        let probability = report.reasoning.top_posterior_probability.unwrap_or(0.0);
+        ftui_runtime::ftui_println!("  top posterior: {top_state}={probability:.3}");
+    }
+    ftui_runtime::ftui_println!(
+        "  calibration healthy: {}",
+        report.reasoning.calibration_healthy
+    );
+    ftui_runtime::ftui_println!("  safe mode active: {}", report.reasoning.safe_mode_active);
+    ftui_runtime::ftui_println!("  evidence: {}", report.reasoning.evidence_summary);
+
+    ftui_runtime::ftui_println!();
+    ftui_runtime::ftui_println!("Experience ledger");
+    for entry in &report.ledger {
+        ftui_runtime::ftui_println!(
+            "  exp {} eff {} state={} action={} kind={} created={}",
+            entry.experience_id,
+            entry.effect_id,
+            entry.state,
+            entry.action,
+            entry.effect_kind,
+            entry.created_at
+        );
+        if let Some(resolved_at) = &entry.resolved_at {
+            ftui_runtime::ftui_println!("    resolved_at: {resolved_at}");
+        }
+        if let Some(outcome_label) = &entry.outcome_label {
+            ftui_runtime::ftui_println!("    outcome: {outcome_label}");
+        }
+        if let Some(correct) = entry.outcome_correct {
+            ftui_runtime::ftui_println!("    correct: {correct}");
+        }
+        if let Some(actual_loss) = entry.actual_loss {
+            ftui_runtime::ftui_println!("    actual_loss: {actual_loss:.3}");
+        }
+        if let Some(regret) = entry.regret {
+            ftui_runtime::ftui_println!("    regret: {regret:.3}");
+        }
+    }
+}
+
 fn handle_atc(action: AtcCommand) -> CliResult<()> {
     match action {
+        AtcCommand::Explain { decision_id, json } => {
+            let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+            let config = Config::from_env();
+            let conn = open_db_sync_with_database_url_and_storage_root_locked(
+                &cfg.database_url,
+                Some(&config.storage_root),
+            )?;
+            let rows = query_atc_decision_rows(&conn, decision_id)?;
+            if rows.is_empty() {
+                let payload = serde_json::json!({
+                    "decision_id": decision_id,
+                    "found": false,
+                    "error": format!("ATC decision not found: {decision_id}"),
+                });
+                output::json_or_table(json, &payload, || {
+                    ftui_runtime::ftui_println!("ATC decision not found: {decision_id}");
+                });
+                return Err(CliError::ExitCode(1));
+            }
+
+            let report = build_atc_explain_report(decision_id, &rows)?;
+            output::json_or_table(json, &report, || render_atc_explain_report(&report));
+            Ok(())
+        }
         AtcCommand::ReprocessFeatures {
             project_key,
             subject,
@@ -22265,6 +22895,156 @@ mod tests {
             .unwrap_or(0)
     }
 
+    fn atc_explain_test_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn expect_db_outcome<T>(
+        outcome: asupersync::Outcome<T, mcp_agent_mail_db::DbError>,
+        context: &str,
+    ) -> T {
+        match outcome {
+            asupersync::Outcome::Ok(value) => value,
+            asupersync::Outcome::Err(error) => panic!("{context}: {error}"),
+            asupersync::Outcome::Cancelled(reason) => {
+                panic!("{context} cancelled: {reason:?}")
+            }
+            asupersync::Outcome::Panicked(payload) => std::panic::resume_unwind(Box::new(payload)),
+        }
+    }
+
+    fn atc_explain_test_pool(db_path: &Path, storage_root: &Path) -> mcp_agent_mail_db::DbPool {
+        mcp_agent_mail_db::DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(storage_root.to_path_buf()),
+            max_connections: 1,
+            min_connections: 1,
+            acquire_timeout_ms: 30_000,
+            max_lifetime_ms: 60_000,
+            run_migrations: true,
+            warmup_connections: 0,
+            cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
+        })
+        .expect("create ATC explain test pool")
+    }
+
+    fn seed_atc_explain_db(db_path: &Path, storage_root: &Path) {
+        let pool = atc_explain_test_pool(db_path, storage_root);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build ATC explain runtime");
+        let cx = asupersync::Cx::for_testing();
+        let created_ts_micros = 1_762_000_000_000_000i64;
+        let features = mcp_agent_mail_core::FeatureVector {
+            version: mcp_agent_mail_core::FEATURE_VERSION,
+            posterior_alive_bp: 7200,
+            posterior_flaky_bp: 1800,
+            silence_secs: 480,
+            observation_count: 42,
+            reservation_count: 1,
+            conflict_count: 0,
+            in_deadlock_cycle: false,
+            throughput_per_min: 12,
+            inbox_depth: 3,
+            expected_loss_bp: 50,
+            loss_gap_bp: 90,
+            calibration_healthy: true,
+            safe_mode_active: false,
+            tick_utilization_bp: 3300,
+            controller_mode: 0,
+            risk_tier: mcp_agent_mail_core::FeatureVector::risk_tier_for(
+                mcp_agent_mail_core::EffectKind::Probe,
+            ),
+        };
+        let row = mcp_agent_mail_core::ExperienceRow {
+            experience_id: 0,
+            decision_id: 77,
+            effect_id: 177,
+            trace_id: "trc-atc-explain-77".to_string(),
+            claim_id: "clm-atc-explain-77".to_string(),
+            evidence_id: "evi-atc-explain-77".to_string(),
+            state: mcp_agent_mail_core::ExperienceState::Resolved,
+            subsystem: mcp_agent_mail_core::ExperienceSubsystem::Liveness,
+            decision_class: "probe_schedule".to_string(),
+            subject: "BlueLake".to_string(),
+            project_key: Some("/tmp/atc-explain".to_string()),
+            policy_id: Some("liveness-incumbent-r7".to_string()),
+            effect_kind: mcp_agent_mail_core::EffectKind::Probe,
+            action: "ProbeAgent".to_string(),
+            posterior: vec![
+                ("Alive".to_string(), 0.72),
+                ("Flaky".to_string(), 0.18),
+                ("Dead".to_string(), 0.10),
+            ],
+            expected_loss: 0.5,
+            runner_up_action: Some("NoAction".to_string()),
+            runner_up_loss: Some(1.4),
+            evidence_summary:
+                "BlueLake exceeded the silence threshold; probing was cheaper than inaction."
+                    .to_string(),
+            calibration_healthy: true,
+            safe_mode_active: false,
+            non_execution_reason: None,
+            outcome: Some(mcp_agent_mail_core::ExperienceOutcome {
+                observed_ts_micros: created_ts_micros + 30_000,
+                label: "agent_replied".to_string(),
+                correct: true,
+                actual_loss: Some(0.0),
+                regret: Some(0.0),
+                evidence: Some(serde_json::json!({
+                    "message_id": 44,
+                    "round_trip_ms": 1800,
+                })),
+            }),
+            created_ts_micros,
+            dispatched_ts_micros: Some(created_ts_micros + 1_000),
+            executed_ts_micros: Some(created_ts_micros + 2_000),
+            resolved_ts_micros: Some(created_ts_micros + 30_000),
+            features: Some(features),
+            feature_ext: Some(
+                mcp_agent_mail_core::FeatureExtension::empty().with_field("message_id", 44),
+            ),
+            context: Some(serde_json::json!({
+                "message_id": 44,
+                "controller_mode": "nominal",
+                "decision_note": "operator requested a probe",
+            })),
+        };
+
+        let _inserted_id = expect_db_outcome(
+            runtime.block_on(mcp_agent_mail_db::queries::insert_experience(
+                &cx, &pool, row,
+            )),
+            "insert ATC explain seed row",
+        );
+    }
+
+    fn run_atc_cmd_with_env_capture(
+        action: AtcCommand,
+        database_url: &str,
+        storage_root: &str,
+    ) -> (CliResult<()>, String) {
+        use ftui_runtime::stdio_capture::StdioCapture;
+
+        let _lock = atc_explain_test_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let _capture_lock = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let capture = StdioCapture::install().expect("install capture");
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url),
+                ("STORAGE_ROOT", storage_root),
+            ],
+            move || handle_atc(action),
+        );
+        let stdout = capture.drain_to_string();
+        (result, stdout)
+    }
+
     /// Extract the first JSON object that looks like doctor-check output.
     fn extract_doctor_check_json(s: &str) -> Option<serde_json::Value> {
         let mut cursor = s;
@@ -23637,6 +24417,7 @@ http_headers = { Authorization = "Bearer secret" }
                     assert!(!dry_run);
                     assert!(!json);
                 }
+                other => panic!("unexpected atc action: {other:?}"),
             },
             other => panic!("unexpected command: {other:?}"),
         }
@@ -23673,6 +24454,23 @@ http_headers = { Authorization = "Bearer secret" }
                     assert!(dry_run);
                     assert!(json);
                 }
+                other => panic!("unexpected atc action: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clap_parses_atc_explain_json() {
+        let cli = Cli::try_parse_from(["am", "atc", "explain", "77", "--json"])
+            .expect("failed to parse atc explain");
+        match cli.command.expect("expected command") {
+            Commands::Atc { action } => match action {
+                AtcCommand::Explain { decision_id, json } => {
+                    assert_eq!(decision_id, 77);
+                    assert!(json);
+                }
+                other => panic!("unexpected atc action: {other:?}"),
             },
             other => panic!("unexpected command: {other:?}"),
         }
@@ -23686,6 +24484,81 @@ http_headers = { Authorization = "Bearer secret" }
         assert!(
             message.contains("at least 1"),
             "unexpected clap error for zero limit: {message}"
+        );
+    }
+
+    #[test]
+    fn handle_atc_explain_json_outputs_transparency_card() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("atc-explain.sqlite3");
+        let storage_root = temp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        seed_atc_explain_db(&db_path, &storage_root);
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        let (result, output) = run_atc_cmd_with_env_capture(
+            AtcCommand::Explain {
+                decision_id: 77,
+                json: true,
+            },
+            &database_url,
+            &storage_root_text,
+        );
+
+        assert!(result.is_ok(), "atc explain should succeed: {result:?}");
+        let json_str = extract_json_block(&output).expect("expected JSON output");
+        let parsed: serde_json::Value = serde_json::from_str(json_str).expect("valid explain JSON");
+        assert_eq!(parsed["decision_id"], 77);
+        assert_eq!(parsed["latest_experience_id"], 1);
+        assert_eq!(parsed["effect_count"], 1);
+        assert_eq!(parsed["inputs"]["subject"], "BlueLake");
+        assert_eq!(parsed["inputs"]["decision_class"], "probe_schedule");
+        assert_eq!(parsed["policy"]["policy_id"], "liveness-incumbent-r7");
+        assert_eq!(parsed["policy"]["primary_method_id"], "atc.liveness.probes");
+        assert_eq!(
+            parsed["policy"]["supporting_method"]["method_id"],
+            "atc.core.expected_loss"
+        );
+        assert_eq!(parsed["reasoning"]["selected_action"], "ProbeAgent");
+        assert_eq!(parsed["ledger"][0]["state"], "resolved");
+        assert_eq!(parsed["ledger"][0]["outcome_label"], "agent_replied");
+        assert_eq!(
+            parsed["inputs"]["feature_schema_version"],
+            serde_json::json!(mcp_agent_mail_core::FEATURE_SCHEMA_VERSION)
+        );
+        assert_eq!(
+            parsed["inputs"]["features"]["posterior_alive_bp"],
+            serde_json::json!(7200)
+        );
+    }
+
+    #[test]
+    fn handle_atc_explain_missing_decision_exits_one() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("atc-explain-empty.sqlite3");
+        let storage_root = temp.path().join("storage");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        seed_atc_explain_db(&db_path, &storage_root);
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        let (result, output) = run_atc_cmd_with_env_capture(
+            AtcCommand::Explain {
+                decision_id: 999,
+                json: false,
+            },
+            &database_url,
+            &storage_root_text,
+        );
+
+        assert!(
+            matches!(result, Err(CliError::ExitCode(1))),
+            "missing decision should exit 1: {result:?}"
+        );
+        assert!(
+            output.contains("ATC decision not found: 999"),
+            "unexpected not-found output:\n{output}"
         );
     }
 
@@ -47998,6 +48871,16 @@ fn resolve_agent_id_for_inbox_check(
 fn parse_positive_usize_arg(value: &str) -> Result<usize, String> {
     let parsed = value
         .parse::<usize>()
+        .map_err(|error| format!("invalid positive integer '{value}': {error}"))?;
+    if parsed == 0 {
+        return Err("value must be at least 1".to_string());
+    }
+    Ok(parsed)
+}
+
+fn parse_positive_u64_arg(value: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
         .map_err(|error| format!("invalid positive integer '{value}': {error}"))?;
     if parsed == 0 {
         return Err("value must be at least 1".to_string());
