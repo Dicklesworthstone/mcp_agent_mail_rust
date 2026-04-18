@@ -145,6 +145,36 @@ The generator should:
 - Call each tool and resource endpoint.
 - Record JSON output for parity comparisons.
 
+## Automated Refresh Pipeline
+
+For upstream drift checks against the live Python reference repo, use the repo-level wrapper:
+
+```bash
+bash scripts/regen_python_parity_fixtures.sh --dry-run
+```
+
+Real run, keeping outputs in temp files:
+
+```bash
+bash scripts/regen_python_parity_fixtures.sh
+```
+
+Apply the refreshed fixture set into the tracked paths:
+
+```bash
+bash scripts/regen_python_parity_fixtures.sh --apply
+```
+
+What the wrapper does:
+- clones or refreshes `https://github.com/Dicklesworthstone/mcp_agent_mail`
+- builds an isolated venv and installs the upstream Python package
+- runs `python_reference/generate_fixtures.py` against that upstream checkout
+- emits a reduced `scenario_catalog.json` manifest alongside a markdown drift report
+- only copies the tracked files when the fixture/catalog payload actually changed
+
+The scheduled GitHub Actions lane lives at `.github/workflows/conformance-fixture-regen.yml`.
+It runs weekly and opens a review PR when drift is detected; it does not auto-merge.
+
 ## Running Conformance Tests
 
 ```

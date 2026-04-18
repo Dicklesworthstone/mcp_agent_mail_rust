@@ -7,10 +7,12 @@ This crate keeps the live Rust router honest against the legacy Python reference
 ## What lives here
 
 - Behavior parity fixtures in `tests/conformance/fixtures/python_reference.json`
+- Regeneration artifacts in `tests/conformance/fixtures/scenario_catalog.json` and `tests/conformance/fixtures/python_reference_regen_report.md`
 - Rust-native golden fixtures in `tests/conformance/fixtures/rust_native/`
 - Tool description parity against `../../tests/conformance/fixtures/tool_descriptions.json`
 - Resource description drift guards for shared resource templates
 - Focused regression checks for tool filtering, error envelopes, and outage behavior
+- Automation entrypoints in `../../scripts/regen_python_parity_fixtures.sh` and `.github/workflows/conformance-fixture-regen.yml`
 
 ## Current coverage (as of 2026-04-18)
 
@@ -21,7 +23,8 @@ This crate keeps the live Rust router honest against the legacy Python reference
 - The live Rust router exposes 25 logical resource templates after collapsing `?{query}` variants.
 - 23 resource templates have Python behavior fixtures.
 - 2 Rust-only resources, `resource://tooling/metrics_core` and `resource://tooling/diagnostics`, are unit-tested in `mcp-agent-mail-tools` but still lack conformance fixtures. They are tracked by `br-a2k3h.4` and `br-a2k3h.6`.
-- The next conformance follow-ups are resource parity coverage (`br-a2k3h.4`) and a CI drift guard for new fixtures (`br-a2k3h.6`).
+- Resource parity coverage remains tracked by `br-a2k3h.4` and `br-a2k3h.6`.
+- Python-parity fixture refresh now has a dedicated weekly automation lane via `scripts/regen_python_parity_fixtures.sh` and `.github/workflows/conformance-fixture-regen.yml`.
 
 ## Tool Classification
 
