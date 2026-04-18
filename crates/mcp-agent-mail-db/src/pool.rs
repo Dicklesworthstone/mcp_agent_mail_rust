@@ -2983,10 +2983,10 @@ async fn run_sqlite_init_once(
 
         drop(mig_conn);
 
-        // Apply the small set of canonical-only runtime follow-up migrations.
-        // This completes schema requirements such as recipients_json and the
-        // case-insensitive agent index without replaying the full historical
-        // FTS create/drop chain on fresh runtime databases.
+        // Apply canonical-only follow-up migrations after the base
+        // FrankenConnection-safe schema has landed. This owns the remaining
+        // runtime-only schema family, including ATC tables and indexes that
+        // file-backed runtimes already access through canonical SQLite.
         let canonical_conn = match open_sqlite_file_with_lock_retry_canonical(sqlite_path) {
             Ok(conn) => conn,
             Err(err) => {
@@ -3002,18 +3002,29 @@ async fn run_sqlite_init_once(
             )));
         }
 
-        match schema::migrate_runtime_canonical_followup(cx, &canonical_conn).await {
-            Outcome::Ok(_) => {}
-            Outcome::Err(err) => {
-                return Outcome::Err(SqlError::Custom(format!(
-                    "sqlite init stage=migrate_runtime_canonical_followup failed: {err}"
-                )));
-            }
-            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-        }
+        let followup_applied =
+            match schema::migrate_runtime_canonical_followup(cx, &canonical_conn).await {
+                Outcome::Ok(applied) => applied,
+                Outcome::Err(err) => {
+                    return Outcome::Err(SqlError::Custom(format!(
+                        "sqlite init stage=migrate_runtime_canonical_followup failed: {err}"
+                    )));
+                }
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+            };
 
         drop(canonical_conn);
+
+        if followup_applied
+            .iter()
+            .any(|id| schema::is_atc_runtime_canonical_migration(id))
+            && let Err(err) = compact_sqlite_path(Path::new(sqlite_path))
+        {
+            return Outcome::Err(SqlError::Custom(format!(
+                "sqlite init stage=compact_after_atc_followup failed: {err}"
+            )));
+        }
     }
 
     let runtime_conn = crate::guard_db_conn(
@@ -3774,7 +3785,8 @@ fn sqlite_pragma_check_details(
 #[allow(clippy::result_large_err)]
 fn sqlite_pragma_check_is_ok(conn: &DbConn, kind: integrity::CheckKind) -> Result<bool, SqlError> {
     let details = sqlite_pragma_check_details(conn, kind)?;
-    Ok(integrity::details_indicate_ok(&details) || integrity::integrity_details_are_suspect(&details))
+    Ok(integrity::details_indicate_ok(&details)
+        || integrity::integrity_details_are_suspect(&details))
 }
 
 #[allow(clippy::result_large_err)]
@@ -3802,7 +3814,8 @@ fn sqlite_pragma_check_is_ok_canonical(
     kind: integrity::CheckKind,
 ) -> Result<bool, SqlError> {
     let details = sqlite_pragma_check_details_canonical(conn, kind)?;
-    Ok(integrity::details_indicate_ok(&details) || integrity::integrity_details_are_suspect(&details))
+    Ok(integrity::details_indicate_ok(&details)
+        || integrity::integrity_details_are_suspect(&details))
 }
 
 #[allow(clippy::result_large_err)]
@@ -4355,6 +4368,21 @@ pub fn wal_checkpoint_truncate_path(db_path: &Path) -> DbResult<u64> {
         .query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
         .map_err(|e| DbError::Sqlite(format!("checkpoint: {e}")))?;
     parse_wal_checkpoint_rows(&rows, "checkpoint", true)
+}
+
+fn compact_sqlite_path(db_path: &Path) -> DbResult<()> {
+    if db_path.as_os_str() == ":memory:" {
+        return Ok(());
+    }
+    wal_checkpoint_truncate_path(db_path)?;
+    let path_str = db_path.to_string_lossy();
+    let conn = open_sqlite_file_with_lock_retry_canonical(path_str.as_ref())
+        .map_err(|e| DbError::Sqlite(format!("compact: open failed: {e}")))?;
+    conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL)
+        .map_err(|e| DbError::Sqlite(format!("compact: init pragmas failed: {e}")))?;
+    conn.execute_raw("VACUUM")
+        .map_err(|e| DbError::Sqlite(format!("compact: vacuum failed: {e}")))?;
+    Ok(())
 }
 
 fn is_real_directory(path: &Path) -> bool {

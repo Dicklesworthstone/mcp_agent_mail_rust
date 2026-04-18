@@ -183,6 +183,9 @@ pub mod search_vector_index;
 pub mod timestamps;
 pub mod tracking;
 
+pub use atc_queries::{
+    ExpiredExperienceCandidate, OpenExperienceFilter, OpenExperienceSummary, RollupEntry,
+};
 pub use cache::{CacheEntryCounts, CacheMetrics, CacheMetricsSnapshot, cache_metrics, read_cache};
 pub use coalesce::{CoalesceMap, CoalesceMetrics, CoalesceOutcome};
 pub use error::{DbError, DbResult, is_corruption_error, is_lock_error, is_pool_exhausted_error};
@@ -264,7 +267,6 @@ pub use pool::{
     resolve_mailbox_sqlite_path,
     sqlite_primary_read_path_is_healthy,
 };
-pub use atc_queries::{OpenExperienceFilter, OpenExperienceSummary, RollupEntry};
 pub use queries::{LeaseOutcome, MvccRetryMetrics, RollupSnapshot, mvcc_retry_metrics};
 pub use reconstruct::{
     ArchiveDriftReport, ArchiveDriftReportSchema, ArchiveMessageInventory, MailboxProjectIdentity,

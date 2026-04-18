@@ -10280,6 +10280,92 @@ pub async fn insert_system_agent(
 /// This path is idempotent across repeated signals for the same
 /// `(decision_id, effect_id)` pair. The first insert wins and subsequent
 /// appends re-select the existing row without mutation.
+fn validate_experience_row_for_insert(row: &ExperienceRow) -> std::result::Result<(), DbError> {
+    let issues = row.validate();
+    if issues.is_empty() {
+        return Ok(());
+    }
+    Err(DbError::invalid("experience_row", issues.join("; ")))
+}
+
+fn experience_feature_vector_size(row: &ExperienceRow) -> usize {
+    row.features
+        .as_ref()
+        .map_or(0, |_| std::mem::size_of::<FeatureVector>())
+        .saturating_add(
+            row.feature_ext
+                .as_ref()
+                .map_or(0, FeatureExtension::estimated_size),
+        )
+}
+
+/// Insert a validated ATC experience row and return the assigned durable ID.
+///
+/// This is the write-facing append API for ATC experience records. The insert
+/// is lifecycle-validated before it reaches SQLite, and repeated inserts for
+/// the same `(decision_id, effect_id)` pair return the originally assigned
+/// durable `experience_id`.
+pub async fn insert_experience(
+    cx: &Cx,
+    pool: &DbPool,
+    row: ExperienceRow,
+) -> Outcome<u64, DbError> {
+    let requested_experience_id = row.experience_id;
+    let state = row.state;
+    let subsystem = row.subsystem;
+    let effect_kind = row.effect_kind;
+    let feature_vector_size = experience_feature_vector_size(&row);
+    let project_key = row.project_key.clone().unwrap_or_default();
+
+    if let Err(error) = validate_experience_row_for_insert(&row) {
+        tracing::warn!(
+            requested_experience_id,
+            state = %state,
+            subsystem = %subsystem,
+            effect_kind = %effect_kind,
+            feature_vector_size,
+            project_key,
+            error = %error,
+            "atc.db.insert_experience rejected invalid row"
+        );
+        return Outcome::Err(error);
+    }
+
+    let started = std::time::Instant::now();
+    match append_atc_experience(cx, pool, &row).await {
+        Outcome::Ok(stored) => {
+            tracing::debug!(
+                experience_id = stored.experience_id,
+                requested_experience_id,
+                state = %state,
+                subsystem = %subsystem,
+                effect_kind = %effect_kind,
+                feature_vector_size,
+                project_key = stored.project_key.as_deref().unwrap_or(""),
+                insert_latency_micros = started.elapsed().as_micros(),
+                duration_micros = ?stored.resolution_latency_micros(),
+                "atc.db.insert_experience"
+            );
+            Outcome::Ok(stored.experience_id)
+        }
+        Outcome::Err(error) => {
+            tracing::warn!(
+                requested_experience_id,
+                state = %state,
+                subsystem = %subsystem,
+                effect_kind = %effect_kind,
+                feature_vector_size,
+                project_key,
+                error = %error,
+                "atc.db.insert_experience failed"
+            );
+            Outcome::Err(error)
+        }
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
 pub async fn append_atc_experience(
     cx: &Cx,
     pool: &DbPool,
@@ -11938,7 +12024,10 @@ pub async fn restore_atc_rollups(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mcp_agent_mail_core::{EffectKind, ExperienceState, ExperienceSubsystem};
+    use mcp_agent_mail_core::{
+        EffectKind, ExperienceOutcome, ExperienceState, ExperienceSubsystem, FeatureExtension,
+        FeatureVector, NonExecutionReason,
+    };
 
     async fn set_agent_last_active_for_test(cx: &Cx, pool: &DbPool, agent_id: i64, ts: i64) {
         let conn = acquire_conn(cx, pool)
@@ -12258,6 +12347,116 @@ mod tests {
         (cx, pool, dir)
     }
 
+    fn make_insert_experience_test_row(
+        decision_id: u64,
+        effect_id: u64,
+        state: ExperienceState,
+        created_ts_micros: i64,
+    ) -> ExperienceRow {
+        let mut row = ExperienceRow {
+            experience_id: 0,
+            decision_id,
+            effect_id,
+            trace_id: format!("trc-insert-{decision_id}-{effect_id}"),
+            claim_id: format!("clm-insert-{decision_id}-{effect_id}"),
+            evidence_id: format!("evi-insert-{decision_id}-{effect_id}"),
+            state,
+            subsystem: ExperienceSubsystem::Liveness,
+            decision_class: "liveness_transition".to_string(),
+            subject: format!("agent-{decision_id}-{effect_id}"),
+            project_key: Some("/tmp/insert-atc-experience".to_string()),
+            policy_id: Some("liveness-incumbent-r1".to_string()),
+            effect_kind: EffectKind::Probe,
+            action: "ProbeAgent".to_string(),
+            posterior: vec![
+                ("Alive".to_string(), 0.40),
+                ("Flaky".to_string(), 0.35),
+                ("Dead".to_string(), 0.25),
+            ],
+            expected_loss: 1.1,
+            runner_up_action: Some("DeferProbe".to_string()),
+            runner_up_loss: Some(1.8),
+            evidence_summary: "insert API regression row".to_string(),
+            calibration_healthy: true,
+            safe_mode_active: false,
+            non_execution_reason: None,
+            outcome: None,
+            created_ts_micros,
+            dispatched_ts_micros: None,
+            executed_ts_micros: None,
+            resolved_ts_micros: None,
+            features: Some(FeatureVector {
+                posterior_alive_bp: 4000,
+                posterior_flaky_bp: 3500,
+                expected_loss_bp: 110,
+                loss_gap_bp: 70,
+                risk_tier: FeatureVector::risk_tier_for(EffectKind::Probe),
+                ..FeatureVector::zeroed()
+            }),
+            feature_ext: Some(
+                FeatureExtension::empty()
+                    .with_field(
+                        "decision_id",
+                        i64::try_from(decision_id).expect("decision_id"),
+                    )
+                    .with_field("effect_id", i64::try_from(effect_id).expect("effect_id")),
+            ),
+            context: Some(serde_json::json!({
+                "source": "insert_experience_test",
+                "decision_id": decision_id,
+                "effect_id": effect_id,
+            })),
+        };
+
+        match state {
+            ExperienceState::Planned => {}
+            ExperienceState::Dispatched => {
+                row.dispatched_ts_micros = Some(created_ts_micros.saturating_add(1_000));
+            }
+            ExperienceState::Executed | ExperienceState::Open => {
+                row.dispatched_ts_micros = Some(created_ts_micros.saturating_add(1_000));
+                row.executed_ts_micros = Some(created_ts_micros.saturating_add(2_000));
+            }
+            ExperienceState::Failed => {
+                row.dispatched_ts_micros = Some(created_ts_micros.saturating_add(1_000));
+                row.executed_ts_micros = Some(created_ts_micros.saturating_add(2_000));
+            }
+            ExperienceState::Throttled | ExperienceState::Suppressed | ExperienceState::Skipped => {
+                row.dispatched_ts_micros = Some(created_ts_micros.saturating_add(1_000));
+                row.executed_ts_micros = Some(created_ts_micros.saturating_add(2_000));
+                row.non_execution_reason = Some(NonExecutionReason::CalibrationFallback {
+                    reason: "insert_experience_test".to_string(),
+                });
+            }
+            ExperienceState::Resolved => {
+                let resolved_ts_micros = created_ts_micros.saturating_add(4_000);
+                row.dispatched_ts_micros = Some(created_ts_micros.saturating_add(1_000));
+                row.executed_ts_micros = Some(created_ts_micros.saturating_add(2_000));
+                row.resolved_ts_micros = Some(resolved_ts_micros);
+                row.outcome = Some(ExperienceOutcome {
+                    observed_ts_micros: resolved_ts_micros,
+                    label: "resolved".to_string(),
+                    correct: true,
+                    actual_loss: Some(0.25),
+                    regret: Some(0.05),
+                    evidence: Some(serde_json::json!({"sealed": true})),
+                });
+            }
+            ExperienceState::Censored => {
+                row.dispatched_ts_micros = Some(created_ts_micros.saturating_add(1_000));
+                row.executed_ts_micros = Some(created_ts_micros.saturating_add(2_000));
+                row.resolved_ts_micros = Some(created_ts_micros.saturating_add(5_000));
+            }
+            ExperienceState::Expired => {
+                row.dispatched_ts_micros = Some(created_ts_micros.saturating_add(1_000));
+                row.executed_ts_micros = Some(created_ts_micros.saturating_add(2_000));
+                row.resolved_ts_micros = Some(created_ts_micros.saturating_add(6_000));
+            }
+        }
+
+        row
+    }
+
     #[test]
     fn append_atc_experience_is_idempotent_by_decision_and_effect() {
         use asupersync::runtime::RuntimeBuilder;
@@ -12355,6 +12554,195 @@ mod tests {
 
             assert_eq!(rows.first().and_then(row_first_i64), Some(1));
         });
+    }
+
+    #[test]
+    fn insert_experience_returns_assigned_id_and_round_trips_terminal_row() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("insert_experience_roundtrip.db");
+
+        rt.block_on(async {
+            let row = make_insert_experience_test_row(
+                501,
+                601,
+                ExperienceState::Resolved,
+                1_700_000_100_000_000,
+            );
+            let mut expected = row.clone();
+            let experience_id = insert_experience(&cx, &pool, row)
+                .await
+                .into_result()
+                .expect("insert experience");
+            assert!(experience_id > 0, "insert must return assigned durable id");
+
+            let stored = fetch_durable_atc_experience_by_id(
+                &cx,
+                &pool,
+                i64::try_from(experience_id).expect("experience_id fits i64"),
+            )
+            .await
+            .into_result()
+            .expect("fetch stored experience")
+            .expect("stored row");
+            expected.experience_id = experience_id;
+
+            assert_eq!(stored, expected);
+            assert_eq!(stored.resolution_latency_micros(), Some(4_000));
+        });
+    }
+
+    #[test]
+    fn insert_experience_rejects_invalid_rows_without_persisting() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("insert_experience_invalid.db");
+
+        rt.block_on(async {
+            let mut row = make_insert_experience_test_row(
+                777,
+                888,
+                ExperienceState::Resolved,
+                1_700_000_200_000_000,
+            );
+            row.outcome = None;
+            row.resolved_ts_micros = None;
+
+            let error = insert_experience(&cx, &pool, row)
+                .await
+                .into_result()
+                .expect_err("invalid row should be rejected");
+            assert!(matches!(
+                error,
+                asupersync::OutcomeError::Err(DbError::InvalidArgument {
+                    field: "experience_row",
+                    ..
+                })
+            ));
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire verify conn");
+            let tracked = tracked(&*conn);
+            let rows = map_sql_outcome(
+                traw_query(
+                    &cx,
+                    &tracked,
+                    "SELECT COUNT(*) FROM atc_experiences WHERE decision_id = ? AND effect_id = ?",
+                    &[Value::BigInt(777), Value::BigInt(888)],
+                )
+                .await,
+            )
+            .into_result()
+            .expect("count experiences after rejected insert");
+            assert_eq!(rows.first().and_then(row_first_i64), Some(0));
+        });
+    }
+
+    #[test]
+    fn insert_experience_is_idempotent_and_returns_same_assigned_id() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("insert_experience_idempotent.db");
+
+        rt.block_on(async {
+            let row = make_insert_experience_test_row(
+                901,
+                902,
+                ExperienceState::Planned,
+                1_700_000_300_000_000,
+            );
+
+            let first = insert_experience(&cx, &pool, row.clone())
+                .await
+                .into_result()
+                .expect("first insert");
+            let second = insert_experience(&cx, &pool, row)
+                .await
+                .into_result()
+                .expect("second insert");
+
+            assert_eq!(first, second, "duplicate insert must return the same id");
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire verify conn");
+            let tracked = tracked(&*conn);
+            let rows = map_sql_outcome(
+                traw_query(
+                    &cx,
+                    &tracked,
+                    "SELECT COUNT(*) FROM atc_experiences WHERE decision_id = ? AND effect_id = ?",
+                    &[Value::BigInt(901), Value::BigInt(902)],
+                )
+                .await,
+            )
+            .into_result()
+            .expect("count duplicate inserts");
+            assert_eq!(rows.first().and_then(row_first_i64), Some(1));
+        });
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(12))]
+        #[test]
+        fn insert_experience_roundtrip_property(
+            decision_id in 10_000_u64..10_512_u64,
+            effect_id in 20_000_u64..20_512_u64,
+            created_ts_micros in -500_000_i64..500_000_i64,
+            state_tag in 0_u8..5_u8,
+        ) {
+            use asupersync::runtime::RuntimeBuilder;
+            use proptest::prelude::*;
+
+            let state = match state_tag {
+                0 => ExperienceState::Planned,
+                1 => ExperienceState::Open,
+                2 => ExperienceState::Resolved,
+                3 => ExperienceState::Censored,
+                _ => ExperienceState::Expired,
+            };
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build runtime");
+            let db_name = format!("insert_experience_property_{decision_id}_{effect_id}_{state_tag}.db");
+            let (cx, pool, _dir) = setup_test_pool(&db_name);
+            let row = make_insert_experience_test_row(decision_id, effect_id, state, created_ts_micros);
+            let expected_latency = row.resolution_latency_micros();
+            let mut expected = row.clone();
+
+            let stored = rt.block_on(async {
+                let experience_id = insert_experience(&cx, &pool, row)
+                    .await
+                    .into_result()
+                    .expect("insert experience");
+                fetch_durable_atc_experience_by_id(
+                    &cx,
+                    &pool,
+                    i64::try_from(experience_id).expect("experience_id fits i64"),
+                )
+                .await
+                .into_result()
+                .expect("fetch stored experience")
+                .expect("stored row")
+            });
+            expected.experience_id = stored.experience_id;
+
+            let stored_latency = stored.resolution_latency_micros();
+            prop_assert_eq!(stored, expected);
+            prop_assert_eq!(stored_latency, expected_latency);
+        }
     }
 
     #[test]
@@ -13235,6 +13623,32 @@ mod tests {
                 .expect("inspect canonical ATC schema")
                 .is_empty(),
             "ATC init should converge the partial schema to the full required surface"
+        );
+
+        let verify_conn = crate::CanonicalDbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open canonical sqlite verification connection");
+        verify_conn
+            .execute_raw(crate::schema::PRAGMA_CONN_SETTINGS_SQL)
+            .expect("apply canonical verification pragmas");
+        let rows = verify_conn
+            .query_sync("PRAGMA quick_check", &[])
+            .expect("run canonical quick_check after ATC init");
+        let detail = rows
+            .first()
+            .and_then(|row| row.get_named::<String>("quick_check").ok())
+            .or_else(|| {
+                rows.first().and_then(|row| {
+                    row.get(0).and_then(|value| match value {
+                        Value::Text(text) => Some(text.clone()),
+                        _ => None,
+                    })
+                })
+            })
+            .expect("quick_check detail after ATC init");
+        close_canonical_db_conn(verify_conn, "ATC init verification connection");
+        assert_eq!(
+            detail, "ok",
+            "ATC init should leave a canonical sqlite file"
         );
     }
 

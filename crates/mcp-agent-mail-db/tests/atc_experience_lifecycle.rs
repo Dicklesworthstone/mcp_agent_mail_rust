@@ -22,8 +22,8 @@ use mcp_agent_mail_core::experience::{
     FeatureVector, NonExecutionReason, ResolutionKind,
 };
 use mcp_agent_mail_db::queries::{
-    append_atc_experience, fetch_open_atc_experiences, resolve_atc_experience,
-    resolve_experience, transition_atc_experience, update_atc_experience_rollup,
+    append_atc_experience, fetch_open_atc_experiences, resolve_atc_experience, resolve_experience,
+    transition_atc_experience, update_atc_experience_rollup,
 };
 use mcp_agent_mail_db::{DbConn, DbPool, DbPoolConfig, create_pool};
 
@@ -514,7 +514,11 @@ fn resolve_experience_resolved_happy_path() {
             .await
             .into_result()
             .expect("fetch open");
-        assert_eq!(open.len(), 0, "resolved experience must not appear in open list");
+        assert_eq!(
+            open.len(),
+            0,
+            "resolved experience must not appear in open list"
+        );
     });
 }
 
@@ -600,7 +604,9 @@ fn resolve_experience_idempotent_censored() {
     let eid = advance_to_open(&rt, &cx, &pool, 2400, 2401, "Agent_IC");
 
     rt.block_on(async {
-        let kind = ResolutionKind::Censored { ts_micros: 1_700_000_001_000_000 };
+        let kind = ResolutionKind::Censored {
+            ts_micros: 1_700_000_001_000_000,
+        };
         resolve_experience(&cx, &pool, eid, &kind)
             .await
             .into_result()

@@ -8,8 +8,7 @@
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use mcp_agent_mail_db::queries::{
-    LeaseOutcome, release_atc_leader_lease, renew_atc_leader_lease,
-    try_acquire_atc_leader_lease,
+    LeaseOutcome, release_atc_leader_lease, renew_atc_leader_lease, try_acquire_atc_leader_lease,
 };
 use mcp_agent_mail_db::{DbConn, DbPool, DbPoolConfig, create_pool};
 
@@ -233,9 +232,11 @@ fn release_is_noop_for_non_leader() {
 #[test]
 fn lease_outcome_is_leader_helper() {
     assert!(LeaseOutcome::Acquired.is_leader());
-    assert!(!LeaseOutcome::NotLeader {
-        holder: "x".into(),
-        expires_at_micros: 0,
-    }
-    .is_leader());
+    assert!(
+        !LeaseOutcome::NotLeader {
+            holder: "x".into(),
+            expires_at_micros: 0,
+        }
+        .is_leader()
+    );
 }

@@ -1799,7 +1799,32 @@ fn is_fts_migration(id: &str) -> bool {
 /// `ALTER TABLE ... ADD COLUMN` reparsing under the base engine even though the
 /// rest of the schema is readable and migratable.
 fn is_unsupported_by_franken(id: &str) -> bool {
-    is_fts_migration(id)
+    is_fts_migration(id) || is_runtime_canonical_followup_migration(id)
+}
+
+#[must_use]
+pub(crate) fn is_atc_runtime_canonical_migration(id: &str) -> bool {
+    matches!(
+        id,
+        "v16_create_atc_experiences"
+            | "v16a_atc_experiences_backfill_effect_id_from_pk"
+            | "v16_create_atc_experience_rollups"
+            | "v16_analyze_atc_experiences"
+            | "v17_idx_atc_experiences_decision_effect_unique"
+            | "v17_create_atc_leader_lease"
+            | "v17_create_atc_rollup_snapshots"
+            | "v17_idx_atc_rollup_snapshots_captured"
+            | "v21_atc_experiences_add_feature_schema_version"
+    ) || id.starts_with("v16a_atc_experiences_add_")
+        || id.starts_with("v16_idx_atc_experiences_")
+        || id.starts_with("v16b_atc_rollups_add_")
+        || id.starts_with("v17_atc_experiences_add_")
+        || id.starts_with("v18_rollup_")
+}
+
+#[must_use]
+fn is_runtime_canonical_followup_migration(id: &str) -> bool {
+    is_atc_runtime_canonical_migration(id)
         || matches!(
             id,
             "v1_create_trigger_messages_ai"
@@ -2010,16 +2035,7 @@ pub fn migration_runner_base() -> MigrationRunner {
 pub fn schema_migrations_runtime_canonical_followup() -> Vec<Migration> {
     schema_migrations()
         .into_iter()
-        .filter(|migration| {
-            matches!(
-                migration.id.as_str(),
-                "v10a_dedup_agents_case_insensitive"
-                    | "v10b_idx_agents_project_name_nocase"
-                    | "v15_add_recipients_json_to_messages"
-                    | "v15b_backfill_recipients_json"
-                    | "v15c_trg_messages_default_recipients_json"
-            )
-        })
+        .filter(|migration| is_runtime_canonical_followup_migration(migration.id.as_str()))
         .collect()
 }
 
@@ -3159,19 +3175,39 @@ mod tests {
         assert!(!ids.contains("v6_trg_inbox_stats_insert"));
         assert!(!ids.contains("v6_trg_inbox_stats_mark_read"));
         assert!(!ids.contains("v6_trg_inbox_stats_ack"));
-        // ADD COLUMN migrations are intentionally included in base mode — the
-        // migration runner handles "duplicate column" errors gracefully.  This
-        // ensures Python-imported databases (with older schemas) get the columns
-        // added instead of hitting "no such column" on dependent indexes.
-        assert!(ids.contains("v17_create_atc_leader_lease"));
-        assert!(ids.contains("v17_atc_experiences_add_contained_suspected_secret"));
-        assert!(ids.contains("v17_atc_experiences_add_privacy_classification"));
-        assert!(ids.contains("v17_create_atc_rollup_snapshots"));
-        assert!(ids.contains("v17_idx_atc_rollup_snapshots_captured"));
+        // ATC schema DDL/ALTERs are canonical-only for file-backed runtimes:
+        // ATC writes already bypass FrankenConnection after repeated
+        // corruption reports, so base mode must leave that schema family to the
+        // canonical follow-up runner.
+        assert!(!ids.contains("v16_create_atc_experiences"));
+        assert!(!ids.contains("v17_create_atc_leader_lease"));
+        assert!(!ids.contains("v17_atc_experiences_add_contained_suspected_secret"));
+        assert!(!ids.contains("v17_atc_experiences_add_privacy_classification"));
+        assert!(!ids.contains("v17_create_atc_rollup_snapshots"));
+        assert!(!ids.contains("v17_idx_atc_rollup_snapshots_captured"));
+        assert!(!ids.contains("v18_rollup_ewma_loss"));
+        assert!(!ids.contains("v21_atc_experiences_add_feature_schema_version"));
         assert!(ids.contains("v19_agents_reaper_exempt"));
         assert!(ids.contains("v20_agents_registration_token"));
         assert!(ids.contains("v20_idx_agents_registration_token"));
+    }
+
+    #[test]
+    fn runtime_canonical_followup_includes_atc_schema_family() {
+        use std::collections::HashSet;
+
+        let ids: HashSet<String> = schema_migrations_runtime_canonical_followup()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+
+        assert!(ids.contains("v10a_dedup_agents_case_insensitive"));
+        assert!(ids.contains("v15_add_recipients_json_to_messages"));
+        assert!(ids.contains("v16_create_atc_experiences"));
+        assert!(ids.contains("v17_create_atc_leader_lease"));
+        assert!(ids.contains("v18_rollup_ewma_loss"));
         assert!(ids.contains("v21_atc_experiences_add_feature_schema_version"));
+        assert!(!ids.contains("v19_agents_reaper_exempt"));
     }
 
     #[test]
