@@ -594,7 +594,7 @@ The interactive TUI has 16 screens. Jump directly with `1`-`9`, `0` (screen 10),
 | 5 | Search | Unified multi-scope search with facets and preview |
 | 6 | Reservations | File reservation status, conflicts, and create/release actions |
 | 7 | Tool Metrics | Per-tool call counts, latency distributions, and failures |
-| 8 | System Health | Probe/circuit/disk/memory diagnostics |
+| 8 | System Health | Probe/circuit/disk/memory diagnostics plus ATC health widget |
 | 9 | Timeline | Events/Commits/Combined timeline views with inspector |
 | 10 | Projects | Project inventory and routing helpers |
 | 11 | Contacts | Contact links, policy view, and graph/mermaid modes |
@@ -602,9 +602,10 @@ The interactive TUI has 16 screens. Jump directly with `1`-`9`, `0` (screen 10),
 | 13 | Analytics | Anomaly insight feed with confidence and deep links |
 | 14 | Attachments | Attachment inventory with preview and provenance |
 | 15 | Archive Browser | Two-pane Git archive browser with tree + file preview |
-| 16 | ATC | Air Traffic Controller decision engine status and transparency cards |
+| 16 | ATC | Snapshot-driven ATC control surface with decision drill-in and retention report |
 
 **Global keys:** `?` help, `Ctrl+P`/`:` command palette, `/` global search focus, `.` contextual action menu, `Ctrl+N` compose overlay, `Ctrl+Y` toast-focus mode, `Ctrl+T`/`Shift+T` cycle theme, `m` toggle MCP/API transport, `q` quit.
+**ATC keys:** `d` decision detail, `r` retention report, `i` toggle detail pane, `Tab` switch agents/decisions.
 
 **Screen-specific highlights:** Messages uses `g` for Local/Global inbox; Threads uses `e/c` for expand/collapse-all in conversation view; Timeline uses `V` for Events/Commits/Combined and `v` for visual selection; Search uses `f` + facet rail navigation for scope/sort/field controls; Contacts uses `n` for Table/Graph mode; batch-capable screens share `Space`/`v`/`A`/`C`; preset-enabled screens use `Ctrl+S`/`Ctrl+L`.
 

@@ -46,6 +46,7 @@ const IO_TIMEOUT: Duration = Duration::from_millis(250);
 const WORKER_SLEEP: Duration = Duration::from_millis(500);
 const MAX_READ_BYTES: usize = 8 * 1024;
 const SCREEN_DIAGNOSTIC_PREVIEW_LIMIT: usize = 3;
+const ATC_STALE_HEARTBEAT_SECS: i64 = 5 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Level {
@@ -139,6 +140,38 @@ fn screen_diag_level(diag: &ScreenDiagnosticSnapshot) -> Level {
 fn format_diag_timestamp_micros(timestamp_micros: i64) -> String {
     DateTime::<Utc>::from_timestamp_micros(timestamp_micros)
         .map_or_else(|| timestamp_micros.to_string(), |ts| ts.to_rfc3339())
+}
+
+fn atc_tick_age_secs(snapshot: &crate::AtcOperatorSnapshot) -> Option<i64> {
+    (snapshot.last_tick_micros > 0).then(|| {
+        (mcp_agent_mail_db::now_micros().saturating_sub(snapshot.last_tick_micros) / 1_000_000)
+            .max(0)
+    })
+}
+
+fn atc_tick_is_stale(snapshot: &crate::AtcOperatorSnapshot) -> bool {
+    atc_tick_age_secs(snapshot).is_some_and(|age| age >= ATC_STALE_HEARTBEAT_SECS)
+}
+
+fn atc_tick_p95_micros(snapshot: &crate::AtcOperatorSnapshot) -> u64 {
+    snapshot
+        .observability
+        .decision_latency_micros
+        .values()
+        .map(|histogram| histogram.p95)
+        .max()
+        .unwrap_or(snapshot.last_tick_duration_micros)
+}
+
+fn atc_retention_status(snapshot: &crate::AtcOperatorSnapshot) -> String {
+    if snapshot.observability.retention_rows_deleted_total > 0 {
+        format!(
+            "active (deleted={})",
+            snapshot.observability.retention_rows_deleted_total
+        )
+    } else {
+        "within-policy".to_string()
+    }
 }
 
 fn recent_system_health_diagnostics(
@@ -533,12 +566,32 @@ impl SystemHealthScreen {
                 value_style,
             ),
         ]));
+        let tick_age =
+            atc_tick_age_secs(&snap.atc).map_or_else(|| "--".to_string(), |age| format!("{age}s"));
+        lines.push(Line::from_spans([
+            Span::styled("Heartbeat: ", label_style),
+            Span::styled(
+                format!(
+                    "last_tick={}  age={}  stale={}",
+                    format_diag_timestamp_micros(snap.atc.last_tick_micros),
+                    tick_age,
+                    atc_tick_is_stale(&snap.atc)
+                ),
+                if atc_tick_is_stale(&snap.atc) {
+                    crate::tui_theme::text_warning(&tp)
+                } else {
+                    value_style
+                },
+            ),
+        ]));
         lines.push(Line::from_spans([
             Span::styled("Budget:    ", label_style),
             Span::styled(
                 format!(
-                    "{}us / {}us",
-                    snap.atc.last_tick_duration_micros, snap.atc.last_tick_budget_micros
+                    "{}us / {}us  p95≈{}us",
+                    snap.atc.last_tick_duration_micros,
+                    snap.atc.last_tick_budget_micros,
+                    atc_tick_p95_micros(&snap.atc)
                 ),
                 if snap.atc.last_tick_budget_exceeded {
                     crate::tui_theme::text_warning(&tp)
@@ -552,6 +605,21 @@ impl SystemHealthScreen {
                     snap.atc.safe_mode,
                     snap.atc.tracked_agents.len()
                 ),
+                hint_style,
+            ),
+        ]));
+        lines.push(Line::from_spans([
+            Span::styled("Rollup:    ", label_style),
+            Span::styled(
+                format!(
+                    "count={}  p95={}us",
+                    snap.atc.observability.rollup_refresh_latency_micros.count,
+                    snap.atc.observability.rollup_refresh_latency_micros.p95
+                ),
+                value_style,
+            ),
+            Span::styled(
+                format!("  retention={}", atc_retention_status(&snap.atc)),
                 hint_style,
             ),
         ]));
@@ -1119,9 +1187,32 @@ impl SystemHealthScreen {
             .sweep_duration_micros
             .get("resolution_window")
             .map_or(0, |hist| hist.p95);
+        let tick_age =
+            atc_tick_age_secs(&snap.atc).map_or_else(|| "--".to_string(), |age| format!("{age}s"));
+        let tick_p95 = atc_tick_p95_micros(&snap.atc);
+        let rollup = &snap.atc.observability.rollup_refresh_latency_micros;
+        let degraded_agents = snap
+            .atc
+            .tracked_agents
+            .iter()
+            .filter(|agent| agent.state != "alive")
+            .count();
+        tracing::debug!(
+            event = "tui.system_health.atc_widget_rendered",
+            writes_total = snap.atc.observability.experiences_written_total,
+            resolves_total = snap.atc.observability.experiences_resolved_total,
+            degraded = degraded_agents,
+            tick_stale = atc_tick_is_stale(&snap.atc)
+        );
 
         let body = format!(
-            "writes={} resolves={} open={} sweep_p95={}us kill={} safe={}",
+            "tick_age={} tick_p95={}us stale={}\nrollup=count:{} p95={}us retention={}\nwrites={} resolves={} open={} sweep_p95={}us kill={} safe={}",
+            tick_age,
+            tick_p95,
+            atc_tick_is_stale(&snap.atc),
+            rollup.count,
+            rollup.p95,
+            atc_retention_status(&snap.atc),
             snap.atc.observability.experiences_written_total,
             snap.atc.observability.experiences_resolved_total,
             strata_summary,
@@ -1965,6 +2056,21 @@ fn add_atc_findings(out: &mut DiagnosticsSnapshot) {
             ),
             remediation: Some(
                 "Profile the ATC hot path before increasing the tick interval or budget.".into(),
+            ),
+        });
+    }
+
+    if atc_tick_is_stale(&out.atc) {
+        out.lines.push(ProbeLine {
+            level: Level::Warn,
+            name: "atc-stale",
+            detail: format!(
+                "ATC engine stale: no heartbeat for {}s",
+                atc_tick_age_secs(&out.atc).unwrap_or_default()
+            ),
+            remediation: Some(
+                "Inspect the ATC operator thread and recent server logs before trusting any ATC surface."
+                    .into(),
             ),
         });
     }
@@ -3538,6 +3644,8 @@ mod tests {
                 source: "live".to_string(),
                 safe_mode: true,
                 kill_switch_enabled: true,
+                last_tick_micros: mcp_agent_mail_db::now_micros().saturating_sub(30_000_000),
+                last_tick_duration_micros: 95_000,
                 observability: mcp_agent_mail_core::metrics::AtcMetricsSnapshot {
                     experiences_written_total: 7,
                     experiences_resolved_total: 5,
@@ -3557,6 +3665,17 @@ mod tests {
                             p99: 160_000,
                         },
                     )]),
+                    rollup_refresh_latency_micros:
+                        mcp_agent_mail_core::metrics::HistogramSnapshot {
+                            count: 2,
+                            sum: 28_000,
+                            min: 10_000,
+                            max: 18_000,
+                            p50: 10_000,
+                            p95: 18_000,
+                            p99: 18_000,
+                        },
+                    retention_rows_deleted_total: 4,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -3565,8 +3684,8 @@ mod tests {
         };
 
         let mut pool = ftui::GraphemePool::new();
-        let mut frame = Frame::new(80, 4, &mut pool);
-        screen.render_atc_health_widget(&mut frame, Rect::new(0, 0, 80, 4), &snap);
+        let mut frame = Frame::new(120, 5, &mut pool);
+        screen.render_atc_health_widget(&mut frame, Rect::new(0, 0, 120, 5), &snap);
 
         let text = buffer_to_text(&frame.buffer);
         assert!(
@@ -3584,6 +3703,36 @@ mod tests {
         assert!(
             text.contains("sweep_p95=150000us"),
             "expected sweep latency summary, got:\n{text}"
+        );
+        assert!(
+            text.contains("tick_p95=95000us"),
+            "expected tick p95 summary, got:\n{text}"
+        );
+        assert!(
+            text.contains("retention=active (deleted=4)"),
+            "expected retention summary, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn atc_findings_surface_stale_heartbeat_warning() {
+        let mut out = DiagnosticsSnapshot {
+            atc: crate::AtcOperatorSnapshot {
+                enabled: true,
+                source: "live".to_string(),
+                last_tick_micros: mcp_agent_mail_db::now_micros()
+                    .saturating_sub((ATC_STALE_HEARTBEAT_SECS + 30) * 1_000_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        add_atc_findings(&mut out);
+
+        assert!(
+            out.lines
+                .iter()
+                .any(|line| { line.name == "atc-stale" && line.detail.contains("no heartbeat") })
         );
     }
 

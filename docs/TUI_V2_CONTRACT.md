@@ -34,9 +34,9 @@
 
 ## 2. Screen Information Architecture
 
-### 2.1 V2 Screen Registry (12 screens)
+### 2.1 V2 Screen Registry (16 screens)
 
-V2 expands from 8 to 12 screens, filling placeholders and adding new capabilities.
+V2 expands from 8 to 16 screens, filling placeholders and adding snapshot-backed operator surfaces.
 
 | # | ID | Label | Category | Status | Description |
 |---|-----|-------|----------|--------|-------------|
@@ -46,21 +46,25 @@ V2 expands from 8 to 12 screens, filling placeholders and adding new capabilitie
 | 4 | `Agents` | Agents | Operations | **Build** | Agent roster: name, program, model, last active, inbox stats, contacts |
 | 5 | `Reservations` | Reserv | Operations | **Build** | Reservation board: active/expired/conflicts, TTL countdown, agent grouping |
 | 6 | `ToolMetrics` | Tools | System | **Build** | Per-tool metrics: call count, error rate, P50/P95/P99 latency, slow flags |
-| 7 | `SystemHealth` | Health | System | **Enhance** | DB/queue/pool diagnostics, circuit breakers, WBQ/coalescer health |
+| 7 | `SystemHealth` | Health | System | **Enhance** | DB/queue/pool diagnostics, circuit breakers, WBQ/coalescer health, ATC health widget |
 | 8 | `Timeline` | Time | Overview | **Enhance** | Chronological event timeline with severity/source/kind filtering + inspector |
 | 9 | `Projects` | Proj | Overview | **New** | Project browser: slug, human_key, agent count, message count, reservation count |
 | 10 | `Contacts` | Links | Communication | **New** | Cross-agent contact graph: approved/pending/blocked links, policy display |
 | 11 | `Search` | Search | Communication | **New** | Unified cross-project search with faceted filtering (agent, thread, date range) |
-| 12 | `Exports` | Export | Operations | **New** | Share/export status: snapshot history, bundle artifacts, hosting targets |
+| 12 | `Explorer` | Explore | Communication | **New** | Unified inbox/outbox explorer with direction, ack, and actor filters |
+| 13 | `Analytics` | Analyt | Overview | **New** | Derived anomaly feed with confidence and remediation hints |
+| 14 | `Attachments` | Files | Operations | **New** | Attachment browser with provenance, preview, and source context |
+| 15 | `ArchiveBrowser` | Archive | Operations | **New** | Two-pane Git archive browser for canonical mailbox artifacts |
+| 16 | `Atc` | ATC | System | **Enhance** | Snapshot-driven ATC control surface with decision drill-in and retention report |
 
 ### 2.2 Screen Categories
 
 | Category | Screens | Purpose |
 |----------|---------|---------|
-| **Overview** | Dashboard, Timeline, Projects | Operational situational awareness |
-| **Communication** | Messages, Threads, Contacts, Search | Message and thread exploration |
-| **Operations** | Agents, Reservations, Exports | Agent and resource management |
-| **System** | ToolMetrics, SystemHealth | Infrastructure diagnostics |
+| **Overview** | Dashboard, Timeline, Projects, Analytics | Operational situational awareness |
+| **Communication** | Messages, Threads, Contacts, Search, Explorer | Message and thread exploration |
+| **Operations** | Agents, Reservations, Attachments, ArchiveBrowser | Agent and resource management |
+| **System** | ToolMetrics, SystemHealth, Atc | Infrastructure diagnostics and ATC control telemetry |
 
 ### 2.3 Navigation Graph
 
@@ -384,7 +388,22 @@ Tool    1──1 MetricsSnapshotEntry (in-memory atomic)
 
 **Data sources:** `DbStatSnapshot`, `TuiSharedState` counters, `health_check()` output
 
-### 5.8 Timeline (Enhance)
+### 5.8 ATC (Enhance)
+
+**Current:** ATC screen exists, but older summary-only wiring drifts from the operator snapshot shape used by robot mode and `/mail/ws-state`.
+
+**V2 additions:**
+- Consume `atc_operator_snapshot()` exclusively for the ATC screen and the System Health ATC widget
+- Top strip shows availability, policy bundle/revision, safe-mode state, and last-tick freshness
+- Decision table shows timestamp, decision class, action, and latest execution outcome when present
+- Detail pane supports `d` drill-in for the selected decision and `r` retention report for rollup/retention posture
+- System Health ATC widget surfaces tick freshness, rollup refresh latency, retention status, and kill/safe indicators
+
+**Keybindings:** `j/k` navigate, `Tab` switch agents/decisions, `d` drill into decision detail, `r` open retention report, `i` toggle detail, `J/K` scroll detail.
+
+**Data sources:** `atc_operator_snapshot()`, `AtcMetricsSnapshot`
+
+### 5.9 Timeline (Enhance)
 
 **Current:** Event list with filtering + inspector dock.
 
@@ -394,7 +413,7 @@ Tool    1──1 MetricsSnapshotEntry (in-memory atomic)
 - Multi-select for batch inspection
 - Event export (copy to clipboard as JSON)
 
-### 5.9 Projects (New)
+### 5.10 Projects (New)
 
 **Layout:** Table + detail dock.
 
@@ -402,7 +421,7 @@ Tool    1──1 MetricsSnapshotEntry (in-memory atomic)
 
 **Data sources:** `list_projects()`, `DbStatSnapshot` per-project.
 
-### 5.10 Contacts (New)
+### 5.11 Contacts (New)
 
 **Layout:** Table + detail dock.
 
@@ -410,7 +429,7 @@ Tool    1──1 MetricsSnapshotEntry (in-memory atomic)
 
 **Data sources:** `list_contacts()` per agent.
 
-### 5.11 Search (New)
+### 5.12 Search (New)
 
 **Layout:** Query bar + facet rail (left 20%) + results list + preview dock.
 
@@ -418,11 +437,11 @@ Tool    1──1 MetricsSnapshotEntry (in-memory atomic)
 
 **Data sources:** `search_messages_fts()`, `search_messages_product()` for cross-project.
 
-### 5.12 Exports (New)
+### 5.13 Explorer (New)
 
-**Layout:** Export history table + status badges.
+**Layout:** Unified inbox/outbox explorer with direction rail and preview dock.
 
-**Data sources:** Share/export module output, bundle manifest.
+**Data sources:** mailbox index queries + thread/message preview helpers
 
 ---
 
