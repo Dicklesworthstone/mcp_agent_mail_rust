@@ -1,0 +1,316 @@
+{
+  "schema_version": 1,
+  "catalog_id": "atc-label-catalog-v1",
+  "updated_at": "2026-04-18T00:00:00Z",
+  "notes": [
+    "This catalog is canonical, not cartesian-exhaustive.",
+    "Each scenario covers one outcome or censor edge with explicit budget, contention, and timing metadata.",
+    "project_closed remains reserved_unreachable_v1 until the labeling automaton distinguishes project closure from generic subject departure."
+  ],
+  "coverage": {
+    "outcome_label_families": [
+      "success",
+      "failure",
+      "correct",
+      "incorrect",
+      "censored",
+      "non_execution"
+    ],
+    "censor_reasons": [
+      "window_expired",
+      "subject_departed",
+      "overlapping_interventions",
+      "exogenous_recovery",
+      "concurrent_operator_change",
+      "ambiguous_result",
+      "project_closed",
+      "insufficient_evidence"
+    ],
+    "budget_health_states": [
+      "healthy",
+      "stressed",
+      "cooling_down",
+      "blocking"
+    ],
+    "contention_profiles": [
+      "isolated",
+      "one_peer_overlap_tolerated",
+      "high_force_overlap_censored",
+      "manual_operator_override"
+    ]
+  },
+  "scenarios": [
+    {
+      "id": "probe_responded_healthy_isolated",
+      "description": "Probe gets a response inside the 60s window with no competing intervention.",
+      "effect_kind": "probe",
+      "state": "executed",
+      "budget_health": "healthy",
+      "contention_profile": "isolated",
+      "attribution_window_case": "immediate_valid_evidence",
+      "expected": {
+        "label_family": "correct",
+        "rule_id": "probe_responded",
+        "censor_reason": null,
+        "learning_signal": true,
+        "reachability": "reachable"
+      }
+    },
+    {
+      "id": "advisory_improved_stressed_isolated",
+      "description": "Advisory improves behavior after the family min-delay while the budget remains permissive but stressed.",
+      "effect_kind": "advisory",
+      "state": "executed",
+      "budget_health": "stressed",
+      "contention_profile": "isolated",
+      "attribution_window_case": "after_min_delay_within_window",
+      "expected": {
+        "label_family": "success",
+        "rule_id": "advisory_improved",
+        "censor_reason": null,
+        "learning_signal": true,
+        "reachability": "reachable"
+      }
+    },
+    {
+      "id": "backpressure_worsened_stressed_isolated",
+      "description": "Backpressure signal lands, but queue health worsens within the attribution window.",
+      "effect_kind": "backpressure",
+      "state": "executed",
+      "budget_health": "stressed",
+      "contention_profile": "isolated",
+      "attribution_window_case": "after_min_delay_within_window",
+      "expected": {
+        "label_family": "failure",
+        "rule_id": "backpressure_worsened",
+        "censor_reason": null,
+        "learning_signal": true,
+        "reachability": "reachable"
+      }
+    },
+    {
+      "id": "release_false_positive_cooling_down_isolated",
+      "description": "A release executes under force-action pressure and turns out to be a false positive.",
+      "effect_kind": "release",
+      "state": "executed",
+      "budget_health": "cooling_down",
+      "contention_profile": "isolated",
+      "attribution_window_case": "immediate_valid_evidence",
+      "expected": {
+        "label_family": "incorrect",
+        "rule_id": "release_false_positive",
+        "censor_reason": null,
+        "learning_signal": true,
+        "reachability": "reachable"
+      }
+    },
+    {
+      "id": "force_reservation_resolved_healthy_isolated",
+      "description": "Force reservation resolves the conflict cleanly with no competing operator or agent action.",
+      "effect_kind": "force_reservation",
+      "state": "executed",
+      "budget_health": "healthy",
+      "contention_profile": "isolated",
+      "attribution_window_case": "immediate_valid_evidence",
+      "expected": {
+        "label_family": "correct",
+        "rule_id": "force_reservation_resolved",
+        "censor_reason": null,
+        "learning_signal": true,
+        "reachability": "reachable"
+      }
+    },
+    {
+      "id": "no_action_stable_healthy_isolated",
+      "description": "Deliberate inaction stays stable past the NoAction minimum delay.",
+      "effect_kind": "no_action",
+      "state": "skipped",
+      "budget_health": "healthy",
+      "contention_profile": "isolated",
+      "attribution_window_case": "after_min_delay_within_window",
+      "expected": {
+        "label_family": "non_execution",
+        "rule_id": "deliberate_inaction_resolved",
+        "censor_reason": null,
+        "learning_signal": true,
+        "reachability": "reachable"
+      }
+    },
+    {
+      "id": "budget_exhausted_worsened_blocking",
+      "description": "The budget blocks execution and the situation worsens, proving the suppression was costly.",
+      "effect_kind": "release",
+      "state": "throttled",
+      "budget_health": "blocking",
+      "contention_profile": "isolated",
+      "attribution_window_case": "after_min_delay_within_window",
+      "expected": {
+        "label_family": "non_execution",
+        "rule_id": "budget_exhausted_resolved",
+        "censor_reason": null,
+        "learning_signal": true,
+        "reachability": "reachable"
+      }
+    },
+    {
+      "id": "routing_overlap_tolerated_stressed",
+      "description": "Routing suggestion still resolves successfully with one tolerated overlapping intervention.",
+      "effect_kind": "routing_suggestion",
+      "state": "executed",
+      "budget_health": "stressed",
+      "contention_profile": "one_peer_overlap_tolerated",
+      "attribution_window_case": "after_min_delay_within_window",
+      "expected": {
+        "label_family": "success",
+        "rule_id": "routing_improved",
+        "censor_reason": null,
+        "learning_signal": true,
+        "reachability": "reachable"
+      }
+    },
+    {
+      "id": "probe_window_expired_no_evidence",
+      "description": "Probe never gets evidence and expires after the family max window.",
+      "effect_kind": "probe",
+      "state": "open",
+      "budget_health": "healthy",
+      "contention_profile": "isolated",
+      "attribution_window_case": "no_evidence_after_max_window",
+      "expected": {
+        "label_family": "censored",
+        "rule_id": "window_expired",
+        "censor_reason": "window_expired",
+        "learning_signal": false,
+        "reachability": "reachable"
+      }
+    },
+    {
+      "id": "no_action_subject_departed",
+      "description": "The subject disappears before the attribution window can resolve.",
+      "effect_kind": "no_action",
+      "state": "skipped",
+      "budget_health": "healthy",
+      "contention_profile": "isolated",
+      "attribution_window_case": "subject_departed_before_observation",
+      "expected": {
+        "label_family": "censored",
+        "rule_id": "subject_departed",
+        "censor_reason": "subject_departed",
+        "learning_signal": false,
+        "reachability": "reachable"
+      }
+    },
+    {
+      "id": "release_operator_override_blocking",
+      "description": "An operator override happens before attribution can assign credit or blame.",
+      "effect_kind": "release",
+      "state": "open",
+      "budget_health": "blocking",
+      "contention_profile": "manual_operator_override",
+      "attribution_window_case": "operator_override_before_observation",
+      "expected": {
+        "label_family": "censored",
+        "rule_id": "operator_change",
+        "censor_reason": "concurrent_operator_change",
+        "learning_signal": false,
+        "reachability": "reachable"
+      }
+    },
+    {
+      "id": "probe_overlap_censored_multi_agent",
+      "description": "Probe has zero overlap tolerance, so any competing intervention censors attribution.",
+      "effect_kind": "probe",
+      "state": "open",
+      "budget_health": "healthy",
+      "contention_profile": "high_force_overlap_censored",
+      "attribution_window_case": "overlap_exceeds_tolerance",
+      "expected": {
+        "label_family": "censored",
+        "rule_id": "overlapping_interventions",
+        "censor_reason": "overlapping_interventions",
+        "learning_signal": false,
+        "reachability": "reachable"
+      }
+    },
+    {
+      "id": "advisory_exogenous_recovery_stressed",
+      "description": "The situation recovers on its own during an advisory window, so advisory credit is censored.",
+      "effect_kind": "advisory",
+      "state": "executed",
+      "budget_health": "stressed",
+      "contention_profile": "isolated",
+      "attribution_window_case": "after_min_delay_within_window",
+      "expected": {
+        "label_family": "censored",
+        "rule_id": "exogenous_recovery",
+        "censor_reason": "exogenous_recovery",
+        "learning_signal": false,
+        "reachability": "reachable"
+      }
+    },
+    {
+      "id": "non_execution_missing_reason_ambiguous",
+      "description": "A non-execution state arrives without its required reason payload, forcing ambiguity.",
+      "effect_kind": "release",
+      "state": "suppressed",
+      "budget_health": "healthy",
+      "contention_profile": "isolated",
+      "attribution_window_case": "invalid_non_execution_metadata",
+      "expected": {
+        "label_family": "censored",
+        "rule_id": "missing_non_execution_reason",
+        "censor_reason": "ambiguous_result",
+        "learning_signal": false,
+        "reachability": "reachable"
+      }
+    },
+    {
+      "id": "backpressure_awaiting_evidence_insufficient",
+      "description": "Backpressure remains inside its attribution window with no evidence yet, so the row stays open with insufficient evidence.",
+      "effect_kind": "backpressure",
+      "state": "open",
+      "budget_health": "healthy",
+      "contention_profile": "isolated",
+      "attribution_window_case": "within_window_no_evidence_yet",
+      "expected": {
+        "label_family": "censored",
+        "rule_id": "awaiting_evidence",
+        "censor_reason": "insufficient_evidence",
+        "learning_signal": false,
+        "reachability": "reachable"
+      }
+    },
+    {
+      "id": "project_closed_reserved_placeholder",
+      "description": "Reserved placeholder for the sealed enum variant that is not emitted by the v1 automaton.",
+      "effect_kind": "advisory",
+      "state": "open",
+      "budget_health": "blocking",
+      "contention_profile": "isolated",
+      "attribution_window_case": "reserved_placeholder",
+      "expected": {
+        "label_family": "censored",
+        "rule_id": "reserved_project_closed_placeholder",
+        "censor_reason": "project_closed",
+        "learning_signal": false,
+        "reachability": "reserved_unreachable_v1"
+      }
+    },
+    {
+      "id": "calibration_fallback_stable_cooling_down",
+      "description": "Calibration fallback suppresses an action and the system stays stable, making the non-execution correct.",
+      "effect_kind": "advisory",
+      "state": "suppressed",
+      "budget_health": "cooling_down",
+      "contention_profile": "isolated",
+      "attribution_window_case": "after_min_delay_within_window",
+      "expected": {
+        "label_family": "non_execution",
+        "rule_id": "calibration_fallback_resolved",
+        "censor_reason": null,
+        "learning_signal": true,
+        "reachability": "reachable"
+      }
+    }
+  ]
+}
