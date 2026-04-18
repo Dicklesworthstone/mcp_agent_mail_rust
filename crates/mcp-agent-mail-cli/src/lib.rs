@@ -21551,17 +21551,24 @@ fn build_systemd_unit_content(
     database_url: &str,
     storage_root: &Path,
 ) -> String {
+    // StartLimit* + longer RestartSec: if WorkingDirectory is missing or the
+    // binary is broken, systemd would otherwise hammer the journal in a tight
+    // loop forever (reported as a silent crash-loop in #96). Five failures in
+    // five minutes is enough to surface a real misconfiguration while still
+    // tolerating transient issues.
     format!(
         r#"[Unit]
 Description=MCP Agent Mail Server
 After=network.target
+StartLimitBurst=5
+StartLimitIntervalSec=300
 
 [Service]
 Type=simple
 ExecStart={exec_args}
 WorkingDirectory={working_dir}
 Restart=on-failure
-RestartSec=5
+RestartSec=30
 Environment=RUST_LOG=info
 Environment=DATABASE_URL={database_url}
 Environment=STORAGE_ROOT={storage_root}
@@ -21600,7 +21607,32 @@ fn service_install_systemd(
         cwd.join(&config.storage_root)
     };
 
-    let unit_content = build_systemd_unit_content(&exec_args, &cwd, &abs_db_url, &abs_storage_root);
+    // systemd CHDIRs into WorkingDirectory *before* anything else (ExecStartPre
+    // included). If the directory is missing, the unit exits 200/CHDIR and
+    // Restart=on-failure spins. The storage root is the only path we can
+    // guarantee `am` itself wants to live in, so create it up front and use
+    // it as WorkingDirectory rather than the (transient) cwd from which
+    // `am service install` happened to be invoked (#96).
+    std::fs::create_dir_all(&abs_storage_root).map_err(|err| {
+        CliError::Other(format!(
+            "failed to create storage root {}: {err}",
+            abs_storage_root.display()
+        ))
+    })?;
+
+    // If DATABASE_URL points outside the storage root (custom layout), make
+    // sure the SQLite parent directory exists too so `am migrate` on first
+    // launch can open the DB file without surprise.
+    if let Some(db_path) = abs_db_url.strip_prefix("sqlite://") {
+        if let Some(parent) = Path::new(db_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+    }
+
+    let unit_content =
+        build_systemd_unit_content(&exec_args, &abs_storage_root, &abs_db_url, &abs_storage_root);
 
     std::fs::write(&unit_path, &unit_content)?;
     ftui_runtime::ftui_println!("Wrote {}", unit_path.display());
@@ -21701,8 +21733,30 @@ fn service_install_launchd(
         cwd.join(&config.storage_root)
     };
 
-    let plist_content =
-        build_launchd_plist_content(&args_xml, &log_dir, &cwd, &abs_db_url, &abs_storage_root);
+    // Same pre-CHDIR safety as the systemd path (#96): ensure the directory
+    // launchd will chdir into actually exists, and prefer the stable storage
+    // root over the cwd that happened to be active at install time.
+    std::fs::create_dir_all(&abs_storage_root).map_err(|err| {
+        CliError::Other(format!(
+            "failed to create storage root {}: {err}",
+            abs_storage_root.display()
+        ))
+    })?;
+    if let Some(db_path) = abs_db_url.strip_prefix("sqlite://") {
+        if let Some(parent) = Path::new(db_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+    }
+
+    let plist_content = build_launchd_plist_content(
+        &args_xml,
+        &log_dir,
+        &abs_storage_root,
+        &abs_db_url,
+        &abs_storage_root,
+    );
 
     // Stop existing job first (ignore errors — may not be loaded).
     let _ = run_cmd(
@@ -22224,6 +22278,30 @@ mod tests {
                 "Environment=STORAGE_ROOT=/home/user/.local/share/mcp-agent-mail/git_mailbox_repo"
             ),
             "unit must contain absolute STORAGE_ROOT"
+        );
+    }
+
+    #[test]
+    fn build_systemd_unit_content_caps_crash_loop_retries() {
+        // Regression for #96: a unit with Restart=on-failure and no
+        // StartLimit* would spin forever if WorkingDirectory didn't exist.
+        let unit = build_systemd_unit_content(
+            "/usr/local/bin/am serve-http",
+            Path::new("/tmp/wd"),
+            "sqlite:///tmp/wd/storage.sqlite3",
+            Path::new("/tmp/wd"),
+        );
+        assert!(
+            unit.contains("StartLimitBurst=5"),
+            "unit must cap restart bursts: {unit}"
+        );
+        assert!(
+            unit.contains("StartLimitIntervalSec=300"),
+            "unit must set restart burst window: {unit}"
+        );
+        assert!(
+            unit.contains("RestartSec=30"),
+            "unit must wait 30s between restarts to avoid journal spam: {unit}"
         );
     }
 
