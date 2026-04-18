@@ -775,6 +775,130 @@ INTEGRITY_CHECK_ON_STARTUP=true \
 
 ---
 
+## Emergency: Roll Back Archive Batch-Write Optimization
+
+Use this when the storage-native batch archive write path regresses edge cases in
+production: missing canonical files, archive/DB parity drift after bursts,
+unexpected commit-coalescer behavior, or durability concerns after crashes.
+
+### Current reality
+
+- The archive perf fix shipped in commit `99bc2663` (`fix(archive): batch 100 p95=238ms under budget (br-8qdh0.4)`).
+- There is **no** `ARCHIVE_WRITE_MODE=fast|legacy|auto` runtime switch in the
+  current codebase.
+- Rollback therefore means **reverting the archive perf change and redeploying**
+  a build that restores the pre-fix per-message write path.
+
+### Trigger signals
+
+Treat any of these as rollback candidates:
+
+- `am doctor check` reports archive/DB parity drift immediately after a burst write window.
+- Operators observe messages acknowledged in the UI but missing from the Git archive.
+- `tests/artifacts/perf/archive_batch_*` remain healthy, but real traffic shows
+  corruption, crash-recovery drift, or commit-coalescer edge cases that benches
+  did not model.
+- A crash or forced restart during a burst leaves archive state inconsistent and
+  `am doctor repair --dry-run` proposes unexpected message reconstruction.
+
+### Immediate containment
+
+1. Stop promoting new builds that include the archive perf fix.
+2. Capture operator evidence before mutation:
+```bash
+git rev-parse HEAD
+am doctor check
+am doctor repair --dry-run
+```
+3. Preserve the active forensic inputs:
+   - latest `tests/artifacts/perf/archive_batch_*` artifacts
+   - any `am doctor` warning report paths
+   - the project slug(s) showing parity drift
+
+### Rollback procedure
+
+1. Move to `main` and fast-forward to the deployed revision:
+```bash
+git checkout main
+git pull --ff-only
+```
+2. Revert the archive perf change that introduced the batch path:
+```bash
+git revert --no-edit 99bc2663
+```
+3. Rebuild and redeploy the reverted revision.
+   Use `rch` for the heavy compile path:
+```bash
+export CARGO_TARGET_DIR=/tmp/target-$(whoami)-am
+rch exec -- cargo check -p mcp-agent-mail --bench benchmarks
+rch exec -- cargo test -p mcp-agent-mail-storage
+```
+4. Restart the service so writes return to the legacy per-message path:
+```bash
+q  # or Ctrl+C if running in the foreground
+am serve-http
+```
+
+### Post-rollback verification
+
+Run the operator checks in this order:
+
+```bash
+am doctor check
+am doctor repair --dry-run
+```
+
+- If `am doctor repair --dry-run` reports only safe hygiene, apply it:
+```bash
+am doctor repair --yes
+```
+- If parity still favors the Git archive or SQLite trust is in doubt, escalate to
+  archive-first rebuild instead of forcing more in-place writes:
+```bash
+am doctor reconstruct --dry-run
+```
+
+### Re-enable the stress guard before re-promotion
+
+Before allowing a new archive perf candidate back into rollout, rerun the
+storage stress and batch benchmark guardrails on the reverted-or-fixed branch:
+
+```bash
+export CARGO_TARGET_DIR=/tmp/target-$(whoami)-am
+rch exec -- cargo test -p mcp-agent-mail-storage --test stress_pipeline -- --nocapture
+MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 \
+  rch exec -- cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch
+```
+
+Expected result:
+
+- storage stress passes without archive/DB divergence
+- warm `batch-100` remains within the documented budget envelope in
+  `benches/BUDGETS.md`
+- no new `am doctor` parity or integrity warnings after restart
+
+### Incident follow-up
+
+After rollback:
+
+1. File or update the incident bead with the trigger symptom, affected project
+   slugs, and whether `repair` or `reconstruct` was required.
+2. Record the exact reverted commit (`99bc2663`) and the rollback timestamp.
+3. Attach the `archive_batch_*` perf artifacts and any `doctor` warning bundle
+   paths so the next fix can distinguish a real correctness regression from a
+   benchmark-only signal.
+
+### Notes
+
+- Keep follow-up documentation-only commits such as `5912d807`
+  (`docs(perf): refresh archive baseline after under-budget fix`) unless you
+  specifically need the release branch to present pre-fix benchmark narratives.
+- Do not invent a runtime flag during an incident. If a future release adds an
+  explicit archive write mode toggle, update this section to prefer the config
+  flip over a git revert.
+
+---
+
 ## Emergency: Disable ATC Learning
 
 If ATC learning is causing production issues (latency spikes, DB errors, privacy concerns):
