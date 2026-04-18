@@ -1861,11 +1861,11 @@ mod tests {
             "database is locked".into()
         )));
         assert!(is_register_retryable(&mcp_agent_mail_db::DbError::Pool(
-            "SQLITE_BUSY while acquiring connection".into()
+            "database is busy".into()
         )));
         assert!(!is_register_retryable(&mcp_agent_mail_db::DbError::NotFound {
             entity: "agent".into(),
-            id: "BlueLake".into(),
+            identifier: "BlueLake".into(),
         }));
     }
 
