@@ -47,7 +47,6 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_r
 - [Robot Mode (`am robot`)](#robot-mode-am-robot)
 - [File Reservations](#file-reservations-for-multi-agent-editing)
 - [Multi-Agent Coordination Workflows](#multi-agent-coordination-workflows)
-- [Browser State Sync](#browser-state-sync-endpoint)
 - [Web UI](#web-ui)
 - [Deployment Validation](#deployment-validation)
 - [Configuration](#configuration)
@@ -757,45 +756,13 @@ Use the Beads issue ID (`br-123`) as the Mail `thread_id` and prefix message sub
 
 ---
 
-## Browser State Sync Endpoint
-
-For browser clients, and for the currently experimental standalone
-`mcp-agent-mail-wasm` client, Agent Mail exposes a polling-based state sync
-contract:
-
-- `GET /mail/ws-state` returns a snapshot payload
-- `GET /mail/ws-state?since=<seq>&limit=<n>` returns deltas since a sequence
-- `POST /mail/ws-input` accepts remote terminal ingress events (`Input`, `Resize`)
-
-The shipped browser surface today is `/web-dashboard`, which consumes these
-server endpoints directly. The separate `mcp-agent-mail-wasm` crate is still a
-thinner, under-covered standalone client surface and should not be read as
-feature-parity proof for the browser dashboard.
-
-Note: `/mail/ws-state` is intentionally HTTP polling, not WebSocket upgrade. WebSocket upgrade attempts return `501 Not Implemented`.
-
-```bash
-# Snapshot
-curl -sS 'http://127.0.0.1:8765/mail/ws-state?limit=50' | jq .
-
-# Delta from a known sequence
-curl -sS 'http://127.0.0.1:8765/mail/ws-state?since=1200&limit=200' | jq .
-
-# Input ingress (key event)
-curl -sS -X POST 'http://127.0.0.1:8765/mail/ws-input' \
-  -H 'Content-Type: application/json' \
-  --data '{"type":"Input","data":{"kind":"Key","key":"j","modifiers":0}}' | jq .
-```
-
----
-
 ## Web Dashboard
 
 The server also exposes a browser TUI mirror at `/web-dashboard`.
 
 This page is a real shipped browser surface. It is served directly by the
-server with its own HTML/JS runtime and does not depend on the standalone
-`mcp-agent-mail-wasm` crate being production-ready.
+server with its own HTML/JS runtime and does not depend on the parked
+`experimental/mcp-agent-mail-wasm` prototype.
 
 This is distinct from the server-rendered `/mail/*` web UI:
 
@@ -958,7 +925,7 @@ MCP Client / Operator / Browser
 
 ```
 mcp_agent_mail_rust/
-├── Cargo.toml                              # Workspace root (12 member crates)
+├── Cargo.toml                              # Workspace root (11 member crates)
 ├── crates/
 │   ├── mcp-agent-mail-core/                # Zero-dep: config, models, errors, metrics
 │   ├── mcp-agent-mail-db/                  # SQLite schema, queries, pool, cache, Search V3 integration
@@ -970,8 +937,9 @@ mcp_agent_mail_rust/
 │   ├── mcp-agent-mail-server/              # HTTP/MCP runtime, dispatch, TUI (16 screens)
 │   ├── mcp-agent-mail/                     # Server binary (mcp-agent-mail)
 │   ├── mcp-agent-mail-cli/                 # CLI binary (am) with robot mode
-│   ├── mcp-agent-mail-conformance/         # Python parity tests
-│   └── mcp-agent-mail-wasm/                # Experimental standalone WASM client surface
+│   └── mcp-agent-mail-conformance/         # Python parity tests
+├── experimental/
+│   └── mcp-agent-mail-wasm/                # Parked standalone WASM/browser prototype
 ├── tests/e2e/                              # End-to-end test scripts
 ├── scripts/                                # CLI integration tests, utilities
 ├── docs/                                   # ADRs, specs, runbooks, migration guides
@@ -1044,7 +1012,7 @@ The `br-0qt6e` ATC learning work is intentionally cross-cutting, but it should n
 | Git/archive boundary | `crates/mcp-agent-mail-storage/src/lib.rs` | Human-auditable artifact writes, WBQ/commit coalescing, selected policy/audit artifacts when explicitly promoted | Raw ATC experience exhaust; the current `WriteOp` surface intentionally handles message, reservation, profile, and notification artifacts, not learning-row mirroring |
 | ATC runtime | `crates/mcp-agent-mail-server/src/atc.rs` | Decision engine, liveness/conflict/routing/calibration math, policy bundle loading, global ATC singletons, tick loop, outcome feedback, summary snapshots | Direct SQLite schema ownership, long-lived CLI state, alternate UI-specific models |
 | Runtime wiring | `crates/mcp-agent-mail-server/src/lib.rs` | Bootstrapping via `init_global_atc()` and `start_atc_operator_runtime()`, tool-dispatch liveness hooks via `atc_register_agent_with_project()` and `atc_observe_activity_with_project()`, shared ATC operator snapshot publication | Per-tool bespoke learning persistence; tool handlers should emit domain facts, not become the learning store |
-| Agent/operator surfaces | `crates/mcp-agent-mail-cli/src/robot.rs`, `crates/mcp-agent-mail-server/src/tui_screens/system_health.rs`, `tui_ws_state.rs`, `tui_web_dashboard.rs`, `/mail/ws-state`, `/web-dashboard/*` | Rendering the shared ATC/operator snapshot for robot, TUI, and browser consumers; local fallback heuristics only when live server state is unavailable | Independent ATC truth, separate persistence, or duplicate learning logic |
+| Agent/operator surfaces | `crates/mcp-agent-mail-cli/src/robot.rs`, `crates/mcp-agent-mail-server/src/tui_screens/system_health.rs`, `tui_web_dashboard.rs`, `/web-dashboard/*` | Rendering the shared ATC/operator snapshot for robot, TUI, and browser consumers; local fallback heuristics only when live server state is unavailable | Independent ATC truth, separate persistence, or duplicate learning logic |
 | Tool/resource layer | `crates/mcp-agent-mail-tools/src/*`, `crates/mcp-agent-mail-tools/src/resources.rs` | Normal tool/resource contracts for mailbox coordination; ATC-adjacent work should surface through existing runtime hooks and shared snapshots | Owning ATC learning state machines or experience-row lifecycle rules |
 
 ### Append and resolution hooks
@@ -1052,12 +1020,12 @@ The `br-0qt6e` ATC learning work is intentionally cross-cutting, but it should n
 - Session/bootstrap and liveness hooks already land at the server dispatch boundary: successful `register_agent` and `macro_start_session` calls register agents with ATC, and tool execution updates ATC activity timestamps.
 - The next durable append path belongs in the same server/runtime seam, not inside individual UIs. Message and reservation learning hooks should flow from the tool-result/event boundary in `mcp-agent-mail-server/src/lib.rs` into the ATC-facing note functions already defined in `mcp-agent-mail-server/src/atc.rs`: `atc_note_message_sent()`, `atc_note_message_received()`, `atc_note_reservation_granted()`, `atc_note_reservation_released()`, and `atc_note_reservation_conflicts()`.
 - Outcome resolution likewise belongs in the server ATC runtime via `atc_record_outcome()`, with the DB crate owning the actual row mutation and rollup updates once the dedicated persistence/query surface is added.
-- `/mail/ws-state`, `/web-dashboard/state`, `am robot atc`, and the System Health screen should stay snapshot-driven consumers of `atc_operator_snapshot()` / `atc_summary()`, not alternate sources of learning state.
+- `/web-dashboard/state`, `am robot atc`, and the System Health screen should stay snapshot-driven consumers of `atc_operator_snapshot()` / `atc_summary()`, not alternate sources of learning state.
 
 ### Hot path vs. cold path boundaries
 
 - Hot path: `mcp-agent-mail-server/src/atc.rs`, the tool-dispatch hook in `mcp-agent-mail-server/src/lib.rs`, and the future DB append/resolve calls. This path must stay append-friendly, bounded, and free of Git write amplification.
-- Warm path: ATC operator snapshots, `am robot atc`, System Health, `/mail/ws-state`, and `/web-dashboard/*`. These surfaces should read already-computed ATC state and only fall back to local heuristics when the live server snapshot is unavailable.
+- Warm path: ATC operator snapshots, `am robot atc`, System Health, and `/web-dashboard/*`. These surfaces should read already-computed ATC state and only fall back to local heuristics when the live server snapshot is unavailable.
 - Cold path: promoted policy bundles, transparency cards, replay artifacts, and operator-facing audit bundles. These may be written through `mcp-agent-mail-storage`, but only after they are intentionally compacted and selected.
 - Explicit non-owner boundary: `mcp-agent-mail-search-core`, share/export, and the WASM/browser mirror are consumers or transport layers. They should not become the canonical home of ATC learning policy, persistence, or attribution logic.
 
@@ -1074,7 +1042,7 @@ The `br-0qt6e` ATC learning work is intentionally cross-cutting, but it should n
 1. Keep `mcp-agent-mail-core` as the schema-and-policy contract: finalize any remaining experience/evidence/baseline/config details there first.
 2. Add the dedicated ATC persistence/query surface in `mcp-agent-mail-db` on top of the existing v16 schema, including append, resolve, rollup, and retention APIs.
 3. Wire `mcp-agent-mail-server` to append experience rows from real dispatch events and to resolve them from real execution/outcome signals, using the existing ATC note and outcome entrypoints instead of inventing parallel paths.
-4. Expose the resulting state consistently through the existing snapshot surfaces: `atc_summary()`, `atc_operator_snapshot()`, `am robot atc`, System Health, `/mail/ws-state`, and `/web-dashboard/*`.
+4. Expose the resulting state consistently through the existing snapshot surfaces: `atc_summary()`, `atc_operator_snapshot()`, `am robot atc`, System Health, and `/web-dashboard/*`.
 5. Only after the core/runtime path is real should additional operator artifacts, Git-promoted transparency bundles, or richer UI affordances be added.
 6. Land replay, E2E, and perf verification last, once the append/resolve boundaries are stable enough to benchmark and audit.
 
@@ -1635,6 +1603,7 @@ Common pitfalls
 | [RUNBOOK_LEGACY_PYTHON_TO_RUST_IMPORT.md](docs/RUNBOOK_LEGACY_PYTHON_TO_RUST_IMPORT.md) | `am legacy` / `am upgrade` migration operations |
 | [RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md) | Pre-release validation |
 | [ROLLOUT_PLAYBOOK.md](docs/ROLLOUT_PLAYBOOK.md) | Staged rollout strategy |
+| [SPEC-browser-parity-contract-deferred.md](docs/SPEC-browser-parity-contract-deferred.md) | Deferred browser TUI mirror contract and future revisit checklist |
 | [SPEC-search-v3-query-contract.md](docs/SPEC-search-v3-query-contract.md) | Query grammar, filters, and Search V3 contract |
 | [SPEC-web-ui-parity-contract.md](docs/SPEC-web-ui-parity-contract.md) | Web UI parity and route contract |
 | [SPEC-verify-live-contract.md](docs/SPEC-verify-live-contract.md) | Static bundle live-verification rules |
