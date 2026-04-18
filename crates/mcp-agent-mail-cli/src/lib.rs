@@ -23121,6 +23121,12 @@ fn build_launchd_plist_content(
     database_url: &str,
     storage_root: &Path,
 ) -> String {
+    // ThrottleInterval=30 mirrors the systemd unit's RestartSec=30 so a
+    // crash-looping process doesn't hammer the logs on both macOS and Linux
+    // (#96 parity). launchd's default ThrottleInterval is 10s, which on a
+    // genuinely misconfigured WorkingDirectory / binary would flood
+    // ~/Library/Logs/agent-mail/ with thousands of entries per minute
+    // before the operator noticed.
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -23142,6 +23148,8 @@ fn build_launchd_plist_content(
         <key>SuccessfulExit</key>
         <false/>
     </dict>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
     <key>StandardOutPath</key>
     <string>{log_dir}/stdout.log</string>
     <key>StandardErrorPath</key>
@@ -24206,6 +24214,29 @@ mod tests {
                 "<string>/Users/dev/.local/share/mcp-agent-mail/git_mailbox_repo</string>"
             ),
             "plist must contain absolute STORAGE_ROOT value"
+        );
+    }
+
+    #[test]
+    fn build_launchd_plist_caps_respawn_throttle() {
+        // Regression for #96 launchd-parity: a plist without ThrottleInterval
+        // relies on launchd's 10s default, which on a genuinely-broken
+        // WorkingDirectory / binary floods Library/Logs at 6 respawns/min.
+        // ThrottleInterval=30 mirrors the systemd unit's RestartSec=30.
+        let plist = build_launchd_plist_content(
+            "        <string>/usr/local/bin/am</string>",
+            Path::new("/tmp/logs"),
+            Path::new("/tmp/wd"),
+            "sqlite:///tmp/wd/storage.sqlite3",
+            Path::new("/tmp/wd"),
+        );
+        assert!(
+            plist.contains("<key>ThrottleInterval</key>"),
+            "plist must set ThrottleInterval to cap respawn rate: {plist}"
+        );
+        assert!(
+            plist.contains("<integer>30</integer>"),
+            "plist must set ThrottleInterval to 30 seconds: {plist}"
         );
     }
 
