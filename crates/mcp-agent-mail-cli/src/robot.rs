@@ -2276,13 +2276,38 @@ fn resolve_robot_scope(
     let local = RobotDbHandle::open_local()?;
     let config = mcp_agent_mail_core::Config::from_env();
     let storage_root = config.storage_root;
-    let local = prefer_archive_snapshot_when_local_db_lags_archive(
+    let preferred = prefer_archive_snapshot_when_local_db_lags_archive(
         local,
         &storage_root,
         Some(&config.database_url),
         "robot scope",
     )?;
-    resolve_robot_scope_with_archive_fallback(local, &storage_root, project_flag, agent_flag)
+    match resolve_robot_scope_with_archive_fallback(
+        preferred,
+        &storage_root,
+        project_flag,
+        agent_flag,
+    ) {
+        Ok(scope) => Ok(scope),
+        Err(error) if is_agent_not_found_error(&error) => {
+            // The preferred DB (possibly an archive snapshot) didn't have
+            // this agent. Retry with a fresh local DB — the agent may exist
+            // in sqlite but not in the git archive (e.g. recently registered
+            // via MCP tools before the commit coalescer flushed).
+            let fresh_local = RobotDbHandle::open_local()?;
+            match resolve_robot_scope_with_handle(fresh_local, project_flag, agent_flag) {
+                Ok(scope) => {
+                    tracing::info!(
+                        error = %error,
+                        "robot scope resolved from local db after archive snapshot missed agent"
+                    );
+                    Ok(scope)
+                }
+                Err(_) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn resolve_robot_project_scope(
@@ -3223,6 +3248,10 @@ fn load_recipient_display_names(
 fn is_missing_agents_table_error(error: &impl std::fmt::Display) -> bool {
     let message = error.to_string();
     message.contains("table not found: agents") || message.contains("no such table: agents")
+}
+
+fn is_agent_not_found_error(error: &CliError) -> bool {
+    matches!(error, CliError::InvalidArgument(msg) if msg.starts_with("agent not found: "))
 }
 
 fn load_recipient_placeholders_without_agents(
@@ -8189,7 +8218,7 @@ mod tests {
         );
         let output = capture.drain_to_string();
         result.expect("robot command should succeed");
-        
+
         let start_idx = output.find('{').expect("json payload start");
         let payload = &output[start_idx..];
         serde_json::from_str(payload).expect("parse robot json output")
@@ -12131,6 +12160,127 @@ mod tests {
         assert_eq!(scope.project_slug, "demo-project");
         assert_eq!(
             scope.agent.as_ref().map(|(_, name)| name.as_str()),
+            Some("CoralMarsh")
+        );
+    }
+
+    #[test]
+    fn is_agent_not_found_error_classification() {
+        assert!(is_agent_not_found_error(&CliError::InvalidArgument(
+            "agent not found: CoralMarsh".to_string()
+        )));
+        assert!(!is_agent_not_found_error(&CliError::InvalidArgument(
+            "project not found: foo".to_string()
+        )));
+        assert!(!is_agent_not_found_error(&CliError::Other(
+            "agent not found: CoralMarsh".to_string()
+        )));
+    }
+
+    #[test]
+    fn resolve_scope_retries_local_db_when_archive_snapshot_misses_agent() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let local_db_path = temp_dir
+            .path()
+            .join("robot_scope_local_retry.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(local_db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY,
+                slug TEXT NOT NULL,
+                human_key TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT 0
+            )",
+            &empty,
+        )
+        .expect("create projects table");
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents table");
+        conn.query_sync(
+            "INSERT INTO projects (id, slug, human_key)
+             VALUES (1, 'demo-project', '/tmp/demo-project')",
+            &empty,
+        )
+        .expect("insert project");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name)
+             VALUES (1, 1, 'CoralMarsh')",
+            &empty,
+        )
+        .expect("insert agent into local db");
+
+        // Archive snapshot DB that has the project but NOT the agent
+        let archive_db_path = temp_dir
+            .path()
+            .join("robot_scope_archive_no_agent.sqlite3");
+        let archive_conn =
+            mcp_agent_mail_db::DbConn::open_file(archive_db_path.display().to_string())
+                .expect("open archive db");
+        archive_conn
+            .query_sync(
+                "CREATE TABLE projects (
+                    id INTEGER PRIMARY KEY,
+                    slug TEXT NOT NULL,
+                    human_key TEXT NOT NULL,
+                    created_at INTEGER NOT NULL DEFAULT 0
+                )",
+                &empty,
+            )
+            .expect("create projects table in archive");
+        archive_conn
+            .query_sync(
+                "CREATE TABLE agents (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    name TEXT NOT NULL
+                )",
+                &empty,
+            )
+            .expect("create agents table in archive");
+        archive_conn
+            .query_sync(
+                "INSERT INTO projects (id, slug, human_key)
+                 VALUES (1, 'demo-project', '/tmp/demo-project')",
+                &empty,
+            )
+            .expect("insert project in archive");
+        // Agent NOT inserted in archive db — simulates archive missing agent
+
+        // Attempting resolution on archive-only DB should fail
+        let archive_handle = RobotDbHandle::from_conn(archive_conn);
+        let err = resolve_robot_scope_with_handle(
+            archive_handle,
+            Some("/tmp/demo-project"),
+            Some("CoralMarsh"),
+        )
+        .expect_err("archive db missing CoralMarsh");
+        assert!(
+            is_agent_not_found_error(&err),
+            "expected agent-not-found, got: {err}"
+        );
+
+        // Local DB should find it
+        let local_conn =
+            mcp_agent_mail_db::DbConn::open_file(local_db_path.display().to_string())
+                .expect("reopen local db");
+        let scope = resolve_robot_scope_with_handle(
+            RobotDbHandle::from_conn(local_conn),
+            Some("/tmp/demo-project"),
+            Some("CoralMarsh"),
+        )
+        .expect("local db should resolve CoralMarsh");
+        assert_eq!(
+            scope.agent.as_ref().map(|(_, n)| n.as_str()),
             Some("CoralMarsh")
         );
     }
