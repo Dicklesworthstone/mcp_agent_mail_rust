@@ -7,6 +7,7 @@
 //! - `create_agent_identity`: Create new agent identity
 //! - whois: Agent profile lookup
 
+use asupersync::Outcome;
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
 use mcp_agent_mail_core::Config;
@@ -20,6 +21,30 @@ use crate::tool_util::{
     db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, get_read_db_pool,
     legacy_tool_error, resolve_project,
 };
+
+/// Classify a [`mcp_agent_mail_db::DbError`] as retryable at the tool layer
+/// for `register_agent` (#98). Matches the same shape the lib.rs error mapper
+/// converts into a `RESOURCE_BUSY` MCP response — those are by definition
+/// transient lock/contention signals that the server is already advertising
+/// as "wait a moment and try again", so an extra server-side retry before
+/// surfacing one to the client is unambiguously safe.
+fn is_register_retryable(err: &mcp_agent_mail_db::DbError) -> bool {
+    use mcp_agent_mail_db::DbError;
+    match err {
+        DbError::ResourceBusy(_) => true,
+        DbError::Sqlite(msg) | DbError::Schema(msg) | DbError::Pool(msg) => {
+            mcp_agent_mail_db::is_lock_error(msg)
+        }
+        _ => false,
+    }
+}
+
+fn register_agent_retry_sleep_ms(attempt: u32, now_ns: u64) -> u64 {
+    let base_ms: u64 = 500u64 * u64::from(attempt + 1);
+    let jitter = (base_ms / 5).max(1);
+    let delta = (now_ns % (jitter * 2)).saturating_sub(jitter);
+    base_ms.saturating_add(delta)
+}
 
 /// Build recovery status for the `health_check` response.
 ///
@@ -1088,18 +1113,54 @@ Check that all parameters have valid values."
         ));
     }
 
-    let agent_out = mcp_agent_mail_db::queries::register_agent(
-        ctx.cx(),
-        &pool,
-        project_id,
-        &agent_name,
-        &program,
-        &model,
-        task_description.as_deref(),
-        Some(&policy),
-        reaper_exempt,
-    )
-    .await;
+    // Tool-layer retry wrapper for #98: `register_agent` is the entry tool
+    // that every multi-agent swarm calls first, so it sees the tallest
+    // concurrent burst of any tool. The inner `run_with_mvcc_retry` already
+    // widens retries (16 attempts, ~29s budget), but a same-instant burst of
+    // 6+ distinct-`project_key` callers can still exhaust the inner budget
+    // because each write serialises on the WAL. Wrap one more coarse level
+    // outside the DB call so the burst settles inside the server process
+    // instead of surfacing a transient RESOURCE_BUSY to every integrator
+    // (which would then have to reimplement its own per-tool retry policy).
+    const REGISTER_AGENT_TOOL_RETRIES: u32 = 4;
+    let agent_out = {
+        let mut attempt: u32 = 0;
+        loop {
+            let out = mcp_agent_mail_db::queries::register_agent(
+                ctx.cx(),
+                &pool,
+                project_id,
+                &agent_name,
+                &program,
+                &model,
+                task_description.as_deref(),
+                Some(&policy),
+                reaper_exempt,
+            )
+            .await;
+
+            let should_retry = matches!(&out, Outcome::Err(err) if is_register_retryable(err));
+            if !should_retry || attempt >= REGISTER_AGENT_TOOL_RETRIES {
+                break out;
+            }
+
+            tracing::warn!(
+                attempt,
+                max = REGISTER_AGENT_TOOL_RETRIES,
+                "register_agent: tool-layer retry on RESOURCE_BUSY"
+            );
+            // 500 / 1000 / 1500 / 2000 ms ladder, ±20% jitter from the low
+            // bits of wall-clock so a same-tick boot batch does not
+            // re-collide in lock-step on every retry.
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0u64, |d| u64::from(d.subsec_nanos()));
+            let sleep_ms = register_agent_retry_sleep_ms(attempt, now_ns);
+            asupersync::time::sleep(ctx.cx().now(), std::time::Duration::from_millis(sleep_ms))
+                .await;
+            attempt = attempt.saturating_add(1);
+        }
+    };
 
     let mut row = db_outcome_to_mcp_result(agent_out)?;
     enqueue_agent_semantic_index(&row);
@@ -1789,6 +1850,32 @@ mod tests {
         assert!(!is_valid_attachments_policy("detach"));
         assert!(!is_valid_attachments_policy(" auto"));
         assert!(!is_valid_attachments_policy("auto "));
+    }
+
+    #[test]
+    fn register_agent_retryable_errors_cover_busy_and_lock_paths() {
+        assert!(is_register_retryable(
+            &mcp_agent_mail_db::DbError::ResourceBusy("busy".into())
+        ));
+        assert!(is_register_retryable(&mcp_agent_mail_db::DbError::Sqlite(
+            "database is locked".into()
+        )));
+        assert!(is_register_retryable(&mcp_agent_mail_db::DbError::Pool(
+            "SQLITE_BUSY while acquiring connection".into()
+        )));
+        assert!(!is_register_retryable(&mcp_agent_mail_db::DbError::NotFound {
+            entity: "agent".into(),
+            id: "BlueLake".into(),
+        }));
+    }
+
+    #[test]
+    fn register_agent_retry_sleep_ms_stays_within_expected_jitter_window() {
+        let first_attempt = register_agent_retry_sleep_ms(0, 42);
+        assert!((400..=600).contains(&first_attempt));
+
+        let fourth_attempt = register_agent_retry_sleep_ms(3, 999_999_999);
+        assert!((1600..=2400).contains(&fourth_attempt));
     }
 
     // ── Response type serialization ──

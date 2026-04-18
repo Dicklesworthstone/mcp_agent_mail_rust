@@ -3086,15 +3086,23 @@ async fn cleanup_committed_message_after_consistency_failure(
 /// Maximum retry attempts for MVCC write conflicts (`BEGIN CONCURRENT`
 /// page-level collisions) and plain `SQLite` write contention.
 ///
-/// Read once from `FSQLITE_CONCURRENT_RETRIES` env var; default 8.
-/// Increased from 5 to 8 to give the exponential backoff (10ms..2s)
-/// enough total budget (~4s) to outlast transient WAL checkpoint stalls
-/// under sustained multi-agent write load.
+/// Read once from `FSQLITE_CONCURRENT_RETRIES` env var; default 16.
+///
+/// History:
+///   - 5  → 8: exponential backoff (25ms..2s) gets ~5s total budget to
+///     outlast transient WAL checkpoint stalls under sustained writes.
+///   - 8  → 16: #98 reported 6 concurrent `register_agent` callers with
+///     distinct `project_key`s producing a ~33 % failure rate — the 8-retry
+///     budget exhausts before all writers settle. 16 retries with the wider
+///     max-delay ceiling below give ~20s cumulative budget while staying
+///     under the 60s SQLite `busy_timeout`, so the last-in-queue writer
+///     still makes it through rather than surfacing RESOURCE_BUSY to
+///     every multi-agent swarm entry-tool caller.
 static MVCC_MAX_RETRIES: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
     std::env::var("FSQLITE_CONCURRENT_RETRIES")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(8)
+        .unwrap_or(16)
 });
 
 /// Global counter: total MVCC retries performed.
@@ -3212,17 +3220,22 @@ where
 
 /// Sleep with exponential backoff for MVCC retry.
 ///
-/// Base: 25 ms, max: 2000 ms, ±25 % jitter (via existing LCG in `retry` module).
+/// Base: 25 ms, max: 3000 ms, ±25 % jitter (via existing LCG in `retry` module).
 ///
-/// The generous ceiling (2s) lets later retries outlast WAL checkpoint stalls
-/// that typically complete within 500ms–1s under concurrent-writer load.
-/// Total budget across 8 retries: ~4s (25+50+100+200+400+800+1600+2000 ms
-/// before jitter), which keeps the caller well below the 60s `busy_timeout`.
+/// Budget summary (before jitter):
+///   - attempts 0..8 : 25+50+100+200+400+800+1600+2000 ≈ 5.2s
+///   - attempts 8..16: 3000 × 8 ≈ 24s (max-delay ceiling reached)
+///
+/// Cumulative cap across 16 retries ≈ 29s, which stays comfortably under
+/// the 60s SQLite `busy_timeout` while giving enough runway for 6+
+/// concurrent writers with ~4s each to all settle (see #98). The 3s
+/// ceiling (raised from 2s) lets later retries outlast the tail of WAL
+/// checkpoint stalls that occasionally stretch to 1-2s on busy disks.
 async fn mvcc_backoff(_cx: &Cx, attempt: u32) {
     use crate::retry::RetryConfig;
     let config = RetryConfig {
         base_delay: std::time::Duration::from_millis(25),
-        max_delay: std::time::Duration::from_secs(2),
+        max_delay: std::time::Duration::from_secs(3),
         use_circuit_breaker: false,
         ..Default::default()
     };
