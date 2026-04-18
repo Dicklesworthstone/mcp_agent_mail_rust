@@ -300,8 +300,13 @@ test_*
 !test_*.rs
 !test_*.sh
 
-# NTM (agent tmux orchestrator) runtime state — per-machine, never tracked
-.ntm/
+# NTM (agent tmux orchestrator) runtime state — per-machine churn, never tracked.
+# (Session summaries under .ntm/summaries/ are historical handoff records
+# and remain tracked deliberately.)
+.ntm/logs/
+.ntm/pids/
+.ntm/rate_limits.json
+.ntm/*.lock
 
 # ATC rollup scratch test databases (SQLite, created under crates/*)
 crates/**/atc_rollup_test_*
