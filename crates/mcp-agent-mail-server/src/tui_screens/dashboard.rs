@@ -3140,6 +3140,47 @@ fn render_bottom_rail(frame: &mut Frame<'_>, area: Rect, context: &BottomRailCon
 
     if preview.is_none() {
         if query_text.is_empty() {
+            // When the insight rail already renders operational panels,
+            // suppress them in the bottom rail to avoid duplication.
+            match insight_layout {
+                InsightRailLayout::Megagrid => {
+                    // Megagrid insight covers all 12 panel types —
+                    // bottom rail only adds a wider activity feed.
+                    render_recent_activity_panel(frame, area, entries, query_text);
+                    return;
+                }
+                InsightRailLayout::Supergrid => {
+                    // Supergrid insight covers Projects, Reservations,
+                    // ToolLatency. Bottom rail adds activity + analytics.
+                    if area.width >= ULTRAWIDE_BOTTOM_MIN_WIDTH
+                        && area.height >= ULTRAWIDE_BOTTOM_MIN_HEIGHT
+                    {
+                        let (activity_col, rest) =
+                            split_width_ratio_with_gap(area, 0.50, 1);
+                        let (mix_col, flow_col) =
+                            split_width_ratio_with_gap(rest, 0.5, 1);
+                        render_recent_activity_panel(
+                            frame,
+                            activity_col,
+                            entries,
+                            query_text,
+                        );
+                        render_event_mix_panel(frame, mix_col, entries, query_text);
+                        render_message_flow_panel(
+                            frame, flow_col, entries, query_text,
+                        );
+                    } else {
+                        render_recent_activity_panel(
+                            frame, area, entries, query_text,
+                        );
+                    }
+                    return;
+                }
+                InsightRailLayout::Hidden
+                | InsightRailLayout::Compact
+                | InsightRailLayout::Ultrawide => {}
+            }
+
             if is_ultradense_bottom_area(area) {
                 let (activity_col, rest) = split_width_ratio_with_gap(area, 0.30, 1);
                 let (mix_col, rest) = split_width_ratio_with_gap(rest, 0.25, 1);
@@ -8993,5 +9034,29 @@ mod tests {
         // 80 cols should fit all labels in 1 row
         let h = quick_filter_controls_height(80, 5);
         assert_eq!(h, 1);
+    }
+
+    #[test]
+    fn preview_footer_mode_suppresses_ops_for_megagrid_and_supergrid() {
+        assert!(matches!(
+            preview_footer_mode(InsightRailLayout::Megagrid),
+            PreviewFooterMode::PreviewAndQueryOnly
+        ));
+        assert!(matches!(
+            preview_footer_mode(InsightRailLayout::Supergrid),
+            PreviewFooterMode::SignalsOnly
+        ));
+        assert!(matches!(
+            preview_footer_mode(InsightRailLayout::Hidden),
+            PreviewFooterMode::FullMetrics
+        ));
+        assert!(matches!(
+            preview_footer_mode(InsightRailLayout::Compact),
+            PreviewFooterMode::FullMetrics
+        ));
+        assert!(matches!(
+            preview_footer_mode(InsightRailLayout::Ultrawide),
+            PreviewFooterMode::FullMetrics
+        ));
     }
 }
