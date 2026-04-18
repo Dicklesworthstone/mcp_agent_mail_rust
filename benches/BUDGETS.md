@@ -170,16 +170,17 @@ Current post-fix artifacts:
 - `tests/artifacts/perf/archive_batch_scaling.csv`
 - `tests/artifacts/perf/archive_batch_100_flamegraph.svg`
 - `tests/artifacts/perf/archive_batch_100_profile.md`
+- `tests/artifacts/perf/extended_dimensions_2026-04-18.json`
 - `benches/archive_perf_baseline.json` (checked-in CI gate baseline for warm batch-1/10/100)
 - `.github/workflows/archive-perf-gate.yml` + `scripts/bench_archive_perf_gate.sh` (PR/scheduled regression gate)
 
 Warm steady-state burst measurements (`MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 rch exec -- cargo bench ... archive_write_batch`):
 
-| Scenario | p50 | p95 | p99 | Note |
-|----------|-----|-----|-----|------|
-| batch-1 | ~11.7ms | ~12.4ms | ~13.5ms | Warm DB + warmed archive |
-| batch-10 | ~28.8ms | ~31.8ms | ~32.7ms | Storage-native batch write removes the old per-message loop overhead |
-| batch-100 | ~213.5ms | ~238.1ms | ~241.8ms | Under the `<250ms` p95 budget with ~`11.9ms` headroom |
+| Scenario | p50 | p95 | p99 | p99.9 | p99.99 | Note |
+|----------|-----|-----|-----|-------|--------|------|
+| batch-1 | ~11.7ms | ~12.4ms | ~13.5ms | ~13.5ms | ~13.5ms | Current sample count is 40, so p99.9/p99.99 collapse to the worst observed sample |
+| batch-10 | ~28.8ms | ~31.8ms | ~32.7ms | ~32.7ms | ~32.7ms | Current sample count is 25, so p99.9/p99.99 collapse to the worst observed sample |
+| batch-100 | ~213.5ms | ~238.1ms | ~241.8ms | ~241.8ms | ~241.8ms | Under the `<250ms` p95 budget with ~`11.9ms` headroom; current sample count is 12, so tail sentinels equal the worst observed sample |
 
 Scaling-law observation:
 - `batch-100 p95 / batch-1 p95 = 19.27x`, so the per-message cost at batch-100 is ~`0.193x` batch-1.
@@ -187,7 +188,11 @@ Scaling-law observation:
 
 CI perf gate policy:
 - The archive regression gate compares warm batch-1/10/100 `p95` and `p99` against `benches/archive_perf_baseline.json`.
-- The gate allows a `10%` tolerance band over the stored baseline to absorb runner noise, but still records hard budget breaches (`>250ms p95`, `>300ms p99`) separately.
+- The gate also records warm-tail sentinels (`p99.9`, `p99.99`, worst observed), direct `am serve-http` cold-start latency, and direct `am serve-http` peak RSS in a single extended-dimensions report.
+- The gate allows a `10%` tolerance band over the stored `p95`/`p99` baselines to absorb runner noise, but still records hard budget breaches (`>250ms p95`, `>300ms p99`) separately.
+- Tail regressions use a stricter guard: fail if `p99.9` regresses more than `50%` versus baseline or rises above `5x` the scenario `budget_p95`.
+- Cold-start guard: `am serve-http --no-auth --no-tui` direct probe must stay at or below the stored `285ms` allowed band, with a hard budget of `<500ms`.
+- Peak-memory guard: the same direct probe must stay at or below the stored `90MiB` allowed band, with a hard budget of `<128MiB`.
 - PRs can carry the `perf-regression-acknowledged` label for an intentional, reviewed performance tradeoff; runtime/benchmark failures are never auto-acknowledged.
 
 Span roll-up for warm batch-100:

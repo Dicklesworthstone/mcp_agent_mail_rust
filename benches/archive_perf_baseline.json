@@ -1,6 +1,6 @@
 {
-  "schema_version": 1,
-  "bead_id": "br-8qdh0.7",
+  "schema_version": 2,
+  "bead_id": "br-8qdh0.12",
   "tolerance_pct": 10.0,
   "source": {
     "captured_at": "2026-04-18",
@@ -8,6 +8,8 @@
     "artifacts": [
       "tests/artifacts/perf/archive_batch_scaling.csv",
       "tests/artifacts/perf/archive_batch_100_profile.md",
+      "tests/artifacts/perf/archive_batch_100_spans.json",
+      "tests/artifacts/perf/extended_dimensions_2026-04-18.json",
       "benches/BUDGETS.md"
     ],
     "runner_class": "reference-linux-nvme"
@@ -18,6 +20,11 @@
       "baseline_p50_us": 11732,
       "baseline_p95_us": 12352,
       "baseline_p99_us": 13517,
+      "baseline_p99_9_us": 13517,
+      "baseline_p99_99_us": 13517,
+      "baseline_max_us": 13517,
+      "allowed_p99_9_us": 20276,
+      "allowed_p99_99_us": 20276,
       "budget_p95_us": 250000,
       "budget_p99_us": 300000
     },
@@ -26,6 +33,11 @@
       "baseline_p50_us": 28817,
       "baseline_p95_us": 31751,
       "baseline_p99_us": 32664,
+      "baseline_p99_9_us": 32664,
+      "baseline_p99_99_us": 32664,
+      "baseline_max_us": 32664,
+      "allowed_p99_9_us": 48996,
+      "allowed_p99_99_us": 48996,
       "budget_p95_us": 250000,
       "budget_p99_us": 300000
     },
@@ -34,8 +46,33 @@
       "baseline_p50_us": 213468,
       "baseline_p95_us": 238053,
       "baseline_p99_us": 241759,
+      "baseline_p99_9_us": 241759,
+      "baseline_p99_99_us": 241759,
+      "baseline_max_us": 241759,
+      "allowed_p99_9_us": 362639,
+      "allowed_p99_99_us": 362639,
       "budget_p95_us": 250000,
       "budget_p99_us": 300000
+    }
+  },
+  "extended": {
+    "tail": {
+      "tail_regression_pct": 50.0,
+      "max_tail_ratio": 5.0
+    },
+    "startup": {
+      "probe": "am serve-http --host 127.0.0.1 --port <ephemeral> --path mcp --no-auth --no-tui",
+      "sample_count": 5,
+      "baseline_p95_ms": 114,
+      "allowed_p95_ms": 285,
+      "budget_p95_ms": 500,
+      "historical_http_e2e_p95_ms": 285
+    },
+    "memory": {
+      "probe": "am serve-http cold-start peak RSS from /proc/<pid>/status",
+      "baseline_peak_rss_kb": 73356,
+      "allowed_peak_rss_kb": 92160,
+      "budget_peak_rss_kb": 131072
     }
   }
 }

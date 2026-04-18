@@ -1,7 +1,15 @@
 //! ATC policy engine read path — rate-limited queries for rollups and open
 //! experiences.  Designed to avoid contending with the write hot path.
+//!
+//! Also provides the ack-overdue sweep: identifies open experiences whose
+//! attribution window has elapsed and returns them as expiry candidates.
+
+use std::collections::BTreeMap;
+use std::time::Instant;
 
 use asupersync::{Cx, Outcome};
+use mcp_agent_mail_core::atc_labeling::attribution_window;
+use mcp_agent_mail_core::experience::{EffectKind, ExperienceOutcome};
 use sqlmodel_core::{Row, Value};
 
 use crate::error::DbError;
@@ -9,8 +17,20 @@ use crate::pool::DbPool;
 
 // ── Rollup read path ────────────────────────────────────────────────
 
+/// Five-minute default rollup refresh window.
+pub const DEFAULT_ROLLUP_REFRESH_LOOKBACK_MICROS: i64 = 300_000_000;
+
+/// Hard cap on the number of strata a single refresh is allowed to touch.
+///
+/// The current ATC taxonomy is bounded by subsystem × effect_kind ×
+/// risk_tier. Keeping the cap explicit prevents accidental cardinality
+/// blowups from malformed effect metadata or future schema drift.
+pub const MAX_ROLLUP_STRATA_PER_REFRESH: usize = 64;
+
+const EWMA_LAMBDA: f64 = 0.95;
+
 /// Typed rollup row for policy engine consumption.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RollupEntry {
     pub stratum_key: String,
     pub subsystem: String,
@@ -39,6 +59,121 @@ const ROLLUP_SELECT_SQL: &str = "\
            ewma_loss, ewma_weight, delay_sum_micros, delay_count, \
            delay_max_micros, last_updated_ts \
     FROM atc_experience_rollups";
+
+const TOUCHED_STRATA_SQL: &str = "\
+    SELECT subsystem, effect_kind \
+    FROM atc_experiences \
+    WHERE created_ts >= ? OR COALESCE(resolved_ts, 0) >= ? \
+    GROUP BY subsystem, effect_kind \
+    ORDER BY subsystem, effect_kind";
+
+const ROLLUP_REFRESH_SELECT_PREFIX_SQL: &str = "\
+    SELECT experience_id, subsystem, effect_kind, state, outcome_json, \
+           created_ts, resolved_ts \
+    FROM atc_experiences WHERE ";
+
+const ROLLUP_REFRESH_UPSERT_SQL: &str = "\
+    INSERT INTO atc_experience_rollups \
+        (stratum_key, subsystem, effect_kind, risk_tier, \
+         total_count, resolved_count, censored_count, expired_count, \
+         correct_count, incorrect_count, total_regret, total_loss, \
+         ewma_loss, ewma_weight, delay_sum_micros, delay_count, \
+         delay_max_micros, last_updated_ts) \
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+    ON CONFLICT(stratum_key) DO UPDATE SET \
+        subsystem = excluded.subsystem, \
+        effect_kind = excluded.effect_kind, \
+        risk_tier = excluded.risk_tier, \
+        total_count = excluded.total_count, \
+        resolved_count = excluded.resolved_count, \
+        censored_count = excluded.censored_count, \
+        expired_count = excluded.expired_count, \
+        correct_count = excluded.correct_count, \
+        incorrect_count = excluded.incorrect_count, \
+        total_regret = excluded.total_regret, \
+        total_loss = excluded.total_loss, \
+        ewma_loss = excluded.ewma_loss, \
+        ewma_weight = excluded.ewma_weight, \
+        delay_sum_micros = excluded.delay_sum_micros, \
+        delay_count = excluded.delay_count, \
+        delay_max_micros = excluded.delay_max_micros, \
+        last_updated_ts = excluded.last_updated_ts";
+
+/// Summary of one rollup refresh pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RollupSummary {
+    pub lookback_micros: i64,
+    pub rows_scanned: usize,
+    pub rows_applied: usize,
+    pub strata_updated: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TouchedStratum {
+    stratum_key: String,
+    subsystem: String,
+    effect_kind: String,
+    risk_tier: i32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RollupAccumulator {
+    entry: Option<RollupEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct ExperienceAggregateRow {
+    subsystem: String,
+    effect_kind: String,
+    state: String,
+    outcome_json: Option<String>,
+    created_ts_micros: i64,
+    resolved_ts_micros: Option<i64>,
+}
+
+trait RollupConn {
+    fn rollup_query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String>;
+    fn rollup_execute_sync(&self, sql: &str, params: &[Value]) -> Result<(), String>;
+}
+
+impl RollupConn for crate::DbConn {
+    fn rollup_query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
+        self.query_sync(sql, params)
+            .map_err(|error| error.to_string())
+    }
+
+    fn rollup_execute_sync(&self, sql: &str, params: &[Value]) -> Result<(), String> {
+        self.execute_sync(sql, params)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl RollupConn for sqlmodel_pool::PooledConnection<crate::DbConn> {
+    fn rollup_query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
+        self.query_sync(sql, params)
+            .map_err(|error| error.to_string())
+    }
+
+    fn rollup_execute_sync(&self, sql: &str, params: &[Value]) -> Result<(), String> {
+        self.execute_sync(sql, params)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl RollupConn for crate::CanonicalDbConn {
+    fn rollup_query_sync(&self, sql: &str, params: &[Value]) -> Result<Vec<Row>, String> {
+        self.query_sync(sql, params)
+            .map_err(|error| error.to_string())
+    }
+
+    fn rollup_execute_sync(&self, sql: &str, params: &[Value]) -> Result<(), String> {
+        self.execute_sync(sql, params)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
 
 fn row_text_idx(row: &Row, idx: usize) -> String {
     row.get(idx)
@@ -92,6 +227,386 @@ fn decode_rollup_row(row: &Row) -> RollupEntry {
         delay_count: row_i64_idx(row, 15),
         delay_max_micros: row_i64_idx(row, 16),
         last_updated_ts: row_i64_idx(row, 17),
+    }
+}
+
+fn decode_experience_aggregate_row(row: &Row) -> ExperienceAggregateRow {
+    ExperienceAggregateRow {
+        subsystem: row_text_idx(row, 1),
+        effect_kind: row_text_idx(row, 2),
+        state: row_text_idx(row, 3),
+        outcome_json: row.get(4).and_then(|value| match value {
+            Value::Text(raw) if !raw.is_empty() => Some(raw.clone()),
+            _ => None,
+        }),
+        created_ts_micros: row_i64_idx(row, 5),
+        resolved_ts_micros: opt_i64(row, 6),
+    }
+}
+
+fn risk_tier_for_effect_kind(raw: &str) -> Option<i32> {
+    match parse_effect_kind(raw)? {
+        EffectKind::Advisory | EffectKind::Probe | EffectKind::NoAction => Some(0),
+        EffectKind::RoutingSuggestion | EffectKind::Backpressure => Some(1),
+        EffectKind::Release | EffectKind::ForceReservation => Some(2),
+    }
+}
+
+fn stratum_for_row(subsystem: &str, effect_kind: &str) -> Option<TouchedStratum> {
+    let risk_tier = risk_tier_for_effect_kind(effect_kind)?;
+    Some(TouchedStratum {
+        stratum_key: format!("{subsystem}:{effect_kind}:{risk_tier}"),
+        subsystem: subsystem.to_string(),
+        effect_kind: effect_kind.to_string(),
+        risk_tier,
+    })
+}
+
+fn query_touched_strata(rows: &[Row]) -> BTreeMap<String, TouchedStratum> {
+    let mut strata = BTreeMap::new();
+    for row in rows {
+        let subsystem = row_text_idx(row, 0);
+        let effect_kind = row_text_idx(row, 1);
+        if let Some(stratum) = stratum_for_row(&subsystem, &effect_kind) {
+            strata.insert(stratum.stratum_key.clone(), stratum);
+        }
+    }
+    strata
+}
+
+fn build_rollup_refresh_scan_query(
+    strata: impl Iterator<Item = TouchedStratum>,
+) -> (String, Vec<Value>) {
+    let mut sql = String::from(ROLLUP_REFRESH_SELECT_PREFIX_SQL);
+    let mut params = Vec::new();
+    let mut wrote_any = false;
+    for stratum in strata {
+        if wrote_any {
+            sql.push_str(" OR ");
+        }
+        wrote_any = true;
+        sql.push_str("(subsystem = ? AND effect_kind = ?)");
+        params.push(Value::Text(stratum.subsystem));
+        params.push(Value::Text(stratum.effect_kind));
+    }
+    sql.push_str(
+        " ORDER BY subsystem, effect_kind, COALESCE(resolved_ts, created_ts), experience_id",
+    );
+    (sql, params)
+}
+
+fn build_existing_rollups_query(stratum_count: usize) -> String {
+    let placeholders = std::iter::repeat_n("?", stratum_count)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{ROLLUP_SELECT_SQL} WHERE stratum_key IN ({placeholders}) ORDER BY stratum_key")
+}
+
+fn decode_existing_rollups(rows: &[Row]) -> BTreeMap<String, RollupEntry> {
+    rows.iter()
+        .map(decode_rollup_row)
+        .map(|entry| (entry.stratum_key.clone(), entry))
+        .collect()
+}
+
+fn tracked_rollup_state(state: &str) -> bool {
+    matches!(state, "open" | "resolved" | "censored" | "expired")
+}
+
+fn apply_resolution_delay(
+    entry: &mut RollupEntry,
+    created_ts_micros: i64,
+    resolved_ts_micros: Option<i64>,
+) {
+    let Some(resolved_ts_micros) = resolved_ts_micros else {
+        return;
+    };
+    let delay_micros = resolved_ts_micros.saturating_sub(created_ts_micros);
+    entry.delay_sum_micros = entry.delay_sum_micros.saturating_add(delay_micros);
+    entry.delay_count = entry.delay_count.saturating_add(1);
+    entry.delay_max_micros = entry.delay_max_micros.max(delay_micros);
+}
+
+fn apply_resolved_outcome(entry: &mut RollupEntry, outcome: Option<ExperienceOutcome>) {
+    let Some(outcome) = outcome else {
+        return;
+    };
+    if outcome.correct {
+        entry.correct_count = entry.correct_count.saturating_add(1);
+    } else {
+        entry.incorrect_count = entry.incorrect_count.saturating_add(1);
+    }
+    let actual_loss = outcome.actual_loss.unwrap_or(0.0);
+    let regret = outcome.regret.unwrap_or(0.0);
+    entry.total_loss += actual_loss;
+    entry.total_regret += regret;
+    if entry.ewma_weight == 0.0 {
+        entry.ewma_loss = actual_loss;
+        entry.ewma_weight = 1.0;
+        return;
+    }
+    let one_minus_lambda = 1.0 - EWMA_LAMBDA;
+    entry.ewma_loss = (EWMA_LAMBDA * entry.ewma_loss) + (one_minus_lambda * actual_loss);
+    entry.ewma_weight = (EWMA_LAMBDA * entry.ewma_weight) + 1.0;
+}
+
+fn accumulate_rollup_row(
+    aggregates: &mut BTreeMap<String, RollupAccumulator>,
+    row: ExperienceAggregateRow,
+) {
+    if !tracked_rollup_state(&row.state) {
+        return;
+    }
+    let Some(stratum) = stratum_for_row(&row.subsystem, &row.effect_kind) else {
+        return;
+    };
+    let accumulator = aggregates.entry(stratum.stratum_key.clone()).or_default();
+    let entry = accumulator.entry.get_or_insert_with(|| RollupEntry {
+        stratum_key: stratum.stratum_key.clone(),
+        subsystem: stratum.subsystem.clone(),
+        effect_kind: stratum.effect_kind.clone(),
+        risk_tier: stratum.risk_tier,
+        total_count: 0,
+        resolved_count: 0,
+        censored_count: 0,
+        expired_count: 0,
+        correct_count: 0,
+        incorrect_count: 0,
+        total_regret: 0.0,
+        total_loss: 0.0,
+        ewma_loss: 0.0,
+        ewma_weight: 0.0,
+        delay_sum_micros: 0,
+        delay_count: 0,
+        delay_max_micros: 0,
+        last_updated_ts: 0,
+    });
+    entry.total_count = entry.total_count.saturating_add(1);
+    entry.last_updated_ts = entry
+        .last_updated_ts
+        .max(row.resolved_ts_micros.unwrap_or(row.created_ts_micros));
+
+    match row.state.as_str() {
+        "open" => {}
+        "resolved" => {
+            entry.resolved_count = entry.resolved_count.saturating_add(1);
+            let outcome = row
+                .outcome_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<ExperienceOutcome>(raw).ok());
+            apply_resolved_outcome(entry, outcome);
+            apply_resolution_delay(entry, row.created_ts_micros, row.resolved_ts_micros);
+        }
+        "censored" => {
+            entry.censored_count = entry.censored_count.saturating_add(1);
+            apply_resolution_delay(entry, row.created_ts_micros, row.resolved_ts_micros);
+        }
+        "expired" => {
+            entry.expired_count = entry.expired_count.saturating_add(1);
+            apply_resolution_delay(entry, row.created_ts_micros, row.resolved_ts_micros);
+        }
+        _ => {}
+    }
+}
+
+fn finalize_rollups(rows: &[Row]) -> BTreeMap<String, RollupEntry> {
+    let mut aggregates = BTreeMap::new();
+    for row in rows {
+        accumulate_rollup_row(&mut aggregates, decode_experience_aggregate_row(row));
+    }
+    aggregates
+        .into_iter()
+        .filter_map(|(stratum_key, accumulator)| {
+            accumulator.entry.map(|entry| (stratum_key, entry))
+        })
+        .collect()
+}
+
+fn upsert_rollup_entry(conn: &impl RollupConn, entry: &RollupEntry) -> Result<(), DbError> {
+    let params = vec![
+        Value::Text(entry.stratum_key.clone()),
+        Value::Text(entry.subsystem.clone()),
+        Value::Text(entry.effect_kind.clone()),
+        Value::Int(entry.risk_tier),
+        Value::BigInt(entry.total_count),
+        Value::BigInt(entry.resolved_count),
+        Value::BigInt(entry.censored_count),
+        Value::BigInt(entry.expired_count),
+        Value::BigInt(entry.correct_count),
+        Value::BigInt(entry.incorrect_count),
+        Value::Double(entry.total_regret),
+        Value::Double(entry.total_loss),
+        Value::Double(entry.ewma_loss),
+        Value::Double(entry.ewma_weight),
+        Value::BigInt(entry.delay_sum_micros),
+        Value::BigInt(entry.delay_count),
+        Value::BigInt(entry.delay_max_micros),
+        Value::BigInt(entry.last_updated_ts),
+    ];
+    conn.rollup_execute_sync(ROLLUP_REFRESH_UPSERT_SQL, &params)
+        .map_err(|error| DbError::Sqlite(format!("refresh_rollups upsert: {error}")))
+}
+
+fn refresh_rollups_with_conn(
+    conn: &impl RollupConn,
+    now_micros: i64,
+    lookback_micros: i64,
+) -> Result<RollupSummary, DbError> {
+    let refresh_started = Instant::now();
+    let cutoff_micros = now_micros.saturating_sub(lookback_micros.max(0));
+    let touched_rows = conn
+        .rollup_query_sync(
+            TOUCHED_STRATA_SQL,
+            &[Value::BigInt(cutoff_micros), Value::BigInt(cutoff_micros)],
+        )
+        .map_err(|error| DbError::Sqlite(format!("refresh_rollups touched strata: {error}")))?;
+    let mut touched = query_touched_strata(&touched_rows);
+    let touched_count_before = touched.len();
+
+    tracing::debug!(
+        event = "atc.rollup.refresh_start",
+        lookback_micros,
+        strata_count_before = touched_count_before,
+        "starting ATC rollup refresh"
+    );
+
+    if touched_count_before > MAX_ROLLUP_STRATA_PER_REFRESH {
+        tracing::warn!(
+            event = "atc.rollup.cardinality_warning",
+            stratum_type = "subsystem+effect_kind+risk_tier",
+            current_count = touched_count_before,
+            limit = MAX_ROLLUP_STRATA_PER_REFRESH,
+            "ATC rollup refresh capped touched strata to prevent cardinality blowup"
+        );
+        touched = touched
+            .into_iter()
+            .take(MAX_ROLLUP_STRATA_PER_REFRESH)
+            .collect();
+    }
+
+    if touched.is_empty() {
+        let duration_micros =
+            i64::try_from(refresh_started.elapsed().as_micros()).unwrap_or(i64::MAX);
+        mcp_agent_mail_core::global_metrics()
+            .atc
+            .record_rollup_refresh(u64::try_from(duration_micros.max(0)).unwrap_or(u64::MAX));
+        tracing::debug!(
+            event = "atc.rollup.refresh_complete",
+            duration_micros,
+            strata_updated = 0,
+            rows_scanned = 0,
+            rows_applied = 0,
+            "ATC rollup refresh found no touched strata"
+        );
+        return Ok(RollupSummary {
+            lookback_micros,
+            rows_scanned: 0,
+            rows_applied: 0,
+            strata_updated: 0,
+        });
+    }
+
+    let existing_sql = build_existing_rollups_query(touched.len());
+    let existing_params = touched.keys().cloned().map(Value::Text).collect::<Vec<_>>();
+    let existing_rows = conn
+        .rollup_query_sync(&existing_sql, &existing_params)
+        .map_err(|error| DbError::Sqlite(format!("refresh_rollups existing rows: {error}")))?;
+    let existing = decode_existing_rollups(&existing_rows);
+
+    let (refresh_sql, refresh_params) = build_rollup_refresh_scan_query(touched.values().cloned());
+    let raw_rows = conn
+        .rollup_query_sync(&refresh_sql, &refresh_params)
+        .map_err(|error| DbError::Sqlite(format!("refresh_rollups scan: {error}")))?;
+    let refreshed = finalize_rollups(&raw_rows);
+
+    conn.rollup_execute_sync("BEGIN IMMEDIATE", &[])
+        .map_err(|error| DbError::Sqlite(format!("refresh_rollups begin: {error}")))?;
+    let mut rows_applied = 0_usize;
+    let write_result = (|| -> Result<(), DbError> {
+        for (stratum_key, entry) in &refreshed {
+            upsert_rollup_entry(conn, entry)?;
+            rows_applied = rows_applied.saturating_add(1);
+            let previous = existing.get(stratum_key);
+            if previous != Some(entry) {
+                tracing::debug!(
+                    event = "atc.rollup.stratum_updated",
+                    stratum_key,
+                    from_total_count = previous.map_or(0, |row| row.total_count),
+                    to_total_count = entry.total_count,
+                    from_resolved_count = previous.map_or(0, |row| row.resolved_count),
+                    to_resolved_count = entry.resolved_count,
+                    from_censored_count = previous.map_or(0, |row| row.censored_count),
+                    to_censored_count = entry.censored_count,
+                    from_expired_count = previous.map_or(0, |row| row.expired_count),
+                    to_expired_count = entry.expired_count,
+                    "updated ATC rollup stratum"
+                );
+            }
+        }
+        conn.rollup_execute_sync("COMMIT", &[])
+            .map_err(|error| DbError::Sqlite(format!("refresh_rollups commit: {error}")))
+    })();
+    if let Err(error) = write_result {
+        let _ = conn.rollup_execute_sync("ROLLBACK", &[]);
+        return Err(error);
+    }
+
+    let duration_micros = i64::try_from(refresh_started.elapsed().as_micros()).unwrap_or(i64::MAX);
+    mcp_agent_mail_core::global_metrics()
+        .atc
+        .record_rollup_refresh(u64::try_from(duration_micros.max(0)).unwrap_or(u64::MAX));
+    tracing::debug!(
+        event = "atc.rollup.refresh_complete",
+        duration_micros,
+        strata_updated = refreshed.len(),
+        rows_scanned = raw_rows.len(),
+        rows_applied,
+        "completed ATC rollup refresh"
+    );
+
+    Ok(RollupSummary {
+        lookback_micros,
+        rows_scanned: raw_rows.len(),
+        rows_applied,
+        strata_updated: refreshed.len(),
+    })
+}
+
+/// Refresh ATC rollups for any strata touched inside the lookback window.
+///
+/// The refresh path scans recently touched experiences to find impacted
+/// strata, recomputes each impacted stratum from raw rows, and then
+/// performs absolute upserts into `atc_experience_rollups`. This keeps the
+/// write hot path append-friendly while still giving the policy engine a
+/// bounded, idempotent aggregate view.
+pub async fn refresh_rollups(
+    cx: &Cx,
+    pool: &DbPool,
+    now_micros: i64,
+    lookback_micros: i64,
+) -> Outcome<RollupSummary, DbError> {
+    if pool.sqlite_path() != ":memory:" {
+        return match crate::queries::open_canonical_atc_conn(pool, "refresh_rollups") {
+            Ok(conn) => {
+                let result = refresh_rollups_with_conn(&conn, now_micros, lookback_micros);
+                crate::queries::close_canonical_db_conn(conn, "refresh_rollups connection");
+                match result {
+                    Ok(summary) => Outcome::Ok(summary),
+                    Err(error) => Outcome::Err(error),
+                }
+            }
+            Err(error) => Outcome::Err(error),
+        };
+    }
+    let conn = match pool.acquire(cx).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(DbError::Sqlite(error.to_string())),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    match refresh_rollups_with_conn(&conn, now_micros, lookback_micros) {
+        Ok(summary) => Outcome::Ok(summary),
+        Err(error) => Outcome::Err(error),
     }
 }
 
@@ -210,9 +725,7 @@ fn decode_open_experience(row: &Row) -> OpenExperienceSummary {
     }
 }
 
-fn build_open_experience_query(
-    filter: &OpenExperienceFilter,
-) -> (String, Vec<Value>) {
+fn build_open_experience_query(filter: &OpenExperienceFilter) -> (String, Vec<Value>) {
     let mut sql = String::from(OPEN_EXPERIENCE_BASE_SQL);
     let mut params = Vec::new();
     if let Some(ref subsystem) = filter.subsystem {
@@ -277,29 +790,380 @@ pub async fn query_open_experiences(
     let (sql, params) = build_open_experience_query(filter);
     match conn.query_sync(&sql, &params) {
         Ok(rows) => Outcome::Ok(rows.iter().map(|r| decode_open_experience(r)).collect()),
-        Err(error) => {
-            Outcome::Err(DbError::Sqlite(format!("query_open_experiences: {error}")))
+        Err(error) => Outcome::Err(DbError::Sqlite(format!("query_open_experiences: {error}"))),
+    }
+}
+
+// ── Ack-overdue / attribution-window expiry sweep ──────────────────
+
+/// An open experience whose attribution window has elapsed.
+#[derive(Debug, Clone)]
+pub struct ExpiredExperienceCandidate {
+    pub experience_id: u64,
+    pub effect_kind: String,
+    pub subject: String,
+    pub subsystem: String,
+    pub created_ts_micros: i64,
+    pub window_micros: i64,
+}
+
+fn parse_effect_kind(raw: &str) -> Option<EffectKind> {
+    match raw {
+        "advisory" => Some(EffectKind::Advisory),
+        "probe" => Some(EffectKind::Probe),
+        "release" => Some(EffectKind::Release),
+        "force_reservation" => Some(EffectKind::ForceReservation),
+        "routing_suggestion" => Some(EffectKind::RoutingSuggestion),
+        "backpressure" => Some(EffectKind::Backpressure),
+        "no_action" => Some(EffectKind::NoAction),
+        _ => None,
+    }
+}
+
+/// Identify open experiences whose attribution window has elapsed.
+///
+/// Scans all non-terminal experiences and compares each row's
+/// `created_ts_micros + attribution_window(effect_kind).max_window_micros`
+/// against `now_micros`.  Returns candidates suitable for
+/// `resolve_experience(..., ResolutionKind::Expired { ts_micros })`.
+pub fn find_expired_experiences(
+    open: &[OpenExperienceSummary],
+    now_micros: i64,
+) -> Vec<ExpiredExperienceCandidate> {
+    let mut candidates = Vec::new();
+    for exp in open {
+        let kind = match parse_effect_kind(&exp.effect_kind) {
+            Some(k) => k,
+            None => continue,
+        };
+        let window = attribution_window(kind);
+        let deadline = exp
+            .created_ts_micros
+            .saturating_add(window.max_window_micros);
+        if now_micros >= deadline {
+            #[allow(clippy::cast_sign_loss)]
+            candidates.push(ExpiredExperienceCandidate {
+                experience_id: exp.experience_id as u64,
+                effect_kind: exp.effect_kind.clone(),
+                subject: exp.subject.clone(),
+                subsystem: exp.subsystem.clone(),
+                created_ts_micros: exp.created_ts_micros,
+                window_micros: window.max_window_micros,
+            });
         }
     }
+    candidates
+}
+
+/// Query open experiences and return those whose attribution window has
+/// elapsed, ready for expiry resolution.
+///
+/// Combines `query_open_experiences` with `find_expired_experiences` into
+/// a single async call for sweep-loop convenience.
+pub async fn sweep_expired_experiences(
+    cx: &Cx,
+    pool: &DbPool,
+    now_micros: i64,
+) -> Outcome<Vec<ExpiredExperienceCandidate>, DbError> {
+    let filter = OpenExperienceFilter::default();
+    let open = match query_open_experiences(cx, pool, &filter).await {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    Outcome::Ok(find_expired_experiences(&open, now_micros))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::runtime::RuntimeBuilder;
+    use proptest::prelude::*;
+    use std::sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    static TEST_POOL_ID: AtomicU64 = AtomicU64::new(1);
+    static TEST_POOL_DIRS: OnceLock<Mutex<Vec<tempfile::TempDir>>> = OnceLock::new();
 
     fn make_row(names: Vec<&str>, values: Vec<Value>) -> Row {
         Row::new(names.into_iter().map(String::from).collect(), values)
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestExperienceSpec {
+        experience_id: i64,
+        subsystem: String,
+        effect_kind: String,
+        state: String,
+        created_ts_micros: i64,
+        resolved_ts_micros: Option<i64>,
+        correct: Option<bool>,
+        actual_loss: Option<f64>,
+        regret: Option<f64>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct ExpectedCounts {
+        total_count: i64,
+        resolved_count: i64,
+        censored_count: i64,
+        expired_count: i64,
+        correct_count: i64,
+        incorrect_count: i64,
+    }
+
+    fn test_pool() -> DbPool {
+        let pool_id = TEST_POOL_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join(format!("atc_rollup_test_{pool_id}.db"));
+        let init_conn = crate::CanonicalDbConn::open_file(db_path.display().to_string())
+            .expect("open canonical ATC test db");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply ATC test pragmas");
+        let base_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&base_sql)
+            .expect("apply ATC test base schema");
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build ATC query setup runtime");
+        let cx = Cx::for_testing();
+        runtime
+            .block_on(crate::schema::migrate_to_latest_base(&cx, &init_conn))
+            .into_result()
+            .expect("migrate ATC test schema");
+        crate::queries::close_canonical_db_conn(init_conn, "ATC rollup test init connection");
+
+        crate::create_pool(&crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .map(|pool| {
+            TEST_POOL_DIRS
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .expect("lock test tempdir registry")
+                .push(dir);
+            pool
+        })
+        .expect("create file-backed ATC test pool")
+    }
+
+    fn encode_outcome(spec: &TestExperienceSpec) -> Option<String> {
+        if spec.state != "resolved" {
+            return None;
+        }
+        let outcome = ExperienceOutcome {
+            observed_ts_micros: spec
+                .resolved_ts_micros
+                .expect("resolved rows need resolved timestamp"),
+            label: if spec.correct.unwrap_or(false) {
+                "correct"
+            } else {
+                "incorrect"
+            }
+            .to_string(),
+            correct: spec.correct.unwrap_or(false),
+            actual_loss: spec.actual_loss,
+            regret: spec.regret,
+            evidence: None,
+        };
+        Some(serde_json::to_string(&outcome).expect("serialize outcome"))
+    }
+
+    fn insert_experience(pool: &DbPool, spec: &TestExperienceSpec) {
+        let conn =
+            crate::queries::open_canonical_atc_conn(pool, "insert_atc_rollup_test_experience")
+                .expect("open canonical ATC test connection");
+        let params = vec![
+            Value::BigInt(spec.experience_id),
+            Value::BigInt(spec.experience_id),
+            Value::BigInt(spec.experience_id),
+            Value::Text(format!("trc-{}", spec.experience_id)),
+            Value::Text(format!("clm-{}", spec.experience_id)),
+            Value::Text(format!("evi-{}", spec.experience_id)),
+            Value::Text(spec.state.clone()),
+            Value::Text(spec.subsystem.clone()),
+            Value::Text("unit_test".to_string()),
+            Value::Text(format!("agent-{}", spec.experience_id)),
+            Value::Text(spec.effect_kind.clone()),
+            Value::Text("test_action".to_string()),
+            Value::Double(0.0),
+            Value::Int(1),
+            Value::BigInt(spec.created_ts_micros),
+            spec.resolved_ts_micros.map_or(Value::Null, Value::BigInt),
+            encode_outcome(spec).map_or(Value::Null, Value::Text),
+        ];
+        conn.execute_sync(
+            "INSERT INTO atc_experiences \
+                (experience_id, decision_id, effect_id, trace_id, claim_id, evidence_id, \
+                 state, subsystem, decision_class, subject, effect_kind, action, \
+                 expected_loss, feature_schema_version, created_ts, resolved_ts, outcome_json) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &params,
+        )
+        .expect("insert ATC experience");
+        crate::queries::close_canonical_db_conn(conn, "insert ATC test experience");
+    }
+
+    fn run_refresh(pool: &DbPool, now_micros: i64, lookback_micros: i64) -> RollupSummary {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build refresh runtime");
+        let cx = Cx::for_testing();
+        match runtime.block_on(refresh_rollups(&cx, pool, now_micros, lookback_micros)) {
+            Outcome::Ok(summary) => summary,
+            Outcome::Err(error) => panic!("refresh_rollups failed: {error}"),
+            Outcome::Cancelled(reason) => panic!("refresh_rollups cancelled: {reason:?}"),
+            Outcome::Panicked(payload) => std::panic::resume_unwind(Box::new(payload)),
+        }
+    }
+
+    fn fetch_rollups(pool: &DbPool) -> Vec<RollupEntry> {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build query runtime");
+        let cx = Cx::for_testing();
+        match runtime.block_on(query_rollups(&cx, pool)) {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(error) => panic!("query_rollups failed: {error}"),
+            Outcome::Cancelled(reason) => panic!("query_rollups cancelled: {reason:?}"),
+            Outcome::Panicked(payload) => std::panic::resume_unwind(Box::new(payload)),
+        }
+    }
+
+    fn rollups_by_key(rows: Vec<RollupEntry>) -> BTreeMap<String, RollupEntry> {
+        rows.into_iter()
+            .map(|entry| (entry.stratum_key.clone(), entry))
+            .collect()
+    }
+
+    fn expected_counts(specs: &[TestExperienceSpec]) -> BTreeMap<String, ExpectedCounts> {
+        let mut counts = BTreeMap::new();
+        for spec in specs {
+            if !tracked_rollup_state(&spec.state) {
+                continue;
+            }
+            let Some(stratum) = stratum_for_row(&spec.subsystem, &spec.effect_kind) else {
+                continue;
+            };
+            let entry = counts.entry(stratum.stratum_key).or_insert(ExpectedCounts {
+                total_count: 0,
+                resolved_count: 0,
+                censored_count: 0,
+                expired_count: 0,
+                correct_count: 0,
+                incorrect_count: 0,
+            });
+            entry.total_count += 1;
+            match spec.state.as_str() {
+                "resolved" => {
+                    entry.resolved_count += 1;
+                    if spec.correct.unwrap_or(false) {
+                        entry.correct_count += 1;
+                    } else {
+                        entry.incorrect_count += 1;
+                    }
+                }
+                "censored" => entry.censored_count += 1,
+                "expired" => entry.expired_count += 1,
+                "open" => {}
+                other => panic!("unexpected test state: {other}"),
+            }
+        }
+        counts
+    }
+
+    fn max_touch_ts(specs: &[TestExperienceSpec]) -> i64 {
+        specs
+            .iter()
+            .map(|spec| spec.resolved_ts_micros.unwrap_or(spec.created_ts_micros))
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn effect_kind_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("probe".to_string()),
+            Just("advisory".to_string()),
+            Just("release".to_string()),
+            Just("backpressure".to_string()),
+        ]
+    }
+
+    fn state_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("open".to_string()),
+            Just("resolved".to_string()),
+            Just("censored".to_string()),
+            Just("expired".to_string()),
+        ]
+    }
+
+    fn experience_specs_strategy() -> impl Strategy<Value = Vec<TestExperienceSpec>> {
+        prop::collection::vec((effect_kind_strategy(), state_strategy(), 0_u8..=1), 1..12).prop_map(
+            |items| {
+                items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, (effect_kind, state, flag))| {
+                        let created_ts_micros = 1_000_000 + (idx as i64 * 10_000);
+                        let resolved_ts_micros = match state.as_str() {
+                            "open" => None,
+                            _ => Some(created_ts_micros + 5_000),
+                        };
+                        let resolved = state == "resolved";
+                        TestExperienceSpec {
+                            experience_id: (idx as i64) + 1,
+                            subsystem: if idx % 2 == 0 {
+                                "liveness".to_string()
+                            } else {
+                                "deadlock".to_string()
+                            },
+                            effect_kind,
+                            state,
+                            created_ts_micros,
+                            resolved_ts_micros,
+                            correct: resolved.then_some(flag == 1),
+                            actual_loss: resolved.then_some(if flag == 1 { 0.0 } else { 1.5 }),
+                            regret: resolved.then_some(if flag == 1 { 0.0 } else { 0.5 }),
+                        }
+                    })
+                    .collect()
+            },
+        )
     }
 
     #[test]
     fn decode_rollup_row_handles_all_fields() {
         let row = make_row(
             vec![
-                "stratum_key", "subsystem", "effect_kind", "risk_tier",
-                "total_count", "resolved_count", "censored_count", "expired_count",
-                "correct_count", "incorrect_count", "total_regret", "total_loss",
-                "ewma_loss", "ewma_weight", "delay_sum_micros", "delay_count",
-                "delay_max_micros", "last_updated_ts",
+                "stratum_key",
+                "subsystem",
+                "effect_kind",
+                "risk_tier",
+                "total_count",
+                "resolved_count",
+                "censored_count",
+                "expired_count",
+                "correct_count",
+                "incorrect_count",
+                "total_regret",
+                "total_loss",
+                "ewma_loss",
+                "ewma_weight",
+                "delay_sum_micros",
+                "delay_count",
+                "delay_max_micros",
+                "last_updated_ts",
             ],
             vec![
                 Value::Text("liveness|probe|0".to_string()),
@@ -346,11 +1210,24 @@ mod tests {
     fn decode_open_experience_handles_nulls() {
         let row = make_row(
             vec![
-                "experience_id", "decision_id", "effect_id", "trace_id",
-                "claim_id", "evidence_id", "state", "subsystem",
-                "decision_class", "subject", "project_key", "policy_id",
-                "effect_kind", "action", "expected_loss", "created_ts",
-                "dispatched_ts", "executed_ts",
+                "experience_id",
+                "decision_id",
+                "effect_id",
+                "trace_id",
+                "claim_id",
+                "evidence_id",
+                "state",
+                "subsystem",
+                "decision_class",
+                "subject",
+                "project_key",
+                "policy_id",
+                "effect_kind",
+                "action",
+                "expected_loss",
+                "created_ts",
+                "dispatched_ts",
+                "executed_ts",
             ],
             vec![
                 Value::BigInt(42),
@@ -406,5 +1283,355 @@ mod tests {
         assert!(sql.contains("AND project_key = ?"));
         assert!(sql.contains("LIMIT 50"));
         assert_eq!(params.len(), 3);
+    }
+
+    #[test]
+    fn refresh_rollups_single_row_counts_one() {
+        let pool = test_pool();
+        let spec = TestExperienceSpec {
+            experience_id: 1,
+            subsystem: "liveness".to_string(),
+            effect_kind: "probe".to_string(),
+            state: "resolved".to_string(),
+            created_ts_micros: 1_000_000,
+            resolved_ts_micros: Some(1_005_000),
+            correct: Some(true),
+            actual_loss: Some(0.25),
+            regret: Some(0.05),
+        };
+        insert_experience(&pool, &spec);
+
+        let summary = run_refresh(&pool, 1_010_000, DEFAULT_ROLLUP_REFRESH_LOOKBACK_MICROS);
+        let rollups = rollups_by_key(fetch_rollups(&pool));
+        let row = rollups
+            .get("liveness:probe:0")
+            .expect("single stratum rollup row");
+
+        assert_eq!(summary.rows_scanned, 1);
+        assert_eq!(summary.rows_applied, 1);
+        assert_eq!(summary.strata_updated, 1);
+        assert_eq!(row.total_count, 1);
+        assert_eq!(row.resolved_count, 1);
+        assert_eq!(row.correct_count, 1);
+        assert_eq!(row.incorrect_count, 0);
+        assert_eq!(row.delay_sum_micros, 5_000);
+        assert_eq!(row.delay_count, 1);
+        assert_eq!(row.delay_max_micros, 5_000);
+        assert!((row.total_loss - 0.25).abs() < f64::EPSILON);
+        assert!((row.total_regret - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn refresh_rollups_multi_stratum_counts_match() {
+        let pool = test_pool();
+        let specs = vec![
+            TestExperienceSpec {
+                experience_id: 1,
+                subsystem: "liveness".to_string(),
+                effect_kind: "probe".to_string(),
+                state: "resolved".to_string(),
+                created_ts_micros: 1_000_000,
+                resolved_ts_micros: Some(1_005_000),
+                correct: Some(true),
+                actual_loss: Some(0.0),
+                regret: Some(0.0),
+            },
+            TestExperienceSpec {
+                experience_id: 2,
+                subsystem: "liveness".to_string(),
+                effect_kind: "probe".to_string(),
+                state: "expired".to_string(),
+                created_ts_micros: 1_010_000,
+                resolved_ts_micros: Some(1_020_000),
+                correct: None,
+                actual_loss: None,
+                regret: None,
+            },
+            TestExperienceSpec {
+                experience_id: 3,
+                subsystem: "deadlock".to_string(),
+                effect_kind: "release".to_string(),
+                state: "censored".to_string(),
+                created_ts_micros: 1_030_000,
+                resolved_ts_micros: Some(1_040_000),
+                correct: None,
+                actual_loss: None,
+                regret: None,
+            },
+            TestExperienceSpec {
+                experience_id: 4,
+                subsystem: "deadlock".to_string(),
+                effect_kind: "release".to_string(),
+                state: "open".to_string(),
+                created_ts_micros: 1_050_000,
+                resolved_ts_micros: None,
+                correct: None,
+                actual_loss: None,
+                regret: None,
+            },
+        ];
+        for spec in &specs {
+            insert_experience(&pool, spec);
+        }
+
+        run_refresh(
+            &pool,
+            max_touch_ts(&specs) + 1,
+            DEFAULT_ROLLUP_REFRESH_LOOKBACK_MICROS,
+        );
+        let rollups = rollups_by_key(fetch_rollups(&pool));
+
+        let probe = rollups.get("liveness:probe:0").expect("probe rollup");
+        assert_eq!(probe.total_count, 2);
+        assert_eq!(probe.resolved_count, 1);
+        assert_eq!(probe.expired_count, 1);
+
+        let release = rollups.get("deadlock:release:2").expect("release rollup");
+        assert_eq!(release.total_count, 2);
+        assert_eq!(release.censored_count, 1);
+        assert_eq!(release.resolved_count, 0);
+        assert_eq!(release.expired_count, 0);
+    }
+
+    #[test]
+    fn refresh_rollups_is_idempotent() {
+        let pool = test_pool();
+        let specs = vec![
+            TestExperienceSpec {
+                experience_id: 1,
+                subsystem: "liveness".to_string(),
+                effect_kind: "probe".to_string(),
+                state: "resolved".to_string(),
+                created_ts_micros: 1_000_000,
+                resolved_ts_micros: Some(1_004_000),
+                correct: Some(false),
+                actual_loss: Some(1.0),
+                regret: Some(0.4),
+            },
+            TestExperienceSpec {
+                experience_id: 2,
+                subsystem: "liveness".to_string(),
+                effect_kind: "probe".to_string(),
+                state: "open".to_string(),
+                created_ts_micros: 1_020_000,
+                resolved_ts_micros: None,
+                correct: None,
+                actual_loss: None,
+                regret: None,
+            },
+        ];
+        for spec in &specs {
+            insert_experience(&pool, spec);
+        }
+
+        let now_micros = max_touch_ts(&specs) + 1;
+        run_refresh(&pool, now_micros, DEFAULT_ROLLUP_REFRESH_LOOKBACK_MICROS);
+        let first = fetch_rollups(&pool);
+        run_refresh(&pool, now_micros, DEFAULT_ROLLUP_REFRESH_LOOKBACK_MICROS);
+        let second = fetch_rollups(&pool);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn refresh_rollups_window_bound_updates_only_recent_stratum() {
+        let pool = test_pool();
+        let old = TestExperienceSpec {
+            experience_id: 1,
+            subsystem: "liveness".to_string(),
+            effect_kind: "probe".to_string(),
+            state: "resolved".to_string(),
+            created_ts_micros: 100,
+            resolved_ts_micros: Some(200),
+            correct: Some(true),
+            actual_loss: Some(0.0),
+            regret: Some(0.0),
+        };
+        let recent = TestExperienceSpec {
+            experience_id: 2,
+            subsystem: "deadlock".to_string(),
+            effect_kind: "release".to_string(),
+            state: "resolved".to_string(),
+            created_ts_micros: 1_000_000,
+            resolved_ts_micros: Some(1_010_000),
+            correct: Some(false),
+            actual_loss: Some(2.0),
+            regret: Some(1.0),
+        };
+        insert_experience(&pool, &old);
+        insert_experience(&pool, &recent);
+
+        run_refresh(&pool, 1_020_000, 2_000_000);
+        let baseline = rollups_by_key(fetch_rollups(&pool));
+
+        let recent_extra = TestExperienceSpec {
+            experience_id: 3,
+            subsystem: "deadlock".to_string(),
+            effect_kind: "release".to_string(),
+            state: "censored".to_string(),
+            created_ts_micros: 1_100_000,
+            resolved_ts_micros: Some(1_120_000),
+            correct: None,
+            actual_loss: None,
+            regret: None,
+        };
+        insert_experience(&pool, &recent_extra);
+
+        run_refresh(&pool, 1_130_000, 200_000);
+        let after = rollups_by_key(fetch_rollups(&pool));
+
+        assert_eq!(
+            baseline.get("liveness:probe:0"),
+            after.get("liveness:probe:0"),
+            "old untouched stratum should be preserved"
+        );
+        let release = after
+            .get("deadlock:release:2")
+            .expect("recent release stratum");
+        assert_eq!(release.total_count, 2);
+        assert_eq!(release.resolved_count, 1);
+        assert_eq!(release.censored_count, 1);
+    }
+
+    proptest! {
+        #[test]
+        fn refresh_rollups_conserves_counts(specs in experience_specs_strategy()) {
+            let pool = test_pool();
+            for spec in &specs {
+                insert_experience(&pool, spec);
+            }
+
+            let now_micros = max_touch_ts(&specs) + 1;
+            let _summary = run_refresh(&pool, now_micros, now_micros.max(1));
+            let actual = rollups_by_key(fetch_rollups(&pool));
+            let expected = expected_counts(&specs);
+
+            prop_assert_eq!(actual.len(), expected.len());
+            for (stratum_key, expected_counts) in expected {
+                let row = actual.get(&stratum_key).expect("expected stratum present");
+                prop_assert_eq!(row.total_count, expected_counts.total_count);
+                prop_assert_eq!(row.resolved_count, expected_counts.resolved_count);
+                prop_assert_eq!(row.censored_count, expected_counts.censored_count);
+                prop_assert_eq!(row.expired_count, expected_counts.expired_count);
+                prop_assert_eq!(row.correct_count, expected_counts.correct_count);
+                prop_assert_eq!(row.incorrect_count, expected_counts.incorrect_count);
+            }
+        }
+    }
+
+    // ── Expiry sweep tests ─────────────────────────────────────────
+
+    fn make_open_summary(
+        id: i64,
+        effect_kind: &str,
+        created_ts_micros: i64,
+    ) -> OpenExperienceSummary {
+        OpenExperienceSummary {
+            experience_id: id,
+            decision_id: 1,
+            effect_id: 1,
+            trace_id: format!("trc-{id}"),
+            state: "open".to_string(),
+            subsystem: "liveness".to_string(),
+            decision_class: "probe_check".to_string(),
+            subject: "GreenCastle".to_string(),
+            project_key: None,
+            effect_kind: effect_kind.to_string(),
+            action: "DeclareAlive".to_string(),
+            expected_loss: 0.1,
+            created_ts_micros,
+            dispatched_ts_micros: None,
+            executed_ts_micros: None,
+        }
+    }
+
+    #[test]
+    fn find_expired_detects_overdue_probe() {
+        // Probe window: 60s = 60_000_000 micros
+        let created = 1_000_000;
+        let now = created + 60_000_001; // 1 microsecond past window
+        let open = vec![make_open_summary(1, "probe", created)];
+        let expired = find_expired_experiences(&open, now);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].experience_id, 1);
+        assert_eq!(expired[0].window_micros, 60_000_000);
+    }
+
+    #[test]
+    fn find_expired_skips_within_window() {
+        let created = 1_000_000;
+        let now = created + 59_999_999; // 1 microsecond before window
+        let open = vec![make_open_summary(1, "probe", created)];
+        let expired = find_expired_experiences(&open, now);
+        assert!(expired.is_empty());
+    }
+
+    #[test]
+    fn find_expired_exact_boundary_is_expired() {
+        let created = 1_000_000;
+        let now = created + 60_000_000; // exactly at window edge
+        let open = vec![make_open_summary(1, "probe", created)];
+        let expired = find_expired_experiences(&open, now);
+        assert_eq!(expired.len(), 1);
+    }
+
+    #[test]
+    fn find_expired_multiple_effect_kinds() {
+        let base = 1_000_000;
+        let now = base + 300_000_001; // past all windows
+        let open = vec![
+            make_open_summary(1, "probe", base),        // 60s window
+            make_open_summary(2, "advisory", base),     // 300s window
+            make_open_summary(3, "release", base),      // 120s window
+            make_open_summary(4, "no_action", base),    // 300s window
+            make_open_summary(5, "backpressure", base), // 120s window
+        ];
+        let expired = find_expired_experiences(&open, now);
+        assert_eq!(expired.len(), 5);
+    }
+
+    #[test]
+    fn find_expired_mixed_timing() {
+        let now = 1_000_000_000;
+        let open = vec![
+            // Created 61s ago → probe expired (60s window)
+            make_open_summary(1, "probe", now - 61_000_000),
+            // Created 30s ago → probe NOT expired
+            make_open_summary(2, "probe", now - 30_000_000),
+            // Created 301s ago → advisory expired (300s window)
+            make_open_summary(3, "advisory", now - 301_000_000),
+            // Created 100s ago → advisory NOT expired
+            make_open_summary(4, "advisory", now - 100_000_000),
+        ];
+        let expired = find_expired_experiences(&open, now);
+        assert_eq!(expired.len(), 2);
+        let ids: Vec<u64> = expired.iter().map(|e| e.experience_id).collect();
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&3));
+    }
+
+    #[test]
+    fn find_expired_unknown_effect_kind_is_skipped() {
+        let now = 1_000_000_000;
+        let open = vec![make_open_summary(1, "unknown_kind", 0)];
+        let expired = find_expired_experiences(&open, now);
+        assert!(expired.is_empty());
+    }
+
+    #[test]
+    fn parse_effect_kind_roundtrip() {
+        let cases = [
+            ("advisory", EffectKind::Advisory),
+            ("probe", EffectKind::Probe),
+            ("release", EffectKind::Release),
+            ("force_reservation", EffectKind::ForceReservation),
+            ("routing_suggestion", EffectKind::RoutingSuggestion),
+            ("backpressure", EffectKind::Backpressure),
+            ("no_action", EffectKind::NoAction),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(parse_effect_kind(text), Some(expected), "failed for {text}");
+        }
+        assert_eq!(parse_effect_kind("bogus"), None);
     }
 }

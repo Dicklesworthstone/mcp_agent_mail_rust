@@ -5,9 +5,9 @@
     clippy::significant_drop_tightening
 )]
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use fastmcp::{Budget, CallToolParams, Cx};
-use fastmcp_core::{Outcome, SessionState, block_on};
+use fastmcp_core::{block_on, Outcome, SessionState};
 use mcp_agent_mail_conformance::Fixtures;
 use mcp_agent_mail_db::search_planner::SearchQuery;
 use mcp_agent_mail_db::{DbPool, DbPoolConfig};
@@ -21,12 +21,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
-use tracing::Subscriber;
 use tracing::field::{Field, Visit};
-use tracing_subscriber::Registry;
+use tracing::Subscriber;
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::Registry;
 
 fn fixtures_path() -> std::path::PathBuf {
     // `CARGO_MANIFEST_DIR` is `crates/mcp-agent-mail` for this bench crate.
@@ -303,6 +303,9 @@ struct ArchiveBenchScenarioResult {
     p50_us: u64,
     p95_us: u64,
     p99_us: u64,
+    p99_9_us: u64,
+    p99_99_us: u64,
+    max_us: u64,
     budget_p95_us: u64,
     budget_p99_us: u64,
     p95_within_budget: bool,
@@ -335,6 +338,9 @@ struct ArchivePerfComparison {
     p50_us: u64,
     p95_us: u64,
     p99_us: u64,
+    p99_9_us: u64,
+    p99_99_us: u64,
+    max_us: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -620,6 +626,9 @@ fn run_archive_harness_once() {
                 let p50_us = percentile_us(samples_us.clone(), 0.50);
                 let p95_us = percentile_us(samples_us.clone(), 0.95);
                 let p99_us = percentile_us(samples_us.clone(), 0.99);
+                let p99_9_us = percentile_us(samples_us.clone(), 0.999);
+                let p99_99_us = percentile_us(samples_us.clone(), 0.9999);
+                let max_us = samples_us.iter().copied().max().unwrap_or(0);
 
                 let (budget_p95_us, budget_p99_us) = scenario_budgets_us(*scenario);
                 let p95_within_budget = p95_us <= budget_p95_us;
@@ -637,6 +646,9 @@ fn run_archive_harness_once() {
                     p50_us,
                     p95_us,
                     p99_us,
+                    p99_9_us,
+                    p99_99_us,
+                    max_us,
                     budget_p95_us,
                     budget_p99_us,
                     p95_within_budget,
@@ -818,6 +830,9 @@ fn run_archive_harness_once() {
             let p50_us = percentile_us(samples_us.clone(), 0.50);
             let p95_us = percentile_us(samples_us.clone(), 0.95);
             let p99_us = percentile_us(samples_us.clone(), 0.99);
+            let p99_9_us = percentile_us(samples_us.clone(), 0.999);
+            let p99_99_us = percentile_us(samples_us.clone(), 0.9999);
+            let max_us = samples_us.iter().copied().max().unwrap_or(0);
 
             let (budget_p95_us, budget_p99_us) = scenario_budgets_us(*scenario);
             let p95_within_budget = p95_us <= budget_p95_us;
@@ -835,6 +850,9 @@ fn run_archive_harness_once() {
                 p50_us,
                 p95_us,
                 p99_us,
+                p99_9_us,
+                p99_99_us,
+                max_us,
                 budget_p95_us,
                 budget_p99_us,
                 p95_within_budget,
@@ -1027,14 +1045,21 @@ fn write_archive_profile_report(
     lines.push("## Batch Comparison".to_string());
     for entry in comparison {
         lines.push(format!(
-            "- batch-{}: p50={}us, p95={}us, p99={}us, samples={}",
+            "- batch-{}: p50={}us, p95={}us, p99={}us, p99.9={}us, p99.99={}us, max={}us, samples={}",
             entry.batch_size,
             entry.p50_us,
             entry.p95_us,
             entry.p99_us,
+            entry.p99_9_us,
+            entry.p99_99_us,
+            entry.max_us,
             entry.samples_us.len()
         ));
     }
+    lines.push(
+        "- note: current warm-path sample counts are below 1,000 per scenario, so p99.9/p99.99 act as a conservative worst-observed tail sentinel."
+            .to_string(),
+    );
     lines.push(String::new());
     lines.push("## Top Span Categories".to_string());
     for category in top_categories {
@@ -1060,14 +1085,18 @@ fn write_archive_scaling_csv(comparison: &[ArchivePerfComparison]) -> io::Result
     let _ = std::fs::create_dir_all(perf_artifact_dir());
 
     let mut lines = Vec::with_capacity(comparison.len() + 1);
-    lines.push("batch_size,p50_us,p95_us,p99_us,sample_count".to_string());
+    lines
+        .push("batch_size,p50_us,p95_us,p99_us,p99_9_us,p99_99_us,max_us,sample_count".to_string());
     for entry in comparison {
         lines.push(format!(
-            "{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{}",
             entry.batch_size,
             entry.p50_us,
             entry.p95_us,
             entry.p99_us,
+            entry.p99_9_us,
+            entry.p99_99_us,
+            entry.max_us,
             entry.samples_us.len()
         ));
     }
@@ -1147,6 +1176,9 @@ fn run_archive_perf_profile_once() {
                 p50_us: percentile_us(samples_us.clone(), 0.50),
                 p95_us: percentile_us(samples_us.clone(), 0.95),
                 p99_us: percentile_us(samples_us.clone(), 0.99),
+                p99_9_us: percentile_us(samples_us.clone(), 0.999),
+                p99_99_us: percentile_us(samples_us.clone(), 0.9999),
+                max_us: samples_us.iter().copied().max().unwrap_or(0),
                 samples_us,
             };
 
