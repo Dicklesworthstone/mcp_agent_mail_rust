@@ -1,4 +1,4 @@
-//! WASM frontend for MCP Agent Mail TUI dashboard.
+//! Experimental WASM frontend for MCP Agent Mail TUI dashboard.
 //!
 //! This crate provides a browser-based interface to the Agent Mail TUI,
 //! enabling remote monitoring and interaction with agents via WebSocket.
@@ -16,10 +16,13 @@
 //!
 //! ```bash
 //! # Using wasm-pack (recommended)
-//! wasm-pack build crates/mcp-agent-mail-wasm --target web
+//! wasm-pack build experimental/mcp-agent-mail-wasm --target web
 //!
 //! # Using cargo directly
-//! cargo build --target wasm32-unknown-unknown -p mcp-agent-mail-wasm --release
+//! cargo build \
+//!   --manifest-path experimental/mcp-agent-mail-wasm/Cargo.toml \
+//!   --target wasm32-unknown-unknown \
+//!   --release
 //! ```
 //!
 //! # Usage

@@ -1,12 +1,13 @@
 [package]
 name = "mcp-agent-mail-wasm"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-rust-version.workspace = true
-repository.workspace = true
-authors.workspace = true
-description = "WASM frontend for MCP Agent Mail TUI dashboard"
+version = "0.2.42"
+edition = "2024"
+license = "LicenseRef-MIT-Rider"
+rust-version = "1.95"
+repository = "https://github.com/Dicklesworthstone/mcp_agent_mail_rust"
+authors = ["Jeff Emanuel"]
+publish = false
+description = "Parked experimental WASM frontend for MCP Agent Mail"
 
 [lib]
 # cdylib for WASM, rlib for native tests
@@ -22,8 +23,8 @@ console-panic = ["console_error_panic_hook"]
 # ──────────────────────────────────────────────────────────────────────────────
 
 [dependencies]
-serde.workspace = true
-serde_json.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
 
 # Core types (WASM-compatible subset)
 # Note: mcp-agent-mail-core has fs2/dirs deps that need conditional compilation
@@ -37,7 +38,7 @@ serde_json.workspace = true
 js-sys = "0.3.85"
 wasm-bindgen = "0.2.108"
 wasm-bindgen-futures = "0.4.58"
-serde-wasm-bindgen.workspace = true
+serde-wasm-bindgen = "0.6"
 console_error_panic_hook = { version = "0.1.7", optional = true }
 web-sys = { version = "0.3.85", features = [
     "Window",
@@ -68,7 +69,7 @@ web-time = "1.1.0"
 # ──────────────────────────────────────────────────────────────────────────────
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-tempfile.workspace = true
+tempfile = "3"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # WASM-pack optimization settings
@@ -81,5 +82,12 @@ tempfile.workspace = true
 # --converge: re-run optimization passes until output stabilizes
 wasm-opt = ["-Oz", "--all-features", "--converge"]
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"

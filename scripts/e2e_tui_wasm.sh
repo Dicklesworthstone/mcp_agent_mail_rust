@@ -421,6 +421,7 @@ http_call_json() {
 
 BIN="$(resolve_binary)"
 e2e_log "using mcp-agent-mail binary: ${BIN}"
+WASM_MANIFEST="experimental/mcp-agent-mail-wasm/Cargo.toml"
 
 # ═══════════════════════════════════════════════════════════════════════
 # Case 1: WASM crate native unit tests (via rch)
@@ -430,7 +431,7 @@ scenario_diag_begin "wasm_native_unit_tests"
 CASE1_LOG="${E2E_ARTIFACT_DIR}/case_01_wasm_native_unit_tests.log"
 
 set +e
-run_cargo_with_rch_only "${CASE1_LOG}" test -p mcp-agent-mail-wasm --lib -- --nocapture
+run_cargo_with_rch_only "${CASE1_LOG}" test --manifest-path "${WASM_MANIFEST}" --lib -- --nocapture
 CASE1_RC=$?
 set -e
 CASE1_OUT="$(cat "${CASE1_LOG}" 2>/dev/null || true)"
@@ -458,7 +459,7 @@ scenario_diag_begin "wasm_target_build"
 CASE2_LOG="${E2E_ARTIFACT_DIR}/case_02_wasm_target_build.log"
 
 set +e
-run_cargo_with_rch_only "${CASE2_LOG}" build -p mcp-agent-mail-wasm --target wasm32-unknown-unknown --release
+run_cargo_with_rch_only "${CASE2_LOG}" build --manifest-path "${WASM_MANIFEST}" --target wasm32-unknown-unknown --release
 CASE2_RC=$?
 set -e
 
