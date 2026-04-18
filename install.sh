@@ -2828,11 +2828,18 @@ ensure_remote_http_client_readiness() {
   # want to start the server manually), but echo the service status
   # verbatim so the failure mode is obvious.
   err "Background service was installed, but the MCP HTTP endpoint is still not healthy."
-  service_output=""
-  if service_output=$("$DEST/$BIN_CLI" service status 2>&1); then
+  # `service status` returns non-zero when the service is failing (which is
+  # exactly the case that lands us here), so capture its output
+  # unconditionally — otherwise a `if service_output=$(...); then` would drop
+  # the diagnostic lines on the floor precisely when they're most needed.
+  local service_output=""
+  service_output=$("$DEST/$BIN_CLI" service status 2>&1 || true)
+  if [ -n "$service_output" ]; then
     while IFS= read -r line; do
-      [ -n "$line" ] && err "  status: ${line}"
-      [ -n "$line" ] && verbose "remote_http_readiness:status ${line}"
+      if [ -n "$line" ]; then
+        err "  status: ${line}"
+        verbose "remote_http_readiness:status ${line}"
+      fi
     done <<< "$service_output"
   fi
   err "Diagnose with:  ${DEST}/${BIN_CLI} service status"
