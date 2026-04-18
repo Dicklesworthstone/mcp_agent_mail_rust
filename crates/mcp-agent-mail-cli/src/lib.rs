@@ -121,6 +121,25 @@ pub enum Commands {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Run the unified local pre-release quality gate.
+    #[command(name = "check")]
+    Check {
+        /// Quick mode: skip long-running perf and E2E gates.
+        #[arg(long, short = 'q')]
+        quick: bool,
+        /// Write JSON report to this path.
+        #[arg(long, short = 'r')]
+        report: Option<std::path::PathBuf>,
+        /// Output format: table, json, or toon (default: auto-detect).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long)]
+        json: bool,
+        /// Run independent gates in parallel (faster execution).
+        #[arg(long, short = 'p')]
+        parallel: bool,
+    },
     /// Run CI quality gates (format, lint, build, test).
     #[command(name = "ci")]
     Ci {
@@ -2156,6 +2175,13 @@ fn execute(cli: Cli) -> CliResult<()> {
             port,
             project,
         } => handle_check_inbox(agent, rate_limit, direct, format, json, host, port, project),
+        Commands::Check {
+            quick,
+            report,
+            format,
+            json,
+            parallel,
+        } => handle_check(quick, report, format, json, parallel),
         Commands::Ci {
             quick,
             report,
@@ -11579,6 +11605,26 @@ const fn ci_should_emit_progress(fmt: output::CliOutputFormat) -> bool {
 }
 
 fn handle_ci(
+    quick: bool,
+    report_path: Option<std::path::PathBuf>,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
+    parallel: bool,
+) -> CliResult<()> {
+    handle_quality_gate_command(quick, report_path, format, json, parallel)
+}
+
+fn handle_check(
+    quick: bool,
+    report_path: Option<std::path::PathBuf>,
+    format: Option<output::CliOutputFormat>,
+    json: bool,
+    parallel: bool,
+) -> CliResult<()> {
+    handle_quality_gate_command(quick, report_path, format, json, parallel)
+}
+
+fn handle_quality_gate_command(
     quick: bool,
     report_path: Option<std::path::PathBuf>,
     format: Option<output::CliOutputFormat>,
@@ -23666,6 +23712,28 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn clap_parses_check_format_toon() {
+        let cli = Cli::try_parse_from(["am", "check", "--format", "toon"])
+            .expect("failed to parse check with format");
+        match cli.command.expect("expected command") {
+            Commands::Check {
+                format,
+                json,
+                quick,
+                report,
+                parallel,
+            } => {
+                assert_eq!(format, Some(output::CliOutputFormat::Toon));
+                assert!(!json);
+                assert!(!quick);
+                assert!(report.is_none());
+                assert!(!parallel);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn clap_parses_bench_with_all_flags() {
         let cli = Cli::try_parse_from([
             "am",
@@ -33607,6 +33675,7 @@ startup_timeout_sec = 42
         let expected = [
             "serve-http",
             "serve-stdio",
+            "check",
             "lint",
             "typecheck",
             "share",

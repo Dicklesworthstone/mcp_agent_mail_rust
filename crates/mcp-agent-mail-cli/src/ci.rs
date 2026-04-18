@@ -1130,11 +1130,11 @@ impl GateReport {
 // Default Gates
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Returns the default set of 16 CI gates.
+/// Returns the default set of unified local quality gates.
 #[must_use]
 pub fn default_gates() -> Vec<GateConfig> {
     vec![
-        // Quality gates (9)
+        // Quality gates
         GateConfig::new(
             "Format check",
             GateCategory::Quality,
@@ -1162,6 +1162,11 @@ pub fn default_gates() -> Vec<GateConfig> {
             "Unit + integration tests",
             GateCategory::Quality,
             ["cargo", "test", "--workspace"],
+        ),
+        GateConfig::new(
+            "Docs drift + resource coverage",
+            GateCategory::Docs,
+            ["cargo", "test", "--test", "docs_drift_ci", "--", "--nocapture"],
         ),
         GateConfig::new(
             "DB stress suite",
@@ -1241,7 +1246,7 @@ pub fn default_gates() -> Vec<GateConfig> {
         )
         .expected_artifact("tests/artifacts/mode_matrix/*")
         .skip_in_quick(),
-        // Performance gates (2)
+        // Performance gates
         GateConfig::new(
             "Perf + security regressions",
             GateCategory::Performance,
@@ -1270,7 +1275,19 @@ pub fn default_gates() -> Vec<GateConfig> {
                 "--nocapture",
             ],
         ),
-        // Security gate (1)
+        GateConfig::new(
+            "Archive perf gate",
+            GateCategory::Performance,
+            ["bash", "scripts/bench_archive_perf_gate.sh", "--skip-bench"],
+        )
+        .skip_in_quick(),
+        GateConfig::new(
+            "ATC perf gate",
+            GateCategory::Performance,
+            ["bash", "scripts/bench_atc_perf_gate.sh"],
+        )
+        .skip_in_quick(),
+        // Security gate
         GateConfig::new(
             "E2E security/privacy",
             GateCategory::Security,
@@ -1278,7 +1295,7 @@ pub fn default_gates() -> Vec<GateConfig> {
         )
         .expected_artifact("tests/artifacts/security_privacy/*")
         .skip_in_quick(),
-        // Docs gate (1)
+        // Docs gates
         GateConfig::new(
             "Release docs references present",
             GateCategory::Docs,
@@ -1288,7 +1305,7 @@ pub fn default_gates() -> Vec<GateConfig> {
                 "test -f docs/RELEASE_CHECKLIST.md && test -f docs/ROLLOUT_PLAYBOOK.md && test -f docs/OPERATOR_RUNBOOK.md",
             ],
         ),
-        // Quality gate (E2E TUI) (1)
+        // Quality gate (E2E TUI)
         GateConfig::new(
             "E2E TUI accessibility",
             GateCategory::Quality,
@@ -1939,7 +1956,7 @@ mod tests {
     #[test]
     fn test_default_gates_count() {
         let gates = default_gates();
-        assert_eq!(gates.len(), 16, "Expected 16 default gates");
+        assert_eq!(gates.len(), 19, "Expected 19 default gates");
     }
 
     #[test]
@@ -1948,8 +1965,8 @@ mod tests {
         let quick_skip: Vec<_> = gates.iter().filter(|g| g.skip_in_quick).collect();
         assert_eq!(
             quick_skip.len(),
-            6,
-            "Expected 6 gates to skip in quick mode"
+            8,
+            "Expected 8 gates to skip in quick mode"
         );
 
         let names: Vec<_> = quick_skip.iter().map(|g| g.name.as_str()).collect();
@@ -1957,6 +1974,8 @@ mod tests {
         assert!(names.contains(&"E2E full matrix"));
         assert!(names.contains(&"E2E dual-mode"));
         assert!(names.contains(&"E2E mode matrix"));
+        assert!(names.contains(&"Archive perf gate"));
+        assert!(names.contains(&"ATC perf gate"));
         assert!(names.contains(&"E2E security/privacy"));
         assert!(names.contains(&"E2E TUI accessibility"));
     }

@@ -45,6 +45,27 @@ fn test_ci_help_shows_all_flags() {
 }
 
 #[test]
+fn test_check_help_shows_all_flags() {
+    let output = Command::new(am_binary())
+        .args(["check", "--help"])
+        .output()
+        .expect("failed to execute am check --help");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("--quick"), "help should mention --quick");
+    assert!(stdout.contains("--report"), "help should mention --report");
+    assert!(stdout.contains("--json"), "help should mention --json");
+    assert!(
+        stdout.contains("--parallel"),
+        "help should mention --parallel"
+    );
+    assert!(stdout.contains("-q"), "help should show -q shorthand");
+    assert!(stdout.contains("-r"), "help should show -r shorthand");
+    assert!(stdout.contains("-p"), "help should show -p shorthand");
+}
+
+#[test]
 fn test_ci_help_exit_code_zero() {
     let output = Command::new(am_binary())
         .args(["ci", "--help"])
@@ -54,6 +75,19 @@ fn test_ci_help_exit_code_zero() {
     assert!(
         output.status.success(),
         "am ci --help should exit with code 0"
+    );
+}
+
+#[test]
+fn test_check_help_exit_code_zero() {
+    let output = Command::new(am_binary())
+        .args(["check", "--help"])
+        .output()
+        .expect("failed to execute am check --help");
+
+    assert!(
+        output.status.success(),
+        "am check --help should exit with code 0"
     );
 }
 
@@ -261,7 +295,7 @@ fn test_default_gates_count() {
     use mcp_agent_mail_cli::ci::default_gates;
 
     let gates = default_gates();
-    assert_eq!(gates.len(), 16, "should have 16 default gates");
+    assert_eq!(gates.len(), 19, "should have 19 default gates");
 }
 
 #[test]
@@ -271,13 +305,15 @@ fn test_default_gates_skip_in_quick() {
     let gates = default_gates();
     let quick_skip: Vec<_> = gates.iter().filter(|g| g.skip_in_quick).collect();
 
-    assert_eq!(quick_skip.len(), 6, "6 gates should skip in quick mode");
+    assert_eq!(quick_skip.len(), 8, "8 gates should skip in quick mode");
 
     let names: Vec<_> = quick_skip.iter().map(|g| g.name.as_str()).collect();
     assert!(names.contains(&"DB stress suite"));
     assert!(names.contains(&"E2E full matrix"));
     assert!(names.contains(&"E2E dual-mode"));
     assert!(names.contains(&"E2E mode matrix"));
+    assert!(names.contains(&"Archive perf gate"));
+    assert!(names.contains(&"ATC perf gate"));
     assert!(names.contains(&"E2E security/privacy"));
     assert!(names.contains(&"E2E TUI accessibility"));
 }

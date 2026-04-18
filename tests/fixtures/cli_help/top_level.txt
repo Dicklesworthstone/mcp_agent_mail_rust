@@ -6,6 +6,7 @@ Commands:
   serve-http
   serve-stdio
   check-inbox                 Check agent inbox for unread messages (for git hooks and editor integrations)
+  check                       Run the unified local pre-release quality gate
   ci                          Run CI quality gates (format, lint, build, test)
   bench                       Run native CLI benchmarks
   lint

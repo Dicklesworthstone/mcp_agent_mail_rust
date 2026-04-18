@@ -1,0 +1,11 @@
+Run the unified local pre-release quality gate
+
+Usage: am check [OPTIONS]
+
+Options:
+  -q, --quick            Quick mode: skip long-running perf and E2E gates
+  -r, --report <REPORT>  Write JSON report to this path
+      --format <FORMAT>  Output format: table, json, or toon (default: auto-detect)
+      --json             Output JSON (shorthand for --format json)
+  -p, --parallel         Run independent gates in parallel (faster execution)
+  -h, --help             Print help

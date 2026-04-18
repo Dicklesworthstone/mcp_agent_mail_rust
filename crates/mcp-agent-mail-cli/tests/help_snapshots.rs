@@ -136,6 +136,7 @@ fn cli_help_snapshots() {
     // br-2ei.5.7.3: golden help snapshots
     let cases: &[(&str, &[&str])] = &[
         ("top_level", &["--help"]),
+        ("check", &["check", "--help"]),
         ("serve_http", &["serve-http", "--help"]),
         ("serve_stdio", &["serve-stdio", "--help"]),
         ("share", &["share", "--help"]),
