@@ -11,8 +11,10 @@ use ftui::KeyCode;
 use serde::{Deserialize, Serialize};
 
 use crate::tui_screens::{
-    ALL_SCREEN_IDS, ScreenCategory, jump_key_label_for_screen, jump_key_legend, screen_meta,
+    ScreenCategory, ALL_SCREEN_IDS, jump_key_label_for_screen, jump_key_legend, screen_meta,
 };
+
+const GLOBAL_HELP_MARKDOWN: &str = include_str!("../../../docs/TUI_HELP.md");
 
 // ──────────────────────────────────────────────────────────────────────
 // GlobalBinding — structured keybinding definition
@@ -665,8 +667,10 @@ impl KeymapRegistry {
         let global_entries = self.help_entries();
         sections.push(HelpSection {
             title: format!("Global ({})", self.profile.label()),
-            description: None,
-            body_markdown: None,
+            description: Some(
+                "Shared navigation, overlays, accessibility, and shell controls.".to_string(),
+            ),
+            body_markdown: Some(GLOBAL_HELP_MARKDOWN.to_string()),
             entries: global_entries,
         });
 
@@ -766,7 +770,7 @@ impl HelpSection {
 mod tests {
     use super::*;
     use crate::tui_screens::{
-        ALL_SCREEN_IDS, MailScreen, agents::AgentsScreen, dashboard::DashboardScreen,
+        MailScreen, ALL_SCREEN_IDS, agents::AgentsScreen, dashboard::DashboardScreen,
         messages::MessageBrowserScreen, reservations::ReservationsScreen,
         system_health::SystemHealthScreen, threads::ThreadExplorerScreen, timeline::TimelineScreen,
         tool_metrics::ToolMetricsScreen,
@@ -1151,6 +1155,13 @@ mod tests {
         let sections = reg.contextual_help(&[], "Dashboard", None, None);
         assert!(sections[0].title.contains("Global"));
         assert!(sections[0].title.contains("Default"));
+        assert!(
+            sections[0]
+                .body_markdown
+                .as_deref()
+                .is_some_and(|body| body.contains("context-aware help")),
+            "expected the global help section to include the compile-time markdown body"
+        );
         assert!(
             sections.iter().any(|s| s.title == "Navigate • Overview"),
             "expected category-organized navigation sections"

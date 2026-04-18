@@ -1251,6 +1251,8 @@ pub struct MailAppModel {
     screen_manager: ScreenManager,
     help_visible: bool,
     help_scroll: u16,
+    help_opened_at: Option<Instant>,
+    help_screen: Option<MailScreenId>,
     keymap: crate::tui_keymap::KeymapRegistry,
     command_palette: CommandPalette,
     ambient_renderer: RefCell<AmbientEffectRenderer>,
@@ -1404,6 +1406,8 @@ impl MailAppModel {
             screen_manager,
             help_visible: false,
             help_scroll: 0,
+            help_opened_at: None,
+            help_screen: None,
             keymap: crate::tui_keymap::KeymapRegistry::default(),
             command_palette,
             ambient_renderer: RefCell::new(AmbientEffectRenderer::new()),
@@ -1679,7 +1683,7 @@ impl MailAppModel {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if !inside_overlay {
-                    self.help_visible = false;
+                    self.close_help_overlay();
                 }
                 true
             }
@@ -1692,6 +1696,54 @@ impl MailAppModel {
                 true
             }
             _ => true,
+        }
+    }
+
+    fn open_help_overlay(&mut self, via: &'static str) {
+        let screen = self.screen_manager.active_screen();
+        self.help_visible = true;
+        self.help_scroll = 0;
+        self.help_opened_at = Some(Instant::now());
+        self.help_screen = Some(screen);
+        tracing::info!(
+            screen = crate::tui_screens::screen_meta(screen).title,
+            via,
+            "tui.help.opened"
+        );
+    }
+
+    fn close_help_overlay(&mut self) {
+        if !self.help_visible {
+            self.help_scroll = 0;
+            self.help_opened_at = None;
+            self.help_screen = None;
+            return;
+        }
+
+        let duration_ms = self
+            .help_opened_at
+            .map(|started| u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        let screen = self
+            .help_screen
+            .take()
+            .unwrap_or_else(|| self.screen_manager.active_screen());
+
+        self.help_visible = false;
+        self.help_scroll = 0;
+        self.help_opened_at = None;
+        tracing::info!(
+            screen = crate::tui_screens::screen_meta(screen).title,
+            duration_ms,
+            "tui.help.closed"
+        );
+    }
+
+    fn toggle_help_overlay(&mut self, via: &'static str) {
+        if self.help_visible {
+            self.close_help_overlay();
+        } else {
+            self.open_help_overlay(via);
         }
     }
 
@@ -2021,8 +2073,7 @@ impl MailAppModel {
 
     #[allow(clippy::missing_const_for_fn)]
     fn open_export_menu(&mut self) {
-        self.help_visible = false;
-        self.help_scroll = 0;
+        self.close_help_overlay();
         self.export_menu_open = true;
         self.export_snapshot_refresh_pending.set(true);
     }
@@ -2950,7 +3001,7 @@ impl MailAppModel {
     }
 
     fn open_palette(&mut self) {
-        self.help_visible = false;
+        self.close_help_overlay();
         let mut actions = build_palette_actions(&self.state);
 
         // Inject context-aware quick actions from the focused entity.
@@ -3100,8 +3151,7 @@ impl MailAppModel {
         // ── App controls ───────────────────────────────────────────
         match id {
             palette_action_ids::APP_TOGGLE_HELP => {
-                self.help_visible = !self.help_visible;
-                self.help_scroll = 0;
+                self.toggle_help_overlay("F1");
                 return Cmd::none();
             }
             palette_action_ids::APP_QUIT => {
@@ -4128,8 +4178,7 @@ impl Model for MailAppModel {
                             return Cmd::none();
                         }
                         MouseAction::ToggleHelp => {
-                            self.help_visible = !self.help_visible;
-                            self.help_scroll = 0;
+                            self.toggle_help_overlay("F1");
                             return Cmd::none();
                         }
                         MouseAction::OpenPalette => {
@@ -4213,7 +4262,7 @@ impl Model for MailAppModel {
                     if self.help_visible {
                         match key.code {
                             KeyCode::Escape | KeyCode::F(1) | KeyCode::Char('?') => {
-                                self.help_visible = false;
+                                self.close_help_overlay();
                                 return Cmd::none();
                             }
                             KeyCode::Char('j') | KeyCode::Down => {
@@ -4224,22 +4273,9 @@ impl Model for MailAppModel {
                                 self.help_scroll = self.help_scroll.saturating_sub(1);
                                 return Cmd::none();
                             }
-                            KeyCode::Char('q') if !text_mode => {
-                                self.clear_quit_confirmation();
-                                self.flush_before_shutdown();
-                                self.state.request_shutdown();
-                                return Cmd::quit();
-                            }
                             _ => {}
                         }
-
-                        if is_ctrl_d {
-                            return self.detach_tui_headless();
-                        }
-                        if is_ctrl_c {
-                            return self.handle_quit_confirmation_input(QuitConfirmSource::CtrlC);
-                        }
-
+                        self.close_help_overlay();
                         return Cmd::none();
                     }
 
@@ -4265,13 +4301,11 @@ impl Model for MailAppModel {
                             return Cmd::quit();
                         }
                         KeyCode::F(1) => {
-                            self.help_visible = !self.help_visible;
-                            self.help_scroll = 0;
+                            self.toggle_help_overlay("F1");
                             return Cmd::none();
                         }
                         KeyCode::Char('?') if !text_mode => {
-                            self.help_visible = !self.help_visible;
-                            self.help_scroll = 0;
+                            self.toggle_help_overlay("?");
                             return Cmd::none();
                         }
                         KeyCode::Char('m') if !text_mode => {
@@ -4403,8 +4437,7 @@ impl Model for MailAppModel {
                 self.dispatch_execute_operation(op, ctx)
             }
             MailMsg::ToggleHelp => {
-                self.help_visible = !self.help_visible;
-                self.help_scroll = 0;
+                self.toggle_help_overlay("F1");
                 Cmd::none()
             }
             MailMsg::Quit => {
@@ -8541,13 +8574,14 @@ mod tests {
     #[test]
     fn q_key_quits_even_when_help_overlay_visible() {
         let mut model = test_model();
-        model.help_visible = true;
+        model.open_help_overlay("F1");
 
         let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('q')));
         let cmd = model.update(MailMsg::Terminal(key));
 
-        assert!(model.state.is_shutdown_requested());
-        assert!(matches!(cmd, Cmd::Quit));
+        assert!(!model.state.is_shutdown_requested());
+        assert!(matches!(cmd, Cmd::None));
+        assert!(!model.help_visible());
     }
 
     #[test]
@@ -8581,16 +8615,21 @@ mod tests {
     #[test]
     fn ctrl_c_requires_confirmation_then_quits_with_help_overlay_visible() {
         let mut model = test_model();
-        model.help_visible = true;
+        model.open_help_overlay("F1");
         let ctrl_c = Event::Key(KeyEvent::new(KeyCode::Char('c')).with_modifiers(Modifiers::CTRL));
 
         let first = model.update(MailMsg::Terminal(ctrl_c.clone()));
         assert!(!model.state.is_shutdown_requested());
         assert!(matches!(first, Cmd::None));
+        assert!(!model.help_visible());
 
         let second = model.update(MailMsg::Terminal(ctrl_c));
+        assert!(!model.state.is_shutdown_requested());
+        assert!(matches!(second, Cmd::None));
+
+        let third = model.update(MailMsg::Terminal(ctrl_c));
         assert!(model.state.is_shutdown_requested());
-        assert!(matches!(second, Cmd::Quit));
+        assert!(matches!(third, Cmd::Quit));
     }
 
     #[test]
@@ -12360,7 +12399,7 @@ first body
         assert!(OverlayLayer::ActionMenu.traps_focus());
         assert!(OverlayLayer::ToastFocus.traps_focus());
         assert!(OverlayLayer::MacroPlayback.traps_focus());
-        // Help does NOT trap focus — it only consumes Esc/j/k.
+        // Help does NOT trap focus — it only owns scroll + dismiss behavior.
         assert!(!OverlayLayer::Help.traps_focus());
         // Passive toasts don't trap focus.
         assert!(!OverlayLayer::Toasts.traps_focus());
@@ -12370,7 +12409,7 @@ first body
     #[test]
     fn escape_closes_topmost_help() {
         let mut model = test_model();
-        model.help_visible = true;
+        model.open_help_overlay("F1");
         assert_eq!(model.topmost_overlay(), OverlayLayer::Help);
 
         // Send Escape
@@ -12383,7 +12422,7 @@ first body
     #[test]
     fn escape_closes_toast_focus_not_help() {
         let mut model = test_model();
-        model.help_visible = true;
+        model.open_help_overlay("F1");
         model.notifications.notify(
             ftui_widgets::Toast::new("test")
                 .icon(ftui_widgets::ToastIcon::Info)
@@ -12402,21 +12441,81 @@ first body
     }
 
     #[test]
-    fn help_overlay_traps_tab_navigation_keys() {
+    fn help_overlay_closes_on_tab_navigation_keys() {
         let mut model = test_model();
         model.update(MailMsg::SwitchScreen(MailScreenId::Messages));
-        model.help_visible = true;
+        model.open_help_overlay("F1");
         let before = model.screen_manager.active_screen();
 
         let tab = MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Tab)));
         model.update(tab);
         assert_eq!(model.screen_manager.active_screen(), before);
-        assert!(model.help_visible);
+        assert!(!model.help_visible);
 
+        model.open_help_overlay("F1");
         let backtab = MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::BackTab)));
         model.update(backtab);
         assert_eq!(model.screen_manager.active_screen(), before);
-        assert!(model.help_visible);
+        assert!(!model.help_visible);
+    }
+
+    #[test]
+    fn help_overlay_closes_on_any_non_scroll_key() {
+        let mut model = test_model();
+        model.open_help_overlay("F1");
+        assert!(model.help_visible());
+
+        let key = MailMsg::Terminal(Event::Key(KeyEvent::new(KeyCode::Char('x'))));
+        let cmd = model.update(key);
+
+        assert!(matches!(cmd, Cmd::None));
+        assert!(!model.help_visible());
+    }
+
+    #[test]
+    fn rendered_help_overlay_covers_all_screens_and_live_bindings() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = TuiSharedState::new(&config);
+        let mut model = MailAppModel::new(state);
+
+        for &id in ALL_SCREEN_IDS {
+            model.update(MailMsg::SwitchScreen(id));
+            model.open_help_overlay("F1");
+
+            let mut pool = ftui::GraphemePool::new();
+            let mut frame = Frame::new(180, 120, &mut pool);
+            model.view(&mut frame);
+            let text = frame_text(&frame);
+            let meta = crate::tui_screens::screen_meta(id);
+
+            assert!(
+                text.contains(meta.title),
+                "rendered help should include screen title for {id:?}; frame dump:\n{text}"
+            );
+            assert!(
+                text.contains("Robot CLI equivalent"),
+                "rendered help should surface the robot command for {id:?}; frame dump:\n{text}"
+            );
+
+            let screen = model
+                .screen_manager
+                .active_screen_ref()
+                .expect("active screen should exist");
+            for binding in screen.keybindings() {
+                assert!(
+                    text.contains(binding.key),
+                    "rendered help for {id:?} should include key '{}' ; frame dump:\n{text}",
+                    binding.key
+                );
+                assert!(
+                    text.contains(binding.action),
+                    "rendered help for {id:?} should include action '{}' ; frame dump:\n{text}",
+                    binding.action
+                );
+            }
+
+            model.close_help_overlay();
+        }
     }
 
     #[test]
