@@ -839,11 +839,12 @@ pub struct LabeledHistogramMap {
 
 impl LabeledHistogramMap {
     pub fn record(&self, label: impl Into<String>, value: u64) {
-        let mut guard = self
-            .inner
+        self.inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.entry(label.into()).or_default().record(value);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(label.into())
+            .or_default()
+            .record(value);
     }
 
     #[must_use]
