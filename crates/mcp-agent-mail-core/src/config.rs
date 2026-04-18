@@ -20,6 +20,7 @@ pub enum AtcWriteMode {
 }
 
 impl AtcWriteMode {
+    #[must_use]
     pub fn from_str_lossy(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "shadow" => Self::Shadow,
@@ -28,15 +29,18 @@ impl AtcWriteMode {
         }
     }
 
-    pub fn is_off(self) -> bool {
+    #[must_use]
+    pub const fn is_off(self) -> bool {
         matches!(self, Self::Off)
     }
 
-    pub fn is_shadow(self) -> bool {
+    #[must_use]
+    pub const fn is_shadow(self) -> bool {
         matches!(self, Self::Shadow)
     }
 
-    pub fn is_live(self) -> bool {
+    #[must_use]
+    pub const fn is_live(self) -> bool {
         matches!(self, Self::Live)
     }
 }

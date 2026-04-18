@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
+use crate::Config;
 use crate::config::{
     dotenv_value, load_dotenv_file, process_env_value, update_envfile, user_env_value,
 };
-use crate::Config;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum FlagKind {
@@ -480,7 +480,7 @@ pub const FLAG_REGISTRY: &[FlagDefinition] = &[
 ];
 
 #[must_use]
-pub fn flag_registry() -> &'static [FlagDefinition] {
+pub const fn flag_registry() -> &'static [FlagDefinition] {
     FLAG_REGISTRY
 }
 
@@ -610,8 +610,11 @@ mod tests {
     fn atc_write_mode_source_prefers_kill_switch() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.env");
-        std::fs::write(&path, "ATC_LEARNING_DISABLED=true\nAM_ATC_WRITE_MODE=live\n")
-            .expect("write env");
+        std::fs::write(
+            &path,
+            "ATC_LEARNING_DISABLED=true\nAM_ATC_WRITE_MODE=live\n",
+        )
+        .expect("write env");
 
         let mut config = Config::default();
         config.console_persist_path = path;

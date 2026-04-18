@@ -439,7 +439,7 @@ impl ResolutionKind {
 
     /// The resolution timestamp (microseconds since epoch).
     #[must_use]
-    pub fn ts_micros(&self) -> i64 {
+    pub const fn ts_micros(&self) -> i64 {
         match self {
             Self::Resolved(outcome) => outcome.observed_ts_micros,
             Self::Censored { ts_micros } | Self::Expired { ts_micros } => *ts_micros,
@@ -676,10 +676,10 @@ impl ExperienceRow {
         if contains_secret(&self.evidence_summary) {
             issues.push("evidence_summary contains a suspected secret");
         }
-        if let Some(label) = self.outcome.as_ref().map(|o| &o.label) {
-            if contains_secret(label) {
-                issues.push("outcome.label contains a suspected secret");
-            }
+        if let Some(label) = self.outcome.as_ref().map(|o| &o.label)
+            && contains_secret(label)
+        {
+            issues.push("outcome.label contains a suspected secret");
         }
         if let Some(ctx) = &self.context {
             let ctx_str = ctx.to_string();

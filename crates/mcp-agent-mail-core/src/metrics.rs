@@ -776,12 +776,12 @@ pub struct LabeledCounterMap {
 
 impl LabeledCounterMap {
     pub fn add(&self, label: impl Into<String>, delta: u64) {
-        let mut guard = self
-            .inner
+        self.inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = guard.entry(label.into()).or_insert(0);
-        *entry = entry.saturating_add(delta);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(label.into())
+            .and_modify(|v| *v = v.saturating_add(delta))
+            .or_insert(delta);
     }
 
     #[must_use]
@@ -800,12 +800,12 @@ pub struct LabeledGaugeMap {
 
 impl LabeledGaugeMap {
     pub fn add(&self, label: impl Into<String>, delta: u64) {
-        let mut guard = self
-            .inner
+        self.inner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = guard.entry(label.into()).or_insert(0);
-        *entry = entry.saturating_add(delta);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(label.into())
+            .and_modify(|v| *v = v.saturating_add(delta))
+            .or_insert(delta);
     }
 
     pub fn sub(&self, label: impl Into<String>, delta: u64) {
@@ -814,11 +814,10 @@ impl LabeledGaugeMap {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let key = label.into();
-        let mut remove = false;
-        if let Some(entry) = guard.get_mut(&key) {
+        let remove = guard.get_mut(&key).map_or(false, |entry| {
             *entry = entry.saturating_sub(delta);
-            remove = *entry == 0;
-        }
+            *entry == 0
+        });
         if remove {
             guard.remove(&key);
         }
