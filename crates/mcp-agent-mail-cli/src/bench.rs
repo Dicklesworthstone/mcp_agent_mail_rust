@@ -217,6 +217,8 @@ pub struct BenchConfig {
     pub conditional: bool,
     #[serde(default = "always_condition")]
     pub condition: BenchCondition,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup: Option<BenchSetup>,
 }
@@ -272,6 +274,7 @@ pub struct BenchmarkDef {
     pub requires_seeded_db: bool,
     pub conditional: bool,
     pub condition: BenchCondition,
+    pub env: &'static [(&'static str, &'static str)],
 }
 
 impl BenchmarkDef {
@@ -290,10 +293,20 @@ impl BenchmarkDef {
             requires_seeded_db: self.requires_seeded_db,
             conditional: self.conditional,
             condition: self.condition,
+            env: self
+                .env
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
             setup: None,
         }
     }
 }
+
+const BENCH_ENV_NONE: &[(&str, &str)] = &[];
+const BENCH_ENV_ATC_OFF: &[(&str, &str)] = &[("ATC_LEARNING_DISABLED", "1")];
+const BENCH_ENV_ATC_SHADOW: &[(&str, &str)] = &[("AM_ATC_WRITE_MODE", "shadow")];
+const BENCH_ENV_ATC_LIVE: &[(&str, &str)] = &[("AM_ATC_WRITE_MODE", "live")];
 
 const CMD_HELP: &[&str] = &["--help"];
 const CMD_LINT: &[&str] = &["lint"];
@@ -801,6 +814,7 @@ pub const DEFAULT_BENCHMARKS: &[BenchmarkDef] = &[
         requires_seeded_db: false,
         conditional: false,
         condition: BenchCondition::Always,
+        env: BENCH_ENV_NONE,
     },
     BenchmarkDef {
         name: "lint",
@@ -810,6 +824,7 @@ pub const DEFAULT_BENCHMARKS: &[BenchmarkDef] = &[
         requires_seeded_db: false,
         conditional: false,
         condition: BenchCondition::Always,
+        env: BENCH_ENV_NONE,
     },
     BenchmarkDef {
         name: "typecheck",
@@ -819,6 +834,7 @@ pub const DEFAULT_BENCHMARKS: &[BenchmarkDef] = &[
         requires_seeded_db: false,
         conditional: false,
         condition: BenchCondition::Always,
+        env: BENCH_ENV_NONE,
     },
     BenchmarkDef {
         name: "stub_encode_1k",
@@ -828,6 +844,7 @@ pub const DEFAULT_BENCHMARKS: &[BenchmarkDef] = &[
         requires_seeded_db: false,
         conditional: true,
         condition: BenchCondition::StubEncoderScriptPresent,
+        env: BENCH_ENV_NONE,
     },
     BenchmarkDef {
         name: "stub_encode_10k",
@@ -837,6 +854,7 @@ pub const DEFAULT_BENCHMARKS: &[BenchmarkDef] = &[
         requires_seeded_db: false,
         conditional: true,
         condition: BenchCondition::StubEncoderScriptPresent,
+        env: BENCH_ENV_NONE,
     },
     BenchmarkDef {
         name: "stub_encode_100k",
@@ -846,6 +864,7 @@ pub const DEFAULT_BENCHMARKS: &[BenchmarkDef] = &[
         requires_seeded_db: false,
         conditional: true,
         condition: BenchCondition::StubEncoderScriptPresent,
+        env: BENCH_ENV_NONE,
     },
     BenchmarkDef {
         name: "mail_inbox",
@@ -855,6 +874,7 @@ pub const DEFAULT_BENCHMARKS: &[BenchmarkDef] = &[
         requires_seeded_db: true,
         conditional: true,
         condition: BenchCondition::SeededDatabaseReady,
+        env: BENCH_ENV_NONE,
     },
     BenchmarkDef {
         name: "mail_send",
@@ -864,6 +884,37 @@ pub const DEFAULT_BENCHMARKS: &[BenchmarkDef] = &[
         requires_seeded_db: true,
         conditional: true,
         condition: BenchCondition::SeededDatabaseReady,
+        env: BENCH_ENV_NONE,
+    },
+    BenchmarkDef {
+        name: "mail_send_no_atc",
+        command: CMD_MAIL_SEND,
+        category: BenchCategory::Operational,
+        default_runs: DEFAULT_RUNS,
+        requires_seeded_db: true,
+        conditional: true,
+        condition: BenchCondition::SeededDatabaseReady,
+        env: BENCH_ENV_ATC_OFF,
+    },
+    BenchmarkDef {
+        name: "mail_send_atc_shadow",
+        command: CMD_MAIL_SEND,
+        category: BenchCategory::Operational,
+        default_runs: DEFAULT_RUNS,
+        requires_seeded_db: true,
+        conditional: true,
+        condition: BenchCondition::SeededDatabaseReady,
+        env: BENCH_ENV_ATC_SHADOW,
+    },
+    BenchmarkDef {
+        name: "mail_send_atc_live",
+        command: CMD_MAIL_SEND,
+        category: BenchCategory::Operational,
+        default_runs: DEFAULT_RUNS,
+        requires_seeded_db: true,
+        conditional: true,
+        condition: BenchCondition::SeededDatabaseReady,
+        env: BENCH_ENV_ATC_LIVE,
     },
     BenchmarkDef {
         name: "mail_search",
@@ -873,6 +924,7 @@ pub const DEFAULT_BENCHMARKS: &[BenchmarkDef] = &[
         requires_seeded_db: true,
         conditional: true,
         condition: BenchCondition::SeededDatabaseReady,
+        env: BENCH_ENV_NONE,
     },
     BenchmarkDef {
         name: "mail_threads",
@@ -882,6 +934,7 @@ pub const DEFAULT_BENCHMARKS: &[BenchmarkDef] = &[
         requires_seeded_db: true,
         conditional: true,
         condition: BenchCondition::SeededDatabaseReady,
+        env: BENCH_ENV_NONE,
     },
     BenchmarkDef {
         name: "doctor_check",
@@ -891,6 +944,7 @@ pub const DEFAULT_BENCHMARKS: &[BenchmarkDef] = &[
         requires_seeded_db: true,
         conditional: true,
         condition: BenchCondition::SeededDatabaseReady,
+        env: BENCH_ENV_NONE,
     },
     BenchmarkDef {
         name: "message_count",
@@ -900,6 +954,7 @@ pub const DEFAULT_BENCHMARKS: &[BenchmarkDef] = &[
         requires_seeded_db: true,
         conditional: true,
         condition: BenchCondition::SeededDatabaseReady,
+        env: BENCH_ENV_NONE,
     },
     BenchmarkDef {
         name: "agents_list",
@@ -909,6 +964,7 @@ pub const DEFAULT_BENCHMARKS: &[BenchmarkDef] = &[
         requires_seeded_db: true,
         conditional: true,
         condition: BenchCondition::SeededDatabaseReady,
+        env: BENCH_ENV_NONE,
     },
 ];
 
@@ -1340,6 +1396,7 @@ mod tests {
             requires_seeded_db: false,
             conditional: false,
             condition: BenchCondition::Always,
+            env: BTreeMap::new(),
             setup: None,
         };
         assert_eq!(cfg.validate(), Err(BenchValidationError::EmptyCommand));
@@ -1356,6 +1413,7 @@ mod tests {
             requires_seeded_db: false,
             conditional: false,
             condition: BenchCondition::Always,
+            env: BTreeMap::new(),
             setup: Some(BenchSetup {
                 command: Vec::new(),
                 env: BTreeMap::new(),
@@ -1367,7 +1425,27 @@ mod tests {
 
     #[test]
     fn default_benchmark_catalog_has_expected_size() {
-        assert_eq!(DEFAULT_BENCHMARKS.len(), 13);
+        assert_eq!(DEFAULT_BENCHMARKS.len(), 16);
+    }
+
+    #[test]
+    fn benchmark_def_to_config_copies_env_overrides() {
+        let def = BenchmarkDef {
+            name: "mail_send_atc_live",
+            command: CMD_MAIL_SEND,
+            category: BenchCategory::Operational,
+            default_runs: DEFAULT_RUNS,
+            requires_seeded_db: true,
+            conditional: true,
+            condition: BenchCondition::SeededDatabaseReady,
+            env: BENCH_ENV_ATC_LIVE,
+        };
+
+        let cfg = def.to_config(BenchProfile::Quick);
+        assert_eq!(
+            cfg.env.get("AM_ATC_WRITE_MODE").map(String::as_str),
+            Some("live")
+        );
     }
 
     #[test]
@@ -1622,6 +1700,7 @@ mod tests {
             requires_seeded_db: true,
             conditional: true,
             condition: BenchCondition::SeededDatabaseReady,
+            env: BTreeMap::new(),
             setup: None,
         };
 

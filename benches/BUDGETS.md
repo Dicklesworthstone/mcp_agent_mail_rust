@@ -171,6 +171,35 @@ Baseline captured via `am bench --quick` (2026-02-09). Seeded with 60 messages (
 | `am lint` | 457ms | < 1000ms | Heavy static analysis |
 | `am typecheck` | 399ms | < 800ms | Heavy type checking |
 
+## ATC Hot-Path Guard (br-bn0vb.15)
+
+The ATC send-message guard is enforced by:
+
+- `.github/workflows/atc-perf-gate.yml`
+- `scripts/bench_atc_perf_gate.sh`
+- `benches/atc_perf_baseline.json`
+- `docs/ATC_PERF_BUDGETS.md`
+
+The workflow runs `am bench` against the dedicated ATC-mode `mail_send`
+variants and enforces that `shadow` and `live` stay within `5%` p95 overhead of
+`mail_send_no_atc`.
+
+The checked-in absolute baseline is retained for historical context in the PR
+artifacts, but the gate only fails when the relative ATC overhead budget is
+breached. Absolute drift on a different or noisier host is reported as an
+advisory note, not a hard failure.
+
+Initial checked-in capture (`2026-04-18`):
+
+| Benchmark | Baseline p95 | Mean | p99 | Delta vs no_atc | Allowed p95 |
+|-----------|--------------|------|-----|-----------------|-------------|
+| `mail_send_no_atc` | `205.78ms` | `189.28ms` | `213.61ms` | `+0.00%` | `205.78ms` |
+| `mail_send_atc_shadow` | `206.13ms` | `200.13ms` | `286.77ms` | `+0.17%` | `216.07ms` |
+| `mail_send_atc_live` | `214.05ms` | `197.38ms` | `291.76ms` | `+4.02%` | `216.07ms` |
+
+Historical seed artifact:
+- `tests/artifacts/perf/atc_pre_wiring_baseline.json`
+
 ## Archive Write Budgets
 
 Baseline numbers are taken from the bench harness artifacts emitted by:

@@ -11354,6 +11354,7 @@ fn handle_bench(
                     "requires_seeded_db": cfg.requires_seeded_db,
                     "conditional": cfg.conditional,
                     "condition": cfg.condition,
+                    "env": cfg.env,
                 })
             })
             .collect();
@@ -11429,11 +11430,14 @@ fn handle_bench(
             "runs": cfg.runs,
             "requires_seeded_db": cfg.requires_seeded_db,
             "conditional": cfg.conditional,
+            "env": cfg.env,
         })
         .to_string();
         let signature =
             bench::fixture_signature(&cfg.name, &command_display, &params_json, &hardware);
-        match bench::run_timed(&command, cfg.warmup, cfg.runs, &bench_env, Some(&cwd)) {
+        let mut benchmark_env = bench_env.clone();
+        benchmark_env.extend(cfg.env.clone());
+        match bench::run_timed(&command, cfg.warmup, cfg.runs, &benchmark_env, Some(&cwd)) {
             Ok(timing) => match bench::BenchResult::from_samples(
                 cfg.name.clone(),
                 command_display,
@@ -21631,8 +21635,12 @@ fn service_install_systemd(
         }
     }
 
-    let unit_content =
-        build_systemd_unit_content(&exec_args, &abs_storage_root, &abs_db_url, &abs_storage_root);
+    let unit_content = build_systemd_unit_content(
+        &exec_args,
+        &abs_storage_root,
+        &abs_db_url,
+        &abs_storage_root,
+    );
 
     std::fs::write(&unit_path, &unit_content)?;
     ftui_runtime::ftui_println!("Wrote {}", unit_path.display());

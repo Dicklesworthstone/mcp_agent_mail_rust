@@ -6,6 +6,7 @@
 # - quick/full benchmark runs
 # - baseline save/load comparison flows
 # - regression exit behavior
+# - ATC perf gate policy (relative overhead is blocking; absolute drift is advisory)
 
 set -euo pipefail
 
@@ -13,6 +14,8 @@ E2E_SUITE="bench"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../../scripts/e2e_lib.sh
 source "${SCRIPT_DIR}/../../scripts/e2e_lib.sh"
+
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 e2e_init_artifacts
 e2e_banner "am bench E2E Suite"
@@ -123,6 +126,23 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Case 2b: ATC-mode mail_send benchmarks expose env wiring
+# ---------------------------------------------------------------------------
+e2e_case_banner "bench_list_atc_mail_send_json"
+if run_bench_case "bench_list_atc_mail_send_json" --list --json --filter "mail_send*"; then
+    out_file="${E2E_ARTIFACT_DIR}/bench_list_atc_mail_send_json/stdout.json"
+    no_atc="$(jq -r '.[] | select(.name=="mail_send_no_atc") | .env.ATC_LEARNING_DISABLED' "${out_file}")"
+    shadow="$(jq -r '.[] | select(.name=="mail_send_atc_shadow") | .env.AM_ATC_WRITE_MODE' "${out_file}")"
+    live="$(jq -r '.[] | select(.name=="mail_send_atc_live") | .env.AM_ATC_WRITE_MODE' "${out_file}")"
+
+    e2e_assert_eq "mail_send_no_atc disables ATC" "1" "${no_atc}"
+    e2e_assert_eq "mail_send_atc_shadow sets shadow mode" "shadow" "${shadow}"
+    e2e_assert_eq "mail_send_atc_live sets live mode" "live" "${live}"
+else
+    e2e_fail "bench --list --json --filter mail_send* failed"
+fi
+
+# ---------------------------------------------------------------------------
 # Case 3: full --json run
 # ---------------------------------------------------------------------------
 e2e_case_banner "bench_full_json"
@@ -193,6 +213,108 @@ if [ -f "${out_file}" ]; then
 else
     e2e_fail "forced regression output file missing"
 fi
+
+# ---------------------------------------------------------------------------
+# Case 6: ATC perf gate treats absolute drift as advisory when overhead is within budget
+# ---------------------------------------------------------------------------
+e2e_case_banner "atc_perf_gate_absolute_drift_is_advisory"
+ATC_GATE_PASS_REPORT="${WORKDIR}/atc_gate_absolute_drift_report.json"
+ATC_GATE_PASS_OUT="${WORKDIR}/atc_gate_absolute_drift_out"
+cat > "${ATC_GATE_PASS_REPORT}" <<'JSON'
+{
+  "summary": {
+    "benchmarks": {
+      "mail_send_no_atc": {
+        "p95_ms": 250.0,
+        "baseline_p95_ms": 205.78,
+        "delta_p95_ms": 44.22,
+        "regression": true
+      },
+      "mail_send_atc_shadow": {
+        "p95_ms": 255.0,
+        "baseline_p95_ms": 206.13,
+        "delta_p95_ms": 48.87,
+        "regression": true
+      },
+      "mail_send_atc_live": {
+        "p95_ms": 260.0,
+        "baseline_p95_ms": 214.05,
+        "delta_p95_ms": 45.95,
+        "regression": true
+      }
+    }
+  },
+  "failures": []
+}
+JSON
+
+set +e
+bash "${PROJECT_ROOT}/scripts/bench_atc_perf_gate.sh" \
+    --skip-bench \
+    --baseline "${PROJECT_ROOT}/benches/atc_perf_baseline.json" \
+    --bench-report "${ATC_GATE_PASS_REPORT}" \
+    --output-dir "${ATC_GATE_PASS_OUT}"
+atc_gate_pass_rc=$?
+set -e
+
+e2e_assert_eq "ATC gate ignores absolute drift-only regressions" "0" "${atc_gate_pass_rc}"
+e2e_assert_eq \
+    "ATC gate summary stays pass for advisory drift" \
+    "pass" \
+    "$(jq -r '.status' "${ATC_GATE_PASS_OUT}/summary.json")"
+e2e_assert_eq \
+    "ATC gate preserves advisory baseline drift list" \
+    "3" \
+    "$(jq -r '.baseline_regressions | length' "${ATC_GATE_PASS_OUT}/summary.json")"
+
+# ---------------------------------------------------------------------------
+# Case 7: ATC perf gate fails when relative overhead breaches the budget
+# ---------------------------------------------------------------------------
+e2e_case_banner "atc_perf_gate_overhead_regression_exit_code"
+ATC_GATE_FAIL_REPORT="${WORKDIR}/atc_gate_overhead_regression_report.json"
+ATC_GATE_FAIL_OUT="${WORKDIR}/atc_gate_overhead_regression_out"
+cat > "${ATC_GATE_FAIL_REPORT}" <<'JSON'
+{
+  "summary": {
+    "benchmarks": {
+      "mail_send_no_atc": {
+        "p95_ms": 250.0,
+        "baseline_p95_ms": 205.78,
+        "delta_p95_ms": 44.22,
+        "regression": false
+      },
+      "mail_send_atc_shadow": {
+        "p95_ms": 255.0,
+        "baseline_p95_ms": 206.13,
+        "delta_p95_ms": 48.87,
+        "regression": false
+      },
+      "mail_send_atc_live": {
+        "p95_ms": 270.0,
+        "baseline_p95_ms": 214.05,
+        "delta_p95_ms": 55.95,
+        "regression": false
+      }
+    }
+  },
+  "failures": []
+}
+JSON
+
+set +e
+bash "${PROJECT_ROOT}/scripts/bench_atc_perf_gate.sh" \
+    --skip-bench \
+    --baseline "${PROJECT_ROOT}/benches/atc_perf_baseline.json" \
+    --bench-report "${ATC_GATE_FAIL_REPORT}" \
+    --output-dir "${ATC_GATE_FAIL_OUT}"
+atc_gate_fail_rc=$?
+set -e
+
+e2e_assert_eq "ATC gate returns exit code 3 on overhead regression" "3" "${atc_gate_fail_rc}"
+e2e_assert_eq \
+    "ATC gate summary flips to regression when overhead budget is breached" \
+    "regression" \
+    "$(jq -r '.status' "${ATC_GATE_FAIL_OUT}/summary.json")"
 
 popd >/dev/null
 
