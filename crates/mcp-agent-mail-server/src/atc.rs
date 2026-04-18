@@ -4037,6 +4037,31 @@ pub struct AtcEngine {
     agent_intervention_counts: HashMap<String, u64>,
     /// Cached state from the previous snapshot for delta computation.
     prev_snapshot_state: PrevSnapshotState,
+    /// Recent reservation lifecycle events for expiry sweep correlation (br-bn0vb.10).
+    /// Ring buffer bounded to MAX_RESERVATION_EVENT_LOG entries.
+    reservation_event_log: VecDeque<ReservationEvent>,
+}
+
+const MAX_RESERVATION_EVENT_LOG: usize = 512;
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReservationEvent {
+    pub kind: ReservationEventKind,
+    pub agent: String,
+    #[allow(dead_code)]
+    pub project: String,
+    #[allow(dead_code)]
+    pub paths: Vec<String>,
+    pub timestamp_micros: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReservationEventKind {
+    Granted,
+    Released,
+    Renewed,
+    ForceReleased,
+    Conflicted,
 }
 
 /// Minimal cached state from the prior summary snapshot for delta computation.
@@ -4160,6 +4185,7 @@ impl AtcEngine {
             resolved_experience_count: 0,
             agent_intervention_counts: HashMap::new(),
             prev_snapshot_state: PrevSnapshotState::default(),
+            reservation_event_log: VecDeque::new(),
         }
     }
 
@@ -4326,6 +4352,13 @@ impl AtcEngine {
                 agent: agent.to_string(),
                 timestamp_micros,
             });
+        self.push_reservation_event(ReservationEvent {
+            kind: ReservationEventKind::Granted,
+            agent: agent.to_string(),
+            project: project.to_string(),
+            paths: paths.to_vec(),
+            timestamp_micros,
+        });
         if !exclusive || paths.is_empty() {
             return;
         }
@@ -4350,6 +4383,13 @@ impl AtcEngine {
                 agent: agent.to_string(),
                 timestamp_micros,
             });
+        self.push_reservation_event(ReservationEvent {
+            kind: ReservationEventKind::Released,
+            agent: agent.to_string(),
+            project: project.to_string(),
+            paths: paths.to_vec(),
+            timestamp_micros,
+        });
         let graph = self.conflict_graphs.entry(project.to_string()).or_default();
         let cleared = graph.clear_holder_conflicts_for_release(agent, paths);
         if cleared > 0 {
@@ -4371,6 +4411,13 @@ impl AtcEngine {
                 agent: agent.to_string(),
                 timestamp_micros,
             });
+        self.push_reservation_event(ReservationEvent {
+            kind: ReservationEventKind::Renewed,
+            agent: agent.to_string(),
+            project: project.to_string(),
+            paths: paths.to_vec(),
+            timestamp_micros,
+        });
         if !paths.is_empty() {
             let graph = self.conflict_graphs.entry(project.to_string()).or_default();
             let cleared = graph.clear_blocked_conflicts_for_grant(agent, paths);
@@ -4394,6 +4441,13 @@ impl AtcEngine {
                 agent: agent.to_string(),
                 timestamp_micros,
             });
+        self.push_reservation_event(ReservationEvent {
+            kind: ReservationEventKind::ForceReleased,
+            agent: agent.to_string(),
+            project: project.to_string(),
+            paths: paths.to_vec(),
+            timestamp_micros,
+        });
         let graph = self.conflict_graphs.entry(project.to_string()).or_default();
         let cleared = graph.clear_holder_conflicts_for_release(agent, paths);
         if cleared > 0 {
@@ -4413,6 +4467,17 @@ impl AtcEngine {
         if requester.is_empty() || conflicts.is_empty() {
             return;
         }
+        let conflict_paths: Vec<String> = conflicts
+            .iter()
+            .map(|(_, requested_path, _)| requested_path.clone())
+            .collect();
+        self.push_reservation_event(ReservationEvent {
+            kind: ReservationEventKind::Conflicted,
+            agent: requester.to_string(),
+            project: project.to_string(),
+            paths: conflict_paths,
+            timestamp_micros,
+        });
         let graph = self.conflict_graphs.entry(project.to_string()).or_default();
         let mut added = false;
         for (holder, requested_path, holder_path_pattern) in conflicts {
@@ -4429,6 +4494,39 @@ impl AtcEngine {
             self.session_summary
                 .absorb(&SynthesisEvent::ConflictDetected { timestamp_micros });
         }
+    }
+
+    fn push_reservation_event(&mut self, event: ReservationEvent) {
+        if self.reservation_event_log.len() >= MAX_RESERVATION_EVENT_LOG {
+            self.reservation_event_log.pop_front();
+        }
+        self.reservation_event_log.push_back(event);
+    }
+
+    pub(crate) fn reservation_outcome_for_agent(
+        &self,
+        agent: &str,
+        since_micros: i64,
+    ) -> Option<ReservationEventKind> {
+        for event in self.reservation_event_log.iter().rev() {
+            if event.timestamp_micros < since_micros {
+                break;
+            }
+            if event.agent.eq_ignore_ascii_case(agent) {
+                match event.kind {
+                    ReservationEventKind::Released => return Some(ReservationEventKind::Released),
+                    ReservationEventKind::ForceReleased => {
+                        return Some(ReservationEventKind::ForceReleased);
+                    }
+                    ReservationEventKind::Conflicted => {
+                        return Some(ReservationEventKind::Conflicted);
+                    }
+                    ReservationEventKind::Renewed => return Some(ReservationEventKind::Renewed),
+                    ReservationEventKind::Granted => {}
+                }
+            }
+        }
+        None
     }
 
     fn note_atc_intervention(&mut self, timestamp_micros: i64) {
@@ -6884,6 +6982,108 @@ mod synthesis_tests {
 
         assert_eq!(summary.conflicts_detected, 1);
         assert_eq!(summary.conflicts_resolved, 1);
+    }
+
+    #[test]
+    fn reservation_event_log_tracks_grant_then_release() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.note_reservation_granted(
+            "BlueLake",
+            &["src/**".to_string()],
+            true,
+            "proj-alpha",
+            1_000_000,
+        );
+        engine.note_reservation_released(
+            "BlueLake",
+            &["src/**".to_string()],
+            "proj-alpha",
+            2_000_000,
+        );
+        let outcome = engine.reservation_outcome_for_agent("BlueLake", 1_000_000);
+        assert_eq!(outcome, Some(ReservationEventKind::Released));
+    }
+
+    #[test]
+    fn reservation_event_log_tracks_conflict() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.note_reservation_granted(
+            "BlueLake",
+            &["src/**".to_string()],
+            true,
+            "proj-alpha",
+            1_000_000,
+        );
+        engine.note_reservation_conflicts(
+            "RedHawk",
+            "proj-alpha",
+            &[(
+                "BlueLake".to_string(),
+                "src/**".to_string(),
+                "src/**".to_string(),
+            )],
+            2_000_000,
+        );
+        let outcome = engine.reservation_outcome_for_agent("RedHawk", 1_000_000);
+        assert_eq!(outcome, Some(ReservationEventKind::Conflicted));
+    }
+
+    #[test]
+    fn reservation_event_log_returns_none_when_only_grants() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.note_reservation_granted(
+            "BlueLake",
+            &["src/**".to_string()],
+            true,
+            "proj-alpha",
+            1_000_000,
+        );
+        let outcome = engine.reservation_outcome_for_agent("BlueLake", 1_000_000);
+        assert_eq!(outcome, None);
+    }
+
+    #[test]
+    fn reservation_event_log_force_release_distinct_from_release() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.note_reservation_force_released(
+            "BlueLake",
+            &["src/**".to_string()],
+            "proj-alpha",
+            2_000_000,
+        );
+        let outcome = engine.reservation_outcome_for_agent("BlueLake", 1_000_000);
+        assert_eq!(outcome, Some(ReservationEventKind::ForceReleased));
+    }
+
+    #[test]
+    fn reservation_event_log_renewed_outcome() {
+        let mut engine = AtcEngine::new_for_testing();
+        engine.note_reservation_renewed(
+            "BlueLake",
+            &["src/**".to_string()],
+            "proj-alpha",
+            2_000_000,
+        );
+        let outcome = engine.reservation_outcome_for_agent("BlueLake", 1_000_000);
+        assert_eq!(outcome, Some(ReservationEventKind::Renewed));
+    }
+
+    #[test]
+    fn reservation_event_log_ring_buffer_bounded() {
+        let mut engine = AtcEngine::new_for_testing();
+        for i in 0..MAX_RESERVATION_EVENT_LOG + 100 {
+            engine.note_reservation_granted(
+                "BlueLake",
+                &["src/**".to_string()],
+                true,
+                "proj-alpha",
+                i as i64,
+            );
+        }
+        assert_eq!(
+            engine.reservation_event_log.len(),
+            MAX_RESERVATION_EVENT_LOG
+        );
     }
 
     #[test]
@@ -9658,6 +9858,18 @@ pub fn atc_note_reservation_force_released(
         return;
     }
     e.note_reservation_force_released(agent, paths, project, timestamp_micros);
+}
+
+/// Query the engine's reservation event log for the most recent outcome affecting `agent`
+/// since `since_micros`. Returns None if no relevant event found.
+#[must_use]
+pub(crate) fn atc_reservation_outcome_for_agent(
+    agent: &str,
+    since_micros: i64,
+) -> Option<ReservationEventKind> {
+    let engine_lock = ATC_ENGINE.get()?;
+    let engine = engine_lock.lock().unwrap_or_else(|p| p.into_inner());
+    engine.reservation_outcome_for_agent(agent, since_micros)
 }
 
 pub fn atc_note_intervention(timestamp_micros: i64) {

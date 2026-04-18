@@ -655,7 +655,7 @@ fn parse_toast_position(value: &str) -> ToastPosition {
 
 fn remote_modifiers_from_bits(modifiers: u8) -> Modifiers {
     let mut out = Modifiers::empty();
-    // Browser payload bit layout (mcp-agent-mail-wasm/www/index.js):
+    // Browser payload bit layout (experimental/mcp-agent-mail-wasm/www/index.js):
     // ctrl=1, shift=2, alt=4, meta=8.
     if (modifiers & 0b0001) != 0 {
         out |= Modifiers::CTRL;
@@ -989,7 +989,7 @@ const COACH_HINTS: &[CoachHint] = &[
     CoachHint {
         id: "dashboard:welcome",
         screen: MailScreenId::Dashboard,
-        message: "Tip: Press ? for help, Ctrl+P for command palette",
+        message: "Tip: Press F1 for help, Ctrl+P for command palette",
     },
     CoachHint {
         id: "messages:search",
@@ -4212,7 +4212,7 @@ impl Model for MailAppModel {
 
                     if self.help_visible {
                         match key.code {
-                            KeyCode::Escape | KeyCode::Char('?') => {
+                            KeyCode::Escape | KeyCode::F(1) | KeyCode::Char('?') => {
                                 self.help_visible = false;
                                 return Cmd::none();
                             }
@@ -4263,6 +4263,11 @@ impl Model for MailAppModel {
                             self.flush_before_shutdown();
                             self.state.request_shutdown();
                             return Cmd::quit();
+                        }
+                        KeyCode::F(1) => {
+                            self.help_visible = !self.help_visible;
+                            self.help_scroll = 0;
+                            return Cmd::none();
                         }
                         KeyCode::Char('?') if !text_mode => {
                             self.help_visible = !self.help_visible;
@@ -4657,14 +4662,19 @@ impl Model for MailAppModel {
         // 6. Help overlay (z=6, topmost)
         if self.help_visible {
             let help_started = Instant::now();
-            let screen_label = crate::tui_screens::screen_meta(active_screen).title;
+            let screen_meta = crate::tui_screens::screen_meta(active_screen);
+            let screen_label = screen_meta.title;
             let screen_tip = self
                 .screen_manager
                 .active_screen_ref()
                 .and_then(super::tui_screens::MailScreen::context_help_tip);
-            let sections = self
-                .keymap
-                .contextual_help(&screen_bindings, screen_label, screen_tip);
+            let screen_markdown = Some(screen_meta.help_markdown);
+            let sections = self.keymap.contextual_help(
+                &screen_bindings,
+                screen_label,
+                screen_tip,
+                screen_markdown,
+            );
             let help_scroll = self.help_scroll;
             tui_chrome::render_help_overlay_sections(
                 &sections,
@@ -8597,6 +8607,16 @@ mod tests {
     fn question_mark_toggles_help() {
         let mut model = test_model();
         let key = Event::Key(ftui::KeyEvent::new(KeyCode::Char('?')));
+        model.update(MailMsg::Terminal(key.clone()));
+        assert!(model.help_visible());
+        model.update(MailMsg::Terminal(key));
+        assert!(!model.help_visible());
+    }
+
+    #[test]
+    fn f1_toggles_help() {
+        let mut model = test_model();
+        let key = Event::Key(ftui::KeyEvent::new(KeyCode::F(1)));
         model.update(MailMsg::Terminal(key.clone()));
         assert!(model.help_visible());
         model.update(MailMsg::Terminal(key));
@@ -12574,7 +12594,7 @@ first body
 
         // Known key-like tokens that appear in hint messages.
         let key_tokens: &[(&str, &[&str])] = &[
-            ("dashboard:welcome", &["?", "Ctrl+P"]),
+            ("dashboard:welcome", &["F1", "Ctrl+P"]),
             ("messages:search", &["/", "Enter"]),
             ("threads:expand", &["Enter", "h"]),
             ("agents:inbox", &["/", "s"]),

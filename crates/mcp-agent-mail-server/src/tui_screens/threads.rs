@@ -4649,9 +4649,12 @@ mod tests {
         // and the drop silently produced `Cmd::None` instead of a
         // rethread. Widen the list area so the 2-line cells are active
         // and `y=4` lands squarely on row 1 (thread `t2`).
-        screen
-            .last_list_area
-            .set(Rect::new(0, 1, THREAD_SUBJECT_LINE_MIN_WIDTH as u16 + 2, 10));
+        screen.last_list_area.set(Rect::new(
+            0,
+            1,
+            THREAD_SUBJECT_LINE_MIN_WIDTH as u16 + 2,
+            10,
+        ));
         screen.last_detail_area.set(Rect::new(
             THREAD_SUBJECT_LINE_MIN_WIDTH as u16 + 2,
             1,

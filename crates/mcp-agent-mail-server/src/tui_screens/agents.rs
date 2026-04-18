@@ -346,9 +346,10 @@ fn enrich_lossy_agent_summary_rows_from_previous(
         };
         // Only restore from previous when its project is actually real;
         // otherwise we'd just swap one placeholder for another.
-        let previous_project_is_placeholder =
-            previous.project.starts_with("[unknown-project-");
-        if (!previous.project.is_empty() && !previous_project_is_placeholder) || row.project.is_empty() {
+        let previous_project_is_placeholder = previous.project.starts_with("[unknown-project-");
+        if (!previous.project.is_empty() && !previous_project_is_placeholder)
+            || row.project.is_empty()
+        {
             row.identity = previous.identity.clone();
             row.project = previous.project.clone();
         }

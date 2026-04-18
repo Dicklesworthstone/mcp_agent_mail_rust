@@ -709,7 +709,7 @@ fn plan_status_segments(
 
     // ── Right segments (right-aligned) ──
     let palette_hint = "[^P]";
-    let help_hint = if help_visible { "[?]" } else { "?" };
+    let help_hint = if help_visible { "[F1]" } else { "F1" };
     let mut right = Vec::new();
 
     right.push(StatusSegment {
@@ -1027,7 +1027,7 @@ pub fn render_help_overlay_sections(
         " "
     };
 
-    let title = format!(" Keyboard Shortcuts{scroll_hint}(Esc to close) ");
+    let title = format!(" Help & Keybindings{scroll_hint}(F1/Esc close) ");
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .title(&title)
@@ -1099,6 +1099,24 @@ pub fn render_help_overlay_sections(
             line_idx += 1;
         }
 
+        // Optional markdown body.
+        if let Some(ref body_markdown) = section.body_markdown {
+            let rendered_body = crate::tui_markdown::render_body(
+                body_markdown,
+                &crate::tui_theme::markdown_theme(),
+            );
+            for line in rendered_body.lines() {
+                if line_idx >= visible_start && line_idx < visible_end && y_pos < inner.height {
+                    Paragraph::new(ftui::text::Text::from_lines([line.clone()])).render(
+                        Rect::new(inner.x + 2, inner.y + y_pos, col_width.saturating_sub(1), 1),
+                        frame,
+                    );
+                    y_pos += 1;
+                }
+                line_idx += 1;
+            }
+        }
+
         // Entries.
         for (entry_idx, (key, action)) in section.entries.iter().enumerate() {
             if line_idx >= visible_start && line_idx < visible_end && y_pos < inner.height {
@@ -1125,7 +1143,7 @@ fn render_help_overlay_title_gradient(frame: &mut Frame<'_>, overlay_area: Rect)
         return;
     }
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let title = "Keyboard Shortcuts";
+    let title = "Help & Keybindings";
     let title_width = usize::from(overlay_area.width.saturating_sub(4)).min(title.len());
     if title_width == 0 {
         return;
@@ -1892,6 +1910,7 @@ mod tests {
         let sections = vec![crate::tui_keymap::HelpSection {
             title: "Global".to_string(),
             description: Some("Common shortcuts".to_string()),
+            body_markdown: None,
             entries: vec![("q".to_string(), "Quit".to_string())],
         }];
         let mut pool = ftui::GraphemePool::new();
@@ -1904,6 +1923,7 @@ mod tests {
         let sections = vec![crate::tui_keymap::HelpSection {
             title: "Global".to_string(),
             description: Some("Common shortcuts".to_string()),
+            body_markdown: None,
             entries: vec![("q".to_string(), "Quit".to_string())],
         }];
         let mut pool = ftui::GraphemePool::new();
@@ -2153,12 +2173,12 @@ mod tests {
             "expected palette hint in status segments: {right_text}"
         );
         assert!(
-            right_text.contains('?'),
+            right_text.contains("F1"),
             "expected help hint in status segments: {right_text}"
         );
         let last_text = right.last().map(|s| s.text.trim()).unwrap_or_default();
         assert!(
-            last_text == "?" || last_text == "[?]",
+            last_text == "F1" || last_text == "[F1]",
             "expected help hint to be rightmost, got: {last_text}"
         );
     }

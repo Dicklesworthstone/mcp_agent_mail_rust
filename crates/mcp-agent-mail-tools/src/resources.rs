@@ -6776,9 +6776,7 @@ mod resource_shape_tests {
                 // is the *only* agent surfaced.
                 let agents_array = agents["agents"].as_array().expect("agents array");
                 assert!(
-                    agents_array
-                        .iter()
-                        .any(|entry| entry["name"] == "Alice"),
+                    agents_array.iter().any(|entry| entry["name"] == "Alice"),
                     "expected Alice (from archive profile.json) in snapshot: {agents_array:?}"
                 );
 
@@ -6789,10 +6787,7 @@ mod resource_shape_tests {
                 // `(SELECT COUNT(*) ...) AS alias` clauses, so we keep the
                 // shape simple and portable.
                 let project_rows = conn
-                    .query_sync(
-                        "SELECT COUNT(*) AS project_count FROM projects",
-                        &[],
-                    )
+                    .query_sync("SELECT COUNT(*) AS project_count FROM projects", &[])
                     .expect("query resource live db project count");
                 let project_count = project_rows
                     .first()
@@ -6801,10 +6796,7 @@ mod resource_shape_tests {
                     .expect("resource project count");
                 assert_eq!(project_count, 0);
                 let agent_rows = conn
-                    .query_sync(
-                        "SELECT COUNT(*) AS agent_count FROM agents",
-                        &[],
-                    )
+                    .query_sync("SELECT COUNT(*) AS agent_count FROM agents", &[])
                     .expect("query resource live db agent count");
                 let agent_count = agent_rows
                     .first()

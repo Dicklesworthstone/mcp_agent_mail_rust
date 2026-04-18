@@ -82,9 +82,9 @@ pub const GLOBAL_BINDINGS: &[GlobalBinding] = &[
         text_suppressible: true,
     },
     GlobalBinding {
-        label: "?",
+        label: "F1",
         action: "Toggle help",
-        text_suppressible: true,
+        text_suppressible: false,
     },
     GlobalBinding {
         label: "y",
@@ -138,6 +138,7 @@ pub fn label_to_keycodes(label: &str) -> Vec<KeyCode> {
         "PageDown" => vec![KeyCode::PageDown],
         "Home" => vec![KeyCode::Home],
         "End" => vec![KeyCode::End],
+        "F1" => vec![KeyCode::F(1)],
         "F12" => vec![KeyCode::F(12)],
         // Ranges
         "1-9" => (1..=9)
@@ -312,7 +313,7 @@ fn vim_profile_bindings() -> Vec<ProfileBinding> {
         pb("command_palette_ctrl", "Ctrl+P", "Command palette", false),
         pb("export_menu", "Ctrl+E", "Export screen snapshot", false),
         pb("cycle_theme", "Ctrl+T", "Cycle theme", true),
-        pb("toggle_help", "?", "Toggle help", true),
+        pb("toggle_help", "F1", "Toggle help", false),
         pb("clipboard_yank", "y", "Copy to clipboard", true),
         pb("quit", "q", "Quit", true),
         pb("quit_ctrl", "Ctrl+C", "Quit (press twice)", false),
@@ -347,7 +348,7 @@ fn emacs_profile_bindings() -> Vec<ProfileBinding> {
         pb("command_palette", "Ctrl+P", "Command palette", false),
         pb("export_menu", "Ctrl+E", "Export screen snapshot", false),
         pb("cycle_theme", "Ctrl+T", "Cycle theme", true),
-        pb("toggle_help", "?", "Toggle help", true),
+        pb("toggle_help", "F1", "Toggle help", false),
         pb("quit", "q", "Quit", true),
         pb("quit_ctrl", "Ctrl+C", "Quit (press twice)", false),
         pb("detach_tui", "Ctrl+D", "Detach TUI (headless)", false),
@@ -376,7 +377,7 @@ fn minimal_profile_bindings() -> Vec<ProfileBinding> {
         pb("prev_screen", "Shift+Tab", "Previous screen", false),
         pb("command_palette", "Ctrl+P", "Command palette", false),
         pb("export_menu", "Ctrl+E", "Export screen snapshot", false),
-        pb("toggle_help", "?", "Toggle help", true),
+        pb("toggle_help", "F1", "Toggle help", false),
         pb("quit_ctrl", "Ctrl+C", "Quit (press twice)", false),
         pb("detach_tui", "Ctrl+D", "Detach TUI (headless)", false),
         pb(
@@ -419,7 +420,7 @@ fn action_id_for_label(label: &str) -> &'static str {
         "Ctrl+E" => "export_menu",
         ":" => "command_palette",
         "Ctrl+T" => "cycle_theme",
-        "?" => "toggle_help",
+        "F1" | "?" => "toggle_help",
         "y" => "clipboard_yank",
         "q" => "quit",
         "Ctrl+C" => "quit_ctrl",
@@ -468,6 +469,7 @@ fn navigation_sections() -> Vec<HelpSection> {
         sections.push(HelpSection {
             title: "Navigate • Overview".to_string(),
             description: None,
+            body_markdown: None,
             entries: overview,
         });
     }
@@ -475,6 +477,7 @@ fn navigation_sections() -> Vec<HelpSection> {
         sections.push(HelpSection {
             title: "Navigate • Communication".to_string(),
             description: None,
+            body_markdown: None,
             entries: communication,
         });
     }
@@ -482,6 +485,7 @@ fn navigation_sections() -> Vec<HelpSection> {
         sections.push(HelpSection {
             title: "Navigate • Operations".to_string(),
             description: None,
+            body_markdown: None,
             entries: operations,
         });
     }
@@ -489,6 +493,7 @@ fn navigation_sections() -> Vec<HelpSection> {
         sections.push(HelpSection {
             title: "Navigate • System".to_string(),
             description: None,
+            body_markdown: None,
             entries: system,
         });
     }
@@ -637,14 +642,18 @@ impl KeymapRegistry {
         screen_bindings: &[crate::tui_screens::HelpEntry],
         screen_label: &str,
         screen_tip: Option<&str>,
+        screen_markdown: Option<&str>,
     ) -> Vec<HelpSection> {
         let mut sections = Vec::new();
 
         // Screen section first — context should be most prominent.
-        if !screen_bindings.is_empty() {
+        if !screen_bindings.is_empty() || screen_tip.is_some() || screen_markdown.is_some() {
             sections.push(HelpSection {
                 title: screen_label.to_string(),
                 description: screen_tip.map(str::to_string),
+                body_markdown: screen_markdown
+                    .filter(|markdown| !markdown.trim().is_empty())
+                    .map(str::to_string),
                 entries: screen_bindings
                     .iter()
                     .map(|e| (e.key.to_string(), e.action.to_string()))
@@ -657,6 +666,7 @@ impl KeymapRegistry {
         sections.push(HelpSection {
             title: format!("Global ({})", self.profile.label()),
             description: None,
+            body_markdown: None,
             entries: global_entries,
         });
 
@@ -728,6 +738,8 @@ pub struct HelpSection {
     pub title: String,
     /// Optional context description shown below the title.
     pub description: Option<String>,
+    /// Optional markdown body rendered between description and keybindings.
+    pub body_markdown: Option<String>,
     /// `(key_label, action_description)` pairs.
     pub entries: Vec<(String, String)>,
 }
@@ -737,7 +749,12 @@ impl HelpSection {
     #[must_use]
     pub fn line_count(&self) -> usize {
         let desc_lines = self.description.as_ref().map_or(0, |_| 1);
-        1 + desc_lines + self.entries.len()
+        let body_lines = self.body_markdown.as_ref().map_or(0, |body| {
+            crate::tui_markdown::render_body(body, &crate::tui_markdown::MarkdownTheme::default())
+                .lines()
+                .len()
+        });
+        1 + desc_lines + body_lines + self.entries.len()
     }
 }
 
@@ -781,6 +798,7 @@ mod tests {
         assert_eq!(label_to_keycodes("Tab"), vec![KeyCode::Tab]);
         assert_eq!(label_to_keycodes("Esc"), vec![KeyCode::Escape]);
         assert_eq!(label_to_keycodes("Enter"), vec![KeyCode::Enter]);
+        assert_eq!(label_to_keycodes("F1"), vec![KeyCode::F(1)]);
         assert_eq!(label_to_keycodes("F12"), vec![KeyCode::F(12)]);
     }
 
@@ -940,14 +958,14 @@ mod tests {
     fn text_suppressible_flag_correctness() {
         for binding in GLOBAL_BINDINGS {
             match binding.label {
-                "Tab" | "Shift+Tab" | "Esc" | "Ctrl+P" | "F12" => {
+                "Tab" | "Shift+Tab" | "Esc" | "Ctrl+P" | "F1" | "F12" => {
                     assert!(
                         !binding.text_suppressible,
                         "{} should NOT be text-suppressible",
                         binding.label
                     );
                 }
-                "q" | "?" | ":" | "m" | "Ctrl+T" | "y" | JUMP_BINDING_LABEL => {
+                "q" | ":" | "m" | "Ctrl+T" | "y" | JUMP_BINDING_LABEL => {
                     assert!(
                         binding.text_suppressible,
                         "{} should be text-suppressible",
@@ -1130,7 +1148,7 @@ mod tests {
     #[test]
     fn registry_contextual_help_has_global_section() {
         let reg = KeymapRegistry::default();
-        let sections = reg.contextual_help(&[], "Dashboard", None);
+        let sections = reg.contextual_help(&[], "Dashboard", None, None);
         assert!(sections[0].title.contains("Global"));
         assert!(sections[0].title.contains("Default"));
         assert!(
@@ -1146,12 +1164,17 @@ mod tests {
             key: "r",
             action: "Refresh",
         }];
-        let sections = reg.contextual_help(&screen, "Messages", None);
+        let sections =
+            reg.contextual_help(&screen, "Messages", None, Some("Focus the active thread."));
         let screen_section = sections
             .iter()
             .find(|s| s.title == "Messages")
             .expect("screen-specific section should be present");
         assert_eq!(screen_section.entries.len(), 1);
+        assert_eq!(
+            screen_section.body_markdown.as_deref(),
+            Some("Focus the active thread.")
+        );
     }
 
     #[test]
@@ -1168,7 +1191,7 @@ mod tests {
     #[test]
     fn contextual_help_navigation_sections_cover_all_screens() {
         let reg = KeymapRegistry::default();
-        let sections = reg.contextual_help(&[], "Dashboard", None);
+        let sections = reg.contextual_help(&[], "Dashboard", None, None);
         let nav_entries = sections
             .iter()
             .filter(|s| s.title.starts_with("Navigate •"))
@@ -1205,6 +1228,7 @@ mod tests {
         let section = HelpSection {
             title: "Test".to_string(),
             description: None,
+            body_markdown: None,
             entries: vec![
                 ("a".to_string(), "Action A".to_string()),
                 ("b".to_string(), "Action B".to_string()),
@@ -1215,9 +1239,18 @@ mod tests {
         let with_desc = HelpSection {
             title: "Test".to_string(),
             description: Some("Quick tip here".to_string()),
+            body_markdown: None,
             entries: vec![("x".to_string(), "Do X".to_string())],
         };
         assert_eq!(with_desc.line_count(), 3); // title + description + 1 entry
+
+        let with_markdown = HelpSection {
+            title: "Test".to_string(),
+            description: None,
+            body_markdown: Some("Line one.\nLine two.".to_string()),
+            entries: vec![("x".to_string(), "Do X".to_string())],
+        };
+        assert_eq!(with_markdown.line_count(), 4); // title + 2 markdown lines + 1 entry
     }
 
     #[test]
@@ -1267,7 +1300,7 @@ mod tests {
     #[test]
     fn contextual_help_navigation_covers_all_categories() {
         let registry = KeymapRegistry::default();
-        let sections = registry.contextual_help(&[], "Test", None);
+        let sections = registry.contextual_help(&[], "Test", None, None);
         let nav_titles: Vec<_> = sections
             .iter()
             .filter(|s| s.title.starts_with("Navigate"))
@@ -1314,7 +1347,12 @@ mod tests {
             action: "Scroll",
         }];
         let registry = KeymapRegistry::default();
-        let sections = registry.contextual_help(&bindings, "Dashboard", Some("Overview tip"));
+        let sections = registry.contextual_help(
+            &bindings,
+            "Dashboard",
+            Some("Overview tip"),
+            Some("Use this screen to scan the system."),
+        );
         let screen_section = sections.iter().find(|s| s.title == "Dashboard");
         assert!(
             screen_section.is_some(),
@@ -1326,9 +1364,30 @@ mod tests {
             Some("Overview tip"),
             "screen section should include the context tip"
         );
+        assert_eq!(
+            sec.body_markdown.as_deref(),
+            Some("Use this screen to scan the system."),
+            "screen section should include markdown help"
+        );
         assert!(
             sec.entries.iter().any(|(k, _)| k == "j/k"),
             "screen section should contain screen-local bindings"
         );
+    }
+
+    #[test]
+    fn contextual_help_supports_markdown_only_screen_sections() {
+        let registry = KeymapRegistry::default();
+        let sections =
+            registry.contextual_help(&[], "Dashboard", None, Some("Use this screen for triage."));
+        let screen_section = sections
+            .iter()
+            .find(|s| s.title == "Dashboard")
+            .expect("markdown-only screen section should be present");
+        assert_eq!(
+            screen_section.body_markdown.as_deref(),
+            Some("Use this screen for triage.")
+        );
+        assert!(screen_section.entries.is_empty());
     }
 }

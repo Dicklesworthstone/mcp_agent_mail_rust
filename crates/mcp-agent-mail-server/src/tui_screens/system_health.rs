@@ -508,6 +508,22 @@ impl SystemHealthScreen {
             Span::styled(format!(" ({})", snap.atc.source), hint_style),
         ]));
         lines.push(Line::from_spans([
+            Span::styled("Learning:  ", label_style),
+            Span::styled(
+                if snap.atc.kill_switch_enabled {
+                    "kill-switch enabled"
+                } else {
+                    "kill-switch disabled"
+                }
+                .to_string(),
+                if snap.atc.kill_switch_enabled {
+                    crate::tui_theme::text_warning(&tp)
+                } else {
+                    value_style
+                },
+            ),
+        ]));
+        lines.push(Line::from_spans([
             Span::styled("Ticks:     ", label_style),
             Span::styled(
                 format!(
@@ -901,7 +917,17 @@ impl SystemHealthScreen {
 
                 self.render_metric_tiles(frame, tiles_area, state, &snap);
                 if gauge_h >= 2 {
-                    self.render_event_ring_gauge(frame, gauge_area, state);
+                    let left_w = gauge_area.width / 2;
+                    let event_area =
+                        Rect::new(gauge_area.x, gauge_area.y, left_w, gauge_area.height);
+                    let atc_area = Rect::new(
+                        gauge_area.x + left_w,
+                        gauge_area.y,
+                        gauge_area.width.saturating_sub(left_w),
+                        gauge_area.height,
+                    );
+                    self.render_event_ring_gauge(frame, event_area, state);
+                    self.render_atc_health_widget(frame, atc_area, &snap);
                 }
                 if cards_h >= 3 {
                     self.render_anomaly_cards(frame, cards_area, &snap);
@@ -922,7 +948,19 @@ impl SystemHealthScreen {
                 );
 
                 self.render_metric_tiles(frame, tiles_area, state, &snap);
-                if cards_h >= 3 {
+                if cards_h >= 6 {
+                    let atc_area = Rect::new(cards_area.x, cards_area.y, cards_area.width, 3);
+                    let findings_area = Rect::new(
+                        cards_area.x,
+                        cards_area.y + 3,
+                        cards_area.width,
+                        cards_area.height.saturating_sub(3),
+                    );
+                    self.render_atc_health_widget(frame, atc_area, &snap);
+                    if findings_area.height >= 3 {
+                        self.render_anomaly_cards(frame, findings_area, &snap);
+                    }
+                } else if cards_h >= 3 {
                     self.render_anomaly_cards(frame, cards_area, &snap);
                 }
             }
@@ -1044,6 +1082,64 @@ impl SystemHealthScreen {
 
         ReservationGauge::new("Event Ring Buffer", current, capacity.max(1))
             .ttl_display(&ttl_str)
+            .render(area, frame);
+    }
+
+    #[allow(clippy::unused_self)]
+    fn render_atc_health_widget(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        snap: &DiagnosticsSnapshot,
+    ) {
+        if area.is_empty() {
+            return;
+        }
+
+        let mut open_strata: Vec<(&String, &u64)> = snap
+            .atc
+            .observability
+            .experiences_open_by_stratum
+            .iter()
+            .collect();
+        open_strata.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
+        let strata_summary = if open_strata.is_empty() {
+            "none".to_string()
+        } else {
+            open_strata
+                .into_iter()
+                .take(2)
+                .map(|(label, count)| format!("{label}={count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let sweep_p95 = snap
+            .atc
+            .observability
+            .sweep_duration_micros
+            .get("resolution_window")
+            .map_or(0, |hist| hist.p95);
+
+        let body = format!(
+            "writes={} resolves={} open={} sweep_p95={}us kill={} safe={}",
+            snap.atc.observability.experiences_written_total,
+            snap.atc.observability.experiences_resolved_total,
+            strata_summary,
+            sweep_p95,
+            if snap.atc.kill_switch_enabled {
+                "on"
+            } else {
+                "off"
+            },
+            if snap.atc.safe_mode { "on" } else { "off" },
+        );
+        Paragraph::new(body)
+            .block(
+                Block::default()
+                    .title(" ATC Health ")
+                    .border_type(BorderType::Rounded)
+                    .borders(ftui::widgets::borders::Borders::ALL),
+            )
             .render(area, frame);
     }
 
@@ -3430,6 +3526,64 @@ mod tests {
         assert!(
             text.contains("Copy Mail UI"),
             "expected footer to include Copy Mail UI shortcut, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn atc_health_widget_renders_observability_summary() {
+        let screen = test_screen(DiagnosticsSnapshot::default());
+        let snap = DiagnosticsSnapshot {
+            atc: crate::AtcOperatorSnapshot {
+                enabled: true,
+                source: "live".to_string(),
+                safe_mode: true,
+                kill_switch_enabled: true,
+                observability: mcp_agent_mail_core::metrics::AtcMetricsSnapshot {
+                    experiences_written_total: 7,
+                    experiences_resolved_total: 5,
+                    experiences_open_by_stratum: std::collections::BTreeMap::from([
+                        ("liveness:Probe:0".to_string(), 3),
+                        ("conflict:Release:2".to_string(), 1),
+                    ]),
+                    sweep_duration_micros: std::collections::BTreeMap::from([(
+                        "resolution_window".to_string(),
+                        mcp_agent_mail_core::metrics::HistogramSnapshot {
+                            count: 4,
+                            sum: 480_000,
+                            min: 90_000,
+                            max: 160_000,
+                            p50: 110_000,
+                            p95: 150_000,
+                            p99: 160_000,
+                        },
+                    )]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(80, 4, &mut pool);
+        screen.render_atc_health_widget(&mut frame, Rect::new(0, 0, 80, 4), &snap);
+
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("ATC Health"),
+            "expected ATC widget title, got:\n{text}"
+        );
+        assert!(
+            text.contains("writes=7"),
+            "expected experience write count, got:\n{text}"
+        );
+        assert!(
+            text.contains("kill=on"),
+            "expected kill switch indicator, got:\n{text}"
+        );
+        assert!(
+            text.contains("sweep_p95=150000us"),
+            "expected sweep latency summary, got:\n{text}"
         );
     }
 

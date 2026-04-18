@@ -1065,8 +1065,7 @@ fn restore_missing_agent_fields_from_previous(
         if !agent.program.is_empty() && agent.last_active_ts != 0 {
             continue;
         }
-        let Some(prev) = previous_agents.iter().find(|prev| prev.name == agent.name)
-        else {
+        let Some(prev) = previous_agents.iter().find(|prev| prev.name == agent.name) else {
             continue;
         };
         if agent.program.is_empty() && !prev.program.is_empty() {
@@ -1252,7 +1251,9 @@ fn restore_missing_contact_project_slugs_from_previous(
             patched = patched.saturating_add(1);
         }
         if from_placeholder && !prev.from_project_slug.starts_with("[unknown-project-") {
-            contact.from_project_slug.clone_from(&prev.from_project_slug);
+            contact
+                .from_project_slug
+                .clone_from(&prev.from_project_slug);
             patched = patched.saturating_add(1);
         }
     }

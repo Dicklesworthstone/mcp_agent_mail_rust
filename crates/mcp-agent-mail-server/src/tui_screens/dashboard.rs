@@ -3155,24 +3155,13 @@ fn render_bottom_rail(frame: &mut Frame<'_>, area: Rect, context: &BottomRailCon
                     if area.width >= ULTRAWIDE_BOTTOM_MIN_WIDTH
                         && area.height >= ULTRAWIDE_BOTTOM_MIN_HEIGHT
                     {
-                        let (activity_col, rest) =
-                            split_width_ratio_with_gap(area, 0.50, 1);
-                        let (mix_col, flow_col) =
-                            split_width_ratio_with_gap(rest, 0.5, 1);
-                        render_recent_activity_panel(
-                            frame,
-                            activity_col,
-                            entries,
-                            query_text,
-                        );
+                        let (activity_col, rest) = split_width_ratio_with_gap(area, 0.50, 1);
+                        let (mix_col, flow_col) = split_width_ratio_with_gap(rest, 0.5, 1);
+                        render_recent_activity_panel(frame, activity_col, entries, query_text);
                         render_event_mix_panel(frame, mix_col, entries, query_text);
-                        render_message_flow_panel(
-                            frame, flow_col, entries, query_text,
-                        );
+                        render_message_flow_panel(frame, flow_col, entries, query_text);
                     } else {
-                        render_recent_activity_panel(
-                            frame, area, entries, query_text,
-                        );
+                        render_recent_activity_panel(frame, area, entries, query_text);
                     }
                     return;
                 }

@@ -697,6 +697,7 @@ pub struct MailScreenMeta {
     pub short_label: &'static str,
     pub category: ScreenCategory,
     pub description: &'static str,
+    pub help_markdown: &'static str,
 }
 
 /// Static registry of all screens with their metadata.
@@ -707,6 +708,7 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         short_label: "Dash",
         category: ScreenCategory::Overview,
         description: "Real-time operational overview with live event stream",
+        help_markdown: "Live operational overview.\nUse it to spot backlog, traffic, and failures before drilling into detail.",
     },
     MailScreenMeta {
         id: MailScreenId::Messages,
@@ -714,6 +716,7 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         short_label: "Msg",
         category: ScreenCategory::Communication,
         description: "Search and browse messages with detail panel",
+        help_markdown: "Inbox-first message browser.\nFilter aggressively, then open a row to inspect full envelopes and bodies.",
     },
     MailScreenMeta {
         id: MailScreenId::Threads,
@@ -721,6 +724,7 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         short_label: "Threads",
         category: ScreenCategory::Communication,
         description: "Thread explorer with conversation view",
+        help_markdown: "Thread-centric conversation view.\nUse it when you need chronology, participants, and reply context instead of isolated messages.",
     },
     MailScreenMeta {
         id: MailScreenId::Agents,
@@ -728,6 +732,7 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         short_label: "Agents",
         category: ScreenCategory::Operations,
         description: "Agent roster with status and activity",
+        help_markdown: "Agent roster and liveness board.\nCheck activity, programs, and models before routing work or escalating.",
     },
     MailScreenMeta {
         id: MailScreenId::Search,
@@ -735,6 +740,7 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         short_label: "Find",
         category: ScreenCategory::Communication,
         description: "Unified search across messages, agents, and projects with facet filters",
+        help_markdown: "Cross-project search cockpit.\nStart with a narrow query, then widen facets only when recall is too low.",
     },
     MailScreenMeta {
         id: MailScreenId::Reservations,
@@ -742,6 +748,7 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         short_label: "Reserv",
         category: ScreenCategory::Operations,
         description: "File reservation conflicts and status",
+        help_markdown: "Lease conflict monitor.\nRenew, release, or force-release only after checking ownership and expiry.",
     },
     MailScreenMeta {
         id: MailScreenId::ToolMetrics,
@@ -749,6 +756,7 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         short_label: "Tools",
         category: ScreenCategory::System,
         description: "Per-tool call counts, latency, and error rates",
+        help_markdown: "Latency and throughput view for MCP tools.\nSort for p95 or failures to find the next operational bottleneck.",
     },
     MailScreenMeta {
         id: MailScreenId::SystemHealth,
@@ -756,6 +764,7 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         short_label: "Health",
         category: ScreenCategory::System,
         description: "Database, queue, and connection diagnostics",
+        help_markdown: "Runtime diagnostics surface.\nConfirm DB, archive, and background workers are healthy before blaming higher layers.",
     },
     MailScreenMeta {
         id: MailScreenId::Timeline,
@@ -763,6 +772,7 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         short_label: "Time",
         category: ScreenCategory::Overview,
         description: "Chronological event timeline with cursor + inspector",
+        help_markdown: "Chronological event stream.\nExpand interesting rows and follow correlation links to reconstruct incidents.",
     },
     MailScreenMeta {
         id: MailScreenId::Projects,
@@ -770,6 +780,7 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         short_label: "Proj",
         category: ScreenCategory::Overview,
         description: "Project browser with per-project stats and detail",
+        help_markdown: "Project directory and routing map.\nUse it to confirm scope, storage roots, and where traffic is landing.",
     },
     MailScreenMeta {
         id: MailScreenId::Contacts,
@@ -777,6 +788,7 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         short_label: "Links",
         category: ScreenCategory::Communication,
         description: "Cross-agent contact links and policy display",
+        help_markdown: "Contact graph and policy screen.\nReview approvals and blocked links before assuming agents can message each other.",
     },
     MailScreenMeta {
         id: MailScreenId::Explorer,
@@ -784,6 +796,7 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         short_label: "Explore",
         category: ScreenCategory::Communication,
         description: "Unified inbox/outbox explorer with direction, grouping, and ack filters",
+        help_markdown: "Inbox/outbox explorer.\nSlice by direction, ack state, or actor when you need a fast mailbox audit.",
     },
     MailScreenMeta {
         id: MailScreenId::Analytics,
@@ -791,6 +804,7 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         short_label: "Insight",
         category: ScreenCategory::System,
         description: "Anomaly insight feed with confidence scoring and actionable next steps",
+        help_markdown: "Derived anomaly feed.\nTreat it as triage assistance, then validate the underlying messages or metrics.",
     },
     MailScreenMeta {
         id: MailScreenId::Attachments,
@@ -798,6 +812,7 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         short_label: "Attach",
         category: ScreenCategory::Communication,
         description: "Attachment browser with inline preview and source provenance trails",
+        help_markdown: "Attachment inventory and preview pane.\nUse provenance before trusting a file came from the sender you expect.",
     },
     MailScreenMeta {
         id: MailScreenId::ArchiveBrowser,
@@ -805,6 +820,7 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         short_label: "Archive",
         category: ScreenCategory::Operations,
         description: "Two-pane Git archive browser with directory tree and file content preview",
+        help_markdown: "Git-backed archive inspector.\nBrowse canonical mailbox artifacts when you need the audit trail, not the index.",
     },
     MailScreenMeta {
         id: MailScreenId::Atc,
@@ -812,6 +828,7 @@ pub const MAIL_SCREEN_REGISTRY: &[MailScreenMeta] = &[
         short_label: "ATC",
         category: ScreenCategory::System,
         description: "Air Traffic Controller decision engine with agent liveness, conflict, and evidence ledger",
+        help_markdown: "ATC control surface.\nThis is architecture-phase scaffolding; production learning writes still track under br-bn0vb.",
     },
 ];
 
@@ -922,6 +939,7 @@ mod tests {
             assert_eq!(meta.id, id);
             assert!(!meta.title.is_empty());
             assert!(!meta.short_label.is_empty());
+            assert!(!meta.help_markdown.is_empty());
         }
     }
 
