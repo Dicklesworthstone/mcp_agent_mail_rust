@@ -936,6 +936,12 @@ mod tests {
             .block_on(crate::schema::migrate_to_latest_base(&cx, &init_conn))
             .into_result()
             .expect("migrate ATC test schema");
+        runtime
+            .block_on(crate::schema::migrate_runtime_canonical_followup(
+                &cx, &init_conn,
+            ))
+            .into_result()
+            .expect("apply ATC canonical follow-up schema");
         crate::queries::close_canonical_db_conn(init_conn, "ATC rollup test init connection");
 
         crate::create_pool(&crate::pool::DbPoolConfig {

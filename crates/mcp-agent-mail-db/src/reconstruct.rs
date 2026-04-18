@@ -96,7 +96,11 @@ fn reconstruct_migration_preflight_already_satisfied(
     Ok(table_columns(conn, &table)?.contains(&column))
 }
 
-fn apply_base_migrations_after_snapshot(conn: &DbConn) -> DbResult<()> {
+fn apply_snapshot_migrations(
+    conn: &DbConn,
+    migrations: Vec<Migration>,
+    phase: &str,
+) -> DbResult<()> {
     conn.execute_raw(&format!(
         "CREATE TABLE IF NOT EXISTS {} (\
             id TEXT PRIMARY KEY ON CONFLICT IGNORE,\
@@ -118,7 +122,7 @@ fn apply_base_migrations_after_snapshot(conn: &DbConn) -> DbResult<()> {
         .filter_map(|row| row.get_named::<String>("id").ok())
         .collect::<HashSet<_>>();
 
-    for migration in schema::schema_migrations_base() {
+    for migration in migrations {
         if applied_ids.contains(&migration.id) {
             continue;
         }
@@ -128,7 +132,7 @@ fn apply_base_migrations_after_snapshot(conn: &DbConn) -> DbResult<()> {
         if !already_satisfied {
             conn.execute_raw(&migration.up).map_err(|e| {
                 DbError::Sqlite(format!(
-                    "reconstruct: apply base migration {} ({}): {e}",
+                    "reconstruct: apply {phase} migration {} ({}): {e}",
                     migration.id, migration.description
                 ))
             })?;
@@ -147,14 +151,29 @@ fn apply_base_migrations_after_snapshot(conn: &DbConn) -> DbResult<()> {
         )
         .map_err(|e| {
             DbError::Sqlite(format!(
-                "reconstruct: record base migration {}: {e}",
+                "reconstruct: record {phase} migration {}: {e}",
                 migration.id
             ))
         })?;
-        applied_ids.insert(migration.id);
+        applied_ids.insert(migration.id.clone());
     }
 
     Ok(())
+}
+
+fn apply_base_migrations_after_snapshot(conn: &DbConn) -> DbResult<()> {
+    apply_snapshot_migrations(conn, schema::schema_migrations_base(), "base")
+}
+
+fn apply_atc_runtime_followup_after_snapshot(conn: &DbConn) -> DbResult<()> {
+    apply_snapshot_migrations(
+        conn,
+        schema::schema_migrations_runtime_canonical_followup()
+            .into_iter()
+            .filter(|migration| schema::is_atc_runtime_canonical_migration(&migration.id))
+            .collect(),
+        "ATC runtime followup",
+    )
 }
 
 /// Statistics returned after a reconstruction attempt.
@@ -1120,10 +1139,10 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
 
         // Follow the snapshot DDL with a synchronous replay of base migrations.
         // The snapshot is intentionally ahead of many legacy mail tables, but it
-        // can still lag newer archive-independent runtime tables such as the ATC
-        // experience store. Replaying the base migrations here keeps rebuilt DBs
-        // aligned with the live server schema while preflighting `ALTER TABLE`
-        // additions so latest-schema columns are not duplicated.
+        // can still lag later base-mode repairs and indexes. Replaying the base
+        // migrations here keeps rebuilt DBs aligned with the current base schema
+        // while preflighting `ALTER TABLE` additions so latest-schema columns are
+        // not duplicated.
         apply_base_migrations_after_snapshot(&conn)?;
 
         // Clean up any FTS artifacts that may have been left by prior migrations.
@@ -1215,6 +1234,13 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
                 discover_messages(&conn, &messages_dir, pid, slug, &mut agent_ids, &mut stats)?;
             }
         }
+
+        // Replay only the ATC runtime follow-up subset after the archive
+        // payload is loaded. Reconstruct intentionally leaves FTS-backed
+        // message trigger follow-ups to the next live startup, but the ATC
+        // schema family must exist immediately so the rebuilt database matches
+        // the live-server ATC contract.
+        apply_atc_runtime_followup_after_snapshot(&conn)?;
 
         // Rebuild all index b-trees to ensure consistency after bulk inserts.
         conn.execute_raw("REINDEX;")

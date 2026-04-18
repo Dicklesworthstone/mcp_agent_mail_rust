@@ -12357,6 +12357,19 @@ mod tests {
             ..Default::default()
         };
         let pool = crate::create_pool(&cfg).expect("create pool");
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build shared ATC test pool runtime");
+        match rt.block_on(ensure_file_backed_atc_pool_initialized(&cx, &pool)) {
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => {
+                panic!("initialize ATC schema in shared test pool: {error}");
+            }
+            Outcome::Cancelled(reason) => {
+                panic!("initialize ATC schema in shared test pool cancelled: {reason}");
+            }
+            Outcome::Panicked(payload) => std::panic::resume_unwind(Box::new(payload)),
+        }
         (cx, pool, dir)
     }
 
