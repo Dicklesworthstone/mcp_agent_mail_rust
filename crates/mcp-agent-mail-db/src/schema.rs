@@ -1300,6 +1300,7 @@ pub fn schema_migrations() -> Vec<Migration> {
             outcome_json TEXT,\
             features_json TEXT,\
             feature_ext_json TEXT,\
+            feature_schema_version INTEGER NOT NULL DEFAULT 1,\
             created_ts INTEGER NOT NULL,\
             dispatched_ts INTEGER,\
             executed_ts INTEGER,\
@@ -1621,6 +1622,69 @@ pub fn schema_migrations() -> Vec<Migration> {
         String::new(),
     ));
 
+    // ── v17: ATC coordination, privacy classification, and snapshots ──
+    //
+    // Reserve schema surface for the next ATC seams before those runtime
+    // features land: leader election across multiple processes, privacy
+    // disclosure / secret-detection flags on experience rows, and rollup
+    // snapshot metadata for doctor/archive durability workflows.
+    migrations.push(Migration::new(
+        "v17_create_atc_leader_lease".to_string(),
+        "create singleton ATC leader lease table for multi-instance coordination".to_string(),
+        "CREATE TABLE IF NOT EXISTS atc_leader_lease (\
+            lease_slot INTEGER PRIMARY KEY NOT NULL DEFAULT 1 CHECK (lease_slot = 1),\
+            instance_id TEXT NOT NULL,\
+            acquired_at INTEGER NOT NULL,\
+            renewed_at INTEGER NOT NULL,\
+            ttl_micros INTEGER NOT NULL CHECK (ttl_micros > 0)\
+         )"
+        .to_string(),
+        String::new(),
+    ));
+
+    migrations.push(Migration::new(
+        "v17_atc_experiences_add_contained_suspected_secret".to_string(),
+        "flag ATC experience rows whose upstream content was classified as secret-bearing"
+            .to_string(),
+        "ALTER TABLE atc_experiences ADD COLUMN contained_suspected_secret \
+         INTEGER NOT NULL DEFAULT 0 CHECK (contained_suspected_secret IN (0, 1))"
+            .to_string(),
+        String::new(),
+    ));
+
+    migrations.push(Migration::new(
+        "v17_atc_experiences_add_privacy_classification".to_string(),
+        "classify ATC experience rows by privacy handling policy".to_string(),
+        "ALTER TABLE atc_experiences ADD COLUMN privacy_classification TEXT NOT NULL DEFAULT 'legacy_unclassified' \
+         CHECK (privacy_classification IN ('legacy_unclassified', 'metadata_only', 'derived_pseudonymous', 'redacted_due_to_secret'))"
+            .to_string(),
+        String::new(),
+    ));
+
+    migrations.push(Migration::new(
+        "v17_create_atc_rollup_snapshots".to_string(),
+        "create ATC rollup snapshot metadata table for durability and restore flows".to_string(),
+        "CREATE TABLE IF NOT EXISTS atc_rollup_snapshots (\
+            snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,\
+            captured_ts INTEGER NOT NULL,\
+            archive_relpath TEXT NOT NULL DEFAULT '',\
+            rollup_rows INTEGER NOT NULL DEFAULT 0,\
+            payload_sha256 TEXT NOT NULL DEFAULT '',\
+            restored_ts INTEGER\
+         )"
+        .to_string(),
+        String::new(),
+    ));
+
+    migrations.push(Migration::new(
+        "v17_idx_atc_rollup_snapshots_captured".to_string(),
+        "index ATC rollup snapshots by capture time".to_string(),
+        "CREATE INDEX IF NOT EXISTS idx_atc_rollup_snapshots_captured \
+         ON atc_rollup_snapshots(captured_ts DESC, snapshot_id DESC)"
+            .to_string(),
+        String::new(),
+    ));
+
     // ── v18: EWMA and delay columns for rollups (br-0qt6e.3.2) ────────
     //
     // Adds EWMA-smoothed loss, EWMA count weight, and delay histogram
@@ -1694,6 +1758,19 @@ pub fn schema_migrations() -> Vec<Migration> {
         "index on agents.registration_token for token lookup".to_string(),
         "CREATE INDEX IF NOT EXISTS idx_agents_registration_token \
          ON agents(registration_token)"
+            .to_string(),
+        String::new(),
+    ));
+
+    // ── v21: Explicit ATC feature-schema versioning ───────────────────
+    //
+    // Persist the feature schema version separately from the JSON payload so
+    // future reprocessing passes can target legacy rows explicitly when the
+    // feature contract evolves.
+    migrations.push(Migration::new(
+        "v21_atc_experiences_add_feature_schema_version".to_string(),
+        "add feature_schema_version column to ATC experiences for payload reprocessing".to_string(),
+        "ALTER TABLE atc_experiences ADD COLUMN feature_schema_version INTEGER NOT NULL DEFAULT 1"
             .to_string(),
         String::new(),
     ));
@@ -3086,9 +3163,15 @@ mod tests {
         // migration runner handles "duplicate column" errors gracefully.  This
         // ensures Python-imported databases (with older schemas) get the columns
         // added instead of hitting "no such column" on dependent indexes.
+        assert!(ids.contains("v17_create_atc_leader_lease"));
+        assert!(ids.contains("v17_atc_experiences_add_contained_suspected_secret"));
+        assert!(ids.contains("v17_atc_experiences_add_privacy_classification"));
+        assert!(ids.contains("v17_create_atc_rollup_snapshots"));
+        assert!(ids.contains("v17_idx_atc_rollup_snapshots_captured"));
         assert!(ids.contains("v19_agents_reaper_exempt"));
         assert!(ids.contains("v20_agents_registration_token"));
         assert!(ids.contains("v20_idx_agents_registration_token"));
+        assert!(ids.contains("v21_atc_experiences_add_feature_schema_version"));
     }
 
     #[test]

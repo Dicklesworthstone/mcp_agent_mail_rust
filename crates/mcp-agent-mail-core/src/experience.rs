@@ -77,8 +77,8 @@
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
 use serde_json::Value;
+use std::sync::LazyLock;
 
 // ──────────────────────────────────────────────────────────────────────
 // Identifiers
@@ -702,33 +702,34 @@ impl ExperienceRow {
 static PEM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"-----BEGIN [A-Z ]+-----").expect("PEM regex"));
 
-static JWT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.").expect("JWT regex"));
+static JWT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.").expect("JWT regex")
+});
 
 /// Secret-detection prefixes and substrings.
 ///
 /// Each entry is `(pattern, match_mode)` where match_mode indicates
 /// whether to use prefix or substring matching.
 const SECRET_PREFIXES: &[&str] = &[
-    "AKIA",            // AWS access key ID
-    "ASIA",            // AWS temporary access key
-    "ghp_",            // GitHub personal access token
-    "gho_",            // GitHub OAuth token
-    "ghu_",            // GitHub user-to-server token
-    "ghs_",            // GitHub server-to-server token
-    "ghr_",            // GitHub refresh token
-    "github_pat_",     // GitHub fine-grained PAT
-    "xoxb-",           // Slack bot token
-    "xoxp-",           // Slack user token
-    "xoxs-",           // Slack session token
-    "xoxa-",           // Slack app token
-    "sk-",             // OpenAI / Anthropic API key
-    "sk-ant-",         // Anthropic API key
-    "Bearer ",         // Authorization bearer tokens
-    "token ",          // Generic token prefix
-    "glpat-",          // GitLab personal access token
-    "npm_",            // npm access token
-    "pypi-AgEIcHlwaS5",// PyPI token
+    "AKIA",             // AWS access key ID
+    "ASIA",             // AWS temporary access key
+    "ghp_",             // GitHub personal access token
+    "gho_",             // GitHub OAuth token
+    "ghu_",             // GitHub user-to-server token
+    "ghs_",             // GitHub server-to-server token
+    "ghr_",             // GitHub refresh token
+    "github_pat_",      // GitHub fine-grained PAT
+    "xoxb-",            // Slack bot token
+    "xoxp-",            // Slack user token
+    "xoxs-",            // Slack session token
+    "xoxa-",            // Slack app token
+    "sk-",              // OpenAI / Anthropic API key
+    "sk-ant-",          // Anthropic API key
+    "Bearer ",          // Authorization bearer tokens
+    "token ",           // Generic token prefix
+    "glpat-",           // GitLab personal access token
+    "npm_",             // npm access token
+    "pypi-AgEIcHlwaS5", // PyPI token
 ];
 
 const SECRET_SUBSTRINGS: &[&str] = &[
@@ -789,6 +790,116 @@ pub fn contains_secret(input: &str) -> bool {
 /// - Readers MUST ignore unknown versions gracefully (treat as opaque).
 /// - Writers MUST set the version to the current constant.
 pub const FEATURE_VERSION: u16 = 1;
+
+/// Durable schema version for persisted ATC feature payloads.
+///
+/// This is stored alongside `features_json` / `feature_ext_json` so database
+/// rows can be reprocessed explicitly when the feature contract evolves.
+/// Today the persisted schema matches [`FEATURE_VERSION`], but the separate
+/// column gives migrations an explicit marker even when legacy rows omitted it.
+pub const FEATURE_SCHEMA_VERSION: u16 = FEATURE_VERSION;
+
+/// Normalized feature payload after applying schema migration rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeaturePayload {
+    /// Persisted schema version after migration.
+    pub schema_version: u16,
+    /// Compact fixed-width feature vector.
+    pub features: Option<FeatureVector>,
+    /// Extension payload for rare/future context.
+    pub feature_ext: Option<FeatureExtension>,
+}
+
+/// Error returned when a persisted feature payload cannot be migrated.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FeatureSchemaMigrationError {
+    /// Stored payload was written by a newer binary and cannot be downgraded.
+    #[error("feature schema version {found} is newer than supported version {supported}")]
+    UnsupportedFutureVersion { found: u16, supported: u16 },
+}
+
+/// Infer the persisted feature schema version from the payload itself.
+///
+/// Legacy rows may not have an explicit DB column yet. In that case:
+/// - a non-zero `FeatureVector.version` wins
+/// - otherwise a non-zero `FeatureExtension.ext_version` wins
+/// - otherwise the current schema version is assumed
+#[must_use]
+pub fn infer_feature_schema_version(
+    features: Option<&FeatureVector>,
+    feature_ext: Option<&FeatureExtension>,
+) -> u16 {
+    let feature_version = features.map_or(0, |value| value.version);
+    let extension_version = feature_ext.map_or(0, |value| value.ext_version);
+    match feature_version.max(extension_version) {
+        0 => FEATURE_SCHEMA_VERSION,
+        version => version,
+    }
+}
+
+/// Migrate a persisted feature payload to the current schema version.
+///
+/// The migration chain is intentionally explicit so future schema bumps add a
+/// new step instead of ad-hoc conditionals spread across callers.
+pub fn migrate_feature_payload(
+    schema_version: u16,
+    features: Option<FeatureVector>,
+    feature_ext: Option<FeatureExtension>,
+) -> Result<FeaturePayload, FeatureSchemaMigrationError> {
+    let mut normalized_version = if schema_version == 0 {
+        infer_feature_schema_version(features.as_ref(), feature_ext.as_ref())
+    } else {
+        schema_version
+    };
+    let mut migrated_features = features;
+    let mut migrated_feature_ext = feature_ext;
+
+    if normalized_version > FEATURE_SCHEMA_VERSION {
+        return Err(FeatureSchemaMigrationError::UnsupportedFutureVersion {
+            found: normalized_version,
+            supported: FEATURE_SCHEMA_VERSION,
+        });
+    }
+
+    while normalized_version < FEATURE_SCHEMA_VERSION {
+        match normalized_version {
+            // Legacy rows predate the explicit DB column. Normalize them to the
+            // first sealed schema by rewriting the embedded version markers.
+            0 => {
+                if let Some(value) = &mut migrated_features {
+                    value.version = FEATURE_VERSION;
+                }
+                if let Some(value) = &mut migrated_feature_ext {
+                    if value.ext_version == 0 {
+                        value.ext_version = 1;
+                    }
+                }
+                normalized_version = 1;
+            }
+            _ => {
+                return Err(FeatureSchemaMigrationError::UnsupportedFutureVersion {
+                    found: normalized_version,
+                    supported: FEATURE_SCHEMA_VERSION,
+                });
+            }
+        }
+    }
+
+    if let Some(value) = &mut migrated_features {
+        value.version = FEATURE_VERSION;
+    }
+    if let Some(value) = &mut migrated_feature_ext {
+        if value.ext_version == 0 {
+            value.ext_version = 1;
+        }
+    }
+
+    Ok(FeaturePayload {
+        schema_version: FEATURE_SCHEMA_VERSION,
+        features: migrated_features,
+        feature_ext: migrated_feature_ext,
+    })
+}
 
 /// Compact feature vector for a single ATC experience.
 ///
@@ -1737,6 +1848,60 @@ mod tests {
             FEATURE_VERSION, 1,
             "FEATURE_VERSION must remain 1 until a migration is committed"
         );
+        assert_eq!(
+            FEATURE_SCHEMA_VERSION, FEATURE_VERSION,
+            "persisted feature schema should track the sealed feature layout"
+        );
+    }
+
+    #[test]
+    fn infer_feature_schema_version_defaults_to_current_contract() {
+        assert_eq!(
+            infer_feature_schema_version(None, None),
+            FEATURE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            infer_feature_schema_version(
+                Some(&FeatureVector {
+                    version: 0,
+                    ..FeatureVector::zeroed()
+                }),
+                None
+            ),
+            FEATURE_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn migrate_feature_payload_upgrades_legacy_zero_version() {
+        let legacy = FeatureVector {
+            version: 0,
+            posterior_alive_bp: 3200,
+            ..FeatureVector::zeroed()
+        };
+        let legacy_ext = FeatureExtension {
+            ext_version: 0,
+            fields: vec![("deadlock_depth".to_string(), 2)],
+        };
+
+        let migrated =
+            migrate_feature_payload(0, Some(legacy), Some(legacy_ext)).expect("migrate payload");
+        assert_eq!(migrated.schema_version, FEATURE_SCHEMA_VERSION);
+        assert_eq!(
+            migrated.features.expect("features").version,
+            FEATURE_VERSION
+        );
+        assert_eq!(migrated.feature_ext.expect("feature ext").ext_version, 1);
+    }
+
+    #[test]
+    fn migrate_feature_payload_rejects_future_versions() {
+        let error = migrate_feature_payload(FEATURE_SCHEMA_VERSION + 1, None, None)
+            .expect_err("future schema version should fail");
+        assert!(matches!(
+            error,
+            FeatureSchemaMigrationError::UnsupportedFutureVersion { .. }
+        ));
     }
 
     #[test]
@@ -1834,6 +1999,9 @@ mod tests {
         let json = serde_json::to_string(&fv).unwrap();
         let _: FeatureVector = serde_json::from_str(&json).unwrap();
 
+        let payload = migrate_feature_payload(0, Some(fv), None).unwrap();
+        assert_eq!(payload.schema_version, FEATURE_SCHEMA_VERSION);
+
         let outcome = ExperienceOutcome {
             observed_ts_micros: 1000,
             label: "ok".into(),
@@ -1901,6 +2069,42 @@ mod tests {
                 from,
                 to
             );
+        }
+
+        #[test]
+        fn feature_payload_migration_is_idempotent(
+            posterior_alive_bp in 0u16..=10_000u16,
+            posterior_flaky_bp in 0u16..=10_000u16,
+            silence_secs in 0u16..=u16::MAX,
+            reservation_count in 0u8..=u8::MAX,
+            conflict_count in 0u8..=u8::MAX,
+            safe_mode_active in any::<bool>(),
+            include_ext in any::<bool>(),
+        ) {
+            let legacy = FeatureVector {
+                version: 0,
+                posterior_alive_bp,
+                posterior_flaky_bp,
+                silence_secs,
+                reservation_count,
+                conflict_count,
+                safe_mode_active,
+                ..FeatureVector::zeroed()
+            };
+            let feature_ext = include_ext.then(|| FeatureExtension {
+                ext_version: 0,
+                fields: vec![("retry_budget".to_string(), 3)],
+            });
+
+            let once = migrate_feature_payload(0, Some(legacy), feature_ext).unwrap();
+            let twice = migrate_feature_payload(
+                once.schema_version,
+                once.features,
+                once.feature_ext.clone(),
+            )
+            .unwrap();
+
+            prop_assert_eq!(twice, once);
         }
     }
 

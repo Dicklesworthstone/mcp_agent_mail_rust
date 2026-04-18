@@ -21,10 +21,11 @@ use asupersync::cx::Cx;
 use mcp_agent_mail_db::DbConn as SqliteConnection;
 use mcp_agent_mail_db::schema::{
     self, MIGRATIONS_TABLE_NAME, PRAGMA_SETTINGS_SQL, enforce_runtime_fts_cleanup,
-    migrate_to_latest, migration_status,
+    init_migrations_table, migrate_to_latest, migration_status,
 };
 use mcp_agent_mail_db::{DbPool, DbPoolConfig};
 use sqlmodel_core::Value;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -73,6 +74,199 @@ fn make_pool() -> (DbPool, tempfile::TempDir) {
     };
     let pool = DbPool::new(&config).expect("create pool");
     (pool, dir)
+}
+
+const ATC_V17_MIGRATION_IDS: &[&str] = &[
+    "v17_create_atc_leader_lease",
+    "v17_atc_experiences_add_contained_suspected_secret",
+    "v17_atc_experiences_add_privacy_classification",
+    "v17_create_atc_rollup_snapshots",
+    "v17_idx_atc_rollup_snapshots_captured",
+];
+
+const ATC_V21_MIGRATION_IDS: &[&str] = &["v21_atc_experiences_add_feature_schema_version"];
+
+fn table_exists(conn: &SqliteConnection, table: &str) -> bool {
+    let rows = conn
+        .query_sync(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+            &[Value::Text(table.to_string())],
+        )
+        .expect("query sqlite_master for table");
+    !rows.is_empty()
+}
+
+fn index_exists(conn: &SqliteConnection, index: &str) -> bool {
+    let rows = conn
+        .query_sync(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1",
+            &[Value::Text(index.to_string())],
+        )
+        .expect("query sqlite_master for index");
+    !rows.is_empty()
+}
+
+fn table_info(conn: &SqliteConnection, table: &str) -> Vec<(String, String, bool, Option<String>)> {
+    let rows = conn
+        .query_sync(&format!("PRAGMA table_info({table})"), &[])
+        .unwrap_or_else(|_| panic!("PRAGMA table_info({table}) failed"));
+    rows.iter()
+        .map(|row| {
+            let name: String = row.get_named("name").unwrap_or_default();
+            let col_type: String = row.get_named("type").unwrap_or_default();
+            let notnull: i64 = row.get_named("notnull").unwrap_or(0);
+            let default_value = row.get_named::<String>("dflt_value").ok();
+            (name, col_type.to_uppercase(), notnull != 0, default_value)
+        })
+        .collect()
+}
+
+fn assert_table_has_columns(conn: &SqliteConnection, table: &str, columns: &[&str]) {
+    let present: HashSet<String> = table_info(conn, table)
+        .into_iter()
+        .map(|(name, _, _, _)| name)
+        .collect();
+    for column in columns {
+        assert!(
+            present.contains(*column),
+            "missing {table}.{column}; present columns: {present:?}"
+        );
+    }
+}
+
+fn assert_atc_v17_schema_surface(conn: &SqliteConnection) {
+    let experience_cols = table_info(conn, "atc_experiences");
+    let secret_col = experience_cols
+        .iter()
+        .find(|(name, _, _, _)| name == "contained_suspected_secret")
+        .expect("contained_suspected_secret column");
+    assert_eq!(secret_col.1, "INTEGER");
+    assert!(
+        secret_col.2,
+        "contained_suspected_secret should be NOT NULL"
+    );
+    assert_eq!(
+        secret_col.3.as_deref(),
+        Some("0"),
+        "contained_suspected_secret default should be 0"
+    );
+
+    let privacy_col = experience_cols
+        .iter()
+        .find(|(name, _, _, _)| name == "privacy_classification")
+        .expect("privacy_classification column");
+    assert_eq!(privacy_col.1, "TEXT");
+    assert!(privacy_col.2, "privacy_classification should be NOT NULL");
+    let privacy_default = privacy_col
+        .3
+        .as_deref()
+        .expect("privacy_classification default");
+    assert!(
+        privacy_default.contains("legacy_unclassified"),
+        "privacy_classification default should mention legacy_unclassified, got {privacy_default:?}"
+    );
+
+    assert!(
+        table_exists(conn, "atc_leader_lease"),
+        "missing atc_leader_lease table"
+    );
+    assert_table_has_columns(
+        conn,
+        "atc_leader_lease",
+        &[
+            "lease_slot",
+            "instance_id",
+            "acquired_at",
+            "renewed_at",
+            "ttl_micros",
+        ],
+    );
+
+    assert!(
+        table_exists(conn, "atc_rollup_snapshots"),
+        "missing atc_rollup_snapshots table"
+    );
+    assert_table_has_columns(
+        conn,
+        "atc_rollup_snapshots",
+        &[
+            "snapshot_id",
+            "captured_ts",
+            "archive_relpath",
+            "rollup_rows",
+            "payload_sha256",
+            "restored_ts",
+        ],
+    );
+
+    assert!(
+        index_exists(conn, "idx_atc_rollup_snapshots_captured"),
+        "missing idx_atc_rollup_snapshots_captured index"
+    );
+}
+
+fn assert_atc_feature_schema_version_column(conn: &SqliteConnection) {
+    let experience_cols = table_info(conn, "atc_experiences");
+    let feature_schema_version = experience_cols
+        .iter()
+        .find(|(name, _, _, _)| name == "feature_schema_version")
+        .expect("feature_schema_version column");
+    assert_eq!(feature_schema_version.1, "INTEGER");
+    assert!(
+        feature_schema_version.2,
+        "feature_schema_version should be NOT NULL"
+    );
+    assert_eq!(
+        feature_schema_version.3.as_deref(),
+        Some("1"),
+        "feature_schema_version default should be 1"
+    );
+}
+
+fn seed_schema_without_migrations(conn: &SqliteConnection, skipped_ids: &[&str]) {
+    block_on({
+        let conn = conn;
+        move |cx| async move {
+            init_migrations_table(&cx, conn)
+                .await
+                .into_result()
+                .expect("init migrations table");
+        }
+    });
+
+    let record_sql = format!(
+        "INSERT INTO {MIGRATIONS_TABLE_NAME} (id, description, applied_at) VALUES (?, ?, ?)"
+    );
+    let skipped: HashSet<&str> = skipped_ids.iter().copied().collect();
+
+    for migration in schema::schema_migrations() {
+        if skipped.contains(migration.id.as_str()) {
+            continue;
+        }
+        conn.execute_raw(&migration.up).unwrap_or_else(|error| {
+            panic!(
+                "apply pre-v17 migration {} ({}): {error}",
+                migration.id, migration.description
+            )
+        });
+        conn.execute_sync(
+            &record_sql,
+            &[
+                Value::Text(migration.id),
+                Value::Text(migration.description),
+                Value::BigInt(1),
+            ],
+        )
+        .expect("record applied migration");
+    }
+}
+
+fn seed_pre_v17_schema(conn: &SqliteConnection) {
+    seed_schema_without_migrations(conn, ATC_V17_MIGRATION_IDS);
+}
+
+fn seed_pre_v21_schema(conn: &SqliteConnection) {
+    seed_schema_without_migrations(conn, ATC_V21_MIGRATION_IDS);
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +350,304 @@ fn all_expected_tables_exist_after_migration() {
     assert!(
         table_names.contains(&MIGRATIONS_TABLE_NAME.to_string()),
         "missing migration tracking table '{MIGRATIONS_TABLE_NAME}'"
+    );
+}
+
+#[test]
+fn atc_v17_schema_surface_exists_after_migration() {
+    let (conn, _dir) = open_temp_db();
+
+    block_on({
+        let conn = &conn;
+        move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+    });
+
+    assert_atc_v17_schema_surface(&conn);
+}
+
+#[test]
+fn atc_v17_upgrade_from_pre_v17_schema_preserves_rows_and_defaults() {
+    let (conn, _dir) = open_temp_db();
+    seed_pre_v17_schema(&conn);
+
+    assert!(
+        !table_exists(&conn, "atc_leader_lease"),
+        "pre-v17 seed should not include atc_leader_lease"
+    );
+    assert!(
+        !table_exists(&conn, "atc_rollup_snapshots"),
+        "pre-v17 seed should not include atc_rollup_snapshots"
+    );
+    let pre_columns: HashSet<String> = table_info(&conn, "atc_experiences")
+        .into_iter()
+        .map(|(name, _, _, _)| name)
+        .collect();
+    assert!(
+        !pre_columns.contains("contained_suspected_secret"),
+        "pre-v17 seed unexpectedly contains contained_suspected_secret"
+    );
+    assert!(
+        !pre_columns.contains("privacy_classification"),
+        "pre-v17 seed unexpectedly contains privacy_classification"
+    );
+
+    conn.execute_sync(
+        "INSERT INTO atc_experiences (\
+            experience_id, decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem,\
+            decision_class, subject, project_key, policy_id, effect_kind, action, posterior_json,\
+            expected_loss, runner_up_action, runner_up_loss, evidence_summary, calibration_healthy,\
+            safe_mode_active, non_execution_json, outcome_json, features_json, feature_ext_json,\
+            created_ts, dispatched_ts, executed_ts, resolved_ts, context_json\
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &[
+            Value::BigInt(1),
+            Value::BigInt(100),
+            Value::BigInt(200),
+            Value::Text("trace-pre-v17".to_string()),
+            Value::Text("claim-pre-v17".to_string()),
+            Value::Text("evidence-pre-v17".to_string()),
+            Value::Text("open".to_string()),
+            Value::Text("liveness".to_string()),
+            Value::Text("probe".to_string()),
+            Value::Text("GreenCastle".to_string()),
+            Value::Text("/tmp/pre-v17".to_string()),
+            Value::Text("policy-v1".to_string()),
+            Value::Text("probe".to_string()),
+            Value::Text("ProbeAgent".to_string()),
+            Value::Text("[]".to_string()),
+            Value::Double(0.25),
+            Value::Null,
+            Value::Null,
+            Value::Text("metric_summary_only".to_string()),
+            Value::BigInt(1),
+            Value::BigInt(0),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::BigInt(1_700_000_000_000_000),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ],
+    )
+    .expect("seed pre-v17 ATC experience row");
+
+    let applied = block_on({
+        let conn = &conn;
+        move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+    });
+    let applied_set: HashSet<&str> = applied.iter().map(String::as_str).collect();
+    let expected_set: HashSet<&str> = ATC_V17_MIGRATION_IDS.iter().copied().collect();
+    assert_eq!(
+        applied_set, expected_set,
+        "upgrade should apply only ATC v17 migrations; got {applied:?}"
+    );
+
+    assert_atc_v17_schema_surface(&conn);
+
+    let rows = conn
+        .query_sync(
+            "SELECT contained_suspected_secret, privacy_classification \
+             FROM atc_experiences WHERE experience_id = 1",
+            &[],
+        )
+        .expect("query upgraded ATC row");
+    assert_eq!(rows.len(), 1, "expected seeded ATC row after upgrade");
+    assert_eq!(
+        rows[0]
+            .get_named::<i64>("contained_suspected_secret")
+            .expect("contained_suspected_secret value"),
+        0,
+        "seeded rows should default contained_suspected_secret=false"
+    );
+    assert_eq!(
+        rows[0]
+            .get_named::<String>("privacy_classification")
+            .expect("privacy_classification value"),
+        "legacy_unclassified",
+        "seeded rows should default privacy_classification=legacy_unclassified"
+    );
+}
+
+#[test]
+fn atc_v17_privacy_classification_constraint_rejects_invalid_values() {
+    let (conn, _dir) = open_temp_db();
+
+    block_on({
+        let conn = &conn;
+        move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+    });
+
+    let error = conn
+        .execute_sync(
+            "INSERT INTO atc_experiences (\
+                experience_id, decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem,\
+                decision_class, subject, effect_kind, action, posterior_json, expected_loss,\
+                evidence_summary, calibration_healthy, safe_mode_active, created_ts, privacy_classification\
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(9),
+                Value::BigInt(900),
+                Value::BigInt(901),
+                Value::Text("trace-invalid-privacy".to_string()),
+                Value::Text("claim-invalid-privacy".to_string()),
+                Value::Text("evidence-invalid-privacy".to_string()),
+                Value::Text("open".to_string()),
+                Value::Text("liveness".to_string()),
+                Value::Text("probe".to_string()),
+                Value::Text("BlueLake".to_string()),
+                Value::Text("probe".to_string()),
+                Value::Text("ProbeAgent".to_string()),
+                Value::Text("[]".to_string()),
+                Value::Double(0.1),
+                Value::Text("metric_summary_only".to_string()),
+                Value::BigInt(1),
+                Value::BigInt(0),
+                Value::BigInt(1_700_000_000_000_100),
+                Value::Text("definitely_invalid".to_string()),
+            ],
+        )
+        .expect_err("invalid privacy classification should fail");
+    let message = error.to_string().to_ascii_lowercase();
+    assert!(
+        message.contains("check") || message.contains("constraint"),
+        "expected constraint error, got: {error}"
+    );
+}
+
+#[test]
+fn reconstruct_from_archive_recreates_atc_v17_schema_surface() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let storage_root = dir.path().join("storage");
+    let db_path = dir.path().join("reconstructed_v17.sqlite3");
+    let agent_dir = storage_root
+        .join("projects")
+        .join("reconstructed-project")
+        .join("agents")
+        .join("BrownKite");
+    std::fs::create_dir_all(&agent_dir).expect("create archive agent dir");
+    std::fs::write(
+        agent_dir.join("profile.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "name": "BrownKite",
+            "program": "codex-cli",
+            "model": "gpt-5",
+            "task_description": "schema migration reconstruct test",
+            "inception_ts": "2026-04-18T00:00:00Z",
+            "last_active_ts": "2026-04-18T00:00:00Z",
+            "attachments_policy": "auto",
+            "contact_policy": "auto"
+        }))
+        .expect("serialize profile"),
+    )
+    .expect("write profile");
+
+    mcp_agent_mail_db::reconstruct_from_archive(&db_path, &storage_root)
+        .expect("reconstruct database from archive");
+
+    let conn = SqliteConnection::open_file(db_path.display().to_string()).expect("open sqlite");
+    conn.execute_raw(PRAGMA_SETTINGS_SQL)
+        .expect("apply sqlite pragmas");
+    assert_atc_v17_schema_surface(&conn);
+}
+
+#[test]
+fn atc_v21_feature_schema_version_exists_after_migration() {
+    let (conn, _dir) = open_temp_db();
+
+    block_on({
+        let conn = &conn;
+        move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+    });
+
+    assert_atc_feature_schema_version_column(&conn);
+}
+
+#[test]
+fn atc_v21_upgrade_from_pre_v21_schema_defaults_feature_schema_version() {
+    let (conn, _dir) = open_temp_db();
+    seed_pre_v21_schema(&conn);
+
+    let pre_columns: HashSet<String> = table_info(&conn, "atc_experiences")
+        .into_iter()
+        .map(|(name, _, _, _)| name)
+        .collect();
+    assert!(
+        !pre_columns.contains("feature_schema_version"),
+        "pre-v21 seed unexpectedly contains feature_schema_version"
+    );
+
+    conn.execute_sync(
+        "INSERT INTO atc_experiences (\
+            experience_id, decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem,\
+            decision_class, subject, project_key, policy_id, effect_kind, action, posterior_json,\
+            expected_loss, runner_up_action, runner_up_loss, evidence_summary, calibration_healthy,\
+            safe_mode_active, non_execution_json, outcome_json, features_json, feature_ext_json,\
+            created_ts, dispatched_ts, executed_ts, resolved_ts, context_json\
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        &[
+            Value::BigInt(2),
+            Value::BigInt(200),
+            Value::BigInt(300),
+            Value::Text("trace-pre-v21".to_string()),
+            Value::Text("claim-pre-v21".to_string()),
+            Value::Text("evidence-pre-v21".to_string()),
+            Value::Text("open".to_string()),
+            Value::Text("conflict".to_string()),
+            Value::Text("reservation_conflict".to_string()),
+            Value::Text("BlueLake".to_string()),
+            Value::Text("/tmp/pre-v21".to_string()),
+            Value::Text("policy-v2".to_string()),
+            Value::Text("advisory".to_string()),
+            Value::Text("RecommendReservation".to_string()),
+            Value::Text("[]".to_string()),
+            Value::Double(0.5),
+            Value::Null,
+            Value::Null,
+            Value::Text("legacy row".to_string()),
+            Value::BigInt(1),
+            Value::BigInt(0),
+            Value::Null,
+            Value::Null,
+            Value::Text("{\"version\":0}".to_string()),
+            Value::Null,
+            Value::BigInt(1_700_000_000_100_000),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ],
+    )
+    .expect("seed pre-v21 ATC experience row");
+
+    let applied = block_on({
+        let conn = &conn;
+        move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+    });
+    let applied_set: HashSet<&str> = applied.iter().map(String::as_str).collect();
+    let expected_set: HashSet<&str> = ATC_V21_MIGRATION_IDS.iter().copied().collect();
+    assert_eq!(
+        applied_set, expected_set,
+        "upgrade should apply only ATC v21 migrations; got {applied:?}"
+    );
+
+    assert_atc_feature_schema_version_column(&conn);
+
+    let rows = conn
+        .query_sync(
+            "SELECT feature_schema_version FROM atc_experiences WHERE experience_id = 2",
+            &[],
+        )
+        .expect("query upgraded ATC v21 row");
+    assert_eq!(rows.len(), 1, "expected seeded ATC row after upgrade");
+    assert_eq!(
+        rows[0]
+            .get_named::<i64>("feature_schema_version")
+            .expect("feature_schema_version value"),
+        1,
+        "seeded rows should default feature_schema_version=1"
     );
 }
 
