@@ -533,10 +533,6 @@ fn accumulate_rollup_row(
     apply_rollup_row(entry, &row);
 }
 
-fn finalize_rollups(rows: &[Row]) -> BTreeMap<String, RollupEntry> {
-    finalize_rollups_with_seed(rows, &BTreeMap::new())
-}
-
 fn finalize_rollups_with_seed(
     rows: &[Row],
     seed: &BTreeMap<String, RollupEntry>,
