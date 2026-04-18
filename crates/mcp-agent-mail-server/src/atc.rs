@@ -4339,6 +4339,30 @@ impl AtcEngine {
         }
     }
 
+    pub(crate) fn note_build_slot_acquired(&mut self, agent: &str, timestamp_micros: i64) {
+        self.session_summary
+            .absorb(&SynthesisEvent::BuildSlotAcquired {
+                agent: agent.to_string(),
+                timestamp_micros,
+            });
+    }
+
+    pub(crate) fn note_build_slot_renewed(&mut self, agent: &str, timestamp_micros: i64) {
+        self.session_summary
+            .absorb(&SynthesisEvent::BuildSlotRenewed {
+                agent: agent.to_string(),
+                timestamp_micros,
+            });
+    }
+
+    pub(crate) fn note_build_slot_released(&mut self, agent: &str, timestamp_micros: i64) {
+        self.session_summary
+            .absorb(&SynthesisEvent::BuildSlotReleased {
+                agent: agent.to_string(),
+                timestamp_micros,
+            });
+    }
+
     pub(crate) fn note_reservation_granted(
         &mut self,
         agent: &str,
@@ -6611,6 +6635,9 @@ pub struct SessionSummary {
     // ── Monotone Counters (increment only) ──
     pub messages_sent: u64,
     pub messages_received: u64,
+    pub build_slots_acquired: u64,
+    pub build_slots_renewed: u64,
+    pub build_slots_released: u64,
     pub reservations_granted: u64,
     pub reservations_released: u64,
     pub reservations_renewed: u64,
@@ -6652,6 +6679,18 @@ pub enum SynthesisEvent {
         agent: String,
         timestamp_micros: i64,
     },
+    BuildSlotAcquired {
+        agent: String,
+        timestamp_micros: i64,
+    },
+    BuildSlotRenewed {
+        agent: String,
+        timestamp_micros: i64,
+    },
+    BuildSlotReleased {
+        agent: String,
+        timestamp_micros: i64,
+    },
     ReservationGranted {
         agent: String,
         timestamp_micros: i64,
@@ -6688,6 +6727,15 @@ impl SynthesisEvent {
                 timestamp_micros, ..
             }
             | Self::MessageReceived {
+                timestamp_micros, ..
+            }
+            | Self::BuildSlotAcquired {
+                timestamp_micros, ..
+            }
+            | Self::BuildSlotRenewed {
+                timestamp_micros, ..
+            }
+            | Self::BuildSlotReleased {
                 timestamp_micros, ..
             }
             | Self::ReservationGranted {
@@ -6739,6 +6787,18 @@ impl SessionSummary {
             }
             SynthesisEvent::MessageReceived { agent, .. } => {
                 self.messages_received += 1;
+                self.active_agents.insert(agent.clone());
+            }
+            SynthesisEvent::BuildSlotAcquired { agent, .. } => {
+                self.build_slots_acquired += 1;
+                self.active_agents.insert(agent.clone());
+            }
+            SynthesisEvent::BuildSlotRenewed { agent, .. } => {
+                self.build_slots_renewed += 1;
+                self.active_agents.insert(agent.clone());
+            }
+            SynthesisEvent::BuildSlotReleased { agent, .. } => {
+                self.build_slots_released += 1;
                 self.active_agents.insert(agent.clone());
             }
             SynthesisEvent::ReservationGranted { agent, .. } => {
@@ -6823,6 +6883,16 @@ impl SessionSummary {
             lines.push(format!("Hot threads: {}", top.join(", ")));
         }
 
+        if self.build_slots_acquired > 0
+            || self.build_slots_renewed > 0
+            || self.build_slots_released > 0
+        {
+            lines.push(format!(
+                "Build slots: {} acquired, {} renewed, {} released",
+                self.build_slots_acquired, self.build_slots_renewed, self.build_slots_released,
+            ));
+        }
+
         if self.reservations_granted > 0
             || self.reservations_released > 0
             || self.reservations_renewed > 0
@@ -6858,6 +6928,9 @@ impl SessionSummary {
     fn is_monotone_vs(&self, previous: &Self) -> bool {
         self.messages_sent >= previous.messages_sent
             && self.messages_received >= previous.messages_received
+            && self.build_slots_acquired >= previous.build_slots_acquired
+            && self.build_slots_renewed >= previous.build_slots_renewed
+            && self.build_slots_released >= previous.build_slots_released
             && self.reservations_granted >= previous.reservations_granted
             && self.reservations_released >= previous.reservations_released
             && self.reservations_renewed >= previous.reservations_renewed
@@ -6946,6 +7019,28 @@ mod synthesis_tests {
 
         assert_eq!(summary.reservations_granted, 1);
         assert_eq!(summary.reservations_released, 1);
+    }
+
+    #[test]
+    fn absorb_build_slot_events() {
+        let mut summary = SessionSummary::default();
+        summary.absorb(&SynthesisEvent::BuildSlotAcquired {
+            agent: "A".to_string(),
+            timestamp_micros: 1,
+        });
+        summary.absorb(&SynthesisEvent::BuildSlotRenewed {
+            agent: "A".to_string(),
+            timestamp_micros: 2,
+        });
+        summary.absorb(&SynthesisEvent::BuildSlotReleased {
+            agent: "A".to_string(),
+            timestamp_micros: 3,
+        });
+
+        assert_eq!(summary.build_slots_acquired, 1);
+        assert_eq!(summary.build_slots_renewed, 1);
+        assert_eq!(summary.build_slots_released, 1);
+        assert!(summary.active_agents.contains("A"));
     }
 
     #[test]
@@ -9858,6 +9953,120 @@ pub fn atc_note_reservation_force_released(
         return;
     }
     e.note_reservation_force_released(agent, paths, project, timestamp_micros);
+}
+
+pub fn atc_note_build_slot_acquired(
+    agent: &str,
+    slot: &str,
+    branch: Option<&str>,
+    ttl_seconds: Option<i64>,
+    exclusive: bool,
+    project: &str,
+    timestamp_micros: i64,
+) {
+    let mode = atc_write_mode();
+    if mode.is_off() {
+        return;
+    }
+    let Some(engine) = ATC_ENGINE.get() else {
+        return;
+    };
+    let Ok(mut e) = engine.lock() else {
+        return;
+    };
+    if !e.enabled() {
+        return;
+    }
+    if mode.is_shadow() {
+        mcp_agent_mail_core::global_metrics()
+            .atc
+            .record_shadow_event("build_slot_acquired");
+        tracing::trace!(
+            event = "atc.shadow.would_insert",
+            family = "build_slot_acquired",
+            agent,
+            slot,
+            ?branch,
+            ttl_seconds,
+            exclusive,
+            project,
+            timestamp_micros,
+            "shadow: would insert build-slot experience row"
+        );
+        return;
+    }
+    e.note_build_slot_acquired(agent, timestamp_micros);
+}
+
+pub fn atc_note_build_slot_renewed(
+    agent: &str,
+    slot: &str,
+    extend_seconds: Option<i64>,
+    project: &str,
+    timestamp_micros: i64,
+) {
+    let mode = atc_write_mode();
+    if mode.is_off() {
+        return;
+    }
+    let Some(engine) = ATC_ENGINE.get() else {
+        return;
+    };
+    let Ok(mut e) = engine.lock() else {
+        return;
+    };
+    if !e.enabled() {
+        return;
+    }
+    if mode.is_shadow() {
+        mcp_agent_mail_core::global_metrics()
+            .atc
+            .record_shadow_event("build_slot_renewed");
+        tracing::trace!(
+            event = "atc.shadow.would_insert",
+            family = "build_slot_renewed",
+            agent,
+            slot,
+            extend_seconds,
+            project,
+            timestamp_micros,
+            "shadow: would insert build-slot experience row"
+        );
+        return;
+    }
+    e.note_build_slot_renewed(agent, timestamp_micros);
+}
+
+pub fn atc_note_build_slot_released(agent: &str, slot: &str, project: &str, timestamp_micros: i64) {
+    let mode = atc_write_mode();
+    if mode.is_off() {
+        return;
+    }
+    let Some(engine) = ATC_ENGINE.get() else {
+        return;
+    };
+    let Ok(mut e) = engine.lock() else {
+        return;
+    };
+    if !e.enabled() {
+        return;
+    }
+    if mode.is_shadow() {
+        mcp_agent_mail_core::global_metrics()
+            .atc
+            .record_shadow_event("build_slot_released");
+        tracing::trace!(
+            event = "atc.shadow.would_insert",
+            family = "build_slot_released",
+            agent,
+            slot,
+            project,
+            timestamp_micros,
+            "shadow: would insert build-slot experience row"
+        );
+        return;
+    }
+    e.note_build_slot_released(agent, timestamp_micros);
 }
 
 /// Query the engine's reservation event log for the most recent outcome affecting `agent`

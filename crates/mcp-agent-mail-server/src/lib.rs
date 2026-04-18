@@ -151,7 +151,8 @@ use jsonwebtoken::{DecodingKey, Validation};
 use mcp_agent_mail_core::config::{ConsoleSplitMode, ConsoleUiAnchor};
 use mcp_agent_mail_core::{
     EffectKind, ExperienceBuilder, ExperienceOutcome, ExperienceRow, ExperienceState,
-    ExperienceSubsystem, FeatureVector, NonExecutionReason, loss_to_bp, prob_to_bp,
+    ExperienceSubsystem, FeatureExtension, FeatureVector, NonExecutionReason, loss_to_bp,
+    prob_to_bp, saturating_u8,
 };
 use mcp_agent_mail_db::{
     DbConn, DbPoolConfig, QueryTracker, active_tracker, create_pool, set_active_tracker,
@@ -307,6 +308,13 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
                 project.as_deref(),
                 agent.as_deref(),
             );
+            record_atc_build_slot_observations_from_tool_contents(
+                self.tool_name,
+                Some(&call_arguments),
+                contents,
+                project.as_deref(),
+                agent.as_deref(),
+            );
             record_atc_message_outcomes_from_tool_contents(
                 self.tool_name,
                 Some(&call_arguments),
@@ -398,6 +406,13 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
                     emit_tui_event_async(event).await;
                 }
                 record_atc_message_observations_from_tool_contents(
+                    self.tool_name,
+                    Some(&call_arguments),
+                    contents,
+                    project.as_deref(),
+                    agent.as_deref(),
+                );
+                record_atc_build_slot_observations_from_tool_contents(
                     self.tool_name,
                     Some(&call_arguments),
                     contents,
@@ -10151,6 +10166,13 @@ to skip auth for local requests.</p>
                     project_hint.as_deref(),
                     agent_hint.as_deref(),
                 );
+                record_atc_build_slot_observations_from_tool_result(
+                    &tool_name,
+                    call_arguments.as_ref(),
+                    &value,
+                    project_hint.as_deref(),
+                    agent_hint.as_deref(),
+                );
                 record_atc_message_outcomes_from_tool_result(
                     &tool_name,
                     call_arguments.as_ref(),
@@ -10540,6 +10562,14 @@ fn extract_arg_i64(arguments: Option<&serde_json::Value>, key: &str) -> Option<i
     value.as_u64().and_then(|v| i64::try_from(v).ok())
 }
 
+fn extract_arg_string(arguments: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    arguments?
+        .as_object()?
+        .get(key)?
+        .as_str()
+        .map(str::to_string)
+}
+
 fn extract_arg_i64_vec(arguments: Option<&serde_json::Value>, key: &str) -> Vec<i64> {
     arguments
         .and_then(serde_json::Value::as_object)
@@ -10590,8 +10620,12 @@ fn truncate_body_md(body: &str) -> String {
 }
 
 const ATC_MESSAGE_OBSERVATION_CACHE_CAPACITY: usize = 8192;
+const ATC_BUILD_SLOT_OBSERVATION_CACHE_CAPACITY: usize = 4096;
 
 static ATC_MESSAGE_OBSERVATION_CACHE: std::sync::LazyLock<
+    Mutex<(HashSet<String>, VecDeque<String>)>,
+> = std::sync::LazyLock::new(|| Mutex::new((HashSet::new(), VecDeque::new())));
+static ATC_BUILD_SLOT_OBSERVATION_CACHE: std::sync::LazyLock<
     Mutex<(HashSet<String>, VecDeque<String>)>,
 > = std::sync::LazyLock::new(|| Mutex::new((HashSet::new(), VecDeque::new())));
 
@@ -10647,6 +10681,23 @@ fn claim_atc_message_observation(observation_key: &str) -> bool {
     true
 }
 
+fn claim_atc_build_slot_observation(observation_key: &str) -> bool {
+    let mut guard = ATC_BUILD_SLOT_OBSERVATION_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (seen, order) = &mut *guard;
+    if !seen.insert(observation_key.to_string()) {
+        return false;
+    }
+    order.push_back(observation_key.to_string());
+    while order.len() > ATC_BUILD_SLOT_OBSERVATION_CACHE_CAPACITY {
+        if let Some(expired) = order.pop_front() {
+            seen.remove(&expired);
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 fn reset_atc_message_observation_cache_for_test() {
     let mut guard = ATC_MESSAGE_OBSERVATION_CACHE
@@ -10656,7 +10707,16 @@ fn reset_atc_message_observation_cache_for_test() {
     guard.1.clear();
 }
 
-fn append_atc_message_observation_row(
+#[cfg(test)]
+fn reset_atc_build_slot_observation_cache_for_test() {
+    let mut guard = ATC_BUILD_SLOT_OBSERVATION_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.0.clear();
+    guard.1.clear();
+}
+
+fn append_atc_hot_path_observation_row(
     pool: &mcp_agent_mail_db::DbPool,
     row: &ExperienceRow,
     observation_family: &str,
@@ -10677,7 +10737,7 @@ fn append_atc_message_observation_row(
                 .atc
                 .record_experience_written(observation_family, &stratum_key);
             tracing::debug!(
-                event = "atc.message_observation.append",
+                event = "atc.hot_path_observation.append",
                 observation_family,
                 experience_id = stored.experience_id,
                 decision_class = %stored.decision_class,
@@ -10686,46 +10746,46 @@ fn append_atc_message_observation_row(
                 stratum = %stratum_key,
                 feature_vector_size,
                 latency_micros,
-                "ATC message observation appended"
+                "ATC hot-path observation appended"
             );
         }
         asupersync::Outcome::Err(error) => {
             mcp_agent_mail_core::global_metrics()
                 .atc
-                .record_derivation_error("message_observation_append");
+                .record_derivation_error("hot_path_observation_append");
             tracing::warn!(
-                event = "atc.message_observation.append",
+                event = "atc.hot_path_observation.append",
                 observation_family,
                 decision_class = %row.decision_class,
                 subject = %row.subject,
                 project_slug = %atc_effect_project_slug(row.project_key.as_deref()),
                 %error,
-                "failed to append ATC message observation"
+                "failed to append ATC hot-path observation"
             );
         }
         asupersync::Outcome::Cancelled(reason) => {
             mcp_agent_mail_core::global_metrics()
                 .atc
-                .record_derivation_error("message_observation_cancelled");
+                .record_derivation_error("hot_path_observation_cancelled");
             tracing::warn!(
-                event = "atc.message_observation.append",
+                event = "atc.hot_path_observation.append",
                 observation_family,
                 decision_class = %row.decision_class,
                 subject = %row.subject,
                 reason = ?reason,
-                "ATC message observation append cancelled"
+                "ATC hot-path observation append cancelled"
             );
         }
         asupersync::Outcome::Panicked(_) => {
             mcp_agent_mail_core::global_metrics()
                 .atc
-                .record_derivation_error("message_observation_panicked");
+                .record_derivation_error("hot_path_observation_panicked");
             tracing::warn!(
-                event = "atc.message_observation.append",
+                event = "atc.hot_path_observation.append",
                 observation_family,
                 decision_class = %row.decision_class,
                 subject = %row.subject,
-                "ATC message observation append panicked"
+                "ATC hot-path observation append panicked"
             );
         }
     }
@@ -10860,6 +10920,312 @@ fn build_message_received_observation_row(
     row
 }
 
+fn stable_atc_i64_hash(value: &str) -> i64 {
+    i64::try_from(stable_fnv1a64(value.as_bytes()) & (i64::MAX as u64)).unwrap_or(i64::MAX)
+}
+
+fn atc_build_slot_feature_vector(
+    summary: Option<&atc::AtcSummarySnapshot>,
+    conflict_count: usize,
+) -> FeatureVector {
+    let mut features = FeatureVector::zeroed();
+    features.observation_count = 1;
+    features.reservation_count = 1;
+    features.conflict_count =
+        saturating_u8(u64::try_from(conflict_count).unwrap_or(u64::from(u8::MAX)));
+    features.calibration_healthy = summary.is_none_or(|value| !value.eprocess_alert);
+    features.safe_mode_active = summary.is_some_and(|value| value.safe_mode);
+    features.tick_utilization_bp = summary.map_or(0, |value| {
+        prob_to_bp(value.budget.utilization_ratio.clamp(0.0, 1.0))
+    });
+    features.controller_mode = atc_message_controller_mode(summary);
+    features.risk_tier = FeatureVector::risk_tier_for(EffectKind::Advisory);
+    features
+}
+
+fn atc_build_slot_observation_numeric_id(namespace: &str, observation_key: &str) -> u64 {
+    (stable_fnv1a64(format!("{namespace}:{observation_key}").as_bytes()) & (i64::MAX as u64)).max(1)
+}
+
+fn build_slot_feature_ext(
+    slot: &str,
+    branch: Option<&str>,
+    ttl_seconds: Option<i64>,
+    conflict_count: usize,
+    exclusive: bool,
+) -> FeatureExtension {
+    FeatureExtension::empty()
+        .with_field("slot_hash", stable_atc_i64_hash(slot))
+        .with_field(
+            "branch_hash",
+            branch.map_or(0, |value| stable_atc_i64_hash(value)),
+        )
+        .with_field("ttl_seconds", ttl_seconds.unwrap_or_default().max(0))
+        .with_field(
+            "conflict_count",
+            i64::try_from(conflict_count).unwrap_or(i64::MAX),
+        )
+        .with_field("exclusive", if exclusive { 1 } else { 0 })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_build_slot_observation_row(
+    project: &str,
+    agent: &str,
+    slot: &str,
+    branch: Option<&str>,
+    ttl_seconds: Option<i64>,
+    exclusive: bool,
+    conflict_count: usize,
+    observation_key: &str,
+    decision_class: &str,
+    action: &str,
+    context: serde_json::Value,
+    timestamp_micros: i64,
+) -> ExperienceRow {
+    let summary = atc::atc_summary();
+    let features = atc_build_slot_feature_vector(summary.as_ref(), conflict_count);
+    let calibration_healthy = features.calibration_healthy;
+    let safe_mode_active = features.safe_mode_active;
+    let mut row = ExperienceBuilder::new(
+        atc_build_slot_observation_numeric_id("decision", observation_key),
+        atc_build_slot_observation_numeric_id("effect", observation_key),
+        format!(
+            "trc-{:016x}",
+            stable_fnv1a64(format!("trace:{observation_key}").as_bytes())
+        ),
+        format!(
+            "clm-{:016x}",
+            stable_fnv1a64(format!("claim:{observation_key}").as_bytes())
+        ),
+        format!(
+            "evi-{:016x}",
+            stable_fnv1a64(format!("evidence:{observation_key}").as_bytes())
+        ),
+        ExperienceSubsystem::Conflict,
+        decision_class,
+        agent,
+        EffectKind::Advisory,
+        action,
+        vec![("observed".to_string(), 1.0)],
+        0.0,
+        format!("observed {decision_class} for build slot {slot}"),
+        calibration_healthy,
+        safe_mode_active,
+    )
+    .project_key(project.to_string())
+    .features(features)
+    .feature_ext(build_slot_feature_ext(
+        slot,
+        branch,
+        ttl_seconds,
+        conflict_count,
+        exclusive,
+    ))
+    .context(context)
+    .build(0, timestamp_micros);
+    row.state = ExperienceState::Executed;
+    row.dispatched_ts_micros = Some(timestamp_micros);
+    row.executed_ts_micros = Some(timestamp_micros);
+    row
+}
+
+fn record_acquire_build_slot_observation(
+    call_args: Option<&serde_json::Value>,
+    payload: &serde_json::Value,
+    project_hint: Option<&str>,
+    agent_hint: Option<&str>,
+    atc_db_pool: Option<&mcp_agent_mail_db::DbPool>,
+) {
+    let ctx = resolve_domain_event_context(call_args, project_hint, agent_hint);
+    let Some(project) = ctx.project.as_deref() else {
+        return;
+    };
+    let granted = payload.get("granted").unwrap_or(payload);
+    let slot = granted
+        .get("slot")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| extract_arg_string(call_args, "slot"));
+    let agent = ctx
+        .agent
+        .as_deref()
+        .or_else(|| granted.get("agent").and_then(serde_json::Value::as_str));
+    let (Some(slot), Some(agent)) = (slot, agent) else {
+        return;
+    };
+    let branch = granted.get("branch").and_then(serde_json::Value::as_str);
+    let exclusive = granted
+        .get("exclusive")
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| extract_arg_bool(call_args, "exclusive"))
+        .unwrap_or(true);
+    let ttl_seconds = extract_arg_i64(call_args, "ttl_seconds");
+    let acquired_ts = granted
+        .get("acquired_ts")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let conflicts = payload
+        .get("conflicts")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let observation_key = format!("build_slot_acquired:{project}:{slot}:{agent}:{acquired_ts}");
+    if !claim_atc_build_slot_observation(&observation_key) {
+        return;
+    }
+    let timestamp_micros = mcp_agent_mail_db::now_micros();
+    atc::atc_note_build_slot_acquired(
+        agent,
+        &slot,
+        branch,
+        ttl_seconds,
+        exclusive,
+        project,
+        timestamp_micros,
+    );
+    if let Some(pool) = atc_db_pool {
+        let row = build_build_slot_observation_row(
+            project,
+            agent,
+            &slot,
+            branch,
+            ttl_seconds,
+            exclusive,
+            conflicts.len(),
+            &observation_key,
+            "build_slot_acquired",
+            "BuildSlotAcquired",
+            serde_json::json!({
+                "slot": slot,
+                "branch": branch,
+                "ttl_seconds": ttl_seconds,
+                "exclusive": exclusive,
+                "acquired_ts": granted.get("acquired_ts").and_then(serde_json::Value::as_str),
+                "expires_ts": granted.get("expires_ts").and_then(serde_json::Value::as_str),
+                "conflict_count": conflicts.len(),
+                "conflicts": conflicts,
+            }),
+            timestamp_micros,
+        );
+        append_atc_hot_path_observation_row(pool, &row, "build_slot_acquired");
+    }
+}
+
+fn record_renew_build_slot_observation(
+    call_args: Option<&serde_json::Value>,
+    payload: &serde_json::Value,
+    project_hint: Option<&str>,
+    agent_hint: Option<&str>,
+    atc_db_pool: Option<&mcp_agent_mail_db::DbPool>,
+) {
+    if !payload
+        .get("renewed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let ctx = resolve_domain_event_context(call_args, project_hint, agent_hint);
+    let Some(project) = ctx.project.as_deref() else {
+        return;
+    };
+    let Some(agent) = ctx.agent.as_deref() else {
+        return;
+    };
+    let Some(slot) = extract_arg_string(call_args, "slot") else {
+        return;
+    };
+    let extend_seconds = extract_arg_i64(call_args, "extend_seconds");
+    let expires_ts = payload
+        .get("expires_ts")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let observation_key = format!("build_slot_renewed:{project}:{slot}:{agent}:{expires_ts}");
+    if !claim_atc_build_slot_observation(&observation_key) {
+        return;
+    }
+    let timestamp_micros = mcp_agent_mail_db::now_micros();
+    atc::atc_note_build_slot_renewed(agent, &slot, extend_seconds, project, timestamp_micros);
+    if let Some(pool) = atc_db_pool {
+        let row = build_build_slot_observation_row(
+            project,
+            agent,
+            &slot,
+            None,
+            extend_seconds,
+            true,
+            0,
+            &observation_key,
+            "build_slot_renewed",
+            "BuildSlotRenewed",
+            serde_json::json!({
+                "slot": slot,
+                "extend_seconds": extend_seconds,
+                "expires_ts": payload.get("expires_ts").and_then(serde_json::Value::as_str),
+            }),
+            timestamp_micros,
+        );
+        append_atc_hot_path_observation_row(pool, &row, "build_slot_renewed");
+    }
+}
+
+fn record_release_build_slot_observation(
+    call_args: Option<&serde_json::Value>,
+    payload: &serde_json::Value,
+    project_hint: Option<&str>,
+    agent_hint: Option<&str>,
+    atc_db_pool: Option<&mcp_agent_mail_db::DbPool>,
+) {
+    if !payload
+        .get("released")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let ctx = resolve_domain_event_context(call_args, project_hint, agent_hint);
+    let Some(project) = ctx.project.as_deref() else {
+        return;
+    };
+    let Some(agent) = ctx.agent.as_deref() else {
+        return;
+    };
+    let Some(slot) = extract_arg_string(call_args, "slot") else {
+        return;
+    };
+    let released_at = payload
+        .get("released_at")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let observation_key = format!("build_slot_released:{project}:{slot}:{agent}:{released_at}");
+    if !claim_atc_build_slot_observation(&observation_key) {
+        return;
+    }
+    let timestamp_micros = mcp_agent_mail_db::now_micros();
+    atc::atc_note_build_slot_released(agent, &slot, project, timestamp_micros);
+    if let Some(pool) = atc_db_pool {
+        let row = build_build_slot_observation_row(
+            project,
+            agent,
+            &slot,
+            None,
+            None,
+            true,
+            0,
+            &observation_key,
+            "build_slot_released",
+            "BuildSlotReleased",
+            serde_json::json!({
+                "slot": slot,
+                "released_at": payload.get("released_at").and_then(serde_json::Value::as_str),
+            }),
+            timestamp_micros,
+        );
+        append_atc_hot_path_observation_row(pool, &row, "build_slot_released");
+    }
+}
+
 fn record_send_message_observation(
     payload: &serde_json::Value,
     project_hint: Option<&str>,
@@ -10895,7 +11261,7 @@ fn record_send_message_observation(
             payload,
             timestamp_micros,
         );
-        append_atc_message_observation_row(pool, &row, "message_sent");
+        append_atc_hot_path_observation_row(pool, &row, "message_sent");
     }
 }
 
@@ -10932,7 +11298,7 @@ fn record_fetch_inbox_message_observation(
             inbox_batch_size,
             timestamp_micros,
         );
-        append_atc_message_observation_row(pool, &row, "message_received");
+        append_atc_hot_path_observation_row(pool, &row, "message_received");
     }
 }
 
@@ -11026,6 +11392,112 @@ fn record_atc_message_observations_from_tool_payload(
         agent_hint,
         atc_db_pool.as_ref(),
     );
+}
+
+fn record_atc_build_slot_observations_from_tool_payload_with_pool(
+    tool_name: &str,
+    call_args: Option<&serde_json::Value>,
+    payload: &serde_json::Value,
+    project_hint: Option<&str>,
+    agent_hint: Option<&str>,
+    atc_db_pool: Option<&mcp_agent_mail_db::DbPool>,
+) {
+    let config = mcp_agent_mail_core::Config::get();
+    if config.atc_write_mode.is_off() || !config.worktrees_enabled {
+        return;
+    }
+    match tool_name {
+        "acquire_build_slot" => record_acquire_build_slot_observation(
+            call_args,
+            payload,
+            project_hint,
+            agent_hint,
+            atc_db_pool,
+        ),
+        "renew_build_slot" => record_renew_build_slot_observation(
+            call_args,
+            payload,
+            project_hint,
+            agent_hint,
+            atc_db_pool,
+        ),
+        "release_build_slot" => record_release_build_slot_observation(
+            call_args,
+            payload,
+            project_hint,
+            agent_hint,
+            atc_db_pool,
+        ),
+        _ => {}
+    }
+}
+
+fn record_atc_build_slot_observations_from_tool_payload(
+    tool_name: &str,
+    call_args: Option<&serde_json::Value>,
+    payload: &serde_json::Value,
+    project_hint: Option<&str>,
+    agent_hint: Option<&str>,
+) {
+    let config = mcp_agent_mail_core::Config::get();
+    if config.atc_write_mode.is_off() || !config.worktrees_enabled {
+        return;
+    }
+    let atc_db_pool = if config.atc_write_mode.is_live() {
+        mcp_agent_mail_db::pool::get_or_reuse_compatible_memory_pool(&DbPoolConfig::from_env()).ok()
+    } else {
+        None
+    };
+    record_atc_build_slot_observations_from_tool_payload_with_pool(
+        tool_name,
+        call_args,
+        payload,
+        project_hint,
+        agent_hint,
+        atc_db_pool.as_ref(),
+    );
+}
+
+fn record_atc_build_slot_observations_from_tool_result(
+    tool_name: &str,
+    call_args: Option<&serde_json::Value>,
+    call_result: &serde_json::Value,
+    project_hint: Option<&str>,
+    agent_hint: Option<&str>,
+) {
+    let payload =
+        parse_call_tool_result_payload(call_result).unwrap_or_else(|| call_result.clone());
+    record_atc_build_slot_observations_from_tool_payload(
+        tool_name,
+        call_args,
+        &payload,
+        project_hint,
+        agent_hint,
+    );
+}
+
+fn record_atc_build_slot_observations_from_tool_contents(
+    tool_name: &str,
+    call_args: Option<&serde_json::Value>,
+    contents: &[Content],
+    project_hint: Option<&str>,
+    agent_hint: Option<&str>,
+) {
+    for content in contents {
+        let Content::Text { text } = content else {
+            continue;
+        };
+        if let Some(payload) = parse_text_payload_json(text) {
+            record_atc_build_slot_observations_from_tool_payload(
+                tool_name,
+                call_args,
+                &payload,
+                project_hint,
+                agent_hint,
+            );
+            return;
+        }
+    }
 }
 
 fn atc_message_resolution_label(tool_name: &str) -> Option<&'static str> {
@@ -11879,13 +12351,15 @@ fn resolve_domain_event_context(
     project_hint: Option<&str>,
     agent_hint: Option<&str>,
 ) -> DomainEventContext {
-    let project = project_hint.map(|value| normalize_project_value(value.to_string())).or_else(|| {
-        extract_arg_str(
-            call_args,
-            &["project_key", "project", "human_key", "project_slug"],
-        )
-        .map(normalize_project_value)
-    });
+    let project = project_hint
+        .map(|value| normalize_project_value(value.to_string()))
+        .or_else(|| {
+            extract_arg_str(
+                call_args,
+                &["project_key", "project", "human_key", "project_slug"],
+            )
+            .map(normalize_project_value)
+        });
     let agent = agent_hint.map(str::to_string).or_else(|| {
         extract_arg_str(
             call_args,
@@ -24009,6 +24483,189 @@ first body
     }
 
     #[test]
+    fn build_slot_atc_observations_append_rows_when_enabled() {
+        let _guard = atc::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_atc_build_slot_observation_cache_for_test();
+        mcp_agent_mail_core::Config::reset_cached();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ATC_WRITE_MODE", "live"), ("WORKTREES_ENABLED", "true")],
+            || {
+                mcp_agent_mail_core::Config::reset_cached();
+                let pool = atc_message_test_pool();
+                let cx = Cx::for_testing();
+
+                let acquire_args = serde_json::json!({
+                    "project_key": "/tmp/alpha",
+                    "agent_name": "GoldFox",
+                    "slot": "cargo-build",
+                    "ttl_seconds": 300,
+                    "exclusive": true
+                });
+                let acquire_payload = serde_json::json!({
+                    "granted": {
+                        "slot": "cargo-build",
+                        "agent": "GoldFox",
+                        "branch": "main",
+                        "exclusive": true,
+                        "acquired_ts": "2026-04-18T20:41:00Z",
+                        "expires_ts": "2026-04-18T20:46:00Z"
+                    },
+                    "conflicts": []
+                });
+                let renew_args = serde_json::json!({
+                    "project_key": "/tmp/alpha",
+                    "agent_name": "GoldFox",
+                    "slot": "cargo-build",
+                    "extend_seconds": 120
+                });
+                let renew_payload = serde_json::json!({
+                    "renewed": true,
+                    "expires_ts": "2026-04-18T20:48:00Z"
+                });
+                let release_args = serde_json::json!({
+                    "project_key": "/tmp/alpha",
+                    "agent_name": "GoldFox",
+                    "slot": "cargo-build"
+                });
+                let release_payload = serde_json::json!({
+                    "released": true,
+                    "released_at": "2026-04-18T20:44:00Z"
+                });
+
+                record_atc_build_slot_observations_from_tool_payload_with_pool(
+                    "acquire_build_slot",
+                    Some(&acquire_args),
+                    &acquire_payload,
+                    None,
+                    None,
+                    Some(&pool),
+                );
+                record_atc_build_slot_observations_from_tool_payload_with_pool(
+                    "renew_build_slot",
+                    Some(&renew_args),
+                    &renew_payload,
+                    None,
+                    None,
+                    Some(&pool),
+                );
+                record_atc_build_slot_observations_from_tool_payload_with_pool(
+                    "release_build_slot",
+                    Some(&release_args),
+                    &release_payload,
+                    None,
+                    None,
+                    Some(&pool),
+                );
+
+                let rows = block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
+                    &cx,
+                    &pool,
+                    Some("GoldFox"),
+                    10,
+                ))
+                .into_result()
+                .expect("fetch build slot ATC experiences");
+
+                assert_eq!(rows.len(), 3);
+                assert!(
+                    rows.iter()
+                        .all(|row| row.state == ExperienceState::Executed)
+                );
+                assert!(rows.iter().any(|row| {
+                    row.decision_class == "build_slot_acquired"
+                        && row
+                            .context
+                            .as_ref()
+                            .and_then(|value| value.get("slot"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("cargo-build")
+                        && row
+                            .context
+                            .as_ref()
+                            .and_then(|value| value.get("ttl_seconds"))
+                            .and_then(serde_json::Value::as_i64)
+                            == Some(300)
+                }));
+                assert!(
+                    rows.iter()
+                        .any(|row| row.decision_class == "build_slot_renewed")
+                );
+                assert!(
+                    rows.iter()
+                        .any(|row| row.decision_class == "build_slot_released")
+                );
+            },
+        );
+
+        mcp_agent_mail_core::Config::reset_cached();
+        reset_atc_build_slot_observation_cache_for_test();
+    }
+
+    #[test]
+    fn build_slot_atc_observations_skip_when_worktrees_disabled() {
+        let _guard = atc::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_atc_build_slot_observation_cache_for_test();
+        mcp_agent_mail_core::Config::reset_cached();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_ATC_WRITE_MODE", "live"),
+                ("WORKTREES_ENABLED", "false"),
+            ],
+            || {
+                mcp_agent_mail_core::Config::reset_cached();
+                let pool = atc_message_test_pool();
+                let cx = Cx::for_testing();
+                let acquire_args = serde_json::json!({
+                    "project_key": "/tmp/alpha",
+                    "agent_name": "GoldFox",
+                    "slot": "cargo-build",
+                    "ttl_seconds": 300,
+                    "exclusive": true
+                });
+                let acquire_payload = serde_json::json!({
+                    "granted": {
+                        "slot": "cargo-build",
+                        "agent": "GoldFox",
+                        "branch": "main",
+                        "exclusive": true,
+                        "acquired_ts": "2026-04-18T20:41:00Z",
+                        "expires_ts": "2026-04-18T20:46:00Z"
+                    },
+                    "conflicts": []
+                });
+
+                record_atc_build_slot_observations_from_tool_payload_with_pool(
+                    "acquire_build_slot",
+                    Some(&acquire_args),
+                    &acquire_payload,
+                    None,
+                    None,
+                    Some(&pool),
+                );
+
+                let rows = block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
+                    &cx,
+                    &pool,
+                    Some("GoldFox"),
+                    10,
+                ))
+                .into_result()
+                .expect("fetch build slot rows when disabled");
+                assert!(rows.is_empty());
+            },
+        );
+
+        mcp_agent_mail_core::Config::reset_cached();
+        reset_atc_build_slot_observation_cache_for_test();
+    }
+
+    #[test]
     fn send_message_atc_observation_appends_once() {
         let _guard = atc::GLOBAL_ATC_TEST_LOCK
             .lock()
@@ -24515,7 +25172,10 @@ first body
                 .expect("fetch inbox ATC experiences after mixed project hints");
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].decision_class, "message_received");
-                assert_eq!(rows[0].project_key.as_deref(), Some(normalized_project.as_str()));
+                assert_eq!(
+                    rows[0].project_key.as_deref(),
+                    Some(normalized_project.as_str())
+                );
             },
         );
 

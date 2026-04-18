@@ -9,6 +9,21 @@ The goal is to capture durable, audit-friendly learning signals without changing
 `fetch_inbox` and `fetch_inbox_product` append independent `message_received` rows for each delivered inbox item.
 These are side-channel observations only: tool success is not coupled to ATC persistence.
 
+## Build Slot Observation
+
+`acquire_build_slot`, `renew_build_slot`, and `release_build_slot` append
+`build_slot_acquired`, `build_slot_renewed`, and `build_slot_released`
+ATC experience rows when `WORKTREES_ENABLED=true`.
+
+Each row carries the normalized project key, agent, slot name, and compact
+slot/branch hashes plus TTL/conflict metadata in context/feature-extension
+fields so the seam remains durable without widening the fixed hot-path feature
+vector.
+
+When `WORKTREES_ENABLED=false`, the hot-path recorder returns immediately and
+does not create any ATC experience rows. The feature gate is enforced both by
+the tool surface and by the ATC seam itself.
+
 ## Ack And Read Resolution
 
 `acknowledge_message(message_id)` resolves the matching `message_sent` row to outcome label `acknowledged`.
