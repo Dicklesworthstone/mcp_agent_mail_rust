@@ -52,7 +52,7 @@ No subcommands needed for the default flow. Subcommands exist for targeted opera
 
 The TUI must be visually indistinguishable in quality from the frankentui demo showcase. Every screen must use frankentui's rich widget library natively — no ANSI string building, no manual cell rendering, no Paragraph widgets where Table/Sparkline/MiniBar should be used.
 
-### 11 Screens (All Fully Implemented)
+### 16 Screens (All Fully Implemented)
 
 | # | Screen | What It Shows | Key Widgets |
 |---|--------|---------------|-------------|
@@ -67,6 +67,11 @@ The TUI must be visually indistinguishable in quality from the frankentui demo s
 | 9 | **Timeline** | Chronological event stream with inspector panel, zoom, correlation lines | LogViewer, Panel (split detail) |
 | 10 | **Projects** | Project list, routing, sibling relationships | Table, Tree |
 | 11 | **Contacts** | Contact graph, policy surface, approval queue | Table, StatusDot, Panel |
+| 12 | **Explorer** | Unified inbox/outbox explorer with direction and acknowledgement filters | Table, Panel, Filter chips |
+| 13 | **Analytics** | Anomaly insight feed with confidence scoring and deep links | Table, Sparkline, Panel |
+| 14 | **Attachments** | Attachment inventory with preview and provenance metadata | Table, Preview panel, StatusDot |
+| 15 | **Archive Browser** | Two-pane Git archive browser with tree navigation and file preview | Tree, Panel, Preview pane |
+| 16 | **ATC** | Snapshot-driven Air Traffic Controller surface with decision drill-in and retention visibility | Table, Panel, Status cards |
 
 ### Visual Requirements (Match Showcase Demo)
 
