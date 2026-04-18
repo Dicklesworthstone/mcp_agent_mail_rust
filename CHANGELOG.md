@@ -8,6 +8,18 @@ Versions marked **[Release]** have published [GitHub Releases](https://github.co
 
 ## Unreleased
 
+### Performance
+
+- **Archive batch write performance fixed** (`br-8qdh0.6`). Warm `batch-100` message writes now measure `238.053ms` p95 and `241.759ms` p99, improving the README historical baseline from roughly `1076ms` p95 to an under-budget steady-state path.
+
+### Documentation
+
+- **Documentation alignment sweep completed** (`br-o217s.7`). Final consistency checks removed stale count phrasing from the operator docs, updated the rollout playbook to the current 37-tool / 25-resource surface, clarified legacy incident notes as pre-16-screen historical artifacts, and kept the conformance audit/README aligned with the live router.
+
+### Database
+
+- **ATC v17 schema surface reserved and tested** (`br-bn0vb.28`). Added additive `v17_*` migrations for the ATC leader-lease table, ATC privacy classification columns on `atc_experiences`, and rollup snapshot metadata storage. Upgrade coverage now proves fresh/latest convergence, pre-v17 row preservation with default backfill, DB-level privacy-classification constraints, and archive reconstruction of the new schema surface.
+
 ### Deferred
 
 - **Browser TUI mirror and WASM frontend deferred** (br-il53l). After evaluating the

@@ -1228,16 +1228,27 @@ These numbers come from [`benches/BUDGETS.md`](benches/BUDGETS.md), which record
 
 Index build throughput baseline from the same file is 7.5K docs/sec at 1K, 36K docs/sec at 5K, and 90K docs/sec at 15K, with roughly 89-107 bytes/doc of disk overhead.
 
-#### Archive Write Baselines (2026-02-08)
+#### Historical Archive Write Baselines (2026-02-08)
 
 | Operation | Baseline p50 | Baseline p95 | Budget p95 | Notes |
 |-----------|--------------|--------------|------------|-------|
 | Single message, no attachments | ~17.2ms | ~21.3ms | < 25ms | Healthy write path |
 | Single message, inline attachment | ~22.0ms | ~26.0ms | < 25ms | Slightly over budget |
 | Single message, file attachment | ~20.4ms | ~25.2ms | < 25ms | Marginal |
-| Batch 100 messages | ~930ms | ~1076ms | < 250ms | Still materially over budget |
+| Batch 100 messages | ~930ms | ~1076ms | < 250ms | Historical pre-fix baseline; superseded below |
 
-The batch-write path is still above budget. This section is here to show both the fast paths and the remaining bottlenecks.
+These numbers are preserved as the pre-fix baseline for comparison.
+
+#### Archive Write Baselines (2026-04-18)
+
+| Operation | Baseline p50 | Baseline p95 | Budget p95 | Notes |
+|-----------|--------------|--------------|------------|-------|
+| Single message, no attachments | ~11.7ms | ~12.4ms | < 25ms | Healthy warm-path write |
+| Single message, inline attachment | ~22.0ms | ~26.0ms | < 25ms | Historical inline-attachment overrun remains tracked separately |
+| Single message, file attachment | ~20.6ms | ~22.0ms | < 25ms | Healthy |
+| Batch 100 messages | ~213.5ms | ~238.1ms | < 250ms | Fixed via storage-native batch bundle writes replacing the old per-message expansion loop |
+
+The archive batch-write path is now under budget on the warm steady-state benchmark path. See `benches/BUDGETS.md` and the `tests/artifacts/perf/archive_batch_*` artifacts for the detailed p99/span breakdown.
 
 ### Reproduction Commands
 
