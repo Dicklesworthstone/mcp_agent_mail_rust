@@ -14,6 +14,7 @@ source "${SCRIPT_DIR}/../../scripts/e2e_lib.sh"
 
 e2e_init_artifacts
 e2e_banner "Bootstrap Surface E2E Suite"
+WORK="$(e2e_mktemp "e2e_bootstrap")"
 
 # Build both binaries (if not already present)
 e2e_ensure_binary "mcp-agent-mail" >/dev/null
@@ -82,3 +83,52 @@ e2e_assert_exit_code "am --help" "0" "$AM_HELP_RC"
 e2e_assert_contains "am help includes guard command" "$AM_HELP_OUT" "guard"
 e2e_assert_contains "am help includes mail command" "$AM_HELP_OUT" "mail"
 e2e_assert_contains "am help includes share command" "$AM_HELP_OUT" "share"
+
+# ===========================================================================
+# Case 5: Server startup aborts immediately when binary build fails
+# ===========================================================================
+e2e_case_banner "server startup fails fast on binary build failure"
+
+set +e
+START_FAIL_STDERR="$(
+    (
+        e2e_ensure_binary() {
+            echo "error: simulated build failure in mcp-agent-mail-tools" >&2
+            echo "caused by: unresolved symbol in startup path" >&2
+            return 23
+        }
+
+        e2e_start_server_with_logs \
+            "${WORK}/server_fail.sqlite3" \
+            "${WORK}/server_fail_storage" \
+            "build_failure"
+    ) 2>&1
+)"
+START_FAIL_RC=$?
+set -e
+
+START_FAIL_DIAG="$(cat "${E2E_ARTIFACT_DIR}/diagnostics/server_startup_failure.txt" 2>/dev/null || true)"
+
+e2e_save_artifact "case_05_build_failure_stderr.txt" "$START_FAIL_STDERR"
+e2e_save_artifact "case_05_build_failure_diag.txt" "$START_FAIL_DIAG"
+e2e_assert_exit_code "server start returns original build failure" "23" "$START_FAIL_RC"
+e2e_assert_contains "stderr preserves build failure" "$START_FAIL_STDERR" \
+    "error: simulated build failure in mcp-agent-mail-tools"
+e2e_assert_contains "diagnostics preserve build failure" "$START_FAIL_DIAG" \
+    "error: simulated build failure in mcp-agent-mail-tools"
+e2e_assert_not_contains "stderr avoids command-not-found follow-on" "$START_FAIL_STDERR" \
+    "command not found"
+e2e_assert_not_contains "diagnostics avoid command-not-found follow-on" "$START_FAIL_DIAG" \
+    "command not found"
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+
+e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
+e2e_summary || true
+
+if [ "${_E2E_FAIL}" -gt 0 ]; then
+    exit 1
+fi
+exit 0

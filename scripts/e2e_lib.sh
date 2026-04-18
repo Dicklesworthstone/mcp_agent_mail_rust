@@ -2306,18 +2306,36 @@ e2e_git_commit() {
 # Build the workspace binary (if needed)
 _e2e_build_binary() {
     local bin_name="$1"
+    local build_output
+    local build_rc=0
     case "$bin_name" in
         am)
-            e2e_run_cargo build -p "mcp-agent-mail-cli" --bin "am" 2>&1 | tail -5
+            set +e
+            build_output="$(e2e_run_cargo build -p "mcp-agent-mail-cli" --bin "am" 2>&1)"
+            build_rc=$?
+            set -e
             ;;
         mcp-agent-mail)
-            e2e_run_cargo build -p "mcp-agent-mail" --bin "mcp-agent-mail" 2>&1 | tail -5
+            set +e
+            build_output="$(e2e_run_cargo build -p "mcp-agent-mail" --bin "mcp-agent-mail" 2>&1)"
+            build_rc=$?
+            set -e
             ;;
         *)
             # Default: assume package/bin share the same name.
-            e2e_run_cargo build -p "$bin_name" --bin "$bin_name" 2>&1 | tail -5
+            set +e
+            build_output="$(e2e_run_cargo build -p "$bin_name" --bin "$bin_name" 2>&1)"
+            build_rc=$?
+            set -e
             ;;
     esac
+
+    if [ "$build_rc" -ne 0 ]; then
+        printf '%s\n' "$build_output"
+        return "$build_rc"
+    fi
+
+    printf '%s\n' "$build_output" | tail -5
 }
 
 e2e_ensure_binary() {
@@ -2376,8 +2394,33 @@ _E2E_SERVER_LABEL=""
 _E2E_SERVER_PORT=""
 _E2E_SERVER_STORAGE_ROOT=""
 _E2E_SERVER_AUTH_MODE="none"
+_E2E_SERVER_BINARY_FAILURE_OUTPUT=""
 _E2E_CASE_MARKERS=()
 _E2E_CASE_LOG_LINE_COUNTS=()
+
+_e2e_resolve_server_binary() {
+    local bin_name="${1:-mcp-agent-mail}"
+    local bin_output
+    local bin_rc=0
+
+    set +e
+    bin_output="$(e2e_ensure_binary "$bin_name" 2>&1)"
+    bin_rc=$?
+    set -e
+
+    if [ "$bin_rc" -ne 0 ]; then
+        _E2E_SERVER_BINARY_FAILURE_OUTPUT="$bin_output"
+        e2e_log "Failed to resolve ${bin_name} before server startup"
+        if [ -n "$bin_output" ]; then
+            printf '%s\n' "$bin_output" >&2
+        fi
+        _e2e_server_startup_diagnostics
+        return "$bin_rc"
+    fi
+
+    _E2E_SERVER_BINARY_FAILURE_OUTPUT=""
+    printf '%s\n' "$bin_output" | tail -n 1
+}
 
 # e2e_start_server_with_logs: Start mcp-agent-mail server with debug logging
 #
@@ -2396,9 +2439,15 @@ e2e_start_server_with_logs() {
     local label="${3:-server}"
     shift 3 2>/dev/null || shift 2 2>/dev/null || true
 
+    _E2E_SERVER_LOG="${E2E_ARTIFACT_DIR}/logs/server_${label}.log"
+    _E2E_SERVER_LABEL="$label"
+    _E2E_SERVER_STORAGE_ROOT="${storage_root}"
+    _E2E_SERVER_AUTH_MODE="none"
+    mkdir -p "$(dirname "$_E2E_SERVER_LOG")"
+
     # Determine server binary
     local bin
-    bin="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
+    bin="$(_e2e_resolve_server_binary "mcp-agent-mail")" || return $?
 
     # Pick a random port if not specified
     local port="${HTTP_PORT:-}"
@@ -2411,11 +2460,7 @@ e2e_start_server_with_logs() {
     fi
 
     # Server log file
-    _E2E_SERVER_LOG="${E2E_ARTIFACT_DIR}/logs/server_${label}.log"
-    _E2E_SERVER_LABEL="$label"
     _E2E_SERVER_PORT="${port}"
-    _E2E_SERVER_STORAGE_ROOT="${storage_root}"
-    _E2E_SERVER_AUTH_MODE="none"
     local extra_env
     for extra_env in "$@"; do
         case "$extra_env" in
@@ -2451,6 +2496,7 @@ e2e_start_server_with_logs() {
         "${bin}" serve --host 127.0.0.1 --port "${port}"
     ) >"$_E2E_SERVER_LOG" 2>&1 &
     _E2E_SERVER_PID=$!
+    _E2E_SERVER_BINARY_FAILURE_OUTPUT=""
 
     # Wait for server to be ready.
     # Override with E2E_SERVER_START_TIMEOUT_SECONDS for slower CI/remote workers.
@@ -2502,8 +2548,14 @@ e2e_start_server_with_pty() {
         return 1
     fi
 
+    _E2E_SERVER_LOG="${E2E_ARTIFACT_DIR}/logs/server_${label}.typescript"
+    _E2E_SERVER_LABEL="$label"
+    _E2E_SERVER_STORAGE_ROOT="${storage_root}"
+    _E2E_SERVER_AUTH_MODE="none"
+    mkdir -p "$(dirname "${_E2E_SERVER_LOG}")" "${storage_root}"
+
     local bin
-    bin="$(e2e_ensure_binary "mcp-agent-mail" | tail -n 1)"
+    bin="$(_e2e_resolve_server_binary "mcp-agent-mail")" || return $?
 
     local port="${HTTP_PORT:-}"
     if [ -z "${port}" ]; then
@@ -2514,11 +2566,7 @@ e2e_start_server_with_pty() {
         fi
     fi
 
-    _E2E_SERVER_LOG="${E2E_ARTIFACT_DIR}/logs/server_${label}.typescript"
-    _E2E_SERVER_LABEL="$label"
     _E2E_SERVER_PORT="${port}"
-    _E2E_SERVER_STORAGE_ROOT="${storage_root}"
-    _E2E_SERVER_AUTH_MODE="none"
     local extra_env
     for extra_env in "$@"; do
         case "$extra_env" in
@@ -2571,6 +2619,7 @@ e2e_start_server_with_pty() {
             "${_E2E_SERVER_LOG}"
     ) >/dev/null 2>&1 &
     _E2E_SERVER_PID=$!
+    _E2E_SERVER_BINARY_FAILURE_OUTPUT=""
 
     local start_timeout_s="${E2E_SERVER_START_TIMEOUT_SECONDS:-15}"
     if ! e2e_wait_port "127.0.0.1" "${port}" "${start_timeout_s}"; then
@@ -2766,6 +2815,14 @@ _e2e_server_startup_diagnostics() {
         echo "Timestamp: $(_e2e_now_rfc3339)"
         echo "Label: ${_E2E_SERVER_LABEL}"
         echo "PID: ${_E2E_SERVER_PID}"
+        echo "Planned log: ${_E2E_SERVER_LOG:-}"
+        echo ""
+        echo "=== Binary build / resolve output ==="
+        if [ -n "${_E2E_SERVER_BINARY_FAILURE_OUTPUT:-}" ]; then
+            printf '%s\n' "${_E2E_SERVER_BINARY_FAILURE_OUTPUT}"
+        else
+            echo "(no binary failure captured)"
+        fi
         echo ""
         echo "=== Server log (last 100 lines) ==="
         if [ -n "${_E2E_SERVER_LOG}" ] && [ -f "${_E2E_SERVER_LOG}" ]; then
