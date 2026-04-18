@@ -297,8 +297,18 @@ test_dotenv
 test_env_read
 test_guard
 test_*
-!test_*.rs
-!test_*.sh
+# Re-include real test_*.rs / test_*.sh files in subdirectories
+# (e.g. crates/*/tests/, tests/), but keep root-level `test_*.rs`
+# scratch files ignored — those are always agent-generated.
+!*/**/test_*.rs
+!*/**/test_*.sh
+
+# Ephemeral benchmark output dirs (random-suffixed per run by atc-bench harness)
+atc-bench*/
+
+# Local cargo target aliases used for side-by-side builds
+target-local-*/
+target-review-*/
 
 # NTM (agent tmux orchestrator) runtime state — per-machine churn, never tracked.
 # (Session summaries under .ntm/summaries/ are historical handoff records
