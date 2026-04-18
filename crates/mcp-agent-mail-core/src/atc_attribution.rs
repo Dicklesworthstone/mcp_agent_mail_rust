@@ -217,7 +217,10 @@ pub fn attribute_outcome(
 
     if subsystems.len() == eligible.len() {
         // All from different subsystems — disjoint, no interference.
-        let most_recent = eligible.iter().min_by_key(|c| c.delay_micros).expect("eligible is not empty");
+        let most_recent = eligible
+            .iter()
+            .min_by_key(|c| c.delay_micros)
+            .expect("eligible is not empty");
         return AttributionResult {
             confidence: AttributionConfidence::Clean,
             primary_cause: Some(most_recent.experience_id),

@@ -1,0 +1,58 @@
+groups:
+  - name: atc-observability
+    interval: 30s
+    rules:
+      - alert: AtcKillSwitchEnabled
+        expr: am_atc_kill_switch_enabled_gauge > 0
+        for: 1m
+        labels:
+          severity: warning
+          service: mcp-agent-mail
+          subsystem: atc
+        annotations:
+          summary: "ATC learning kill switch is enabled"
+          description: "Experience writes are suppressed. Inspect the storage-root .atc_kill_switch sentinel and rollback notes in docs/RUNBOOK-atc-rollback.md."
+
+      - alert: AtcResolutionSweepSlowP95
+        expr: histogram_quantile(0.95, sum by (le, sweep_kind) (rate(am_atc_sweep_duration_micros_bucket{sweep_kind=\"resolution_window\"}[10m]))) > 250000
+        for: 10m
+        labels:
+          severity: warning
+          service: mcp-agent-mail
+          subsystem: atc
+        annotations:
+          summary: "ATC resolution sweep p95 is elevated"
+          description: "Resolution-window sweeps are running above 250ms p95 for 10 minutes. Check DB pressure, open-experience backlog, and slow-control traces."
+
+      - alert: AtcDerivationErrorsPresent
+        expr: sum by (error_kind) (increase(am_atc_derivation_errors_total[10m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+          service: mcp-agent-mail
+          subsystem: atc
+        annotations:
+          summary: "ATC derivation errors detected"
+          description: "Experience-row construction, append, or resolution transitions are failing. Correlate with tracing events `atc.insert_experience` and `atc.resolve_experience`."
+
+      - alert: AtcSafeModeEnteringFrequently
+        expr: sum(increase(am_atc_safe_mode_transitions_total{direction=\"enter\"}[30m])) > 2
+        for: 0m
+        labels:
+          severity: critical
+          service: mcp-agent-mail
+          subsystem: atc
+        annotations:
+          summary: "ATC safe mode entered repeatedly"
+          description: "Calibration health is unstable. Inspect ATC policy telemetry, shadow disagreements, and recent outcome traces before re-enabling live learning."
+
+      - alert: AtcOpenExperienceStratumBacklog
+        expr: max by (stratum) (am_atc_experiences_open_by_stratum) > 50
+        for: 15m
+        labels:
+          severity: warning
+          service: mcp-agent-mail
+          subsystem: atc
+        annotations:
+          summary: "ATC open experience backlog is accumulating"
+          description: "A single stratum has more than 50 unresolved experiences for 15 minutes. Inspect the SystemHealth ATC widget and recent resolution traces."

@@ -9,7 +9,9 @@
 #![forbid(unsafe_code)]
 
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::sync::LazyLock;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
@@ -763,6 +765,206 @@ pub struct SearchMetricsSnapshot {
     pub tantivy_last_update_us: u64,
 }
 
+// ---------------------------------------------------------------------------
+// ATC observability metrics
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+pub struct LabeledCounterMap {
+    inner: Mutex<BTreeMap<String, u64>>,
+}
+
+impl LabeledCounterMap {
+    pub fn add(&self, label: impl Into<String>, delta: u64) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = guard.entry(label.into()).or_insert(0);
+        *entry = entry.saturating_add(delta);
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> BTreeMap<String, u64> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct LabeledGaugeMap {
+    inner: Mutex<BTreeMap<String, u64>>,
+}
+
+impl LabeledGaugeMap {
+    pub fn add(&self, label: impl Into<String>, delta: u64) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = guard.entry(label.into()).or_insert(0);
+        *entry = entry.saturating_add(delta);
+    }
+
+    pub fn sub(&self, label: impl Into<String>, delta: u64) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = label.into();
+        let mut remove = false;
+        if let Some(entry) = guard.get_mut(&key) {
+            *entry = entry.saturating_sub(delta);
+            remove = *entry == 0;
+        }
+        if remove {
+            guard.remove(&key);
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> BTreeMap<String, u64> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct LabeledHistogramMap {
+    inner: Mutex<BTreeMap<String, Log2Histogram>>,
+}
+
+impl LabeledHistogramMap {
+    pub fn record(&self, label: impl Into<String>, value: u64) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.entry(label.into()).or_default().record(value);
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> BTreeMap<String, HistogramSnapshot> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(label, histogram)| (label.clone(), histogram.snapshot()))
+            .collect()
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct AtcMetrics {
+    pub experiences_written_total: Counter,
+    pub experiences_written_by_kind: LabeledCounterMap,
+    pub experiences_resolved_total: Counter,
+    pub experiences_resolved_by_outcome: LabeledCounterMap,
+    pub experiences_open_by_stratum: LabeledGaugeMap,
+    pub sweep_duration_micros: LabeledHistogramMap,
+    pub sweep_rows_resolved_total: LabeledCounterMap,
+    pub rollup_refresh_latency_micros: Log2Histogram,
+    pub retention_rows_deleted_total: Counter,
+    pub kill_switch_enabled_gauge: GaugeU64,
+    pub decision_latency_micros: LabeledHistogramMap,
+    pub safe_mode_transitions_total: LabeledCounterMap,
+    pub shadow_events_total: LabeledCounterMap,
+    pub derivation_errors_total: LabeledCounterMap,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AtcMetricsSnapshot {
+    pub experiences_written_total: u64,
+    pub experiences_written_by_kind: BTreeMap<String, u64>,
+    pub experiences_resolved_total: u64,
+    pub experiences_resolved_by_outcome: BTreeMap<String, u64>,
+    pub experiences_open_by_stratum: BTreeMap<String, u64>,
+    pub sweep_duration_micros: BTreeMap<String, HistogramSnapshot>,
+    pub sweep_rows_resolved_total: BTreeMap<String, u64>,
+    pub rollup_refresh_latency_micros: HistogramSnapshot,
+    pub retention_rows_deleted_total: u64,
+    pub kill_switch_enabled_gauge: u64,
+    pub decision_latency_micros: BTreeMap<String, HistogramSnapshot>,
+    pub safe_mode_transitions_total: BTreeMap<String, u64>,
+    pub shadow_events_total: BTreeMap<String, u64>,
+    pub derivation_errors_total: BTreeMap<String, u64>,
+}
+
+impl AtcMetrics {
+    pub fn record_experience_written(&self, event_kind: &str, stratum: &str) {
+        self.experiences_written_total.inc();
+        self.experiences_written_by_kind.add(event_kind, 1);
+        self.experiences_open_by_stratum.add(stratum, 1);
+    }
+
+    pub fn record_experience_resolved(&self, outcome: &str, stratum: &str) {
+        self.experiences_resolved_total.inc();
+        self.experiences_resolved_by_outcome.add(outcome, 1);
+        self.experiences_open_by_stratum.sub(stratum, 1);
+    }
+
+    pub fn record_sweep(&self, sweep_kind: &str, duration_micros: u64, rows_resolved: u64) {
+        self.sweep_duration_micros
+            .record(sweep_kind, duration_micros);
+        self.sweep_rows_resolved_total
+            .add(sweep_kind, rows_resolved);
+    }
+
+    pub fn record_rollup_refresh(&self, latency_micros: u64) {
+        self.rollup_refresh_latency_micros.record(latency_micros);
+    }
+
+    pub fn record_retention_deleted(&self, rows_deleted: u64) {
+        self.retention_rows_deleted_total.add(rows_deleted);
+    }
+
+    pub fn set_kill_switch_enabled(&self, enabled: bool) {
+        self.kill_switch_enabled_gauge.set(u64::from(enabled));
+    }
+
+    pub fn record_decision_latency(&self, decision_kind: &str, latency_micros: u64) {
+        self.decision_latency_micros
+            .record(decision_kind, latency_micros);
+    }
+
+    pub fn record_safe_mode_transition(&self, entered: bool) {
+        let direction = if entered { "enter" } else { "exit" };
+        self.safe_mode_transitions_total.add(direction, 1);
+    }
+
+    pub fn record_shadow_event(&self, event_kind: &str) {
+        self.shadow_events_total.add(event_kind, 1);
+    }
+
+    pub fn record_derivation_error(&self, error_kind: &str) {
+        self.derivation_errors_total.add(error_kind, 1);
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> AtcMetricsSnapshot {
+        AtcMetricsSnapshot {
+            experiences_written_total: self.experiences_written_total.load(),
+            experiences_written_by_kind: self.experiences_written_by_kind.snapshot(),
+            experiences_resolved_total: self.experiences_resolved_total.load(),
+            experiences_resolved_by_outcome: self.experiences_resolved_by_outcome.snapshot(),
+            experiences_open_by_stratum: self.experiences_open_by_stratum.snapshot(),
+            sweep_duration_micros: self.sweep_duration_micros.snapshot(),
+            sweep_rows_resolved_total: self.sweep_rows_resolved_total.snapshot(),
+            rollup_refresh_latency_micros: self.rollup_refresh_latency_micros.snapshot(),
+            retention_rows_deleted_total: self.retention_rows_deleted_total.load(),
+            kill_switch_enabled_gauge: self.kill_switch_enabled_gauge.load(),
+            decision_latency_micros: self.decision_latency_micros.snapshot(),
+            safe_mode_transitions_total: self.safe_mode_transitions_total.snapshot(),
+            shadow_events_total: self.shadow_events_total.snapshot(),
+            derivation_errors_total: self.derivation_errors_total.snapshot(),
+        }
+    }
+}
+
 impl Default for SearchMetrics {
     fn default() -> Self {
         Self {
@@ -1103,6 +1305,7 @@ pub struct GlobalMetrics {
     pub storage: StorageMetrics,
     pub system: SystemMetrics,
     pub search: SearchMetrics,
+    pub atc: AtcMetrics,
     pub canary: CanaryMetrics,
 }
 
@@ -1114,6 +1317,7 @@ pub struct GlobalMetricsSnapshot {
     pub storage: StorageMetricsSnapshot,
     pub system: SystemMetricsSnapshot,
     pub search: SearchMetricsSnapshot,
+    pub atc: AtcMetricsSnapshot,
     pub canary: CanaryMetricsSnapshot,
 }
 
@@ -1127,6 +1331,7 @@ impl GlobalMetrics {
             storage: self.storage.snapshot(),
             system: self.system.snapshot(),
             search: self.search.snapshot(),
+            atc: self.atc.snapshot(),
             canary: self.canary.snapshot(),
         }
     }
@@ -1718,6 +1923,90 @@ mod tests {
         let snap = m.snapshot();
         assert_eq!(snap.disk_storage_free_bytes, 1_000_000);
         assert_eq!(snap.disk_pressure_level, 2);
+    }
+
+    #[test]
+    fn labeled_gauge_map_saturates_and_drops_zero_entries() {
+        let gauges = LabeledGaugeMap::default();
+        gauges.add("liveness:probe:0", 3);
+        gauges.sub("liveness:probe:0", 1);
+        gauges.sub("liveness:probe:0", 10);
+        assert!(gauges.snapshot().is_empty());
+    }
+
+    #[test]
+    fn atc_metrics_snapshot_tracks_labeled_counts() {
+        let metrics = AtcMetrics::default();
+
+        metrics.record_experience_written("probe", "liveness:probe:0");
+        metrics.record_experience_written("probe", "liveness:probe:0");
+        metrics.record_experience_resolved("later_activity", "liveness:probe:0");
+        metrics.record_sweep("resolution_window", 42_000, 3);
+        metrics.record_rollup_refresh(9_000);
+        metrics.record_retention_deleted(5);
+        metrics.set_kill_switch_enabled(true);
+        metrics.record_decision_latency("probe_schedule", 13_000);
+        metrics.record_safe_mode_transition(true);
+        metrics.record_shadow_event("probe");
+        metrics.record_derivation_error("append_experience");
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.experiences_written_total, 2);
+        assert_eq!(snapshot.experiences_resolved_total, 1);
+        assert_eq!(
+            snapshot.experiences_written_by_kind.get("probe").copied(),
+            Some(2)
+        );
+        assert_eq!(
+            snapshot
+                .experiences_resolved_by_outcome
+                .get("later_activity")
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(
+            snapshot
+                .experiences_open_by_stratum
+                .get("liveness:probe:0")
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(snapshot.kill_switch_enabled_gauge, 1);
+        assert_eq!(snapshot.retention_rows_deleted_total, 5);
+        assert_eq!(
+            snapshot.safe_mode_transitions_total.get("enter").copied(),
+            Some(1)
+        );
+        assert_eq!(snapshot.shadow_events_total.get("probe").copied(), Some(1));
+        assert_eq!(
+            snapshot
+                .derivation_errors_total
+                .get("append_experience")
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(
+            snapshot
+                .sweep_rows_resolved_total
+                .get("resolution_window")
+                .copied(),
+            Some(3)
+        );
+        assert_eq!(
+            snapshot
+                .sweep_duration_micros
+                .get("resolution_window")
+                .map(|hist| hist.count),
+            Some(1)
+        );
+        assert_eq!(
+            snapshot
+                .decision_latency_micros
+                .get("probe_schedule")
+                .map(|hist| hist.count),
+            Some(1)
+        );
+        assert_eq!(snapshot.rollup_refresh_latency_micros.count, 1);
     }
 
     // ── global_metrics() singleton ────────────────────────────────────
