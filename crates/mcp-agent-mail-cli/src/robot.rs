@@ -12180,9 +12180,7 @@ mod tests {
     #[test]
     fn resolve_scope_retries_local_db_when_archive_snapshot_misses_agent() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let local_db_path = temp_dir
-            .path()
-            .join("robot_scope_local_retry.sqlite3");
+        let local_db_path = temp_dir.path().join("robot_scope_local_retry.sqlite3");
         let conn = mcp_agent_mail_db::DbConn::open_file(local_db_path.display().to_string())
             .expect("open sqlite db");
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
@@ -12220,9 +12218,7 @@ mod tests {
         .expect("insert agent into local db");
 
         // Archive snapshot DB that has the project but NOT the agent
-        let archive_db_path = temp_dir
-            .path()
-            .join("robot_scope_archive_no_agent.sqlite3");
+        let archive_db_path = temp_dir.path().join("robot_scope_archive_no_agent.sqlite3");
         let archive_conn =
             mcp_agent_mail_db::DbConn::open_file(archive_db_path.display().to_string())
                 .expect("open archive db");
@@ -12270,9 +12266,8 @@ mod tests {
         );
 
         // Local DB should find it
-        let local_conn =
-            mcp_agent_mail_db::DbConn::open_file(local_db_path.display().to_string())
-                .expect("reopen local db");
+        let local_conn = mcp_agent_mail_db::DbConn::open_file(local_db_path.display().to_string())
+            .expect("reopen local db");
         let scope = resolve_robot_scope_with_handle(
             RobotDbHandle::from_conn(local_conn),
             Some("/tmp/demo-project"),

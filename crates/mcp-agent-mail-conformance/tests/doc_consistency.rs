@@ -253,7 +253,9 @@ fn validate_agents_md(doc: &str, counts: LiveCounts) -> Result<(), String> {
             },
             ClaimPattern {
                 label: "AGENTS tools crate row",
-                regex: compile(r"\| `mcp-agent-mail-tools` \| `src/` \| (?P<count>\d+) MCP tool implementations"),
+                regex: compile(
+                    r"\| `mcp-agent-mail-tools` \| `src/` \| (?P<count>\d+) MCP tool implementations",
+                ),
                 expected: counts.tools,
                 source_of_truth: "mcp_agent_mail_tools::TOOL_CLUSTER_MAP",
             },

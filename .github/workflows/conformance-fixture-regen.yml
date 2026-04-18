@@ -1,0 +1,79 @@
+name: Conformance Fixture Regen
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Branch, tag, or SHA from the Python reference repo"
+        required: false
+        default: "main"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  regen:
+    name: Refresh Python parity fixtures
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
+      TRACKED_FIXTURE: crates/mcp-agent-mail-conformance/tests/conformance/fixtures/python_reference.json
+      TRACKED_CATALOG: crates/mcp-agent-mail-conformance/tests/conformance/fixtures/scenario_catalog.json
+      TRACKED_REPORT: crates/mcp-agent-mail-conformance/tests/conformance/fixtures/python_reference_regen_report.md
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Regenerate fixture artifacts
+        id: regen
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bash scripts/regen_python_parity_fixtures.sh \
+            --upstream-ref "${UPSTREAM_REF}" \
+            --apply \
+            | tee /tmp/conformance-fixture-regen.stdout
+
+          if git status --short -- "${TRACKED_FIXTURE}" "${TRACKED_CATALOG}" "${TRACKED_REPORT}" | grep -q .; then
+            echo "has_changes=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "has_changes=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Upload regeneration report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-fixture-regen-report
+          path: |
+            /tmp/conformance-fixture-regen.stdout
+            crates/mcp-agent-mail-conformance/tests/conformance/fixtures/python_reference_regen_report.md
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Create pull request
+        if: steps.regen.outputs.has_changes == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: automation/conformance-fixture-regen
+          delete-branch: true
+          title: "chore: refresh Python parity conformance fixtures"
+          commit-message: "chore: refresh Python parity conformance fixtures"
+          body-path: crates/mcp-agent-mail-conformance/tests/conformance/fixtures/python_reference_regen_report.md
+          labels: conformance, python-parity, automation
+          add-paths: |
+            crates/mcp-agent-mail-conformance/tests/conformance/fixtures/python_reference.json
+            crates/mcp-agent-mail-conformance/tests/conformance/fixtures/scenario_catalog.json
+            crates/mcp-agent-mail-conformance/tests/conformance/fixtures/python_reference_regen_report.md
