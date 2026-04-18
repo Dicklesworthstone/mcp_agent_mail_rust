@@ -8863,17 +8863,17 @@ impl AtcSimulatePolicyArtifact {
         format!("{:016x}", atc_policy_hash_fnv1a64(serialized.as_bytes()))
     }
 
-    fn validate(&self) -> CliResult<()> {
+    fn validate(&self, role: &str) -> CliResult<()> {
         if self.schema_version == 0 || self.policy_id.trim().is_empty() {
-            return Err(CliError::InvalidArgument(
-                "policy bundle load failed: invalid incumbent policy metadata (hint: provide a non-empty policy_id and schema_version)".to_string(),
-            ));
+            return Err(CliError::InvalidArgument(format!(
+                "policy bundle load failed: invalid {role} policy metadata (hint: provide a non-empty policy_id and schema_version)"
+            )));
         }
         let computed = self.compute_artifact_hash();
         if computed != self.artifact_hash {
             return Err(CliError::InvalidArgument(format!(
-                "policy bundle load failed: invalid incumbent policy hash (hint: recompute artifact_hash for policy_id '{}')",
-                self.policy_id
+                "policy bundle load failed: invalid {role} policy hash (hint: recompute artifact_hash for policy_id '{}')",
+                self.policy_id,
             )));
         }
         Ok(())
@@ -8948,13 +8948,9 @@ impl AtcSimulatePolicyBundle {
                 "policy bundle load failed: invalid bundle metadata (hint: provide a non-empty bundle_id and schema_version)".to_string(),
             ));
         }
-        self.incumbent.validate()?;
+        self.incumbent.validate("incumbent")?;
         if let Some(candidate) = self.candidate.as_ref() {
-            candidate.validate().map_err(|error| {
-                CliError::InvalidArgument(format!(
-                    "policy bundle load failed: invalid candidate policy: {error}"
-                ))
-            })?;
+            candidate.validate("candidate")?;
         }
         let computed = self.compute_bundle_hash();
         if computed != self.bundle_hash {
@@ -25763,6 +25759,36 @@ http_headers = { Authorization = "Bearer secret" }
         assert_eq!(
             before_hash, after_hash,
             "simulate must not mutate primary DB"
+        );
+    }
+
+    #[test]
+    fn read_atc_simulate_policy_bundle_reports_candidate_role_on_hash_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let policy_path = temp.path().join("policy-bad-candidate.json");
+        write_atc_simulate_policy_bundle(&policy_path, [8.0, 3.0, 0.2], Some([4.0, 1.2, 0.1]));
+
+        let mut bundle: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&policy_path).expect("read policy bundle"),
+        )
+        .expect("parse policy bundle");
+        bundle["candidate"]["artifact_hash"] = serde_json::json!("bad-candidate-hash");
+        std::fs::write(
+            &policy_path,
+            serde_json::to_vec_pretty(&bundle).expect("serialize broken bundle"),
+        )
+        .expect("write broken bundle");
+
+        let err = read_atc_simulate_policy_bundle(policy_path.to_str().expect("utf8 path"))
+            .expect_err("candidate hash mismatch should fail");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("invalid candidate policy hash"),
+            "unexpected error: {err_text}"
+        );
+        assert!(
+            !err_text.contains("invalid incumbent policy hash"),
+            "candidate failure should not be mislabeled as incumbent: {err_text}"
         );
     }
 

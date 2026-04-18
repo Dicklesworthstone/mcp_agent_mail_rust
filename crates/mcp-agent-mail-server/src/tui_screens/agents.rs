@@ -614,12 +614,18 @@ impl AgentsScreen {
                 COL_NAME => crate::tui_screens::cmp_ci(&a.name, &b.name),
                 COL_PROGRAM => crate::tui_screens::cmp_ci(&a.program, &b.program),
                 COL_MODEL => crate::tui_screens::cmp_ci(&a.model, &b.model),
-                COL_HEALTH => agent_health_sort_tuple(a).cmp(&agent_health_sort_tuple(b)),
+                COL_HEALTH => agent_health_cmp(a, b, self.sort_asc),
                 COL_LAST_ACTIVE => a.last_active_ts.cmp(&b.last_active_ts),
                 COL_MESSAGES => a.message_count.cmp(&b.message_count),
                 _ => std::cmp::Ordering::Equal,
             };
-            if self.sort_asc { cmp } else { cmp.reverse() }
+            if self.sort_col == COL_HEALTH {
+                cmp
+            } else if self.sort_asc {
+                cmp
+            } else {
+                cmp.reverse()
+            }
         });
 
         let rendered_count = u64::try_from(rows.len()).unwrap_or(u64::MAX);
@@ -1584,15 +1590,36 @@ fn format_relative_time_with(ts_micros: i64, now_micros: i64) -> String {
     }
 }
 
-fn agent_health_sort_tuple(agent: &AgentRow) -> (u8, u8, u16, u64) {
-    agent.health.as_ref().map_or((0, 0, 0, 0), |health| {
-        (
-            1,
-            health.score,
-            health.observed_weight_bp,
-            health.decision_count,
-        )
-    })
+fn agent_health_cmp(left: &AgentRow, right: &AgentRow, sort_asc: bool) -> std::cmp::Ordering {
+    match (left.health.as_ref(), right.health.as_ref()) {
+        (Some(left_health), Some(right_health)) => {
+            let cmp = if sort_asc {
+                right_health
+                    .score
+                    .cmp(&left_health.score)
+                    .then_with(|| {
+                        right_health
+                            .observed_weight_bp
+                            .cmp(&left_health.observed_weight_bp)
+                    })
+                    .then_with(|| right_health.decision_count.cmp(&left_health.decision_count))
+            } else {
+                left_health
+                    .score
+                    .cmp(&right_health.score)
+                    .then_with(|| {
+                        left_health
+                            .observed_weight_bp
+                            .cmp(&right_health.observed_weight_bp)
+                    })
+                    .then_with(|| left_health.decision_count.cmp(&right_health.decision_count))
+            };
+            cmp.then_with(|| crate::tui_screens::cmp_ci(&left.name, &right.name))
+        }
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => crate::tui_screens::cmp_ci(&left.name, &right.name),
+    }
 }
 
 fn health_badge(health: Option<&AgentHealthScorecard>) -> String {
@@ -1850,6 +1877,38 @@ mod tests {
         assert!(lines.iter().any(|(label, value, _)| {
             label == "Health" && value.contains("C 63") && value.contains("5 decisions")
         }));
+    }
+
+    #[test]
+    fn health_sort_defaults_to_weakest_first_and_keeps_unscored_last() {
+        let weak = {
+            let mut agent = test_agent_row("Amber", "alpha", "codex-cli", "gpt-5", 100, 3);
+            agent.health = Some(test_health(41, 2));
+            agent
+        };
+        let strong = {
+            let mut agent = test_agent_row("Blue", "alpha", "codex-cli", "gpt-5", 100, 8);
+            agent.health = Some(test_health(96, 7));
+            agent
+        };
+        let unknown = test_agent_row("Cipher", "alpha", "codex-cli", "gpt-5", 100, 1);
+
+        let mut rows = vec![unknown.clone(), strong.clone(), weak.clone()];
+        rows.sort_by(|left, right| agent_health_cmp(left, right, false));
+        assert_eq!(
+            rows.iter()
+                .map(|agent| agent.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Amber", "Blue", "Cipher"]
+        );
+
+        rows.sort_by(|left, right| agent_health_cmp(left, right, true));
+        assert_eq!(
+            rows.iter()
+                .map(|agent| agent.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Blue", "Amber", "Cipher"]
+        );
     }
 
     #[test]

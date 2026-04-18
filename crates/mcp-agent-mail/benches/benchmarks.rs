@@ -36,6 +36,24 @@ fn fixtures_path() -> std::path::PathBuf {
         .join("../mcp-agent-mail-conformance/tests/conformance/fixtures/python_reference.json")
 }
 
+struct CurrentDirGuard {
+    original: PathBuf,
+}
+
+impl CurrentDirGuard {
+    fn push(path: &Path) -> io::Result<Self> {
+        let original = std::env::current_dir()?;
+        std::env::set_current_dir(path)?;
+        Ok(Self { original })
+    }
+}
+
+impl Drop for CurrentDirGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.original);
+    }
+}
+
 fn seed_fixtures(fixtures: &Fixtures) {
     static SEEDED: Once = Once::new();
 
@@ -3387,8 +3405,7 @@ fn collect_canonical_message_paths(dir: &Path, out: &mut Vec<PathBuf>) -> io::Re
 
 fn seed_archive_read_dataset(dataset_size: usize) -> (TempDir, Vec<PathBuf>) {
     let tmp = TempDir::new().expect("tempdir");
-    let original_cwd = std::env::current_dir().expect("cwd");
-    std::env::set_current_dir(tmp.path()).expect("chdir");
+    let _cwd_guard = CurrentDirGuard::push(tmp.path()).expect("chdir");
 
     let mut config = mcp_agent_mail_core::Config::from_env();
     config.storage_root = tmp.path().join("archive_repo");
@@ -3433,7 +3450,6 @@ fn seed_archive_read_dataset(dataset_size: usize) -> (TempDir, Vec<PathBuf>) {
     canonical_paths.sort();
     assert_eq!(canonical_paths.len(), dataset_size);
 
-    std::env::set_current_dir(original_cwd).expect("restore cwd");
     (tmp, canonical_paths)
 }
 

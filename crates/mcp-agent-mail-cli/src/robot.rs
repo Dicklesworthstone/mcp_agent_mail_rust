@@ -5432,14 +5432,15 @@ fn build_agents_with_health(
         })
         .collect();
     let health_inputs = if health_enabled {
-        fetch_agent_health_inputs(
-            conn,
-            project_id,
-            &raw_agents
-                .iter()
-                .map(|row| row.agent_id)
-                .collect::<Vec<_>>(),
-        )
+        let agent_ids = raw_agents
+            .iter()
+            .map(|row| row.agent_id)
+            .collect::<Vec<_>>();
+        let last_active_by_id = raw_agents
+            .iter()
+            .map(|row| (row.agent_id, row.last_active_ts))
+            .collect::<HashMap<_, _>>();
+        fetch_agent_health_inputs(conn, project_id, &agent_ids, &last_active_by_id)
     } else {
         HashMap::new()
     };
@@ -5610,6 +5611,7 @@ fn fetch_agent_health_inputs(
     conn: &DbConn,
     project_id: i64,
     agent_ids: &[i64],
+    last_active_by_id: &HashMap<i64, i64>,
 ) -> HashMap<i64, AgentHealthInputs> {
     if agent_ids.is_empty() {
         return HashMap::new();
@@ -5637,14 +5639,9 @@ fn fetch_agent_health_inputs(
         let reservation = reservation_stats.get(agent_id).cloned().unwrap_or_default();
         let contact = contact_stats.get(agent_id).cloned().unwrap_or_default();
         let contact_observed = contact.respected_count + contact.violation_count > 0;
-        let last_active_age_micros = conn
-            .query_sync(
-                "SELECT last_active_ts FROM agents WHERE id = ? AND project_id = ?",
-                &[Value::BigInt(*agent_id), Value::BigInt(project_id)],
-            )
-            .ok()
-            .and_then(|rows| rows.first().cloned())
-            .map(|row| row.get_named::<i64>("last_active_ts").unwrap_or(0))
+        let last_active_age_micros = last_active_by_id
+            .get(agent_id)
+            .copied()
             .filter(|last_active_ts| *last_active_ts > 0)
             .map(|last_active_ts| now.saturating_sub(last_active_ts).max(0) as u64);
 
@@ -13057,6 +13054,14 @@ mod tests {
         let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
             .expect("open sqlite db");
         let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+        let now_us = mcp_agent_mail_db::now_micros();
+        let last_active_ts = now_us - 5 * 60 * 1_000_000;
+        let created_first = now_us - 3 * 60 * 60 * 1_000_000;
+        let created_second = now_us - 2 * 60 * 60 * 1_000_000;
+        let created_third = now_us - 60 * 60 * 1_000_000;
+        let ack_first = created_first + 5 * 60 * 1_000_000;
+        let ack_second = created_second + 30 * 60 * 1_000_000;
+        let ack_third = created_third + 2 * 60 * 60 * 1_000_000;
 
         conn.query_sync(
             "CREATE TABLE agents (
@@ -13093,26 +13098,32 @@ mod tests {
         .expect("create recipients");
 
         conn.query_sync(
-            "INSERT INTO agents
+            &format!(
+                "INSERT INTO agents
                 (id, project_id, name, program, model, last_active_ts, contact_policy)
              VALUES
-                (1, 1, 'GreenCastle', 'codex-cli', 'gpt-5', 9_000_000, 'auto')",
+                (1, 1, 'GreenCastle', 'codex-cli', 'gpt-5', {last_active_ts}, 'auto')"
+            ),
             &empty,
         )
         .expect("insert agent");
         conn.query_sync(
-            "INSERT INTO messages (id, project_id, sender_id, created_ts, ack_required) VALUES
-                (1, 1, 1, 1_000_000, 1),
-                (2, 1, 1, 2_000_000, 1),
-                (3, 1, 1, 3_000_000, 1)",
+            &format!(
+                "INSERT INTO messages (id, project_id, sender_id, created_ts, ack_required) VALUES
+                (1, 1, 1, {created_first}, 1),
+                (2, 1, 1, {created_second}, 1),
+                (3, 1, 1, {created_third}, 1)"
+            ),
             &empty,
         )
         .expect("insert messages");
         conn.query_sync(
-            "INSERT INTO message_recipients (message_id, agent_id, ack_ts) VALUES
-                (1, 1, 301_000_000),
-                (2, 1, 1_802_000_000),
-                (3, 1, 7_203_000_000)",
+            &format!(
+                "INSERT INTO message_recipients (message_id, agent_id, ack_ts) VALUES
+                (1, 1, {ack_first}),
+                (2, 1, {ack_second}),
+                (3, 1, {ack_third})"
+            ),
             &empty,
         )
         .expect("insert recipients");
