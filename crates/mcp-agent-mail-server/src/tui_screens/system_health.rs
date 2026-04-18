@@ -265,6 +265,8 @@ struct DiagnosticsSnapshot {
     path_probes: Vec<PathProbe>,
     lines: Vec<ProbeLine>,
     atc: crate::AtcOperatorSnapshot,
+    agent_attention_count: usize,
+    agent_attention_summary: String,
     /// Tailscale remote-access URL with token, if Tailscale is active.
     remote_url: Option<String>,
 }
@@ -1206,7 +1208,7 @@ impl SystemHealthScreen {
         );
 
         let body = format!(
-            "tick_age={} tick_p95={}us stale={}\nrollup=count:{} p95={}us retention={}\nwrites={} resolves={} open={} sweep_p95={}us kill={} safe={}",
+            "tick_age={} tick_p95={}us stale={}\nrollup=count:{} p95={}us retention={}\nwrites={} resolves={} open={} sweep_p95={}us kill={} safe={}\nattention={} worst={}",
             tick_age,
             tick_p95,
             atc_tick_is_stale(&snap.atc),
@@ -1223,6 +1225,8 @@ impl SystemHealthScreen {
                 "off"
             },
             if snap.atc.safe_mode { "on" } else { "off" },
+            snap.agent_attention_count,
+            snap.agent_attention_summary,
         );
         Paragraph::new(body)
             .block(
@@ -1903,6 +1907,32 @@ fn run_diagnostics(state: &TuiSharedState, tailscale_ip: Option<&str>) -> Diagno
         remote_url,
         ..Default::default()
     };
+    if let Some(db_snapshot) = state.db_stats_snapshot() {
+        let mut attention_agents = db_snapshot
+            .agents_list
+            .into_iter()
+            .filter_map(|agent| {
+                agent.health.and_then(|health| {
+                    health
+                        .needs_attention()
+                        .then_some((health.score, health.badge(), agent.name))
+                })
+            })
+            .collect::<Vec<_>>();
+        attention_agents
+            .sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.2.cmp(&right.2)));
+        out.agent_attention_count = attention_agents.len();
+        out.agent_attention_summary = if attention_agents.is_empty() {
+            "none".to_string()
+        } else {
+            attention_agents
+                .iter()
+                .take(2)
+                .map(|(_, badge, name)| format!("{name}:{badge}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+    }
 
     let parsed = match parse_http_endpoint(&cfg) {
         Ok(p) => p,
@@ -2056,6 +2086,21 @@ fn add_atc_findings(out: &mut DiagnosticsSnapshot) {
             ),
             remediation: Some(
                 "Profile the ATC hot path before increasing the tick interval or budget.".into(),
+            ),
+        });
+    }
+
+    if out.agent_attention_count > 0 {
+        out.lines.push(ProbeLine {
+            level: Level::Warn,
+            name: "atc-agent-health",
+            detail: format!(
+                "{} agent(s) need attention ({})",
+                out.agent_attention_count, out.agent_attention_summary
+            ),
+            remediation: Some(
+                "Open the Agents screen and sort by health to inspect the weakest scorecards."
+                    .into(),
             ),
         });
     }
@@ -3345,6 +3390,28 @@ mod tests {
     }
 
     #[test]
+    fn atc_findings_surface_agent_attention_warning() {
+        let mut out = DiagnosticsSnapshot {
+            atc: crate::AtcOperatorSnapshot {
+                enabled: true,
+                source: "live".to_string(),
+                ..Default::default()
+            },
+            agent_attention_count: 2,
+            agent_attention_summary: "BetaAgent:C 63, GammaAgent:F 21".to_string(),
+            ..Default::default()
+        };
+
+        add_atc_findings(&mut out);
+
+        assert!(out.lines.iter().any(|line| {
+            line.name == "atc-agent-health"
+                && line.detail.contains("2 agent(s) need attention")
+                && line.detail.contains("BetaAgent:C 63")
+        }));
+    }
+
+    #[test]
     fn atc_findings_surface_spawn_failure() {
         let mut out = DiagnosticsSnapshot {
             atc: crate::AtcOperatorSnapshot {
@@ -3680,6 +3747,8 @@ mod tests {
                 },
                 ..Default::default()
             },
+            agent_attention_count: 2,
+            agent_attention_summary: "BetaAgent:C 63, GammaAgent:F 21".to_string(),
             ..Default::default()
         };
 
@@ -3711,6 +3780,10 @@ mod tests {
         assert!(
             text.contains("retention=active (deleted=4)"),
             "expected retention summary, got:\n{text}"
+        );
+        assert!(
+            text.contains("attention=2"),
+            "expected agent attention count, got:\n{text}"
         );
     }
 

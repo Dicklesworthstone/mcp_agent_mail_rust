@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent_detect;
+pub mod agent_health;
 pub mod atc_adaptation;
 pub mod atc_admissibility;
 pub mod atc_assumptions;
@@ -40,8 +41,8 @@ pub mod ephemeral;
 pub mod error;
 pub mod evidence_ledger;
 pub mod experience;
-pub mod flake_triage;
 pub mod flags;
+pub mod flake_triage;
 pub mod identity;
 pub mod intern;
 pub mod kpi;
@@ -67,6 +68,10 @@ pub mod proptest_generators;
 pub use agent_detect::{
     AgentDetectError, AgentDetectOptions, AgentDetectRootOverride, InstalledAgentDetectionEntry,
     InstalledAgentDetectionReport, InstalledAgentDetectionSummary, detect_installed_agents,
+};
+pub use agent_health::{
+    AgentHealthGrade, AgentHealthInputs, AgentHealthMetric, AgentHealthMetricKind,
+    AgentHealthScorecard, compute_agent_health,
 };
 pub use atc_fairness::{
     ACCEPTABLE_ASYMMETRY_RULES, AGENT_STARVATION_WINDOW_MICROS, COHORT_STARVATION_WINDOW_MICROS,

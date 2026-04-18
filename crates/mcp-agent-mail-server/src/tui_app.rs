@@ -5730,6 +5730,7 @@ fn build_palette_actions_from_snapshot(state: &TuiSharedState, out: &mut Vec<Act
             name,
             program,
             last_active_ts,
+            ..
         } = agent;
         let desc = if let Some((model, project_slug)) = agent_metadata.get(&name) {
             format!("{program}/{model}  project: {project_slug}  active: {last_active_ts}")

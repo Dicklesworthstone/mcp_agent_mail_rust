@@ -14,6 +14,7 @@ use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use mcp_agent_mail_core::{AgentHealthInputs, compute_agent_health};
 use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::is_sqlite_recovery_error_message;
 use mcp_agent_mail_db::pool::DbPoolConfig;
@@ -43,6 +44,8 @@ const NO_VERSION_FULL_SNAPSHOT_INTERVAL_MICROS: i64 = 30_000_000;
 /// Maximum agents to fetch per poll cycle.  Raised from 50 to 500 to avoid
 /// silently truncating the agent list in large deployments (B4 truthfulness).
 const MAX_AGENTS: usize = 500;
+const AGENT_HEALTH_WINDOW_MICROS: i64 = 30 * 24 * 60 * 60 * 1_000_000;
+const ACK_ON_TIME_THRESHOLD_MICROS: i64 = 30 * 60 * 1_000_000;
 
 /// Maximum projects to fetch per poll cycle.  Raised from 100 to 500 to avoid
 /// silently truncating the project list in large deployments (B5 truthfulness).
@@ -70,6 +73,38 @@ struct DbSnapshotCounts {
     file_reservations: u64,
     contact_links: u64,
     ack_pending: u64,
+}
+
+#[derive(Debug, Clone)]
+struct AgentListRow {
+    id: i64,
+    project: String,
+    name: String,
+    program: String,
+    model: String,
+    last_active_ts: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AgentAckStats {
+    on_time_count: u64,
+    late_count: u64,
+    pending_count: u64,
+    p50_latency_micros: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AgentReservationStats {
+    clean_count: u64,
+    late_release_count: u64,
+    expired_count: u64,
+    active_count: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AgentContactStats {
+    respected_count: u64,
+    violation_count: u64,
 }
 
 #[derive(Debug, Default)]
@@ -1365,11 +1400,43 @@ pub(crate) fn timestamp_sort_expr(column: &str) -> String {
 
 /// Fetch the agent list ordered by most recently active.
 fn fetch_agents_list(conn: &DbConn) -> Vec<AgentSummary> {
-    let last_active_sort = timestamp_sort_expr("last_active_ts");
+    let base_rows = fetch_agent_list_rows(conn);
+    if base_rows.is_empty() {
+        return Vec::new();
+    }
+    let health_inputs = fetch_agent_health_inputs(conn, &base_rows);
+    base_rows
+        .into_iter()
+        .map(|row| {
+            let health = health_inputs.get(&row.id).map(compute_agent_health);
+            AgentSummary {
+                project: row.project,
+                name: row.name,
+                program: row.program,
+                model: row.model,
+                last_active_ts: row.last_active_ts,
+                health,
+            }
+        })
+        .collect()
+}
+
+fn fetch_agent_list_rows(conn: &DbConn) -> Vec<AgentListRow> {
+    let last_active_sort = timestamp_sort_expr("a.last_active_ts");
     conn.query_sync(
         &format!(
-            "SELECT id, name, program, last_active_ts FROM agents \
-             ORDER BY {last_active_sort} DESC, id DESC LIMIT {MAX_AGENTS}"
+            "SELECT \
+                a.id AS raw_agent_id, \
+                a.project_id AS raw_project_id, \
+                COALESCE(p.slug, '') AS project_slug, \
+                a.name, \
+                a.program, \
+                COALESCE(a.model, '') AS model, \
+                a.last_active_ts \
+             FROM agents a \
+             LEFT JOIN projects p ON p.id = a.project_id \
+             ORDER BY {last_active_sort} DESC, a.id DESC \
+             LIMIT {MAX_AGENTS}"
         ),
         &[],
     )
@@ -1377,30 +1444,377 @@ fn fetch_agents_list(conn: &DbConn) -> Vec<AgentSummary> {
     .map(|rows| {
         rows.into_iter()
             .filter_map(|row| {
-                let agent_id = row
-                    .get_named::<i64>("id")
+                let agent_id = parse_raw_i64(&row, "raw_agent_id")?;
+                let project_id = parse_raw_i64(&row, "raw_project_id").unwrap_or(0);
+                let project = row
+                    .get_named::<String>("project_slug")
                     .ok()
-                    .or_else(|| row.get_as::<i64>(0).ok())?;
+                    .or_else(|| row.get_as::<String>(2).ok())
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| format!("[unknown-project-{project_id}]"));
                 let name = row
                     .get_named::<String>("name")
                     .ok()
-                    .or_else(|| row.get_as::<String>(1).ok())
-                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| row.get_as::<String>(3).ok())
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
                     .unwrap_or_else(|| format!("[unknown-agent-{agent_id}]"));
                 let program = row
                     .get_named::<String>("program")
                     .ok()
-                    .or_else(|| row.get_as::<String>(2).ok())
+                    .or_else(|| row.get_as::<String>(4).ok())
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "[unknown-program]".to_string());
+                let model = row
+                    .get_named::<String>("model")
+                    .ok()
+                    .or_else(|| row.get_as::<String>(5).ok())
                     .unwrap_or_default();
-                Some(AgentSummary {
+                Some(AgentListRow {
+                    id: agent_id,
+                    project,
                     name,
                     program,
+                    model,
                     last_active_ts: parse_raw_ts(&row, "last_active_ts"),
                 })
             })
             .collect()
     })
     .unwrap_or_default()
+}
+
+fn fetch_agent_health_inputs(
+    conn: &DbConn,
+    agents: &[AgentListRow],
+) -> HashMap<i64, AgentHealthInputs> {
+    if agents.is_empty() {
+        return HashMap::new();
+    }
+
+    let now = now_micros();
+    let window_start = now.saturating_sub(AGENT_HEALTH_WINDOW_MICROS);
+    let ids = agents
+        .iter()
+        .map(|agent| agent.id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let ack_stats = fetch_agent_ack_stats(conn, &ids, window_start);
+    let reservation_stats = fetch_agent_reservation_stats(conn, &ids, window_start, now);
+    let contact_stats = fetch_agent_contact_stats(conn, &ids, window_start, now);
+    let decision_counts = fetch_agent_decision_counts(conn, agents, window_start);
+
+    agents
+        .iter()
+        .map(|agent| {
+            let ack = ack_stats.get(&agent.id).cloned().unwrap_or_default();
+            let reservation = reservation_stats
+                .get(&agent.id)
+                .cloned()
+                .unwrap_or_default();
+            let contact = contact_stats.get(&agent.id).cloned().unwrap_or_default();
+            let contact_observed = contact.respected_count + contact.violation_count > 0;
+            let age = if agent.last_active_ts > 0 {
+                Some(now.saturating_sub(agent.last_active_ts).max(0) as u64)
+            } else {
+                None
+            };
+            (
+                agent.id,
+                AgentHealthInputs {
+                    ack_on_time_count: ack.on_time_count,
+                    ack_late_count: ack.late_count,
+                    ack_pending_count: ack.pending_count,
+                    ack_p50_latency_micros: ack.p50_latency_micros,
+                    reservation_clean_count: reservation.clean_count,
+                    reservation_late_release_count: reservation.late_release_count,
+                    reservation_expired_count: reservation.expired_count,
+                    reservation_active_count: reservation.active_count,
+                    contact_policy_respected_count: contact_observed
+                        .then_some(contact.respected_count),
+                    contact_policy_violation_count: contact_observed
+                        .then_some(contact.violation_count),
+                    last_active_age_micros: age,
+                    decision_count: decision_counts.get(&agent.name).copied().unwrap_or(0),
+                },
+            )
+        })
+        .collect()
+}
+
+fn fetch_agent_ack_stats(
+    conn: &DbConn,
+    agent_ids_sql: &str,
+    window_start: i64,
+) -> HashMap<i64, AgentAckStats> {
+    if agent_ids_sql.is_empty() {
+        return HashMap::new();
+    }
+    let created_expr = timestamp_sort_expr("m.created_ts");
+    let ack_expr = timestamp_sort_expr("mr.ack_ts");
+    let ack_delta_expr = format!(
+        "CASE WHEN {ack_expr} > {created_expr} THEN ({ack_expr} - {created_expr}) ELSE 0 END"
+    );
+    let sql = format!(
+        "SELECT \
+            mr.agent_id AS agent_id, \
+            CASE \
+                    WHEN {ack_expr} > 0 \
+                    THEN {ack_delta_expr} \
+                    ELSE NULL END AS ack_latency_micros, \
+            SUM(CASE \
+                    WHEN {ack_expr} > 0 \
+                     AND {ack_delta_expr} <= {ACK_ON_TIME_THRESHOLD_MICROS} \
+                    THEN 1 ELSE 0 END) AS ack_on_time, \
+            SUM(CASE \
+                    WHEN {ack_expr} > 0 \
+                     AND {ack_delta_expr} > {ACK_ON_TIME_THRESHOLD_MICROS} \
+                    THEN 1 ELSE 0 END) AS ack_late, \
+            SUM(CASE \
+                    WHEN {ack_expr} <= 0 \
+                    THEN 1 ELSE 0 END) AS ack_pending, \
+         FROM message_recipients mr \
+         JOIN messages m ON m.id = mr.message_id \
+         WHERE mr.agent_id IN ({agent_ids_sql}) \
+           AND m.ack_required != 0 \
+           AND {created_expr} >= {window_start}"
+    );
+    conn.query_sync(&sql, &[])
+        .ok()
+        .map(|rows| {
+            let mut stats: HashMap<i64, AgentAckStats> = HashMap::new();
+            let mut latencies: HashMap<i64, Vec<u64>> = HashMap::new();
+            for row in rows {
+                let Some(agent_id) = parse_raw_i64(&row, "agent_id") else {
+                    continue;
+                };
+                let entry = stats.entry(agent_id).or_default();
+                entry.on_time_count +=
+                    parse_raw_i64(&row, "ack_on_time").unwrap_or(0).max(0) as u64;
+                entry.late_count += parse_raw_i64(&row, "ack_late").unwrap_or(0).max(0) as u64;
+                entry.pending_count +=
+                    parse_raw_i64(&row, "ack_pending").unwrap_or(0).max(0) as u64;
+                if let Some(latency) = parse_raw_i64(&row, "ack_latency_micros")
+                    .and_then(|value| u64::try_from(value.max(0)).ok())
+                {
+                    latencies.entry(agent_id).or_default().push(latency);
+                }
+            }
+            for (agent_id, mut values) in latencies {
+                if let Some(entry) = stats.get_mut(&agent_id) {
+                    entry.p50_latency_micros = Some(median_micros(&mut values));
+                }
+            }
+            stats
+        })
+        .unwrap_or_default()
+}
+
+fn median_micros(values: &mut [u64]) -> u64 {
+    values.sort_unstable();
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[mid]
+    } else {
+        values[mid - 1].saturating_add(values[mid]) / 2
+    }
+}
+
+fn fetch_agent_reservation_stats(
+    conn: &DbConn,
+    agent_ids_sql: &str,
+    window_start: i64,
+    now: i64,
+) -> HashMap<i64, AgentReservationStats> {
+    if agent_ids_sql.is_empty() {
+        return HashMap::new();
+    }
+    let created_expr = timestamp_sort_expr("created_ts");
+    let expires_expr = timestamp_sort_expr("expires_ts");
+    let released_expr = timestamp_sort_expr("released_ts");
+    let sql = format!(
+        "SELECT \
+            agent_id AS agent_id, \
+            SUM(CASE \
+                    WHEN {created_expr} >= {window_start} \
+                     AND {released_expr} > 0 \
+                     AND {released_expr} <= {expires_expr} \
+                    THEN 1 ELSE 0 END) AS clean_count, \
+            SUM(CASE \
+                    WHEN {created_expr} >= {window_start} \
+                     AND {released_expr} > {expires_expr} \
+                    THEN 1 ELSE 0 END) AS late_count, \
+            SUM(CASE \
+                    WHEN {created_expr} >= {window_start} \
+                     AND {released_expr} <= 0 \
+                     AND {expires_expr} < {now} \
+                    THEN 1 ELSE 0 END) AS expired_count, \
+            SUM(CASE \
+                    WHEN {created_expr} >= {window_start} \
+                     AND {released_expr} <= 0 \
+                     AND {expires_expr} >= {now} \
+                    THEN 1 ELSE 0 END) AS active_count \
+         FROM file_reservations \
+         WHERE agent_id IN ({agent_ids_sql}) \
+         GROUP BY agent_id"
+    );
+    conn.query_sync(&sql, &[])
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    let agent_id = parse_raw_i64(&row, "agent_id")?;
+                    Some((
+                        agent_id,
+                        AgentReservationStats {
+                            clean_count: parse_raw_i64(&row, "clean_count").unwrap_or(0).max(0)
+                                as u64,
+                            late_release_count: parse_raw_i64(&row, "late_count")
+                                .unwrap_or(0)
+                                .max(0) as u64,
+                            expired_count: parse_raw_i64(&row, "expired_count").unwrap_or(0).max(0)
+                                as u64,
+                            active_count: parse_raw_i64(&row, "active_count").unwrap_or(0).max(0)
+                                as u64,
+                        },
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn fetch_agent_contact_stats(
+    conn: &DbConn,
+    agent_ids_sql: &str,
+    window_start: i64,
+    now: i64,
+) -> HashMap<i64, AgentContactStats> {
+    if agent_ids_sql.is_empty() {
+        return HashMap::new();
+    }
+    let message_created_expr = timestamp_sort_expr("m.created_ts");
+    let link_expires_expr = timestamp_sort_expr("al.expires_ts");
+    let sql = format!(
+        "WITH approved_links AS ( \
+            SELECT a_agent_id AS sender_id, b_agent_id AS recipient_id \
+            FROM agent_links al \
+            WHERE status IN ('approved', 'accepted') \
+              AND ({link_expires_expr} <= 0 OR {link_expires_expr} > {now}) \
+            UNION \
+            SELECT b_agent_id AS sender_id, a_agent_id AS recipient_id \
+            FROM agent_links al \
+            WHERE status IN ('approved', 'accepted') \
+              AND ({link_expires_expr} <= 0 OR {link_expires_expr} > {now}) \
+         ) \
+         SELECT \
+            mr.agent_id AS agent_id, \
+            SUM(CASE \
+                    WHEN recipient.contact_policy IN ('open', 'auto') THEN 1 \
+                    WHEN m.sender_id = mr.agent_id THEN 1 \
+                    WHEN recipient.contact_policy = 'contacts_only' AND EXISTS ( \
+                        SELECT 1 FROM approved_links link \
+                        WHERE link.sender_id = m.sender_id \
+                          AND link.recipient_id = mr.agent_id \
+                    ) THEN 1 \
+                    ELSE 0 END) AS respected_count, \
+            SUM(CASE \
+                    WHEN recipient.contact_policy = 'contacts_only' \
+                     AND m.sender_id != mr.agent_id \
+                     AND NOT EXISTS ( \
+                        SELECT 1 FROM approved_links link \
+                        WHERE link.sender_id = m.sender_id \
+                          AND link.recipient_id = mr.agent_id \
+                    ) THEN 1 \
+                    WHEN recipient.contact_policy = 'block_all' \
+                     AND m.sender_id != mr.agent_id \
+                    THEN 1 \
+                    ELSE 0 END) AS violation_count \
+         FROM message_recipients mr \
+         JOIN messages m ON m.id = mr.message_id \
+         JOIN agents recipient ON recipient.id = mr.agent_id \
+         WHERE mr.agent_id IN ({agent_ids_sql}) \
+           AND {message_created_expr} >= {window_start} \
+         GROUP BY mr.agent_id"
+    );
+    conn.query_sync(&sql, &[])
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    let agent_id = parse_raw_i64(&row, "agent_id")?;
+                    Some((
+                        agent_id,
+                        AgentContactStats {
+                            respected_count: parse_raw_i64(&row, "respected_count")
+                                .unwrap_or(0)
+                                .max(0) as u64,
+                            violation_count: parse_raw_i64(&row, "violation_count")
+                                .unwrap_or(0)
+                                .max(0) as u64,
+                        },
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn fetch_agent_decision_counts(
+    conn: &DbConn,
+    agents: &[AgentListRow],
+    window_start: i64,
+) -> HashMap<String, u64> {
+    if agents.is_empty() {
+        return HashMap::new();
+    }
+    let mut name_counts: HashMap<&str, usize> = HashMap::new();
+    for agent in agents {
+        *name_counts.entry(agent.name.as_str()).or_insert(0) += 1;
+    }
+    let unique_names: Vec<&str> = agents
+        .iter()
+        .map(|agent| agent.name.as_str())
+        .filter(|name| name_counts.get(name).copied().unwrap_or(0) == 1)
+        .collect();
+    if unique_names.is_empty() {
+        return HashMap::new();
+    }
+
+    let placeholders = std::iter::repeat_n("?", unique_names.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut params = vec![Value::BigInt(window_start)];
+    params.extend(
+        unique_names
+            .iter()
+            .map(|name| Value::Text((*name).to_string())),
+    );
+    let sql = format!(
+        "SELECT subject AS agent_name, COUNT(*) AS decision_count \
+         FROM atc_experiences \
+         WHERE created_ts >= ? \
+           AND subject IN ({placeholders}) \
+         GROUP BY subject"
+    );
+    conn.query_sync(&sql, &params)
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| {
+                    let name = row
+                        .get_named::<String>("agent_name")
+                        .ok()
+                        .or_else(|| row.get_as::<String>(0).ok())?;
+                    let count = parse_raw_i64(&row, "decision_count").unwrap_or(0).max(0) as u64;
+                    Some((name, count))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Fetch the project list with per-project agent/message/reservation counts.
@@ -2711,9 +3125,12 @@ mod tests {
     fn delta_detects_agents_list_change() {
         let a = DbStatSnapshot {
             agents_list: vec![AgentSummary {
+                project: String::new(),
                 name: "GoldFox".into(),
                 program: "claude-code".into(),
+                model: String::new(),
                 last_active_ts: 100,
+                health: None,
             }],
             ..Default::default()
         };
@@ -2772,9 +3189,12 @@ mod tests {
             contact_links: 1,
             ack_pending: 1,
             agents_list: vec![AgentSummary {
+                project: String::new(),
                 name: "X".into(),
                 program: "Y".into(),
+                model: String::new(),
                 last_active_ts: 1,
+                health: None,
             }],
             projects_list: vec![ProjectSummary {
                 id: 1,
@@ -3558,9 +3978,12 @@ first body
             contact_links: 7,
             ack_pending: 11,
             agents_list: vec![AgentSummary {
+                project: String::new(),
                 name: "BlueLake".to_string(),
                 program: "codex".to_string(),
+                model: String::new(),
                 last_active_ts: 10,
+                health: None,
             }],
             projects_list: vec![
                 ProjectSummary {
@@ -4000,14 +4423,20 @@ first body
             agents: 2,
             agents_list: vec![
                 AgentSummary {
+                    project: String::new(),
                     name: "BlueLake".to_string(),
                     program: "codex".to_string(),
+                    model: String::new(),
                     last_active_ts: 100,
+                    health: None,
                 },
                 AgentSummary {
+                    project: String::new(),
                     name: "RedStone".to_string(),
                     program: "claude".to_string(),
+                    model: String::new(),
                     last_active_ts: 90,
+                    health: None,
                 },
             ],
             timestamp_micros: 50,
@@ -4678,9 +5107,12 @@ first body
             contact_links: 2,
             ack_pending: 1,
             agents_list: vec![AgentSummary {
+                project: String::new(),
                 name: "GoldFox".into(),
                 program: "claude-code".into(),
+                model: String::new(),
                 last_active_ts: 1000,
+                health: None,
             }],
             ..Default::default()
         };
@@ -5638,14 +6070,20 @@ first body
             agents: 5,
             agents_list: vec![
                 AgentSummary {
+                    project: String::new(),
                     name: "RedFox".to_string(),
                     program: "cc".to_string(),
+                    model: String::new(),
                     last_active_ts: 1,
+                    health: None,
                 },
                 AgentSummary {
+                    project: String::new(),
                     name: "BlueLake".to_string(),
                     program: "cc".to_string(),
+                    model: String::new(),
                     last_active_ts: 2,
+                    health: None,
                 },
             ],
             projects: 10,
@@ -5666,5 +6104,55 @@ first body
                 || snap.projects_list.len() <= MAX_PROJECTS,
             "either count >= list or list is within cap"
         );
+    }
+
+    #[test]
+    fn fetch_agent_ack_stats_uses_p50_latency() {
+        let conn = DbConn::open_memory().expect("open in-memory db");
+        conn.execute_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                created_ts INTEGER NOT NULL,
+                ack_required INTEGER NOT NULL
+            )",
+            &[],
+        )
+        .expect("create messages");
+        conn.execute_sync(
+            "CREATE TABLE message_recipients (
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                ack_ts INTEGER
+            )",
+            &[],
+        )
+        .expect("create recipients");
+
+        conn.execute_sync(
+            "INSERT INTO messages (id, created_ts, ack_required) VALUES
+                (1, 1_000_000, 1),
+                (2, 2_000_000, 1),
+                (3, 3_000_000, 1),
+                (4, 4_000_000, 1)",
+            &[],
+        )
+        .expect("insert messages");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, ack_ts) VALUES
+                (1, 7, 301_000_000),
+                (2, 7, 1_802_000_000),
+                (3, 7, 7_203_000_000),
+                (4, 7, NULL)",
+            &[],
+        )
+        .expect("insert recipients");
+
+        let stats = fetch_agent_ack_stats(&conn, "7", 0);
+        let agent = stats.get(&7).expect("agent stats present");
+
+        assert_eq!(agent.on_time_count, 2);
+        assert_eq!(agent.late_count, 1);
+        assert_eq!(agent.pending_count, 1);
+        assert_eq!(agent.p50_latency_micros, Some(1_800_000_000));
     }
 }

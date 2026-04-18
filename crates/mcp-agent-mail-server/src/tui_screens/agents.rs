@@ -12,6 +12,7 @@ use ftui::widgets::paragraph::Paragraph;
 use ftui::widgets::table::{Row, Table, TableState};
 use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
 use ftui_runtime::program::Cmd;
+use mcp_agent_mail_core::{AgentHealthGrade, AgentHealthScorecard};
 use mcp_agent_mail_db::DbConn;
 
 use crate::tui_bridge::{ScreenDiagnosticSnapshot, TuiSharedState};
@@ -24,10 +25,11 @@ use crate::tui_widgets::{MetricTile, MetricTrend};
 const COL_NAME: usize = 0;
 const COL_PROGRAM: usize = 1;
 const COL_MODEL: usize = 2;
-const COL_LAST_ACTIVE: usize = 3;
-const COL_MESSAGES: usize = 4;
+const COL_HEALTH: usize = 3;
+const COL_LAST_ACTIVE: usize = 4;
+const COL_MESSAGES: usize = 5;
 
-const SORT_LABELS: &[&str] = &["Name", "Program", "Model", "Active", "Msgs"];
+const SORT_LABELS: &[&str] = &["Name", "Program", "Model", "Health", "Active", "Msgs"];
 const STATUS_FADE_TICKS: u8 = 5;
 const MESSAGE_FLASH_TICKS: u8 = 3;
 const STAGGER_MAX_TICKS: u8 = 10;
@@ -64,6 +66,7 @@ struct AgentRow {
     project: String,
     program: String,
     model: String,
+    health: Option<AgentHealthScorecard>,
     last_active_ts: i64,
     message_count: u64,
 }
@@ -265,6 +268,7 @@ fn fetch_agent_rows_from_sqlite(conn: &DbConn) -> Vec<AgentRow> {
                 project,
                 program,
                 model,
+                health: None,
                 last_active_ts: crate::tui_poller::parse_raw_ts(&row, "last_active_ts"),
                 message_count: row
                     .get_named::<i64>("cnt")
@@ -355,6 +359,9 @@ fn enrich_lossy_agent_summary_rows_from_previous(
         }
         if row.model.is_empty() {
             row.model = previous.model.clone();
+        }
+        if row.health.is_none() {
+            row.health = previous.health.clone();
         }
         row.message_count = row.message_count.max(previous.message_count);
     }
@@ -531,6 +538,18 @@ impl AgentsScreen {
         };
         let recovered_rows_usable =
             !recovered_rows.is_empty() && recovered_rows.len() >= db.agents_list.len();
+        let summary_health_by_identity: HashMap<AgentIdentity, AgentHealthScorecard> = db
+            .agents_list
+            .iter()
+            .filter_map(|agent| {
+                agent.health.as_ref().map(|health| {
+                    (
+                        AgentIdentity::new(agent.project.clone(), agent.name.clone()),
+                        health.clone(),
+                    )
+                })
+            })
+            .collect();
         let mut rows: Vec<AgentRow> = if recovered_rows_usable {
             recovered_rows
                 .into_iter()
@@ -538,6 +557,9 @@ impl AgentsScreen {
                     let recent_count = self.msg_counts.get(&row.identity).copied().unwrap_or(0);
                     if let Some(model_name) = self.model_names.get(&row.identity) {
                         row.model = model_name.clone();
+                    }
+                    if let Some(health) = summary_health_by_identity.get(&row.identity) {
+                        row.health = Some(health.clone());
                     }
                     row.message_count = row.message_count.max(recent_count);
                     row
@@ -547,13 +569,18 @@ impl AgentsScreen {
             db.agents_list
                 .iter()
                 .map(|a| {
-                    let identity = AgentIdentity::new("", a.name.clone());
+                    let identity = AgentIdentity::new(a.project.clone(), a.name.clone());
                     AgentRow {
                         identity: identity.clone(),
                         name: a.name.clone(),
-                        project: String::new(),
+                        project: a.project.clone(),
                         program: a.program.clone(),
-                        model: self.model_names.get(&identity).cloned().unwrap_or_default(),
+                        model: if a.model.is_empty() {
+                            self.model_names.get(&identity).cloned().unwrap_or_default()
+                        } else {
+                            a.model.clone()
+                        },
+                        health: a.health.clone(),
                         last_active_ts: a.last_active_ts,
                         message_count: self.msg_counts.get(&identity).copied().unwrap_or(0),
                     }
@@ -587,6 +614,7 @@ impl AgentsScreen {
                 COL_NAME => crate::tui_screens::cmp_ci(&a.name, &b.name),
                 COL_PROGRAM => crate::tui_screens::cmp_ci(&a.program, &b.program),
                 COL_MODEL => crate::tui_screens::cmp_ci(&a.model, &b.model),
+                COL_HEALTH => agent_health_sort_tuple(a).cmp(&agent_health_sort_tuple(b)),
                 COL_LAST_ACTIVE => a.last_active_ts.cmp(&b.last_active_ts),
                 COL_MESSAGES => a.message_count.cmp(&b.message_count),
                 _ => std::cmp::Ordering::Equal,
@@ -931,7 +959,7 @@ impl MailScreen for AgentsScreen {
                     self.sort_asc = !self.sort_asc;
                     self.rebuild_from_state(state);
                 }
-                KeyCode::Char('i') => {
+                KeyCode::Char('i') | KeyCode::Char('h') => {
                     self.detail_visible = !self.detail_visible;
                 }
                 KeyCode::Char('J') => {
@@ -1073,7 +1101,7 @@ impl MailScreen for AgentsScreen {
                 action: "Toggle sort order",
             },
             HelpEntry {
-                key: "i",
+                key: "i/h",
                 action: "Toggle detail panel",
             },
             HelpEntry {
@@ -1088,7 +1116,7 @@ impl MailScreen for AgentsScreen {
     }
 
     fn context_help_tip(&self) -> Option<&'static str> {
-        Some("Registered agents and their status. Enter to view inbox, / to filter.")
+        Some("Registered agents and their health. Use h for score detail, / to filter.")
     }
 
     fn receive_deep_link(&mut self, target: &DeepLinkTarget) -> bool {
@@ -1284,6 +1312,29 @@ impl AgentsScreen {
             None,
         ));
         lines.push(("Messages".into(), agent.message_count.to_string(), None));
+        if let Some(health) = &agent.health {
+            lines.push((
+                "Health".into(),
+                format!("{}  ({} decisions)", health.badge(), health.decision_count),
+                Some(health_grade_color(health.grade, tp)),
+            ));
+            lines.push((
+                "Coverage".into(),
+                format!("{}bp observed", health.observed_weight_bp),
+                None,
+            ));
+            for metric in &health.metrics {
+                lines.push((
+                    metric.label().into(),
+                    format!("{} — {}", metric.value_label(), metric.evidence),
+                    Some(if metric.available {
+                        health_metric_color(metric.raw_score, tp)
+                    } else {
+                        tp.text_muted
+                    }),
+                ));
+            }
+        }
 
         // Sparkline as text bar
         if !self.msg_rate_history.is_empty() {
@@ -1301,12 +1352,24 @@ impl AgentsScreen {
     fn render_summary_band(&self, frame: &mut Frame<'_>, area: Rect) {
         let tp = crate::tui_theme::TuiThemePalette::current();
         let total_agents = self.agents.len() as u64;
-        let (active, idle, _inactive) = self.cached_status_counts;
+        let (active, _idle, _inactive) = self.cached_status_counts;
+        let needing_attention = self
+            .agents
+            .iter()
+            .filter(|agent| {
+                agent
+                    .health
+                    .as_ref()
+                    .is_some_and(AgentHealthScorecard::needs_attention)
+            })
+            .count() as u64;
+        let healthy = total_agents.saturating_sub(needing_attention);
         let total_msgs = self.cached_total_msgs;
 
         let agents_str = total_agents.to_string();
         let active_str = active.to_string();
-        let idle_str = idle.to_string();
+        let healthy_str = healthy.to_string();
+        let attention_str = needing_attention.to_string();
         let msgs_str = total_msgs.to_string();
 
         let sparkline_data = &self.cached_sparkline_vec;
@@ -1314,7 +1377,18 @@ impl AgentsScreen {
         let tiles: Vec<(&str, &str, MetricTrend, PackedRgba)> = vec![
             ("Agents", &agents_str, MetricTrend::Flat, tp.metric_agents),
             ("Active", &active_str, MetricTrend::Flat, tp.activity_active),
-            ("Idle", &idle_str, MetricTrend::Flat, tp.activity_idle),
+            (
+                "Healthy",
+                &healthy_str,
+                MetricTrend::Flat,
+                tp.activity_active,
+            ),
+            (
+                "Attention",
+                &attention_str,
+                MetricTrend::Flat,
+                tp.activity_stale,
+            ),
             (
                 "Messages",
                 &msgs_str,
@@ -1355,36 +1429,37 @@ impl AgentsScreen {
 
         // Responsive columns
         let (header_cells, widths): (Vec<&str>, Vec<Constraint>) = if narrow {
-            // < 80: Name(+status), Active, Msgs only
+            // < 80: keep health visible without the detail pane.
             (
-                vec!["Name", "Last Active", "Msgs"],
+                vec!["Name", "Health", "Last Active"],
                 vec![
-                    Constraint::Percentage(40.0),
-                    Constraint::Percentage(30.0),
-                    Constraint::Percentage(30.0),
+                    Constraint::Percentage(45.0),
+                    Constraint::Percentage(20.0),
+                    Constraint::Percentage(35.0),
                 ],
             )
         } else if wide {
-            // >= 120: all columns + status badge
             (
-                vec!["Name", "Program", "Model", "Last Active", "Msgs"],
+                vec!["Name", "Program", "Model", "Health", "Last Active", "Msgs"],
                 vec![
-                    Constraint::Percentage(25.0),
                     Constraint::Percentage(20.0),
                     Constraint::Percentage(20.0),
                     Constraint::Percentage(20.0),
                     Constraint::Percentage(15.0),
+                    Constraint::Percentage(15.0),
+                    Constraint::Percentage(10.0),
                 ],
             )
         } else {
-            // 80–119: hide Model
+            // 80–119: hide model, keep health.
             (
-                vec!["Name", "Program", "Last Active", "Msgs"],
+                vec!["Name", "Program", "Health", "Last Active", "Msgs"],
                 vec![
-                    Constraint::Percentage(28.0),
-                    Constraint::Percentage(25.0),
-                    Constraint::Percentage(27.0),
-                    Constraint::Percentage(20.0),
+                    Constraint::Percentage(26.0),
+                    Constraint::Percentage(22.0),
+                    Constraint::Percentage(14.0),
+                    Constraint::Percentage(22.0),
+                    Constraint::Percentage(16.0),
                 ],
             )
         };
@@ -1401,6 +1476,7 @@ impl AgentsScreen {
             .enumerate()
             .map(|(i, agent)| {
                 let active_str = format_relative_time_with(agent.last_active_ts, now_ts);
+                let health_str = health_badge(agent.health.as_ref());
                 let msg_str = agent.message_count.to_string();
                 let style = self.row_style(i, agent, now_ts);
 
@@ -1414,12 +1490,13 @@ impl AgentsScreen {
                 };
 
                 if narrow {
-                    Row::new(vec![name_display, active_str, msg_str]).style(style)
+                    Row::new(vec![name_display, health_str, active_str]).style(style)
                 } else if wide {
                     Row::new(vec![
                         name_display,
                         agent.program.clone(),
                         agent.model.clone(),
+                        health_str,
                         active_str,
                         msg_str,
                     ])
@@ -1428,6 +1505,7 @@ impl AgentsScreen {
                     Row::new(vec![
                         name_display,
                         agent.program.clone(),
+                        health_str,
                         active_str,
                         msg_str,
                     ])
@@ -1454,11 +1532,22 @@ impl AgentsScreen {
         let total = self.agents.len() as u64;
         let (active, idle, inactive) = self.cached_status_counts;
         let total_msgs = self.cached_total_msgs;
+        let attention = self
+            .agents
+            .iter()
+            .filter(|agent| {
+                agent
+                    .health
+                    .as_ref()
+                    .is_some_and(AgentHealthScorecard::needs_attention)
+            })
+            .count() as u64;
 
         let total_str = total.to_string();
         let active_str = active.to_string();
         let idle_str = idle.to_string();
         let inactive_str = inactive.to_string();
+        let attention_str = attention.to_string();
         let msgs_str = total_msgs.to_string();
 
         let items: Vec<(&str, &str, PackedRgba)> = vec![
@@ -1466,6 +1555,7 @@ impl AgentsScreen {
             (&*active_str, "active", tp.activity_active),
             (&*idle_str, "idle", tp.activity_idle),
             (&*inactive_str, "offline", tp.activity_stale),
+            (&*attention_str, "attention", tp.activity_stale),
             (&*msgs_str, "msgs", tp.metric_messages),
         ];
 
@@ -1491,6 +1581,43 @@ fn format_relative_time_with(ts_micros: i64, now_micros: i64) -> String {
         format!("{}h ago", delta / 3600)
     } else {
         format!("{}d ago", delta / 86400)
+    }
+}
+
+fn agent_health_sort_tuple(agent: &AgentRow) -> (u8, u8, u16, u64) {
+    agent.health.as_ref().map_or((0, 0, 0, 0), |health| {
+        (
+            1,
+            health.score,
+            health.observed_weight_bp,
+            health.decision_count,
+        )
+    })
+}
+
+fn health_badge(health: Option<&AgentHealthScorecard>) -> String {
+    health
+        .map(AgentHealthScorecard::badge)
+        .unwrap_or_else(|| "--".to_string())
+}
+
+fn health_grade_color(
+    grade: AgentHealthGrade,
+    tp: &crate::tui_theme::TuiThemePalette,
+) -> PackedRgba {
+    match grade {
+        AgentHealthGrade::A | AgentHealthGrade::B => tp.activity_active,
+        AgentHealthGrade::C => tp.activity_idle,
+        AgentHealthGrade::D | AgentHealthGrade::F => tp.activity_stale,
+    }
+}
+
+fn health_metric_color(score: u8, tp: &crate::tui_theme::TuiThemePalette) -> PackedRgba {
+    match score {
+        90..=100 => tp.activity_active,
+        75..=89 => tp.metric_agents,
+        60..=74 => tp.activity_idle,
+        _ => tp.activity_stale,
     }
 }
 
@@ -1623,8 +1750,19 @@ mod tests {
             project: project.to_string(),
             program: program.to_string(),
             model: model.to_string(),
+            health: None,
             last_active_ts,
             message_count,
+        }
+    }
+
+    fn test_health(score: u8, decision_count: u64) -> AgentHealthScorecard {
+        AgentHealthScorecard {
+            score,
+            grade: AgentHealthGrade::from_score(score),
+            observed_weight_bp: 10_000,
+            decision_count,
+            metrics: Vec::new(),
         }
     }
 
@@ -1696,6 +1834,22 @@ mod tests {
         assert!(bindings.len() >= 4);
         assert!(bindings.iter().any(|b| b.key == "j/k"));
         assert!(bindings.iter().any(|b| b.key == "/"));
+        assert!(bindings.iter().any(|b| b.key == "i/h"));
+    }
+
+    #[test]
+    fn detail_lines_include_health_badge() {
+        let mut screen = AgentsScreen::new();
+        screen.cached_now_ts = chrono::Utc::now().timestamp_micros();
+        let mut agent = test_agent_row("RedFox", "alpha", "codex-cli", "gpt-5", 100, 7);
+        agent.health = Some(test_health(63, 5));
+
+        let lines =
+            screen.build_detail_lines(&agent, &crate::tui_theme::TuiThemePalette::current());
+
+        assert!(lines.iter().any(|(label, value, _)| {
+            label == "Health" && value.contains("C 63") && value.contains("5 decisions")
+        }));
     }
 
     #[test]
@@ -1812,14 +1966,20 @@ mod tests {
             agents: 3,
             agents_list: vec![
                 crate::tui_events::AgentSummary {
+                    project: String::new(),
                     name: "RedFox".to_string(),
                     program: "claude-code".to_string(),
+                    model: String::new(),
                     last_active_ts: 100,
+                    health: None,
                 },
                 crate::tui_events::AgentSummary {
+                    project: String::new(),
                     name: "BlueLake".to_string(),
                     program: "codex-cli".to_string(),
+                    model: String::new(),
                     last_active_ts: 200,
+                    health: None,
                 },
             ],
             ..Default::default()
@@ -1851,9 +2011,12 @@ mod tests {
         state.update_db_stats(crate::tui_events::DbStatSnapshot {
             agents: 1,
             agents_list: vec![crate::tui_events::AgentSummary {
+                project: String::new(),
                 name: "RedFox".to_string(),
                 program: "claude-code".to_string(),
+                model: String::new(),
                 last_active_ts: 100,
+                health: None,
             }],
             ..Default::default()
         });
@@ -1876,14 +2039,20 @@ mod tests {
             agents: 0,
             agents_list: vec![
                 crate::tui_events::AgentSummary {
+                    project: String::new(),
                     name: "RedFox".to_string(),
                     program: "claude-code".to_string(),
+                    model: String::new(),
                     last_active_ts: 100,
+                    health: None,
                 },
                 crate::tui_events::AgentSummary {
+                    project: String::new(),
                     name: "BlueLake".to_string(),
                     program: "codex-cli".to_string(),
+                    model: String::new(),
                     last_active_ts: 200,
+                    health: None,
                 },
             ],
             ..Default::default()
@@ -2207,14 +2376,20 @@ mod tests {
             agents: 2,
             agents_list: vec![
                 crate::tui_events::AgentSummary {
+                    project: String::new(),
                     name: "RedFox".to_string(),
                     program: "claude-code".to_string(),
+                    model: String::new(),
                     last_active_ts: 100,
+                    health: None,
                 },
                 crate::tui_events::AgentSummary {
+                    project: String::new(),
                     name: "BlueLake".to_string(),
                     program: "codex-cli".to_string(),
+                    model: String::new(),
                     last_active_ts: 200,
+                    health: None,
                 },
             ],
             ..Default::default()
@@ -2245,14 +2420,20 @@ mod tests {
             agents_list: vec![
                 // But poller only provides 2 (simulating cap)
                 crate::tui_events::AgentSummary {
+                    project: String::new(),
                     name: "RedFox".to_string(),
                     program: "claude-code".to_string(),
+                    model: String::new(),
                     last_active_ts: 100,
+                    health: None,
                 },
                 crate::tui_events::AgentSummary {
+                    project: String::new(),
                     name: "BlueLake".to_string(),
                     program: "codex-cli".to_string(),
+                    model: String::new(),
                     last_active_ts: 200,
+                    health: None,
                 },
             ],
             ..Default::default()
@@ -2289,19 +2470,28 @@ mod tests {
             agents: 3,
             agents_list: vec![
                 crate::tui_events::AgentSummary {
+                    project: String::new(),
                     name: "RedFox".to_string(),
                     program: "claude-code".to_string(),
+                    model: String::new(),
                     last_active_ts: 100,
+                    health: None,
                 },
                 crate::tui_events::AgentSummary {
+                    project: String::new(),
                     name: "BlueLake".to_string(),
                     program: "codex-cli".to_string(),
+                    model: String::new(),
                     last_active_ts: 200,
+                    health: None,
                 },
                 crate::tui_events::AgentSummary {
+                    project: String::new(),
                     name: "GreenPeak".to_string(),
                     program: "claude-code".to_string(),
+                    model: String::new(),
                     last_active_ts: 300,
+                    health: None,
                 },
             ],
             ..Default::default()
@@ -2364,9 +2554,12 @@ mod tests {
         state.update_db_stats(crate::tui_events::DbStatSnapshot {
             agents: 1,
             agents_list: vec![crate::tui_events::AgentSummary {
+                project: String::new(),
                 name: "TestAgent".to_string(),
                 program: "test".to_string(),
+                model: String::new(),
                 last_active_ts: 100,
+                health: None,
             }],
             ..Default::default()
         });
@@ -2413,9 +2606,12 @@ mod tests {
         state.update_db_stats(crate::tui_events::DbStatSnapshot {
             agents: 1,
             agents_list: vec![crate::tui_events::AgentSummary {
+                project: String::new(),
                 name: "TickLatch".to_string(),
                 program: "codex".to_string(),
+                model: String::new(),
                 last_active_ts: 100,
+                health: None,
             }],
             ..Default::default()
         });
@@ -2493,9 +2689,12 @@ mod tests {
         state.update_db_stats(crate::tui_events::DbStatSnapshot {
             agents: 1,
             agents_list: vec![crate::tui_events::AgentSummary {
+                project: String::new(),
                 name: "RedFox".to_string(),
                 program: "claude-code".to_string(),
+                model: String::new(),
                 last_active_ts: chrono::Utc::now().timestamp_micros(), // active
+                health: None,
             }],
             ..Default::default()
         });
@@ -2516,9 +2715,12 @@ mod tests {
         state.update_db_stats(crate::tui_events::DbStatSnapshot {
             agents: 1,
             agents_list: vec![crate::tui_events::AgentSummary {
+                project: String::new(),
                 name: "RedFox".to_string(),
                 program: "claude-code".to_string(),
+                model: String::new(),
                 last_active_ts: 100,
+                health: None,
             }],
             ..Default::default()
         });
@@ -2696,14 +2898,20 @@ mod tests {
             messages: 4,
             agents_list: vec![
                 crate::tui_events::AgentSummary {
+                    project: String::new(),
                     name: "RedFox".to_string(),
                     program: "claude-code".to_string(),
+                    model: String::new(),
                     last_active_ts: 100,
+                    health: None,
                 },
                 crate::tui_events::AgentSummary {
+                    project: String::new(),
                     name: "BlueLake".to_string(),
                     program: "codex-cli".to_string(),
+                    model: String::new(),
                     last_active_ts: 200,
+                    health: None,
                 },
             ],
             ..Default::default()
@@ -2800,14 +3008,20 @@ mod tests {
             agents: 2,
             agents_list: vec![
                 crate::tui_events::AgentSummary {
+                    project: "alpha".to_string(),
                     name: "RedFox".to_string(),
                     program: "claude-code".to_string(),
+                    model: String::new(),
                     last_active_ts: 100,
+                    health: None,
                 },
                 crate::tui_events::AgentSummary {
+                    project: "beta".to_string(),
                     name: "RedFox".to_string(),
                     program: "codex-cli".to_string(),
+                    model: String::new(),
                     last_active_ts: 200,
+                    health: None,
                 },
             ],
             ..Default::default()
@@ -2917,9 +3131,12 @@ mod tests {
         state.update_db_stats(crate::tui_events::DbStatSnapshot {
             agents: 1,
             agents_list: vec![crate::tui_events::AgentSummary {
+                project: "alpha".to_string(),
                 name: "RedFox".to_string(),
                 program: "claude-code".to_string(),
+                model: String::new(),
                 last_active_ts: 100,
+                health: None,
             }],
             ..Default::default()
         });
@@ -3043,9 +3260,12 @@ mod tests {
         state.update_db_stats(crate::tui_events::DbStatSnapshot {
             agents: 1,
             agents_list: vec![crate::tui_events::AgentSummary {
+                project: String::new(),
                 name: "RedFox".to_string(),
                 program: "claude-code".to_string(),
+                model: String::new(),
                 last_active_ts: 100,
+                health: None,
             }],
             ..Default::default()
         });
@@ -3074,14 +3294,20 @@ mod tests {
             agents: 2,
             agents_list: vec![
                 crate::tui_events::AgentSummary {
+                    project: String::new(),
                     name: "AliceRiver".to_string(),
                     program: "codex-cli".to_string(),
+                    model: String::new(),
                     last_active_ts: 100,
+                    health: None,
                 },
                 crate::tui_events::AgentSummary {
+                    project: String::new(),
                     name: "BobStone".to_string(),
                     program: "claude-code".to_string(),
+                    model: String::new(),
                     last_active_ts: 200,
+                    health: None,
                 },
             ],
             ..Default::default()

@@ -10,8 +10,13 @@ use chrono::Utc;
 use clap::{Args, Subcommand};
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::{McpContext, McpError, McpResult};
+use mcp_agent_mail_core::{
+    AgentHealthGrade, AgentHealthInputs, AgentHealthMetric, AgentHealthScorecard,
+    compute_agent_health,
+};
 use serde::{Deserialize, Serialize};
 use sqlmodel_core::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::CliError;
@@ -1060,6 +1065,29 @@ pub struct AnomalyCard {
 
 /// robot agents — agent roster entry.
 #[derive(Debug, Serialize)]
+pub struct AgentHealthMetricRow {
+    pub label: String,
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<u8>,
+    pub weight_bp: u16,
+    pub evidence: String,
+}
+
+/// robot agents — optional per-agent health detail.
+#[derive(Debug, Serialize)]
+pub struct AgentHealthView {
+    pub badge: String,
+    pub score: u8,
+    pub grade: String,
+    pub needs_attention: bool,
+    pub decision_count: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub metrics: Vec<AgentHealthMetricRow>,
+}
+
+/// robot agents — agent roster entry.
+#[derive(Debug, Serialize)]
 pub struct AgentRow {
     pub name: String,
     pub program: String,
@@ -1067,6 +1095,8 @@ pub struct AgentRow {
     pub last_active: String,
     pub msg_count: usize,
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<AgentHealthView>,
 }
 
 /// robot contacts — contact entry.
@@ -1637,7 +1667,13 @@ pub enum RobotSubcommand {
         /// Show only active agents.
         #[arg(long)]
         active: bool,
-        /// Sort by field (name, last_active, msg_count).
+        /// Include health summary for all agents, or drill into one named agent.
+        #[arg(long, num_args = 0..=1, default_missing_value = "__all__", value_name = "AGENT")]
+        health: Option<String>,
+        /// Filter health output to this grade or worse (A, B, C, D, F).
+        #[arg(long)]
+        threshold: Option<String>,
+        /// Sort by field (name, last_active, msg_count, health).
         #[arg(long)]
         sort: Option<String>,
     },
@@ -1750,12 +1786,33 @@ fn parse_agent_sort_field(sort: Option<&str>) -> Result<Option<String>, CliError
         return Ok(None);
     };
     let normalized = sort.to_ascii_lowercase();
-    if matches!(normalized.as_str(), "last_active" | "name" | "msg_count") {
+    if matches!(
+        normalized.as_str(),
+        "last_active" | "name" | "msg_count" | "health"
+    ) {
         Ok(Some(normalized))
     } else {
         Err(CliError::InvalidArgument(format!(
-            "invalid --sort value `{sort}`; expected one of: last_active, name, msg_count"
+            "invalid --sort value `{sort}`; expected one of: last_active, name, msg_count, health"
         )))
+    }
+}
+
+fn parse_agent_health_threshold(
+    threshold: Option<&str>,
+) -> Result<Option<AgentHealthGrade>, CliError> {
+    let Some(threshold) = threshold.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    match threshold.to_ascii_uppercase().as_str() {
+        "A" => Ok(Some(AgentHealthGrade::A)),
+        "B" => Ok(Some(AgentHealthGrade::B)),
+        "C" => Ok(Some(AgentHealthGrade::C)),
+        "D" => Ok(Some(AgentHealthGrade::D)),
+        "F" => Ok(Some(AgentHealthGrade::F)),
+        _ => Err(CliError::InvalidArgument(format!(
+            "invalid --threshold value `{threshold}`; expected one of: A, B, C, D, F"
+        ))),
     }
 }
 
@@ -5321,14 +5378,36 @@ fn build_agents(
     active_only: bool,
     sort_field: Option<&str>,
 ) -> Result<Vec<AgentRow>, CliError> {
+    build_agents_with_health(conn, project_id, active_only, sort_field, None, None)
+}
+
+fn build_agents_with_health(
+    conn: &DbConn,
+    project_id: i64,
+    active_only: bool,
+    sort_field: Option<&str>,
+    health_target: Option<&str>,
+    threshold: Option<AgentHealthGrade>,
+) -> Result<Vec<AgentRow>, CliError> {
     struct PendingAgentRow {
         row: AgentRow,
         last_active_ts: i64,
     }
 
+    struct RawAgentRow {
+        agent_id: i64,
+        name: String,
+        program: String,
+        model: String,
+        last_active_ts: i64,
+        msg_count: usize,
+    }
+
     let now_us = mcp_agent_mail_db::now_micros();
     let active_threshold = now_us - 15 * 60 * 1_000_000; // 15 min
     let idle_threshold = now_us - 4 * 3600 * 1_000_000; // 4 hours
+    let health_enabled =
+        health_target.is_some() || threshold.is_some() || sort_field == Some("health");
 
     let rows = conn
         .query_sync(
@@ -5341,14 +5420,41 @@ fn build_agents(
         )
         .map_err(|e| CliError::Other(format!("agents query: {e}")))?;
 
+    let raw_agents: Vec<RawAgentRow> = rows
+        .iter()
+        .map(|row| RawAgentRow {
+            agent_id: row.get_named("id").unwrap_or(0),
+            name: row.get_named("name").unwrap_or_default(),
+            program: row.get_named("program").unwrap_or_default(),
+            model: row.get_named("model").unwrap_or_default(),
+            last_active_ts: row.get_named("last_active_ts").unwrap_or(0),
+            msg_count: row.get_named::<i64>("msg_count").unwrap_or(0).max(0) as usize,
+        })
+        .collect();
+    let health_inputs = if health_enabled {
+        fetch_agent_health_inputs(
+            conn,
+            project_id,
+            &raw_agents
+                .iter()
+                .map(|row| row.agent_id)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        HashMap::new()
+    };
+
     let mut agents_by_name: std::collections::HashMap<String, PendingAgentRow> =
         std::collections::HashMap::new();
-    for row in &rows {
-        let name: String = row.get_named("name").unwrap_or_default();
-        let program: String = row.get_named("program").unwrap_or_default();
-        let model: String = row.get_named("model").unwrap_or_default();
-        let last_active_ts: i64 = row.get_named("last_active_ts").unwrap_or(0);
-        let msg_count: i64 = row.get_named("msg_count").unwrap_or(0);
+    for row in raw_agents {
+        let RawAgentRow {
+            agent_id,
+            name,
+            program,
+            model,
+            last_active_ts,
+            msg_count,
+        } = row;
 
         let status = if last_active_ts >= active_threshold {
             "active"
@@ -5363,6 +5469,19 @@ fn build_agents(
         }
 
         let age_seconds = now_us.saturating_sub(last_active_ts) / 1_000_000;
+        let health = health_inputs
+            .get(&agent_id)
+            .map(|inputs| compute_agent_health(inputs))
+            .and_then(|scorecard| {
+                threshold
+                    .is_none_or(|minimum| scorecard.grade >= minimum)
+                    .then_some(agent_health_view(
+                        &scorecard,
+                        health_target
+                            .map(|target| target.eq_ignore_ascii_case(&name))
+                            .unwrap_or(false),
+                    ))
+            });
 
         let logical_name = name.to_lowercase();
         let candidate = PendingAgentRow {
@@ -5371,8 +5490,9 @@ fn build_agents(
                 program,
                 model,
                 last_active: format_age(age_seconds),
-                msg_count: msg_count as usize,
+                msg_count,
                 status: status.to_string(),
+                health,
             },
             last_active_ts,
         };
@@ -5388,10 +5508,37 @@ fn build_agents(
         }
     }
     let mut pending_agents: Vec<PendingAgentRow> = agents_by_name.into_values().collect();
+    if let Some(target) = health_target.filter(|target| *target != "__all__") {
+        pending_agents.retain(|agent| agent.row.name.eq_ignore_ascii_case(target));
+        if pending_agents.is_empty() {
+            return Err(CliError::InvalidArgument(format!(
+                "agent not found for --health {target}"
+            )));
+        }
+    } else if threshold.is_some() {
+        pending_agents.retain(|agent| agent.row.health.is_some());
+    }
 
     // Sort
     match sort_field {
         Some("name") => pending_agents.sort_by(|a, b| a.row.name.cmp(&b.row.name)),
+        Some("health") => pending_agents.sort_by(|left, right| {
+            let left_key = left
+                .row
+                .health
+                .as_ref()
+                .map(|health| (health.score, std::cmp::Reverse(health.decision_count)))
+                .unwrap_or((u8::MAX, std::cmp::Reverse(0)));
+            let right_key = right
+                .row
+                .health
+                .as_ref()
+                .map(|health| (health.score, std::cmp::Reverse(health.decision_count)))
+                .unwrap_or((u8::MAX, std::cmp::Reverse(0)));
+            left_key
+                .cmp(&right_key)
+                .then_with(|| left.row.name.cmp(&right.row.name))
+        }),
         Some("msg_count") => pending_agents.sort_by_key(|x| std::cmp::Reverse(x.row.msg_count)),
         _ => pending_agents.sort_by_key(|x| {
             (
@@ -5403,8 +5550,394 @@ fn build_agents(
 
     Ok(pending_agents
         .into_iter()
+        .filter(|pending| pending.row.health.is_some() || threshold.is_none())
         .map(|pending| pending.row)
         .collect())
+}
+
+#[derive(Debug, Clone, Default)]
+struct RobotAgentAckStats {
+    on_time_count: u64,
+    late_count: u64,
+    pending_count: u64,
+    p50_latency_micros: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RobotAgentReservationStats {
+    clean_count: u64,
+    late_release_count: u64,
+    expired_count: u64,
+    active_count: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RobotAgentContactStats {
+    respected_count: u64,
+    violation_count: u64,
+}
+
+fn agent_health_view(scorecard: &AgentHealthScorecard, include_metrics: bool) -> AgentHealthView {
+    AgentHealthView {
+        badge: scorecard.badge(),
+        score: scorecard.score,
+        grade: scorecard.grade.label().to_string(),
+        needs_attention: scorecard.needs_attention(),
+        decision_count: scorecard.decision_count,
+        metrics: include_metrics
+            .then(|| {
+                scorecard
+                    .metrics
+                    .iter()
+                    .map(agent_health_metric_row)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn agent_health_metric_row(metric: &AgentHealthMetric) -> AgentHealthMetricRow {
+    AgentHealthMetricRow {
+        label: metric.label().to_string(),
+        available: metric.available,
+        score: metric.available.then_some(metric.raw_score),
+        weight_bp: metric.weight_bp,
+        evidence: metric.evidence.clone(),
+    }
+}
+
+fn fetch_agent_health_inputs(
+    conn: &DbConn,
+    project_id: i64,
+    agent_ids: &[i64],
+) -> HashMap<i64, AgentHealthInputs> {
+    if agent_ids.is_empty() {
+        return HashMap::new();
+    }
+
+    let now = mcp_agent_mail_db::now_micros();
+    let window_start = now.saturating_sub(30 * 24 * 60 * 60 * 1_000_000);
+    let agent_ids_sql = agent_ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let ack_stats = fetch_robot_agent_ack_stats(conn, project_id, &agent_ids_sql, window_start);
+    let reservation_stats =
+        fetch_robot_agent_reservation_stats(conn, project_id, &agent_ids_sql, window_start, now);
+    let contact_stats =
+        fetch_robot_agent_contact_stats(conn, project_id, &agent_ids_sql, window_start, now);
+    let decision_counts =
+        fetch_robot_agent_decision_counts(conn, project_id, agent_ids, window_start);
+
+    let mut inputs = HashMap::new();
+    for agent_id in agent_ids {
+        let ack = ack_stats.get(agent_id).cloned().unwrap_or_default();
+        let reservation = reservation_stats.get(agent_id).cloned().unwrap_or_default();
+        let contact = contact_stats.get(agent_id).cloned().unwrap_or_default();
+        let contact_observed = contact.respected_count + contact.violation_count > 0;
+        let last_active_age_micros = conn
+            .query_sync(
+                "SELECT last_active_ts FROM agents WHERE id = ? AND project_id = ?",
+                &[Value::BigInt(*agent_id), Value::BigInt(project_id)],
+            )
+            .ok()
+            .and_then(|rows| rows.first().cloned())
+            .map(|row| row.get_named::<i64>("last_active_ts").unwrap_or(0))
+            .filter(|last_active_ts| *last_active_ts > 0)
+            .map(|last_active_ts| now.saturating_sub(last_active_ts).max(0) as u64);
+
+        inputs.insert(
+            *agent_id,
+            AgentHealthInputs {
+                ack_on_time_count: ack.on_time_count,
+                ack_late_count: ack.late_count,
+                ack_pending_count: ack.pending_count,
+                ack_p50_latency_micros: ack.p50_latency_micros,
+                reservation_clean_count: reservation.clean_count,
+                reservation_late_release_count: reservation.late_release_count,
+                reservation_expired_count: reservation.expired_count,
+                reservation_active_count: reservation.active_count,
+                contact_policy_respected_count: contact_observed.then_some(contact.respected_count),
+                contact_policy_violation_count: contact_observed.then_some(contact.violation_count),
+                last_active_age_micros,
+                decision_count: decision_counts.get(agent_id).copied().unwrap_or(0),
+            },
+        );
+    }
+    inputs
+}
+
+fn fetch_robot_agent_ack_stats(
+    conn: &DbConn,
+    project_id: i64,
+    agent_ids_sql: &str,
+    window_start: i64,
+) -> HashMap<i64, RobotAgentAckStats> {
+    if agent_ids_sql.is_empty() {
+        return HashMap::new();
+    }
+    let ack_threshold_micros = 30 * 60 * 1_000_000_i64;
+    let sql = format!(
+        "SELECT \
+            mr.agent_id AS agent_id, \
+            CASE WHEN mr.ack_ts > 0 THEN (mr.ack_ts - m.created_ts) ELSE NULL END AS ack_latency_micros, \
+            CASE WHEN mr.ack_ts > 0 AND (mr.ack_ts - m.created_ts) <= {ack_threshold_micros} THEN 1 ELSE 0 END AS ack_on_time, \
+            CASE WHEN mr.ack_ts > 0 AND (mr.ack_ts - m.created_ts) > {ack_threshold_micros} THEN 1 ELSE 0 END AS ack_late, \
+            CASE WHEN COALESCE(mr.ack_ts, 0) <= 0 THEN 1 ELSE 0 END AS ack_pending \
+         FROM message_recipients mr \
+         JOIN messages m ON m.id = mr.message_id \
+         WHERE mr.agent_id IN ({agent_ids_sql}) \
+           AND m.project_id = ? \
+           AND m.ack_required != 0 \
+           AND m.created_ts >= ?"
+    );
+    conn.query_sync(
+        &sql,
+        &[Value::BigInt(project_id), Value::BigInt(window_start)],
+    )
+    .ok()
+    .map(|rows| {
+        let mut stats: HashMap<i64, RobotAgentAckStats> = HashMap::new();
+        let mut latencies: HashMap<i64, Vec<u64>> = HashMap::new();
+        for row in rows {
+            let agent_id = row.get_named::<i64>("agent_id").unwrap_or(0);
+            let entry = stats.entry(agent_id).or_default();
+            entry.on_time_count += row.get_named::<i64>("ack_on_time").unwrap_or(0).max(0) as u64;
+            entry.late_count += row.get_named::<i64>("ack_late").unwrap_or(0).max(0) as u64;
+            entry.pending_count += row.get_named::<i64>("ack_pending").unwrap_or(0).max(0) as u64;
+            if let Some(latency) = row.get_named::<i64>("ack_latency_micros").ok()
+                && latency > 0
+            {
+                latencies.entry(agent_id).or_default().push(latency as u64);
+            }
+        }
+        for (agent_id, mut values) in latencies {
+            if let Some(entry) = stats.get_mut(&agent_id) {
+                entry.p50_latency_micros = Some(median_micros(&mut values));
+            }
+        }
+        stats
+    })
+    .unwrap_or_default()
+}
+
+fn fetch_robot_agent_reservation_stats(
+    conn: &DbConn,
+    project_id: i64,
+    agent_ids_sql: &str,
+    window_start: i64,
+    now: i64,
+) -> HashMap<i64, RobotAgentReservationStats> {
+    if agent_ids_sql.is_empty() {
+        return HashMap::new();
+    }
+    let has_release_ledger = has_file_reservation_release_ledger(conn);
+    let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
+    let release_alias = "frl";
+    let release_join = active_reservation_release_join_sql(has_release_ledger, "fr", release_alias);
+    let released_ts_sql = reservation_released_ts_sql(
+        has_release_ledger,
+        has_legacy_released_ts_column,
+        "fr",
+        release_alias,
+    );
+    let active_filter_sql = active_reservation_filter_sql(
+        has_release_ledger,
+        has_legacy_released_ts_column,
+        "fr",
+        release_alias,
+    );
+    let sql = format!(
+        "SELECT \
+            fr.agent_id AS agent_id, \
+            SUM(CASE \
+                    WHEN fr.created_ts >= ? \
+                     AND {released_ts_sql} > 0 \
+                     AND {released_ts_sql} <= fr.expires_ts \
+                    THEN 1 ELSE 0 END) AS clean_count, \
+            SUM(CASE \
+                    WHEN fr.created_ts >= ? \
+                     AND {released_ts_sql} > fr.expires_ts \
+                    THEN 1 ELSE 0 END) AS late_count, \
+            SUM(CASE \
+                    WHEN fr.created_ts >= ? \
+                     AND {released_ts_sql} IS NULL \
+                     AND fr.expires_ts < ? \
+                    THEN 1 ELSE 0 END) AS expired_count, \
+            SUM(CASE \
+                    WHEN fr.created_ts >= ? \
+                     AND {active_filter_sql} \
+                    THEN 1 ELSE 0 END) AS active_count \
+         FROM file_reservations fr \
+         {release_join} \
+         WHERE fr.project_id = ? \
+           AND fr.agent_id IN ({agent_ids_sql}) \
+         GROUP BY fr.agent_id"
+    );
+    conn.query_sync(
+        &sql,
+        &[
+            Value::BigInt(window_start),
+            Value::BigInt(window_start),
+            Value::BigInt(window_start),
+            Value::BigInt(now),
+            Value::BigInt(window_start),
+            Value::BigInt(project_id),
+        ],
+    )
+    .ok()
+    .map(|rows| {
+        rows.into_iter()
+            .map(|row| {
+                (
+                    row.get_named::<i64>("agent_id").unwrap_or(0),
+                    RobotAgentReservationStats {
+                        clean_count: row.get_named::<i64>("clean_count").unwrap_or(0).max(0) as u64,
+                        late_release_count: row.get_named::<i64>("late_count").unwrap_or(0).max(0)
+                            as u64,
+                        expired_count: row.get_named::<i64>("expired_count").unwrap_or(0).max(0)
+                            as u64,
+                        active_count: row.get_named::<i64>("active_count").unwrap_or(0).max(0)
+                            as u64,
+                    },
+                )
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn fetch_robot_agent_contact_stats(
+    conn: &DbConn,
+    project_id: i64,
+    agent_ids_sql: &str,
+    window_start: i64,
+    now: i64,
+) -> HashMap<i64, RobotAgentContactStats> {
+    if agent_ids_sql.is_empty() {
+        return HashMap::new();
+    }
+    let sql = format!(
+        "WITH approved_links AS ( \
+            SELECT a_agent_id AS sender_id, b_agent_id AS recipient_id \
+            FROM agent_links \
+            WHERE status IN ('approved', 'accepted') \
+              AND (expires_ts IS NULL OR expires_ts <= 0 OR expires_ts > ?) \
+            UNION \
+            SELECT b_agent_id AS sender_id, a_agent_id AS recipient_id \
+            FROM agent_links \
+            WHERE status IN ('approved', 'accepted') \
+              AND (expires_ts IS NULL OR expires_ts <= 0 OR expires_ts > ?) \
+         ) \
+         SELECT \
+            mr.agent_id AS agent_id, \
+            SUM(CASE \
+                    WHEN recipient.contact_policy IN ('open', 'auto') THEN 1 \
+                    WHEN m.sender_id = mr.agent_id THEN 1 \
+                    WHEN recipient.contact_policy = 'contacts_only' AND EXISTS ( \
+                        SELECT 1 FROM approved_links link \
+                        WHERE link.sender_id = m.sender_id \
+                          AND link.recipient_id = mr.agent_id \
+                    ) THEN 1 \
+                    ELSE 0 END) AS respected_count, \
+            SUM(CASE \
+                    WHEN recipient.contact_policy = 'contacts_only' \
+                     AND m.sender_id != mr.agent_id \
+                     AND NOT EXISTS ( \
+                        SELECT 1 FROM approved_links link \
+                        WHERE link.sender_id = m.sender_id \
+                          AND link.recipient_id = mr.agent_id \
+                    ) THEN 1 \
+                    WHEN recipient.contact_policy = 'block_all' \
+                     AND m.sender_id != mr.agent_id \
+                    THEN 1 \
+                    ELSE 0 END) AS violation_count \
+         FROM message_recipients mr \
+         JOIN messages m ON m.id = mr.message_id \
+         JOIN agents recipient ON recipient.id = mr.agent_id \
+         WHERE recipient.project_id = ? \
+           AND mr.agent_id IN ({agent_ids_sql}) \
+           AND m.created_ts >= ? \
+         GROUP BY mr.agent_id"
+    );
+    conn.query_sync(
+        &sql,
+        &[
+            Value::BigInt(now),
+            Value::BigInt(now),
+            Value::BigInt(project_id),
+            Value::BigInt(window_start),
+        ],
+    )
+    .ok()
+    .map(|rows| {
+        rows.into_iter()
+            .map(|row| {
+                (
+                    row.get_named::<i64>("agent_id").unwrap_or(0),
+                    RobotAgentContactStats {
+                        respected_count: row.get_named::<i64>("respected_count").unwrap_or(0).max(0)
+                            as u64,
+                        violation_count: row.get_named::<i64>("violation_count").unwrap_or(0).max(0)
+                            as u64,
+                    },
+                )
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn fetch_robot_agent_decision_counts(
+    conn: &DbConn,
+    project_id: i64,
+    agent_ids: &[i64],
+    window_start: i64,
+) -> HashMap<i64, u64> {
+    if agent_ids.is_empty() {
+        return HashMap::new();
+    }
+    let agent_ids_sql = agent_ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT a.id AS agent_id, COUNT(*) AS decision_count \
+         FROM atc_experiences e \
+         JOIN agents a ON a.name = e.subject AND a.project_id = ? \
+         WHERE a.id IN ({agent_ids_sql}) \
+           AND e.created_ts >= ? \
+         GROUP BY a.id"
+    );
+    conn.query_sync(
+        &sql,
+        &[Value::BigInt(project_id), Value::BigInt(window_start)],
+    )
+    .ok()
+    .map(|rows| {
+        rows.into_iter()
+            .map(|row| {
+                (
+                    row.get_named::<i64>("agent_id").unwrap_or(0),
+                    row.get_named::<i64>("decision_count").unwrap_or(0).max(0) as u64,
+                )
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn median_micros(values: &mut [u64]) -> u64 {
+    values.sort_unstable();
+    let mid = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[mid]
+    } else {
+        values[mid - 1].saturating_add(values[mid]) / 2
+    }
 }
 
 // ── Contacts command implementation ─────────────────────────────────────────
@@ -8206,10 +8739,31 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             }
             format_output(&env, format)?
         }
-        RobotSubcommand::Agents { active, sort } => {
+        RobotSubcommand::Agents {
+            active,
+            health,
+            threshold,
+            sort,
+        } => {
             let scope = resolve_robot_scope(args.project.as_deref(), None)?;
-            let sort = parse_agent_sort_field(sort.as_deref())?;
-            let agents = build_agents(scope.conn(), scope.project_id, active, sort.as_deref())?;
+            let mut sort = parse_agent_sort_field(sort.as_deref())?;
+            let threshold = parse_agent_health_threshold(threshold.as_deref())?;
+            if (health.is_some() || threshold.is_some()) && sort.is_none() {
+                sort = Some("health".to_string());
+            }
+            let agents =
+                if health.is_some() || threshold.is_some() || sort.as_deref() == Some("health") {
+                    build_agents_with_health(
+                        scope.conn(),
+                        scope.project_id,
+                        active,
+                        sort.as_deref(),
+                        health.as_deref(),
+                        threshold,
+                    )?
+                } else {
+                    build_agents(scope.conn(), scope.project_id, active, sort.as_deref())?
+                };
 
             #[derive(Serialize)]
             struct AgentsData {
@@ -9174,6 +9728,7 @@ mod tests {
             last_active: "2m ago".into(),
             msg_count: 15,
             status: "active".into(),
+            health: None,
         }];
         let json = serde_json::to_string(&agents).unwrap();
         let toon_out = toon::json_to_toon(&json).unwrap();
@@ -9204,6 +9759,7 @@ mod tests {
                 last_active: format!("{i}m ago"),
                 msg_count: i * 10,
                 status: "active".into(),
+                health: None,
             })
             .collect();
 
@@ -10016,12 +10572,43 @@ mod tests {
             last_active: "5m ago".into(),
             msg_count: 42,
             status: "active".into(),
+            health: None,
         };
         let v: Value = serde_json::to_value(&agent).unwrap();
         assert_eq!(v["name"], "GoldHawk");
         assert_eq!(v["program"], "claude-code");
         assert_eq!(v["msg_count"], 42);
         assert_eq!(v["status"], "active");
+    }
+
+    #[test]
+    fn test_agent_row_serialization_with_health() {
+        let agent = AgentRow {
+            name: "GoldHawk".into(),
+            program: "claude-code".into(),
+            model: "opus-4.6".into(),
+            last_active: "5m ago".into(),
+            msg_count: 42,
+            status: "active".into(),
+            health: Some(AgentHealthView {
+                badge: "B 78".into(),
+                score: 78,
+                grade: "B".into(),
+                needs_attention: false,
+                decision_count: 12,
+                metrics: vec![AgentHealthMetricRow {
+                    label: "Response time".into(),
+                    available: true,
+                    score: Some(84),
+                    weight_bp: 1500,
+                    evidence: "p50 ack latency 30m".into(),
+                }],
+            }),
+        };
+
+        let v: Value = serde_json::to_value(&agent).unwrap();
+        assert_eq!(v["health"]["badge"], "B 78");
+        assert_eq!(v["health"]["metrics"][0]["evidence"], "p50 ack latency 30m");
     }
 
     #[test]
@@ -10275,6 +10862,7 @@ mod tests {
                         last_active: "2m ago".into(),
                         msg_count: 50,
                         status: "active".into(),
+                        health: None,
                     },
                     AgentRow {
                         name: "SilverCove".into(),
@@ -10283,6 +10871,7 @@ mod tests {
                         last_active: "1h ago".into(),
                         msg_count: 10,
                         status: "idle".into(),
+                        health: None,
                     },
                 ],
             },
@@ -11012,6 +11601,7 @@ mod tests {
                 status: "active".into(),
                 msg_count: 5,
                 last_active: "5m".into(),
+                health: None,
             }],
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -12458,6 +13048,88 @@ mod tests {
             err.to_string().contains("ambiguous agent name"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn build_agents_with_health_reports_p50_latency_detail() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_agents_health.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                program TEXT NOT NULL,
+                model TEXT NOT NULL,
+                last_active_ts INTEGER NOT NULL,
+                contact_policy TEXT NOT NULL DEFAULT 'auto'
+            )",
+            &empty,
+        )
+        .expect("create agents");
+        conn.query_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL,
+                created_ts INTEGER NOT NULL,
+                ack_required INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create messages");
+        conn.query_sync(
+            "CREATE TABLE message_recipients (
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                ack_ts INTEGER
+            )",
+            &empty,
+        )
+        .expect("create recipients");
+
+        conn.query_sync(
+            "INSERT INTO agents
+                (id, project_id, name, program, model, last_active_ts, contact_policy)
+             VALUES
+                (1, 1, 'GreenCastle', 'codex-cli', 'gpt-5', 9_000_000, 'auto')",
+            &empty,
+        )
+        .expect("insert agent");
+        conn.query_sync(
+            "INSERT INTO messages (id, project_id, sender_id, created_ts, ack_required) VALUES
+                (1, 1, 1, 1_000_000, 1),
+                (2, 1, 1, 2_000_000, 1),
+                (3, 1, 1, 3_000_000, 1)",
+            &empty,
+        )
+        .expect("insert messages");
+        conn.query_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, ack_ts) VALUES
+                (1, 1, 301_000_000),
+                (2, 1, 1_802_000_000),
+                (3, 1, 7_203_000_000)",
+            &empty,
+        )
+        .expect("insert recipients");
+
+        let agents =
+            build_agents_with_health(&conn, 1, false, Some("health"), Some("GreenCastle"), None)
+                .expect("build agents with health");
+
+        assert_eq!(agents.len(), 1);
+        let health = agents[0].health.as_ref().expect("health details present");
+        assert_eq!(health.metrics.len(), 5);
+        let response_time = health
+            .metrics
+            .iter()
+            .find(|metric| metric.label == "Response time")
+            .expect("response time metric present");
+        assert_eq!(response_time.evidence, "p50 ack latency 30m");
     }
 
     #[test]
@@ -15002,7 +15674,18 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("expected one of: last_active, name, msg_count"),
+                .contains("expected one of: last_active, name, msg_count, health"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_agent_health_threshold_rejects_invalid_value() {
+        let err = parse_agent_health_threshold(Some("warning"))
+            .expect_err("unexpectedly accepted invalid threshold");
+
+        assert!(
+            err.to_string().contains("expected one of: A, B, C, D, F"),
             "unexpected error: {err}"
         );
     }

@@ -5,6 +5,7 @@ use ftui::text::{Line, Span};
 use ftui::{Frame, PackedRgba, Style};
 use ftui_widgets::fenwick::FenwickTree;
 use ftui_widgets::virtualized::RenderItem;
+use mcp_agent_mail_core::AgentHealthScorecard;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -291,9 +292,12 @@ impl VerbosityTier {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AgentSummary {
+    pub project: String,
     pub name: String,
     pub program: String,
+    pub model: String,
     pub last_active_ts: i64,
+    pub health: Option<AgentHealthScorecard>,
 }
 
 /// Per-project summary for the Projects screen.
@@ -2349,9 +2353,12 @@ mod tests {
                     contact_links: 5,
                     ack_pending: 6,
                     agents_list: vec![AgentSummary {
+                        project: String::new(),
                         name: "TealMeadow".to_string(),
                         program: "codex-cli".to_string(),
+                        model: String::new(),
                         last_active_ts: 99,
+                        health: None,
                     }],
                     timestamp_micros: 109,
                     ..Default::default()
@@ -2516,14 +2523,20 @@ mod tests {
             ack_pending: 2,
             agents_list: vec![
                 AgentSummary {
+                    project: String::new(),
                     name: "GoldFox".into(),
                     program: "claude-code".into(),
+                    model: String::new(),
                     last_active_ts: 123_456,
+                    health: None,
                 },
                 AgentSummary {
+                    project: String::new(),
                     name: "SilverWolf".into(),
                     program: "codex-cli".into(),
+                    model: String::new(),
                     last_active_ts: 789_012,
+                    health: None,
                 },
             ],
             timestamp_micros: 500_000,
