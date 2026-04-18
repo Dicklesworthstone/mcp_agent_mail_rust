@@ -2446,9 +2446,12 @@ detect_mcp_configs() {
   local -a candidates=()
 
   if [ -n "$home_dir" ]; then
-    # Claude Code / Claude Desktop
-    candidates+=("claude|${home_dir}/.claude/settings.json")
-    candidates+=("claude|${home_dir}/.claude/settings.local.json")
+    # Claude Desktop only. Claude Code does NOT read MCP server
+    # registrations from ~/.claude/settings.json — those files are for
+    # hooks/statusLine/env and the mcpServers key there is silently
+    # ignored. Claude Code is configured via the `claude mcp add` CLI
+    # (writes to ~/.claude.json), handled by setup_claude_code_mcp_via_cli
+    # before the candidate scan. See #97.
     candidates+=("claude|${home_dir}/.claude/claude_desktop_config.json")
     candidates+=("claude|${home_dir}/.config/Claude/claude_desktop_config.json")
     candidates+=("claude|${home_dir}/Library/Application Support/Claude/claude_desktop_config.json")
@@ -2484,8 +2487,10 @@ detect_mcp_configs() {
   fi
 
   # Project-local config files.
-  candidates+=("claude|${project_dir}/.claude/settings.json")
-  candidates+=("claude|${project_dir}/.claude/settings.local.json")
+  # Claude Code project-scope MCP is configured via `<project>/.mcp.json`, not
+  # settings.json — see #97. We don't auto-write project-scope MCP from the
+  # installer; users run `claude mcp add --scope project` themselves if they
+  # want a project-pinned entry.
   candidates+=("codex|${project_dir}/.codex/config.toml")
   candidates+=("codex|${project_dir}/codex.mcp.json")
   candidates+=("cursor|${project_dir}/cursor.mcp.json")
@@ -2815,14 +2820,24 @@ ensure_remote_http_client_readiness() {
     return 0
   fi
 
-  warn "Background service was installed, but the MCP HTTP endpoint is still not healthy."
+  # The service install returned 0 but the endpoint never came up. This was
+  # the exact failure mode in #96 (systemd CHDIR crash-loop) where the
+  # installer said "ok" while every MCP client saw zero tools. Surface it as
+  # an ERR so it cannot be missed in install output — we still don't
+  # hard-fail the install (users running in non-systemd environments may
+  # want to start the server manually), but echo the service status
+  # verbatim so the failure mode is obvious.
+  err "Background service was installed, but the MCP HTTP endpoint is still not healthy."
+  service_output=""
   if service_output=$("$DEST/$BIN_CLI" service status 2>&1); then
     while IFS= read -r line; do
+      [ -n "$line" ] && err "  status: ${line}"
       [ -n "$line" ] && verbose "remote_http_readiness:status ${line}"
     done <<< "$service_output"
   fi
-  warn "Open service diagnostics with: ${DEST}/${BIN_CLI} service status"
-  warn "Or start a foreground server manually with: ${DEST}/${BIN_CLI} serve-http --no-tui"
+  err "Diagnose with:  ${DEST}/${BIN_CLI} service status"
+  err "Or start a foreground server manually with:  ${DEST}/${BIN_CLI} serve-http --no-tui"
+  err "MCP clients (Claude Code, Cursor, Codex, …) will see zero tools until this is resolved."
   return 0
 }
 
@@ -3364,13 +3379,65 @@ print('OK:inserted backup=' + backup)
   fi
 }
 
+# Register mcp-agent-mail with Claude Code via the supported `claude mcp add`
+# CLI. Claude Code reads MCP registrations from ~/.claude.json (a single
+# dotfile whose full schema we don't want to hand-edit). This is the supported
+# path, handles scoping, and avoids the silent-failure mode reported in #97
+# where entries were written to ~/.claude/settings.json and ignored by the
+# Claude Code loader.
+#
+# Return codes:
+#   0 — registered (or already present with matching transport/url)
+#   1 — skipped cleanly (claude CLI not installed — don't fail the install)
+#   2 — attempted but failed
+setup_claude_code_mcp_via_cli() {
+  if ! command -v claude >/dev/null 2>&1; then
+    verbose "setup_claude_code_mcp:skip reason=claude_cli_not_available"
+    return 1
+  fi
+
+  local desired_url
+  desired_url="$(desired_mcp_http_url)"
+  local bearer_token
+  bearer_token="$(resolve_setup_http_bearer_token 2>/dev/null || true)"
+
+  # `claude mcp list` exits non-zero if the config is uninitialized on first
+  # run; treat both "missing" and "absent" the same — we'll add.
+  local list_output=""
+  list_output="$(claude mcp list 2>/dev/null || true)"
+
+  # If an entry already exists but points at a different URL or is missing the
+  # Authorization header the current bearer token expects, re-register to keep
+  # the client in sync with the server we just installed.
+  if printf '%s\n' "$list_output" | grep -qE '^[[:space:]]*mcp-agent-mail[:[:space:]]'; then
+    # Best-effort: remove first so the re-add takes effect. `claude mcp remove`
+    # is idempotent and non-fatal if the entry is already gone.
+    claude mcp remove mcp-agent-mail --scope user >/dev/null 2>&1 \
+      || claude mcp remove mcp-agent-mail >/dev/null 2>&1 \
+      || true
+  fi
+
+  local -a add_args=(mcp add --scope user --transport http mcp-agent-mail "$desired_url")
+  if [ -n "$bearer_token" ]; then
+    add_args+=(--header "Authorization: Bearer ${bearer_token}")
+  fi
+
+  if claude "${add_args[@]}" >/dev/null 2>&1; then
+    ok "[claude-code] Registered mcp-agent-mail via 'claude mcp add' (user scope, HTTP transport)"
+    verbose "setup_claude_code_mcp:ok url=${desired_url}"
+    return 0
+  fi
+
+  verbose "setup_claude_code_mcp:fail url=${desired_url}"
+  return 2
+}
+
 # Set up MCP configs for all detected tools.
 # For fresh installs: create configs where missing, insert entries where absent.
 setup_mcp_configs() {
   local binary_path="$1"
   local scan
   scan=$(detect_mcp_configs "$PWD" || true)
-  [ -z "$scan" ] && return 0
 
   local bearer_token
   bearer_token=$(generate_bearer_token)
@@ -3382,8 +3449,27 @@ setup_mcp_configs() {
   local failed=0
   local tool path exists_flag
 
-  # Track which tools we've already configured (prefer existing configs)
+  # Track which tools we've already configured (prefer existing configs).
+  # Pre-seeded with claude-code so the desktop claude_desktop_config.json
+  # candidates still get their normal handling (they use tool=claude, which
+  # is distinct from claude-code below).
   local configured_tools=""
+
+  # Claude Code gets its own path: the `claude mcp add` CLI writes to
+  # ~/.claude.json, which is the file Claude Code actually reads. Writing to
+  # ~/.claude/settings.json is silently ignored (#97). We attempt this first
+  # regardless of whether candidate files exist, because Claude Code doesn't
+  # surface in the candidate scan any more.
+  if setup_claude_code_mcp_via_cli; then
+    configured=$((configured + 1))
+  fi
+
+  [ -z "$scan" ] && {
+    if [ "$configured" -gt 0 ]; then
+      ok "Configured $configured MCP config(s)"
+    fi
+    return 0
+  }
 
   # First pass: handle existing configs
   while IFS=$'\t' read -r tool path exists_flag; do
