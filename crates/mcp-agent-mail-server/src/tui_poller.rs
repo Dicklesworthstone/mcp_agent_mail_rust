@@ -1100,7 +1100,7 @@ fn restore_missing_agent_fields_from_previous(
         if !agent.program.is_empty() && agent.last_active_ts != 0 {
             continue;
         }
-        let Some(prev) = previous_agents.iter().find(|prev| prev.name == agent.name) else {
+        let Some(prev) = unique_previous_agent_summary(previous_agents, agent) else {
             continue;
         };
         if agent.program.is_empty() && !prev.program.is_empty() {
@@ -1119,6 +1119,18 @@ fn restore_missing_agent_fields_from_previous(
             "tui poller backfilled empty agent fields from previous snapshot"
         );
     }
+}
+
+fn unique_previous_agent_summary<'a>(
+    previous_agents: &'a [AgentSummary],
+    current_agent: &AgentSummary,
+) -> Option<&'a AgentSummary> {
+    let mut matching = previous_agents.iter().filter(|prev| {
+        prev.name == current_agent.name
+            && (current_agent.project.is_empty() || prev.project == current_agent.project)
+    });
+    let first = matching.next()?;
+    matching.next().is_none().then_some(first)
 }
 
 fn unique_previous_project_summary<F>(
@@ -1273,12 +1285,7 @@ fn restore_missing_contact_project_slugs_from_previous(
         // from_agent + to_agent, plus the non-placeholder project slug
         // when available (to avoid collapsing a pair that genuinely lives
         // across two projects).
-        let Some(prev) = previous_contacts.iter().find(|prev| {
-            prev.from_agent == contact.from_agent
-                && prev.to_agent == contact.to_agent
-                && (from_placeholder || prev.from_project_slug == contact.from_project_slug)
-                && (to_placeholder || prev.to_project_slug == contact.to_project_slug)
-        }) else {
+        let Some(prev) = unique_previous_contact_summary(previous_contacts, contact) else {
             continue;
         };
         if to_placeholder && !prev.to_project_slug.starts_with("[unknown-project-") {
@@ -1299,6 +1306,31 @@ fn restore_missing_contact_project_slugs_from_previous(
             "tui poller repaired `[unknown-project-*]` placeholder slugs in contacts list from previous snapshot"
         );
     }
+}
+
+fn unique_previous_contact_summary<'a>(
+    previous_contacts: &'a [ContactSummary],
+    current_contact: &ContactSummary,
+) -> Option<&'a ContactSummary> {
+    let from_placeholder = current_contact
+        .from_project_slug
+        .starts_with("[unknown-project-");
+    let to_placeholder = current_contact
+        .to_project_slug
+        .starts_with("[unknown-project-");
+
+    let mut matching = previous_contacts.iter().filter(|prev| {
+        prev.from_agent == current_contact.from_agent
+            && prev.to_agent == current_contact.to_agent
+            && prev.status == current_contact.status
+            && prev.reason == current_contact.reason
+            && prev.updated_ts == current_contact.updated_ts
+            && prev.expires_ts == current_contact.expires_ts
+            && (from_placeholder || prev.from_project_slug == current_contact.from_project_slug)
+            && (to_placeholder || prev.to_project_slug == current_contact.to_project_slug)
+    });
+    let first = matching.next()?;
+    matching.next().is_none().then_some(first)
 }
 
 fn refill_missing_detail_lists_from_sqlite(
@@ -4534,6 +4566,82 @@ first body
 
         assert_eq!(snapshot.contact_links, 2);
         assert_eq!(snapshot.contacts_list, previous.contacts_list);
+    }
+
+    #[test]
+    fn restore_missing_agent_fields_keeps_project_specific_identity() {
+        let previous = vec![
+            AgentSummary {
+                project: "alpha".to_string(),
+                name: "BlueLake".to_string(),
+                program: "claude-code".to_string(),
+                model: String::new(),
+                last_active_ts: 10,
+                health: None,
+            },
+            AgentSummary {
+                project: "beta".to_string(),
+                name: "BlueLake".to_string(),
+                program: "codex".to_string(),
+                model: String::new(),
+                last_active_ts: 20,
+                health: None,
+            },
+        ];
+        let mut current = vec![AgentSummary {
+            project: "beta".to_string(),
+            name: "BlueLake".to_string(),
+            program: String::new(),
+            model: String::new(),
+            last_active_ts: 0,
+            health: None,
+        }];
+
+        restore_missing_agent_fields_from_previous(&mut current, &previous, None);
+
+        assert_eq!(current[0].program, "codex");
+        assert_eq!(current[0].last_active_ts, 20);
+    }
+
+    #[test]
+    fn restore_missing_contact_project_slugs_leaves_ambiguous_pairs_unpatched() {
+        let previous = vec![
+            ContactSummary {
+                from_agent: "BlueLake".to_string(),
+                to_agent: "RedStone".to_string(),
+                from_project_slug: "alpha".to_string(),
+                to_project_slug: "shared".to_string(),
+                status: "accepted".to_string(),
+                reason: "ok".to_string(),
+                updated_ts: 100,
+                expires_ts: None,
+            },
+            ContactSummary {
+                from_agent: "BlueLake".to_string(),
+                to_agent: "RedStone".to_string(),
+                from_project_slug: "beta".to_string(),
+                to_project_slug: "shared".to_string(),
+                status: "accepted".to_string(),
+                reason: "ok".to_string(),
+                updated_ts: 100,
+                expires_ts: None,
+            },
+        ];
+        let mut current = vec![ContactSummary {
+            from_agent: "BlueLake".to_string(),
+            to_agent: "RedStone".to_string(),
+            from_project_slug: "[unknown-project-11]".to_string(),
+            to_project_slug: "shared".to_string(),
+            status: "accepted".to_string(),
+            reason: "ok".to_string(),
+            updated_ts: 100,
+            expires_ts: None,
+        }];
+
+        restore_missing_contact_project_slugs_from_previous(&mut current, &previous, None);
+
+        assert_eq!(current[0].from_project_slug, "[unknown-project-11]");
+        assert_eq!(current[0].to_project_slug, "shared");
     }
 
     // ── fetch_db_stats with nonexistent DB ───────────────────────────
