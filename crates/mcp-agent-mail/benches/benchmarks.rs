@@ -83,6 +83,10 @@ fn seed_fixtures(fixtures: &Fixtures) {
 }
 
 fn bench_tools(c: &mut Criterion) {
+    if !bench_scope_enabled("tools") {
+        return;
+    }
+
     // Ensure DB is initialized before anything touches the pool cache.
     let tmp = TempDir::new().expect("tempdir");
     let original_cwd = std::env::current_dir().expect("cwd");
@@ -245,6 +249,19 @@ fn share_artifact_dir(run_id: &str) -> PathBuf {
 
 fn perf_artifact_dir() -> PathBuf {
     repo_root().join("tests").join("artifacts").join("perf")
+}
+
+fn bench_scope_enabled(scope: &str) -> bool {
+    let Ok(raw_scope) = std::env::var("MCP_AGENT_MAIL_BENCH_SCOPE") else {
+        return true;
+    };
+
+    let scopes = raw_scope
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    scopes.is_empty() || scopes.contains(&"all") || scopes.contains(&scope)
 }
 
 fn write_bmp24(path: &Path, width: u32, height: u32, seed: u32) -> std::io::Result<()> {
@@ -1812,6 +1829,10 @@ pub(crate) fn run_archive_perf_profile_once_for_testing() {
 
 #[allow(clippy::too_many_lines)]
 fn bench_archive_write(c: &mut Criterion) {
+    if !bench_scope_enabled("archive_write") {
+        return;
+    }
+
     run_archive_harness_once();
     run_archive_perf_profile_once();
 
@@ -2409,6 +2430,10 @@ fn run_search_harness_once() {
 }
 
 fn bench_global_search(c: &mut Criterion) {
+    if !bench_scope_enabled("global_search") {
+        return;
+    }
+
     run_search_harness_once();
 
     let scenarios: &[SearchScenario] = &[
@@ -3229,6 +3254,10 @@ fn run_share_harness_once() {
 
 #[allow(clippy::too_many_lines)]
 fn bench_share_export(c: &mut Criterion) {
+    if !bench_scope_enabled("share_export") {
+        return;
+    }
+
     run_share_harness_once();
 
     let scenarios: &[ShareScenario] = &[
@@ -3273,11 +3302,319 @@ fn bench_share_export(c: &mut Criterion) {
     group.finish();
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveReadScenario {
+    BatchSequential {
+        dataset_size: usize,
+        reads_per_op: usize,
+    },
+    RandomAccess {
+        dataset_size: usize,
+        reads_per_op: usize,
+    },
+}
+
+impl ArchiveReadScenario {
+    const fn benchmark_name(self) -> &'static str {
+        match self {
+            Self::BatchSequential { .. } => "batch_sequential",
+            Self::RandomAccess { .. } => "random_access",
+        }
+    }
+
+    const fn dataset_size(self) -> usize {
+        match self {
+            Self::BatchSequential { dataset_size, .. }
+            | Self::RandomAccess { dataset_size, .. } => dataset_size,
+        }
+    }
+
+    const fn reads_per_op(self) -> usize {
+        match self {
+            Self::BatchSequential { reads_per_op, .. }
+            | Self::RandomAccess { reads_per_op, .. } => reads_per_op,
+        }
+    }
+
+    const fn ops(self) -> usize {
+        match self {
+            Self::BatchSequential { .. } => 20,
+            Self::RandomAccess { .. } => 40,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ArchiveReadBenchScenarioResult {
+    scenario: String,
+    dataset_size: usize,
+    reads_per_op: usize,
+    ops: usize,
+    samples_us: Vec<u64>,
+    p50_us: u64,
+    p95_us: u64,
+    p99_us: u64,
+    max_us: u64,
+    throughput_reads_per_sec: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ArchiveReadBenchRun {
+    run_id: String,
+    arch: String,
+    os: String,
+    results: Vec<ArchiveReadBenchScenarioResult>,
+}
+
+fn collect_canonical_message_paths(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            if entry.file_name() == "threads" {
+                continue;
+            }
+            collect_canonical_message_paths(&path, out)?;
+            continue;
+        }
+
+        if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn seed_archive_read_dataset(dataset_size: usize) -> (TempDir, Vec<PathBuf>) {
+    let tmp = TempDir::new().expect("tempdir");
+    let original_cwd = std::env::current_dir().expect("cwd");
+    std::env::set_current_dir(tmp.path()).expect("chdir");
+
+    let mut config = mcp_agent_mail_core::Config::from_env();
+    config.storage_root = tmp.path().join("archive_repo");
+    config.database_url = format!(
+        "sqlite+aiosqlite:///{}",
+        tmp.path().join("storage.sqlite3").display()
+    );
+
+    let project_slug = "bench-archive-read";
+    let archive = mcp_agent_mail_storage::ensure_archive(&config, project_slug).expect("archive");
+    let sender = "BenchReader";
+    let recipients = vec!["BenchReceiver".to_string()];
+
+    for msg_id in 1..=dataset_size {
+        let message_json = serde_json::json!({
+            "id": i64::try_from(msg_id).unwrap_or(i64::MAX),
+            "project": project_slug,
+            "subject": format!("bench read {msg_id}"),
+            "thread_id": format!("bench-read-{}", msg_id % 16),
+            "created_ts": 1_700_000_000_000_000i64 + i64::try_from(msg_id).unwrap_or(0),
+        });
+
+        mcp_agent_mail_storage::write_message_bundle(
+            &archive,
+            &config,
+            &message_json,
+            "hello from archive read bench",
+            sender,
+            &recipients,
+            &[],
+            None,
+        )
+        .expect("write_message_bundle");
+    }
+
+    mcp_agent_mail_storage::flush_async_commits();
+    mcp_agent_mail_storage::wbq_flush();
+
+    let mut canonical_paths = Vec::with_capacity(dataset_size);
+    collect_canonical_message_paths(&archive.root.join("messages"), &mut canonical_paths)
+        .expect("collect canonical message paths");
+    canonical_paths.sort();
+    assert_eq!(canonical_paths.len(), dataset_size);
+
+    std::env::set_current_dir(original_cwd).expect("restore cwd");
+    (tmp, canonical_paths)
+}
+
+fn deterministic_read_plan(canonical_paths: &[PathBuf], reads_per_op: usize) -> Vec<PathBuf> {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let len_u64 = u64::try_from(canonical_paths.len())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    (0..reads_per_op)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let idx_u64 = state % len_u64;
+            let idx = usize::try_from(idx_u64).unwrap_or(0);
+            canonical_paths[idx].clone()
+        })
+        .collect()
+}
+
+fn archive_read_summary_path() -> PathBuf {
+    perf_artifact_dir().join("archive_read_summary.json")
+}
+
+fn archive_read_dated_summary_path() -> PathBuf {
+    perf_artifact_dir().join(format!(
+        "archive_read_summary_{}.json",
+        perf_artifact_date()
+    ))
+}
+
+fn build_archive_read_paths(
+    scenario: ArchiveReadScenario,
+    canonical_paths: &[PathBuf],
+) -> Vec<PathBuf> {
+    match scenario {
+        ArchiveReadScenario::BatchSequential { reads_per_op, .. } => canonical_paths
+            .iter()
+            .take(reads_per_op)
+            .cloned()
+            .collect::<Vec<_>>(),
+        ArchiveReadScenario::RandomAccess { reads_per_op, .. } => {
+            deterministic_read_plan(canonical_paths, reads_per_op)
+        }
+    }
+}
+
+fn measure_archive_read_sample(read_paths: &[PathBuf]) -> u64 {
+    let started_at = Instant::now();
+    for path in read_paths {
+        let (frontmatter, body_md) =
+            mcp_agent_mail_storage::read_message_file(path).expect("read_message_file");
+        black_box((frontmatter, body_md));
+    }
+
+    u64::try_from(started_at.elapsed().as_micros().min(u128::from(u64::MAX))).unwrap_or(u64::MAX)
+}
+
+fn run_archive_read_harness_once() {
+    static DID_RUN: Once = Once::new();
+    DID_RUN.call_once(|| {
+        let scenarios = [
+            ArchiveReadScenario::BatchSequential {
+                dataset_size: 1_000,
+                reads_per_op: 1_000,
+            },
+            ArchiveReadScenario::RandomAccess {
+                dataset_size: 1_000,
+                reads_per_op: 100,
+            },
+        ];
+
+        let mut results = Vec::with_capacity(scenarios.len());
+        let _ = std::fs::create_dir_all(perf_artifact_dir());
+
+        for scenario in scenarios {
+            let (_tmp, canonical_paths) = seed_archive_read_dataset(scenario.dataset_size());
+            let read_paths = build_archive_read_paths(scenario, &canonical_paths);
+
+            let warmup_us = measure_archive_read_sample(&read_paths);
+            black_box(warmup_us);
+
+            let ops = scenario.ops();
+            let mut samples_us = Vec::with_capacity(ops);
+            for _ in 0..ops {
+                samples_us.push(measure_archive_read_sample(&read_paths));
+            }
+
+            let total_reads = scenario.reads_per_op().saturating_mul(ops);
+            let total_reads_f64 =
+                u32::try_from(total_reads).map_or_else(|_| f64::from(u32::MAX), f64::from);
+            let total_us = samples_us.iter().copied().sum::<u64>();
+            let total_us_f64 =
+                u32::try_from(total_us).map_or_else(|_| f64::from(u32::MAX), f64::from);
+            let throughput_reads_per_sec = if total_us_f64 > 0.0 {
+                total_reads_f64 / (total_us_f64 / 1_000_000.0)
+            } else {
+                0.0
+            };
+
+            results.push(ArchiveReadBenchScenarioResult {
+                scenario: scenario.benchmark_name().to_string(),
+                dataset_size: scenario.dataset_size(),
+                reads_per_op: scenario.reads_per_op(),
+                ops,
+                p50_us: percentile_us(samples_us.clone(), 0.50),
+                p95_us: percentile_us(samples_us.clone(), 0.95),
+                p99_us: percentile_us(samples_us.clone(), 0.99),
+                max_us: samples_us.iter().copied().max().unwrap_or(0),
+                samples_us,
+                throughput_reads_per_sec: (throughput_reads_per_sec * 100.0).round() / 100.0,
+            });
+        }
+
+        let run = ArchiveReadBenchRun {
+            run_id: run_id(),
+            arch: std::env::consts::ARCH.to_string(),
+            os: std::env::consts::OS.to_string(),
+            results,
+        };
+
+        let serialized = serde_json::to_string_pretty(&run).unwrap_or_default();
+        let _ = std::fs::write(archive_read_summary_path(), &serialized);
+        let _ = std::fs::write(archive_read_dated_summary_path(), serialized);
+    });
+}
+
+fn bench_archive_read(c: &mut Criterion) {
+    if !bench_scope_enabled("archive_read") {
+        return;
+    }
+
+    run_archive_read_harness_once();
+
+    let scenarios = [
+        ArchiveReadScenario::BatchSequential {
+            dataset_size: 1_000,
+            reads_per_op: 1_000,
+        },
+        ArchiveReadScenario::RandomAccess {
+            dataset_size: 1_000,
+            reads_per_op: 100,
+        },
+    ];
+
+    let mut group = c.benchmark_group("archive_read");
+    group.sample_size(20);
+
+    for scenario in scenarios {
+        group.throughput(Throughput::Elements(
+            u64::try_from(scenario.reads_per_op()).unwrap_or(u64::MAX),
+        ));
+        group.bench_with_input(
+            BenchmarkId::new(scenario.benchmark_name(), scenario.dataset_size()),
+            &scenario,
+            |b, &scenario| {
+                let (_tmp, canonical_paths) = seed_archive_read_dataset(scenario.dataset_size());
+                let read_paths = build_archive_read_paths(scenario, &canonical_paths);
+
+                b.iter_custom(|iters| {
+                    let mut total = std::time::Duration::ZERO;
+                    for _ in 0..iters {
+                        total += std::time::Duration::from_micros(measure_archive_read_sample(
+                            &read_paths,
+                        ));
+                    }
+                    total
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_tools,
     bench_global_search,
     bench_archive_write,
+    bench_archive_read,
     bench_share_export
 );
 criterion_main!(benches);

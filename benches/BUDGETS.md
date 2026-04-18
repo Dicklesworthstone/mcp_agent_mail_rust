@@ -272,6 +272,36 @@ Span roll-up for warm batch-100:
 - `archive_batch.flush_async_commits`: ~0.82s cumulative (~32%)
 - `archive_batch.wbq_flush`: ~601us cumulative (noise floor)
 
+### Archive Read Characterization (br-8qdh0.13, 2026-04-18)
+
+Archive read-path characterization now lives in
+`crates/mcp-agent-mail/benches/benchmarks.rs` under the `archive_read` group.
+The deterministic warm summary artifact is written to:
+
+- `tests/artifacts/perf/archive_read_summary.json`
+- `tests/artifacts/perf/archive_read_summary_2026-04-18.json`
+
+Reference run command:
+
+```bash
+MCP_AGENT_MAIL_BENCH_SCOPE=archive_read \
+CARGO_TARGET_DIR=/data/projects/mcp_agent_mail_rust/target \
+cargo bench -p mcp-agent-mail --bench benchmarks -- archive_read --noplot
+```
+
+Measured warm-cache baselines from `tests/artifacts/perf/archive_read_summary_2026-04-18.json`:
+
+| Scenario | Dataset | Reads/op | Baseline p50 | Baseline p95 | Baseline p99 | Budget p95 | Budget p99 | Notes |
+|----------|---------|----------|--------------|--------------|--------------|------------|------------|-------|
+| `batch_sequential` | 1000 canonical messages | 1000 | ~28.7ms | ~30.1ms | ~30.8ms | < 60ms | < 75ms | Full canonical archive sweep; bound is dominated by file open + frontmatter parse per message |
+| `random_access` | 1000 canonical messages | 100 | ~2.6ms | ~3.0ms | ~3.5ms | < 10ms | < 15ms | Deterministic pseudo-random read plan over the same warm dataset |
+
+Current execution note (`2026-04-18`):
+- `rch exec` could not be used as the source of truth for this run because worker `ts2`
+  compiled a divergent/broken `asupersync` mirror while the local checkout compiled cleanly.
+  Until worker skew is corrected, use the checked-in local summary JSON as the authoritative
+  read-path baseline.
+
 ### MCP Tool Handler Baselines (Criterion, 2026-02-08)
 
 | Tool | Median | Throughput | Change | Notes |
