@@ -294,6 +294,18 @@ storage.sqlite3.activity.lock
 test_bug
 test_dir
 test_dotenv
+test_env_read
+test_guard
+test_*
+!test_*.rs
+!test_*.sh
+
+# NTM (agent tmux orchestrator) runtime state — per-machine, never tracked
+.ntm/
+
+# ATC rollup scratch test databases (SQLite, created under crates/*)
+crates/**/atc_rollup_test_*
+atc_rollup_test_*
 
 # Release preparation build artifacts
 .cargo-home-release-prep/
