@@ -4534,7 +4534,9 @@ impl AtcEngine {
     ) -> Option<ReservationEventKind> {
         for event in self.reservation_event_log.iter().rev() {
             if event.timestamp_micros < since_micros {
-                break;
+                // Don't break — clock skew between agents can produce
+                // out-of-order timestamps in the ring buffer.
+                continue;
             }
             if event.agent.eq_ignore_ascii_case(agent) {
                 match event.kind {
@@ -7178,6 +7180,35 @@ mod synthesis_tests {
         assert_eq!(
             engine.reservation_event_log.len(),
             MAX_RESERVATION_EVENT_LOG
+        );
+    }
+
+    #[test]
+    fn reservation_outcome_survives_clock_skew() {
+        let mut engine = AtcEngine::new_for_testing();
+        // Event 1: BlueLake releases at t=5_000_000 (the outcome we want)
+        engine.note_reservation_released(
+            "BlueLake",
+            &["src/**".to_string()],
+            "proj-alpha",
+            5_000_000,
+        );
+        // Event 2: a later event arrives with clock-skewed timestamp *below*
+        // the query threshold — this sits later in the buffer but has ts < since_micros
+        engine.note_reservation_granted(
+            "RedHawk",
+            &["lib/**".to_string()],
+            true,
+            "proj-alpha",
+            1_000_000, // skewed: pushed after BlueLake's release but ts is very old
+        );
+        // Query since t=3_000_000.
+        // Reverse iteration: RedHawk@1M (ts < 3M → break). Never reaches BlueLake@5M.
+        let outcome = engine.reservation_outcome_for_agent("BlueLake", 3_000_000);
+        assert_eq!(
+            outcome,
+            Some(ReservationEventKind::Released),
+            "clock-skewed events must not cause early break"
         );
     }
 
@@ -10077,7 +10108,7 @@ pub(crate) fn atc_reservation_outcome_for_agent(
     since_micros: i64,
 ) -> Option<ReservationEventKind> {
     let engine_lock = ATC_ENGINE.get()?;
-    let engine = engine_lock.lock().unwrap_or_else(|p| p.into_inner());
+    let engine = engine_lock.lock().ok()?;
     engine.reservation_outcome_for_agent(agent, since_micros)
 }
 
@@ -10154,7 +10185,7 @@ pub fn atc_tick_report(now_micros: i64) -> Option<AtcTickReport> {
 #[must_use]
 pub fn atc_decision_record(decision_id: u64) -> Option<AtcDecisionRecord> {
     let engine_lock = ATC_ENGINE.get()?;
-    let engine = engine_lock.lock().unwrap_or_else(|p| p.into_inner());
+    let engine = engine_lock.lock().ok()?;
     engine.ledger.get(decision_id).cloned()
 }
 
@@ -10165,7 +10196,7 @@ pub fn atc_decision_record(decision_id: u64) -> Option<AtcDecisionRecord> {
 #[must_use]
 pub fn atc_agent_last_activity(agent: &str) -> Option<i64> {
     let engine_lock = ATC_ENGINE.get()?;
-    let engine = engine_lock.lock().unwrap_or_else(|p| p.into_inner());
+    let engine = engine_lock.lock().ok()?;
     engine
         .agents
         .get(agent)
