@@ -756,44 +756,13 @@ Use the Beads issue ID (`br-123`) as the Mail `thread_id` and prefix message sub
 
 ---
 
-## Web Dashboard
+## Web Dashboard (Deferred)
 
-The server also exposes a browser TUI mirror at `/web-dashboard`.
+The browser TUI mirror at `/web-dashboard` is deferred. All `/web-dashboard/*` endpoints currently return `501 Not Implemented`.
 
-This page is a real shipped browser surface. It is served directly by the
-server with its own HTML/JS runtime and does not depend on the parked
-`experimental/mcp-agent-mail-wasm` prototype.
+The underlying modules (`tui_ws_state.rs`, `tui_ws_input.rs`, `tui_web_dashboard.rs`) remain in the codebase and are tested at the module level, so the feature can be re-enabled when the browser parity contract is finalized. See `docs/SPEC-browser-parity-contract-deferred.md` and tracker `br-il53l` for details.
 
-This is distinct from the server-rendered `/mail/*` web UI:
-
-- `/web-dashboard` mirrors the live terminal TUI into a browser canvas when a live TUI is active
-- `/web-dashboard/state` serves the browser dashboard state contract
-- `/web-dashboard/input` forwards browser keyboard input back to the live TUI
-
-### Runtime Modes
-
-The dashboard is intentionally explicit about which mode it is in:
-
-- `live`: the terminal TUI is active and browser mirroring is working
-- `warming`: the terminal TUI exists, but the first browser frame has not been captured yet
-- `inactive`: no live terminal TUI is attached, so the page falls back to passive server telemetry instead of pretending the mirror is available
-
-In `inactive` mode, the page remains useful: it shows passive request/event telemetry and links back into the main `/mail` web UI.
-
-### Browser Auth
-
-For browser access with bearer auth enabled, use the same query-token pattern as the `/mail` UI:
-
-```bash
-http://127.0.0.1:8765/web-dashboard?token=<HTTP_BEARER_TOKEN>
-```
-
-When loaded that way, the page automatically reuses the token for background polling and input POSTs. Unauthorized HTML requests to `/web-dashboard` return a remediation page; unauthorized JSON requests to `/web-dashboard/state` and `/web-dashboard/input` return JSON `401` responses.
-
-### Notes
-
-- Headless runs such as `mcp-agent-mail serve --no-tui` do not provide a live terminal mirror, so `/web-dashboard` will stay in `inactive` mode.
-- Polling requests for `/web-dashboard/state` are suppressed from the TUI event stream to avoid self-generated telemetry noise.
+For human-facing web access, use the server-rendered `/mail/*` web UI described below.
 
 ---
 
@@ -1255,7 +1224,7 @@ These numbers come from [`benches/BUDGETS.md`](benches/BUDGETS.md), which record
 | `am lint` | 457ms | < 1000ms |
 | `am typecheck` | 399ms | < 800ms |
 
-#### Search V3 Tantivy Lexical Baselines (2026-02-18)
+#### Search V3 Frankensearch Lexical Baselines (2026-02-18)
 
 | Corpus size | Baseline p50 | Baseline p95 | Baseline p99 | Budget p95 |
 |-------------|--------------|--------------|--------------|------------|
