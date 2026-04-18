@@ -4467,14 +4467,21 @@ struct ToolLatencyRow {
     max_ms: u64,
 }
 
-/// Aggregate tool latency data from visible entries.
+/// Window (in microseconds) for tool latency aggregation.
+/// Events older than this are excluded so startup outliers age out.
+const TOOL_LATENCY_WINDOW_MICROS: i64 = 5 * 60 * 1_000_000; // 5 minutes
+
+/// Aggregate tool latency data from visible entries within the time window.
 fn compute_tool_latency_rows(
     entries: &[&EventEntry],
     query_terms: &[String],
 ) -> Vec<ToolLatencyRow> {
+    let now_micros = chrono::Utc::now().timestamp_micros();
+    let cutoff = now_micros.saturating_sub(TOOL_LATENCY_WINDOW_MICROS);
     let mut by_tool: HashMap<String, ToolAgg> = HashMap::new();
     for entry in entries.iter().filter(|entry| {
         entry.kind == MailEventKind::ToolCallEnd
+            && entry.timestamp_micros >= cutoff
             && text_matches_query_terms(&entry.summary, query_terms)
     }) {
         if let Some((tool_name, duration_ms)) = parse_tool_end_duration(&entry.summary) {
@@ -4519,7 +4526,7 @@ fn render_tool_latency_panel_cached(frame: &mut Frame<'_>, area: Rect, rows: &[T
     }
 
     let tp = crate::tui_theme::TuiThemePalette::current();
-    let title = format!("Tool Latency · {}", rows.len());
+    let title = format!("Tool Latency 5m · {}", rows.len());
     let block = accent_panel_block(&title, tp.metric_latency);
     let inner = block.inner(area);
     block.render(area, frame);
@@ -6675,6 +6682,35 @@ mod tests {
         assert!(rows.is_empty());
 
         reset_tool_metrics();
+    }
+
+    #[test]
+    fn tool_latency_window_excludes_stale_events() {
+        let now = chrono::Utc::now().timestamp_micros();
+        let recent = EventEntry {
+            kind: MailEventKind::ToolCallEnd,
+            severity: EventSeverity::Debug,
+            seq: 1,
+            timestamp_micros: now - 60_000_000, // 1 minute ago
+            timestamp: String::new(),
+            icon: '⚙',
+            summary: "fetch_inbox 5ms q=2".to_string(),
+        };
+        let stale = EventEntry {
+            kind: MailEventKind::ToolCallEnd,
+            severity: EventSeverity::Debug,
+            seq: 0,
+            timestamp_micros: now - 10 * 60 * 1_000_000, // 10 minutes ago
+            timestamp: String::new(),
+            icon: '⚙',
+            summary: "fetch_inbox 9999ms q=1".to_string(),
+        };
+        let entries: Vec<&EventEntry> = vec![&stale, &recent];
+        let rows = compute_tool_latency_rows(&entries, &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].calls, 1);
+        assert_eq!(rows[0].avg_ms, 5);
+        assert_eq!(rows[0].max_ms, 5);
     }
 
     #[test]
