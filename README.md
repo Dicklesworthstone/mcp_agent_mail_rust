@@ -958,7 +958,9 @@ $STORAGE_ROOT/                              # e.g. ~/.local/share/mcp-agent-mail
 
 ## ATC Learning Implementation Map
 
-> Status: architecture-phase, not learning-phase. Scaffolding + schema + policy engine exist; hot-path experience writes + outcome resolution are tracked in `br-bn0vb`.
+> **Architecture phase — not yet learning from live traffic.**
+>
+> The ATC decision engine, policy scaffolding, schema (v16 `atc_experiences` / `atc_experience_rollups`), and 20+ core modules exist and are tested. However, the hot-path experience write pipeline (`atc_note_*` → DB insert) and outcome resolution loop are not yet wired to live traffic. The `AM_ATC_WRITE_MODE` env var (off/shadow/live) gates this pipeline; default is `off`. Until `br-bn0vb` (ATC Learning Loop Closure) lands its Seam 6 validation, ATC operates on in-memory heuristics only — no durable learning, no cross-session memory, no production feedback calibration. Treat everything below as the implementation blueprint, not a description of current runtime behavior.
 
 The `br-0qt6e` ATC learning work is intentionally cross-cutting, but it should not be cross-owned. The codebase already has the right seams; future implementation should deepen those seams instead of spreading ATC state across tools, UI layers, or ad-hoc SQL in random crates.
 
