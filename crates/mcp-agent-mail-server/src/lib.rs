@@ -301,6 +301,13 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
             ) {
                 emit_tui_event(event);
             }
+            record_atc_message_observations_from_tool_contents(
+                self.tool_name,
+                Some(&call_arguments),
+                contents,
+                project.as_deref(),
+                agent.as_deref(),
+            );
         }
         emit_tui_event(tui_events::MailEvent::tool_call_end(
             self.tool_name,
@@ -384,6 +391,13 @@ impl<T: fastmcp::ToolHandler> fastmcp::ToolHandler for InstrumentedTool<T> {
                 ) {
                     emit_tui_event_async(event).await;
                 }
+                record_atc_message_observations_from_tool_contents(
+                    self.tool_name,
+                    Some(&call_arguments),
+                    contents,
+                    project.as_deref(),
+                    agent.as_deref(),
+                );
             }
             emit_tui_event_async(tui_events::MailEvent::tool_call_end(
                 self.tool_name,
@@ -9643,6 +9657,13 @@ to skip auth for local requests.</p>
 
                 // Register agent in ATC on successful register_agent / macro_start_session.
                 if matches!(tool_name.as_str(), "register_agent" | "macro_start_session")
+                record_atc_message_observations_from_tool_result(
+                    &tool_name,
+                    call_arguments.as_ref(),
+                    &value,
+                    project_hint.as_deref(),
+                    agent_hint.as_deref(),
+                );
                     && let Some(ref agent) = agent_hint
                 {
                     let program =
@@ -10066,6 +10087,445 @@ fn message_sent_event_from_payload(
         .and_then(serde_json::Value::as_str)
         .filter(|s| !s.is_empty())
         .or(fallback_sender)
+const ATC_MESSAGE_OBSERVATION_CACHE_CAPACITY: usize = 8192;
+
+static ATC_MESSAGE_OBSERVATION_CACHE: std::sync::LazyLock<
+    Mutex<(HashSet<String>, VecDeque<String>)>,
+> = std::sync::LazyLock::new(|| Mutex::new((HashSet::new(), VecDeque::new())));
+
+fn normalize_atc_thread_id(thread_id: Option<&str>) -> Option<&str> {
+    thread_id.filter(|value| !value.is_empty() && *value != "unthreaded")
+}
+
+fn atc_message_controller_mode(summary: Option<&atc::AtcSummarySnapshot>) -> u8 {
+    match summary.map(|value| value.budget.mode.as_str()) {
+        Some("pressure") => 1,
+        Some("conservative") => 2,
+        _ => 0,
+    }
+}
+
+fn atc_message_feature_vector(
+    summary: Option<&atc::AtcSummarySnapshot>,
+    throughput_per_min: u8,
+    inbox_depth: u8,
+) -> FeatureVector {
+    let mut features = FeatureVector::zeroed();
+    features.observation_count = 1;
+    features.throughput_per_min = throughput_per_min;
+    features.inbox_depth = inbox_depth;
+    features.calibration_healthy = summary.is_none_or(|value| !value.eprocess_alert);
+    features.safe_mode_active = summary.is_some_and(|value| value.safe_mode);
+    features.tick_utilization_bp = summary.map_or(0, |value| {
+        prob_to_bp(value.budget.utilization_ratio.clamp(0.0, 1.0))
+    });
+    features.controller_mode = atc_message_controller_mode(summary);
+    features.risk_tier = FeatureVector::risk_tier_for(EffectKind::Advisory);
+    features
+}
+
+fn atc_message_observation_numeric_id(namespace: &str, observation_key: &str) -> u64 {
+    (stable_fnv1a64(format!("{namespace}:{observation_key}").as_bytes()) & (i64::MAX as u64)).max(1)
+}
+
+fn claim_atc_message_observation(observation_key: &str) -> bool {
+    let mut guard = ATC_MESSAGE_OBSERVATION_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (seen, order) = &mut *guard;
+    if !seen.insert(observation_key.to_string()) {
+        return false;
+    }
+    order.push_back(observation_key.to_string());
+    while order.len() > ATC_MESSAGE_OBSERVATION_CACHE_CAPACITY {
+        if let Some(expired) = order.pop_front() {
+            seen.remove(&expired);
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+fn reset_atc_message_observation_cache_for_test() {
+    let mut guard = ATC_MESSAGE_OBSERVATION_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.0.clear();
+    guard.1.clear();
+}
+
+fn append_atc_message_observation_row(
+    pool: &mcp_agent_mail_db::DbPool,
+    row: &ExperienceRow,
+    observation_family: &str,
+) {
+    if !atc_durable_experience_store_writable(pool) {
+        return;
+    }
+    let started_at = Instant::now();
+    let stratum_key = atc_experience_stratum_key(row);
+    let feature_vector_size = atc_feature_vector_size(row);
+    let cx = Cx::for_request_with_budget(Budget::INFINITE);
+    match block_on(mcp_agent_mail_db::queries::append_atc_experience(
+        &cx, pool, row,
+    )) {
+        asupersync::Outcome::Ok(stored) => {
+            let latency_micros = elapsed_micros(started_at);
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_experience_written(observation_family, &stratum_key);
+            tracing::debug!(
+                event = "atc.message_observation.append",
+                observation_family,
+                experience_id = stored.experience_id,
+                decision_class = %stored.decision_class,
+                subject = %stored.subject,
+                project_slug = %atc_effect_project_slug(stored.project_key.as_deref()),
+                stratum = %stratum_key,
+                feature_vector_size,
+                latency_micros,
+                "ATC message observation appended"
+            );
+        }
+        asupersync::Outcome::Err(error) => {
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_derivation_error("message_observation_append");
+            tracing::warn!(
+                event = "atc.message_observation.append",
+                observation_family,
+                decision_class = %row.decision_class,
+                subject = %row.subject,
+                project_slug = %atc_effect_project_slug(row.project_key.as_deref()),
+                %error,
+                "failed to append ATC message observation"
+            );
+        }
+        asupersync::Outcome::Cancelled(reason) => {
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_derivation_error("message_observation_cancelled");
+            tracing::warn!(
+                event = "atc.message_observation.append",
+                observation_family,
+                decision_class = %row.decision_class,
+                subject = %row.subject,
+                reason,
+                "ATC message observation append cancelled"
+            );
+        }
+        asupersync::Outcome::Panicked(_) => {
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_derivation_error("message_observation_panicked");
+            tracing::warn!(
+                event = "atc.message_observation.append",
+                observation_family,
+                decision_class = %row.decision_class,
+                subject = %row.subject,
+                "ATC message observation append panicked"
+            );
+        }
+    }
+}
+
+fn build_message_sent_observation_row(
+    project: &str,
+    message_id: i64,
+    from: &str,
+    recipients: &[String],
+    thread_id: Option<&str>,
+    payload: &serde_json::Value,
+    timestamp_micros: i64,
+) -> ExperienceRow {
+    let summary = atc::atc_summary();
+    let subject = payload
+        .get("subject")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let observation_key = format!("message_sent:{project}:{message_id}:{from}");
+    let decision_id = atc_message_observation_numeric_id("decision", &observation_key);
+    let effect_id = atc_message_observation_numeric_id("effect", &observation_key);
+    let features = atc_message_feature_vector(summary.as_ref(), 1, 0);
+    let calibration_healthy = features.calibration_healthy;
+    let safe_mode_active = features.safe_mode_active;
+    let mut row = ExperienceBuilder::new(
+        decision_id,
+        effect_id,
+        format!(
+            "trc-{:016x}",
+            stable_fnv1a64(format!("trace:{observation_key}").as_bytes())
+        ),
+        format!(
+            "clm-{:016x}",
+            stable_fnv1a64(format!("claim:{observation_key}").as_bytes())
+        ),
+        format!(
+            "evi-{:016x}",
+            stable_fnv1a64(format!("evidence:{observation_key}").as_bytes())
+        ),
+        ExperienceSubsystem::Synthesis,
+        "message_sent",
+        from,
+        EffectKind::Advisory,
+        "MessageSent",
+        vec![("observed".to_string(), 1.0)],
+        0.0,
+        format!("observed send_message success for message {message_id}"),
+        calibration_healthy,
+        safe_mode_active,
+    )
+    .project_key(project.to_string())
+    .features(features)
+    .context(serde_json::json!({
+        "message_id": message_id,
+        "thread_id": thread_id,
+        "sender": from,
+        "recipient_count": recipients.len(),
+        "ack_required": payload.get("ack_required").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        "importance": payload.get("importance").and_then(serde_json::Value::as_str),
+        "subject_hash": format!("{:016x}", stable_fnv1a64(subject.as_bytes())),
+    }))
+    .build(0, timestamp_micros);
+    row.state = ExperienceState::Executed;
+    row.dispatched_ts_micros = Some(timestamp_micros);
+    row.executed_ts_micros = Some(timestamp_micros);
+    row
+}
+
+fn build_message_received_observation_row(
+    project: &str,
+    message_id: i64,
+    agent: &str,
+    from: &str,
+    thread_id: Option<&str>,
+    payload: &serde_json::Value,
+    inbox_batch_size: usize,
+    timestamp_micros: i64,
+) -> ExperienceRow {
+    let summary = atc::atc_summary();
+    let subject = payload
+        .get("subject")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let observation_key = format!("message_received:{project}:{message_id}:{agent}");
+    let decision_id = atc_message_observation_numeric_id("decision", &observation_key);
+    let effect_id = atc_message_observation_numeric_id("effect", &observation_key);
+    let inbox_depth = u8::try_from(inbox_batch_size).unwrap_or(u8::MAX);
+    let features = atc_message_feature_vector(summary.as_ref(), 0, inbox_depth);
+    let calibration_healthy = features.calibration_healthy;
+    let safe_mode_active = features.safe_mode_active;
+    let mut row = ExperienceBuilder::new(
+        decision_id,
+        effect_id,
+        format!(
+            "trc-{:016x}",
+            stable_fnv1a64(format!("trace:{observation_key}").as_bytes())
+        ),
+        format!(
+            "clm-{:016x}",
+            stable_fnv1a64(format!("claim:{observation_key}").as_bytes())
+        ),
+        format!(
+            "evi-{:016x}",
+            stable_fnv1a64(format!("evidence:{observation_key}").as_bytes())
+        ),
+        ExperienceSubsystem::Synthesis,
+        "message_received",
+        agent,
+        EffectKind::Advisory,
+        "MessageReceived",
+        vec![("observed".to_string(), 1.0)],
+        0.0,
+        format!("observed fetch_inbox receipt for message {message_id}"),
+        calibration_healthy,
+        safe_mode_active,
+    )
+    .project_key(project.to_string())
+    .features(features)
+    .context(serde_json::json!({
+        "message_id": message_id,
+        "thread_id": thread_id,
+        "agent": agent,
+        "from": from,
+        "inbox_batch_size": inbox_batch_size,
+        "subject_hash": format!("{:016x}", stable_fnv1a64(subject.as_bytes())),
+    }))
+    .build(0, timestamp_micros);
+    row.state = ExperienceState::Executed;
+    row.dispatched_ts_micros = Some(timestamp_micros);
+    row.executed_ts_micros = Some(timestamp_micros);
+    row
+}
+
+fn record_send_message_observation(
+    payload: &serde_json::Value,
+    project_hint: Option<&str>,
+    fallback_sender: Option<&str>,
+    atc_db_pool: Option<&mcp_agent_mail_db::DbPool>,
+) {
+    let Some((message_id, project, sent_event)) =
+        message_sent_event_from_payload(payload, project_hint, fallback_sender)
+    else {
+        return;
+    };
+    let (from, thread_id) = match &sent_event {
+        tui_events::MailEvent::MessageSent {
+            from, thread_id, ..
+        } => (from.clone(), thread_id.clone()),
+        _ => return,
+    };
+    let recipients = message_recipients_from_payload(payload);
+    let normalized_thread = normalize_atc_thread_id(Some(thread_id.as_str()));
+    let observation_key = format!("message_sent:{project}:{message_id}:{from}");
+    if !claim_atc_message_observation(&observation_key) {
+        return;
+    }
+    let timestamp_micros = mcp_agent_mail_db::now_micros();
+    atc::atc_note_message_sent(&from, &recipients, normalized_thread, timestamp_micros);
+    if let Some(pool) = atc_db_pool {
+        let row = build_message_sent_observation_row(
+            &project,
+            message_id,
+            &from,
+            &recipients,
+            normalized_thread,
+            payload,
+            timestamp_micros,
+        );
+        append_atc_message_observation_row(pool, &row, "message_sent");
+    }
+}
+
+fn record_fetch_inbox_message_observation(
+    project: &str,
+    agent: &str,
+    payload: &serde_json::Value,
+    inbox_batch_size: usize,
+    atc_db_pool: Option<&mcp_agent_mail_db::DbPool>,
+) {
+    let Some(message_id) = json_i64_field(payload, "id") else {
+        return;
+    };
+    let from = payload
+        .get("from")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let thread_id = payload.get("thread_id").and_then(serde_json::Value::as_str);
+    let normalized_thread = normalize_atc_thread_id(thread_id);
+    let observation_key = format!("message_received:{project}:{message_id}:{agent}");
+    if !claim_atc_message_observation(&observation_key) {
+        return;
+    }
+    let timestamp_micros = mcp_agent_mail_db::now_micros();
+    atc::atc_note_message_received(agent, normalized_thread, timestamp_micros);
+    if let Some(pool) = atc_db_pool {
+        let row = build_message_received_observation_row(
+            project,
+            message_id,
+            agent,
+            from,
+            normalized_thread,
+            payload,
+            inbox_batch_size,
+            timestamp_micros,
+        );
+        append_atc_message_observation_row(pool, &row, "message_received");
+    }
+}
+
+fn record_atc_message_observations_from_tool_payload_with_pool(
+    tool_name: &str,
+    call_args: Option<&serde_json::Value>,
+    payload: &serde_json::Value,
+    project_hint: Option<&str>,
+    agent_hint: Option<&str>,
+    atc_db_pool: Option<&mcp_agent_mail_db::DbPool>,
+) {
+    let config = mcp_agent_mail_core::Config::get();
+    if config.atc_write_mode.is_off() {
+        return;
+    }
+    let ctx = resolve_domain_event_context(call_args, project_hint, agent_hint);
+    match tool_name {
+        "send_message" | "reply_message" => {
+            if let Some(deliveries) = payload
+                .get("deliveries")
+                .and_then(serde_json::Value::as_array)
+            {
+                for delivery in deliveries.iter().take(32) {
+                    let delivery_project = delivery
+                        .get("project")
+                        .and_then(serde_json::Value::as_str)
+                        .or(ctx.project.as_deref());
+                    let msg_payload = delivery.get("payload").unwrap_or(payload);
+                    record_send_message_observation(
+                        msg_payload,
+                        delivery_project,
+                        ctx.agent.as_deref(),
+                        atc_db_pool,
+                    );
+                }
+            } else {
+                record_send_message_observation(
+                    payload,
+                    ctx.project.as_deref(),
+                    ctx.agent.as_deref(),
+                    atc_db_pool,
+                );
+            }
+        }
+        "fetch_inbox" | "fetch_inbox_product" => {
+            let Some(project) = ctx.project.as_deref().or(project_hint) else {
+                return;
+            };
+            let Some(agent) = ctx.agent.as_deref() else {
+                return;
+            };
+            let Some(messages) = payload.as_array() else {
+                return;
+            };
+            let inbox_batch_size = messages.len();
+            for message in messages.iter().take(16) {
+                record_fetch_inbox_message_observation(
+                    project,
+                    agent,
+                    message,
+                    inbox_batch_size,
+                    atc_db_pool,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn record_atc_message_observations_from_tool_payload(
+    tool_name: &str,
+    call_args: Option<&serde_json::Value>,
+    payload: &serde_json::Value,
+    project_hint: Option<&str>,
+    agent_hint: Option<&str>,
+) {
+    let config = mcp_agent_mail_core::Config::get();
+    if config.atc_write_mode.is_off() {
+        return;
+    }
+    let atc_db_pool = if config.atc_write_mode.is_live() {
+        get_or_create_pool(&DbPoolConfig::from_env()).ok()
+    } else {
+        None
+    };
+    record_atc_message_observations_from_tool_payload_with_pool(
+        tool_name,
+        call_args,
+        payload,
+        project_hint,
+        agent_hint,
+        atc_db_pool.as_ref(),
+    );
+}
+
         .unwrap_or("unknown")
         .to_string();
     let to = json_string_vec_field(payload, "to");
@@ -10691,6 +11151,24 @@ fn apply_toon_to_content(
     content_key: &str,
     format_value: &str,
     config: &mcp_agent_mail_core::Config,
+fn record_atc_message_observations_from_tool_result(
+    tool_name: &str,
+    call_args: Option<&serde_json::Value>,
+    call_result: &serde_json::Value,
+    project_hint: Option<&str>,
+    agent_hint: Option<&str>,
+) {
+    let payload =
+        parse_call_tool_result_payload(call_result).unwrap_or_else(|| call_result.clone());
+    record_atc_message_observations_from_tool_payload(
+        tool_name,
+        call_args,
+        &payload,
+        project_hint,
+        agent_hint,
+    );
+}
+
 ) {
     let Ok(decision) = mcp_agent_mail_core::toon::resolve_output_format(Some(format_value), config)
     else {
@@ -10715,6 +11193,30 @@ fn apply_toon_to_content(
         }
         let Some(text_str) = block.get("text").and_then(|t| t.as_str()) else {
             continue;
+fn record_atc_message_observations_from_tool_contents(
+    tool_name: &str,
+    call_args: Option<&serde_json::Value>,
+    contents: &[Content],
+    project_hint: Option<&str>,
+    agent_hint: Option<&str>,
+) {
+    for content in contents {
+        let Content::Text { text } = content else {
+            continue;
+        };
+        if let Some(payload) = parse_text_payload_json(text) {
+            record_atc_message_observations_from_tool_payload(
+                tool_name,
+                call_args,
+                &payload,
+                project_hint,
+                agent_hint,
+            );
+            return;
+        }
+    }
+}
+
         };
         // Try to parse the text as JSON
         let payload: serde_json::Value = match serde_json::from_str(text_str) {
@@ -22230,6 +22732,209 @@ first body
         let call_result = serde_json::json!({
             "structuredContent": payload
         });
+    fn atc_message_test_pool() -> mcp_agent_mail_db::DbPool {
+        create_pool(&DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            min_connections: 0,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        })
+        .expect("create ATC message test pool")
+    }
+
+    #[test]
+    fn send_message_atc_observation_appends_once() {
+        let _guard = atc::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_atc_message_observation_cache_for_test();
+        mcp_agent_mail_core::Config::reset_cached();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ATC_WRITE_MODE", "live")],
+            || {
+                mcp_agent_mail_core::Config::reset_cached();
+                let pool = atc_message_test_pool();
+                let cx = Cx::for_testing();
+                let payload = serde_json::json!({
+                    "deliveries": [{
+                        "project": "/tmp/alpha",
+                        "payload": {
+                            "id": 4201,
+                            "from": "RedFox",
+                            "to": ["BlueLake"],
+                            "cc": ["GrayWolf"],
+                            "subject": "Seam 3.1 send",
+                            "thread_id": "br-bn0vb.6",
+                            "ack_required": true,
+                            "importance": "high"
+                        }
+                    }],
+                    "count": 1
+                });
+
+                record_atc_message_observations_from_tool_payload_with_pool(
+                    "send_message",
+                    None,
+                    &payload,
+                    None,
+                    Some("RedFox"),
+                    Some(&pool),
+                );
+
+                let rows = block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
+                    &cx,
+                    &pool,
+                    Some("RedFox"),
+                    10,
+                ))
+                .into_result()
+                .expect("fetch send ATC experiences");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].decision_class, "message_sent");
+                assert_eq!(rows[0].state, ExperienceState::Executed);
+                assert_eq!(
+                    rows[0]
+                        .context
+                        .as_ref()
+                        .and_then(|value| value.get("message_id"))
+                        .and_then(serde_json::Value::as_i64),
+                    Some(4201)
+                );
+                assert_eq!(
+                    rows[0]
+                        .context
+                        .as_ref()
+                        .and_then(|value| value.get("recipient_count"))
+                        .and_then(serde_json::Value::as_u64),
+                    Some(2)
+                );
+
+                record_atc_message_observations_from_tool_payload_with_pool(
+                    "send_message",
+                    None,
+                    &payload,
+                    None,
+                    Some("RedFox"),
+                    Some(&pool),
+                );
+
+                let replay_rows = block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
+                    &cx,
+                    &pool,
+                    Some("RedFox"),
+                    10,
+                ))
+                .into_result()
+                .expect("fetch replayed send ATC experiences");
+                assert_eq!(replay_rows.len(), 1);
+            },
+        );
+
+        mcp_agent_mail_core::Config::reset_cached();
+        reset_atc_message_observation_cache_for_test();
+    }
+
+    #[test]
+    fn fetch_inbox_atc_observation_appends_one_row_per_message() {
+        let _guard = atc::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_atc_message_observation_cache_for_test();
+        mcp_agent_mail_core::Config::reset_cached();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ATC_WRITE_MODE", "live")],
+            || {
+                mcp_agent_mail_core::Config::reset_cached();
+                let pool = atc_message_test_pool();
+                let cx = Cx::for_testing();
+                let call_args = serde_json::json!({
+                    "project_key": "/tmp/alpha",
+                    "agent_name": "BlueLake"
+                });
+                let payload = serde_json::json!([
+                    {
+                        "id": 5101,
+                        "from": "RedFox",
+                        "subject": "one",
+                        "thread_id": "br-bn0vb.6"
+                    },
+                    {
+                        "id": 5102,
+                        "from": "GrayWolf",
+                        "subject": "two",
+                        "thread_id": "br-bn0vb.6"
+                    },
+                    {
+                        "id": 5103,
+                        "from": "IvorySummit",
+                        "subject": "three",
+                        "thread_id": "br-bn0vb.6"
+                    }
+                ]);
+
+                record_atc_message_observations_from_tool_payload_with_pool(
+                    "fetch_inbox",
+                    Some(&call_args),
+                    &payload,
+                    None,
+                    None,
+                    Some(&pool),
+                );
+
+                let rows = block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
+                    &cx,
+                    &pool,
+                    Some("BlueLake"),
+                    10,
+                ))
+                .into_result()
+                .expect("fetch inbox ATC experiences");
+                assert_eq!(rows.len(), 3);
+                assert!(
+                    rows.iter()
+                        .all(|row| row.decision_class == "message_received")
+                );
+                assert!(
+                    rows.iter()
+                        .all(|row| row.state == ExperienceState::Executed)
+                );
+                assert_eq!(
+                    rows[0]
+                        .context
+                        .as_ref()
+                        .and_then(|value| value.get("inbox_batch_size"))
+                        .and_then(serde_json::Value::as_u64),
+                    Some(3)
+                );
+
+                record_atc_message_observations_from_tool_payload_with_pool(
+                    "fetch_inbox",
+                    Some(&call_args),
+                    &payload,
+                    None,
+                    None,
+                    Some(&pool),
+                );
+
+                let replay_rows = block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
+                    &cx,
+                    &pool,
+                    Some("BlueLake"),
+                    10,
+                ))
+                .into_result()
+                .expect("fetch replayed inbox ATC experiences");
+                assert_eq!(replay_rows.len(), 3);
+            },
+        );
+
+        mcp_agent_mail_core::Config::reset_cached();
+        reset_atc_message_observation_cache_for_test();
+    }
+
 
         let events =
             derive_domain_events_from_tool_result("send_message", None, &call_result, None, None);
