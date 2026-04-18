@@ -740,11 +740,7 @@ fn e2e_message_learning_loop_covers_ack_and_ack_overdue_branches() {
             // unit tests. Drive the same sweep directly here so this E2E stays
             // deterministic while still validating the end-to-end learning
             // pipeline from tool call to resolved ATC snapshot.
-            run_atc_resolution_sweep_for_integration_test(
-                &db_pool,
-                now_micros(),
-                600_000_000,
-            );
+            run_atc_resolution_sweep_for_integration_test(&db_pool, now_micros(), 600_000_000);
 
             let overdue_row =
                 wait_for_message_outcome(&runtime, &cx, &db_pool, message_two_id, "ack_overdue");

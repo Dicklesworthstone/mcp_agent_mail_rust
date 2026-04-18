@@ -24666,6 +24666,79 @@ first body
     }
 
     #[test]
+    fn build_slot_atc_observations_dedupe_duplicate_acquire_payloads() {
+        let _guard = atc::GLOBAL_ATC_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_atc_build_slot_observation_cache_for_test();
+        mcp_agent_mail_core::Config::reset_cached();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ATC_WRITE_MODE", "live"), ("WORKTREES_ENABLED", "true")],
+            || {
+                mcp_agent_mail_core::Config::reset_cached();
+                let pool = atc_message_test_pool();
+                let cx = Cx::for_testing();
+
+                let acquire_args = serde_json::json!({
+                    "project_key": "/tmp/alpha",
+                    "agent_name": "GoldFox",
+                    "slot": "cargo-build",
+                    "ttl_seconds": 300,
+                    "exclusive": true
+                });
+                let acquire_payload = serde_json::json!({
+                    "granted": {
+                        "slot": "cargo-build",
+                        "agent": "GoldFox",
+                        "branch": "main",
+                        "exclusive": true,
+                        "acquired_ts": "2026-04-18T20:41:00Z",
+                        "expires_ts": "2026-04-18T20:46:00Z"
+                    },
+                    "conflicts": []
+                });
+
+                record_atc_build_slot_observations_from_tool_payload_with_pool(
+                    "acquire_build_slot",
+                    Some(&acquire_args),
+                    &acquire_payload,
+                    None,
+                    None,
+                    Some(&pool),
+                );
+                record_atc_build_slot_observations_from_tool_payload_with_pool(
+                    "acquire_build_slot",
+                    Some(&acquire_args),
+                    &acquire_payload,
+                    None,
+                    None,
+                    Some(&pool),
+                );
+
+                let rows = block_on(mcp_agent_mail_db::queries::fetch_open_atc_experiences(
+                    &cx,
+                    &pool,
+                    Some("GoldFox"),
+                    10,
+                ))
+                .into_result()
+                .expect("fetch build slot ATC experiences");
+
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "duplicate acquire payloads should be coalesced by the build-slot observation cache"
+                );
+                assert_eq!(rows[0].decision_class, "build_slot_acquired");
+            },
+        );
+
+        mcp_agent_mail_core::Config::reset_cached();
+        reset_atc_build_slot_observation_cache_for_test();
+    }
+
+    #[test]
     fn send_message_atc_observation_appends_once() {
         let _guard = atc::GLOBAL_ATC_TEST_LOCK
             .lock()

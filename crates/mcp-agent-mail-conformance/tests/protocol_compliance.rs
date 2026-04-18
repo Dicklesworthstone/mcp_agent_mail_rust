@@ -5,7 +5,7 @@ use fastmcp_transport::http::{
     HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler, HttpTransport,
 };
 use mcp_agent_mail_core::Config;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{Cursor, Write};
 use std::sync::{Arc, Mutex};

@@ -12,16 +12,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::{Cx, Outcome};
-use mcp_agent_mail_core::atc_retention::{retention_rule, LearningArtifactKind};
+use mcp_agent_mail_core::atc_retention::{LearningArtifactKind, retention_rule};
 use mcp_agent_mail_core::{
     EffectKind, ExperienceOutcome, ExperienceRow, ExperienceState, ExperienceSubsystem,
 };
 use mcp_agent_mail_db::atc_queries::{
-    query_open_experiences, query_rollups, refresh_rollups, replay, retention_compact,
-    OpenExperienceFilter, SequenceRange,
+    OpenExperienceFilter, SequenceRange, query_open_experiences, query_rollups, refresh_rollups,
+    replay, retention_compact,
 };
 use mcp_agent_mail_db::queries::insert_experience;
-use mcp_agent_mail_db::{schema, DbError, DbPool, DbPoolConfig, RollupEntry};
+use mcp_agent_mail_db::{DbError, DbPool, DbPoolConfig, RollupEntry, schema};
 use tempfile::TempDir;
 
 const MICROS_PER_DAY: i64 = 86_400_000_000;
@@ -290,9 +290,11 @@ fn atc_retention_compaction_soak_preserves_rollups_and_open_rows() {
             "query open experiences during soak accumulation",
         );
         assert_eq!(open_rows.len(), (day_index + 1) * DAILY_OPEN_ROWS);
-        assert!(open_rows
-            .iter()
-            .all(|row| row.state == ExperienceState::Open));
+        assert!(
+            open_rows
+                .iter()
+                .all(|row| row.state == ExperienceState::Open)
+        );
 
         expect_outcome(
             runtime.block_on(refresh_rollups(&cx, &pool, now, lookback_micros)),

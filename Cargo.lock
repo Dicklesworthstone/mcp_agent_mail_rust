@@ -2199,6 +2199,7 @@ dependencies = [
  "hashbrown 0.14.5",
  "serde",
  "tracing",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -4772,6 +4773,7 @@ dependencies = [
  "clap",
  "fastmcp-core",
  "fastmcp-rust",
+ "fastmcp-transport",
  "indexmap",
  "insta",
  "mcp-agent-mail-core",

@@ -11,7 +11,7 @@ use ftui::KeyCode;
 use serde::{Deserialize, Serialize};
 
 use crate::tui_screens::{
-    ScreenCategory, ALL_SCREEN_IDS, jump_key_label_for_screen, jump_key_legend, screen_meta,
+    ALL_SCREEN_IDS, ScreenCategory, jump_key_label_for_screen, jump_key_legend, screen_meta,
 };
 
 const GLOBAL_HELP_MARKDOWN: &str = include_str!("../../../docs/TUI_HELP.md");
@@ -770,7 +770,7 @@ impl HelpSection {
 mod tests {
     use super::*;
     use crate::tui_screens::{
-        MailScreen, ALL_SCREEN_IDS, agents::AgentsScreen, dashboard::DashboardScreen,
+        ALL_SCREEN_IDS, MailScreen, agents::AgentsScreen, dashboard::DashboardScreen,
         messages::MessageBrowserScreen, reservations::ReservationsScreen,
         system_health::SystemHealthScreen, threads::ThreadExplorerScreen, timeline::TimelineScreen,
         tool_metrics::ToolMetricsScreen,

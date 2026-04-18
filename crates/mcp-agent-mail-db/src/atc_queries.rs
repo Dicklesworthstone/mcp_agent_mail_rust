@@ -347,8 +347,8 @@ fn apply_resolved_outcome(entry: &mut RollupEntry, outcome: Option<ExperienceOut
         return;
     }
     let one_minus_lambda = 1.0 - EWMA_LAMBDA;
-    entry.ewma_loss = (EWMA_LAMBDA * entry.ewma_loss) + (one_minus_lambda * actual_loss);
-    entry.ewma_weight = (EWMA_LAMBDA * entry.ewma_weight) + 1.0;
+    entry.ewma_loss = EWMA_LAMBDA.mul_add(entry.ewma_loss, one_minus_lambda * actual_loss);
+    entry.ewma_weight = EWMA_LAMBDA.mul_add(entry.ewma_weight, 1.0);
 }
 
 fn accumulate_rollup_row(
@@ -620,7 +620,7 @@ fn query_rollups_canonical(pool: &DbPool) -> Result<Vec<RollupEntry>, DbError> {
             &[],
             "query_rollups",
         )?;
-        Ok(rows.iter().map(|r| decode_rollup_row(r)).collect())
+        Ok(rows.iter().map(decode_rollup_row).collect())
     })();
     crate::queries::close_canonical_db_conn(conn, "query_rollups connection");
     result
@@ -644,7 +644,7 @@ pub async fn query_rollups(cx: &Cx, pool: &DbPool) -> Outcome<Vec<RollupEntry>, 
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
     match conn.query_sync(ROLLUP_SELECT_SQL, &[]) {
-        Ok(rows) => Outcome::Ok(rows.iter().map(|r| decode_rollup_row(r)).collect()),
+        Ok(rows) => Outcome::Ok(rows.iter().map(decode_rollup_row).collect()),
         Err(error) => Outcome::Err(DbError::Sqlite(format!("query_rollups: {error}"))),
     }
 }
@@ -894,7 +894,8 @@ fn build_open_experience_query(
     }
     sql.push_str(" ORDER BY created_ts DESC, experience_id DESC");
     if let Some(limit) = filter.limit {
-        sql.push_str(&format!(" LIMIT {limit}"));
+        use std::fmt::Write;
+        let _ = write!(sql, " LIMIT {limit}");
     }
     Ok((sql, params))
 }
@@ -903,21 +904,21 @@ fn build_replay_query(range: SequenceRange) -> Result<(String, Vec<Value>), DbEr
     let (from_seq, to_seq) = range.sql_bounds()?;
     let mut sql = String::from(crate::queries::ATC_EXPERIENCE_SELECT_COLUMNS_SQL);
     let mut params = Vec::new();
-    if from_seq.is_some() || to_seq.is_some() {
-        sql.push_str(" WHERE ");
-        let mut wrote_any = false;
-        if let Some(from_seq) = from_seq {
-            sql.push_str("experience_id >= ?");
-            params.push(Value::BigInt(from_seq));
-            wrote_any = true;
+    match (from_seq, to_seq) {
+        (Some(from), Some(to)) => {
+            sql.push_str(" WHERE experience_id >= ? AND experience_id <= ?");
+            params.push(Value::BigInt(from));
+            params.push(Value::BigInt(to));
         }
-        if let Some(to_seq) = to_seq {
-            if wrote_any {
-                sql.push_str(" AND ");
-            }
-            sql.push_str("experience_id <= ?");
-            params.push(Value::BigInt(to_seq));
+        (Some(from), None) => {
+            sql.push_str(" WHERE experience_id >= ?");
+            params.push(Value::BigInt(from));
         }
+        (None, Some(to)) => {
+            sql.push_str(" WHERE experience_id <= ?");
+            params.push(Value::BigInt(to));
+        }
+        (None, None) => {}
     }
     sql.push_str(" ORDER BY experience_id ASC");
     Ok((sql, params))
@@ -1051,6 +1052,7 @@ fn retention_compact_canonical(pool: &DbPool, cutoff_ts_micros: i64) -> Result<u
             "retention_compact delete",
         )?;
         crate::queries::commit_canonical_atc_write_tx(&conn)?;
+        #[allow(clippy::cast_possible_truncation)]
         Ok(deleted as usize)
     })();
     if result.is_err() {
@@ -1075,18 +1077,7 @@ pub async fn retention_compact(
     }
 
     let cutoff_ts_micros = crate::now_micros().saturating_sub(max_age_micros);
-    let deleted_rows = if pool.sqlite_path() != ":memory:" {
-        match crate::queries::ensure_file_backed_atc_pool_initialized(cx, pool).await {
-            Outcome::Ok(()) => {}
-            Outcome::Err(error) => return Outcome::Err(error),
-            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
-            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
-        }
-        match retention_compact_canonical(pool, cutoff_ts_micros) {
-            Ok(rows) => rows,
-            Err(error) => return Outcome::Err(error),
-        }
-    } else {
+    let deleted_rows = if pool.sqlite_path() == ":memory:" {
         let conn = match pool.acquire(cx).await {
             Outcome::Ok(c) => c,
             Outcome::Err(error) => return Outcome::Err(DbError::Sqlite(error.to_string())),
@@ -1100,12 +1091,24 @@ pub async fn retention_compact(
                AND resolved_ts <= ?",
             &[Value::BigInt(cutoff_ts_micros)],
         ) {
+            #[allow(clippy::cast_possible_truncation)]
             Ok(rows) => rows as usize,
             Err(error) => {
                 return Outcome::Err(DbError::Sqlite(format!(
                     "retention_compact delete: {error}"
                 )));
             }
+        }
+    } else {
+        match crate::queries::ensure_file_backed_atc_pool_initialized(cx, pool).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+        match retention_compact_canonical(pool, cutoff_ts_micros) {
+            Ok(rows) => rows,
+            Err(error) => return Outcome::Err(error),
         }
     };
 
@@ -1200,12 +1203,21 @@ fn parse_effect_kind(raw: &str) -> Option<EffectKind> {
     }
 }
 
+fn experience_resolution_anchor_micros(exp: &OpenExperienceSummary) -> i64 {
+    exp.executed_ts_micros
+        .or(exp.dispatched_ts_micros)
+        .unwrap_or(exp.created_ts_micros)
+}
+
 /// Identify open experiences whose attribution window has elapsed.
 ///
-/// Scans all non-terminal experiences and compares each row's
-/// `created_ts_micros + attribution_window(effect_kind).max_window_micros`
-/// against `now_micros`.  Returns candidates suitable for
+/// Scans all non-terminal experiences and compares each row's execution
+/// anchor (`executed_ts_micros`, then `dispatched_ts_micros`, then
+/// `created_ts_micros`) plus
+/// `attribution_window(effect_kind).max_window_micros` against `now_micros`.
+/// Returns candidates suitable for
 /// `resolve_experience(..., ResolutionKind::Expired { ts_micros })`.
+#[must_use]
 pub fn find_expired_experiences(
     open: &[OpenExperienceSummary],
     now_micros: i64,
@@ -1217,8 +1229,7 @@ pub fn find_expired_experiences(
             None => continue,
         };
         let window = attribution_window(kind);
-        let deadline = exp
-            .created_ts_micros
+        let deadline = experience_resolution_anchor_micros(exp)
             .saturating_add(window.max_window_micros);
         if now_micros >= deadline {
             #[allow(clippy::cast_sign_loss)]
@@ -1878,6 +1889,76 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "known design bug: refresh_rollups overwrites preserved compacted history"]
+    fn refresh_rollups_can_erase_compacted_history_for_touched_stratum() {
+        let pool = test_pool();
+        let max_age_micros = minimum_retention_compaction_age_micros().expect("policy age");
+        let now = crate::now_micros();
+        let old_resolved_ts = now - max_age_micros - 10_000_000;
+
+        let historical = TestExperienceSpec {
+            experience_id: 1,
+            subsystem: "liveness".to_string(),
+            effect_kind: "probe".to_string(),
+            state: "resolved".to_string(),
+            created_ts_micros: old_resolved_ts - 5_000,
+            resolved_ts_micros: Some(old_resolved_ts),
+            correct: Some(true),
+            actual_loss: Some(0.0),
+            regret: Some(0.0),
+        };
+        insert_experience(&pool, &historical);
+
+        run_refresh(&pool, now, now.max(1));
+        let baseline = rollups_by_key(fetch_rollups(&pool));
+        let baseline_probe = baseline
+            .get("liveness:probe:0")
+            .expect("baseline liveness probe rollup");
+        assert_eq!(baseline_probe.total_count, 1);
+        assert_eq!(baseline_probe.resolved_count, 1);
+
+        let summary = run_retention_compact(&pool, max_age_micros, true);
+        assert_eq!(summary.deleted_rows, 1);
+
+        let after_compaction = rollups_by_key(fetch_rollups(&pool));
+        let compacted_probe = after_compaction
+            .get("liveness:probe:0")
+            .expect("rollup should survive compaction");
+        assert_eq!(compacted_probe.total_count, 1);
+        assert_eq!(compacted_probe.resolved_count, 1);
+
+        let refreshed_now = now + 20_000_000;
+        let new_resolved_ts = refreshed_now - 1_000_000;
+        let new_row = TestExperienceSpec {
+            experience_id: 2,
+            subsystem: "liveness".to_string(),
+            effect_kind: "probe".to_string(),
+            state: "resolved".to_string(),
+            created_ts_micros: new_resolved_ts - 5_000,
+            resolved_ts_micros: Some(new_resolved_ts),
+            correct: Some(false),
+            actual_loss: Some(1.0),
+            regret: Some(0.25),
+        };
+        insert_experience(&pool, &new_row);
+
+        run_refresh(&pool, refreshed_now, refreshed_now.max(1));
+        let after_refresh = rollups_by_key(fetch_rollups(&pool));
+        let probe = after_refresh
+            .get("liveness:probe:0")
+            .expect("refreshed liveness probe rollup");
+
+        assert_eq!(
+            probe.total_count, 2,
+            "refresh should retain compacted historical totals and add the new row"
+        );
+        assert_eq!(
+            probe.resolved_count, 2,
+            "refresh should retain compacted resolved counts instead of recomputing from surviving raw rows only"
+        );
+    }
+
+    #[test]
     fn replay_returns_rows_in_stable_sequence_order() {
         let pool = test_pool();
         let specs = vec![
@@ -2225,6 +2306,38 @@ mod tests {
         let open = vec![make_open_summary(1, "probe", created)];
         let expired = find_expired_experiences(&open, now);
         assert_eq!(expired.len(), 1);
+    }
+
+    #[test]
+    fn find_expired_uses_execution_anchor_when_present() {
+        let created = 1_000_000;
+        let executed = created + 50_000_000;
+        let now = created + 100_000_000;
+        let mut row = make_open_summary(1, "probe", created);
+        row.executed_ts_micros = Some(executed);
+
+        let expired = find_expired_experiences(&[row], now);
+
+        assert!(
+            expired.is_empty(),
+            "probe attribution should start from execution time, not creation time"
+        );
+    }
+
+    #[test]
+    fn find_expired_falls_back_to_dispatch_anchor() {
+        let created = 1_000_000;
+        let dispatched = created + 45_000_000;
+        let now = created + 100_000_000;
+        let mut row = make_open_summary(1, "probe", created);
+        row.dispatched_ts_micros = Some(dispatched);
+
+        let expired = find_expired_experiences(&[row], now);
+
+        assert!(
+            expired.is_empty(),
+            "probe attribution should fall back to dispatch time before creation time"
+        );
     }
 
     #[test]

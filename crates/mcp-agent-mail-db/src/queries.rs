@@ -1123,7 +1123,7 @@ pub fn reprocess_atc_feature_schema(
                 parse_json_optional::<FeatureExtension>(row_opt_text(row, 3), "feature_ext_json")?;
             let migrated = migrate_feature_payload(
                 stored_schema_version,
-                features.clone(),
+                features,
                 feature_ext.clone(),
             )
             .map_err(|error| DbError::invalid("feature_schema_version", error.to_string()))?;
@@ -2545,6 +2545,7 @@ fn snapshot_atc_rollups_file_backed(
     let payload = serde_json::to_string(&rollups)
         .map_err(|e| DbError::Internal(format!("snapshot rollups serialize: {e}")))?;
     let sha256 = sha256_hex(&payload);
+    #[allow(clippy::cast_possible_wrap)]
     let row_count = rollups.len() as i64;
 
     let conn = open_canonical_atc_conn(pool, "snapshot_atc_rollups")?;
@@ -12029,6 +12030,7 @@ pub async fn snapshot_atc_rollups(
         }
     };
     let sha256 = sha256_hex(&payload);
+    #[allow(clippy::cast_possible_wrap)]
     let row_count = rollups.len() as i64;
 
     match traw_execute(

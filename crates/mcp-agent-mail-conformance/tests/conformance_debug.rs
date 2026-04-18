@@ -355,6 +355,7 @@ fn audit_doc_matches_live_inventory() {
     );
 }
 
+#[test]
 fn crate_readme_current_coverage_matches_audit_summary() {
     let readme = read_file(crate_root().join(README_RELATIVE));
     for needle in [

@@ -1166,7 +1166,14 @@ pub fn default_gates() -> Vec<GateConfig> {
         GateConfig::new(
             "Docs drift + resource coverage",
             GateCategory::Docs,
-            ["cargo", "test", "--test", "docs_drift_ci", "--", "--nocapture"],
+            [
+                "cargo",
+                "test",
+                "--test",
+                "docs_drift_ci",
+                "--",
+                "--nocapture",
+            ],
         ),
         GateConfig::new(
             "DB stress suite",

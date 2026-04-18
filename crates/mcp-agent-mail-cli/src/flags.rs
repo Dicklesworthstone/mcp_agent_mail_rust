@@ -190,16 +190,22 @@ fn render_flag_list(snapshots: &[FlagSnapshot], fmt: output::CliOutputFormat) ->
                     ]));
                 }
 
-                table
-                    .as_mut()
-                    .expect("table should be initialized for subsystem")
-                    .add_row(vec![
-                        snapshot.name.clone(),
-                        snapshot.current_value.clone(),
-                        snapshot.source.clone(),
-                        snapshot.stability.clone(),
-                        dynamic_display(snapshot).to_string(),
-                    ]);
+                let table = table.get_or_insert_with(|| {
+                    output::CliTable::new(vec![
+                        "NAME",
+                        "VALUE",
+                        "SOURCE",
+                        "STABILITY",
+                        "DYNAMIC",
+                    ])
+                });
+                table.add_row(vec![
+                    snapshot.name.clone(),
+                    snapshot.current_value.clone(),
+                    snapshot.source.clone(),
+                    snapshot.stability.clone(),
+                    dynamic_display(snapshot).to_string(),
+                ]);
             }
 
             if let Some(rendered) = table.take() {
@@ -487,6 +493,23 @@ mod tests {
     }
 
     #[test]
+    fn clap_parses_flags_off() {
+        let cli = crate::Cli::try_parse_from(["am", "flags", "off", "ATC_LEARNING_DISABLED"])
+            .expect("parse flags off");
+
+        match cli.command.expect("expected command") {
+            crate::Commands::Flags {
+                action: FlagsCommand::Off { name, format, json },
+            } => {
+                assert_eq!(name, "ATC_LEARNING_DISABLED");
+                assert!(format.is_none());
+                assert!(!json);
+            }
+            other => panic!("expected Flags Off, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn unknown_flag_reports_suggestion() {
         let error = handle_flags(FlagsCommand::Status {
             name: "ATC_LEARNING_DISABLE".to_string(),
@@ -526,6 +549,38 @@ mod tests {
                 let written = std::fs::read_to_string(&config_path).expect("read config env");
                 assert!(
                     written.contains("ATC_LEARNING_DISABLED=true"),
+                    "expected persisted toggle, got: {written}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn handle_flags_off_writes_console_persist_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.env");
+        std::fs::write(&config_path, "ATC_LEARNING_DISABLED=true\n").expect("seed config env");
+        let config_path_str = config_path.to_string_lossy().to_string();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("CONSOLE_PERSIST_PATH", &config_path_str)],
+            || {
+                let (result, output) = capture_output(|| {
+                    handle_flags(FlagsCommand::Off {
+                        name: "ATC_LEARNING_DISABLED".to_string(),
+                        format: Some(output::CliOutputFormat::Json),
+                        json: false,
+                    })
+                });
+                assert!(result.is_ok(), "flags off failed: {result:?}");
+                let parsed = extract_json(&output);
+                assert_eq!(parsed["name"], "ATC_LEARNING_DISABLED");
+                assert_eq!(parsed["current_value"], "false");
+                assert_eq!(parsed["source"], "config");
+
+                let written = std::fs::read_to_string(&config_path).expect("read config env");
+                assert!(
+                    written.contains("ATC_LEARNING_DISABLED=false"),
                     "expected persisted toggle, got: {written}"
                 );
             },

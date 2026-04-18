@@ -7213,6 +7213,37 @@ mod synthesis_tests {
     }
 
     #[test]
+    fn reservation_outcome_lost_to_ring_buffer_eviction() {
+        let mut engine = AtcEngine::new_for_testing();
+        // Agent releases a reservation — this is the outcome sweep needs.
+        engine.note_reservation_force_released(
+            "BlueLake",
+            &["src/**".to_string()],
+            "proj-alpha",
+            1_000_000,
+        );
+        // Attacker floods the ring buffer with grants from many agents,
+        // pushing BlueLake's force-release off the front.
+        for i in 0..MAX_RESERVATION_EVENT_LOG + 10 {
+            engine.note_reservation_granted(
+                &format!("Flood{i}"),
+                &["x/**".to_string()],
+                false,
+                "proj-alpha",
+                (2_000_000 + i) as i64,
+            );
+        }
+        // BlueLake's force-release is now evicted. Sweep can never find it.
+        let outcome = engine.reservation_outcome_for_agent("BlueLake", 0);
+        // This returns None — the outcome is permanently lost.
+        // Documenting the behavior; not a fix, just evidence.
+        assert_eq!(
+            outcome, None,
+            "force-release evicted by ring buffer flood — outcome permanently lost"
+        );
+    }
+
+    #[test]
     fn monotonicity_holds() {
         let mut summary = SessionSummary::default();
 

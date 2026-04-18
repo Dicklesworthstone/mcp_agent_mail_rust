@@ -40,10 +40,22 @@ fn is_register_retryable(err: &mcp_agent_mail_db::DbError) -> bool {
 }
 
 fn register_agent_retry_sleep_ms(attempt: u32, now_ns: u64) -> u64 {
-    let base_ms: u64 = 500u64 * u64::from(attempt + 1);
+    // 500ms / 1000ms / 1500ms / 2000ms ladder with truly symmetric ±20% jitter.
+    // The jitter has to go in both directions — a one-sided saturating_sub
+    // variant would only push the sleep later, which keeps same-tick retry
+    // batches in lock-step on the early half of each interval. Mapping the
+    // entropy into [0, 2*jitter] and re-centering at `jitter` gives full
+    // ±jitter coverage; saturating_{add,sub} keeps us safe on degenerate
+    // attempts near u64::MAX.
+    let base_ms: u64 = 500u64.saturating_mul(u64::from(attempt).saturating_add(1));
     let jitter = (base_ms / 5).max(1);
-    let delta = (now_ns % (jitter * 2)).saturating_sub(jitter);
-    base_ms.saturating_add(delta)
+    let span = jitter.saturating_mul(2).saturating_add(1);
+    let entropy = now_ns % span;
+    if entropy >= jitter {
+        base_ms.saturating_add(entropy - jitter)
+    } else {
+        base_ms.saturating_sub(jitter - entropy)
+    }
 }
 
 /// Build recovery status for the `health_check` response.
@@ -1863,10 +1875,12 @@ mod tests {
         assert!(is_register_retryable(&mcp_agent_mail_db::DbError::Pool(
             "database is busy".into()
         )));
-        assert!(!is_register_retryable(&mcp_agent_mail_db::DbError::NotFound {
-            entity: "agent".into(),
-            identifier: "BlueLake".into(),
-        }));
+        assert!(!is_register_retryable(
+            &mcp_agent_mail_db::DbError::NotFound {
+                entity: "agent".into(),
+                identifier: "BlueLake".into(),
+            }
+        ));
     }
 
     #[test]

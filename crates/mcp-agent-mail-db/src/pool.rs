@@ -6110,6 +6110,7 @@ fn compatible_cached_memory_pool(config: &DbPoolConfig) -> DbResult<Option<Arc<P
             Some(_) => return Ok(None),
         }
     }
+    drop(guard);
 
     Ok(candidate)
 }
