@@ -3391,6 +3391,11 @@ print('OK:inserted backup=' + backup)
 #   1 — skipped cleanly (claude CLI not installed — don't fail the install)
 #   2 — attempted but failed
 setup_claude_code_mcp_via_cli() {
+  # $1: bearer token to register (must match what the other MCP client configs
+  # in this installer run are using, so Claude Code and Codex/Cursor/etc. all
+  # agree on the same Authorization header).
+  local bearer_token="${1:-}"
+
   if ! command -v claude >/dev/null 2>&1; then
     verbose "setup_claude_code_mcp:skip reason=claude_cli_not_available"
     return 1
@@ -3398,8 +3403,6 @@ setup_claude_code_mcp_via_cli() {
 
   local desired_url
   desired_url="$(desired_mcp_http_url)"
-  local bearer_token
-  bearer_token="$(resolve_setup_http_bearer_token 2>/dev/null || true)"
 
   # `claude mcp list` exits non-zero if the config is uninitialized on first
   # run; treat both "missing" and "absent" the same — we'll add.
@@ -3459,8 +3462,10 @@ setup_mcp_configs() {
   # ~/.claude.json, which is the file Claude Code actually reads. Writing to
   # ~/.claude/settings.json is silently ignored (#97). We attempt this first
   # regardless of whether candidate files exist, because Claude Code doesn't
-  # surface in the candidate scan any more.
-  if setup_claude_code_mcp_via_cli; then
+  # surface in the candidate scan any more. Pass the same $bearer_token the
+  # rest of this function writes into other tools' configs so every MCP
+  # client in this install agrees on the same Authorization header.
+  if setup_claude_code_mcp_via_cli "$bearer_token"; then
     configured=$((configured + 1))
   fi
 
