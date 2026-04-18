@@ -17,6 +17,7 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 ### Documentation
 
 - **Documentation alignment sweep completed** (`br-o217s.7`). Final consistency checks removed stale count phrasing from the operator docs, updated the rollout playbook to the current 37-tool / 25-resource surface, clarified legacy incident notes as pre-16-screen historical artifacts, and kept the conformance audit/README aligned with the live router.
+- **Reality-check epilogue completed** (`br-ldpdv`). Re-ran the post-epic audit against the live repo surface, confirmed the five original reality-check epics are closed, fixed deferred-browser doc drift so `/mail/ws-state` stays documented as a supported robot/TUI polling endpoint while `/web-dashboard/*` and `/mail/ws-input` remain deferred, and found no new untracked gap category.
 
 ### Database
 
@@ -26,9 +27,11 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 - **Browser TUI mirror and WASM frontend deferred** (br-il53l). After evaluating the
   ship-or-retire decision (br-il53l.1), the browser TUI mirror (`/web-dashboard/*`,
-  `/mail/ws-state`, `/mail/ws-input`) and the standalone `mcp-agent-mail-wasm` crate
+  `/mail/ws-input`) and the standalone `mcp-agent-mail-wasm` crate
   are deferred indefinitely. All six browser-mirror HTTP endpoints now return
   `501 Not Implemented` with a pointer to `docs/SPEC-browser-parity-contract-deferred.md`.
+  The shared `/mail/ws-state` polling endpoint remains live for robot/TUI snapshot
+  consumers and should not be treated as proof that browser parity shipped.
   The underlying modules (`tui_ws_state.rs`, `tui_ws_input.rs`, `tui_web_dashboard.rs`)
   remain in the codebase and are tested at the module level, so the feature can be
   re-enabled when the browser parity contract is finalized.

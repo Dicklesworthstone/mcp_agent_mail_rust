@@ -35,8 +35,10 @@ on 2026-04-18. The reasons captured in the backlog and reflected in project post
 - keeping the docs honest was better than shipping a brittle, half-wired surface.
 
 The practical result is: the browser mirror is deferred, not silently abandoned, and the
-project should stop implying that `/web-dashboard` or `/mail/ws-state` are maintained
-production surfaces until a future reactivation effort lands.
+project should stop implying that `/web-dashboard` or `/mail/ws-input` are maintained
+production surfaces until a future reactivation effort lands. `/mail/ws-state` remains a
+supported polling endpoint for robot/TUI consumers, but that does **not** mean browser
+parity shipped.
 
 ## Architectural Seams Worth Preserving
 
@@ -67,7 +69,7 @@ If this feature is revived after significant codebase drift, start here:
 
 ## What Needs Re-Validation Before Any Resurrection
 
-- State snapshot and delta semantics for `/mail/ws-state`
+- State snapshot and delta semantics for browser consumption of `/mail/ws-state`
 - Input event shape and trust boundary for `/mail/ws-input`
 - Browser auth flow and token reuse rules
 - Runtime mode semantics such as `live`, `warming`, and `inactive`
@@ -91,7 +93,9 @@ This spec should be read alongside those retirement tasks, not as a substitute f
 ## Current Guidance
 
 - Treat `/mail/*` as the supported browser-facing surface.
-- Treat `/web-dashboard`, `/mail/ws-state`, and `/mail/ws-input` as deferred browser-mirror
-  concepts until the retirement beads complete and a future resurrection plan exists.
+- Treat `/mail/ws-state` as a supported polling endpoint for robot/TUI consumers, not as
+  proof that the browser mirror shipped.
+- Treat `/web-dashboard` and `/mail/ws-input` as deferred browser-mirror concepts until a
+  future resurrection plan exists.
 - If future work restarts this area, begin by opening a new audit bead rather than assuming
   this document is an implementation-ready spec.
