@@ -2211,8 +2211,13 @@ fn probe_integrity(config: &Config) -> ProbeResult {
 
             return ProbeResult::Fail(ProbeFailure {
                 name: "integrity",
-                problem: format!("Cannot create pool for integrity check: {e}"),
-                fix: "Check DATABASE_URL or set INTEGRITY_CHECK_ON_STARTUP=false to skip".into(),
+                problem: format!(
+                    "Integrity probe could not open mailbox {}: {}",
+                    pool_config.database_url,
+                    classify_integrity_open_root_cause(&err_str)
+                ),
+                fix: "Check DATABASE_URL, filesystem permissions, and parent-directory existence before retrying. Set `INTEGRITY_CHECK_ON_STARTUP=false` only if you intentionally want to skip startup integrity probing."
+                    .into(),
             });
         }
     };
@@ -2283,6 +2288,91 @@ fn try_remove_corrupt_wal(db_path: &std::path::Path) -> bool {
     removed
 }
 
+fn compact_probe_detail(detail: &str) -> String {
+    let compact = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        "unspecified error".to_string()
+    } else {
+        compact
+    }
+}
+
+fn classify_integrity_busy_root_cause(detail: &str) -> String {
+    let compact = compact_probe_detail(detail);
+    let lower = compact.to_ascii_lowercase();
+
+    if lower.contains("mailbox activity lock is busy") {
+        format!(
+            "mailbox activity lock is already held by another Agent Mail runtime or mutating `am doctor` command ({compact})"
+        )
+    } else if lower.contains("database is locked")
+        || lower.contains("database is busy")
+        || lower.contains("resource temporarily unavailable")
+        || lower.contains("busy timeout")
+    {
+        format!(
+            "SQLite reports a concurrent writer, recovery owner, or file lock on the mailbox ({compact})"
+        )
+    } else {
+        format!("mailbox is busy and could not be probed safely ({compact})")
+    }
+}
+
+fn classify_integrity_open_root_cause(detail: &str) -> String {
+    let compact = compact_probe_detail(detail);
+    let lower = compact.to_ascii_lowercase();
+
+    if lower.contains("permission denied") {
+        format!("filesystem permissions blocked opening the SQLite mailbox ({compact})")
+    } else if lower.contains("no such file or directory") {
+        format!("the SQLite path or its parent directory does not exist ({compact})")
+    } else if lower.contains("read-only") || lower.contains("readonly") {
+        format!(
+            "the SQLite mailbox is read-only but startup needs write-capable access ({compact})"
+        )
+    } else {
+        format!(
+            "pool initialization failed before the integrity probe could inspect the mailbox ({compact})"
+        )
+    }
+}
+
+fn classify_recovery_failure_root_cause(detail: &str) -> String {
+    let compact = compact_probe_detail(detail);
+    let lower = compact.to_ascii_lowercase();
+
+    if lower.contains("mailbox mutation refused")
+        || lower.contains("wait for the active owner to finish")
+        || lower.contains("supervised restart or operator intervention")
+    {
+        format!(
+            "another process still owns the mailbox, so automatic recovery refused to compete ({compact})"
+        )
+    } else if lower.contains("quarantined recovery artifact") {
+        format!(
+            "quarantined recovery artifacts already exist and automatic recovery stopped to preserve evidence ({compact})"
+        )
+    } else if lower.contains("unhealthy sqlite candidate")
+        || lower.contains("candidate activation failed")
+    {
+        format!(
+            "automatic recovery built a replacement SQLite candidate that failed validation ({compact})"
+        )
+    } else if lower.contains("failed to quarantine") || lower.contains("rollback") {
+        format!(
+            "automatic recovery could not safely quarantine or roll back mailbox artifacts ({compact})"
+        )
+    } else if lower.contains("refusing blank reinitialization")
+        || lower.contains("refusing archive salvage reconstruction")
+    {
+        format!(
+            "automatic recovery failed closed to avoid data loss while durable artifacts still exist ({compact})"
+        )
+    } else {
+        format!("automatic recovery did not produce a safe validated mailbox candidate ({compact})")
+    }
+}
+
 fn integrity_busy_probe_failure(config: &Config, detail: &str) -> ProbeResult {
     let db_target = resolve_server_database_url_sqlite_path(&config.database_url).map_or_else(
         || config.database_url.clone(),
@@ -2290,8 +2380,11 @@ fn integrity_busy_probe_failure(config: &Config, detail: &str) -> ProbeResult {
     );
     ProbeResult::Fail(ProbeFailure {
         name: "integrity",
-        problem: format!("SQLite integrity check could not run because {db_target} is busy: {detail}"),
-        fix: "Stop any running `am`, `mcp-agent-mail`, or `am doctor ...` process using this mailbox, or wait for it to finish, then retry."
+        problem: format!(
+            "Integrity probe blocked for {db_target}: {}",
+            classify_integrity_busy_root_cause(detail)
+        ),
+        fix: "Wait for the current mailbox owner to finish, or stop the conflicting `am`, `mcp-agent-mail`, or mutating `am doctor` process and retry."
             .into(),
     })
 }
@@ -2307,8 +2400,11 @@ fn attempt_probe_recovery(config: &Config) -> ProbeResult {
     let Some(db_path) = resolve_server_database_url_sqlite_path(&config.database_url) else {
         return ProbeResult::Fail(ProbeFailure {
             name: "integrity",
-            problem: "Cannot determine database file path for recovery".into(),
-            fix: "Check DATABASE_URL format".into(),
+            problem:
+                "Automatic recovery cannot start: DATABASE_URL does not resolve to a filesystem SQLite path"
+                    .into(),
+            fix: "Set DATABASE_URL to a real SQLite file path such as `sqlite:///.../storage.sqlite3`."
+                .into(),
         });
     };
     if let Err(problem) = validate_real_file_target_path(&db_path, "database path") {
@@ -2357,7 +2453,11 @@ fn attempt_probe_recovery(config: &Config) -> ProbeResult {
         }
         Err(e) => ProbeResult::Fail(ProbeFailure {
             name: "integrity",
-            problem: format!("SQLite corruption detected and automatic recovery failed: {e}"),
+            problem: format!(
+                "Automatic recovery failed for {}: {}",
+                db_path.display(),
+                classify_recovery_failure_root_cause(&e.to_string())
+            ),
             fix: format!(
                 "Try these in order:\n\
                  1. `am doctor repair --yes` — automatic repair from backups/archive\n\
@@ -2570,13 +2670,13 @@ fn probe_db_lock(config: &Config) -> ProbeResult {
             let problem = holder.as_ref().map_or_else(
                 || {
                     format!(
-                        "Database file {} is exclusively locked by another process",
+                        "DB lock probe blocked for {}: SQLite file is exclusively locked by another process",
                         sqlite_path.display(),
                     )
                 },
                 |h| {
                     format!(
-                        "Database file {} is exclusively locked by PID {} ({})",
+                        "DB lock probe blocked for {}: SQLite file is exclusively locked by PID {} ({})",
                         sqlite_path.display(),
                         h.pid,
                         h.cmdline,
@@ -2607,7 +2707,7 @@ fn probe_db_lock(config: &Config) -> ProbeResult {
         }
         DbLockStatus::Error(msg) => ProbeResult::Fail(ProbeFailure {
             name: "db-lock",
-            problem: format!("Database lock probe failed: {msg}"),
+            problem: format!("DB lock probe failed: {}", compact_probe_detail(&msg)),
             fix: "Check database file permissions and path validity.".into(),
         }),
     }
@@ -4155,8 +4255,41 @@ second body
 
         let result = integrity_busy_probe_failure(&config, "database is busy");
         assert!(
-            matches!(result, ProbeResult::Fail(ProbeFailure { name: "integrity", ref problem, ref fix }) if problem.contains("busy") && fix.contains("Stop any running")),
+            matches!(result, ProbeResult::Fail(ProbeFailure { name: "integrity", ref problem, ref fix }) if problem.contains("Integrity probe blocked") && problem.contains("concurrent writer, recovery owner, or file lock") && fix.contains("Wait for the current mailbox owner")),
             "busy integrity failures should point users at live lock holders; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn integrity_busy_probe_failure_mentions_mailbox_activity_lock_root_cause() {
+        let mut config = default_config();
+        config.database_url = "sqlite:///tmp/test-mailbox-lock.sqlite3".into();
+
+        let detail = "mailbox activity lock is busy for storage root /tmp/mail (shared lock /tmp/mail/.mailbox.activity.lock): another Agent Mail runtime or mutating `am doctor` operation is already active";
+        let result = integrity_busy_probe_failure(&config, detail);
+        assert!(
+            matches!(result, ProbeResult::Fail(ProbeFailure { ref problem, .. }) if problem.contains("mailbox activity lock is already held by another Agent Mail runtime or mutating `am doctor` command")),
+            "mailbox activity contention should be called out explicitly: {result:?}"
+        );
+    }
+
+    #[test]
+    fn classify_integrity_open_root_cause_mentions_permissions() {
+        let detail = classify_integrity_open_root_cause("Permission denied (os error 13)");
+        assert!(
+            detail.contains("filesystem permissions blocked opening the SQLite mailbox"),
+            "unexpected open-failure classification: {detail}"
+        );
+    }
+
+    #[test]
+    fn classify_recovery_failure_root_cause_mentions_competing_owner() {
+        let detail = classify_recovery_failure_root_cause(
+            "mailbox mutation refused for /tmp/storage.sqlite3: split-brain detected; wait for the active owner to finish instead of competing recovery",
+        );
+        assert!(
+            detail.contains("another process still owns the mailbox"),
+            "unexpected recovery-failure classification: {detail}"
         );
     }
 
@@ -4206,7 +4339,10 @@ second body
         config.database_url = format!("sqlite:///{}", db_path.display());
 
         let result = probe_db_lock(&config);
-        assert!(matches!(result, ProbeResult::Fail(f) if f.name == "db-lock"));
+        assert!(
+            matches!(result, ProbeResult::Fail(ProbeFailure { name: "db-lock", ref problem, .. }) if problem.contains("DB lock probe blocked for")),
+            "locked database should identify the db-lock probe as the failing surface: {result:?}"
+        );
 
         file.unlock().unwrap();
     }
