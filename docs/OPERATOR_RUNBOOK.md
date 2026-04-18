@@ -819,3 +819,17 @@ am robot atc --toon | grep kill_switch
 |---|---|---|---|
 | `AM_ATC_WRITE_MODE` | `off`, `shadow`, `live` | `off` | Controls experience write pipeline |
 | `ATC_LEARNING_DISABLED` | `0`, `1` | `0` | Hard override: forces write mode to `off` |
+
+### ATC observability signals
+
+When ATC learning is enabled, watch these signals together:
+
+- Tracing events: `atc.insert_experience`, `atc.resolve_experience`, `atc.sweep.resolution_window`, `atc.decision`, `atc.shadow.would_insert`, `atc.safe_mode.enter`, `atc.safe_mode.exit`, `atc.kill_switch.change`
+- Metrics: experience writes/resolutions, open-experience counts by stratum, resolution-sweep latency, safe-mode transitions, shadow events, derivation errors, kill-switch gauge
+- TUI surface: the SystemHealth dashboard includes an `ATC Health` widget summarizing write volume, unresolved strata, sweep p95, kill-switch state, and safe-mode state
+
+Use [`docs/ATC_ALERTS_EXAMPLE.yaml`](ATC_ALERTS_EXAMPLE.yaml) as the baseline alert contract for Prometheus-compatible rules. The file is intentionally small and focuses on operator actionability rather than exhaustive coverage.
+
+### ATC historical backfill policy
+
+ATC learns only from events observed going forward — there is no backfill of prior messaging history from the Git archive. The archive contains Markdown artifacts and commit metadata, but these lack the feature-vector context (posterior distributions, calibration state, safe-mode flags, timing signals) that live-captured experiences carry, so any reconstructed rows would be systematically lower quality and could bias the learning pipeline. This is an intentional design decision (Option A from br-bn0vb.23). If a future release adds an optional `am atc ingest-archive` tool for exploratory backfill, ingested rows will be tagged `backfilled=true` so policies can down-weight or exclude them.
