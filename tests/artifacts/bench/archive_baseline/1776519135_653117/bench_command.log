@@ -1,0 +1,865 @@
+  [2m2026-04-18T13:32:16.076578Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: ts2 at ubuntu@192.168.1.124 (20 slots, speed 50.0)[0m
+    [2;3mat[0m rch/src/hook.rs:293 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:16.606581Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mStarting remote compilation pipeline for mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663 (hash: 2dc6a687eefd58bc)[0m
+    [2;3mat[0m rch/src/hook.rs:4664 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:16.606728Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mPrepared dependency sync manifest for 71 roots[0m
+    [2;3mat[0m rch/src/hook.rs:4686 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:17.531958Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSyncing project to worker ts2...[0m
+    [2;3mat[0m rch/src/hook.rs:4710 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:17.532014Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 2 pattern(s) from .rchignore (total: 39)[0m
+    [2;3mat[0m rch/src/transfer.rs:575 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:17.532022Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/asupersync -> /data/projects/asupersync on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:17.894007Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 361ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:17.894061Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/asupersync/asupersync-macros -> /data/projects/asupersync/asupersync-macros on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:18.199667Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 305ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:18.199730Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/asupersync/franken_decision -> /data/projects/asupersync/franken_decision on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:18.500162Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 300ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:18.500232Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/asupersync/franken_evidence -> /data/projects/asupersync/franken_evidence on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:18.815260Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 315ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:18.815323Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/asupersync/franken_kernel -> /data/projects/asupersync/franken_kernel on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:19.126006Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 310ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:19.126063Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/beads_rust -> /data/projects/beads_rust on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:20.503468Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1377ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:20.503522Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensearch -> /data/projects/frankensearch on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:20.812650Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 309ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:20.812704Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensearch/crates/frankensearch-core -> /data/projects/frankensearch/crates/frankensearch-core on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:21.119465Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 306ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:21.119520Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensearch/crates/frankensearch-embed -> /data/projects/frankensearch/crates/frankensearch-embed on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:21.433684Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 314ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:21.433744Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensearch/crates/frankensearch-fusion -> /data/projects/frankensearch/crates/frankensearch-fusion on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:21.754096Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 320ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:21.754147Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensearch/crates/frankensearch-index -> /data/projects/frankensearch/crates/frankensearch-index on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:22.063865Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 309ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:22.063953Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensearch/crates/frankensearch-lexical -> /data/projects/frankensearch/crates/frankensearch-lexical on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:22.364693Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 300ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:22.364750Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensearch/crates/frankensearch-rerank -> /data/projects/frankensearch/crates/frankensearch-rerank on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:22.668584Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 303ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:22.668633Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensearch/frankensearch -> /data/projects/frankensearch/frankensearch on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:22.963871Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 295ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:22.963931Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 1 pattern(s) from .rchignore (total: 38)[0m
+    [2;3mat[0m rch/src/transfer.rs:575 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:22.963936Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite -> /data/projects/frankensqlite on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:23.272690Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 308ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:23.272755Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite -> /data/projects/frankensqlite/crates/fsqlite on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:23.574682Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 301ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:23.574733Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ast -> /data/projects/frankensqlite/crates/fsqlite-ast on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:23.885567Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 310ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:23.885671Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-btree -> /data/projects/frankensqlite/crates/fsqlite-btree on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:24.193114Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 307ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:24.193178Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-core -> /data/projects/frankensqlite/crates/fsqlite-core on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:24.501982Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 308ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:24.502048Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-error -> /data/projects/frankensqlite/crates/fsqlite-error on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:24.797826Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 295ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:24.797899Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-fts5 -> /data/projects/frankensqlite/crates/fsqlite-ext-fts5 on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:25.116163Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 318ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:25.116232Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-icu -> /data/projects/frankensqlite/crates/fsqlite-ext-icu on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:25.441519Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 325ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:25.441586Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-json -> /data/projects/frankensqlite/crates/fsqlite-ext-json on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:25.758838Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 317ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:25.758892Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-misc -> /data/projects/frankensqlite/crates/fsqlite-ext-misc on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:26.078752Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 319ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:26.078818Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-ext-rtree -> /data/projects/frankensqlite/crates/fsqlite-ext-rtree on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:26.390990Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 312ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:26.391034Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-func -> /data/projects/frankensqlite/crates/fsqlite-func on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:26.713945Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 322ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:26.713977Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-mvcc -> /data/projects/frankensqlite/crates/fsqlite-mvcc on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:27.022123Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 308ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:27.022169Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-observability -> /data/projects/frankensqlite/crates/fsqlite-observability on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:27.326643Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 304ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:27.326704Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-pager -> /data/projects/frankensqlite/crates/fsqlite-pager on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:27.631588Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 304ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:27.631642Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-parser -> /data/projects/frankensqlite/crates/fsqlite-parser on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:27.936765Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 305ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:27.936825Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-planner -> /data/projects/frankensqlite/crates/fsqlite-planner on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:28.276686Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 339ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:28.276759Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-types -> /data/projects/frankensqlite/crates/fsqlite-types on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:28.580686Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 303ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:28.580738Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-vdbe -> /data/projects/frankensqlite/crates/fsqlite-vdbe on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:28.887187Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 306ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:28.887245Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-vfs -> /data/projects/frankensqlite/crates/fsqlite-vfs on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:29.210165Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 322ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:29.210218Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankensqlite/crates/fsqlite-wal -> /data/projects/frankensqlite/crates/fsqlite-wal on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:29.520869Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 310ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:29.520952Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentui -> /data/projects/frankentui on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:29.818201Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 297ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:29.818260Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentui/crates/ftui -> /data/projects/frankentui/crates/ftui on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:30.128117Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 309ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:30.128176Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentui/crates/ftui-a11y -> /data/projects/frankentui/crates/ftui-a11y on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:30.429821Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 301ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:30.429889Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentui/crates/ftui-backend -> /data/projects/frankentui/crates/ftui-backend on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:30.719689Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 289ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:30.719749Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentui/crates/ftui-core -> /data/projects/frankentui/crates/ftui-core on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:31.019055Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 299ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:31.019108Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentui/crates/ftui-extras -> /data/projects/frankentui/crates/ftui-extras on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:31.330511Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 311ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:31.330565Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentui/crates/ftui-i18n -> /data/projects/frankentui/crates/ftui-i18n on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:31.621505Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 290ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:31.621556Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentui/crates/ftui-layout -> /data/projects/frankentui/crates/ftui-layout on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:31.923251Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 301ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:31.923299Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentui/crates/ftui-render -> /data/projects/frankentui/crates/ftui-render on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:32.224115Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 300ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:32.224225Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentui/crates/ftui-runtime -> /data/projects/frankentui/crates/ftui-runtime on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:32.525890Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 301ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:32.525968Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentui/crates/ftui-style -> /data/projects/frankentui/crates/ftui-style on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:32.819646Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 293ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:32.819703Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentui/crates/ftui-text -> /data/projects/frankentui/crates/ftui-text on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:33.122771Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 303ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:33.122832Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentui/crates/ftui-tty -> /data/projects/frankentui/crates/ftui-tty on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:33.456530Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 333ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:33.456593Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentui/crates/ftui-widgets -> /data/projects/frankentui/crates/ftui-widgets on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:33.764986Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 308ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:33.765046Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663 -> /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663 on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:34.085638Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 320ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:34.085703Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail -> /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:34.381779Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 296ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:34.381843Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail-cli -> /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail-cli on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:34.688266Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 306ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:34.688325Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail-conformance -> /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail-conformance on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:34.994395Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 306ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:34.994461Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail-core -> /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail-core on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:35.304157Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 309ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:35.304213Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail-db -> /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail-db on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:35.608517Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 304ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:35.608582Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail-guard -> /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail-guard on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:35.909323Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 300ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:35.909375Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail-search-core -> /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail-search-core on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:36.217507Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 308ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:36.217572Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail-server -> /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail-server on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:36.525965Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 308ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:36.526026Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail-share -> /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail-share on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:36.820152Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 294ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:36.820219Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail-storage -> /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail-storage on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:37.116851Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 296ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:37.116927Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail-tools -> /data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail-tools on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:37.416350Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 299ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:37.416411Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/sqlmodel_rust -> /data/projects/sqlmodel_rust on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:37.708968Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 292ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:37.709044Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/sqlmodel_rust/crates/sqlmodel -> /data/projects/sqlmodel_rust/crates/sqlmodel on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:38.018096Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 309ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:38.018155Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/sqlmodel_rust/crates/sqlmodel-core -> /data/projects/sqlmodel_rust/crates/sqlmodel-core on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:38.329065Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 310ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:38.329128Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/sqlmodel_rust/crates/sqlmodel-frankensqlite -> /data/projects/sqlmodel_rust/crates/sqlmodel-frankensqlite on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:38.638860Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 309ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:38.638955Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/sqlmodel_rust/crates/sqlmodel-macros -> /data/projects/sqlmodel_rust/crates/sqlmodel-macros on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:38.939194Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 300ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:38.939266Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/sqlmodel_rust/crates/sqlmodel-pool -> /data/projects/sqlmodel_rust/crates/sqlmodel-pool on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:39.253199Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 313ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:39.253276Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/sqlmodel_rust/crates/sqlmodel-query -> /data/projects/sqlmodel_rust/crates/sqlmodel-query on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:39.565808Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 312ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:39.565875Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/sqlmodel_rust/crates/sqlmodel-schema -> /data/projects/sqlmodel_rust/crates/sqlmodel-schema on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:39.876705Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 310ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:39.876760Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/sqlmodel_rust/crates/sqlmodel-session -> /data/projects/sqlmodel_rust/crates/sqlmodel-session on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:40.193357Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 316ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:40.193415Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/sqlmodel_rust/crates/sqlmodel-sqlite -> /data/projects/sqlmodel_rust/crates/sqlmodel-sqlite on ts2[0m
+    [2;3mat[0m rch/src/transfer.rs:1032 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:40.507169Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 313ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1101 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:40.507199Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSync complete: 81800 files, 2337309 bytes in 22932ms[0m
+    [2;3mat[0m rch/src/hook.rs:4867 [2;3mon[0m ThreadId(1)
+
+  [2m2026-04-18T13:32:40.789113Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mExecuting command remotely: env CARGO_TARGET_DIR=/tmp/cargo-target cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch[0m
+    [2;3mat[0m rch/src/hook.rs:4894 [2;3mon[0m ThreadId(1)
+
+warning: unused variable: `event_type`
+   --> /data/projects/asupersync/src/observability/structured_cancellation_analyzer.rs:422:9
+    |
+422 |         event_type: &str,
+    |         ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_event_type`
+    |
+    = note: `-W unused-variables` implied by `-W unused`
+    = help: to override `-W unused` add `#[allow(unused_variables)]`
+
+warning: unused variable: `trace_id`
+   --> /data/projects/asupersync/src/observability/structured_cancellation_analyzer.rs:423:9
+    |
+423 |         trace_id: crate::observability::TraceId,
+    |         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_trace_id`
+
+warning: unused variable: `entity_id`
+   --> /data/projects/asupersync/src/observability/structured_cancellation_analyzer.rs:424:9
+    |
+424 |         entity_id: Option<&str>,
+    |         ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_entity_id`
+
+warning: unused variable: `alert`
+   --> /data/projects/asupersync/src/observability/structured_cancellation_analyzer.rs:440:18
+    |
+440 |     fn log_alert(alert: &CancellationAlert) {
+    |                  ^^^^^ help: if this is intentional, prefix it with an underscore: `_alert`
+
+warning: value assigned to `added` is never read
+   --> /data/projects/asupersync/src/tls/connector.rs:290:37
+    |
+290 | ...                   added += self.load_pem_file(&path);
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `-W unused-assignments` implied by `-W unused`
+    = help: to override `-W unused` add `#[allow(unused_assignments)]`
+
+warning: `asupersync` (lib) generated 5 warnings (run `cargo fix --lib -p asupersync` to apply 4 suggestions)
+warning: `asupersync` (lib) generated 5 warnings (5 duplicates)
+warning: beads_rust@0.1.44: Object f20a00213ecb7058e2278d89d6237b6cdbfe679e as referred to by "refs/heads/main" could not be found
+warning: beads_rust@0.1.44: VERGEN_GIT_BRANCH set to default
+warning: beads_rust@0.1.44: VERGEN_GIT_COMMIT_TIMESTAMP set to default
+warning: beads_rust@0.1.44: VERGEN_GIT_SHA set to default
+warning: beads_rust@0.1.44: VERGEN_GIT_DIRTY set to default
+   Compiling mcp-agent-mail-server v0.2.42 (/data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663/crates/mcp-agent-mail-server)
+error[E0425]: cannot find type `AtcMetricsSnapshot` in module `mcp_agent_mail_core::metrics`
+    --> crates/mcp-agent-mail-server/src/lib.rs:4068:61
+     |
+4068 |     pub(crate) observability: mcp_agent_mail_core::metrics::AtcMetricsSnapshot,
+     |                                                             ^^^^^^^^^^^^^^^^^^
+     |
+    ::: crates/mcp-agent-mail-core/src/metrics.rs:426:1
+     |
+ 426 | pub struct DbMetricsSnapshot {
+     | ---------------------------- similarly named struct `DbMetricsSnapshot` defined here
+     |
+help: a struct with a similar name exists
+     |
+4068 -     pub(crate) observability: mcp_agent_mail_core::metrics::AtcMetricsSnapshot,
+4068 +     pub(crate) observability: mcp_agent_mail_core::metrics::DbMetricsSnapshot,
+     |
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/atc.rs:9318:10
+     |
+9318 |         .atc
+     |          ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/atc.rs:9419:14
+     |
+9419 |             .atc
+     |              ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/atc.rs:9451:14
+     |
+9451 |             .atc
+     |              ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/atc.rs:9488:14
+     |
+9488 |             .atc
+     |              ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/atc.rs:9526:14
+     |
+9526 |             .atc
+     |              ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/atc.rs:9573:14
+     |
+9573 |             .atc
+     |              ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/atc.rs:9610:14
+     |
+9610 |             .atc
+     |              ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/atc.rs:9647:14
+     |
+9647 |             .atc
+     |              ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/atc.rs:9679:14
+     |
+9679 |             .atc
+     |              ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/atc.rs:9786:18
+     |
+9786 |                 .atc
+     |                  ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/lib.rs:4684:18
+     |
+4684 |                 .atc
+     |                  ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/lib.rs:4707:18
+     |
+4707 |                 .atc
+     |                  ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/lib.rs:4724:18
+     |
+4724 |                 .atc
+     |                  ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/lib.rs:4739:18
+     |
+4739 |                 .atc
+     |                  ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/lib.rs:4745:18
+     |
+4745 |                 .atc
+     |                  ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/lib.rs:4943:14
+     |
+4943 |             .atc
+     |              ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/lib.rs:4971:18
+     |
+4971 |                 .atc
+     |                  ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/lib.rs:5006:18
+     |
+5006 |                 .atc
+     |                  ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/lib.rs:5139:18
+     |
+5139 |                 .atc
+     |                  ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/lib.rs:5182:26
+     |
+5182 |                         .atc
+     |                          ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/lib.rs:5199:26
+     |
+5199 |                         .atc
+     |                          ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/lib.rs:5225:26
+     |
+5225 |                         .atc
+     |                          ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/lib.rs:5241:26
+     |
+5241 |                         .atc
+     |                          ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/lib.rs:5256:43
+     |
+5256 |     mcp_agent_mail_core::global_metrics().atc.record_sweep(
+     |                                           ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/lib.rs:5542:18
+     |
+5542 |                 .atc
+     |                  ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/lib.rs:5633:66
+     |
+5633 |             observability: mcp_agent_mail_core::global_metrics().atc.snapshot(),
+     |                                                                  ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/lib.rs:5656:62
+     |
+5656 |         observability: mcp_agent_mail_core::global_metrics().atc.snapshot(),
+     |                                                              ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+    --> crates/mcp-agent-mail-server/src/lib.rs:5828:22
+     |
+5828 |                     .atc
+     |                      ^^^ unknown field
+     |
+     = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+     --> crates/mcp-agent-mail-server/src/lib.rs:10204:18
+      |
+10204 |                 .atc
+      |                  ^^^ unknown field
+      |
+      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+     --> crates/mcp-agent-mail-server/src/lib.rs:10221:18
+      |
+10221 |                 .atc
+      |                  ^^^ unknown field
+      |
+      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+     --> crates/mcp-agent-mail-server/src/lib.rs:10235:18
+      |
+10235 |                 .atc
+      |                  ^^^ unknown field
+      |
+      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+     --> crates/mcp-agent-mail-server/src/lib.rs:10248:18
+      |
+10248 |                 .atc
+      |                  ^^^ unknown field
+      |
+      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+     --> crates/mcp-agent-mail-server/src/lib.rs:10629:14
+      |
+10629 |             .atc
+      |              ^^^ unknown field
+      |
+      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+     --> crates/mcp-agent-mail-server/src/lib.rs:10676:22
+      |
+10676 |                     .atc
+      |                      ^^^ unknown field
+      |
+      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+     --> crates/mcp-agent-mail-server/src/lib.rs:10692:22
+      |
+10692 |                     .atc
+      |                      ^^^ unknown field
+      |
+      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+     --> crates/mcp-agent-mail-server/src/lib.rs:10708:22
+      |
+10708 |                     .atc
+      |                      ^^^ unknown field
+      |
+      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+     --> crates/mcp-agent-mail-server/src/lib.rs:10753:22
+      |
+10753 |                     .atc
+      |                      ^^^ unknown field
+      |
+      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+     --> crates/mcp-agent-mail-server/src/lib.rs:10832:26
+      |
+10832 |                         .atc
+      |                          ^^^ unknown field
+      |
+      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+     --> crates/mcp-agent-mail-server/src/lib.rs:10849:26
+      |
+10849 |                         .atc
+      |                          ^^^ unknown field
+      |
+      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+     --> crates/mcp-agent-mail-server/src/lib.rs:10903:26
+      |
+10903 |                         .atc
+      |                          ^^^ unknown field
+      |
+      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+     --> crates/mcp-agent-mail-server/src/lib.rs:10920:26
+      |
+10920 |                         .atc
+      |                          ^^^ unknown field
+      |
+      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+     --> crates/mcp-agent-mail-server/src/lib.rs:10978:30
+      |
+10978 | ...                   .atc
+      |                        ^^^ unknown field
+      |
+      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+error[E0609]: no field `atc` on type `&'static GlobalMetrics`
+     --> crates/mcp-agent-mail-server/src/lib.rs:10994:30
+      |
+10994 | ...                   .atc
+      |                        ^^^ unknown field
+      |
+      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others
+
+Some errors have detailed explanations: E0425, E0609.
+For more information about an error, try `rustc --explain E0425`.
+error: could not compile `mcp-agent-mail-server` (lib) due to 44 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `mcp-agent-mail-server` (lib) due to 44 previous errors
+  [2m2026-04-18T13:32:51.232231Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRemote command finished: exit=101 in 10443ms[0m
+    [2;3mat[0m rch/src/hook.rs:5015 [2;3mon[0m ThreadId(1)
+
+[RCH] remote ts2 failed (exit 101)

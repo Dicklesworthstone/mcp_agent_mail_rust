@@ -1,0 +1,51 @@
+{
+  "bead_id": "br-8qdh0.8",
+  "run_id": "1776519135_653117",
+  "created_at_utc": "2026-04-18T13:32:15Z",
+  "host_name": "threadripperje",
+  "uname_full": "Linux threadripperje 6.17.0-19-generic #19-Ubuntu SMP PREEMPT_DYNAMIC Fri Mar  6 14:02:58 UTC 2026 x86_64 GNU/Linux",
+  "os": {
+    "pretty": "Ubuntu 25.10",
+    "kernel_release": "6.17.0-19-generic"
+  },
+  "cpu": {
+    "model": "AMD Ryzen Threadripper PRO 5995WX 64-Cores",
+    "logical_cpus": 128,
+    "threads_per_core": 2,
+    "cores_per_socket": 64,
+    "sockets": 1,
+    "max_mhz": 4575.1641,
+    "min_mhz": 413.4190,
+    "governor": "performance"
+  },
+  "memory": {
+    "total_human": "499Gi",
+    "swap_human": "63Gi"
+  },
+  "storage": {
+    "workspace_mount": {
+      "source": "/dev/nvme0n1",
+      "filesystem": "btrfs",
+      "mount_options": "rw,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=5,subvol=/"
+    },
+    "root_mount": {
+      "source": "/dev/nvme1n1p6",
+      "filesystem": "btrfs",
+      "mount_options": "rw,relatime,ssd,discard=async,space_cache=v2,subvolid=5,subvol=/"
+    },
+    "device": {
+      "model": "Samsung SSD 9100 PRO 4TB",
+      "transport": "nvme",
+      "size_human": "3.6T"
+    }
+  },
+  "rust": {
+    "toolchain_file": "[toolchain]\nchannel = \"nightly\"\ncomponents = [\"rustfmt\", \"clippy\"]",
+    "rustc_verbose": "rustc 1.97.0-nightly (e9e32aca5 2026-04-17)\nbinary: rustc\ncommit-hash: e9e32aca5a4ffd08cbc29547b039d64b92a2c03b\ncommit-date: 2026-04-17\nhost: x86_64-unknown-linux-gnu\nrelease: 1.97.0-nightly\nLLVM version: 22.1.2",
+    "cargo_target_dir": "/tmp/cargo-target"
+  },
+  "benchmark_source": {
+    "git_commit": "99bc2663ece83e05a846638c69abc6c32228f7bb",
+    "git_subject": "fix(archive): batch 100 p95=238ms under budget (br-8qdh0.4)"
+  }
+}

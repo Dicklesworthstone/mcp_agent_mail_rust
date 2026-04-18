@@ -9,12 +9,56 @@ Updated via native `am bench` and `cargo bench`.
 2. **Change** — apply one optimization
 3. **Prove** — verify behavior unchanged (golden outputs) AND performance improved
 
-## Hardware Notes
+## Hardware + Environment Baseline
 
-- Platform: Linux x86_64 (Ubuntu)
-- Kernel: 6.17.0
-- Target dir: `/data/tmp/cargo-target`
-- Build profile: `release` for CLI benchmarks, `bench` for Criterion
+All archive-write numbers below are tied to the reference host and should not be
+treated as portable absolutes.
+
+- **CPU**: AMD Ryzen Threadripper PRO 5995WX, 64 cores / 128 threads, boost enabled, `performance` governor (`413-4575 MHz` reported by `lscpu`)
+- **RAM**: `499 GiB` system memory, `63 GiB` swap
+- **Storage**: workspace on `/data` -> `/dev/nvme0n1`, Samsung SSD 9100 PRO 4TB NVMe, `btrfs`, mount options `rw,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=5,subvol=/`
+- **OS**: Ubuntu 25.10 (Questing Quokka), kernel `6.17.0-19-generic`
+- **Rust toolchain**: `rust-toolchain.toml` pins `nightly`; reference compiler was `rustc 1.97.0-nightly (e9e32aca5 2026-04-17)`
+- **Build profile**: `cargo bench` with `[profile.bench] inherits = "release"`; effective settings are `opt-level=3`, `lto="thin"`, `codegen-units=1`, `panic="abort"`, `strip="symbols"`
+- **Workload isolation**: bare host, no taskset/cgroup pinning, remote execution via `rch exec`, target dir currently `/tmp/cargo-target`
+- **Runtime**: wall-clock Criterion measurement; warm-path side-artifacts are enabled with `MCP_AGENT_MAIL_ARCHIVE_PROFILE=1`
+- **Canonical wrapper**: `scripts/bench_baseline.sh`
+- **Latest successful cold-harness bundle**: `tests/artifacts/bench/archive/1776505951_367469/summary.json`
+- **Latest warm-path profile artifacts**: `tests/artifacts/perf/archive_batch_100_profile.md`, `tests/artifacts/perf/archive_batch_scaling.csv`, `tests/artifacts/perf/archive_batch_100_spans.json`
+
+### Re-running the archive baseline
+
+Use the canonical wrapper:
+
+```bash
+scripts/bench_baseline.sh
+```
+
+If the shared checkout is temporarily non-buildable, create a clean detached
+worktree at the desired source commit and point the wrapper at it:
+
+```bash
+scripts/bench_baseline.sh --bench-root /abs/path/to/clean/worktree
+```
+
+The wrapper:
+
+1. Captures the hardware + environment fingerprint
+2. Runs `MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 rch exec -- cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch`
+3. Copies the `archive_batch_*` raw artifacts into `tests/artifacts/bench/archive_baseline/<run_id>/`
+4. Emits `fingerprint.json` and `summary.json` for machine diffing / future perf-gate ingestion
+
+Current blocker on `2026-04-18`:
+- fresh reruns from the shared checkout and clean detached worktrees at `f19dd828`, `1d83c6b7`, and `99bc2663` all fail before measurement because `mcp-agent-mail-server` expects `metrics::AtcMetricsSnapshot` / `global_metrics().atc`
+- until that compile break is fixed, treat `tests/artifacts/bench/archive/1776505951_367469/summary.json` as the authoritative measured baseline and use new `archive_baseline/<run_id>/summary.json` bundles as blocker artifacts, not as latency evidence
+
+### Variance Envelope
+
+- Treat `batch-100 p95 ~= 238.1ms` on the same CPU/storage/filesystem/kernel/governor as the reference steady-state target.
+- Treat `<= 10%` p95 drift on the same host as noise.
+- Investigate `> 10%` drift; escalate at `>= 20%` or after three consecutive `> 10%` runs.
+- Cross-host comparisons are advisory only; NVMe model, filesystem, mount options, and kernel materially affect `fsync`-heavy workloads.
+- If a same-host rerun breaches the envelope after an archive-path change, follow [docs/OPERATOR_RUNBOOK.md](/data/projects/mcp_agent_mail_rust/docs/OPERATOR_RUNBOOK.md#emergency-roll-back-archive-batch-write-optimization).
 
 ## Tool Handler Budgets
 
@@ -93,7 +137,7 @@ Baseline captured via `am bench --quick` (2026-02-09). Seeded with 60 messages (
 Baseline numbers are taken from the bench harness artifacts emitted by:
 
 ```bash
-cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write
+rch exec -- cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write
 ```
 
 Artifacts (JSON + raw samples) are written under:
@@ -127,7 +171,7 @@ Current post-fix artifacts:
 - `tests/artifacts/perf/archive_batch_100_flamegraph.svg`
 - `tests/artifacts/perf/archive_batch_100_profile.md`
 
-Warm steady-state burst measurements (`MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 cargo bench ... archive_write_batch`):
+Warm steady-state burst measurements (`MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 rch exec -- cargo bench ... archive_write_batch`):
 
 | Scenario | p50 | p95 | p99 | Note |
 |----------|-----|-----|-----|------|

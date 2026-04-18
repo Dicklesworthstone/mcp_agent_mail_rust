@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "status": "build_blocked",
+  "bead_id": "br-8qdh0.8",
+  "run_id": "1776519135_653117",
+  "created_at_utc": "2026-04-18T13:32:15Z",
+  "project_root": "/data/projects/mcp_agent_mail_rust",
+  "bench_root": "/data/projects/mcp_agent_mail_rust_bench_br_8qdh0_8_99bc2663",
+  "output_dir": "/data/projects/mcp_agent_mail_rust/tests/artifacts/bench/archive_baseline/1776519135_653117",
+  "command": "MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 rch exec -- env CARGO_TARGET_DIR=/tmp/cargo-target cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch",
+  "fingerprint": {
+    "bead_id": "br-8qdh0.8",
+    "run_id": "1776519135_653117",
+    "created_at_utc": "2026-04-18T13:32:15Z",
+    "host_name": "threadripperje",
+    "uname_full": "Linux threadripperje 6.17.0-19-generic #19-Ubuntu SMP PREEMPT_DYNAMIC Fri Mar  6 14:02:58 UTC 2026 x86_64 GNU/Linux",
+    "os": {
+      "pretty": "Ubuntu 25.10",
+      "kernel_release": "6.17.0-19-generic"
+    },
+    "cpu": {
+      "model": "AMD Ryzen Threadripper PRO 5995WX 64-Cores",
+      "logical_cpus": 128,
+      "threads_per_core": 2,
+      "cores_per_socket": 64,
+      "sockets": 1,
+      "max_mhz": 4575.1641,
+      "min_mhz": 413.4190,
+      "governor": "performance"
+    },
+    "memory": {
+      "total_human": "499Gi",
+      "swap_human": "63Gi"
+    },
+    "storage": {
+      "workspace_mount": {
+        "source": "/dev/nvme0n1",
+        "filesystem": "btrfs",
+        "mount_options": "rw,noatime,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=5,subvol=/"
+      },
+      "root_mount": {
+        "source": "/dev/nvme1n1p6",
+        "filesystem": "btrfs",
+        "mount_options": "rw,relatime,ssd,discard=async,space_cache=v2,subvolid=5,subvol=/"
+      },
+      "device": {
+        "model": "Samsung SSD 9100 PRO 4TB",
+        "transport": "nvme",
+        "size_human": "3.6T"
+      }
+    },
+    "rust": {
+      "toolchain_file": "[toolchain]\nchannel = \"nightly\"\ncomponents = [\"rustfmt\", \"clippy\"]",
+      "rustc_verbose": "rustc 1.97.0-nightly (e9e32aca5 2026-04-17)\nbinary: rustc\ncommit-hash: e9e32aca5a4ffd08cbc29547b039d64b92a2c03b\ncommit-date: 2026-04-17\nhost: x86_64-unknown-linux-gnu\nrelease: 1.97.0-nightly\nLLVM version: 22.1.2",
+      "cargo_target_dir": "/tmp/cargo-target"
+    },
+    "benchmark_source": {
+      "git_commit": "99bc2663ece83e05a846638c69abc6c32228f7bb",
+      "git_subject": "fix(archive): batch 100 p95=238ms under budget (br-8qdh0.4)"
+    }
+  },
+  "baseline_references": {
+    "budgets_doc": "benches/BUDGETS.md",
+    "rollback_runbook": "docs/OPERATOR_RUNBOOK.md#emergency-roll-back-archive-batch-write-optimization"
+  },
+  "results": [],
+  "failure": {
+    "mode": "cargo_bench_failed_before_measurement",
+    "exit_code": 101,
+    "log_path": "bench_command.log",
+    "excerpt": "     --> crates/mcp-agent-mail-server/src/lib.rs:10692:22\n      |\n10692 |                     .atc\n      |                      ^^^ unknown field\n      |\n      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others\n\nerror[E0609]: no field `atc` on type `&'static GlobalMetrics`\n     --> crates/mcp-agent-mail-server/src/lib.rs:10708:22\n      |\n10708 |                     .atc\n      |                      ^^^ unknown field\n      |\n      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others\n\nerror[E0609]: no field `atc` on type `&'static GlobalMetrics`\n     --> crates/mcp-agent-mail-server/src/lib.rs:10753:22\n      |\n10753 |                     .atc\n      |                      ^^^ unknown field\n      |\n      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others\n\nerror[E0609]: no field `atc` on type `&'static GlobalMetrics`\n     --> crates/mcp-agent-mail-server/src/lib.rs:10832:26\n      |\n10832 |                         .atc\n      |                          ^^^ unknown field\n      |\n      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others\n\nerror[E0609]: no field `atc` on type `&'static GlobalMetrics`\n     --> crates/mcp-agent-mail-server/src/lib.rs:10849:26\n      |\n10849 |                         .atc\n      |                          ^^^ unknown field\n      |\n      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others\n\nerror[E0609]: no field `atc` on type `&'static GlobalMetrics`\n     --> crates/mcp-agent-mail-server/src/lib.rs:10903:26\n      |\n10903 |                         .atc\n      |                          ^^^ unknown field\n      |\n      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others\n\nerror[E0609]: no field `atc` on type `&'static GlobalMetrics`\n     --> crates/mcp-agent-mail-server/src/lib.rs:10920:26\n      |\n10920 |                         .atc\n      |                          ^^^ unknown field\n      |\n      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others\n\nerror[E0609]: no field `atc` on type `&'static GlobalMetrics`\n     --> crates/mcp-agent-mail-server/src/lib.rs:10978:30\n      |\n10978 | ...                   .atc\n      |                        ^^^ unknown field\n      |\n      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others\n\nerror[E0609]: no field `atc` on type `&'static GlobalMetrics`\n     --> crates/mcp-agent-mail-server/src/lib.rs:10994:30\n      |\n10994 | ...                   .atc\n      |                        ^^^ unknown field\n      |\n      = note: available fields are: `http`, `tools`, `db`, `storage`, `system` ... and 2 others\n\nSome errors have detailed explanations: E0425, E0609.\nFor more information about an error, try `rustc --explain E0425`.\nerror: could not compile `mcp-agent-mail-server` (lib) due to 44 previous errors\nwarning: build failed, waiting for other jobs to finish...\nerror: could not compile `mcp-agent-mail-server` (lib) due to 44 previous errors\n  \u001b[2m2026-04-18T13:32:51.232231Z\u001b[0m \u001b[32m INFO\u001b[0m \u001b[1;32mrch::hook\u001b[0m\u001b[32m: \u001b[32mRemote command finished: exit=101 in 10443ms\u001b[0m\n    \u001b[2;3mat\u001b[0m rch/src/hook.rs:5015 \u001b[2;3mon\u001b[0m ThreadId(1)\n\n[RCH] remote ts2 failed (exit 101)"
+  }
+}
