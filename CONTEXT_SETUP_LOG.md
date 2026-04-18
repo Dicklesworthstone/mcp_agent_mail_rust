@@ -21,7 +21,7 @@
 *   **Key Components:**
     *   `mcp-agent-mail-server`: The core MCP server.
     *   `mcp-agent-mail-cli`: The CLI interface (`am`).
-    *   `mcp-agent-mail-tools`: Implementation of 34 MCP tools.
+    *   `mcp-agent-mail-tools`: Implementation of 37 MCP tools.
     *   `asupersync`: Mandatory async runtime (no `tokio`).
 
 ## Next Steps
