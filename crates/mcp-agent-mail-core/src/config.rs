@@ -2043,9 +2043,8 @@ impl Config {
         // database lives alongside the storage directory rather than relative
         // to an arbitrary CWD.
         if config.database_url == DEFAULT_LEGACY_DATABASE_URL {
-            config.database_url = crate::disk::sqlite_url_from_path(
-                &config.storage_root.join("storage.sqlite3"),
-            );
+            config.database_url =
+                crate::disk::sqlite_url_from_path(&config.storage_root.join("storage.sqlite3"));
         }
 
         config
@@ -2379,39 +2378,42 @@ fn process_env_override_value(key: &str) -> Option<String> {
     guard.get(key).cloned()
 }
 
-static TEST_SERIALIZER: std::sync::LazyLock<std::sync::Mutex<()>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+static TEST_SERIALIZER: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+struct ProcessEnvOverrideGuard {
+    previous: Vec<(String, Option<String>)>,
+}
+
+impl Drop for ProcessEnvOverrideGuard {
+    fn drop(&mut self) {
+        {
+            let mut guard = process_env_overrides()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (key, previous) in self.previous.drain(..) {
+                match previous {
+                    Some(value) => {
+                        guard.insert(key, value);
+                    }
+                    None => {
+                        guard.remove(&key);
+                    }
+                }
+            }
+        }
+        global_config_cache_reset();
+    }
+}
 
 #[doc(hidden)]
 pub fn with_process_env_overrides_for_test<R>(
     overrides: &[(&str, &str)],
     f: impl FnOnce() -> R,
 ) -> R {
-    let _lock = TEST_SERIALIZER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    struct OverrideGuard {
-        previous: Vec<(String, Option<String>)>,
-    }
-
-    impl Drop for OverrideGuard {
-        fn drop(&mut self) {
-            {
-                let mut guard = process_env_overrides()
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                for (key, previous) in self.previous.drain(..) {
-                    match previous {
-                        Some(value) => {
-                            guard.insert(key, value);
-                        }
-                        None => {
-                            guard.remove(&key);
-                        }
-                    }
-                }
-            }
-            global_config_cache_reset();
-        }
-    }
-
+    let _lock = TEST_SERIALIZER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let previous = {
         let mut guard = process_env_overrides()
             .lock()
@@ -2427,7 +2429,7 @@ pub fn with_process_env_overrides_for_test<R>(
     };
 
     global_config_cache_reset();
-    let restore = OverrideGuard { previous };
+    let restore = ProcessEnvOverrideGuard { previous };
     let result = f();
     drop(restore);
     result
@@ -2996,6 +2998,77 @@ mod tests {
         let config = Config::from_env();
         assert!(!config.log_tool_calls_enabled);
         assert_eq!(config.log_tool_calls_result_max_chars, 1234);
+    }
+
+    #[test]
+    fn test_atc_defaults_align_with_baseline_contract() {
+        let config = Config::default();
+
+        assert!(config.atc_enabled);
+        assert_eq!(
+            config.atc_probe_interval_secs,
+            crate::atc_baseline::BASELINE_TIMING.probe_interval_micros as u64 / 1_000_000
+        );
+        assert_eq!(
+            config.atc_advisory_cooldown_secs,
+            crate::atc_baseline::BASELINE_TIMING.advisory_cooldown_micros as u64 / 1_000_000
+        );
+        assert_eq!(
+            config.atc_summary_interval_secs,
+            crate::atc_baseline::BASELINE_TIMING.summary_interval_micros as u64 / 1_000_000
+        );
+        assert_eq!(
+            config.atc_safe_mode_recovery_count,
+            crate::atc_baseline::BASELINE_CALIBRATION.safe_mode_recovery_count
+        );
+        assert_eq!(
+            config.atc_eprocess_threshold,
+            crate::atc_baseline::BASELINE_CALIBRATION.eprocess_alert_threshold
+        );
+        assert_eq!(
+            config.atc_cusum_threshold,
+            crate::atc_baseline::BASELINE_CALIBRATION.cusum_threshold
+        );
+        assert_eq!(
+            config.atc_cusum_delta,
+            crate::atc_baseline::BASELINE_CALIBRATION.cusum_delta
+        );
+        assert_eq!(
+            config.atc_ledger_capacity,
+            crate::atc_baseline::BASELINE_CALIBRATION.ledger_capacity
+        );
+        assert_eq!(
+            config.atc_suspicion_k,
+            crate::atc_baseline::BASELINE_SUSPICION_K
+        );
+    }
+
+    #[test]
+    fn test_atc_env_overrides_and_clamps() {
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_ATC_ENABLED", "false"),
+            ("AM_ATC_PROBE_INTERVAL_SECS", "1"),
+            ("AM_ATC_ADVISORY_COOLDOWN_SECS", "2"),
+            ("AM_ATC_SUMMARY_INTERVAL_SECS", "3"),
+            ("AM_ATC_SAFE_MODE_RECOVERY_COUNT", "0"),
+            ("AM_ATC_EPROCESS_THRESHOLD", "21.5"),
+            ("AM_ATC_CUSUM_THRESHOLD", "7.25"),
+            ("AM_ATC_CUSUM_DELTA", "0.3"),
+            ("AM_ATC_LEDGER_CAPACITY", "4"),
+            ("AM_ATC_SUSPICION_K", "4.5"),
+        ]);
+
+        let config = Config::from_env();
+        assert!(!config.atc_enabled);
+        assert_eq!(config.atc_probe_interval_secs, 5);
+        assert_eq!(config.atc_advisory_cooldown_secs, 10);
+        assert_eq!(config.atc_summary_interval_secs, 10);
+        assert_eq!(config.atc_safe_mode_recovery_count, 1);
+        assert_eq!(config.atc_eprocess_threshold, 21.5);
+        assert_eq!(config.atc_cusum_threshold, 7.25);
+        assert_eq!(config.atc_cusum_delta, 0.3);
+        assert_eq!(config.atc_ledger_capacity, 10);
+        assert_eq!(config.atc_suspicion_k, 4.5);
     }
 
     #[test]

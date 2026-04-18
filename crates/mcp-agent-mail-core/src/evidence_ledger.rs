@@ -272,6 +272,10 @@ impl EvidenceLedger {
     }
 
     /// Backfill the outcome for a previously recorded decision.
+    ///
+    /// The in-memory ring buffer is updated in place. When JSONL output is
+    /// enabled, the original decision line remains immutable and a second
+    /// sideband `"outcome"` record is appended for recovery/replay.
     pub fn record_outcome(&self, seq: u64, actual: impl Into<String>, correct: bool) {
         let actual_str = actual.into();
         {
@@ -377,6 +381,7 @@ impl EvidenceLedger {
 mod tests {
     use super::*;
 
+    use proptest::prelude::*;
     use std::sync::Arc;
     use std::thread;
 
@@ -469,6 +474,10 @@ mod tests {
 
     fn ev(dp: &str) -> Value {
         serde_json::json!({"dp": dp})
+    }
+
+    fn token_strategy() -> impl Strategy<Value = String> {
+        proptest::string::string_regex("[a-z][a-z0-9_.-]{0,12}").unwrap()
     }
 
     /// 1. Record 5 entries, recent(3) returns last 3 (newest-first).
@@ -686,6 +695,53 @@ mod tests {
         assert_eq!(decoded.expected, Some("hit".to_string()));
         assert_eq!(decoded.trace_id, Some("trace-123".to_string()));
         assert_eq!(decoded.model, "model-v2");
+    }
+
+    proptest! {
+        #[test]
+        fn entry_json_roundtrip_is_stable(
+            decision_id in token_strategy(),
+            decision_point in token_strategy(),
+            action in token_strategy(),
+            confidence_bp in 0u16..=10_000u16,
+            expected_loss_bp in prop::option::of(0u16..=10_000u16),
+            expected in prop::option::of(token_strategy()),
+            actual in prop::option::of(token_strategy()),
+            correct in prop::option::of(any::<bool>()),
+            trace_id in prop::option::of(token_strategy()),
+            model in token_strategy(),
+            seq in 0u64..10_000u64,
+            ts_micros in 1i64..1_000_000i64,
+            queue_depth in 0u16..=1024u16,
+            calibrated in any::<bool>(),
+        ) {
+            let entry = EvidenceLedgerEntry {
+                seq,
+                ts_micros,
+                decision_id,
+                decision_point,
+                action,
+                confidence: f64::from(confidence_bp) / 10_000.0,
+                evidence: serde_json::json!({
+                    "queue_depth": queue_depth,
+                    "calibrated": calibrated,
+                    "sealed": true,
+                }),
+                expected_loss: expected_loss_bp.map(|bp| f64::from(bp) / 100.0),
+                expected,
+                actual,
+                correct,
+                trace_id,
+                model,
+            };
+
+            let first = serde_json::to_string(&entry).unwrap();
+            let second = serde_json::to_string(&entry).unwrap();
+            let decoded: EvidenceLedgerEntry = serde_json::from_str(&first).unwrap();
+
+            prop_assert_eq!(first, second, "same entry should serialize stably");
+            prop_assert_eq!(decoded, entry, "serde roundtrip drifted");
+        }
     }
 
     /// `parse_configured_path` handles None, empty, and whitespace.

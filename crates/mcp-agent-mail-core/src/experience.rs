@@ -1034,6 +1034,7 @@ impl ExperienceBuilder {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use proptest::prelude::*;
 
     fn sample_builder() -> ExperienceBuilder {
         ExperienceBuilder::new(
@@ -1061,6 +1062,146 @@ mod tests {
 
     fn sample_row() -> ExperienceRow {
         sample_builder().build(1, Utc::now().timestamp_micros())
+    }
+
+    fn state_strategy() -> impl Strategy<Value = ExperienceState> {
+        prop_oneof![
+            Just(ExperienceState::Planned),
+            Just(ExperienceState::Dispatched),
+            Just(ExperienceState::Executed),
+            Just(ExperienceState::Failed),
+            Just(ExperienceState::Throttled),
+            Just(ExperienceState::Suppressed),
+            Just(ExperienceState::Skipped),
+            Just(ExperienceState::Open),
+            Just(ExperienceState::Resolved),
+            Just(ExperienceState::Censored),
+            Just(ExperienceState::Expired),
+        ]
+    }
+
+    fn subsystem_strategy() -> impl Strategy<Value = ExperienceSubsystem> {
+        prop_oneof![
+            Just(ExperienceSubsystem::Liveness),
+            Just(ExperienceSubsystem::Conflict),
+            Just(ExperienceSubsystem::LoadRouting),
+            Just(ExperienceSubsystem::Synthesis),
+            Just(ExperienceSubsystem::Calibration),
+        ]
+    }
+
+    fn effect_kind_strategy() -> impl Strategy<Value = EffectKind> {
+        prop_oneof![
+            Just(EffectKind::Advisory),
+            Just(EffectKind::Probe),
+            Just(EffectKind::Release),
+            Just(EffectKind::ForceReservation),
+            Just(EffectKind::RoutingSuggestion),
+            Just(EffectKind::Backpressure),
+            Just(EffectKind::NoAction),
+        ]
+    }
+
+    fn token_strategy() -> impl Strategy<Value = String> {
+        proptest::string::string_regex("[a-z][a-z0-9_.-]{0,12}").unwrap()
+    }
+
+    fn project_key_strategy() -> impl Strategy<Value = String> {
+        proptest::string::string_regex("/data/[a-z0-9_./-]{1,24}").unwrap()
+    }
+
+    fn sample_non_execution_reason() -> NonExecutionReason {
+        NonExecutionReason::CalibrationFallback {
+            reason: "contract_test_non_execution".to_string(),
+        }
+    }
+
+    fn row_in_state(state: ExperienceState, created_ts_micros: i64) -> ExperienceRow {
+        let mut row = sample_builder().build(1, created_ts_micros);
+        match state {
+            ExperienceState::Planned => {}
+            ExperienceState::Dispatched => {
+                row.transition_to(ExperienceState::Dispatched).unwrap();
+            }
+            ExperienceState::Executed => {
+                row.transition_to(ExperienceState::Dispatched).unwrap();
+                row.transition_to(ExperienceState::Executed).unwrap();
+            }
+            ExperienceState::Failed => {
+                row.transition_to(ExperienceState::Dispatched).unwrap();
+                row.transition_to(ExperienceState::Failed).unwrap();
+            }
+            ExperienceState::Throttled => {
+                row.transition_to(ExperienceState::Dispatched).unwrap();
+                row.non_execution_reason = Some(sample_non_execution_reason());
+                row.transition_to(ExperienceState::Throttled).unwrap();
+            }
+            ExperienceState::Suppressed => {
+                row.transition_to(ExperienceState::Dispatched).unwrap();
+                row.non_execution_reason = Some(sample_non_execution_reason());
+                row.transition_to(ExperienceState::Suppressed).unwrap();
+            }
+            ExperienceState::Skipped => {
+                row.transition_to(ExperienceState::Dispatched).unwrap();
+                row.non_execution_reason = Some(sample_non_execution_reason());
+                row.transition_to(ExperienceState::Skipped).unwrap();
+            }
+            ExperienceState::Open => {
+                row.transition_to(ExperienceState::Dispatched).unwrap();
+                row.transition_to(ExperienceState::Executed).unwrap();
+                row.transition_to(ExperienceState::Open).unwrap();
+            }
+            ExperienceState::Resolved => {
+                row.transition_to(ExperienceState::Dispatched).unwrap();
+                row.transition_to(ExperienceState::Executed).unwrap();
+                row.transition_to(ExperienceState::Open).unwrap();
+                row.resolve(ExperienceOutcome {
+                    observed_ts_micros: created_ts_micros.saturating_add(1_000),
+                    label: "resolved".to_string(),
+                    correct: true,
+                    actual_loss: Some(0.25),
+                    regret: Some(0.0),
+                    evidence: Some(serde_json::json!({"sealed": true})),
+                })
+                .unwrap();
+            }
+            ExperienceState::Censored => {
+                row.transition_to(ExperienceState::Dispatched).unwrap();
+                row.transition_to(ExperienceState::Executed).unwrap();
+                row.transition_to(ExperienceState::Open).unwrap();
+                row.censor(created_ts_micros.saturating_add(2_000)).unwrap();
+            }
+            ExperienceState::Expired => {
+                row.transition_to(ExperienceState::Dispatched).unwrap();
+                row.transition_to(ExperienceState::Executed).unwrap();
+                row.transition_to(ExperienceState::Open).unwrap();
+                row.expire(created_ts_micros.saturating_add(3_000)).unwrap();
+            }
+        }
+        row
+    }
+
+    fn transition_allowed(from: ExperienceState, to: ExperienceState) -> bool {
+        from == to
+            || matches!(
+                (from, to),
+                (ExperienceState::Planned, ExperienceState::Dispatched)
+                    | (
+                        ExperienceState::Dispatched,
+                        ExperienceState::Executed
+                            | ExperienceState::Failed
+                            | ExperienceState::Throttled
+                            | ExperienceState::Suppressed
+                            | ExperienceState::Skipped
+                    )
+                    | (ExperienceState::Executed, ExperienceState::Open)
+                    | (
+                        ExperienceState::Open,
+                        ExperienceState::Resolved
+                            | ExperienceState::Censored
+                            | ExperienceState::Expired
+                    )
+            )
     }
 
     #[test]
@@ -1488,7 +1629,10 @@ mod tests {
     fn validate_clean_row_passes() {
         let row = sample_row();
         let issues = row.validate();
-        assert!(issues.is_empty(), "clean row should have no issues: {issues:?}");
+        assert!(
+            issues.is_empty(),
+            "clean row should have no issues: {issues:?}"
+        );
     }
 
     #[test]
@@ -1559,6 +1703,64 @@ mod tests {
         };
         let json = serde_json::to_string(&outcome).unwrap();
         let _: ExperienceOutcome = serde_json::from_str(&json).unwrap();
+    }
+
+    proptest! {
+        #[test]
+        fn experience_row_roundtrip_property(
+            state in state_strategy(),
+            subsystem in subsystem_strategy(),
+            effect_kind in effect_kind_strategy(),
+            subject in token_strategy(),
+            action in token_strategy(),
+            project_key in prop::option::of(project_key_strategy()),
+            policy_id in prop::option::of(token_strategy()),
+            runner_up_action in prop::option::of(token_strategy()),
+            runner_up_loss_bp in prop::option::of(0u16..=10_000u16),
+            calibration_healthy in any::<bool>(),
+            safe_mode_active in any::<bool>(),
+            created_ts_micros in 1i64..1_000_000i64,
+        ) {
+            let mut row = row_in_state(state, created_ts_micros);
+            row.subsystem = subsystem;
+            row.effect_kind = effect_kind;
+            row.subject = subject;
+            row.action = action;
+            row.project_key = project_key;
+            row.policy_id = policy_id;
+            row.runner_up_action = runner_up_action;
+            row.runner_up_loss = row
+                .runner_up_action
+                .as_ref()
+                .and(runner_up_loss_bp)
+                .map(|bp| f64::from(bp) / 100.0);
+            row.calibration_healthy = calibration_healthy;
+            row.safe_mode_active = safe_mode_active;
+            row.context = Some(serde_json::json!({
+                "state": state.to_string(),
+                "sealed": true,
+            }));
+
+            let encoded = serde_json::to_string(&row).unwrap();
+            let decoded: ExperienceRow = serde_json::from_str(&encoded).unwrap();
+
+            prop_assert!(decoded.validate().is_empty(), "decoded row should remain structurally valid after roundtrip");
+            prop_assert_eq!(decoded, row);
+        }
+
+        #[test]
+        fn validate_transition_matches_contract(
+            from in state_strategy(),
+            to in state_strategy(),
+        ) {
+            prop_assert_eq!(
+                validate_transition(from, to).is_ok(),
+                transition_allowed(from, to),
+                "transition contract drifted for {:?} -> {:?}",
+                from,
+                to
+            );
+        }
     }
 
     #[test]
