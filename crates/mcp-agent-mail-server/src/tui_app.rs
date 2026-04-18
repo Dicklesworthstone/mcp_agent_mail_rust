@@ -8624,7 +8624,7 @@ mod tests {
         assert!(matches!(first, Cmd::None));
         assert!(!model.help_visible());
 
-        let second = model.update(MailMsg::Terminal(ctrl_c));
+        let second = model.update(MailMsg::Terminal(ctrl_c.clone()));
         assert!(!model.state.is_shutdown_requested());
         assert!(matches!(second, Cmd::None));
 
