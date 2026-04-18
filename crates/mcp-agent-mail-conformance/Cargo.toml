@@ -9,6 +9,10 @@ authors.workspace = true
 description = "Conformance test harness for MCP Agent Mail"
 publish = false
 
+[[test]]
+name = "docs_drift_ci"
+path = "../../tests/docs_drift_ci.rs"
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
