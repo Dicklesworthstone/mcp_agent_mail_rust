@@ -2372,11 +2372,14 @@ fn process_env_override_value(key: &str) -> Option<String> {
     guard.get(key).cloned()
 }
 
+static TEST_SERIALIZER: std::sync::LazyLock<std::sync::Mutex<()>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
 #[doc(hidden)]
 pub fn with_process_env_overrides_for_test<R>(
     overrides: &[(&str, &str)],
     f: impl FnOnce() -> R,
 ) -> R {
+    let _lock = TEST_SERIALIZER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     struct OverrideGuard {
         previous: Vec<(String, Option<String>)>,
     }
