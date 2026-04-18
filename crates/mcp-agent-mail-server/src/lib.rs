@@ -4017,14 +4017,15 @@ fn set_tui_state_handle(state: Option<Arc<tui_bridge::TuiSharedState>>) {
     *lock_mutex(&TUI_STATE) = state;
 }
 
-static BROWSER_TUI_DEFERRED_JSON: std::sync::LazyLock<serde_json::Value> =
-    std::sync::LazyLock::new(|| {
+static BROWSER_TUI_DEFERRED_JSON: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(
+    || {
         serde_json::json!({
             "error": "not_implemented",
             "detail": "The browser TUI mirror is deferred; see docs/SPEC-browser-parity-contract-deferred.md",
             "tracker": "br-il53l"
         })
-    });
+    },
+);
 
 const BROWSER_TUI_DEFERRED_HTML: &str = concat!(
     "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Browser TUI Mirror — Deferred</title></head>",
@@ -4043,12 +4044,14 @@ pub(crate) struct AtcOperatorSnapshot {
     pub(crate) enabled: bool,
     pub(crate) source: String,
     pub(crate) safe_mode: bool,
+    pub(crate) kill_switch_enabled: bool,
     pub(crate) tick_count: u64,
     pub(crate) tracked_agents: Vec<AtcOperatorAgentSnapshot>,
     pub(crate) deadlock_cycles: usize,
     pub(crate) eprocess_value: f64,
     pub(crate) regret_avg: f64,
     pub(crate) decisions_total: u64,
+    pub(crate) observability: mcp_agent_mail_core::metrics::AtcMetricsSnapshot,
     pub(crate) recent_actions: Vec<AtcOperatorActionSnapshot>,
     pub(crate) recent_decisions: Vec<atc::AtcDecisionRecord>,
     pub(crate) recent_executions: Vec<AtcOperatorExecutionSnapshot>,
@@ -4545,6 +4548,10 @@ fn atc_effect_project_slug(project_key: Option<&str>) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+fn atc_elapsed_micros(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
 fn atc_effect_sampled_input(effect: &atc::AtcEffectPlan) -> serde_json::Value {
     serde_json::json!({
         "decision_id": effect.decision_id,
@@ -4560,7 +4567,17 @@ fn atc_effect_sampled_input(effect: &atc::AtcEffectPlan) -> serde_json::Value {
 }
 
 fn atc_experience_stratum_key(row: &ExperienceRow) -> String {
-    row.features.stratum_key(&row.subsystem, &row.effect_kind)
+    row.features.as_ref().map_or_else(
+        || {
+            format!(
+                "{}:{}:{}",
+                row.subsystem,
+                row.effect_kind,
+                FeatureVector::risk_tier_for(row.effect_kind)
+            )
+        },
+        |features| features.stratum_key(&row.subsystem, &row.effect_kind),
+    )
 }
 
 fn atc_feature_vector_size(row: &ExperienceRow) -> usize {
@@ -4568,7 +4585,7 @@ fn atc_feature_vector_size(row: &ExperienceRow) -> usize {
         + row
             .feature_ext
             .as_ref()
-            .map_or(0, mcp_agent_mail_core::FeatureExtension::estimated_size)
+            .map_or(0, |ext| ext.estimated_size())
 }
 
 fn build_atc_experience_row(effect: &atc::AtcEffectPlan) -> Result<ExperienceRow, String> {
@@ -4671,7 +4688,7 @@ fn append_atc_experience_for_effect(
         &cx, pool, &row,
     )) {
         asupersync::Outcome::Ok(value) => {
-            let latency_micros = elapsed_micros(started_at);
+            let latency_micros = atc_elapsed_micros(started_at);
             mcp_agent_mail_core::global_metrics()
                 .atc
                 .record_experience_written(&effect.kind, &stratum_key);
@@ -5221,10 +5238,12 @@ fn sweep_open_experiences_for_resolution(
         // Otherwise: still within resolution window, leave as open.
     }
 
-    let duration_micros = elapsed_micros(started_at);
-    mcp_agent_mail_core::global_metrics()
-        .atc
-        .record_sweep("resolution_window", duration_micros, rows_resolved);
+    let duration_micros = atc_elapsed_micros(started_at);
+    mcp_agent_mail_core::global_metrics().atc.record_sweep(
+        "resolution_window",
+        duration_micros,
+        rows_resolved,
+    );
     tracing::info!(
         event = "atc.sweep.resolution_window",
         rows_scanned = open_experiences.len(),
@@ -5581,6 +5600,7 @@ fn build_atc_operator_snapshot(
             enabled: summary.enabled,
             source: "live".to_string(),
             safe_mode: summary.safe_mode,
+            kill_switch_enabled: atc::atc_kill_switch_active(),
             tick_count: summary.tick_count,
             tracked_agents: summary
                 .tracked_agents
@@ -5596,6 +5616,7 @@ fn build_atc_operator_snapshot(
             eprocess_value: summary.eprocess_value,
             regret_avg: summary.regret_avg,
             decisions_total: summary.decisions_total,
+            observability: mcp_agent_mail_core::global_metrics().atc.snapshot(),
             recent_actions: recent_actions.iter().cloned().collect(),
             recent_decisions: summary.recent_decisions,
             recent_executions: recent_executions.iter().cloned().collect(),
@@ -5617,6 +5638,8 @@ fn build_atc_operator_snapshot(
     AtcOperatorSnapshot {
         enabled: true,
         source: "warming_up".to_string(),
+        kill_switch_enabled: atc::atc_kill_switch_active(),
+        observability: mcp_agent_mail_core::global_metrics().atc.snapshot(),
         recent_actions: recent_actions.iter().cloned().collect(),
         recent_executions: recent_executions.iter().cloned().collect(),
         last_tick_micros,
@@ -5792,7 +5815,8 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
                     .record_decision_latency(&effect.kind, decision_latency_micros);
                 tracing::debug!(
                     event = "atc.decision",
-                    policy_version = summary.policy.policy_revision,
+                    policy_bundle = %summary.policy.bundle_id,
+                    incumbent_policy_id = %summary.policy.incumbent_policy_id,
                     decision_kind = %effect.kind,
                     confidence = effect.expected_loss.unwrap_or(0.0),
                     safe_mode_state = summary.safe_mode,
@@ -8641,19 +8665,11 @@ impl HttpState {
         }
 
         if path == "/mail/ws-input" {
-            return Some(self.json_response(
-                req,
-                501,
-                &BROWSER_TUI_DEFERRED_JSON,
-            ));
+            return Some(self.json_response(req, 501, &BROWSER_TUI_DEFERRED_JSON));
         }
 
         if path == "/mail/ws-state" {
-            return Some(self.json_response(
-                req,
-                501,
-                &BROWSER_TUI_DEFERRED_JSON,
-            ));
+            return Some(self.json_response(req, 501, &BROWSER_TUI_DEFERRED_JSON));
         }
 
         if path == "/mail/api/locks" || path == "/mail/api/locks/" {
@@ -8685,11 +8701,7 @@ impl HttpState {
             || path == "/web-dashboard/stream"
             || path == "/web-dashboard/input"
         {
-            return Some(self.json_response(
-                req,
-                501,
-                &BROWSER_TUI_DEFERRED_JSON,
-            ));
+            return Some(self.json_response(req, 501, &BROWSER_TUI_DEFERRED_JSON));
         }
 
         if path == "/mail" || path.starts_with("/mail/") {
@@ -9645,6 +9657,13 @@ to skip auth for local requests.</p>
                 ) {
                     emit_tui_event(event);
                 }
+                record_atc_message_observations_from_tool_result(
+                    &tool_name,
+                    call_arguments.as_ref(),
+                    &value,
+                    project_hint.as_deref(),
+                    agent_hint.as_deref(),
+                );
 
                 // Record agent activity in the ATC engine for liveness tracking.
                 if let Some(ref agent) = agent_hint {
@@ -9657,13 +9676,6 @@ to skip auth for local requests.</p>
 
                 // Register agent in ATC on successful register_agent / macro_start_session.
                 if matches!(tool_name.as_str(), "register_agent" | "macro_start_session")
-                record_atc_message_observations_from_tool_result(
-                    &tool_name,
-                    call_arguments.as_ref(),
-                    &value,
-                    project_hint.as_deref(),
-                    agent_hint.as_deref(),
-                );
                     && let Some(ref agent) = agent_hint
                 {
                     let program =
@@ -10075,18 +10087,6 @@ fn truncate_body_md(body: &str) -> String {
     result
 }
 
-fn message_sent_event_from_payload(
-    payload: &serde_json::Value,
-    project: Option<&str>,
-    fallback_sender: Option<&str>,
-) -> Option<(i64, String, tui_events::MailEvent)> {
-    let id = json_i64_field(payload, "id")?;
-    let project = project.filter(|p| !p.is_empty()).map(str::to_string)?;
-    let from = payload
-        .get("from")
-        .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.is_empty())
-        .or(fallback_sender)
 const ATC_MESSAGE_OBSERVATION_CACHE_CAPACITY: usize = 8192;
 
 static ATC_MESSAGE_OBSERVATION_CACHE: std::sync::LazyLock<
@@ -10170,7 +10170,7 @@ fn append_atc_message_observation_row(
         &cx, pool, row,
     )) {
         asupersync::Outcome::Ok(stored) => {
-            let latency_micros = elapsed_micros(started_at);
+            let latency_micros = atc_elapsed_micros(started_at);
             mcp_agent_mail_core::global_metrics()
                 .atc
                 .record_experience_written(observation_family, &stratum_key);
@@ -10210,7 +10210,7 @@ fn append_atc_message_observation_row(
                 observation_family,
                 decision_class = %row.decision_class,
                 subject = %row.subject,
-                reason,
+                reason = ?reason,
                 "ATC message observation append cancelled"
             );
         }
@@ -10526,6 +10526,18 @@ fn record_atc_message_observations_from_tool_payload(
     );
 }
 
+fn message_sent_event_from_payload(
+    payload: &serde_json::Value,
+    project: Option<&str>,
+    fallback_sender: Option<&str>,
+) -> Option<(i64, String, tui_events::MailEvent)> {
+    let id = json_i64_field(payload, "id")?;
+    let project = project.filter(|p| !p.is_empty()).map(str::to_string)?;
+    let from = payload
+        .get("from")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .or(fallback_sender)
         .unwrap_or("unknown")
         .to_string();
     let to = json_string_vec_field(payload, "to");
@@ -10887,6 +10899,58 @@ fn derive_release_domain_events(
     )]
 }
 
+fn derive_renew_domain_events(
+    call_args: Option<&serde_json::Value>,
+    payload: &serde_json::Value,
+    ctx: &DomainEventContext,
+) -> Vec<tui_events::MailEvent> {
+    let renewed_count = json_u64_field(payload, "renewed").unwrap_or(0);
+    if renewed_count == 0 {
+        return Vec::new();
+    }
+    let Some(project_value) = &ctx.project else {
+        return Vec::new();
+    };
+    let agent_value = ctx.agent.clone().unwrap_or_else(|| "unknown".to_string());
+    let mut paths: Vec<String> = payload
+        .get("file_reservations")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| r.get("path_pattern"))
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if paths.is_empty() {
+        paths = extract_arg_string_vec(call_args, "paths");
+    }
+    if paths.is_empty() {
+        paths = extract_arg_i64_vec(call_args, "file_reservation_ids")
+            .into_iter()
+            .map(|id| format!("id:{id}"))
+            .collect();
+    }
+    if paths.is_empty() {
+        paths.push("<renewed>".to_string());
+    }
+    atc::atc_note_reservation_renewed(
+        &agent_value,
+        &paths,
+        project_value,
+        mcp_agent_mail_db::now_micros(),
+    );
+
+    vec![tui_events::MailEvent::reservation_granted(
+        agent_value,
+        paths,
+        true,
+        extract_arg_u64(call_args, "ttl_seconds").unwrap_or(3600),
+        project_value.clone(),
+    )]
+}
+
 fn derive_force_release_domain_events(
     call_args: Option<&serde_json::Value>,
     payload: &serde_json::Value,
@@ -10918,8 +10982,8 @@ fn derive_force_release_domain_events(
         .map(str::to_string)
         .or_else(|| ctx.agent.clone())
         .unwrap_or_else(|| "unknown".to_string());
-    // Wire force-release into ATC conflict graph (br-0qt6e.2.9)
-    atc::atc_note_reservation_released(
+    // Wire force-release into ATC conflict graph (br-bn0vb.7)
+    atc::atc_note_reservation_force_released(
         &agent_value,
         &paths,
         project_value,
@@ -11058,6 +11122,7 @@ fn derive_domain_events_from_tool_payload(
             derive_reservation_granted_domain_events(call_args, payload, &ctx)
         }
         "release_file_reservations" => derive_release_domain_events(call_args, payload, &ctx),
+        "renew_file_reservations" => derive_renew_domain_events(call_args, payload, &ctx),
         "force_release_file_reservation" => {
             derive_force_release_domain_events(call_args, payload, &ctx)
         }
@@ -11086,6 +11151,24 @@ fn derive_domain_events_from_tool_result(
     derive_domain_events_from_tool_payload(tool_name, call_args, &payload, project_hint, agent_hint)
 }
 
+fn record_atc_message_observations_from_tool_result(
+    tool_name: &str,
+    call_args: Option<&serde_json::Value>,
+    call_result: &serde_json::Value,
+    project_hint: Option<&str>,
+    agent_hint: Option<&str>,
+) {
+    let payload =
+        parse_call_tool_result_payload(call_result).unwrap_or_else(|| call_result.clone());
+    record_atc_message_observations_from_tool_payload(
+        tool_name,
+        call_args,
+        &payload,
+        project_hint,
+        agent_hint,
+    );
+}
+
 fn derive_domain_events_from_tool_contents(
     tool_name: &str,
     call_args: Option<&serde_json::Value>,
@@ -11108,6 +11191,30 @@ fn derive_domain_events_from_tool_contents(
         }
     }
     Vec::new()
+}
+
+fn record_atc_message_observations_from_tool_contents(
+    tool_name: &str,
+    call_args: Option<&serde_json::Value>,
+    contents: &[Content],
+    project_hint: Option<&str>,
+    agent_hint: Option<&str>,
+) {
+    for content in contents {
+        let Content::Text { text } = content else {
+            continue;
+        };
+        if let Some(payload) = parse_text_payload_json(text) {
+            record_atc_message_observations_from_tool_payload(
+                tool_name,
+                call_args,
+                &payload,
+                project_hint,
+                agent_hint,
+            );
+            return;
+        }
+    }
 }
 
 fn log_tool_query_stats(
@@ -11151,24 +11258,6 @@ fn apply_toon_to_content(
     content_key: &str,
     format_value: &str,
     config: &mcp_agent_mail_core::Config,
-fn record_atc_message_observations_from_tool_result(
-    tool_name: &str,
-    call_args: Option<&serde_json::Value>,
-    call_result: &serde_json::Value,
-    project_hint: Option<&str>,
-    agent_hint: Option<&str>,
-) {
-    let payload =
-        parse_call_tool_result_payload(call_result).unwrap_or_else(|| call_result.clone());
-    record_atc_message_observations_from_tool_payload(
-        tool_name,
-        call_args,
-        &payload,
-        project_hint,
-        agent_hint,
-    );
-}
-
 ) {
     let Ok(decision) = mcp_agent_mail_core::toon::resolve_output_format(Some(format_value), config)
     else {
@@ -11193,30 +11282,6 @@ fn record_atc_message_observations_from_tool_result(
         }
         let Some(text_str) = block.get("text").and_then(|t| t.as_str()) else {
             continue;
-fn record_atc_message_observations_from_tool_contents(
-    tool_name: &str,
-    call_args: Option<&serde_json::Value>,
-    contents: &[Content],
-    project_hint: Option<&str>,
-    agent_hint: Option<&str>,
-) {
-    for content in contents {
-        let Content::Text { text } = content else {
-            continue;
-        };
-        if let Some(payload) = parse_text_payload_json(text) {
-            record_atc_message_observations_from_tool_payload(
-                tool_name,
-                call_args,
-                &payload,
-                project_hint,
-                agent_hint,
-            );
-            return;
-        }
-    }
-}
-
         };
         // Try to parse the text as JSON
         let payload: serde_json::Value = match serde_json::from_str(text_str) {
@@ -12318,6 +12383,7 @@ fn header_value<'a>(req: &'a Http1Request, name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
+#[allow(dead_code)]
 fn header_has_token(req: &Http1Request, name: &str, token: &str) -> bool {
     header_value(req, name).is_some_and(|value| {
         value
@@ -12326,6 +12392,7 @@ fn header_has_token(req: &Http1Request, name: &str, token: &str) -> bool {
     })
 }
 
+#[allow(dead_code)]
 fn is_websocket_upgrade_request(req: &Http1Request) -> bool {
     header_has_token(req, "connection", "upgrade") && header_has_token(req, "upgrade", "websocket")
 }
@@ -14413,8 +14480,7 @@ first body
             response_header(&resp, "content-type"),
             Some("application/json")
         );
-        let body: serde_json::Value =
-            serde_json::from_slice(&resp.body).expect("deferred json");
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("deferred json");
         assert_eq!(body["error"], "not_implemented");
         assert_eq!(body["tracker"], "br-il53l");
     }
@@ -15224,8 +15290,7 @@ first body
         let req = make_request(Http1Method::Get, "/web-dashboard/state", &[]);
         let resp = block_on(state.handle(req));
         assert_eq!(resp.status, 501);
-        let body: serde_json::Value =
-            serde_json::from_slice(&resp.body).expect("deferred json");
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("deferred json");
         assert_eq!(body["error"], "not_implemented");
         assert_eq!(body["tracker"], "br-il53l");
     }
@@ -15238,8 +15303,7 @@ first body
         req.body = br#"{"type":"Input","data":{"kind":"Key","key":"j","modifiers":0}}"#.to_vec();
         let resp = block_on(state.handle(req));
         assert_eq!(resp.status, 501);
-        let body: serde_json::Value =
-            serde_json::from_slice(&resp.body).expect("deferred json");
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("deferred json");
         assert_eq!(body["error"], "not_implemented");
     }
 
@@ -22668,70 +22732,6 @@ first body
         );
     }
 
-    #[test]
-    fn derive_domain_events_from_tool_contents_payload() {
-        let payload = serde_json::json!({
-            "deliveries": [{
-                "project": "alpha",
-                "payload": {
-                    "id": 45,
-                    "from": "RedFox",
-                    "to": ["BlueLake"],
-                    "subject": "From contents",
-                    "thread_id": "br-45"
-                }
-            }],
-            "count": 1
-        });
-        let contents = vec![Content::Text {
-            text: payload.to_string(),
-        }];
-
-        let events =
-            derive_domain_events_from_tool_contents("send_message", None, &contents, None, None);
-        assert_eq!(events.len(), 2);
-        match &events[0] {
-            tui_events::MailEvent::MessageSent { id, subject, .. } => {
-                assert_eq!(*id, 45);
-                assert_eq!(subject, "From contents");
-            }
-            other => panic!("expected MessageSent event, got {other:?}"),
-        }
-        assert!(events.iter().any(|event| matches!(
-            event,
-            tui_events::MailEvent::MessageReceived { id, to, .. }
-                if *id == 45 && to.as_slice() == ["BlueLake"]
-        )));
-    }
-
-    #[test]
-    fn derive_domain_events_from_tool_contents_non_json_is_empty() {
-        let contents = vec![Content::Text {
-            text: "not-json".to_string(),
-        }];
-        let events =
-            derive_domain_events_from_tool_contents("send_message", None, &contents, None, None);
-        assert!(events.is_empty());
-    }
-
-    #[test]
-    fn derive_domain_events_from_structured_content_payload() {
-        let payload = serde_json::json!({
-            "deliveries": [{
-                "project": "alpha",
-                "payload": {
-                    "id": 43,
-                    "from": "RedFox",
-                    "to": ["BlueLake"],
-                    "subject": "Structured content",
-                    "thread_id": "br-43"
-                }
-            }],
-            "count": 1
-        });
-        let call_result = serde_json::json!({
-            "structuredContent": payload
-        });
     fn atc_message_test_pool() -> mcp_agent_mail_db::DbPool {
         create_pool(&DbPoolConfig {
             database_url: "sqlite:///:memory:".to_string(),
@@ -22935,6 +22935,70 @@ first body
         reset_atc_message_observation_cache_for_test();
     }
 
+    #[test]
+    fn derive_domain_events_from_tool_contents_payload() {
+        let payload = serde_json::json!({
+            "deliveries": [{
+                "project": "alpha",
+                "payload": {
+                    "id": 45,
+                    "from": "RedFox",
+                    "to": ["BlueLake"],
+                    "subject": "From contents",
+                    "thread_id": "br-45"
+                }
+            }],
+            "count": 1
+        });
+        let contents = vec![Content::Text {
+            text: payload.to_string(),
+        }];
+
+        let events =
+            derive_domain_events_from_tool_contents("send_message", None, &contents, None, None);
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            tui_events::MailEvent::MessageSent { id, subject, .. } => {
+                assert_eq!(*id, 45);
+                assert_eq!(subject, "From contents");
+            }
+            other => panic!("expected MessageSent event, got {other:?}"),
+        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            tui_events::MailEvent::MessageReceived { id, to, .. }
+                if *id == 45 && to.as_slice() == ["BlueLake"]
+        )));
+    }
+
+    #[test]
+    fn derive_domain_events_from_tool_contents_non_json_is_empty() {
+        let contents = vec![Content::Text {
+            text: "not-json".to_string(),
+        }];
+        let events =
+            derive_domain_events_from_tool_contents("send_message", None, &contents, None, None);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn derive_domain_events_from_structured_content_payload() {
+        let payload = serde_json::json!({
+            "deliveries": [{
+                "project": "alpha",
+                "payload": {
+                    "id": 43,
+                    "from": "RedFox",
+                    "to": ["BlueLake"],
+                    "subject": "Structured content",
+                    "thread_id": "br-43"
+                }
+            }],
+            "count": 1
+        });
+        let call_result = serde_json::json!({
+            "structuredContent": payload
+        });
 
         let events =
             derive_domain_events_from_tool_result("send_message", None, &call_result, None, None);
@@ -23291,6 +23355,79 @@ first body
                 .iter()
                 .any(|event| matches!(event, tui_events::MailEvent::ReservationReleased { .. }))
         );
+    }
+
+    #[test]
+    fn derive_domain_events_from_renew_reservation_payload() {
+        let payload = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::json!({
+                    "renewed": 2,
+                    "file_reservations": [
+                        {
+                            "id": 10,
+                            "path_pattern": "src/**",
+                            "old_expires_ts": "2026-01-01T00:00:00Z",
+                            "new_expires_ts": "2026-01-02T00:00:00Z"
+                        },
+                        {
+                            "id": 11,
+                            "path_pattern": "tests/**",
+                            "old_expires_ts": "2026-01-01T00:00:00Z",
+                            "new_expires_ts": "2026-01-02T00:00:00Z"
+                        }
+                    ]
+                }).to_string()
+            }]
+        });
+        let call_args = serde_json::json!({
+            "agent_name": "BlueLake",
+            "ttl_seconds": 1800
+        });
+
+        let events = derive_domain_events_from_tool_result(
+            "renew_file_reservations",
+            Some(&call_args),
+            &payload,
+            Some("proj-alpha"),
+            None,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            tui_events::MailEvent::ReservationGranted { agent, paths, .. } => {
+                assert_eq!(agent, "BlueLake");
+                assert_eq!(paths.len(), 2);
+                assert!(paths.contains(&"src/**".to_string()));
+                assert!(paths.contains(&"tests/**".to_string()));
+            }
+            other => panic!("expected ReservationGranted event from renew, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_domain_events_from_renew_zero_renewed() {
+        let payload = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::json!({
+                    "renewed": 0,
+                    "file_reservations": []
+                }).to_string()
+            }]
+        });
+        let call_args = serde_json::json!({
+            "agent_name": "BlueLake"
+        });
+
+        let events = derive_domain_events_from_tool_result(
+            "renew_file_reservations",
+            Some(&call_args),
+            &payload,
+            Some("proj-alpha"),
+            None,
+        );
+        assert!(events.is_empty(), "zero renewed should produce no events");
     }
 
     #[test]
@@ -25943,9 +26080,7 @@ first body
                     // on the first scheduler tick after force-close is
                     // requested.
                     task_shutdown
-                        .wait_for_phase(
-                            asupersync::server::shutdown::ShutdownPhase::ForceClosing,
-                        )
+                        .wait_for_phase(asupersync::server::shutdown::ShutdownPhase::ForceClosing)
                         .await;
                     Ok::<(), std::io::Error>(())
                 })

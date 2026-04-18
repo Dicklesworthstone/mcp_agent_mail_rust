@@ -4359,6 +4359,50 @@ impl AtcEngine {
         }
     }
 
+    pub(crate) fn note_reservation_renewed(
+        &mut self,
+        agent: &str,
+        paths: &[String],
+        project: &str,
+        timestamp_micros: i64,
+    ) {
+        self.session_summary
+            .absorb(&SynthesisEvent::ReservationRenewed {
+                agent: agent.to_string(),
+                timestamp_micros,
+            });
+        if !paths.is_empty() {
+            let graph = self.conflict_graphs.entry(project.to_string()).or_default();
+            let cleared = graph.clear_blocked_conflicts_for_grant(agent, paths);
+            if cleared > 0 {
+                self.dirty_projects.insert(project.to_string());
+                self.session_summary
+                    .absorb(&SynthesisEvent::ConflictResolved { timestamp_micros });
+            }
+        }
+    }
+
+    pub(crate) fn note_reservation_force_released(
+        &mut self,
+        agent: &str,
+        paths: &[String],
+        project: &str,
+        timestamp_micros: i64,
+    ) {
+        self.session_summary
+            .absorb(&SynthesisEvent::ReservationForceReleased {
+                agent: agent.to_string(),
+                timestamp_micros,
+            });
+        let graph = self.conflict_graphs.entry(project.to_string()).or_default();
+        let cleared = graph.clear_holder_conflicts_for_release(agent, paths);
+        if cleared > 0 {
+            self.dirty_projects.insert(project.to_string());
+            self.session_summary
+                .absorb(&SynthesisEvent::ConflictResolved { timestamp_micros });
+        }
+    }
+
     pub(crate) fn note_reservation_conflicts(
         &mut self,
         requester: &str,
@@ -6471,6 +6515,8 @@ pub struct SessionSummary {
     pub messages_received: u64,
     pub reservations_granted: u64,
     pub reservations_released: u64,
+    pub reservations_renewed: u64,
+    pub reservations_force_released: u64,
     pub conflicts_detected: u64,
     pub conflicts_resolved: u64,
     pub atc_interventions: u64,
@@ -6516,6 +6562,14 @@ pub enum SynthesisEvent {
         agent: String,
         timestamp_micros: i64,
     },
+    ReservationRenewed {
+        agent: String,
+        timestamp_micros: i64,
+    },
+    ReservationForceReleased {
+        agent: String,
+        timestamp_micros: i64,
+    },
     ConflictDetected {
         timestamp_micros: i64,
     },
@@ -6542,6 +6596,12 @@ impl SynthesisEvent {
                 timestamp_micros, ..
             }
             | Self::ReservationReleased {
+                timestamp_micros, ..
+            }
+            | Self::ReservationRenewed {
+                timestamp_micros, ..
+            }
+            | Self::ReservationForceReleased {
                 timestamp_micros, ..
             }
             | Self::ConflictDetected { timestamp_micros }
@@ -6589,6 +6649,14 @@ impl SessionSummary {
             }
             SynthesisEvent::ReservationReleased { agent, .. } => {
                 self.reservations_released += 1;
+                self.active_agents.insert(agent.clone());
+            }
+            SynthesisEvent::ReservationRenewed { agent, .. } => {
+                self.reservations_renewed += 1;
+                self.active_agents.insert(agent.clone());
+            }
+            SynthesisEvent::ReservationForceReleased { agent, .. } => {
+                self.reservations_force_released += 1;
                 self.active_agents.insert(agent.clone());
             }
             SynthesisEvent::ConflictDetected { .. } => {
@@ -6657,10 +6725,17 @@ impl SessionSummary {
             lines.push(format!("Hot threads: {}", top.join(", ")));
         }
 
-        if self.reservations_granted > 0 || self.reservations_released > 0 {
+        if self.reservations_granted > 0
+            || self.reservations_released > 0
+            || self.reservations_renewed > 0
+            || self.reservations_force_released > 0
+        {
             lines.push(format!(
-                "Reservations: {} granted, {} released",
-                self.reservations_granted, self.reservations_released,
+                "Reservations: {} granted, {} released, {} renewed, {} force-released",
+                self.reservations_granted,
+                self.reservations_released,
+                self.reservations_renewed,
+                self.reservations_force_released,
             ));
         }
 
@@ -6687,6 +6762,8 @@ impl SessionSummary {
             && self.messages_received >= previous.messages_received
             && self.reservations_granted >= previous.reservations_granted
             && self.reservations_released >= previous.reservations_released
+            && self.reservations_renewed >= previous.reservations_renewed
+            && self.reservations_force_released >= previous.reservations_force_released
             && self.conflicts_detected >= previous.conflicts_detected
             && self.conflicts_resolved >= previous.conflicts_resolved
             && self.atc_interventions >= previous.atc_interventions
@@ -6771,6 +6848,28 @@ mod synthesis_tests {
 
         assert_eq!(summary.reservations_granted, 1);
         assert_eq!(summary.reservations_released, 1);
+    }
+
+    #[test]
+    fn absorb_reservation_renewed_and_force_released_events() {
+        let mut summary = SessionSummary::default();
+        summary.absorb(&SynthesisEvent::ReservationRenewed {
+            agent: "A".to_string(),
+            timestamp_micros: 1,
+        });
+        summary.absorb(&SynthesisEvent::ReservationForceReleased {
+            agent: "B".to_string(),
+            timestamp_micros: 2,
+        });
+        summary.absorb(&SynthesisEvent::ReservationRenewed {
+            agent: "A".to_string(),
+            timestamp_micros: 3,
+        });
+
+        assert_eq!(summary.reservations_renewed, 2);
+        assert_eq!(summary.reservations_force_released, 1);
+        assert!(summary.active_agents.contains("A"));
+        assert!(summary.active_agents.contains("B"));
     }
 
     #[test]
@@ -8865,6 +8964,18 @@ impl AtcEngine {
                         } => {
                             self.observe_activity(agent, None, timestamp_micros);
                         }
+                        SynthesisEvent::ReservationRenewed {
+                            ref agent,
+                            timestamp_micros,
+                        } => {
+                            self.observe_activity(agent, None, timestamp_micros);
+                        }
+                        SynthesisEvent::ReservationForceReleased {
+                            ref agent,
+                            timestamp_micros,
+                        } => {
+                            self.observe_activity(agent, None, timestamp_micros);
+                        }
                         _ => {}
                     }
                 }
@@ -9201,18 +9312,35 @@ fn atc_write_mode() -> mcp_agent_mail_core::AtcWriteMode {
 }
 
 pub fn refresh_kill_switch() {
-    let active = ATC_KILL_SWITCH_PATH
-        .get()
-        .is_some_and(|p| p.exists());
+    let active = ATC_KILL_SWITCH_PATH.get().is_some_and(|p| p.exists());
     let was_active = ATC_KILL_SWITCH.swap(active, AtomicOrdering::Relaxed);
+    mcp_agent_mail_core::global_metrics()
+        .atc
+        .set_kill_switch_enabled(active);
     if active != was_active {
+        let reason = if active {
+            ATC_KILL_SWITCH_PATH
+                .get()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         if active {
             tracing::info!(
+                event = "atc.kill_switch.change",
+                from_state = "disabled",
+                to_state = "enabled",
+                reason,
                 path = ?ATC_KILL_SWITCH_PATH.get(),
                 "ATC kill switch ACTIVATED — all experience writes suppressed"
             );
         } else {
             tracing::info!(
+                event = "atc.kill_switch.change",
+                from_state = "enabled",
+                to_state = "disabled",
+                reason = "",
                 path = ?ATC_KILL_SWITCH_PATH.get(),
                 "ATC kill switch DEACTIVATED — experience writes resume per AM_ATC_WRITE_MODE"
             );
@@ -9287,7 +9415,11 @@ pub fn atc_note_message_sent(
         return;
     }
     if mode.is_shadow() {
+        mcp_agent_mail_core::global_metrics()
+            .atc
+            .record_shadow_event("message_sent");
         tracing::trace!(
+            event = "atc.shadow.would_insert",
             family = "message_sent",
             from,
             ?to,
@@ -9315,7 +9447,11 @@ pub fn atc_note_message_received(agent: &str, thread_id: Option<&str>, timestamp
         return;
     }
     if mode.is_shadow() {
+        mcp_agent_mail_core::global_metrics()
+            .atc
+            .record_shadow_event("message_received");
         tracing::trace!(
+            event = "atc.shadow.would_insert",
             family = "message_received",
             agent,
             ?thread_id,
@@ -9348,7 +9484,11 @@ pub fn atc_note_reservation_granted(
         return;
     }
     if mode.is_shadow() {
+        mcp_agent_mail_core::global_metrics()
+            .atc
+            .record_shadow_event("reservation_granted");
         tracing::trace!(
+            event = "atc.shadow.would_insert",
             family = "reservation_granted",
             agent,
             ?paths,
@@ -9382,7 +9522,11 @@ pub fn atc_note_reservation_released(
         return;
     }
     if mode.is_shadow() {
+        mcp_agent_mail_core::global_metrics()
+            .atc
+            .record_shadow_event("reservation_released");
         tracing::trace!(
+            event = "atc.shadow.would_insert",
             family = "reservation_released",
             agent,
             ?paths,
@@ -9425,7 +9569,11 @@ pub fn atc_note_reservation_conflicts(
         })
         .collect();
     if mode.is_shadow() {
+        mcp_agent_mail_core::global_metrics()
+            .atc
+            .record_shadow_event("reservation_conflicts");
         tracing::trace!(
+            event = "atc.shadow.would_insert",
             family = "reservation_conflicts",
             requester,
             project,
@@ -9436,6 +9584,80 @@ pub fn atc_note_reservation_conflicts(
         return;
     }
     e.note_reservation_conflicts(requester, project, &conflicts, timestamp_micros);
+}
+
+pub fn atc_note_reservation_renewed(
+    agent: &str,
+    paths: &[String],
+    project: &str,
+    timestamp_micros: i64,
+) {
+    let mode = atc_write_mode();
+    if mode.is_off() {
+        return;
+    }
+    let Some(engine) = ATC_ENGINE.get() else {
+        return;
+    };
+    let Ok(mut e) = engine.lock() else {
+        return;
+    };
+    if !e.enabled() {
+        return;
+    }
+    if mode.is_shadow() {
+        mcp_agent_mail_core::global_metrics()
+            .atc
+            .record_shadow_event("reservation_renewed");
+        tracing::trace!(
+            event = "atc.shadow.would_insert",
+            family = "reservation_renewed",
+            agent,
+            ?paths,
+            project,
+            timestamp_micros,
+            "shadow: would insert experience row"
+        );
+        return;
+    }
+    e.note_reservation_renewed(agent, paths, project, timestamp_micros);
+}
+
+pub fn atc_note_reservation_force_released(
+    agent: &str,
+    paths: &[String],
+    project: &str,
+    timestamp_micros: i64,
+) {
+    let mode = atc_write_mode();
+    if mode.is_off() {
+        return;
+    }
+    let Some(engine) = ATC_ENGINE.get() else {
+        return;
+    };
+    let Ok(mut e) = engine.lock() else {
+        return;
+    };
+    if !e.enabled() {
+        return;
+    }
+    if mode.is_shadow() {
+        mcp_agent_mail_core::global_metrics()
+            .atc
+            .record_shadow_event("reservation_force_released");
+        tracing::trace!(
+            event = "atc.shadow.would_insert",
+            family = "reservation_force_released",
+            agent,
+            ?paths,
+            project,
+            timestamp_micros,
+            "shadow: would insert experience row"
+        );
+        return;
+    }
+    e.note_reservation_force_released(agent, paths, project, timestamp_micros);
 }
 
 pub fn atc_note_intervention(timestamp_micros: i64) {
@@ -9453,7 +9675,11 @@ pub fn atc_note_intervention(timestamp_micros: i64) {
         return;
     }
     if mode.is_shadow() {
+        mcp_agent_mail_core::global_metrics()
+            .atc
+            .record_shadow_event("intervention");
         tracing::trace!(
+            event = "atc.shadow.would_insert",
             family = "intervention",
             timestamp_micros,
             "shadow: would insert experience row"
@@ -9549,10 +9775,36 @@ pub fn atc_record_outcome(
         // Clone to satisfy borrow checker (calibration borrows eprocess/cusum)
         let ep_snapshot = engine.eprocess.clone();
         let cusum_snapshot = engine.cusum.clone();
+        let was_safe_mode = engine.calibration.is_safe_mode();
+        let safe_mode_since = engine.calibration.safe_mode_since();
         let changed = engine
             .calibration
             .update(&ep_snapshot, &cusum_snapshot, correct, now);
         if changed {
+            let safe_mode_active = engine.calibration.is_safe_mode();
+            mcp_agent_mail_core::global_metrics()
+                .atc
+                .record_safe_mode_transition(safe_mode_active);
+            if safe_mode_active {
+                tracing::warn!(
+                    event = "atc.safe_mode.enter",
+                    reason = format!(
+                        "eprocess={} cusum={}",
+                        ep_snapshot.miscalibrated(),
+                        cusum_snapshot.degradation_detected()
+                    ),
+                    triggered_by = ?subsystem,
+                    "ATC safe mode entered"
+                );
+            } else if was_safe_mode {
+                tracing::info!(
+                    event = "atc.safe_mode.exit",
+                    duration = now.saturating_sub(safe_mode_since),
+                    remediation = "consecutive_correct_recovery",
+                    triggered_by = ?subsystem,
+                    "ATC safe mode exited"
+                );
+            }
             engine.mark_agents_dirty();
         }
     }
