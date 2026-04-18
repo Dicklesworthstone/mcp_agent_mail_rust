@@ -267,6 +267,12 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 Provides asynchronous multi-agent coordination via a mail metaphor: identities, inbox/outbox, searchable threads, advisory file reservations (leases), and build slots — all backed by Git for human-auditable artifacts and SQLite for fast indexing.
 
+### Documentation
+
+- Deferred browser parity reference: `docs/SPEC-browser-parity-contract-deferred.md`
+- Parked prototype: `experimental/mcp-agent-mail-wasm/` is deferred prior art, not
+  an active workspace crate or shipped browser surface
+
 ### Architecture
 
 ```
@@ -291,7 +297,7 @@ MCP Client (agent) ──── stdio/HTTP ────► mcp-agent-mail-server
 
 ```
 mcp_agent_mail_rust/
-├── Cargo.toml                              # Workspace root
+├── Cargo.toml                              # Workspace root (active crates only; experimental surfaces excluded)
 ├── crates/
 │   ├── mcp-agent-mail-core/                # Zero-dep: config, models, errors, metrics
 │   ├── mcp-agent-mail-db/                  # SQLite schema, queries, pool, cache, FTS
@@ -303,6 +309,8 @@ mcp_agent_mail_rust/
 │   ├── mcp-agent-mail/                     # Server binary (mcp-agent-mail)
 │   ├── mcp-agent-mail-cli/                 # CLI binary (am)
 │   └── mcp-agent-mail-conformance/         # Python parity tests
+├── experimental/
+│   └── mcp-agent-mail-wasm/                # Parked standalone WASM/browser prototype
 ├── tests/e2e/                              # End-to-end test scripts
 ├── scripts/                                # CLI integration tests, utilities
 └── rust-toolchain.toml                     # Nightly toolchain requirement
