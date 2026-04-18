@@ -170,6 +170,8 @@ Current post-fix artifacts:
 - `tests/artifacts/perf/archive_batch_scaling.csv`
 - `tests/artifacts/perf/archive_batch_100_flamegraph.svg`
 - `tests/artifacts/perf/archive_batch_100_profile.md`
+- `benches/archive_perf_baseline.json` (checked-in CI gate baseline for warm batch-1/10/100)
+- `.github/workflows/archive-perf-gate.yml` + `scripts/bench_archive_perf_gate.sh` (PR/scheduled regression gate)
 
 Warm steady-state burst measurements (`MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 rch exec -- cargo bench ... archive_write_batch`):
 
@@ -182,6 +184,11 @@ Warm steady-state burst measurements (`MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 rch exec
 Scaling-law observation:
 - `batch-100 p95 / batch-1 p95 = 19.27x`, so the per-message cost at batch-100 is ~`0.193x` batch-1.
 - `wbq_flush` remains negligible; the decisive cost is now the batch archive write plus `flush_async_commits`.
+
+CI perf gate policy:
+- The archive regression gate compares warm batch-1/10/100 `p95` and `p99` against `benches/archive_perf_baseline.json`.
+- The gate allows a `10%` tolerance band over the stored baseline to absorb runner noise, but still records hard budget breaches (`>250ms p95`, `>300ms p99`) separately.
+- PRs can carry the `perf-regression-acknowledged` label for an intentional, reviewed performance tradeoff; runtime/benchmark failures are never auto-acknowledged.
 
 Span roll-up for warm batch-100:
 - `archive_batch.write_message_batch` / `archive_batch.write_message_batch_bundle`: ~1.75s cumulative across 12 samples (~68% of sampled wall time)

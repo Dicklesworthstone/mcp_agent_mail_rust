@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "bead_id": "br-8qdh0.7",
+  "tolerance_pct": 10.0,
+  "source": {
+    "captured_at": "2026-04-18",
+    "source_commit": "99bc2663ece83e05a846638c69abc6c32228f7bb",
+    "artifacts": [
+      "tests/artifacts/perf/archive_batch_scaling.csv",
+      "tests/artifacts/perf/archive_batch_100_profile.md",
+      "benches/BUDGETS.md"
+    ],
+    "runner_class": "reference-linux-nvme"
+  },
+  "scenarios": {
+    "batch_no_attachments_1": {
+      "batch_size": 1,
+      "baseline_p50_us": 11732,
+      "baseline_p95_us": 12352,
+      "baseline_p99_us": 13517,
+      "budget_p95_us": 250000,
+      "budget_p99_us": 300000
+    },
+    "batch_no_attachments_10": {
+      "batch_size": 10,
+      "baseline_p50_us": 28817,
+      "baseline_p95_us": 31751,
+      "baseline_p99_us": 32664,
+      "budget_p95_us": 250000,
+      "budget_p99_us": 300000
+    },
+    "batch_no_attachments_100": {
+      "batch_size": 100,
+      "baseline_p50_us": 213468,
+      "baseline_p95_us": 238053,
+      "baseline_p99_us": 241759,
+      "budget_p95_us": 250000,
+      "budget_p99_us": 300000
+    }
+  }
+}
