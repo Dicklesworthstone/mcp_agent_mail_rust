@@ -99,7 +99,11 @@ cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write
 Artifacts (JSON + raw samples) are written under:
 - `tests/artifacts/bench/archive/<run_id>/summary.json`
 
-Most recent baseline run (2026-02-08): `tests/artifacts/bench/archive/1770542015_450923/summary.json`.
+Most recent cold-harness baseline run (2026-04-18):
+`tests/artifacts/bench/archive/1776505951_367469/summary.json`.
+
+Historical pre-profile reference (2026-02-08):
+`tests/artifacts/bench/archive/1770542015_450923/summary.json`.
 
 Golden baseline: `tests/artifacts/bench/baseline/golden_baseline_20260208.json`.
 
@@ -107,10 +111,36 @@ Budgets are set to ~2x the measured baseline p95 to absorb variance.
 
 | Operation | Baseline p50 | Baseline p95 | Baseline p99 | Budget p95 | Budget p99 | Notes |
 |-----------|--------------|--------------|--------------|------------|------------|-------|
-| Single message (no attachments) | ~17.2ms | ~21.3ms | ~22.1ms | < 25ms | < 30ms | Writes canonical+outbox+1 inbox + git commit flush |
-| Single message (inline attachment) | ~22.0ms | ~26.0ms | ~26.7ms | < 25ms | < 30ms | Includes WebP convert + manifest + audit + inline base64 body. **p95 over budget** |
-| Single message (file attachment) | ~20.4ms | ~25.2ms | ~29.1ms | < 25ms | < 30ms | Includes WebP convert + manifest + audit + file-path body. **p95 marginal** |
-| Batch 100 messages (no attachments) | ~930ms | ~1076ms | ~1076ms | < 250ms | < 300ms | **4x over budget** — commit batching not yet coalescing effectively |
+| Single message (no attachments) | ~20.3ms | ~21.1ms | ~22.2ms | < 25ms | < 30ms | Writes canonical+outbox+1 inbox + git commit flush |
+| Single message (inline attachment) | ~19.3ms | ~19.8ms | ~20.5ms | < 25ms | < 30ms | Includes WebP convert + manifest + audit + inline base64 body |
+| Single message (file attachment) | ~20.6ms | ~22.0ms | ~22.4ms | < 25ms | < 30ms | Includes WebP convert + manifest + audit + file-path body |
+| Batch 100 messages (no attachments) | ~1117.9ms | ~1316.6ms | ~1316.6ms | < 250ms | < 300ms | Cold fresh-repo burst per sample; use the warm-path profile update below for the decisive steady-state signal |
+
+### Warm-Path Profile Update (br-8qdh0.1, 2026-04-18)
+
+Artifacts:
+- `tests/artifacts/perf/archive_batch_100_spans.json`
+- `tests/artifacts/perf/archive_batch_scaling.csv`
+- `tests/artifacts/perf/archive_batch_100_flamegraph.svg`
+- `tests/artifacts/perf/archive_batch_100_profile.md`
+- `docs/PERF-archive-batch-profile-2026-04-18.md`
+
+Warm steady-state burst measurements (`MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 cargo bench ... archive_write_batch`):
+
+| Scenario | p50 | p95 | p99 | Note |
+|----------|-----|-----|-----|------|
+| batch-1 | ~11.9ms | ~12.7ms | ~15.0ms | Warm DB + warmed archive |
+| batch-10 | ~33.1ms | ~38.2ms | ~38.9ms | Some amortization already visible |
+| batch-100 | ~220.4ms | ~264.7ms | ~265.0ms | Near budget; ~14.7ms above p95 target |
+
+Scaling-law observation:
+- `batch-100 p95 / batch-1 p95 = 20.84x`, so the per-message cost at batch-100 is ~`0.208x` batch-1.
+- `wbq_flush` is negligible in the span trace; the cost is dominated by the write loop itself plus `flush_async_commits`.
+
+Span roll-up for warm batch-100:
+- `archive_batch.write_message_loop`: ~2.04s cumulative across 12 samples (~77% of sampled wall time)
+- `archive_batch.flush_async_commits`: ~0.61s cumulative (~23%)
+- `archive_batch.wbq_flush`: ~420us cumulative (noise floor)
 
 ### MCP Tool Handler Baselines (Criterion, 2026-02-08)
 
@@ -247,11 +277,19 @@ Generated via `cargo flamegraph --root` with `CARGO_PROFILE_RELEASE_DEBUG=true`.
 |---------|------|---------|-------------|
 | Tool handlers | `benches/flamegraph_bench_tools.svg` | 45,056 | 65% kernel (btrfs fdatasync), syscall cancel dominates userspace |
 | Archive writes | `benches/flamegraph_bench_archive.svg` | 44,948 | Same pattern — I/O bound, not CPU bound |
+| Archive batch 100 (warm path, 2026-04-18) | `tests/artifacts/perf/archive_batch_100_flamegraph.svg` | 77,537 | Allocator churn plus `commit-coalesce`, `git`, `unlinkat`, and `fsync` dominate the targeted batch path; `wbq_flush` is not a hotspot |
 
 **Interpretation**: Both profiles confirm the strace analysis below. The Rust userspace code is
 highly optimized; the bottleneck is kernel-side I/O (btrfs journal sync via `fdatasync`).
 Optimization effort should target reducing sync frequency (commit batching) rather than
 CPU-side code changes.
+
+**2026-04-18 targeted update**: the warm batch-100 flamegraph refines that earlier conclusion.
+The path is still I/O-heavy, but the highest-signal user-space stacks are allocator churn
+(`_int_malloc`, `realloc`, `free`) plus `commit-coalesce` / `git` cleanup work, with
+`unlinkat`, `rename`, `readdir`, and `fsync` showing the filesystem side of the same burst.
+Optimization effort should focus on reducing per-message archive/object churn and git cleanup
+inside the batch burst before spending more time on `wbq_flush`.
 
 ## Syscall Profile (strace, 2026-02-08)
 

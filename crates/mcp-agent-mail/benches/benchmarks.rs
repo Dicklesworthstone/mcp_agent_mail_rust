@@ -5,20 +5,28 @@
     clippy::significant_drop_tightening
 )]
 
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use fastmcp::{Budget, CallToolParams, Cx};
-use fastmcp_core::{Outcome, SessionState, block_on};
+use fastmcp_core::{block_on, Outcome, SessionState};
 use mcp_agent_mail_conformance::Fixtures;
 use mcp_agent_mail_db::search_planner::SearchQuery;
 use mcp_agent_mail_db::{DbPool, DbPoolConfig};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
 use std::hint::black_box;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
+use tracing::field::{Field, Visit};
+use tracing::Subscriber;
+use tracing_subscriber::layer::{Context, Layer};
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::Registry;
 
 fn fixtures_path() -> std::path::PathBuf {
     // `CARGO_MANIFEST_DIR` is `crates/mcp-agent-mail` for this bench crate.
@@ -174,12 +182,21 @@ enum ArchiveScenario {
 }
 
 impl ArchiveScenario {
-    const fn name(self) -> &'static str {
+    const fn benchmark_name(self) -> &'static str {
         match self {
             Self::SingleNoAttachments => "single_no_attachments",
             Self::SingleInlineAttachment => "single_inline_attachment",
             Self::SingleFileAttachment => "single_file_attachment",
             Self::BatchNoAttachments { .. } => "batch_no_attachments",
+        }
+    }
+
+    fn artifact_label(self) -> String {
+        match self {
+            Self::BatchNoAttachments { batch_size } => {
+                format!("{}_{}", self.benchmark_name(), batch_size)
+            }
+            _ => self.benchmark_name().to_string(),
         }
     }
 
@@ -222,6 +239,10 @@ fn share_artifact_dir(run_id: &str) -> PathBuf {
         .join("bench")
         .join("share")
         .join(run_id)
+}
+
+fn perf_artifact_dir() -> PathBuf {
+    repo_root().join("tests").join("artifacts").join("perf")
 }
 
 fn write_bmp24(path: &Path, width: u32, height: u32, seed: u32) -> std::io::Result<()> {
@@ -300,6 +321,181 @@ struct ArchiveBenchRun {
     results: Vec<ArchiveBenchScenarioResult>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct RecordedSpan {
+    name: String,
+    fields: BTreeMap<String, String>,
+    duration_us: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ArchivePerfComparison {
+    batch_size: usize,
+    samples_us: Vec<u64>,
+    p50_us: u64,
+    p95_us: u64,
+    p99_us: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ArchivePerfCategory {
+    category: String,
+    cumulative_us: u64,
+    count: usize,
+    avg_us: u64,
+    max_us: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ArchivePerfReport {
+    run_id: String,
+    arch: String,
+    os: String,
+    warm_db: bool,
+    comparison: Vec<ArchivePerfComparison>,
+    batch_100_spans: Vec<RecordedSpan>,
+    top_categories: Vec<ArchivePerfCategory>,
+    scaling_law_note: String,
+}
+
+#[derive(Debug, Default)]
+struct SpanFieldRecorder {
+    fields: BTreeMap<String, String>,
+}
+
+impl Visit for SpanFieldRecorder {
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.fields
+            .insert(field.name().to_string(), format!("{value:?}"));
+    }
+}
+
+#[derive(Debug)]
+struct ActiveSpanRecord {
+    name: String,
+    fields: BTreeMap<String, String>,
+    entered_at: Option<Instant>,
+    cumulative: std::time::Duration,
+}
+
+#[derive(Debug, Default)]
+struct SpanRecorderState {
+    active: Mutex<HashMap<tracing::span::Id, ActiveSpanRecord>>,
+    closed: Mutex<Vec<RecordedSpan>>,
+}
+
+impl SpanRecorderState {
+    fn take_closed(&self) -> Vec<RecordedSpan> {
+        let mut closed = self.closed.lock().expect("closed span lock");
+        std::mem::take(&mut *closed)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SpanRecorderLayer {
+    state: Arc<SpanRecorderState>,
+}
+
+impl SpanRecorderLayer {
+    fn new(state: Arc<SpanRecorderState>) -> Self {
+        Self { state }
+    }
+}
+
+impl<S> Layer<S> for SpanRecorderLayer
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        _ctx: Context<'_, S>,
+    ) {
+        let mut visitor = SpanFieldRecorder::default();
+        attrs.record(&mut visitor);
+        let mut active = self.state.active.lock().expect("active span lock");
+        active.insert(
+            id.clone(),
+            ActiveSpanRecord {
+                name: attrs.metadata().name().to_string(),
+                fields: visitor.fields,
+                entered_at: None,
+                cumulative: std::time::Duration::ZERO,
+            },
+        );
+    }
+
+    fn on_enter(&self, id: &tracing::span::Id, _ctx: Context<'_, S>) {
+        let mut active = self.state.active.lock().expect("active span lock");
+        if let Some(span) = active.get_mut(id) {
+            span.entered_at = Some(Instant::now());
+        }
+    }
+
+    fn on_exit(&self, id: &tracing::span::Id, _ctx: Context<'_, S>) {
+        let mut active = self.state.active.lock().expect("active span lock");
+        if let Some(span) = active.get_mut(id) {
+            if let Some(started_at) = span.entered_at.take() {
+                span.cumulative += started_at.elapsed();
+            }
+        }
+    }
+
+    fn on_close(&self, id: tracing::span::Id, _ctx: Context<'_, S>) {
+        let mut active = self.state.active.lock().expect("active span lock");
+        let Some(span) = active.remove(&id) else {
+            return;
+        };
+        drop(active);
+
+        if span.cumulative.is_zero() {
+            return;
+        }
+
+        let duration_us = u64::try_from(span.cumulative.as_micros()).unwrap_or(u64::MAX);
+        let mut closed = self.state.closed.lock().expect("closed span lock");
+        closed.push(RecordedSpan {
+            name: span.name,
+            fields: span.fields,
+            duration_us,
+        });
+    }
+}
+
+fn span_recorder_state() -> Arc<SpanRecorderState> {
+    static STATE: OnceLock<Arc<SpanRecorderState>> = OnceLock::new();
+    STATE
+        .get_or_init(|| {
+            let state = Arc::new(SpanRecorderState::default());
+            let subscriber = Registry::default().with(SpanRecorderLayer::new(state.clone()));
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("bench trace subscriber must install once");
+            state
+        })
+        .clone()
+}
+
 const PERCENTILE_SCALE: u32 = 1_000_000;
 
 fn percentile_us(mut samples: Vec<u64>, pct: f64) -> u64 {
@@ -339,6 +535,8 @@ fn run_archive_harness_once() {
             (ArchiveScenario::SingleNoAttachments, 200),
             (ArchiveScenario::SingleInlineAttachment, 50),
             (ArchiveScenario::SingleFileAttachment, 50),
+            (ArchiveScenario::BatchNoAttachments { batch_size: 1 }, 100),
+            (ArchiveScenario::BatchNoAttachments { batch_size: 10 }, 50),
             (ArchiveScenario::BatchNoAttachments { batch_size: 100 }, 10),
         ];
 
@@ -423,7 +621,7 @@ fn run_archive_harness_once() {
                 }
 
                 let scenario_result = ArchiveBenchScenarioResult {
-                    scenario: scenario.name().to_string(),
+                    scenario: scenario.artifact_label(),
                     elements_per_op,
                     samples_us: samples_us.clone(),
                     p50_us,
@@ -439,7 +637,7 @@ fn run_archive_harness_once() {
                 };
 
                 let _ = std::fs::write(
-                    out_dir.join(format!("{}.json", scenario.name())),
+                    out_dir.join(format!("{}.json", scenario.artifact_label())),
                     serde_json::to_string_pretty(&scenario_result).unwrap_or_default(),
                 );
                 results.push(scenario_result);
@@ -621,7 +819,7 @@ fn run_archive_harness_once() {
             }
 
             let scenario_result = ArchiveBenchScenarioResult {
-                scenario: scenario.name().to_string(),
+                scenario: scenario.artifact_label(),
                 elements_per_op,
                 samples_us: samples_us.clone(),
                 p50_us,
@@ -637,7 +835,7 @@ fn run_archive_harness_once() {
             };
 
             let _ = std::fs::write(
-                out_dir.join(format!("{}.json", scenario.name())),
+                out_dir.join(format!("{}.json", scenario.artifact_label())),
                 serde_json::to_string_pretty(&scenario_result).unwrap_or_default(),
             );
 
@@ -662,9 +860,295 @@ fn run_archive_harness_once() {
     });
 }
 
+fn run_archive_batch_sample(
+    archive: &mcp_agent_mail_storage::ProjectArchive,
+    config: &mcp_agent_mail_core::Config,
+    sender: &str,
+    recipients: &[String],
+    batch_size: usize,
+    msg_id: &mut i64,
+    sample_index: usize,
+) -> u64 {
+    let sample_span = tracing::info_span!(
+        "archive_batch.sample",
+        batch_size,
+        sample_index,
+        elements = batch_size
+    );
+    let _sample_guard = sample_span.entered();
+
+    let t0 = Instant::now();
+    {
+        let write_span =
+            tracing::info_span!("archive_batch.write_message_loop", batch_size, sample_index);
+        let _write_guard = write_span.entered();
+        for _ in 0..batch_size {
+            let message_span =
+                tracing::trace_span!("archive_batch.write_message_bundle", batch_size);
+            let _message_guard = message_span.entered();
+            let message_json = serde_json::json!({
+                "id": *msg_id,
+                "project": "bench-archive",
+                "subject": "bench batch",
+                "created_ts": 1_700_000_000_000_000i64,
+            });
+            mcp_agent_mail_storage::write_message_bundle(
+                archive,
+                config,
+                &message_json,
+                "hello",
+                sender,
+                recipients,
+                &[],
+                None,
+            )
+            .expect("write_message_bundle");
+            *msg_id += 1;
+        }
+    }
+
+    {
+        let flush_span = tracing::info_span!("archive_batch.flush_async_commits", batch_size);
+        let _flush_guard = flush_span.entered();
+        mcp_agent_mail_storage::flush_async_commits();
+    }
+    {
+        let wbq_span = tracing::info_span!("archive_batch.wbq_flush", batch_size);
+        let _wbq_guard = wbq_span.entered();
+        mcp_agent_mail_storage::wbq_flush();
+    }
+
+    u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+fn summarize_recorded_spans(spans: &[RecordedSpan]) -> Vec<ArchivePerfCategory> {
+    let mut grouped: HashMap<String, Vec<u64>> = HashMap::new();
+    for span in spans {
+        grouped
+            .entry(span.name.clone())
+            .or_default()
+            .push(span.duration_us);
+    }
+
+    let mut categories: Vec<ArchivePerfCategory> = grouped
+        .into_iter()
+        .map(|(category, durations)| {
+            let count = durations.len();
+            let cumulative_us = durations.iter().copied().sum::<u64>();
+            let max_us = durations.iter().copied().max().unwrap_or(0);
+            let avg_us = if count > 0 {
+                cumulative_us / u64::try_from(count).unwrap_or(1)
+            } else {
+                0
+            };
+            ArchivePerfCategory {
+                category,
+                cumulative_us,
+                count,
+                avg_us,
+                max_us,
+            }
+        })
+        .collect();
+
+    categories.sort_by_key(|item| std::cmp::Reverse(item.cumulative_us));
+    categories.truncate(10);
+    categories
+}
+
+fn scaling_law_note(comparison: &[ArchivePerfComparison]) -> String {
+    let batch_1 = comparison.iter().find(|item| item.batch_size == 1);
+    let batch_10 = comparison.iter().find(|item| item.batch_size == 10);
+    let batch_100 = comparison.iter().find(|item| item.batch_size == 100);
+
+    match (batch_1, batch_10, batch_100) {
+        (Some(batch_1), Some(batch_10), Some(batch_100)) if batch_1.p95_us > 0 => {
+            let ratio_10 = batch_10.p95_us as f64 / batch_1.p95_us as f64;
+            let ratio_100 = batch_100.p95_us as f64 / batch_1.p95_us as f64;
+            let amortized_100 = ratio_100 / 100.0;
+            format!(
+                "batch-10 p95 is {ratio_10:.2}x batch-1 and batch-100 p95 is {ratio_100:.2}x batch-1; \
+                 amortized per-message cost at batch-100 is {amortized_100:.3}x batch-1."
+            )
+        }
+        _ => "insufficient comparison data to compute scaling law".to_string(),
+    }
+}
+
+fn write_archive_profile_report(
+    comparison: &[ArchivePerfComparison],
+    top_categories: &[ArchivePerfCategory],
+    scaling_note: &str,
+) -> io::Result<()> {
+    let report_path = perf_artifact_dir().join("archive_batch_100_profile.md");
+    let _ = std::fs::create_dir_all(perf_artifact_dir());
+
+    let mut lines = Vec::new();
+    lines.push("# Archive Batch 100 Profile".to_string());
+    lines.push(String::new());
+    lines.push("## Batch Comparison".to_string());
+    for entry in comparison {
+        lines.push(format!(
+            "- batch-{}: p50={}us, p95={}us, p99={}us, samples={}",
+            entry.batch_size,
+            entry.p50_us,
+            entry.p95_us,
+            entry.p99_us,
+            entry.samples_us.len()
+        ));
+    }
+    lines.push(String::new());
+    lines.push("## Top Span Categories".to_string());
+    for category in top_categories {
+        lines.push(format!(
+            "- `{}`: cumulative={}us, count={}, avg={}us, max={}us",
+            category.category,
+            category.cumulative_us,
+            category.count,
+            category.avg_us,
+            category.max_us
+        ));
+    }
+    lines.push(String::new());
+    lines.push("## Scaling Law".to_string());
+    lines.push(format!("- {scaling_note}"));
+    lines.push(String::new());
+
+    std::fs::write(report_path, lines.join("\n"))
+}
+
+fn write_archive_scaling_csv(comparison: &[ArchivePerfComparison]) -> io::Result<()> {
+    let csv_path = perf_artifact_dir().join("archive_batch_scaling.csv");
+    let _ = std::fs::create_dir_all(perf_artifact_dir());
+
+    let mut lines = Vec::with_capacity(comparison.len() + 1);
+    lines.push("batch_size,p50_us,p95_us,p99_us,sample_count".to_string());
+    for entry in comparison {
+        lines.push(format!(
+            "{},{},{},{},{}",
+            entry.batch_size,
+            entry.p50_us,
+            entry.p95_us,
+            entry.p99_us,
+            entry.samples_us.len()
+        ));
+    }
+
+    std::fs::write(csv_path, lines.join("\n"))
+}
+
+fn run_archive_perf_profile_once() {
+    static DID_RUN: Once = Once::new();
+    if std::env::var_os("MCP_AGENT_MAIL_ARCHIVE_PROFILE").is_none() {
+        return;
+    }
+
+    DID_RUN.call_once(|| {
+        let state = span_recorder_state();
+        let perf_dir = perf_artifact_dir();
+        let _ = std::fs::create_dir_all(&perf_dir);
+        let _ = state.take_closed();
+
+        let mut comparison = Vec::new();
+        let mut batch_100_spans = Vec::new();
+        let sample_counts = [(1usize, 40usize), (10usize, 25usize), (100usize, 12usize)];
+
+        for (batch_size, sample_count) in sample_counts {
+            let tmp = TempDir::new().expect("tempdir");
+            let original_cwd = std::env::current_dir().expect("cwd");
+            std::env::set_current_dir(tmp.path()).expect("chdir");
+
+            let mut config = mcp_agent_mail_core::Config::from_env();
+            config.storage_root = tmp.path().join("archive_repo");
+            config.database_url = format!(
+                "sqlite+aiosqlite:///{}",
+                tmp.path().join("storage.sqlite3").display()
+            );
+
+            let sender = "BenchSender";
+            let recipients = vec!["BenchReceiver".to_string()];
+            let mut msg_id = 1_i64;
+
+            let archive = {
+                let setup_span = tracing::info_span!("archive_batch.ensure_archive", batch_size);
+                let _setup_guard = setup_span.entered();
+                mcp_agent_mail_storage::ensure_archive(&config, "bench-archive")
+                    .expect("ensure_archive")
+            };
+
+            let warmup_span = tracing::info_span!("archive_batch.warmup", batch_size);
+            let _warmup_guard = warmup_span.entered();
+            let _ = run_archive_batch_sample(
+                &archive,
+                &config,
+                sender,
+                &recipients,
+                batch_size,
+                &mut msg_id,
+                usize::MAX,
+            );
+            drop(_warmup_guard);
+            let _ = state.take_closed();
+
+            let mut samples_us = Vec::with_capacity(sample_count);
+            for sample_index in 0..sample_count {
+                let elapsed_us = run_archive_batch_sample(
+                    &archive,
+                    &config,
+                    sender,
+                    &recipients,
+                    batch_size,
+                    &mut msg_id,
+                    sample_index,
+                );
+                samples_us.push(elapsed_us);
+            }
+
+            let scenario = ArchivePerfComparison {
+                batch_size,
+                p50_us: percentile_us(samples_us.clone(), 0.50),
+                p95_us: percentile_us(samples_us.clone(), 0.95),
+                p99_us: percentile_us(samples_us.clone(), 0.99),
+                samples_us,
+            };
+
+            if batch_size == 100 {
+                batch_100_spans = state.take_closed();
+            } else {
+                let _ = state.take_closed();
+            }
+            comparison.push(scenario);
+
+            std::env::set_current_dir(original_cwd).expect("restore cwd");
+            drop(tmp);
+        }
+
+        let top_categories = summarize_recorded_spans(&batch_100_spans);
+        let scaling_note = scaling_law_note(&comparison);
+        let report = ArchivePerfReport {
+            run_id: run_id(),
+            arch: std::env::consts::ARCH.to_string(),
+            os: std::env::consts::OS.to_string(),
+            warm_db: true,
+            comparison,
+            batch_100_spans,
+            top_categories: top_categories.clone(),
+            scaling_law_note: scaling_note.clone(),
+        };
+
+        let _ = std::fs::write(
+            perf_dir.join("archive_batch_100_spans.json"),
+            serde_json::to_string_pretty(&report).unwrap_or_default(),
+        );
+        let _ = write_archive_scaling_csv(&report.comparison);
+        let _ = write_archive_profile_report(&report.comparison, &top_categories, &scaling_note);
+    });
+}
+
 #[allow(clippy::too_many_lines)]
 fn bench_archive_write(c: &mut Criterion) {
     run_archive_harness_once();
+    run_archive_perf_profile_once();
 
     let scenarios: &[ArchiveScenario] = &[
         ArchiveScenario::SingleNoAttachments,
@@ -677,7 +1161,7 @@ fn bench_archive_write(c: &mut Criterion) {
         group.throughput(Throughput::Elements(scenario.elements_per_op()));
 
         group.bench_with_input(
-            BenchmarkId::new(scenario.name(), scenario.elements_per_op()),
+            BenchmarkId::new(scenario.benchmark_name(), scenario.elements_per_op()),
             &scenario,
             |b, &scenario| {
                 b.iter_custom(|iters| {
@@ -834,69 +1318,74 @@ fn bench_archive_write(c: &mut Criterion) {
 
     // Batch benches are much slower (intentionally) under legacy-ish commit batching,
     // so use a smaller sample size to keep `cargo bench` runtimes reasonable.
-    let scenario = ArchiveScenario::BatchNoAttachments { batch_size: 100 };
     let mut batch_group = c.benchmark_group("archive_write_batch");
     batch_group.sample_size(20);
-    batch_group.throughput(Throughput::Elements(scenario.elements_per_op()));
-    batch_group.bench_with_input(
-        BenchmarkId::new(scenario.name(), scenario.elements_per_op()),
-        &scenario,
-        |b, &scenario| {
-            b.iter_custom(|iters| {
-                let tmp = TempDir::new().expect("tempdir");
-                let original_cwd = std::env::current_dir().expect("cwd");
-                std::env::set_current_dir(tmp.path()).expect("chdir");
+    for scenario in [
+        ArchiveScenario::BatchNoAttachments { batch_size: 1 },
+        ArchiveScenario::BatchNoAttachments { batch_size: 10 },
+        ArchiveScenario::BatchNoAttachments { batch_size: 100 },
+    ] {
+        batch_group.throughput(Throughput::Elements(scenario.elements_per_op()));
+        batch_group.bench_with_input(
+            BenchmarkId::new(scenario.benchmark_name(), scenario.elements_per_op()),
+            &scenario,
+            |b, &scenario| {
+                b.iter_custom(|iters| {
+                    let tmp = TempDir::new().expect("tempdir");
+                    let original_cwd = std::env::current_dir().expect("cwd");
+                    std::env::set_current_dir(tmp.path()).expect("chdir");
 
-                let mut config = mcp_agent_mail_core::Config::from_env();
-                config.storage_root = tmp.path().join("archive_repo");
-                config.database_url = format!(
-                    "sqlite+aiosqlite:///{}",
-                    tmp.path().join("storage.sqlite3").display()
-                );
+                    let mut config = mcp_agent_mail_core::Config::from_env();
+                    config.storage_root = tmp.path().join("archive_repo");
+                    config.database_url = format!(
+                        "sqlite+aiosqlite:///{}",
+                        tmp.path().join("storage.sqlite3").display()
+                    );
 
-                let project_slug = "bench-archive";
-                let archive =
-                    mcp_agent_mail_storage::ensure_archive(&config, project_slug).expect("archive");
+                    let project_slug = "bench-archive";
+                    let archive = mcp_agent_mail_storage::ensure_archive(&config, project_slug)
+                        .expect("archive");
 
-                let sender = "BenchSender";
-                let recipients = vec!["BenchReceiver".to_string()];
+                    let sender = "BenchSender";
+                    let recipients = vec!["BenchReceiver".to_string()];
 
-                let mut msg_id: i64 = 1;
-                let t0 = Instant::now();
+                    let mut msg_id: i64 = 1;
+                    let t0 = Instant::now();
 
-                for _ in 0..iters {
-                    if let ArchiveScenario::BatchNoAttachments { batch_size } = scenario {
-                        for _ in 0..batch_size {
-                            let message_json = serde_json::json!({
-                                "id": msg_id,
-                                "project": project_slug,
-                                "subject": "bench batch",
-                                "created_ts": 1_700_000_000_000_000i64,
-                            });
-                            mcp_agent_mail_storage::write_message_bundle(
-                                &archive,
-                                &config,
-                                &message_json,
-                                "hello",
-                                sender,
-                                &recipients,
-                                &[],
-                                None,
-                            )
-                            .expect("write_message_bundle");
-                            msg_id += 1;
+                    for _ in 0..iters {
+                        if let ArchiveScenario::BatchNoAttachments { batch_size } = scenario {
+                            for _ in 0..batch_size {
+                                let message_json = serde_json::json!({
+                                    "id": msg_id,
+                                    "project": project_slug,
+                                    "subject": "bench batch",
+                                    "created_ts": 1_700_000_000_000_000i64,
+                                });
+                                mcp_agent_mail_storage::write_message_bundle(
+                                    &archive,
+                                    &config,
+                                    &message_json,
+                                    "hello",
+                                    sender,
+                                    &recipients,
+                                    &[],
+                                    None,
+                                )
+                                .expect("write_message_bundle");
+                                msg_id += 1;
+                            }
+                            mcp_agent_mail_storage::flush_async_commits();
                         }
-                        mcp_agent_mail_storage::flush_async_commits();
                     }
-                }
 
-                let dt = t0.elapsed();
-                std::env::set_current_dir(original_cwd).expect("restore cwd");
-                drop(tmp);
-                dt
-            });
-        },
-    );
+                    let dt = t0.elapsed();
+                    std::env::set_current_dir(original_cwd).expect("restore cwd");
+                    drop(tmp);
+                    dt
+                });
+            },
+        );
+    }
     batch_group.finish();
 }
 

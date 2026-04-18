@@ -1,0 +1,8921 @@
+{
+  "run_id": "1776505092_105440",
+  "arch": "x86_64",
+  "os": "linux",
+  "warm_db": true,
+  "comparison": [
+    {
+      "batch_size": 1,
+      "samples_us": [
+        12155,
+        11916,
+        12243,
+        11858,
+        14964,
+        12671,
+        12111,
+        11699,
+        12023,
+        11742,
+        12368,
+        11794,
+        11767,
+        11790,
+        11775,
+        12065,
+        12100,
+        11619,
+        11741,
+        11800,
+        11925,
+        12688,
+        12734,
+        11664,
+        12404,
+        11917,
+        11817,
+        12189,
+        11914,
+        11831,
+        12701,
+        11662,
+        11783,
+        11808,
+        11726,
+        12593,
+        11903,
+        12382,
+        11989,
+        11863
+      ],
+      "p50_us": 11916,
+      "p95_us": 12701,
+      "p99_us": 14964
+    },
+    {
+      "batch_size": 10,
+      "samples_us": [
+        37990,
+        31903,
+        33376,
+        31630,
+        35970,
+        31212,
+        31529,
+        34776,
+        32321,
+        32278,
+        29543,
+        28753,
+        34833,
+        32562,
+        31895,
+        34838,
+        38239,
+        34557,
+        33073,
+        32669,
+        31748,
+        36057,
+        35044,
+        38879,
+        36176
+      ],
+      "p50_us": 33073,
+      "p95_us": 38239,
+      "p99_us": 38879
+    },
+    {
+      "batch_size": 100,
+      "samples_us": [
+        188033,
+        187466,
+        191863,
+        197078,
+        203402,
+        205554,
+        229411,
+        220397,
+        250026,
+        246141,
+        264709,
+        265006
+      ],
+      "p50_us": 220397,
+      "p95_us": 264709,
+      "p99_us": 265006
+    }
+  ],
+  "batch_100_spans": [
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1742
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1595
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1545
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1666
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1496
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1769
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1548
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1479
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1461
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1544
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2662
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1474
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1470
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1482
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1473
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1719
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1999
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1546
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1518
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1429
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1390
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1502
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2045
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1926
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1519
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1587
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1385
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1445
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1719
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1808
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1650
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1476
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1519
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1492
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1771
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1608
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2505
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2748
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1943
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2696
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1492
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1328
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1288
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1280
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1283
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1321
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1259
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1253
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1220
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1274
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1287
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1225
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1236
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1475
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1368
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1419
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2474
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1998
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1521
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2190
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1375
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1401
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1374
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1265
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1503
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1228
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1198
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1304
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1384
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1297
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1304
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1303
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1849
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1392
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1336
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1732
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1348
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1433
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1622
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1283
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1366
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1365
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1721
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1379
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1277
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1263
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1247
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1389
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1255
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1785
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1440
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3335
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1927
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1542
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2595
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3045
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 7655
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2743
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2032
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1366
+    },
+    {
+      "name": "archive_batch.write_message_loop",
+      "fields": {
+        "batch_size": "100",
+        "sample_index": "0"
+      },
+      "duration_us": 167558
+    },
+    {
+      "name": "archive_batch.flush_async_commits",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 20427
+    },
+    {
+      "name": "archive_batch.wbq_flush",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 43
+    },
+    {
+      "name": "archive_batch.sample",
+      "fields": {
+        "batch_size": "100",
+        "elements": "100",
+        "sample_index": "0"
+      },
+      "duration_us": 188033
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2041
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1889
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1762
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1671
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1367
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1409
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1375
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1323
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1492
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1607
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1452
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1445
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1618
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1507
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1372
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1223
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1251
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1649
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1522
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1320
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1343
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2125
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2732
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1317
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2676
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1984
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2270
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1513
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1906
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1280
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1316
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1283
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1266
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1284
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1304
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1407
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1356
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1301
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1344
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1604
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1930
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1997
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1841
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1471
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1332
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1413
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1529
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1344
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1453
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2110
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1731
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1596
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2111
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1727
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2145
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1894
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2021
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1946
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1797
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1749
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1514
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1767
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1580
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1576
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1530
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1675
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1653
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1484
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1441
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1691
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1926
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2510
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1691
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1459
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1761
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2921
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3074
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2547
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1807
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1531
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1451
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1957
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1527
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1487
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1605
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1529
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1570
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1502
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1499
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1462
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1744
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1443
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1617
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1905
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1476
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1487
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1496
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1421
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1471
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1521
+    },
+    {
+      "name": "archive_batch.write_message_loop",
+      "fields": {
+        "batch_size": "100",
+        "sample_index": "1"
+      },
+      "duration_us": 166690
+    },
+    {
+      "name": "archive_batch.flush_async_commits",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 20517
+    },
+    {
+      "name": "archive_batch.wbq_flush",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 44
+    },
+    {
+      "name": "archive_batch.sample",
+      "fields": {
+        "batch_size": "100",
+        "elements": "100",
+        "sample_index": "1"
+      },
+      "duration_us": 187466
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1770
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2260
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2194
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1955
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2130
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1882
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1449
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1461
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1402
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1426
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1396
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1503
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2296
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2373
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1470
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1357
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1406
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1509
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1990
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1709
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1641
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2148
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1955
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1566
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1585
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1472
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1508
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1669
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1370
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1456
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1633
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1448
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1476
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1458
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1439
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1510
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1564
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1502
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1524
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1589
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3548
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1480
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1571
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1923
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1464
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1557
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1448
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1558
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1455
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1607
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1481
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1547
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1386
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1464
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1447
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1428
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1645
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2291
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3017
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2057
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1496
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1538
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1528
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2049
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2087
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2442
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1781
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1684
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1552
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1585
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2114
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1682
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1632
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2035
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1950
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1695
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1496
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1418
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1480
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1965
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2401
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2099
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1655
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1408
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1250
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2367
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1442
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1436
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1704
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1397
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1295
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1290
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1673
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1268
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1315
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2097
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1831
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2204
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1669
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2087
+    },
+    {
+      "name": "archive_batch.write_message_loop",
+      "fields": {
+        "batch_size": "100",
+        "sample_index": "2"
+      },
+      "duration_us": 171285
+    },
+    {
+      "name": "archive_batch.flush_async_commits",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 20537
+    },
+    {
+      "name": "archive_batch.wbq_flush",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 31
+    },
+    {
+      "name": "archive_batch.sample",
+      "fields": {
+        "batch_size": "100",
+        "elements": "100",
+        "sample_index": "2"
+      },
+      "duration_us": 191864
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1638
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1282
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1237
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2473
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1843
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1693
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1374
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2370
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1303
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1297
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1345
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1333
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1275
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1326
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1409
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1790
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1423
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1373
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2033
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1645
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1945
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1604
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1852
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2354
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1758
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2213
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1436
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1291
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1240
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1256
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1291
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2645
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1342
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1301
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1500
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1563
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1425
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1703
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2304
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2086
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2388
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1940
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2346
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1250
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2069
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1910
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1554
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3233
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1360
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1504
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1531
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1305
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1242
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3208
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1687
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2139
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2841
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2404
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 9226
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2487
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1333
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1354
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1321
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1277
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1191
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1216
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1250
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1328
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1309
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1304
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1342
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1246
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1382
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1378
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2055
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2620
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1673
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1307
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1288
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1315
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2180
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1931
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1595
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1324
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1324
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1294
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1428
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1781
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2124
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1428
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2966
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1224
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1339
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1330
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1377
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2412
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1672
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2431
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1979
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1374
+    },
+    {
+      "name": "archive_batch.write_message_loop",
+      "fields": {
+        "batch_size": "100",
+        "sample_index": "3"
+      },
+      "duration_us": 176491
+    },
+    {
+      "name": "archive_batch.flush_async_commits",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 20530
+    },
+    {
+      "name": "archive_batch.wbq_flush",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 48
+    },
+    {
+      "name": "archive_batch.sample",
+      "fields": {
+        "batch_size": "100",
+        "elements": "100",
+        "sample_index": "3"
+      },
+      "duration_us": 197079
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1997
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2373
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1702
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1675
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1476
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1682
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1331
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1458
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1397
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2004
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1406
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2320
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1703
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1628
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1666
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1806
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1469
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1627
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1912
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1441
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1354
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1388
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1352
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2623
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1493
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1587
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1577
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1313
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1293
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1304
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1343
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1696
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1327
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1917
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1398
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1451
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1960
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1526
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1499
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1473
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1772
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1487
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1462
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1447
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1440
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1683
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1523
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1470
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1528
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1786
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1472
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1508
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1462
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1474
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1512
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1658
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1633
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1956
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1443
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1618
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2361
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1572
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1459
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1492
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1423
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1823
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1504
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1602
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1449
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1413
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1457
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2054
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2526
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1972
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1734
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1907
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1810
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1430
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1395
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1504
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1498
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1589
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2347
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1894
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1504
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2005
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1864
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1480
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1613
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1363
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1479
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1649
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2544
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1649
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2657
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2255
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2335
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1576
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1573
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2026
+    },
+    {
+      "name": "archive_batch.write_message_loop",
+      "fields": {
+        "batch_size": "100",
+        "sample_index": "4"
+      },
+      "duration_us": 167473
+    },
+    {
+      "name": "archive_batch.flush_async_commits",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 35891
+    },
+    {
+      "name": "archive_batch.wbq_flush",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 26
+    },
+    {
+      "name": "archive_batch.sample",
+      "fields": {
+        "batch_size": "100",
+        "elements": "100",
+        "sample_index": "4"
+      },
+      "duration_us": 203402
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1798
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2632
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1733
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1476
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1560
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1486
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1427
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1740
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1816
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2103
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1561
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2072
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1938
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1694
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1860
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1990
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1874
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1493
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1484
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1524
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1536
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1554
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1626
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1572
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1844
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2291
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2336
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1896
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 4954
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1554
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1665
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1774
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1280
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2119
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1339
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3089
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2212
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1349
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1347
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1256
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1231
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1204
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1291
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1212
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1244
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1351
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1278
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1819
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1425
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1436
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1407
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1838
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1649
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1306
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1301
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1260
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1214
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1222
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1221
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1278
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1215
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1285
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1242
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1252
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1590
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1318
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2031
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1329
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1273
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1247
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1246
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1269
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1345
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1874
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1324
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1958
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1462
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2222
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1432
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1620
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1382
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1296
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1399
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1240
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1277
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1277
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1340
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1283
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1771
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1185
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1221
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1570
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1522
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1316
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3775
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1927
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1964
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1621
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3065
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2212
+    },
+    {
+      "name": "archive_batch.write_message_loop",
+      "fields": {
+        "batch_size": "100",
+        "sample_index": "5"
+      },
+      "duration_us": 164467
+    },
+    {
+      "name": "archive_batch.flush_async_commits",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 41020
+    },
+    {
+      "name": "archive_batch.wbq_flush",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 49
+    },
+    {
+      "name": "archive_batch.sample",
+      "fields": {
+        "batch_size": "100",
+        "elements": "100",
+        "sample_index": "5"
+      },
+      "duration_us": 205554
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1758
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1368
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1475
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2556
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2097
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1623
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1284
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1258
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1318
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1466
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1739
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2534
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2801
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1353
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1851
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2378
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2110
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1814
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1494
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1528
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1748
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2196
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1518
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1531
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1361
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1363
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1339
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1856
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1354
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2051
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1805
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1354
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1763
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1293
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1331
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1460
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1531
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1509
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1555
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1443
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1269
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1652
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1734
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2872
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2125
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2116
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2259
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 12151
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1574
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1357
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1473
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1375
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1281
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1328
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1395
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1286
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1331
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1479
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1354
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1300
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1638
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1331
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1939
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1821
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1742
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1261
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1358
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1346
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2292
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1827
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1503
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1671
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1664
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1351
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1276
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1438
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1783
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1275
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1318
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2770
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2167
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1675
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2041
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1615
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1329
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1866
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1397
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1412
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1292
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3387
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1944
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1789
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1460
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1405
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1692
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1438
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1337
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1745
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2051
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2304
+    },
+    {
+      "name": "archive_batch.write_message_loop",
+      "fields": {
+        "batch_size": "100",
+        "sample_index": "6"
+      },
+      "duration_us": 178158
+    },
+    {
+      "name": "archive_batch.flush_async_commits",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 51212
+    },
+    {
+      "name": "archive_batch.wbq_flush",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 28
+    },
+    {
+      "name": "archive_batch.sample",
+      "fields": {
+        "batch_size": "100",
+        "elements": "100",
+        "sample_index": "6"
+      },
+      "duration_us": 229411
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1982
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1972
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1780
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2046
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1455
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1826
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1920
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1496
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1721
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1882
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2147
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1374
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1399
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1307
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1294
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1244
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1391
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1552
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1835
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1487
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1361
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2208
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1566
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2045
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1611
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2021
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1366
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1366
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1753
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1483
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1583
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1482
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1340
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1291
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1446
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2684
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1334
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1527
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1510
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2097
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1347
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1341
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1538
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1615
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1337
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1336
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1406
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1451
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1421
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1326
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1378
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1217
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1281
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1998
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2139
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1412
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1543
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1362
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1330
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2095
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2005
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1333
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1400
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1300
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1289
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2559
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2788
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2325
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2165
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2258
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3157
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1448
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2634
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1837
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1699
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2785
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1305
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1311
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1870
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1573
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1313
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2093
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1594
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2173
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1335
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1612
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1395
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1316
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2272
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1476
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1295
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1660
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1916
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1476
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1868
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1738
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2361
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1419
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1504
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2054
+    },
+    {
+      "name": "archive_batch.write_message_loop",
+      "fields": {
+        "batch_size": "100",
+        "sample_index": "7"
+      },
+      "duration_us": 169241
+    },
+    {
+      "name": "archive_batch.flush_async_commits",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 51114
+    },
+    {
+      "name": "archive_batch.wbq_flush",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 29
+    },
+    {
+      "name": "archive_batch.sample",
+      "fields": {
+        "batch_size": "100",
+        "elements": "100",
+        "sample_index": "7"
+      },
+      "duration_us": 220397
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2132
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1725
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1678
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1666
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1548
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1286
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1332
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1330
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1273
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1308
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1446
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1562
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1573
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1692
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1432
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2114
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1357
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1494
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1578
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1361
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2763
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3082
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1766
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 6226
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 9053
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2620
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1753
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1481
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1219
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1437
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1559
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 4872
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2052
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3263
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1530
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1588
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1557
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1303
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1551
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1251
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1504
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1590
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1314
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1296
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1345
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1327
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1353
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1360
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1854
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1861
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1258
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1371
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2062
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1784
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1355
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1294
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1312
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1316
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2723
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1678
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1433
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1508
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1375
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1331
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1201
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1233
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1313
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1365
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1413
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2509
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1410
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1429
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1365
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1321
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1565
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1531
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1422
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1252
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1289
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1640
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1598
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1618
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1398
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1551
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1488
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1303
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1471
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1309
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1776
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1791
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1298
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1434
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1242
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1567
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1470
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1414
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1595
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2088
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1461
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1419
+    },
+    {
+      "name": "archive_batch.write_message_loop",
+      "fields": {
+        "batch_size": "100",
+        "sample_index": "8"
+      },
+      "duration_us": 173275
+    },
+    {
+      "name": "archive_batch.flush_async_commits",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 76712
+    },
+    {
+      "name": "archive_batch.wbq_flush",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 29
+    },
+    {
+      "name": "archive_batch.sample",
+      "fields": {
+        "batch_size": "100",
+        "elements": "100",
+        "sample_index": "8"
+      },
+      "duration_us": 250027
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1575
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1602
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1640
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1387
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1248
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1344
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2342
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1581
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1498
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1341
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1221
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1365
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1262
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1376
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1197
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1219
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2300
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1338
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1630
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1377
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1368
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1523
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1197
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1240
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1806
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2192
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2962
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2848
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2136
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1454
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1435
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1384
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1578
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2161
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1485
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1298
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1315
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1328
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2489
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2425
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1256
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1243
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1726
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1744
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 10000
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1321
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1205
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1427
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1473
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1433
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1341
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1561
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1616
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1386
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2455
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2336
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1386
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1246
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1240
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1290
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1389
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2108
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1306
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1284
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1257
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1504
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1336
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1335
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1461
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1266
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1258
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1272
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1406
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1362
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2424
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1339
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1363
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1634
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1769
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1452
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1435
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1293
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1240
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1209
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1299
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1629
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1705
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1867
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1961
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2057
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2405
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2420
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1767
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3647
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1742
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 6751
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1424
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1403
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1633
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1583
+    },
+    {
+      "name": "archive_batch.write_message_loop",
+      "fields": {
+        "batch_size": "100",
+        "sample_index": "9"
+      },
+      "duration_us": 174648
+    },
+    {
+      "name": "archive_batch.flush_async_commits",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 71455
+    },
+    {
+      "name": "archive_batch.wbq_flush",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 26
+    },
+    {
+      "name": "archive_batch.sample",
+      "fields": {
+        "batch_size": "100",
+        "elements": "100",
+        "sample_index": "9"
+      },
+      "duration_us": 246141
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1882
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1400
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1361
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1305
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1337
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1256
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1265
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1304
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1876
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2720
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1485
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1507
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1417
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1389
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2030
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1412
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1403
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1402
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1349
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1326
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1298
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1324
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1459
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1426
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1357
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1356
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1421
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1347
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1459
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1411
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1342
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1210
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1247
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1287
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1940
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1415
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1342
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1326
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1794
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1659
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1305
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1280
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1318
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1257
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1249
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1205
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1241
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1856
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1404
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1349
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1450
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2545
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1770
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1315
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1344
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1325
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1272
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1257
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1216
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1327
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1287
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1336
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1909
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1411
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3201
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1398
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1353
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1326
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1319
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1239
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1327
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1835
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1870
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1442
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1352
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1416
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1416
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1361
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1415
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1621
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1251
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1686
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1338
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1264
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1804
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2234
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1996
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1347
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1646
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1423
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1316
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1584
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1379
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1233
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3303
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1312
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1432
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1476
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1964
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3067
+    },
+    {
+      "name": "archive_batch.write_message_loop",
+      "fields": {
+        "batch_size": "100",
+        "sample_index": "10"
+      },
+      "duration_us": 152271
+    },
+    {
+      "name": "archive_batch.flush_async_commits",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 112385
+    },
+    {
+      "name": "archive_batch.wbq_flush",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 40
+    },
+    {
+      "name": "archive_batch.sample",
+      "fields": {
+        "batch_size": "100",
+        "elements": "100",
+        "sample_index": "10"
+      },
+      "duration_us": 264710
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2268
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1499
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1508
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1987
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1407
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1345
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1290
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1330
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1590
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1688
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1750
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1618
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1329
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1332
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1269
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1314
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1608
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1421
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1351
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1272
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1257
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1414
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1323
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1374
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1429
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1434
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1332
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1326
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1298
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1333
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2612
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1783
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1431
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2142
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1838
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1404
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1360
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1562
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1672
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1745
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1379
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1794
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2033
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3510
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3142
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2412
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1941
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2204
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 7820
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1476
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1545
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1273
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1423
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1921
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2382
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 4450
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2277
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1787
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2429
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1851
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3850
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1255
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1596
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2153
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1804
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 4327
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1373
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1391
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1197
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1318
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1203
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2545
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1986
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 3819
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2291
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1666
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 2210
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1331
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1380
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1687
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1713
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1340
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1294
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1248
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1189
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1244
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1238
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1509
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1344
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1483
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1256
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1446
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1349
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1393
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1334
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1365
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1226
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1281
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1268
+    },
+    {
+      "name": "archive_batch.write_message_bundle",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 1411
+    },
+    {
+      "name": "archive_batch.write_message_loop",
+      "fields": {
+        "batch_size": "100",
+        "sample_index": "11"
+      },
+      "duration_us": 177891
+    },
+    {
+      "name": "archive_batch.flush_async_commits",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 87079
+    },
+    {
+      "name": "archive_batch.wbq_flush",
+      "fields": {
+        "batch_size": "100"
+      },
+      "duration_us": 27
+    },
+    {
+      "name": "archive_batch.sample",
+      "fields": {
+        "batch_size": "100",
+        "elements": "100",
+        "sample_index": "11"
+      },
+      "duration_us": 265007
+    }
+  ],
+  "top_categories": [
+    {
+      "category": "archive_batch.sample",
+      "cumulative_us": 2649091,
+      "count": 12,
+      "avg_us": 220757,
+      "max_us": 265007
+    },
+    {
+      "category": "archive_batch.write_message_loop",
+      "cumulative_us": 2039448,
+      "count": 12,
+      "avg_us": 169954,
+      "max_us": 178158
+    },
+    {
+      "category": "archive_batch.write_message_bundle",
+      "cumulative_us": 2035491,
+      "count": 1200,
+      "avg_us": 1696,
+      "max_us": 12151
+    },
+    {
+      "category": "archive_batch.flush_async_commits",
+      "cumulative_us": 608879,
+      "count": 12,
+      "avg_us": 50739,
+      "max_us": 112385
+    },
+    {
+      "category": "archive_batch.wbq_flush",
+      "cumulative_us": 420,
+      "count": 12,
+      "avg_us": 35,
+      "max_us": 49
+    }
+  ],
+  "scaling_law_note": "batch-10 p95 is 3.01x batch-1 and batch-100 p95 is 20.84x batch-1; amortized per-message cost at batch-100 is 0.208x batch-1."
+}
