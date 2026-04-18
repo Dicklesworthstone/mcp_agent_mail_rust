@@ -869,10 +869,10 @@ pub fn migrate_feature_payload(
                 if let Some(value) = &mut migrated_features {
                     value.version = FEATURE_VERSION;
                 }
-                if let Some(value) = &mut migrated_feature_ext {
-                    if value.ext_version == 0 {
-                        value.ext_version = 1;
-                    }
+                if let Some(value) = &mut migrated_feature_ext
+                    && value.ext_version == 0
+                {
+                    value.ext_version = 1;
                 }
                 normalized_version = 1;
             }
@@ -888,10 +888,10 @@ pub fn migrate_feature_payload(
     if let Some(value) = &mut migrated_features {
         value.version = FEATURE_VERSION;
     }
-    if let Some(value) = &mut migrated_feature_ext {
-        if value.ext_version == 0 {
-            value.ext_version = 1;
-        }
+    if let Some(value) = &mut migrated_feature_ext
+        && value.ext_version == 0
+    {
+        value.ext_version = 1;
     }
 
     Ok(FeaturePayload {

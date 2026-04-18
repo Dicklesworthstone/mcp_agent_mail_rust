@@ -814,7 +814,7 @@ impl LabeledGaugeMap {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let key = label.into();
-        let remove = guard.get_mut(&key).map_or(false, |entry| {
+        let remove = guard.get_mut(&key).is_some_and(|entry| {
             *entry = entry.saturating_sub(delta);
             *entry == 0
         });

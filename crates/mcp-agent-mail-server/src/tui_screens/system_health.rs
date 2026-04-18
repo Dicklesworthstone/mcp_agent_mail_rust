@@ -1166,7 +1166,7 @@ impl SystemHealthScreen {
             return;
         }
 
-        let mut open_strata: Vec<(&String, &u64)> = snap
+        let mut open_strata: Vec<_> = snap
             .atc
             .observability
             .experiences_open_by_stratum
