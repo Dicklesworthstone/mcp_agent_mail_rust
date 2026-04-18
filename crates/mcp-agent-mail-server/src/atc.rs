@@ -8755,6 +8755,7 @@ impl KaplanMeierEstimator {
 use std::sync::{Mutex, OnceLock};
 
 static ATC_ENGINE: OnceLock<Mutex<AtcEngine>> = OnceLock::new();
+static ATC_WRITE_MODE: OnceLock<mcp_agent_mail_core::AtcWriteMode> = OnceLock::new();
 static ATC_POPULATION: OnceLock<Mutex<HierarchicalAgentModel>> = OnceLock::new();
 static ATC_CONFORMAL: OnceLock<Mutex<AtcConformalSet>> = OnceLock::new();
 static ATC_THRESHOLDS: OnceLock<Mutex<HashMap<String, AdaptiveThreshold>>> = OnceLock::new();
@@ -8914,6 +8915,7 @@ impl AtcEngine {
 
 /// Initialize the global ATC engine. Call once at server startup.
 pub fn init_global_atc(config: &mcp_agent_mail_core::Config) {
+    let _ = ATC_WRITE_MODE.set(config.atc_write_mode);
     let atc_config = AtcEngine::config_from_env(config);
     let engine_lock = ATC_ENGINE.get_or_init(|| Mutex::new(AtcEngine::new(atc_config.clone())));
     *engine_lock
@@ -9182,12 +9184,23 @@ pub struct AtcConflictObservation {
     pub holder_path_pattern: String,
 }
 
+fn atc_write_mode() -> mcp_agent_mail_core::AtcWriteMode {
+    ATC_WRITE_MODE
+        .get()
+        .copied()
+        .unwrap_or(mcp_agent_mail_core::AtcWriteMode::Off)
+}
+
 pub fn atc_note_message_sent(
     from: &str,
     to: &[String],
     thread_id: Option<&str>,
     timestamp_micros: i64,
 ) {
+    let mode = atc_write_mode();
+    if mode.is_off() {
+        return;
+    }
     let Some(engine) = ATC_ENGINE.get() else {
         return;
     };
@@ -9197,10 +9210,25 @@ pub fn atc_note_message_sent(
     if !e.enabled() {
         return;
     }
+    if mode.is_shadow() {
+        tracing::trace!(
+            family = "message_sent",
+            from,
+            ?to,
+            ?thread_id,
+            timestamp_micros,
+            "shadow: would insert experience row"
+        );
+        return;
+    }
     e.note_message_sent(from, to, thread_id, timestamp_micros);
 }
 
 pub fn atc_note_message_received(agent: &str, thread_id: Option<&str>, timestamp_micros: i64) {
+    let mode = atc_write_mode();
+    if mode.is_off() {
+        return;
+    }
     let Some(engine) = ATC_ENGINE.get() else {
         return;
     };
@@ -9208,6 +9236,16 @@ pub fn atc_note_message_received(agent: &str, thread_id: Option<&str>, timestamp
         return;
     };
     if !e.enabled() {
+        return;
+    }
+    if mode.is_shadow() {
+        tracing::trace!(
+            family = "message_received",
+            agent,
+            ?thread_id,
+            timestamp_micros,
+            "shadow: would insert experience row"
+        );
         return;
     }
     e.note_message_received(agent, thread_id, timestamp_micros);
@@ -9220,6 +9258,10 @@ pub fn atc_note_reservation_granted(
     project: &str,
     timestamp_micros: i64,
 ) {
+    let mode = atc_write_mode();
+    if mode.is_off() {
+        return;
+    }
     let Some(engine) = ATC_ENGINE.get() else {
         return;
     };
@@ -9227,6 +9269,18 @@ pub fn atc_note_reservation_granted(
         return;
     };
     if !e.enabled() {
+        return;
+    }
+    if mode.is_shadow() {
+        tracing::trace!(
+            family = "reservation_granted",
+            agent,
+            ?paths,
+            exclusive,
+            project,
+            timestamp_micros,
+            "shadow: would insert experience row"
+        );
         return;
     }
     e.note_reservation_granted(agent, paths, exclusive, project, timestamp_micros);
@@ -9238,6 +9292,10 @@ pub fn atc_note_reservation_released(
     project: &str,
     timestamp_micros: i64,
 ) {
+    let mode = atc_write_mode();
+    if mode.is_off() {
+        return;
+    }
     let Some(engine) = ATC_ENGINE.get() else {
         return;
     };
@@ -9245,6 +9303,17 @@ pub fn atc_note_reservation_released(
         return;
     };
     if !e.enabled() {
+        return;
+    }
+    if mode.is_shadow() {
+        tracing::trace!(
+            family = "reservation_released",
+            agent,
+            ?paths,
+            project,
+            timestamp_micros,
+            "shadow: would insert experience row"
+        );
         return;
     }
     e.note_reservation_released(agent, paths, project, timestamp_micros);
@@ -9256,6 +9325,10 @@ pub fn atc_note_reservation_conflicts(
     conflicts: &[AtcConflictObservation],
     timestamp_micros: i64,
 ) {
+    let mode = atc_write_mode();
+    if mode.is_off() {
+        return;
+    }
     let Some(engine) = ATC_ENGINE.get() else {
         return;
     };
@@ -9275,10 +9348,25 @@ pub fn atc_note_reservation_conflicts(
             )
         })
         .collect();
+    if mode.is_shadow() {
+        tracing::trace!(
+            family = "reservation_conflicts",
+            requester,
+            project,
+            conflict_count = conflicts.len(),
+            timestamp_micros,
+            "shadow: would insert experience row"
+        );
+        return;
+    }
     e.note_reservation_conflicts(requester, project, &conflicts, timestamp_micros);
 }
 
 pub fn atc_note_intervention(timestamp_micros: i64) {
+    let mode = atc_write_mode();
+    if mode.is_off() {
+        return;
+    }
     let Some(engine) = ATC_ENGINE.get() else {
         return;
     };
@@ -9286,6 +9374,14 @@ pub fn atc_note_intervention(timestamp_micros: i64) {
         return;
     };
     if !e.enabled() {
+        return;
+    }
+    if mode.is_shadow() {
+        tracing::trace!(
+            family = "intervention",
+            timestamp_micros,
+            "shadow: would insert experience row"
+        );
         return;
     }
     e.note_atc_intervention(timestamp_micros);

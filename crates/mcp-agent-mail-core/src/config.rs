@@ -10,6 +10,47 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+/// ATC experience write mode: controls whether `atc_note_*` calls persist
+/// experience rows, log shadow traces, or are entirely suppressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum AtcWriteMode {
+    Off,
+    Shadow,
+    Live,
+}
+
+impl AtcWriteMode {
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "shadow" => Self::Shadow,
+            "live" => Self::Live,
+            _ => Self::Off,
+        }
+    }
+
+    pub fn is_off(self) -> bool {
+        matches!(self, Self::Off)
+    }
+
+    pub fn is_shadow(self) -> bool {
+        matches!(self, Self::Shadow)
+    }
+
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Live)
+    }
+}
+
+impl std::fmt::Display for AtcWriteMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => f.write_str("off"),
+            Self::Shadow => f.write_str("shadow"),
+            Self::Live => f.write_str("live"),
+        }
+    }
+}
+
 /// Tool filtering configuration for context reduction.
 #[derive(Debug, Clone)]
 pub struct ToolFilterSettings {
@@ -315,6 +356,8 @@ pub struct Config {
     pub atc_ledger_capacity: usize,
     /// Suspicion k-factor for rhythm-based liveness detection.
     pub atc_suspicion_k: f64,
+    /// Experience write mode: `off` (suppress), `shadow` (trace-log only), `live` (persist).
+    pub atc_write_mode: AtcWriteMode,
 
     // Write-behind queue (WBQ) tuning
     /// Channel capacity for the write-behind queue (default 8192).
@@ -1179,6 +1222,7 @@ impl Default for Config {
             atc_cusum_delta: 0.1,
             atc_ledger_capacity: 1000,
             atc_suspicion_k: 3.0,
+            atc_write_mode: AtcWriteMode::Off,
 
             // WBQ tuning
             wbq_channel_capacity: 8_192,
@@ -2000,6 +2044,9 @@ impl Config {
             && f.is_finite()
         {
             config.atc_suspicion_k = f;
+        }
+        if let Some(v) = console_value("AM_ATC_WRITE_MODE") {
+            config.atc_write_mode = AtcWriteMode::from_str_lossy(&v);
         }
 
         // WBQ tuning
@@ -3069,6 +3116,31 @@ mod tests {
         assert_eq!(config.atc_cusum_delta, 0.3);
         assert_eq!(config.atc_ledger_capacity, 10);
         assert_eq!(config.atc_suspicion_k, 4.5);
+    }
+
+    #[test]
+    fn test_atc_write_mode_parsing() {
+        assert!(AtcWriteMode::from_str_lossy("off").is_off());
+        assert!(AtcWriteMode::from_str_lossy("shadow").is_shadow());
+        assert!(AtcWriteMode::from_str_lossy("SHADOW").is_shadow());
+        assert!(AtcWriteMode::from_str_lossy("  Shadow  ").is_shadow());
+        assert!(AtcWriteMode::from_str_lossy("live").is_live());
+        assert!(AtcWriteMode::from_str_lossy("LIVE").is_live());
+        assert!(AtcWriteMode::from_str_lossy("bogus").is_off());
+        assert!(AtcWriteMode::from_str_lossy("").is_off());
+    }
+
+    #[test]
+    fn test_atc_write_mode_env_override() {
+        let _env = TestEnvOverrideGuard::set(&[("AM_ATC_WRITE_MODE", "shadow")]);
+        let config = Config::from_env();
+        assert!(config.atc_write_mode.is_shadow());
+    }
+
+    #[test]
+    fn test_atc_write_mode_default_is_off() {
+        let config = Config::default();
+        assert!(config.atc_write_mode.is_off());
     }
 
     #[test]
