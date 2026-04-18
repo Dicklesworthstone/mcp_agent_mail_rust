@@ -3456,9 +3456,10 @@ setup_mcp_configs() {
   local tool path exists_flag
 
   # Track which tools we've already configured (prefer existing configs).
-  # Pre-seeded with claude-code so the desktop claude_desktop_config.json
-  # candidates still get their normal handling (they use tool=claude, which
-  # is distinct from claude-code below).
+  # Note: Claude Code is handled separately via setup_claude_code_mcp_via_cli
+  # below and does NOT appear in the candidate scan. The `tool=claude` entries
+  # in the scan therefore all refer to Claude Desktop's claude_desktop_config.json
+  # (a different product), and the loop below gets to handle them normally.
   local configured_tools=""
 
   # Claude Code gets its own path: the `claude mcp add` CLI writes to
