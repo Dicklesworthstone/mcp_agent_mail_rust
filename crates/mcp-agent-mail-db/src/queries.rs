@@ -1604,12 +1604,12 @@ fn open_fresh_file_backed_conn(pool: &DbPool) -> std::result::Result<crate::DbCo
 // corrupting file-backed mailboxes under FrankenConnection writes. Route
 // file-backed ATC experience IO through canonical SQLite until the upstream
 // page-ordering/runtime bug is fixed.
-fn close_canonical_db_conn(conn: crate::CanonicalDbConn, context: &'static str) {
+pub(crate) fn close_canonical_db_conn(conn: crate::CanonicalDbConn, context: &'static str) {
     let _ = context;
     drop(conn);
 }
 
-fn open_canonical_atc_conn(
+pub(crate) fn open_canonical_atc_conn(
     pool: &DbPool,
     purpose: &'static str,
 ) -> std::result::Result<crate::CanonicalDbConn, DbError> {
@@ -1638,7 +1638,7 @@ fn rollback_canonical_atc_write_tx(conn: &crate::CanonicalDbConn) {
     let _ = conn.execute_sync("ROLLBACK", &[]);
 }
 
-fn canonical_query_atc_rows(
+pub(crate) fn canonical_query_atc_rows(
     conn: &crate::CanonicalDbConn,
     sql: &str,
     params: &[Value],

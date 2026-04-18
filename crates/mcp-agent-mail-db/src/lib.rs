@@ -34,6 +34,7 @@
 )]
 
 pub mod archive_anomaly;
+pub mod atc_queries;
 pub mod cache;
 pub mod coalesce;
 pub mod error;
@@ -263,6 +264,7 @@ pub use pool::{
     resolve_mailbox_sqlite_path,
     sqlite_primary_read_path_is_healthy,
 };
+pub use atc_queries::{OpenExperienceFilter, OpenExperienceSummary, RollupEntry};
 pub use queries::{LeaseOutcome, MvccRetryMetrics, RollupSnapshot, mvcc_retry_metrics};
 pub use reconstruct::{
     ArchiveDriftReport, ArchiveDriftReportSchema, ArchiveMessageInventory, MailboxProjectIdentity,
