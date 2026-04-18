@@ -24,6 +24,7 @@ pub mod output;
 pub mod robot;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -31,7 +32,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::McpContext;
 
@@ -495,6 +496,37 @@ pub enum AtcCommand {
         #[arg(value_name = "decision_id", value_parser = parse_positive_u64_arg)]
         decision_id: u64,
         /// Output JSON instead of human-readable text.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Simulate a proposed liveness policy against historical ATC experiences.
+    #[command(name = "simulate")]
+    Simulate {
+        /// Stable operator label for this historical dry-run scenario.
+        #[arg(value_name = "scenario_id")]
+        scenario_id: String,
+        /// Path to the proposed ATC liveness policy bundle JSON, or `-` for stdin.
+        #[arg(long, value_name = "path")]
+        policy: String,
+        /// Inclusive lower bound for `created_ts` (`RFC3339` or `YYYY-MM-DD`).
+        #[arg(long, value_name = "timestamp")]
+        since: String,
+        /// Inclusive upper bound for `created_ts` (`RFC3339` or `YYYY-MM-DD`).
+        #[arg(long, value_name = "timestamp")]
+        until: Option<String>,
+        /// Restrict the simulation to a single subject / agent.
+        #[arg(long)]
+        subject: Option<String>,
+        /// Ignore counterfactuals whose top posterior probability is below this threshold.
+        #[arg(long, default_value_t = 0.0, value_parser = parse_probability_arg)]
+        dry_run_confidence: f64,
+        /// Optional path for writing the structured JSON simulation artifact.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Output format: table, json, or toon (default: table).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -8202,6 +8234,101 @@ struct AtcExplainReport {
     ledger: Vec<AtcExplainLedgerRow>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AtcSimulatePolicyArtifact {
+    schema_version: u32,
+    policy_id: String,
+    artifact_hash: String,
+    suspicion_k: f64,
+    max_probes_per_tick: usize,
+    probe_recency_decay_secs: f64,
+    probe_gain_floor: f64,
+    probe_budget_fraction: f64,
+    conservative_probe_budget_fraction: f64,
+    release_guard_enabled: bool,
+    losses: [[f64; 3]; 3],
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct AtcSimulatePolicyBundle {
+    schema_version: u32,
+    bundle_id: String,
+    bundle_hash: String,
+    incumbent: AtcSimulatePolicyArtifact,
+    candidate: Option<AtcSimulatePolicyArtifact>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct AtcSimulateSequenceRange {
+    from_seq: Option<u64>,
+    to_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct AtcSimulateStratumSummary {
+    stratum_key: String,
+    decisions: usize,
+    same_action: usize,
+    different_action: usize,
+    avg_expected_loss_delta: f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct AtcSimulateDecisionDelta {
+    decision_id: u64,
+    subject: String,
+    project_key: Option<String>,
+    created_at: String,
+    stratum_key: String,
+    recorded_action: String,
+    proposed_action: String,
+    changed_action: bool,
+    recorded_expected_loss: f64,
+    proposed_expected_loss: f64,
+    expected_loss_delta: f64,
+    top_posterior_state: Option<String>,
+    top_posterior_probability: Option<f64>,
+    safe_mode_active: bool,
+    outcome_label: Option<String>,
+    actual_loss: Option<f64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct AtcSimulateReport {
+    scenario_id: String,
+    policy_source: String,
+    output_path: Option<String>,
+    bundle_id: String,
+    bundle_hash: String,
+    incumbent_policy_id: String,
+    simulated_policy_id: String,
+    since: String,
+    until: Option<String>,
+    subject: Option<String>,
+    min_decision_confidence: f64,
+    sequence_range: AtcSimulateSequenceRange,
+    experiences_considered: usize,
+    decisions_evaluated: usize,
+    rows_skipped_non_liveness: usize,
+    rows_skipped_low_confidence: usize,
+    rows_skipped_unsupported_action: usize,
+    same_action: usize,
+    different_action: usize,
+    same_action_loss_changed: usize,
+    avg_expected_loss_delta: f64,
+    by_stratum: Vec<AtcSimulateStratumSummary>,
+    notable_divergences: Vec<AtcSimulateDecisionDelta>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AtcSimulateStratumAccumulator {
+    decisions: usize,
+    same_action: usize,
+    different_action: usize,
+    total_expected_loss_delta: f64,
+}
+
 fn atc_row_opt_text_idx(row: &mcp_agent_mail_db::sqlmodel_core::Row, idx: usize) -> Option<String> {
     row.get(idx)
         .and_then(|value| match value {
@@ -8687,6 +8814,587 @@ fn render_atc_explain_report(report: &AtcExplainReport) {
     }
 }
 
+fn atc_policy_hash_fnv1a64(bytes: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+impl AtcSimulatePolicyArtifact {
+    fn compute_artifact_hash(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut losses_str = String::with_capacity(64);
+        losses_str.push('[');
+        for (i, row) in self.losses.iter().enumerate() {
+            if i > 0 {
+                losses_str.push(';');
+            }
+            losses_str.push('[');
+            for (j, value) in row.iter().enumerate() {
+                if j > 0 {
+                    losses_str.push(',');
+                }
+                let _ = write!(losses_str, "{value:.6}");
+            }
+            losses_str.push(']');
+        }
+        losses_str.push(']');
+
+        let serialized = format!(
+            "{}|{}|{:.6}|{}|{:.6}|{:.6}|{:.6}|{:.6}|{}|{}",
+            self.schema_version,
+            self.policy_id,
+            self.suspicion_k,
+            self.max_probes_per_tick,
+            self.probe_recency_decay_secs,
+            self.probe_gain_floor,
+            self.probe_budget_fraction,
+            self.conservative_probe_budget_fraction,
+            self.release_guard_enabled,
+            losses_str,
+        );
+        format!("{:016x}", atc_policy_hash_fnv1a64(serialized.as_bytes()))
+    }
+
+    fn validate(&self) -> CliResult<()> {
+        if self.schema_version == 0 || self.policy_id.trim().is_empty() {
+            return Err(CliError::InvalidArgument(
+                "policy bundle load failed: invalid incumbent policy metadata (hint: provide a non-empty policy_id and schema_version)".to_string(),
+            ));
+        }
+        let computed = self.compute_artifact_hash();
+        if computed != self.artifact_hash {
+            return Err(CliError::InvalidArgument(format!(
+                "policy bundle load failed: invalid incumbent policy hash (hint: recompute artifact_hash for policy_id '{}')",
+                self.policy_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn choose_action(
+        &self,
+        posterior: &[(String, f64)],
+        release_guard_active: bool,
+    ) -> CliResult<(String, f64)> {
+        let mut best_action = None::<(&str, f64)>;
+        for (action_name, action_idx) in [
+            ("DeclareAlive", 0usize),
+            ("Suspect", 1usize),
+            ("ReleaseReservations", 2usize),
+        ] {
+            if release_guard_active
+                && self.release_guard_enabled
+                && action_name == "ReleaseReservations"
+            {
+                continue;
+            }
+            let expected_loss = posterior.iter().try_fold(0.0, |acc, (label, probability)| {
+                let Some(state_idx) = atc_simulate_liveness_state_index(label) else {
+                    return Err(CliError::InvalidArgument(format!(
+                        "policy simulation failed: unsupported posterior state '{label}' (hint: replay rows must contain Alive/Flaky/Dead states)"
+                    )));
+                };
+                Ok(acc + (*probability * self.losses[action_idx][state_idx]))
+            })?;
+            match best_action {
+                None => best_action = Some((action_name, expected_loss)),
+                Some((best_name, best_loss))
+                    if expected_loss < best_loss
+                        || ((expected_loss - best_loss).abs() <= 1e-9
+                            && action_name < best_name) =>
+                {
+                    best_action = Some((action_name, expected_loss));
+                }
+                _ => {}
+            }
+        }
+
+        best_action
+            .map(|(action, loss)| (action.to_string(), loss))
+            .ok_or_else(|| {
+                CliError::InvalidArgument(
+                    "policy simulation failed: no candidate actions were available (hint: disable release guard or provide a valid bundle)".to_string(),
+                )
+            })
+    }
+}
+
+impl AtcSimulatePolicyBundle {
+    fn compute_bundle_hash(&self) -> String {
+        let serialized = format!(
+            "{}|{}|{}|{}|{}",
+            self.schema_version,
+            self.bundle_id,
+            self.incumbent.artifact_hash,
+            self.candidate
+                .as_ref()
+                .map_or("-", |candidate| candidate.artifact_hash.as_str()),
+            self.incumbent.policy_id,
+        );
+        format!("{:016x}", atc_policy_hash_fnv1a64(serialized.as_bytes()))
+    }
+
+    fn validate(&self) -> CliResult<()> {
+        if self.schema_version == 0 || self.bundle_id.trim().is_empty() {
+            return Err(CliError::InvalidArgument(
+                "policy bundle load failed: invalid bundle metadata (hint: provide a non-empty bundle_id and schema_version)".to_string(),
+            ));
+        }
+        self.incumbent.validate()?;
+        if let Some(candidate) = self.candidate.as_ref() {
+            candidate.validate().map_err(|error| {
+                CliError::InvalidArgument(format!(
+                    "policy bundle load failed: invalid candidate policy: {error}"
+                ))
+            })?;
+        }
+        let computed = self.compute_bundle_hash();
+        if computed != self.bundle_hash {
+            return Err(CliError::InvalidArgument(
+                "policy bundle load failed: invalid bundle hash (hint: recompute bundle_hash after editing the JSON)".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn atc_simulate_liveness_state_index(label: &str) -> Option<usize> {
+    match label.trim().to_ascii_lowercase().as_str() {
+        "alive" => Some(0),
+        "flaky" => Some(1),
+        "dead" => Some(2),
+        _ => None,
+    }
+}
+
+fn read_atc_simulate_policy_bundle(policy: &str) -> CliResult<AtcSimulatePolicyBundle> {
+    let raw = if policy.trim() == "-" {
+        use std::io::Read as _;
+
+        let mut stdin = std::io::stdin().lock();
+        let mut buffer = String::new();
+        stdin
+            .read_to_string(&mut buffer)
+            .map_err(|error| {
+                CliError::Other(format!(
+                    "policy bundle load failed: could not read stdin: {error} (hint: pass --policy <path> or pipe JSON to stdin with --policy -)"
+                ))
+            })?;
+        buffer
+    } else {
+        std::fs::read_to_string(policy).map_err(|error| {
+            CliError::Other(format!(
+                "policy bundle load failed: could not read '{policy}': {error} (hint: provide a valid JSON bundle path or use --policy - for stdin)"
+            ))
+        })?
+    };
+
+    let bundle: AtcSimulatePolicyBundle = serde_json::from_str(&raw).map_err(|error| {
+        CliError::InvalidArgument(format!(
+            "policy bundle load failed: could not parse JSON: {error} (hint: provide a valid ATC liveness policy bundle)"
+        ))
+    })?;
+    bundle.validate()?;
+    Ok(bundle)
+}
+
+fn parse_atc_simulation_timestamp(value: &str, end_of_day: bool) -> CliResult<(i64, String)> {
+    if let Some(micros) = mcp_agent_mail_db::iso_to_micros(value) {
+        return Ok((micros, value.to_string()));
+    }
+
+    if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        let naive = if end_of_day {
+            date.and_hms_micro_opt(23, 59, 59, 999_999)
+        } else {
+            date.and_hms_micro_opt(0, 0, 0, 0)
+        }
+        .ok_or_else(|| {
+            CliError::InvalidArgument(format!(
+                "invalid simulation timestamp: {value} (hint: use RFC3339 or YYYY-MM-DD)"
+            ))
+        })?;
+        let micros = mcp_agent_mail_core::timestamps::naive_to_micros(naive);
+        return Ok((micros, mcp_agent_mail_db::micros_to_iso(micros)));
+    }
+
+    Err(CliError::InvalidArgument(format!(
+        "invalid simulation timestamp: {value} (hint: use RFC3339 or YYYY-MM-DD)"
+    )))
+}
+
+fn query_atc_simulation_sequence_range(
+    conn: &mcp_agent_mail_db::DbConn,
+    since_micros: i64,
+    until_micros: Option<i64>,
+) -> CliResult<Option<mcp_agent_mail_db::SequenceRange>> {
+    let mut sql = "SELECT MIN(experience_id) AS min_id, MAX(experience_id) AS max_id \
+                   FROM atc_experiences WHERE created_ts >= ?"
+        .to_string();
+    let mut params = vec![mcp_agent_mail_db::sqlmodel_core::Value::BigInt(
+        since_micros,
+    )];
+    if let Some(until_micros) = until_micros {
+        sql.push_str(" AND created_ts <= ?");
+        params.push(mcp_agent_mail_db::sqlmodel_core::Value::BigInt(
+            until_micros,
+        ));
+    }
+
+    let rows = conn.query_sync(&sql, &params).map_err(|error| {
+        CliError::Other(format!(
+            "ATC simulation failed: could not query historical bounds: {error} (hint: verify that atc_experiences exists and the mailbox database is readable)"
+        ))
+    })?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let min_id = row.get_named::<i64>("min_id").ok();
+    let max_id = row.get_named::<i64>("max_id").ok();
+    match (min_id, max_id) {
+        (Some(from_seq), Some(to_seq)) => Ok(Some(mcp_agent_mail_db::SequenceRange {
+            from_seq: u64::try_from(from_seq).ok(),
+            to_seq: u64::try_from(to_seq).ok(),
+        })),
+        _ => Ok(None),
+    }
+}
+
+fn atc_simulation_stratum_key(row: &mcp_agent_mail_core::ExperienceRow) -> String {
+    row.features.as_ref().map_or_else(
+        || {
+            format!(
+                "{}:{}:{}",
+                row.subsystem,
+                row.effect_kind,
+                mcp_agent_mail_core::FeatureVector::risk_tier_for(row.effect_kind)
+            )
+        },
+        |features| features.stratum_key(&row.subsystem, &row.effect_kind),
+    )
+}
+
+fn build_atc_simulation_report(
+    scenario_id: &str,
+    policy_source: &str,
+    output_path: Option<&Path>,
+    bundle: &AtcSimulatePolicyBundle,
+    since: &str,
+    until: Option<&str>,
+    subject: Option<&str>,
+    min_decision_confidence: f64,
+    range: mcp_agent_mail_db::SequenceRange,
+    rows: &[mcp_agent_mail_core::ExperienceRow],
+) -> CliResult<AtcSimulateReport> {
+    let since_micros = mcp_agent_mail_db::iso_to_micros(since).ok_or_else(|| {
+        CliError::InvalidArgument(format!(
+            "invalid simulation since timestamp in report builder: {since}"
+        ))
+    })?;
+    let until_micros = until.and_then(mcp_agent_mail_db::iso_to_micros);
+    let subject_filter = subject.map(str::trim).filter(|value| !value.is_empty());
+    let simulated_policy = bundle.candidate.as_ref().unwrap_or(&bundle.incumbent);
+
+    let mut latest_by_decision = BTreeMap::<u64, mcp_agent_mail_core::ExperienceRow>::new();
+    let mut experiences_considered = 0usize;
+    for row in rows {
+        if row.created_ts_micros < since_micros {
+            continue;
+        }
+        if until_micros.is_some_and(|value| row.created_ts_micros > value) {
+            continue;
+        }
+        if subject_filter.is_some_and(|needle| !row.subject.eq_ignore_ascii_case(needle)) {
+            continue;
+        }
+        experiences_considered += 1;
+        latest_by_decision
+            .entry(row.decision_id)
+            .and_modify(|current| {
+                if row.experience_id > current.experience_id {
+                    *current = row.clone();
+                }
+            })
+            .or_insert_with(|| row.clone());
+    }
+
+    let mut rows_skipped_non_liveness = 0usize;
+    let mut rows_skipped_low_confidence = 0usize;
+    let mut rows_skipped_unsupported_action = 0usize;
+    let mut same_action = 0usize;
+    let mut different_action = 0usize;
+    let mut same_action_loss_changed = 0usize;
+    let mut total_expected_loss_delta = 0.0f64;
+    let mut warnings = Vec::new();
+    let mut by_stratum = BTreeMap::<String, AtcSimulateStratumAccumulator>::new();
+    let mut deltas = Vec::<AtcSimulateDecisionDelta>::new();
+
+    for row in latest_by_decision.values() {
+        if row.subsystem != mcp_agent_mail_core::ExperienceSubsystem::Liveness {
+            rows_skipped_non_liveness += 1;
+            continue;
+        }
+        let top_posterior = row
+            .posterior
+            .iter()
+            .max_by(|left, right| left.1.total_cmp(&right.1))
+            .map(|(label, probability)| (label.clone(), *probability));
+        if top_posterior
+            .as_ref()
+            .is_some_and(|(_, probability)| *probability < min_decision_confidence)
+        {
+            rows_skipped_low_confidence += 1;
+            continue;
+        }
+
+        let recorded_action = row.action.clone();
+        match recorded_action.as_str() {
+            "DeclareAlive" | "Suspect" | "ReleaseReservations" => {}
+            _ => {
+                rows_skipped_unsupported_action += 1;
+                continue;
+            }
+        }
+
+        let (proposed_action, proposed_expected_loss) =
+            simulated_policy.choose_action(&row.posterior, row.safe_mode_active)?;
+        let expected_loss_delta = proposed_expected_loss - row.expected_loss;
+        total_expected_loss_delta += expected_loss_delta;
+
+        let changed_action = proposed_action != recorded_action;
+        if changed_action {
+            different_action += 1;
+        } else {
+            same_action += 1;
+            if expected_loss_delta.abs() > 1e-6 {
+                same_action_loss_changed += 1;
+            }
+        }
+
+        let stratum_key = atc_simulation_stratum_key(row);
+        let accumulator = by_stratum.entry(stratum_key.clone()).or_default();
+        accumulator.decisions += 1;
+        accumulator.total_expected_loss_delta += expected_loss_delta;
+        if changed_action {
+            accumulator.different_action += 1;
+        } else {
+            accumulator.same_action += 1;
+        }
+
+        deltas.push(AtcSimulateDecisionDelta {
+            decision_id: row.decision_id,
+            subject: row.subject.clone(),
+            project_key: row.project_key.clone(),
+            created_at: mcp_agent_mail_db::micros_to_iso(row.created_ts_micros),
+            stratum_key,
+            recorded_action,
+            proposed_action,
+            changed_action,
+            recorded_expected_loss: row.expected_loss,
+            proposed_expected_loss,
+            expected_loss_delta,
+            top_posterior_state: top_posterior.as_ref().map(|(label, _)| label.clone()),
+            top_posterior_probability: top_posterior.map(|(_, probability)| probability),
+            safe_mode_active: row.safe_mode_active,
+            outcome_label: row.outcome.as_ref().map(|outcome| outcome.label.clone()),
+            actual_loss: row.outcome.as_ref().and_then(|outcome| outcome.actual_loss),
+        });
+    }
+
+    if rows_skipped_non_liveness > 0 {
+        warnings.push(format!(
+            "Simulation currently re-evaluates only liveness decisions; skipped {rows_skipped_non_liveness} non-liveness decisions in the selected window."
+        ));
+    }
+    if rows_skipped_unsupported_action > 0 {
+        warnings.push(format!(
+            "Skipped {rows_skipped_unsupported_action} liveness rows whose recorded action was not one of DeclareAlive/Suspect/ReleaseReservations."
+        ));
+    }
+    if rows_skipped_low_confidence > 0 {
+        warnings.push(format!(
+            "Skipped {rows_skipped_low_confidence} liveness decisions below the configured confidence threshold {:.3}.",
+            min_decision_confidence
+        ));
+    }
+
+    deltas.sort_by(|left, right| {
+        right
+            .changed_action
+            .cmp(&left.changed_action)
+            .then_with(|| {
+                right
+                    .expected_loss_delta
+                    .abs()
+                    .total_cmp(&left.expected_loss_delta.abs())
+            })
+            .then_with(|| left.decision_id.cmp(&right.decision_id))
+    });
+    let notable_divergences = deltas.iter().take(10).cloned().collect::<Vec<_>>();
+
+    let decisions_evaluated = same_action + different_action;
+    let avg_expected_loss_delta = if decisions_evaluated == 0 {
+        0.0
+    } else {
+        total_expected_loss_delta / decisions_evaluated as f64
+    };
+
+    let by_stratum = by_stratum
+        .into_iter()
+        .map(|(stratum_key, summary)| AtcSimulateStratumSummary {
+            stratum_key,
+            decisions: summary.decisions,
+            same_action: summary.same_action,
+            different_action: summary.different_action,
+            avg_expected_loss_delta: if summary.decisions == 0 {
+                0.0
+            } else {
+                summary.total_expected_loss_delta / summary.decisions as f64
+            },
+        })
+        .collect::<Vec<_>>();
+
+    Ok(AtcSimulateReport {
+        scenario_id: scenario_id.to_string(),
+        policy_source: policy_source.to_string(),
+        output_path: output_path.map(|path| path.display().to_string()),
+        bundle_id: bundle.bundle_id.clone(),
+        bundle_hash: bundle.bundle_hash.clone(),
+        incumbent_policy_id: bundle.incumbent.policy_id.clone(),
+        simulated_policy_id: simulated_policy.policy_id.clone(),
+        since: since.to_string(),
+        until: until.map(ToOwned::to_owned),
+        subject: subject_filter.map(ToOwned::to_owned),
+        min_decision_confidence,
+        sequence_range: AtcSimulateSequenceRange {
+            from_seq: range.from_seq,
+            to_seq: range.to_seq,
+        },
+        experiences_considered,
+        decisions_evaluated,
+        rows_skipped_non_liveness,
+        rows_skipped_low_confidence,
+        rows_skipped_unsupported_action,
+        same_action,
+        different_action,
+        same_action_loss_changed,
+        avg_expected_loss_delta,
+        by_stratum,
+        notable_divergences,
+        warnings,
+    })
+}
+
+fn write_atc_simulation_report(report: &AtcSimulateReport, output_path: &Path) -> CliResult<()> {
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let payload = serde_json::to_vec_pretty(report).map_err(|error| {
+        CliError::Other(format!("failed to serialize simulation report: {error}"))
+    })?;
+    std::fs::write(output_path, payload).map_err(|error| {
+        CliError::Other(format!(
+            "failed to write simulation report '{}': {error}",
+            output_path.display()
+        ))
+    })
+}
+
+fn render_atc_simulate_report(report: &AtcSimulateReport) {
+    ftui_runtime::ftui_println!("ATC simulation {}", report.scenario_id);
+    ftui_runtime::ftui_println!("  policy bundle: {}", report.bundle_id);
+    ftui_runtime::ftui_println!("  incumbent policy: {}", report.incumbent_policy_id);
+    ftui_runtime::ftui_println!("  simulated policy: {}", report.simulated_policy_id);
+    ftui_runtime::ftui_println!("  source: {}", report.policy_source);
+    ftui_runtime::ftui_println!(
+        "  period: {} .. {}",
+        report.since,
+        report.until.as_deref().unwrap_or("latest")
+    );
+    if let Some(subject) = &report.subject {
+        ftui_runtime::ftui_println!("  subject: {subject}");
+    }
+    if let Some(path) = &report.output_path {
+        ftui_runtime::ftui_println!("  report file: {path}");
+    }
+
+    ftui_runtime::ftui_println!();
+    ftui_runtime::ftui_println!("Summary");
+    ftui_runtime::ftui_println!(
+        "  experiences considered: {}",
+        report.experiences_considered
+    );
+    ftui_runtime::ftui_println!("  decisions evaluated: {}", report.decisions_evaluated);
+    ftui_runtime::ftui_println!("  same action: {}", report.same_action);
+    ftui_runtime::ftui_println!("  different action: {}", report.different_action);
+    ftui_runtime::ftui_println!(
+        "  same action, different loss: {}",
+        report.same_action_loss_changed
+    );
+    ftui_runtime::ftui_println!(
+        "  avg expected-loss delta: {:.3}",
+        report.avg_expected_loss_delta
+    );
+
+    if !report.by_stratum.is_empty() {
+        ftui_runtime::ftui_println!();
+        ftui_runtime::ftui_println!("By stratum");
+        for row in &report.by_stratum {
+            ftui_runtime::ftui_println!(
+                "  {} decisions={} same={} different={} avg_delta={:.3}",
+                row.stratum_key,
+                row.decisions,
+                row.same_action,
+                row.different_action,
+                row.avg_expected_loss_delta
+            );
+        }
+    }
+
+    if !report.notable_divergences.is_empty() {
+        ftui_runtime::ftui_println!();
+        ftui_runtime::ftui_println!("Notable divergences");
+        for delta in &report.notable_divergences {
+            ftui_runtime::ftui_println!(
+                "  decision {} {} {} -> {} (delta {:.3})",
+                delta.decision_id,
+                delta.subject,
+                delta.recorded_action,
+                delta.proposed_action,
+                delta.expected_loss_delta
+            );
+            if let Some((state, probability)) = delta
+                .top_posterior_state
+                .as_ref()
+                .zip(delta.top_posterior_probability)
+            {
+                ftui_runtime::ftui_println!("    top posterior: {state}={probability:.3}");
+            }
+            if let Some(outcome_label) = &delta.outcome_label {
+                ftui_runtime::ftui_println!("    observed outcome: {outcome_label}");
+            }
+        }
+    }
+
+    if !report.warnings.is_empty() {
+        ftui_runtime::ftui_println!();
+        ftui_runtime::ftui_println!("Warnings");
+        for warning in &report.warnings {
+            ftui_runtime::ftui_println!("  {warning}");
+        }
+    }
+}
+
 fn handle_atc(action: AtcCommand) -> CliResult<()> {
     match action {
         AtcCommand::Explain { decision_id, json } => {
@@ -8711,6 +9419,80 @@ fn handle_atc(action: AtcCommand) -> CliResult<()> {
 
             let report = build_atc_explain_report(decision_id, &rows)?;
             output::json_or_table(json, &report, || render_atc_explain_report(&report));
+            Ok(())
+        }
+        AtcCommand::Simulate {
+            scenario_id,
+            policy,
+            since,
+            until,
+            subject,
+            dry_run_confidence,
+            output: output_path,
+            format,
+            json,
+        } => {
+            let output_format = output::CliOutputFormat::resolve(format, json);
+            let (since_micros, since_iso) = parse_atc_simulation_timestamp(&since, false)?;
+            let until_pair = until
+                .as_deref()
+                .map(|value| parse_atc_simulation_timestamp(value, true))
+                .transpose()?;
+            if let Some((until_micros, _)) = until_pair.as_ref()
+                && *until_micros < since_micros
+            {
+                return Err(CliError::InvalidArgument(format!(
+                    "invalid ATC simulation window: until precedes since (hint: choose an --until value on or after {since_iso})"
+                )));
+            }
+
+            let bundle = read_atc_simulate_policy_bundle(&policy)?;
+            let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
+            let config = Config::from_env();
+            let read_db = open_db_sync_async_canonical_read_best_effort_with_database_url(
+                &cfg.database_url,
+                Some(config.storage_root.as_path()),
+                "ATC simulate",
+            )?;
+            let range = query_atc_simulation_sequence_range(
+                read_db.conn(),
+                since_micros,
+                until_pair.as_ref().map(|(micros, _)| *micros),
+            )?
+            .unwrap_or_default();
+
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .map_err(|error| {
+                    CliError::Other(format!("failed to build ATC simulate runtime: {error}"))
+                })?;
+            let cx = asupersync::Cx::for_request();
+            let stream = outcome_to_result(runtime.block_on(async {
+                mcp_agent_mail_db::atc_queries::replay(&cx, read_db.pool(), range).await
+            }))?;
+            let report = build_atc_simulation_report(
+                &scenario_id,
+                if policy.trim() == "-" {
+                    "<stdin>"
+                } else {
+                    &policy
+                },
+                output_path.as_deref(),
+                &bundle,
+                &since_iso,
+                until_pair.as_ref().map(|(_, iso)| iso.as_str()),
+                subject.as_deref(),
+                dry_run_confidence,
+                stream.range,
+                &stream.rows,
+            )?;
+
+            if let Some(path) = output_path.as_deref() {
+                write_atc_simulation_report(&report, path)?;
+            }
+            output::emit_output(&report, output_format, || {
+                render_atc_simulate_report(&report)
+            });
             Ok(())
         }
         AtcCommand::ReprocessFeatures {
@@ -23020,6 +23802,233 @@ mod tests {
         );
     }
 
+    fn write_atc_simulate_policy_bundle(
+        path: &Path,
+        release_losses: [f64; 3],
+        candidate_release_losses: Option<[f64; 3]>,
+    ) {
+        let mut incumbent = AtcSimulatePolicyArtifact {
+            schema_version: 1,
+            policy_id: "liveness-proposed-r1".to_string(),
+            artifact_hash: String::new(),
+            suspicion_k: 3.0,
+            max_probes_per_tick: 3,
+            probe_recency_decay_secs: 60.0,
+            probe_gain_floor: 0.01,
+            probe_budget_fraction: 0.55,
+            conservative_probe_budget_fraction: 0.25,
+            release_guard_enabled: true,
+            losses: [[0.0, 2.0, 10.0], [2.0, 0.5, 3.0], release_losses],
+        };
+        incumbent.artifact_hash = incumbent.compute_artifact_hash();
+        let candidate = candidate_release_losses.map(|release_losses| {
+            let mut artifact = AtcSimulatePolicyArtifact {
+                schema_version: 1,
+                policy_id: "liveness-candidate-r2".to_string(),
+                artifact_hash: String::new(),
+                suspicion_k: 3.0,
+                max_probes_per_tick: 3,
+                probe_recency_decay_secs: 60.0,
+                probe_gain_floor: 0.01,
+                probe_budget_fraction: 0.55,
+                conservative_probe_budget_fraction: 0.25,
+                release_guard_enabled: true,
+                losses: [[0.0, 2.0, 10.0], [2.0, 0.5, 3.0], release_losses],
+            };
+            artifact.artifact_hash = artifact.compute_artifact_hash();
+            artifact
+        });
+        let mut bundle = AtcSimulatePolicyBundle {
+            schema_version: 1,
+            bundle_id: "atc-liveness-bundle-sim-r1".to_string(),
+            bundle_hash: String::new(),
+            incumbent,
+            candidate,
+        };
+        bundle.bundle_hash = bundle.compute_bundle_hash();
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&bundle).expect("serialize simulate bundle"),
+        )
+        .expect("write simulate bundle");
+    }
+
+    fn seed_atc_simulate_db(db_path: &Path, storage_root: &Path) {
+        let pool = atc_explain_test_pool(db_path, storage_root);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build ATC simulate runtime");
+        let cx = asupersync::Cx::for_testing();
+        let base_ts = 1_762_100_000_000_000i64;
+
+        let blue_features = mcp_agent_mail_core::FeatureVector {
+            posterior_alive_bp: 3500,
+            posterior_flaky_bp: 2500,
+            expected_loss_bp: 203,
+            loss_gap_bp: 160,
+            risk_tier: mcp_agent_mail_core::FeatureVector::risk_tier_for(
+                mcp_agent_mail_core::EffectKind::Advisory,
+            ),
+            ..mcp_agent_mail_core::FeatureVector::zeroed()
+        };
+        let red_features = mcp_agent_mail_core::FeatureVector {
+            posterior_alive_bp: 8500,
+            posterior_flaky_bp: 1000,
+            expected_loss_bp: 70,
+            loss_gap_bp: 120,
+            risk_tier: mcp_agent_mail_core::FeatureVector::risk_tier_for(
+                mcp_agent_mail_core::EffectKind::NoAction,
+            ),
+            ..mcp_agent_mail_core::FeatureVector::zeroed()
+        };
+        let conflict_features = mcp_agent_mail_core::FeatureVector {
+            risk_tier: mcp_agent_mail_core::FeatureVector::risk_tier_for(
+                mcp_agent_mail_core::EffectKind::Advisory,
+            ),
+            ..mcp_agent_mail_core::FeatureVector::zeroed()
+        };
+
+        let rows = vec![
+            mcp_agent_mail_core::ExperienceRow {
+                experience_id: 0,
+                decision_id: 100,
+                effect_id: 1100,
+                trace_id: "trc-atc-sim-100".to_string(),
+                claim_id: "clm-atc-sim-100".to_string(),
+                evidence_id: "evi-atc-sim-100".to_string(),
+                state: mcp_agent_mail_core::ExperienceState::Resolved,
+                subsystem: mcp_agent_mail_core::ExperienceSubsystem::Liveness,
+                decision_class: "liveness_transition".to_string(),
+                subject: "BlueLake".to_string(),
+                project_key: Some("/tmp/atc-sim".to_string()),
+                policy_id: Some("liveness-incumbent-r0".to_string()),
+                effect_kind: mcp_agent_mail_core::EffectKind::Advisory,
+                action: "Suspect".to_string(),
+                posterior: vec![
+                    ("Alive".to_string(), 0.35),
+                    ("Flaky".to_string(), 0.25),
+                    ("Dead".to_string(), 0.40),
+                ],
+                expected_loss: 2.025,
+                runner_up_action: Some("ReleaseReservations".to_string()),
+                runner_up_loss: Some(3.63),
+                evidence_summary: "BlueLake crossed the silence threshold".to_string(),
+                calibration_healthy: true,
+                safe_mode_active: false,
+                non_execution_reason: None,
+                outcome: Some(mcp_agent_mail_core::ExperienceOutcome {
+                    observed_ts_micros: base_ts + 50_000,
+                    label: "agent_replied_late".to_string(),
+                    correct: true,
+                    actual_loss: Some(0.8),
+                    regret: Some(0.0),
+                    evidence: Some(serde_json::json!({"reply_ms": 4200})),
+                }),
+                created_ts_micros: base_ts,
+                dispatched_ts_micros: Some(base_ts + 1_000),
+                executed_ts_micros: Some(base_ts + 2_000),
+                resolved_ts_micros: Some(base_ts + 50_000),
+                features: Some(blue_features),
+                feature_ext: None,
+                context: Some(serde_json::json!({"scenario": "blue_alert"})),
+            },
+            mcp_agent_mail_core::ExperienceRow {
+                experience_id: 0,
+                decision_id: 101,
+                effect_id: 1101,
+                trace_id: "trc-atc-sim-101".to_string(),
+                claim_id: "clm-atc-sim-101".to_string(),
+                evidence_id: "evi-atc-sim-101".to_string(),
+                state: mcp_agent_mail_core::ExperienceState::Resolved,
+                subsystem: mcp_agent_mail_core::ExperienceSubsystem::Liveness,
+                decision_class: "liveness_transition".to_string(),
+                subject: "RedLake".to_string(),
+                project_key: Some("/tmp/atc-sim".to_string()),
+                policy_id: Some("liveness-incumbent-r0".to_string()),
+                effect_kind: mcp_agent_mail_core::EffectKind::NoAction,
+                action: "DeclareAlive".to_string(),
+                posterior: vec![
+                    ("Alive".to_string(), 0.85),
+                    ("Flaky".to_string(), 0.10),
+                    ("Dead".to_string(), 0.05),
+                ],
+                expected_loss: 0.7,
+                runner_up_action: Some("Suspect".to_string()),
+                runner_up_loss: Some(1.9),
+                evidence_summary: "RedLake remained within expected rhythm".to_string(),
+                calibration_healthy: true,
+                safe_mode_active: false,
+                non_execution_reason: None,
+                outcome: Some(mcp_agent_mail_core::ExperienceOutcome {
+                    observed_ts_micros: base_ts + 1_050_000,
+                    label: "healthy_idle".to_string(),
+                    correct: true,
+                    actual_loss: Some(0.1),
+                    regret: Some(0.0),
+                    evidence: Some(serde_json::json!({"idle_secs": 38})),
+                }),
+                created_ts_micros: base_ts + 1_000_000,
+                dispatched_ts_micros: Some(base_ts + 1_001_000),
+                executed_ts_micros: Some(base_ts + 1_002_000),
+                resolved_ts_micros: Some(base_ts + 1_050_000),
+                features: Some(red_features),
+                feature_ext: None,
+                context: Some(serde_json::json!({"scenario": "red_stable"})),
+            },
+            mcp_agent_mail_core::ExperienceRow {
+                experience_id: 0,
+                decision_id: 102,
+                effect_id: 1102,
+                trace_id: "trc-atc-sim-102".to_string(),
+                claim_id: "clm-atc-sim-102".to_string(),
+                evidence_id: "evi-atc-sim-102".to_string(),
+                state: mcp_agent_mail_core::ExperienceState::Resolved,
+                subsystem: mcp_agent_mail_core::ExperienceSubsystem::Conflict,
+                decision_class: "deadlock_cycle".to_string(),
+                subject: "AmberPeak".to_string(),
+                project_key: Some("/tmp/atc-sim".to_string()),
+                policy_id: None,
+                effect_kind: mcp_agent_mail_core::EffectKind::Advisory,
+                action: "AdvisoryMessage".to_string(),
+                posterior: vec![("CycleDetected".to_string(), 1.0)],
+                expected_loss: 0.3,
+                runner_up_action: Some("NoAction".to_string()),
+                runner_up_loss: Some(0.8),
+                evidence_summary: "reservation cycle detected".to_string(),
+                calibration_healthy: true,
+                safe_mode_active: false,
+                non_execution_reason: None,
+                outcome: Some(mcp_agent_mail_core::ExperienceOutcome {
+                    observed_ts_micros: base_ts + 2_000_000,
+                    label: "cycle_cleared".to_string(),
+                    correct: true,
+                    actual_loss: Some(0.2),
+                    regret: Some(0.0),
+                    evidence: Some(serde_json::json!({"cycle_size": 2})),
+                }),
+                created_ts_micros: base_ts + 2_000_000,
+                dispatched_ts_micros: Some(base_ts + 2_001_000),
+                executed_ts_micros: Some(base_ts + 2_002_000),
+                resolved_ts_micros: Some(base_ts + 2_010_000),
+                features: Some(conflict_features),
+                feature_ext: None,
+                context: Some(serde_json::json!({"scenario": "conflict"})),
+            },
+        ];
+
+        for row in rows {
+            let _inserted_id = expect_db_outcome(
+                runtime.block_on(mcp_agent_mail_db::queries::insert_experience(
+                    &cx, &pool, row,
+                )),
+                "insert ATC simulate seed row",
+            );
+        }
+
+        pool.wal_checkpoint()
+            .expect("checkpoint ATC simulate seed db");
+    }
+
     fn run_atc_cmd_with_env_capture(
         action: AtcCommand,
         database_url: &str,
@@ -24559,6 +25568,201 @@ http_headers = { Authorization = "Bearer secret" }
         assert!(
             output.contains("ATC decision not found: 999"),
             "unexpected not-found output:\n{output}"
+        );
+    }
+
+    #[test]
+    fn clap_parses_atc_simulate_flags() {
+        let cli = Cli::try_parse_from([
+            "am",
+            "atc",
+            "simulate",
+            "apr17-tightening",
+            "--policy",
+            "/tmp/policy.json",
+            "--since",
+            "2026-04-01",
+            "--until",
+            "2026-04-17",
+            "--subject",
+            "BlueLake",
+            "--dry-run-confidence",
+            "0.8",
+            "--output",
+            "/tmp/report.json",
+            "--format",
+            "json",
+        ])
+        .expect("failed to parse atc simulate");
+        match cli.command.expect("expected command") {
+            Commands::Atc { action } => match action {
+                AtcCommand::Simulate {
+                    scenario_id,
+                    policy,
+                    since,
+                    until,
+                    subject,
+                    dry_run_confidence,
+                    output,
+                    format,
+                    json,
+                } => {
+                    assert_eq!(scenario_id, "apr17-tightening");
+                    assert_eq!(policy, "/tmp/policy.json");
+                    assert_eq!(since, "2026-04-01");
+                    assert_eq!(until.as_deref(), Some("2026-04-17"));
+                    assert_eq!(subject.as_deref(), Some("BlueLake"));
+                    assert!((dry_run_confidence - 0.8).abs() < f64::EPSILON);
+                    assert_eq!(output, Some(PathBuf::from("/tmp/report.json")));
+                    assert_eq!(format, Some(output::CliOutputFormat::Json));
+                    assert!(!json);
+                }
+                other => panic!("unexpected atc action: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_atc_simulate_json_reports_no_differences_for_identical_policy() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("atc-sim.sqlite3");
+        let storage_root = temp.path().join("storage");
+        let policy_path = temp.path().join("policy-identical.json");
+        let report_path = temp.path().join("artifacts").join("simulation.json");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        seed_atc_simulate_db(&db_path, &storage_root);
+        write_atc_simulate_policy_bundle(&policy_path, [8.0, 3.0, 0.2], None);
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        let (result, output) = run_atc_cmd_with_env_capture(
+            AtcCommand::Simulate {
+                scenario_id: "apr17-tightening".to_string(),
+                policy: policy_path.display().to_string(),
+                since: "2025-11-01T00:00:00Z".to_string(),
+                until: Some("2027-01-01T00:00:00Z".to_string()),
+                subject: None,
+                dry_run_confidence: 0.0,
+                output: Some(report_path.clone()),
+                format: Some(output::CliOutputFormat::Json),
+                json: false,
+            },
+            &database_url,
+            &storage_root_text,
+        );
+
+        assert!(result.is_ok(), "atc simulate should succeed: {result:?}");
+        let json_str = extract_json_block(&output).expect("expected JSON output");
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_str).expect("valid simulate JSON");
+        assert_eq!(parsed["scenario_id"], "apr17-tightening");
+        assert_eq!(parsed["different_action"], 0);
+        assert_eq!(parsed["same_action"], 2);
+        assert_eq!(parsed["rows_skipped_non_liveness"], 1);
+        assert_eq!(parsed["decisions_evaluated"], 2);
+        assert_eq!(parsed["experiences_considered"], 3);
+        assert!(
+            report_path.exists(),
+            "simulation artifact should be written"
+        );
+    }
+
+    #[test]
+    fn handle_atc_simulate_json_reports_stricter_policy_divergence() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("atc-sim-divergence.sqlite3");
+        let storage_root = temp.path().join("storage");
+        let policy_path = temp.path().join("policy-stricter.json");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        seed_atc_simulate_db(&db_path, &storage_root);
+        write_atc_simulate_policy_bundle(&policy_path, [8.0, 3.0, 0.2], Some([4.0, 1.2, 0.1]));
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        let (result, output) = run_atc_cmd_with_env_capture(
+            AtcCommand::Simulate {
+                scenario_id: "apr17-stricter-release".to_string(),
+                policy: policy_path.display().to_string(),
+                since: "2025-11-01T00:00:00Z".to_string(),
+                until: Some("2027-01-01T00:00:00Z".to_string()),
+                subject: None,
+                dry_run_confidence: 0.0,
+                output: None,
+                format: Some(output::CliOutputFormat::Json),
+                json: false,
+            },
+            &database_url,
+            &storage_root_text,
+        );
+
+        assert!(result.is_ok(), "atc simulate should succeed: {result:?}");
+        let json_str = extract_json_block(&output).expect("expected JSON output");
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_str).expect("valid simulate JSON");
+        assert_eq!(parsed["different_action"], 1);
+        assert_eq!(parsed["same_action"], 1);
+        assert_eq!(
+            parsed["simulated_policy_id"],
+            serde_json::json!("liveness-candidate-r2")
+        );
+        assert_eq!(
+            parsed["notable_divergences"][0]["recorded_action"],
+            serde_json::json!("Suspect")
+        );
+        assert_eq!(
+            parsed["notable_divergences"][0]["proposed_action"],
+            serde_json::json!("ReleaseReservations")
+        );
+    }
+
+    #[test]
+    fn handle_atc_simulate_does_not_mutate_primary_db_file() {
+        use sha2::Digest as _;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("atc-sim-readonly.sqlite3");
+        let storage_root = temp.path().join("storage");
+        let policy_path = temp.path().join("policy-readonly.json");
+        std::fs::create_dir_all(&storage_root).expect("create storage root");
+        seed_atc_simulate_db(&db_path, &storage_root);
+        write_atc_simulate_policy_bundle(&policy_path, [8.0, 3.0, 0.2], None);
+
+        let before_hash = {
+            let bytes = std::fs::read(&db_path).expect("read db before simulate");
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(&bytes);
+            hex::encode(hasher.finalize())
+        };
+
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let storage_root_text = storage_root.to_string_lossy().to_string();
+        let (result, _output) = run_atc_cmd_with_env_capture(
+            AtcCommand::Simulate {
+                scenario_id: "apr17-readonly".to_string(),
+                policy: policy_path.display().to_string(),
+                since: "2025-11-01T00:00:00Z".to_string(),
+                until: Some("2027-01-01T00:00:00Z".to_string()),
+                subject: None,
+                dry_run_confidence: 0.0,
+                output: None,
+                format: Some(output::CliOutputFormat::Json),
+                json: false,
+            },
+            &database_url,
+            &storage_root_text,
+        );
+        assert!(result.is_ok(), "atc simulate should succeed: {result:?}");
+
+        let after_hash = {
+            let bytes = std::fs::read(&db_path).expect("read db after simulate");
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(&bytes);
+            hex::encode(hasher.finalize())
+        };
+        assert_eq!(
+            before_hash, after_hash,
+            "simulate must not mutate primary DB"
         );
     }
 
@@ -48884,6 +50088,16 @@ fn parse_positive_u64_arg(value: &str) -> Result<u64, String> {
         .map_err(|error| format!("invalid positive integer '{value}': {error}"))?;
     if parsed == 0 {
         return Err("value must be at least 1".to_string());
+    }
+    Ok(parsed)
+}
+
+fn parse_probability_arg(value: &str) -> Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|error| format!("invalid probability '{value}': {error}"))?;
+    if !(0.0..=1.0).contains(&parsed) {
+        return Err("probability must be between 0.0 and 1.0".to_string());
     }
     Ok(parsed)
 }
