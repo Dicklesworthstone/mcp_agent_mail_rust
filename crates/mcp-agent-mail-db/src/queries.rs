@@ -2178,7 +2178,21 @@ fn resolve_atc_experience_file_backed(
             Value::Text(outcome_json),
             Value::BigInt(id),
         ];
-        canonical_execute_atc(&conn, sql, &params, "resolve_atc_experience update")?;
+        let rows_affected =
+            canonical_execute_atc(&conn, sql, &params, "resolve_atc_experience update")?;
+        if rows_affected == 0 {
+            let rows = canonical_query_atc_rows(
+                &conn,
+                "SELECT state FROM atc_experiences WHERE experience_id = ? LIMIT 1",
+                &[Value::BigInt(id)],
+                "resolve_atc_experience select",
+            )?;
+            let state = rows
+                .first()
+                .map(|row| row_text(row, 0, "state").and_then(|raw| parse_enum(raw, "state")))
+                .transpose()?;
+            resolve_atc_experience_noop_result(state, experience_id)?;
+        }
         commit_canonical_atc_write_tx(&conn)
     })();
     if result.is_err() {
@@ -2240,6 +2254,20 @@ fn overwrite_resolved_atc_experience_outcome_file_backed(
     }
     close_canonical_db_conn(conn, "canonical ATC overwrite-resolved connection");
     result
+}
+
+fn resolve_atc_experience_noop_result(
+    current_state: Option<ExperienceState>,
+    experience_id: u64,
+) -> std::result::Result<(), DbError> {
+    match current_state {
+        Some(ExperienceState::Resolved) => Ok(()),
+        Some(current_state) => Err(DbError::invalid(
+            "state",
+            format!("experience {experience_id} is {current_state}, must be open to resolve"),
+        )),
+        None => Err(DbError::not_found("experience", experience_id.to_string())),
+    }
 }
 
 fn resolve_experience_file_backed(
@@ -11057,8 +11085,9 @@ pub async fn resolve_atc_experience(
     // Only update rows that are in `open` state. The state machine
     // requires Executed → Open before Open → Resolved. The caller
     // must ensure the Executed → Open transition happens first (e.g.,
-    // via the resolution sweep). Already-resolved rows are idempotently
-    // skipped by the WHERE clause.
+    // via the resolution sweep). A zero-row update is treated as a
+    // follow-up state read so stale callers cannot report false success
+    // for missing or non-open rows.
     let sql = "UPDATE atc_experiences \
                SET state = 'resolved', resolved_ts = ?, outcome_json = ? \
                WHERE experience_id = ? AND state = 'open'";
@@ -11070,7 +11099,42 @@ pub async fn resolve_atc_experience(
     ];
 
     match traw_execute(cx, &tracked, sql, &params).await {
-        Outcome::Ok(_) => Outcome::Ok(()),
+        Outcome::Ok(rows_affected) => {
+            if rows_affected > 0 {
+                return Outcome::Ok(());
+            }
+
+            match traw_query(
+                cx,
+                &tracked,
+                "SELECT state FROM atc_experiences WHERE experience_id = ? LIMIT 1",
+                &[Value::BigInt(id)],
+            )
+            .await
+            {
+                Outcome::Ok(rows) => {
+                    let state = match rows
+                        .first()
+                        .map(|row| {
+                            row_text(row, 0, "state").and_then(|raw| parse_enum(raw, "state"))
+                        })
+                        .transpose()
+                    {
+                        Ok(state) => state,
+                        Err(error) => return Outcome::Err(error),
+                    };
+                    match resolve_atc_experience_noop_result(state, experience_id) {
+                        Ok(()) => Outcome::Ok(()),
+                        Err(error) => Outcome::Err(error),
+                    }
+                }
+                Outcome::Err(error) => Outcome::Err(DbError::Internal(format!(
+                    "failed to inspect experience {experience_id} after resolve no-op: {error}"
+                ))),
+                Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => Outcome::Panicked(payload),
+            }
+        }
         Outcome::Err(error) => Outcome::Err(DbError::Internal(format!(
             "failed to resolve experience {experience_id}: {error}"
         ))),
@@ -13939,6 +14003,168 @@ mod tests {
                 .into_result()
                 .expect("fetch unmatched subject");
             assert!(unmatched.is_empty());
+        });
+    }
+
+    #[test]
+    fn resolve_atc_experience_requires_open_state_for_in_memory_pool() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            min_connections: 1,
+            max_connections: 1,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create in-memory pool");
+
+        rt.block_on(async {
+            let row = make_insert_experience_test_row(
+                410,
+                510,
+                ExperienceState::Executed,
+                1_700_000_000_030_000,
+            );
+            let stored = append_atc_experience(&cx, &pool, &row)
+                .await
+                .into_result()
+                .expect("append executed experience");
+
+            let outcome = ExperienceOutcome {
+                observed_ts_micros: 1_700_000_000_031_000,
+                label: "acknowledged".to_string(),
+                correct: true,
+                actual_loss: Some(0.1),
+                regret: Some(0.0),
+                evidence: Some(serde_json::json!({
+                    "source": "review-round-2",
+                    "branch": "memory"
+                })),
+            };
+
+            let stored_before = fetch_durable_atc_experience_by_id(
+                &cx,
+                &pool,
+                i64::try_from(stored.experience_id).expect("experience id fits i64"),
+            )
+            .await
+            .into_result()
+            .expect("fetch inserted experience")
+            .expect("experience should exist before resolve attempt");
+            assert_eq!(stored_before.state, ExperienceState::Executed);
+
+            let invalid = resolve_atc_experience(&cx, &pool, stored.experience_id, &outcome)
+                .await
+                .into_result();
+            assert!(
+                matches!(
+                    invalid,
+                    Err(asupersync::OutcomeError::Err(DbError::InvalidArgument {
+                        field: "state",
+                        ..
+                    }))
+                ),
+                "expected invalid state error, got {invalid:?}"
+            );
+
+            let stored_after = fetch_durable_atc_experience_by_id(
+                &cx,
+                &pool,
+                i64::try_from(stored.experience_id).expect("experience id fits i64"),
+            )
+            .await
+            .into_result()
+            .expect("fetch persisted experience")
+            .expect("experience should still exist");
+            assert_eq!(stored_after.state, ExperienceState::Executed);
+            assert!(stored_after.outcome.is_none());
+
+            let missing =
+                resolve_atc_experience(&cx, &pool, stored.experience_id + 10_000, &outcome)
+                    .await
+                    .into_result();
+            assert!(matches!(
+                missing,
+                Err(asupersync::OutcomeError::Err(DbError::NotFound {
+                    entity: "experience",
+                    ..
+                }))
+            ));
+        });
+    }
+
+    #[test]
+    fn resolve_atc_experience_requires_open_state_for_file_backed_pool() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("resolve_atc_experience_requires_open_state.db");
+
+        rt.block_on(async {
+            let row = make_insert_experience_test_row(
+                411,
+                511,
+                ExperienceState::Executed,
+                1_700_000_000_040_000,
+            );
+            let stored = append_atc_experience(&cx, &pool, &row)
+                .await
+                .into_result()
+                .expect("append executed experience");
+
+            let outcome = ExperienceOutcome {
+                observed_ts_micros: 1_700_000_000_041_000,
+                label: "acknowledged".to_string(),
+                correct: true,
+                actual_loss: Some(0.1),
+                regret: Some(0.0),
+                evidence: Some(serde_json::json!({
+                    "source": "review-round-2",
+                    "branch": "file-backed"
+                })),
+            };
+
+            let invalid = resolve_atc_experience(&cx, &pool, stored.experience_id, &outcome)
+                .await
+                .into_result();
+            assert!(matches!(
+                invalid,
+                Err(asupersync::OutcomeError::Err(DbError::InvalidArgument {
+                    field: "state",
+                    ..
+                }))
+            ));
+
+            let stored_after = fetch_durable_atc_experience_by_id(
+                &cx,
+                &pool,
+                i64::try_from(stored.experience_id).expect("experience id fits i64"),
+            )
+            .await
+            .into_result()
+            .expect("fetch persisted experience")
+            .expect("experience should still exist");
+            assert_eq!(stored_after.state, ExperienceState::Executed);
+            assert!(stored_after.outcome.is_none());
+
+            let missing =
+                resolve_atc_experience(&cx, &pool, stored.experience_id + 10_000, &outcome)
+                    .await
+                    .into_result();
+            assert!(matches!(
+                missing,
+                Err(asupersync::OutcomeError::Err(DbError::NotFound {
+                    entity: "experience",
+                    ..
+                }))
+            ));
         });
     }
 
