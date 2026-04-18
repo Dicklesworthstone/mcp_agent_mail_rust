@@ -12,8 +12,8 @@ members = [
   "crates/mcp-agent-mail-share",
   "crates/mcp-agent-mail-conformance",
   "crates/mcp-agent-mail-search-core",
-  "crates/mcp-agent-mail-wasm",
 ]
+exclude = ["experimental/*"]
 
 [workspace.package]
 version = "0.2.42"
