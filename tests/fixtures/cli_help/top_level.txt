@@ -36,6 +36,7 @@ Commands:
   setup                       Detect coding agents and configure MCP server connections
   golden                      Capture, verify, and inspect deterministic golden CLI artifacts
   flake-triage                Flake triage: scan artifacts, reproduce failures, detect flaky tests
+  atc                         ATC maintenance and backfill workflows
   robot                       Agent-optimized commands with TOON/JSON/Markdown output
   legacy                      Legacy Python installation detection, migration/import, and status
   upgrade                     Upgrade helper: detect legacy install, import data, refresh setup
