@@ -4052,6 +4052,13 @@ const ATC_OPERATOR_ACTION_CAPACITY: usize = 64;
 const ATC_OPERATOR_EXECUTION_CAPACITY: usize = 64;
 const ATC_OPERATOR_STOP_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const ATC_OPERATOR_MIN_TICK_INTERVAL: Duration = Duration::from_millis(250);
+const ATC_ROLLUP_REFRESH_INTERVAL_MICROS: i64 = 300_000_000;
+const ATC_ROLLUP_REFRESH_LOOKBACK_MICROS: i64 =
+    mcp_agent_mail_db::atc_queries::DEFAULT_ROLLUP_REFRESH_LOOKBACK_MICROS;
+
+fn next_atc_rollup_refresh_micros(now_micros: i64) -> i64 {
+    now_micros.saturating_add(ATC_ROLLUP_REFRESH_INTERVAL_MICROS)
+}
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub(crate) struct AtcOperatorSnapshot {
@@ -5790,6 +5797,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
     let mut atc_resolution_tick_counter: u64 = 0;
     let mut executor_registered_projects: HashSet<String> = HashSet::new();
     let mut next_population_sync_micros = 0_i64;
+    let mut next_rollup_refresh_micros = 0_i64;
 
     set_atc_operator_snapshot(AtcOperatorSnapshot::warming_up(true));
 
@@ -5995,6 +6003,38 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
             if let Some(pool) = atc_db_pool.as_ref() {
                 sweep_open_experiences_for_resolution(pool, now_micros, 600_000_000);
             }
+        }
+        if let Some(pool) = atc_db_pool.as_ref()
+            && now_micros >= next_rollup_refresh_micros
+        {
+            let cx = Cx::for_request_with_budget(Budget::INFINITE);
+            match block_on(mcp_agent_mail_db::atc_queries::refresh_rollups(
+                &cx,
+                pool,
+                now_micros,
+                ATC_ROLLUP_REFRESH_LOOKBACK_MICROS,
+            )) {
+                asupersync::Outcome::Ok(summary) => {
+                    tracing::debug!(
+                        event = "atc.rollup.tick_refresh_complete",
+                        lookback_micros = summary.lookback_micros,
+                        rows_scanned = summary.rows_scanned,
+                        rows_applied = summary.rows_applied,
+                        strata_updated = summary.strata_updated,
+                        "refreshed ATC rollups on operator tick"
+                    );
+                }
+                asupersync::Outcome::Err(error) => {
+                    tracing::warn!(%error, "failed to refresh ATC rollups on operator tick");
+                }
+                asupersync::Outcome::Cancelled(reason) => {
+                    tracing::warn!(?reason, "ATC rollup refresh cancelled before completion");
+                }
+                asupersync::Outcome::Panicked(_) => {
+                    tracing::error!("ATC rollup refresh panicked");
+                }
+            }
+            next_rollup_refresh_micros = next_atc_rollup_refresh_micros(now_micros);
         }
 
         let tick_duration_micros =
@@ -13398,6 +13438,20 @@ mod tests {
         assert_eq!(normalized_probe_host(""), "127.0.0.1");
         assert_eq!(normalized_probe_host("  "), "127.0.0.1");
         assert_eq!(normalized_probe_host("127.0.0.1"), "127.0.0.1");
+    }
+
+    #[test]
+    fn next_atc_rollup_refresh_deadline_uses_configured_interval() {
+        let now_micros = 1_000_000;
+        assert_eq!(
+            next_atc_rollup_refresh_micros(now_micros),
+            now_micros + ATC_ROLLUP_REFRESH_INTERVAL_MICROS
+        );
+    }
+
+    #[test]
+    fn next_atc_rollup_refresh_deadline_saturates() {
+        assert_eq!(next_atc_rollup_refresh_micros(i64::MAX), i64::MAX);
     }
 
     #[test]
