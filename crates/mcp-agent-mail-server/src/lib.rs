@@ -4003,6 +4003,22 @@ fn set_tui_state_handle(state: Option<Arc<tui_bridge::TuiSharedState>>) {
     *lock_mutex(&TUI_STATE) = state;
 }
 
+static BROWSER_TUI_DEFERRED_JSON: std::sync::LazyLock<serde_json::Value> =
+    std::sync::LazyLock::new(|| {
+        serde_json::json!({
+            "error": "not_implemented",
+            "detail": "The browser TUI mirror is deferred; see docs/SPEC-browser-parity-contract-deferred.md",
+            "tracker": "br-il53l"
+        })
+    });
+
+const BROWSER_TUI_DEFERRED_HTML: &str = concat!(
+    "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Browser TUI Mirror — Deferred</title></head>",
+    "<body><h1>501 Not Implemented</h1>",
+    "<p>The browser TUI mirror is deferred. See <code>docs/SPEC-browser-parity-contract-deferred.md</code> ",
+    "and tracker <code>br-il53l</code> for details.</p></body></html>",
+);
+
 const ATC_OPERATOR_ACTION_CAPACITY: usize = 64;
 const ATC_OPERATOR_EXECUTION_CAPACITY: usize = 64;
 const ATC_OPERATOR_STOP_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -8402,55 +8418,19 @@ impl HttpState {
         }
 
         if path == "/mail/ws-input" {
-            if !matches!(req.method, Http1Method::Post) {
-                return Some(self.error_response(req, 405, "Method Not Allowed"));
-            }
-            let Some(state) = tui_state_handle() else {
-                return Some(self.error_response(req, 503, "TUI state is not active"));
-            };
-            let parsed = match tui_ws_input::parse_remote_terminal_events(&req.body) {
-                Ok(parsed) => parsed,
-                Err(err) => return Some(self.error_response(req, 400, &err)),
-            };
-            let mut dropped_oldest = 0_usize;
-            let accepted = parsed.events.len();
-            for event in parsed.events {
-                if state.push_remote_terminal_event(event) {
-                    dropped_oldest += 1;
-                }
-            }
-            let queue_stats = state.remote_terminal_queue_stats();
-            let payload = serde_json::json!({
-                "status": "accepted",
-                "accepted": accepted,
-                "ignored": parsed.ignored,
-                "dropped_oldest": dropped_oldest,
-                "queue_depth": queue_stats.depth,
-                "queue_dropped_oldest_total": queue_stats.dropped_oldest_total,
-                "queue_resize_coalesced_total": queue_stats.resize_coalesced_total,
-            });
-            return Some(self.json_response(req, 202, &payload));
+            return Some(self.json_response(
+                req,
+                501,
+                &BROWSER_TUI_DEFERRED_JSON,
+            ));
         }
 
         if path == "/mail/ws-state" {
-            if !matches!(req.method, Http1Method::Get) {
-                return Some(self.error_response(req, 405, "Method Not Allowed"));
-            }
-            if is_websocket_upgrade_request(req) {
-                return Some(self.error_response(
-                    req,
-                    501,
-                    "WebSocket upgrade is not supported on /mail/ws-state; use HTTP polling.",
-                ));
-            }
-
-            let (_path_part, query_part) = split_path_query(&req.uri);
-            let query = query_part.as_deref();
-            let payload = tui_state_handle().map_or_else(
-                || tui_ws_state::poll_payload(&self.ws_state_fallback, query),
-                |state| tui_ws_state::poll_payload(&state, query),
-            );
-            return Some(self.json_response(req, 200, &payload));
+            return Some(self.json_response(
+                req,
+                501,
+                &BROWSER_TUI_DEFERRED_JSON,
+            ));
         }
 
         if path == "/mail/api/locks" || path == "/mail/api/locks/" {
@@ -8468,64 +8448,25 @@ impl HttpState {
             return Some(self.json_response(req, 200, &payload));
         }
 
-        // ── Web Dashboard (TUI mirror in browser) ────────────────────
+        // ── Web Dashboard (TUI mirror in browser) ─── DEFERRED ──────
         if path == "/web-dashboard" || path == "/web-dashboard/" {
-            if !matches!(req.method, Http1Method::Get) {
-                return Some(self.error_response(req, 405, "Method Not Allowed"));
-            }
-            let host = req
-                .headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("host"))
-                .map_or("", |(_, v)| v.as_str());
-            let html = tui_web_dashboard::handle_page(host);
             return Some(self.raw_response(
                 req,
-                200,
+                501,
                 "text/html; charset=utf-8",
-                html.into_bytes(),
+                BROWSER_TUI_DEFERRED_HTML.as_bytes().to_vec(),
             ));
         }
 
-        if path == "/web-dashboard/state" {
-            if !matches!(req.method, Http1Method::Get) {
-                return Some(self.error_response(req, 405, "Method Not Allowed"));
-            }
-            let (_path_part, query_part) = split_path_query(&req.uri);
-            let live_state = tui_state_handle();
-            let (status, payload) = tui_web_dashboard::handle_state_response(
-                live_state.as_deref(),
-                &self.ws_state_fallback,
-                query_part.as_deref(),
-            );
-            return Some(self.raw_response(req, status, "application/json", payload.into_bytes()));
-        }
-
-        if path == "/web-dashboard/stream" {
-            if !matches!(req.method, Http1Method::Get) {
-                return Some(self.error_response(req, 405, "Method Not Allowed"));
-            }
-            let (_path_part, query_part) = split_path_query(&req.uri);
-            let live_state = tui_state_handle();
-            let (status, payload) = tui_web_dashboard::handle_stream_response(
-                live_state.as_deref(),
-                &self.ws_state_fallback,
-                query_part.as_deref(),
-            );
-            return Some(self.raw_response(req, status, "application/json", payload.into_bytes()));
-        }
-
-        if path == "/web-dashboard/input" {
-            if !matches!(req.method, Http1Method::Post) {
-                return Some(self.error_response(req, 405, "Method Not Allowed"));
-            }
-            let live_state = tui_state_handle();
-            let (status, payload) = live_state
-                .as_deref()
-                .map_or_else(tui_web_dashboard::handle_inactive_input, |state| {
-                    tui_web_dashboard::handle_input(state, &req.body)
-                });
-            return Some(self.raw_response(req, status, "application/json", payload.into_bytes()));
+        if path == "/web-dashboard/state"
+            || path == "/web-dashboard/stream"
+            || path == "/web-dashboard/input"
+        {
+            return Some(self.json_response(
+                req,
+                501,
+                &BROWSER_TUI_DEFERRED_JSON,
+            ));
         }
 
         if path == "/mail" || path.starts_with("/mail/") {
@@ -13751,23 +13692,20 @@ first body
     }
 
     #[test]
-    fn mail_ws_state_poll_returns_snapshot_json() {
+    fn mail_ws_state_returns_501_deferred() {
         let config = mcp_agent_mail_core::Config::default();
         let state = build_state(config);
         let req = make_request(Http1Method::Get, "/mail/ws-state?limit=5", &[]);
         let resp = block_on(state.handle(req));
-        assert_eq!(resp.status, 200);
+        assert_eq!(resp.status, 501);
         assert_eq!(
             response_header(&resp, "content-type"),
             Some("application/json")
         );
-
-        let payload: serde_json::Value =
-            serde_json::from_slice(&resp.body).expect("ws-state response json");
-        assert_eq!(payload["schema_version"], "am_ws_state_poll.v1");
-        assert_eq!(payload["mode"], "snapshot");
-        assert_eq!(payload["transport"], "http-poll");
-        assert!(payload["next_seq"].as_u64().is_some());
+        let body: serde_json::Value =
+            serde_json::from_slice(&resp.body).expect("deferred json");
+        assert_eq!(body["error"], "not_implemented");
+        assert_eq!(body["tracker"], "br-il53l");
     }
 
     #[test]
@@ -14526,7 +14464,7 @@ first body
     }
 
     #[test]
-    fn mail_ws_state_upgrade_request_returns_501_json_error() {
+    fn mail_ws_state_upgrade_request_returns_501_deferred() {
         let config = mcp_agent_mail_core::Config::default();
         let state = build_state(config);
         let req = make_request(
@@ -14536,217 +14474,75 @@ first body
         );
         let resp = block_on(state.handle(req));
         assert_eq!(resp.status, 501);
-        assert_eq!(
-            response_header(&resp, "content-type"),
-            Some("application/json")
-        );
-        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("error json");
-        assert_eq!(
-            body["detail"],
-            "WebSocket upgrade is not supported on /mail/ws-state; use HTTP polling."
-        );
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("deferred json");
+        assert_eq!(body["error"], "not_implemented");
+        assert_eq!(body["tracker"], "br-il53l");
     }
 
     #[test]
-    fn mail_ws_input_rejects_get_with_405() {
+    fn mail_ws_input_returns_501_deferred() {
         let config = mcp_agent_mail_core::Config::default();
         let state = build_state(config);
         let req = make_request(Http1Method::Get, "/mail/ws-input", &[]);
         let resp = block_on(state.handle(req));
-        assert_eq!(resp.status, 405);
-        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("error json");
-        assert_eq!(body["detail"], "Method Not Allowed");
+        assert_eq!(resp.status, 501);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("deferred json");
+        assert_eq!(body["error"], "not_implemented");
     }
 
     #[test]
-    fn web_dashboard_route_returns_html_shell() {
+    fn web_dashboard_route_returns_501_deferred_html() {
         let config = mcp_agent_mail_core::Config::default();
         let state = build_state(config);
         let req = make_request(Http1Method::Get, "/web-dashboard", &[]);
         let resp = block_on(state.handle(req));
-        assert_eq!(resp.status, 200);
+        assert_eq!(resp.status, 501);
         assert_eq!(
             response_header(&resp, "content-type"),
             Some("text/html; charset=utf-8")
         );
         let body = String::from_utf8(resp.body).expect("utf8 body");
-        assert!(body.contains("Browser TUI Mirror"));
-        assert!(body.contains("/web-dashboard/state"));
+        assert!(body.contains("501 Not Implemented"));
+        assert!(body.contains("br-il53l"));
     }
 
     #[test]
-    fn web_dashboard_state_without_tui_returns_inactive_json() {
+    fn web_dashboard_state_returns_501_deferred() {
         let config = mcp_agent_mail_core::Config::default();
         let state = build_state(config);
         let req = make_request(Http1Method::Get, "/web-dashboard/state", &[]);
         let resp = block_on(state.handle(req));
-        assert_eq!(resp.status, 200);
-        assert_eq!(
-            response_header(&resp, "content-type"),
-            Some("application/json")
-        );
+        assert_eq!(resp.status, 501);
         let body: serde_json::Value =
-            serde_json::from_slice(&resp.body).expect("inactive state json");
-        assert_eq!(body["mode"], "inactive");
-        assert_eq!(body["reason"], "tui_inactive");
-        assert_eq!(body["poll_state"]["mode"], "snapshot");
+            serde_json::from_slice(&resp.body).expect("deferred json");
+        assert_eq!(body["error"], "not_implemented");
+        assert_eq!(body["tracker"], "br-il53l");
     }
 
     #[test]
-    fn web_dashboard_state_without_tui_uses_fallback_request_counters() {
-        let config = mcp_agent_mail_core::Config::default();
-        let state = build_state(config);
-
-        let req = make_request(Http1Method::Get, "/mail/api/locks", &[]);
-        let resp = block_on(state.handle(req));
-        assert_eq!(resp.status, 200);
-
-        let req = make_request(Http1Method::Get, "/web-dashboard/state", &[]);
-        let resp = block_on(state.handle(req));
-        let body: serde_json::Value =
-            serde_json::from_slice(&resp.body).expect("inactive state json");
-        assert_eq!(body["mode"], "inactive");
-        assert_eq!(body["poll_state"]["request_counters"]["total"], 1);
-        assert!(
-            body["poll_state"]["events"]
-                .as_array()
-                .is_some_and(|events| !events.is_empty()),
-            "fallback state should retain recent headless events"
-        );
-    }
-
-    #[test]
-    fn web_dashboard_state_with_live_tui_but_no_frame_returns_warming_json() {
-        let _guard = TUI_STATE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let config = mcp_agent_mail_core::Config::default();
-        let state = build_state(config.clone());
-        let shared = tui_bridge::TuiSharedState::new(&config);
-        set_tui_state_handle(None);
-        set_tui_state_handle(Some(Arc::clone(&shared)));
-
-        let req = make_request(Http1Method::Get, "/web-dashboard/state", &[]);
-        let resp = block_on(state.handle(req));
-        assert_eq!(resp.status, 200);
-        let body: serde_json::Value =
-            serde_json::from_slice(&resp.body).expect("warming state json");
-        assert_eq!(body["mode"], "warming");
-        assert_eq!(body["reason"], "tui_warming");
-
-        set_tui_state_handle(None);
-    }
-
-    #[test]
-    fn web_dashboard_input_without_tui_returns_inactive_json() {
+    fn web_dashboard_input_returns_501_deferred() {
         let config = mcp_agent_mail_core::Config::default();
         let state = build_state(config);
         let mut req = make_request(Http1Method::Post, "/web-dashboard/input", &[]);
         req.body = br#"{"type":"Input","data":{"kind":"Key","key":"j","modifiers":0}}"#.to_vec();
         let resp = block_on(state.handle(req));
-        assert_eq!(resp.status, 503);
+        assert_eq!(resp.status, 501);
         let body: serde_json::Value =
-            serde_json::from_slice(&resp.body).expect("inactive input json");
-        assert_eq!(body["status"], "inactive");
-        let detail = body["detail"].as_str().unwrap_or_default();
-        assert!(
-            detail.contains("Live TUI state is not active"),
-            "unexpected inactive input detail: {detail}"
-        );
+            serde_json::from_slice(&resp.body).expect("deferred json");
+        assert_eq!(body["error"], "not_implemented");
     }
 
     #[test]
-    fn mail_ws_input_enqueues_remote_terminal_events() {
-        let _guard = TUI_STATE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    fn mail_ws_input_post_returns_501_deferred() {
         let config = mcp_agent_mail_core::Config::default();
-        let state = build_state(config.clone());
-        let shared = tui_bridge::TuiSharedState::new(&config);
-        set_tui_state_handle(None);
-        set_tui_state_handle(Some(Arc::clone(&shared)));
-
+        let state = build_state(config);
         let mut req = make_request(Http1Method::Post, "/mail/ws-input", &[]);
-        req.body = br#"{
-            "events": [
-                {"type":"Input","data":{"kind":"Key","key":"k","modifiers":1}},
-                {"type":"Resize","data":{"cols":140,"rows":42}},
-                {"type":"Ping"}
-            ]
-        }"#
-        .to_vec();
-
+        req.body = br#"{"events": [{"type":"Ping"}]}"#.to_vec();
         let resp = block_on(state.handle(req));
-        assert_eq!(resp.status, 202);
-        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("accepted json");
-        assert_eq!(body["accepted"], 2);
-        assert_eq!(body["ignored"], 1);
-        assert_eq!(body["dropped_oldest"], 0);
-        assert_eq!(body["queue_dropped_oldest_total"], 0);
-        assert_eq!(body["queue_resize_coalesced_total"], 0);
-        assert_eq!(body["status"], "accepted");
-
-        let queued = shared.drain_remote_terminal_events(8);
-        assert_eq!(queued.len(), 2);
-        assert!(matches!(
-            queued[0],
-            tui_bridge::RemoteTerminalEvent::Key {
-                ref key,
-                modifiers: 1
-            } if key == "k"
-        ));
-        assert!(matches!(
-            queued[1],
-            tui_bridge::RemoteTerminalEvent::Resize {
-                cols: 140,
-                rows: 42
-            }
-        ));
-
-        set_tui_state_handle(None);
-    }
-
-    #[test]
-    fn mail_ws_input_coalesces_resize_bursts() {
-        let _guard = TUI_STATE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let config = mcp_agent_mail_core::Config::default();
-        let state = build_state(config.clone());
-        let shared = tui_bridge::TuiSharedState::new(&config);
-        set_tui_state_handle(None);
-        set_tui_state_handle(Some(Arc::clone(&shared)));
-
-        let mut req = make_request(Http1Method::Post, "/mail/ws-input", &[]);
-        req.body = br#"{
-            "events": [
-                {"type":"Resize","data":{"cols":120,"rows":40}},
-                {"type":"Resize","data":{"cols":121,"rows":41}},
-                {"type":"Resize","data":{"cols":122,"rows":42}}
-            ]
-        }"#
-        .to_vec();
-
-        let resp = block_on(state.handle(req));
-        assert_eq!(resp.status, 202);
-        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("accepted json");
-        assert_eq!(body["accepted"], 3);
-        assert_eq!(body["ignored"], 0);
-        assert_eq!(body["dropped_oldest"], 0);
-        assert_eq!(body["queue_depth"], 1);
-        assert_eq!(body["queue_dropped_oldest_total"], 0);
-        assert_eq!(body["queue_resize_coalesced_total"], 2);
-        assert_eq!(body["status"], "accepted");
-
-        let queued = shared.drain_remote_terminal_events(8);
-        assert_eq!(
-            queued,
-            vec![tui_bridge::RemoteTerminalEvent::Resize {
-                cols: 122,
-                rows: 42
-            }]
-        );
-        set_tui_state_handle(None);
+        assert_eq!(resp.status, 501);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("deferred json");
+        assert_eq!(body["error"], "not_implemented");
+        assert_eq!(body["tracker"], "br-il53l");
     }
 
     #[test]
@@ -16235,20 +16031,15 @@ first body
     }
 
     #[test]
-    fn http_post_ws_input_without_tui_returns_503() {
+    fn http_post_ws_input_returns_501_deferred() {
         let config = mcp_agent_mail_core::Config::default();
         let state = build_state(config);
         let mut req = make_request(Http1Method::Post, "/mail/ws-input", &[]);
         req.body = br#"{"type":"Input","data":{"kind":"Key","key":"j","modifiers":0}}"#.to_vec();
         let resp = block_on(state.handle(req));
-        // When TUI state is not active, /mail/ws-input returns 503.
-        assert_eq!(resp.status, 503);
-        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("json response");
-        let detail = body["detail"].as_str().unwrap_or_default();
-        assert!(
-            detail.contains("TUI state is not active"),
-            "unexpected 503 detail: {detail}"
-        );
+        assert_eq!(resp.status, 501);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).expect("deferred json");
+        assert_eq!(body["error"], "not_implemented");
     }
 
     #[test]
