@@ -6967,12 +6967,7 @@ fn atc_filtered_decisions(
             .filter(|action| atc_timestamp_matches_since(action.timestamp_micros, since_micros))
             .cloned()
             .collect();
-        let has_focus_match = focus_agent.is_some_and(|focus| {
-            fallback_actions
-                .iter()
-                .any(|action| action.agent.eq_ignore_ascii_case(focus))
-        });
-        if has_focus_match {
+        if focus_agent.is_some() {
             fallback_actions.retain(|action| {
                 focus_agent.is_some_and(|focus| action.agent.eq_ignore_ascii_case(focus))
             });
@@ -7018,12 +7013,7 @@ fn atc_filtered_decisions(
         .filter(|decision| atc_timestamp_matches_since(decision.timestamp_micros, since_micros))
         .cloned()
         .collect();
-    let has_focus_match = focus_agent.is_some_and(|focus| {
-        decisions
-            .iter()
-            .any(|decision| decision.subject.eq_ignore_ascii_case(focus))
-    });
-    if has_focus_match {
+    if focus_agent.is_some() {
         decisions.retain(|decision| {
             focus_agent.is_some_and(|focus| decision.subject.eq_ignore_ascii_case(focus))
         });
@@ -7054,12 +7044,7 @@ fn atc_execution_data(
         .filter(|execution| atc_timestamp_matches_since(execution.timestamp_micros, since_micros))
         .cloned()
         .collect();
-    let has_focus_match = focus_agent.is_some_and(|focus| {
-        executions
-            .iter()
-            .any(|execution| execution.agent.eq_ignore_ascii_case(focus))
-    });
-    if has_focus_match {
+    if focus_agent.is_some() {
         executions.retain(|execution| {
             focus_agent.is_some_and(|focus| execution.agent.eq_ignore_ascii_case(focus))
         });
@@ -7103,12 +7088,7 @@ fn atc_liveness_data(
     prefer_degraded: bool,
 ) -> Vec<AtcLivenessData> {
     let mut agents = snapshot.tracked_agents.clone();
-    let has_focus_match = focus_agent.is_some_and(|focus| {
-        agents
-            .iter()
-            .any(|agent| agent.name.eq_ignore_ascii_case(focus))
-    });
-    if has_focus_match {
+    if focus_agent.is_some() {
         agents.retain(|agent| {
             focus_agent.is_some_and(|focus| agent.name.eq_ignore_ascii_case(focus))
         });
@@ -9469,6 +9449,29 @@ mod tests {
             data.reservation_conflicts.is_empty(),
             "focused agent without conflicts should not inherit unrelated contention: {:?}",
             data.reservation_conflicts
+        );
+    }
+
+    #[test]
+    fn focused_atc_sections_hide_unrelated_rows_when_agent_has_no_matches() {
+        let snapshot = sample_atc_snapshot();
+
+        let decisions = atc_filtered_decisions(&snapshot, Some("GammaAgent"), None, None, 5);
+        assert!(
+            decisions.is_empty(),
+            "focused ATC decisions should not fall back to unrelated agents: {decisions:?}"
+        );
+
+        let executions = atc_execution_data(&snapshot, Some("GammaAgent"), None, 5);
+        assert!(
+            executions.is_empty(),
+            "focused ATC executions should not fall back to unrelated agents: {executions:?}"
+        );
+
+        let liveness = atc_liveness_data(&snapshot, Some("GammaAgent"), 5, true);
+        assert!(
+            liveness.is_empty(),
+            "focused ATC liveness should not fall back to unrelated agents: {liveness:?}"
         );
     }
 
