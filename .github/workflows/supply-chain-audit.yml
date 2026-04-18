@@ -1,0 +1,63 @@
+name: Supply Chain Audit
+
+on:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  supply-chain-audit:
+    name: cargo-audit + cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone sibling dependencies
+        run: |
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensearch ../frankensearch
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync ../asupersync
+          git clone --depth 1 https://github.com/Dicklesworthstone/sqlmodel_rust ../sqlmodel_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
+          git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install supply-chain tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install --locked cargo-audit cargo-deny
+
+      - name: Run cargo-audit baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Weekly audit lane stays green by pinning the known current baseline:
+          # - RUSTSEC-2023-0071: rsa timing advisory, no published fix yet
+          # - RUSTSEC-2026-0098 / 0099: rustls-webpki lockfile pin pending dependency refresh
+          cargo audit \
+            --ignore RUSTSEC-2023-0071 \
+            --ignore RUSTSEC-2026-0098 \
+            --ignore RUSTSEC-2026-0099
+
+      - name: Enforce cargo-deny async/runtime policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo deny check bans -c deny.toml --hide-inclusion-graph

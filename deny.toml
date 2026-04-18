@@ -1,0 +1,20 @@
+[graph]
+all-features = true
+
+[bans]
+multiple-versions = "allow"
+
+# Ratchet policy:
+# - This repo is asupersync-only and must not grow new tokio/reqwest/hyper/tower ingress.
+# - The current legacy chain is still present transitively via fastembed/hf-hub and
+#   beads_rust/self_update, so those wrappers are allowed temporarily.
+# - Any new path to these crates outside the listed wrappers fails CI immediately.
+deny = [
+  { crate = "tokio", wrappers = ["h2", "hyper", "hyper-rustls", "hyper-tls", "hyper-util", "reqwest", "tokio-native-tls", "tokio-rustls", "tokio-util", "tower"], reason = "Project policy is asupersync-only. Current legacy tokio ingress is tolerated only through the known reqwest/hyper chain until those upstream dependencies are removed." },
+  { crate = "reqwest", wrappers = ["hf-hub", "self_update"], reason = "Use asupersync::http::h1 for HTTP. Current reqwest ingress is tolerated only via fastembed/hf-hub and beads_rust/self_update until those are retired." },
+  { crate = "hyper", wrappers = ["reqwest", "self_update", "hyper-rustls", "hyper-tls", "hyper-util"], reason = "No new hyper-based runtime stack. Existing reqwest/self_update ingress is grandfathered temporarily." },
+  { crate = "tower", wrappers = ["reqwest", "tower-http"], reason = "No new tower adoption. Existing reqwest chain is tolerated temporarily." },
+  { crate = "axum", reason = "Project policy is asupersync-only; do not introduce axum." },
+  { crate = "async-std", reason = "Project policy is asupersync-only; do not introduce async-std." },
+  { crate = "smol", reason = "Project policy is asupersync-only; do not introduce smol." },
+]
