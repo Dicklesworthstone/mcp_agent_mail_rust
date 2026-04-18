@@ -210,7 +210,7 @@ VS16 (U+FE0F) variation selectors must be stripped before width calculation in `
 ## Testing Philosophy
 
 - **Real tests, no mocks** — All tests use real SQLite databases, real git repos, real file I/O
-- **Conformance testing** against Python fixtures — 23 tools, 23+ resources, byte-level output comparison
+- **Conformance testing** against Python fixtures — 37 tools, 25 resources, byte-level output comparison
 - **E2E test scripts** with detailed logging across all transports (stdio, HTTP, CLI)
 - **Stress tests** — Concurrent operations, pool exhaustion recovery, cache coherency under load
 - **Property tests** — Fuzzing for edge cases in parsing, validation, serialization

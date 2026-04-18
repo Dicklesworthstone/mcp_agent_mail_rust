@@ -244,12 +244,12 @@ scripts/e2e_cli.sh            # CLI integration (99 assertions)
 | `mcp-agent-mail-share` | Snapshot, scrub, bundle, crypto pipeline |
 | `mcp-agent-mail-server` | HTTP handler, dispatch, TUI widgets, property tests |
 | `mcp-agent-mail-cli` | 40+ CLI commands, dual-mode matrix |
-| `mcp-agent-mail-conformance` | Parity with Python reference (23 tools, 23+ resources) |
+| `mcp-agent-mail-conformance` | Parity with Python reference (34 Python-parity tools + 3 Rust-native, 25 resources) |
 | `tests/e2e/` | Cross-component E2E via stdio/HTTP transport |
 
 ### Test Fixtures
 
-Conformance tests use Python-generated fixtures in `tests/conformance/fixtures/` to ensure output format parity with the reference Python implementation across all 23 tools and 23+ resources.
+Conformance tests use Python-generated fixtures in `tests/conformance/fixtures/` to ensure output format parity with the reference Python implementation across 34 Python-parity tools and 25 resources (3 additional Rust-native tools are tested separately).
 
 ---
 

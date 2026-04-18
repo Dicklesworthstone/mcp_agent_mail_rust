@@ -151,11 +151,11 @@ Initial budgets (conservative; tighten after the first baseline run on CI-like h
 | medium | 5,000 | < 15ms | < 25ms |
 | large | 15,000 | < 50ms | < 80ms |
 
-## Search V3 Tantivy Lexical Budgets (br-2tnl.7.5)
+## Search V3 Frankensearch Lexical Budgets (br-2tnl.7.5)
 
 Deterministic harness implemented in `crates/mcp-agent-mail-db/benches/search_v3_bench.rs`.
-Seeds Tantivy indexes with synthetic documents and measures `TantivyBridge::search()` p50/p95/p99
-for a fixed query (`needle`, `limit=20`).
+Seeds frankensearch indexes (Tantivy is the lexical backend inside frankensearch) with synthetic
+documents and measures `TantivyBridge::search()` p50/p95/p99 for a fixed query (`needle`, `limit=20`).
 
 Artifacts are written under:
 - `tests/artifacts/bench/search_v3/<run_id>/summary.json`
@@ -177,8 +177,8 @@ Baseline (2026-02-18):
 | Scenario | Messages | Baseline p50 | Baseline p95 | Baseline p99 | Budget p95 | Budget p99 | Notes |
 |----------|----------|-------------|-------------|-------------|------------|------------|-------|
 | small | 1,000 | ~382µs | ~531µs | ~706µs | < 1.5ms | < 3ms | 6x under budget |
-| medium | 5,000 | ~622µs | ~800µs | ~1.1ms | < 5ms | < 10ms | Tantivy sub-ms even at 5K |
-| large | 15,000 | ~679µs | ~805µs | ~1.0ms | < 15ms | < 25ms | 18x under budget; Tantivy barely scales with corpus |
+| medium | 5,000 | ~622µs | ~800µs | ~1.1ms | < 5ms | < 10ms | Frankensearch lexical sub-ms even at 5K |
+| large | 15,000 | ~679µs | ~805µs | ~1.0ms | < 15ms | < 25ms | 18x under budget; lexical path barely scales with corpus |
 
 Index build throughput (baseline): 7.5K docs/sec (1K), 36K docs/sec (5K), 90K docs/sec (15K).
 Disk overhead: ~89-107 bytes/doc (amortized).

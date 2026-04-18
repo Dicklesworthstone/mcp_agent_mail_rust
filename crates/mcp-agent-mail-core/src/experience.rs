@@ -598,6 +598,41 @@ impl ExperienceRow {
         self.resolved_ts_micros
             .map(|r| r.saturating_sub(self.created_ts_micros))
     }
+
+    /// Validate structural invariants for the current state.
+    ///
+    /// Returns a list of violations. An empty vec means the row is valid.
+    ///
+    /// **State-to-required-fields mapping:**
+    /// - `Throttled | Suppressed | Skipped`: `non_execution_reason` SHOULD be set
+    /// - `Resolved`: `outcome` and `resolved_ts_micros` MUST be set
+    /// - `Censored | Expired`: `resolved_ts_micros` MUST be set
+    /// - All states: `posterior` MUST be non-empty
+    #[must_use]
+    pub fn validate(&self) -> Vec<&'static str> {
+        let mut issues = Vec::new();
+        if self.posterior.is_empty() {
+            issues.push("posterior vector must be non-empty");
+        }
+        if matches!(
+            self.state,
+            ExperienceState::Throttled | ExperienceState::Suppressed | ExperienceState::Skipped
+        ) && self.non_execution_reason.is_none()
+        {
+            issues.push("non_execution_reason should be set for throttled/suppressed/skipped");
+        }
+        if self.state == ExperienceState::Resolved && self.outcome.is_none() {
+            issues.push("outcome must be set for resolved state");
+        }
+        if matches!(
+            self.state,
+            ExperienceState::Resolved | ExperienceState::Censored | ExperienceState::Expired
+        ) && self.resolved_ts_micros.is_none()
+        {
+            issues.push("resolved_ts_micros must be set for resolved/censored/expired state");
+        }
+        issues
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1412,6 +1447,118 @@ mod tests {
         // FeatureVector should be <= 64 bytes
         let size = std::mem::size_of::<FeatureVector>();
         assert!(size <= 64, "FeatureVector is {size} bytes, budget is 64");
+    }
+
+    #[test]
+    fn feature_version_sealed() {
+        assert_eq!(
+            FEATURE_VERSION, 1,
+            "FEATURE_VERSION must remain 1 until a migration is committed"
+        );
+    }
+
+    #[test]
+    fn validate_resolved_without_outcome() {
+        let mut row = sample_row();
+        row.transition_to(ExperienceState::Dispatched).unwrap();
+        row.transition_to(ExperienceState::Executed).unwrap();
+        row.transition_to(ExperienceState::Open).unwrap();
+        // Force state without using resolve() to simulate corrupt data
+        row.state = ExperienceState::Resolved;
+        let issues = row.validate();
+        assert!(
+            issues.iter().any(|i| i.contains("outcome")),
+            "should flag missing outcome: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn validate_skipped_without_reason() {
+        let mut row = sample_row();
+        row.transition_to(ExperienceState::Dispatched).unwrap();
+        row.state = ExperienceState::Skipped;
+        let issues = row.validate();
+        assert!(
+            issues.iter().any(|i| i.contains("non_execution_reason")),
+            "should flag missing non_execution_reason: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn validate_clean_row_passes() {
+        let row = sample_row();
+        let issues = row.validate();
+        assert!(issues.is_empty(), "clean row should have no issues: {issues:?}");
+    }
+
+    #[test]
+    fn sealed_contract_all_types_roundtrip() {
+        // Every public type must survive JSON roundtrip
+        let row = sample_builder()
+            .project_key("/test")
+            .runner_up("DeclareAlive", 0.3)
+            .build(1, 1_000_000);
+        let json = serde_json::to_string(&row).unwrap();
+        let _: ExperienceRow = serde_json::from_str(&json).unwrap();
+
+        for state in [
+            ExperienceState::Planned,
+            ExperienceState::Dispatched,
+            ExperienceState::Executed,
+            ExperienceState::Failed,
+            ExperienceState::Throttled,
+            ExperienceState::Suppressed,
+            ExperienceState::Skipped,
+            ExperienceState::Open,
+            ExperienceState::Resolved,
+            ExperienceState::Censored,
+            ExperienceState::Expired,
+        ] {
+            let json = serde_json::to_string(&state).unwrap();
+            let decoded: ExperienceState = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, state);
+        }
+
+        for kind in [
+            EffectKind::Advisory,
+            EffectKind::Probe,
+            EffectKind::Release,
+            EffectKind::ForceReservation,
+            EffectKind::RoutingSuggestion,
+            EffectKind::Backpressure,
+            EffectKind::NoAction,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let decoded: EffectKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, kind);
+        }
+
+        for sub in [
+            ExperienceSubsystem::Liveness,
+            ExperienceSubsystem::Conflict,
+            ExperienceSubsystem::LoadRouting,
+            ExperienceSubsystem::Synthesis,
+            ExperienceSubsystem::Calibration,
+        ] {
+            let json = serde_json::to_string(&sub).unwrap();
+            let decoded: ExperienceSubsystem = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, sub);
+        }
+
+        let fv = FeatureVector::zeroed();
+        let json = serde_json::to_string(&fv).unwrap();
+        let _: FeatureVector = serde_json::from_str(&json).unwrap();
+
+        let outcome = ExperienceOutcome {
+            observed_ts_micros: 1000,
+            label: "ok".into(),
+            correct: true,
+            actual_loss: Some(0.5),
+            regret: Some(0.1),
+            evidence: None,
+        };
+        let json = serde_json::to_string(&outcome).unwrap();
+        let _: ExperienceOutcome = serde_json::from_str(&json).unwrap();
     }
 
     #[test]
