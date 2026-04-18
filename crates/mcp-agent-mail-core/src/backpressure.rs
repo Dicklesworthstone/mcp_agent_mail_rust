@@ -775,6 +775,7 @@ mod tests {
                 tui_spin_watchdog_last_trip_us: 0,
             },
             search: SearchMetricsSnapshot::default(),
+            atc: AtcMetricsSnapshot::default(),
             canary: CanaryMetricsSnapshot::default(),
         };
 

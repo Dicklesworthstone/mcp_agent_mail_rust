@@ -75,7 +75,9 @@
 
 #![allow(clippy::doc_markdown)]
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 use serde_json::Value;
 
 // ──────────────────────────────────────────────────────────────────────
@@ -671,8 +673,107 @@ impl ExperienceRow {
         {
             issues.push("resolved_ts_micros must be set for resolved/censored/expired state");
         }
+        if contains_secret(&self.evidence_summary) {
+            issues.push("evidence_summary contains a suspected secret");
+        }
+        if let Some(label) = self.outcome.as_ref().map(|o| &o.label) {
+            if contains_secret(label) {
+                issues.push("outcome.label contains a suspected secret");
+            }
+        }
+        if let Some(ctx) = &self.context {
+            let ctx_str = ctx.to_string();
+            if contains_secret(&ctx_str) {
+                issues.push("context contains a suspected secret");
+            }
+        }
+        if self.evidence_summary.len() > 256 {
+            issues.push("evidence_summary exceeds 256 chars");
+        }
+
         issues
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Secret detection for data-minimization enforcement
+// ──────────────────────────────────────────────────────────────────────
+
+static PEM_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"-----BEGIN [A-Z ]+-----").expect("PEM regex"));
+
+static JWT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.").expect("JWT regex"));
+
+/// Secret-detection prefixes and substrings.
+///
+/// Each entry is `(pattern, match_mode)` where match_mode indicates
+/// whether to use prefix or substring matching.
+const SECRET_PREFIXES: &[&str] = &[
+    "AKIA",            // AWS access key ID
+    "ASIA",            // AWS temporary access key
+    "ghp_",            // GitHub personal access token
+    "gho_",            // GitHub OAuth token
+    "ghu_",            // GitHub user-to-server token
+    "ghs_",            // GitHub server-to-server token
+    "ghr_",            // GitHub refresh token
+    "github_pat_",     // GitHub fine-grained PAT
+    "xoxb-",           // Slack bot token
+    "xoxp-",           // Slack user token
+    "xoxs-",           // Slack session token
+    "xoxa-",           // Slack app token
+    "sk-",             // OpenAI / Anthropic API key
+    "sk-ant-",         // Anthropic API key
+    "Bearer ",         // Authorization bearer tokens
+    "token ",          // Generic token prefix
+    "glpat-",          // GitLab personal access token
+    "npm_",            // npm access token
+    "pypi-AgEIcHlwaS5",// PyPI token
+];
+
+const SECRET_SUBSTRINGS: &[&str] = &[
+    "-----BEGIN",
+    "AWS_SECRET_ACCESS_KEY",
+    "PRIVATE KEY",
+    "PASSWORD=",
+    "SECRET=",
+    "API_KEY=",
+    "APIKEY=",
+];
+
+/// Returns `true` if the input string likely contains a secret or credential.
+///
+/// Used by `ExperienceRow::validate()` to enforce the data-minimization
+/// policy (SPEC-atc-privacy-policy §Category D). ATC stores metrics,
+/// not content — raw secrets must never enter the experience pipeline.
+#[must_use]
+pub fn contains_secret(input: &str) -> bool {
+    if input.len() < 4 {
+        return false;
+    }
+
+    for prefix in SECRET_PREFIXES {
+        if input.contains(prefix) {
+            return true;
+        }
+    }
+
+    let upper = input.to_uppercase();
+    for substr in SECRET_SUBSTRINGS {
+        if upper.contains(substr) {
+            return true;
+        }
+    }
+
+    if PEM_RE.is_match(input) {
+        return true;
+    }
+
+    if JWT_RE.is_match(input) {
+        return true;
+    }
+
+    false
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -1817,5 +1918,120 @@ mod tests {
             .build(1, Utc::now().timestamp_micros());
         assert!(row.features.is_some());
         assert_eq!(row.features.unwrap().posterior_alive_bp, 9500);
+    }
+
+    // ── Secret detection tests ──────────────────────────────────────
+
+    #[test]
+    fn detects_aws_access_key() {
+        assert!(contains_secret("AKIAIOSFODNN7EXAMPLE"));
+        assert!(contains_secret("key is ASIAIOSFODNN7EXAMPLE here"));
+    }
+
+    #[test]
+    fn detects_github_pat() {
+        assert!(contains_secret("ghp_ABCDEFghijklmnop1234567890abcdef"));
+        assert!(contains_secret("github_pat_11ABCDEF0123456789_abcdef"));
+    }
+
+    #[test]
+    fn detects_slack_token() {
+        assert!(contains_secret("xoxb-123456789-abcdefgh"));
+        assert!(contains_secret("xoxp-123456789-abcdefgh"));
+    }
+
+    #[test]
+    fn detects_bearer_token() {
+        assert!(contains_secret("Bearer eyJhbGciOiJIUzI1NiJ9.abc.def"));
+    }
+
+    #[test]
+    fn detects_jwt() {
+        assert!(contains_secret(
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjg"
+        ));
+    }
+
+    #[test]
+    fn detects_pem_block() {
+        assert!(contains_secret("-----BEGIN RSA PRIVATE KEY-----\nMIIE..."));
+        assert!(contains_secret("-----BEGIN CERTIFICATE-----\nMIID..."));
+    }
+
+    #[test]
+    fn detects_openai_anthropic_key() {
+        assert!(contains_secret("sk-proj-abcdefghijklmnop"));
+        assert!(contains_secret("sk-ant-api03-abcdefg"));
+    }
+
+    #[test]
+    fn detects_secret_substrings() {
+        assert!(contains_secret("AWS_SECRET_ACCESS_KEY=wJalrXUtnFE"));
+        assert!(contains_secret("export PRIVATE KEY here"));
+        assert!(contains_secret("password=hunter2"));
+        assert!(contains_secret("api_key=abc123def456"));
+    }
+
+    #[test]
+    fn clean_strings_pass() {
+        assert!(!contains_secret("agent_responded_within_window"));
+        assert!(!contains_secret("probe_sent: latency=1800ms"));
+        assert!(!contains_secret("calibration_healthy: true"));
+        assert!(!contains_secret("budget_exhausted: probe_budget at 0.95"));
+        assert!(!contains_secret(""));
+        assert!(!contains_secret("ab"));
+    }
+
+    #[test]
+    fn validate_rejects_secret_in_evidence_summary() {
+        let mut row = sample_builder().build(1, 1_000_000);
+        row.evidence_summary = "key is AKIAIOSFODNN7EXAMPLE".to_string();
+        let issues = row.validate();
+        assert!(issues.iter().any(|i| i.contains("evidence_summary")));
+    }
+
+    #[test]
+    fn validate_rejects_secret_in_outcome_label() {
+        let mut row = sample_builder().build(1, 1_000_000);
+        row.state = ExperienceState::Resolved;
+        row.resolved_ts_micros = Some(2_000_000);
+        row.outcome = Some(ExperienceOutcome {
+            observed_ts_micros: 2_000_000,
+            label: "Bearer eyJhbGciOiJIUzI1NiJ9.sub.sig".to_string(),
+            correct: true,
+            actual_loss: None,
+            regret: None,
+            evidence: None,
+        });
+        let issues = row.validate();
+        assert!(issues.iter().any(|i| i.contains("outcome.label")));
+    }
+
+    #[test]
+    fn validate_rejects_secret_in_context() {
+        let mut row = sample_builder().build(1, 1_000_000);
+        row.context = Some(serde_json::json!({
+            "debug": "password=hunter2"
+        }));
+        let issues = row.validate();
+        assert!(issues.iter().any(|i| i.contains("context")));
+    }
+
+    #[test]
+    fn validate_rejects_long_evidence_summary() {
+        let mut row = sample_builder().build(1, 1_000_000);
+        row.evidence_summary = "x".repeat(257);
+        let issues = row.validate();
+        assert!(issues.iter().any(|i| i.contains("256 chars")));
+    }
+
+    #[test]
+    fn validate_clean_row_no_secret_issues() {
+        let row = sample_builder().build(1, 1_000_000);
+        let issues = row.validate();
+        assert!(
+            !issues.iter().any(|i| i.contains("secret")),
+            "clean row should have no secret issues: {issues:?}"
+        );
     }
 }
