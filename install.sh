@@ -3411,21 +3411,17 @@ setup_claude_code_mcp_via_cli() {
   local desired_url
   desired_url="$(desired_mcp_http_url)"
 
-  # `claude mcp list` exits non-zero if the config is uninitialized on first
-  # run; treat both "missing" and "absent" the same — we'll add.
-  local list_output=""
-  list_output="$(claude mcp list 2>/dev/null || true)"
-
-  # If an entry already exists but points at a different URL or is missing the
-  # Authorization header the current bearer token expects, re-register to keep
-  # the client in sync with the server we just installed.
-  if printf '%s\n' "$list_output" | grep -qE '^[[:space:]]*mcp-agent-mail[:[:space:]]'; then
-    # Best-effort: remove first so the re-add takes effect. `claude mcp remove`
-    # is idempotent and non-fatal if the entry is already gone.
-    claude mcp remove mcp-agent-mail --scope user >/dev/null 2>&1 \
-      || claude mcp remove mcp-agent-mail >/dev/null 2>&1 \
-      || true
-  fi
+  # Best-effort remove first so the add always takes effect with the current
+  # URL + Authorization header. Skipping remove and relying on `add` to update
+  # an existing entry doesn't work — `claude mcp add` refuses to overwrite an
+  # existing name on most `claude` versions, and gating remove on a regex
+  # match against `claude mcp list` output makes us fragile to any future
+  # change to that CLI's listing format. `claude mcp remove` is a no-op when
+  # the entry is absent, so the unconditional call is safe on first install
+  # too; both `|| true` fallbacks swallow the expected non-zero exit code.
+  claude mcp remove mcp-agent-mail --scope user >/dev/null 2>&1 \
+    || claude mcp remove mcp-agent-mail >/dev/null 2>&1 \
+    || true
 
   local -a add_args=(mcp add --scope user --transport http mcp-agent-mail "$desired_url")
   if [ -n "$bearer_token" ]; then

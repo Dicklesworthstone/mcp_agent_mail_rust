@@ -9081,25 +9081,24 @@ impl HttpState {
                     self.config.storage_root.as_path(),
                 ) {
                     Some(durability) => {
+                        use mcp_agent_mail_db::DurabilityState;
                         body["durability_state"] = serde_json::json!(durability.to_string());
-                        if matches!(
-                            durability,
-                            mcp_agent_mail_db::DurabilityState::Corrupt
-                                | mcp_agent_mail_db::DurabilityState::Recovering
-                        ) {
-                            body["status"] = serde_json::json!("degraded");
-                            503
-                        } else if matches!(
-                            durability,
-                            mcp_agent_mail_db::DurabilityState::DegradedReadOnly
-                        ) {
-                            // Reads still work; keep 200 but signal the
-                            // degraded state in the body so callers can
-                            // opt into strict behavior.
-                            body["status"] = serde_json::json!("ready_degraded");
-                            200
-                        } else {
-                            200
+                        // Exhaustive match so a future DurabilityState variant
+                        // addition is a compile error rather than silently
+                        // falling through to 200.
+                        match durability {
+                            DurabilityState::Healthy => 200,
+                            DurabilityState::DegradedReadOnly => {
+                                // Reads still work; keep 200 but signal the
+                                // degraded state in the body so callers can
+                                // opt into strict behavior.
+                                body["status"] = serde_json::json!("ready_degraded");
+                                200
+                            }
+                            DurabilityState::Recovering | DurabilityState::Corrupt => {
+                                body["status"] = serde_json::json!("degraded");
+                                503
+                            }
                         }
                     }
                     None => 200,
@@ -13385,10 +13384,10 @@ fn log_active_database(config: &mcp_agent_mail_core::Config) {
 /// corresponding fields are set to `null` rather than degrading the overall
 /// readiness signal.
 /// Fast-path mailbox-verdict probe used by `/health` and
-/// `/health/durability` (#94). Returns `None` for :memory: DBs (where there
-/// is no file to probe) or when the verdict engine itself panics; both cases
-/// are indistinguishable from "healthy" from the supervisor's point of view,
-/// so we don't flip status code on them.
+/// `/health/durability` (#94). Returns `None` for :memory: DBs — those
+/// have no on-disk state the verdict engine can meaningfully inspect,
+/// so the readiness check is the only health signal. Any durability
+/// state for file-backed DBs is returned as `Some(state)`.
 fn probe_runtime_durability_state(
     database_url: &str,
     storage_root: &Path,
