@@ -36,6 +36,32 @@ fn cache_scope_for_pool(pool: &DbPool) -> String {
 }
 
 // =============================================================================
+// ATC Leader Lease types
+// =============================================================================
+
+/// Result of attempting to acquire the ATC leader lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseOutcome {
+    /// This instance now holds the leader lease.
+    Acquired,
+    /// Another instance holds a non-expired lease.
+    NotLeader {
+        /// Instance ID of the current leader.
+        holder: String,
+        /// When the current lease expires (microseconds since epoch).
+        expires_at_micros: i64,
+    },
+}
+
+impl LeaseOutcome {
+    /// Whether this instance acquired or retained the lease.
+    #[must_use]
+    pub const fn is_leader(&self) -> bool {
+        matches!(self, Self::Acquired)
+    }
+}
+
+// =============================================================================
 // Tracked query wrappers
 // =============================================================================
 
@@ -817,6 +843,8 @@ const REQUIRED_ATC_EXPERIENCE_COLUMNS: &[&str] = &[
     "executed_ts",
     "resolved_ts",
     "context_json",
+    "contained_suspected_secret",
+    "privacy_classification",
 ];
 
 const REQUIRED_ATC_ROLLUP_COLUMNS: &[&str] = &[
@@ -838,6 +866,30 @@ const REQUIRED_ATC_ROLLUP_COLUMNS: &[&str] = &[
     "delay_count",
     "delay_max_micros",
     "last_updated_ts",
+];
+
+const REQUIRED_ATC_AUXILIARY_TABLES: &[(&str, &[&str])] = &[
+    (
+        "atc_leader_lease",
+        &[
+            "lease_slot",
+            "instance_id",
+            "acquired_at",
+            "renewed_at",
+            "ttl_micros",
+        ],
+    ),
+    (
+        "atc_rollup_snapshots",
+        &[
+            "snapshot_id",
+            "captured_ts",
+            "archive_relpath",
+            "rollup_rows",
+            "payload_sha256",
+            "restored_ts",
+        ],
+    ),
 ];
 
 fn build_recent_contact_union_sql_with_placeholders(placeholders: &str) -> String {
@@ -923,6 +975,23 @@ fn inspect_canonical_atc_schema(pool: &DbPool) -> std::result::Result<Vec<String
             for column in REQUIRED_ATC_ROLLUP_COLUMNS {
                 if !rollup_columns.contains(*column) {
                     missing.push(format!("atc_experience_rollups.{column}"));
+                }
+            }
+        }
+
+        for (table_name, required_columns) in REQUIRED_ATC_AUXILIARY_TABLES {
+            let columns = canonical_table_columns(
+                &conn,
+                table_name,
+                "inspect canonical ATC auxiliary columns",
+            )?;
+            if columns.is_empty() {
+                missing.push(format!("table {table_name}"));
+                continue;
+            }
+            for column in *required_columns {
+                if !columns.contains(*column) {
+                    missing.push(format!("{table_name}.{column}"));
                 }
             }
         }
@@ -1768,19 +1837,17 @@ fn resolve_experience_file_backed(
     let result = (|| {
         begin_canonical_atc_write_tx(&conn)?;
 
-        let select_sql =
-            "SELECT state FROM atc_experiences WHERE experience_id = ? LIMIT 1";
+        let select_sql = "SELECT state FROM atc_experiences WHERE experience_id = ? LIMIT 1";
         let rows = canonical_query_atc_rows(
             &conn,
             select_sql,
             &[Value::BigInt(id)],
             "resolve_experience select",
         )?;
-        let row = rows.first().ok_or_else(|| {
-            DbError::not_found("experience", experience_id.to_string())
-        })?;
-        let current_state: ExperienceState =
-            parse_enum(row_text(row, 0, "state")?, "state")?;
+        let row = rows
+            .first()
+            .ok_or_else(|| DbError::not_found("experience", experience_id.to_string()))?;
+        let current_state: ExperienceState = parse_enum(row_text(row, 0, "state")?, "state")?;
         let target = resolution.target_state();
 
         if current_state == target {
@@ -1798,9 +1865,7 @@ fn resolve_experience_file_backed(
         if current_state != ExperienceState::Open {
             return Err(DbError::invalid(
                 "state",
-                format!(
-                    "experience {experience_id} is {current_state}, must be open to resolve"
-                ),
+                format!("experience {experience_id} is {current_state}, must be open to resolve"),
             ));
         }
 
@@ -2019,6 +2084,153 @@ fn fetch_atc_rollups_file_backed(pool: &DbPool) -> std::result::Result<Vec<AtcRo
         Ok(results)
     })();
     close_canonical_db_conn(conn, "canonical ATC rollups fetch connection");
+    result
+}
+
+// ── File-backed ATC leader lease ────────────────────────────────────────
+
+fn try_acquire_atc_leader_lease_file_backed(
+    pool: &DbPool,
+    instance_id: &str,
+    now_micros: i64,
+    ttl_micros: i64,
+) -> std::result::Result<LeaseOutcome, DbError> {
+    let conn = open_canonical_atc_conn(pool, "try_acquire_atc_leader_lease")?;
+    let result = (|| {
+        begin_canonical_atc_write_tx(&conn)?;
+
+        let rows = canonical_query_atc_rows(
+            &conn,
+            "SELECT instance_id, renewed_at, ttl_micros FROM atc_leader_lease WHERE lease_slot = 1",
+            &[],
+            "leader_lease select",
+        )?;
+
+        if let Some(row) = rows.first() {
+            let holder = row_text(row, 0, "instance_id")?;
+            let renewed = row.get(1).and_then(value_as_i64).unwrap_or(0);
+            let ttl = row.get(2).and_then(value_as_i64).unwrap_or(0);
+
+            if holder == instance_id {
+                canonical_execute_atc(
+                    &conn,
+                    "UPDATE atc_leader_lease SET renewed_at = ?, ttl_micros = ? WHERE lease_slot = 1",
+                    &[Value::BigInt(now_micros), Value::BigInt(ttl_micros)],
+                    "leader_lease renew own",
+                )?;
+                commit_canonical_atc_write_tx(&conn)?;
+                return Ok(LeaseOutcome::Acquired);
+            }
+
+            let expires_at = renewed.saturating_add(ttl);
+            if now_micros >= expires_at {
+                canonical_execute_atc(
+                    &conn,
+                    "UPDATE atc_leader_lease SET instance_id = ?, acquired_at = ?, renewed_at = ?, ttl_micros = ? WHERE lease_slot = 1",
+                    &[
+                        Value::Text(instance_id.to_string()),
+                        Value::BigInt(now_micros),
+                        Value::BigInt(now_micros),
+                        Value::BigInt(ttl_micros),
+                    ],
+                    "leader_lease steal expired",
+                )?;
+                commit_canonical_atc_write_tx(&conn)?;
+                return Ok(LeaseOutcome::Acquired);
+            }
+
+            commit_canonical_atc_write_tx(&conn)?;
+            return Ok(LeaseOutcome::NotLeader {
+                holder,
+                expires_at_micros: expires_at,
+            });
+        }
+
+        canonical_execute_atc(
+            &conn,
+            "INSERT INTO atc_leader_lease (lease_slot, instance_id, acquired_at, renewed_at, ttl_micros) \
+             VALUES (1, ?, ?, ?, ?)",
+            &[
+                Value::Text(instance_id.to_string()),
+                Value::BigInt(now_micros),
+                Value::BigInt(now_micros),
+                Value::BigInt(ttl_micros),
+            ],
+            "leader_lease insert",
+        )?;
+        commit_canonical_atc_write_tx(&conn)?;
+        Ok(LeaseOutcome::Acquired)
+    })();
+    if result.is_err() {
+        rollback_canonical_atc_write_tx(&conn);
+    }
+    close_canonical_db_conn(conn, "canonical ATC leader lease connection");
+    result
+}
+
+fn renew_atc_leader_lease_file_backed(
+    pool: &DbPool,
+    instance_id: &str,
+    now_micros: i64,
+    ttl_micros: i64,
+) -> std::result::Result<bool, DbError> {
+    let conn = open_canonical_atc_conn(pool, "renew_atc_leader_lease")?;
+    let result = (|| {
+        begin_canonical_atc_write_tx(&conn)?;
+        let rows = canonical_query_atc_rows(
+            &conn,
+            "SELECT instance_id FROM atc_leader_lease WHERE lease_slot = 1",
+            &[],
+            "leader_lease renew select",
+        )?;
+        let is_ours = rows
+            .first()
+            .and_then(|r| r.get(0))
+            .is_some_and(|v| matches!(v, Value::Text(s) if s == instance_id));
+        if !is_ours {
+            commit_canonical_atc_write_tx(&conn)?;
+            return Ok(false);
+        }
+        canonical_execute_atc(
+            &conn,
+            "UPDATE atc_leader_lease SET renewed_at = ?, ttl_micros = ? WHERE lease_slot = 1 AND instance_id = ?",
+            &[
+                Value::BigInt(now_micros),
+                Value::BigInt(ttl_micros),
+                Value::Text(instance_id.to_string()),
+            ],
+            "leader_lease renew update",
+        )?;
+        commit_canonical_atc_write_tx(&conn)?;
+        Ok(true)
+    })();
+    if result.is_err() {
+        rollback_canonical_atc_write_tx(&conn);
+    }
+    close_canonical_db_conn(conn, "canonical ATC leader lease renew connection");
+    result
+}
+
+fn release_atc_leader_lease_file_backed(
+    pool: &DbPool,
+    instance_id: &str,
+) -> std::result::Result<bool, DbError> {
+    let conn = open_canonical_atc_conn(pool, "release_atc_leader_lease")?;
+    let result = (|| {
+        begin_canonical_atc_write_tx(&conn)?;
+        canonical_execute_atc(
+            &conn,
+            "DELETE FROM atc_leader_lease WHERE lease_slot = 1 AND instance_id = ?",
+            &[Value::Text(instance_id.to_string())],
+            "leader_lease release",
+        )?;
+        commit_canonical_atc_write_tx(&conn)?;
+        Ok(true)
+    })();
+    if result.is_err() {
+        rollback_canonical_atc_write_tx(&conn);
+    }
+    close_canonical_db_conn(conn, "canonical ATC leader lease release connection");
     result
 }
 
@@ -5739,7 +5951,7 @@ pub async fn search_messages_for_product(
                     Err(_) => match row.get(1) {
                         Some(v) => value_as_i64(v).unwrap_or(0),
                         None => 0,
-                    }
+                    },
                 };
                 let subject: String = match row.get_named("subject") {
                     Ok(v) => v,
@@ -5754,7 +5966,7 @@ pub async fn search_messages_for_product(
                     Err(_) => match row.get_by_name("ack_required") {
                         Some(v) => value_as_i64(v).unwrap_or(0),
                         None => 0,
-                    }
+                    },
                 };
                 let created_ts: i64 = match row.get_named("created_ts") {
                     Ok(v) => v,
@@ -5765,9 +5977,9 @@ pub async fn search_messages_for_product(
                             Err(_) => match row.get(5) {
                                 Some(val) => value_as_i64(val).unwrap_or(0),
                                 None => 0,
-                            }
-                        }
-                    }
+                            },
+                        },
+                    },
                 };
                 let thread_id: Option<String> = match row.get_named("thread_id") {
                     Ok(v) => v,
@@ -5783,7 +5995,7 @@ pub async fn search_messages_for_product(
                     Err(_) => match row.get(9) {
                         Some(v) => value_as_i64(v).unwrap_or(0),
                         None => 0,
-                    }
+                    },
                 };
 
                 out.push(SearchRowWithProject {
@@ -10083,19 +10295,15 @@ pub async fn resolve_experience(
     let row = match rows.first() {
         Some(r) => r,
         None => {
-            return Outcome::Err(DbError::not_found(
-                "experience",
-                experience_id.to_string(),
-            ));
+            return Outcome::Err(DbError::not_found("experience", experience_id.to_string()));
         }
     };
 
-    let current_state: ExperienceState = match row_text(row, 0, "state")
-        .and_then(|raw| parse_enum(raw, "state"))
-    {
-        Ok(s) => s,
-        Err(e) => return Outcome::Err(e),
-    };
+    let current_state: ExperienceState =
+        match row_text(row, 0, "state").and_then(|raw| parse_enum(raw, "state")) {
+            Ok(s) => s,
+            Err(e) => return Outcome::Err(e),
+        };
 
     let target = resolution.target_state();
 
@@ -10114,9 +10322,7 @@ pub async fn resolve_experience(
     if current_state != ExperienceState::Open {
         return Outcome::Err(DbError::invalid(
             "state",
-            format!(
-                "experience {experience_id} is {current_state}, must be open to resolve"
-            ),
+            format!("experience {experience_id} is {current_state}, must be open to resolve"),
         ));
     }
 
@@ -10409,6 +10615,269 @@ pub async fn fetch_atc_rollups(cx: &Cx, pool: &DbPool) -> Outcome<Vec<AtcRollupR
     }
 
     Outcome::Ok(results)
+}
+
+// =============================================================================
+// ATC Leader Lease — public API
+// =============================================================================
+
+/// Attempt to acquire the singleton ATC leader lease.
+///
+/// Leader election for multi-process ATC coordination. Only the leader
+/// instance runs tick-driven operations (experience sweeps, rollup
+/// refreshes, retention purges). Followers skip these to avoid conflicts.
+///
+/// **Semantics:**
+/// - If no lease exists: inserts one, returns `Acquired`.
+/// - If this instance already holds it: renews, returns `Acquired`.
+/// - If another instance holds an expired lease: steals it, returns `Acquired`.
+/// - If another instance holds a live lease: returns `NotLeader`.
+///
+/// Callers should retry on a timer (e.g., every `ttl_micros / 3`).
+pub async fn try_acquire_atc_leader_lease(
+    cx: &Cx,
+    pool: &DbPool,
+    instance_id: &str,
+    now_micros: i64,
+    ttl_micros: i64,
+) -> Outcome<LeaseOutcome, DbError> {
+    if pool.sqlite_path() != ":memory:" {
+        match ensure_file_backed_atc_pool_initialized(cx, pool).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+        return match try_acquire_atc_leader_lease_file_backed(
+            pool,
+            instance_id,
+            now_micros,
+            ttl_micros,
+        ) {
+            Ok(outcome) => Outcome::Ok(outcome),
+            Err(error) => Outcome::Err(error),
+        };
+    }
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+
+    let rows = match traw_query(
+        cx,
+        &tracked,
+        "SELECT instance_id, renewed_at, ttl_micros FROM atc_leader_lease WHERE lease_slot = 1",
+        &[],
+    )
+    .await
+    {
+        Outcome::Ok(r) => r,
+        Outcome::Err(error) => {
+            return Outcome::Err(DbError::Internal(format!(
+                "leader_lease select failed: {error}"
+            )));
+        }
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    if let Some(row) = rows.first() {
+        let holder = match row_text(row, 0, "instance_id") {
+            Ok(s) => s,
+            Err(e) => return Outcome::Err(e),
+        };
+        let renewed = row.get(1).and_then(value_as_i64).unwrap_or(0);
+        let ttl = row.get(2).and_then(value_as_i64).unwrap_or(0);
+
+        if holder == instance_id {
+            return match traw_execute(
+                cx,
+                &tracked,
+                "UPDATE atc_leader_lease SET renewed_at = ?, ttl_micros = ? WHERE lease_slot = 1",
+                &[Value::BigInt(now_micros), Value::BigInt(ttl_micros)],
+            )
+            .await
+            {
+                Outcome::Ok(_) => Outcome::Ok(LeaseOutcome::Acquired),
+                Outcome::Err(e) => {
+                    Outcome::Err(DbError::Internal(format!("leader_lease renew: {e}")))
+                }
+                Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                Outcome::Panicked(p) => Outcome::Panicked(p),
+            };
+        }
+
+        let expires_at = renewed.saturating_add(ttl);
+        if now_micros >= expires_at {
+            return match traw_execute(
+                cx,
+                &tracked,
+                "UPDATE atc_leader_lease SET instance_id = ?, acquired_at = ?, renewed_at = ?, ttl_micros = ? WHERE lease_slot = 1",
+                &[
+                    Value::Text(instance_id.to_string()),
+                    Value::BigInt(now_micros),
+                    Value::BigInt(now_micros),
+                    Value::BigInt(ttl_micros),
+                ],
+            )
+            .await
+            {
+                Outcome::Ok(_) => Outcome::Ok(LeaseOutcome::Acquired),
+                Outcome::Err(e) => Outcome::Err(DbError::Internal(format!("leader_lease steal: {e}"))),
+                Outcome::Cancelled(r) => Outcome::Cancelled(r),
+                Outcome::Panicked(p) => Outcome::Panicked(p),
+            };
+        }
+
+        return Outcome::Ok(LeaseOutcome::NotLeader {
+            holder,
+            expires_at_micros: expires_at,
+        });
+    }
+
+    match traw_execute(
+        cx,
+        &tracked,
+        "INSERT INTO atc_leader_lease (lease_slot, instance_id, acquired_at, renewed_at, ttl_micros) \
+         VALUES (1, ?, ?, ?, ?)",
+        &[
+            Value::Text(instance_id.to_string()),
+            Value::BigInt(now_micros),
+            Value::BigInt(now_micros),
+            Value::BigInt(ttl_micros),
+        ],
+    )
+    .await
+    {
+        Outcome::Ok(_) => Outcome::Ok(LeaseOutcome::Acquired),
+        Outcome::Err(e) => Outcome::Err(DbError::Internal(format!("leader_lease insert: {e}"))),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Renew the ATC leader lease if this instance still holds it.
+///
+/// Returns `true` if the lease was renewed, `false` if this instance
+/// is no longer the leader (another instance stole the lease).
+pub async fn renew_atc_leader_lease(
+    cx: &Cx,
+    pool: &DbPool,
+    instance_id: &str,
+    now_micros: i64,
+    ttl_micros: i64,
+) -> Outcome<bool, DbError> {
+    if pool.sqlite_path() != ":memory:" {
+        match ensure_file_backed_atc_pool_initialized(cx, pool).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+        return match renew_atc_leader_lease_file_backed(pool, instance_id, now_micros, ttl_micros) {
+            Ok(renewed) => Outcome::Ok(renewed),
+            Err(error) => Outcome::Err(error),
+        };
+    }
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+
+    let rows = match traw_query(
+        cx,
+        &tracked,
+        "SELECT instance_id FROM atc_leader_lease WHERE lease_slot = 1",
+        &[],
+    )
+    .await
+    {
+        Outcome::Ok(r) => r,
+        Outcome::Err(e) => {
+            return Outcome::Err(DbError::Internal(format!("leader_lease renew select: {e}")));
+        }
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let is_ours = rows
+        .first()
+        .and_then(|r| r.get(0))
+        .is_some_and(|v| matches!(v, Value::Text(s) if s == instance_id));
+
+    if !is_ours {
+        return Outcome::Ok(false);
+    }
+
+    match traw_execute(
+        cx,
+        &tracked,
+        "UPDATE atc_leader_lease SET renewed_at = ?, ttl_micros = ? \
+         WHERE lease_slot = 1 AND instance_id = ?",
+        &[
+            Value::BigInt(now_micros),
+            Value::BigInt(ttl_micros),
+            Value::Text(instance_id.to_string()),
+        ],
+    )
+    .await
+    {
+        Outcome::Ok(_) => Outcome::Ok(true),
+        Outcome::Err(e) => Outcome::Err(DbError::Internal(format!("leader_lease renew: {e}"))),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+/// Release the ATC leader lease. No-op if this instance is not the leader.
+pub async fn release_atc_leader_lease(
+    cx: &Cx,
+    pool: &DbPool,
+    instance_id: &str,
+) -> Outcome<bool, DbError> {
+    if pool.sqlite_path() != ":memory:" {
+        match ensure_file_backed_atc_pool_initialized(cx, pool).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(e) => return Outcome::Err(e),
+            Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+            Outcome::Panicked(p) => return Outcome::Panicked(p),
+        }
+        return match release_atc_leader_lease_file_backed(pool, instance_id) {
+            Ok(released) => Outcome::Ok(released),
+            Err(error) => Outcome::Err(error),
+        };
+    }
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+
+    match traw_execute(
+        cx,
+        &tracked,
+        "DELETE FROM atc_leader_lease WHERE lease_slot = 1 AND instance_id = ?",
+        &[Value::Text(instance_id.to_string())],
+    )
+    .await
+    {
+        Outcome::Ok(_) => Outcome::Ok(true),
+        Outcome::Err(e) => Outcome::Err(DbError::Internal(format!("leader_lease release: {e}"))),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
 }
 
 // =============================================================================
