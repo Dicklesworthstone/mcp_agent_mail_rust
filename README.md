@@ -961,9 +961,9 @@ $STORAGE_ROOT/                              # e.g. ~/.local/share/mcp-agent-mail
 
 ## ATC Learning Implementation Map
 
-> **Architecture phase — not yet learning from live traffic.**
+> **Validated ATC learning loop — rollout remains gated by write mode.**
 >
-> The ATC decision engine, policy scaffolding, schema (v16 `atc_experiences` / `atc_experience_rollups`), and 20+ core modules exist and are tested. However, the hot-path experience write pipeline (`atc_note_*` → DB insert) and outcome resolution loop are not yet wired to live traffic. The `AM_ATC_WRITE_MODE` env var (off/shadow/live) gates this pipeline; default is `off`. Until `br-bn0vb` (ATC Learning Loop Closure) lands its Seam 6 validation, ATC operates on in-memory heuristics only — no durable learning, no cross-session memory, no production feedback calibration. Treat everything below as the implementation blueprint, not a description of current runtime behavior.
+> ATC now has a durable live-learning path: hot-path `atc_note_*` hooks append experience rows, real runtime signals resolve outcomes, rollups/retention/replay are implemented, and robot/TUI surfaces consume the shared live operator snapshot. `AM_ATC_WRITE_MODE` still gates rollout (`off` default, `shadow` for observation, `live` for durable writes), so broader promotion remains operator-controlled rather than always-on. Treat the map below as the current ownership contract and rollout/hardening guide, not as a future-only blueprint.
 
 The `br-0qt6e` ATC learning work is intentionally cross-cutting, but it should not be cross-owned. The codebase already has the right seams; future implementation should deepen those seams instead of spreading ATC state across tools, UI layers, or ad-hoc SQL in random crates.
 
@@ -982,13 +982,13 @@ The `br-0qt6e` ATC learning work is intentionally cross-cutting, but it should n
 ### Append and resolution hooks
 
 - Session/bootstrap and liveness hooks already land at the server dispatch boundary: successful `register_agent` and `macro_start_session` calls register agents with ATC, and tool execution updates ATC activity timestamps.
-- The next durable append path belongs in the same server/runtime seam, not inside individual UIs. Message and reservation learning hooks should flow from the tool-result/event boundary in `mcp-agent-mail-server/src/lib.rs` into the ATC-facing note functions already defined in `mcp-agent-mail-server/src/atc.rs`: `atc_note_message_sent()`, `atc_note_message_received()`, `atc_note_reservation_granted()`, `atc_note_reservation_released()`, and `atc_note_reservation_conflicts()`.
-- Outcome resolution likewise belongs in the server ATC runtime via `atc_record_outcome()`, with the DB crate owning the actual row mutation and rollup updates once the dedicated persistence/query surface is added.
-- `/web-dashboard/state`, `am robot atc`, and the System Health screen should stay snapshot-driven consumers of `atc_operator_snapshot()` / `atc_summary()`, not alternate sources of learning state.
+- The durable append path now belongs in that same server/runtime seam, not inside individual UIs. Message and reservation learning hooks flow from the tool-result/event boundary in `mcp-agent-mail-server/src/lib.rs` into the ATC-facing note functions in `mcp-agent-mail-server/src/atc.rs`: `atc_note_message_sent()`, `atc_note_message_received()`, `atc_note_reservation_granted()`, `atc_note_reservation_released()`, and `atc_note_reservation_conflicts()`.
+- Outcome resolution now flows through the server ATC runtime via `atc_record_outcome()` and the overdue/retention sweeps, with the DB crate owning the actual row mutation and rollup updates.
+- `/web-dashboard/state`, `am robot atc`, the ATC TUI screen, and the System Health screen stay snapshot-driven consumers of `atc_operator_snapshot()` / `atc_summary()`, not alternate sources of learning state.
 
 ### Hot path vs. cold path boundaries
 
-- Hot path: `mcp-agent-mail-server/src/atc.rs`, the tool-dispatch hook in `mcp-agent-mail-server/src/lib.rs`, and the future DB append/resolve calls. This path must stay append-friendly, bounded, and free of Git write amplification.
+- Hot path: `mcp-agent-mail-server/src/atc.rs`, the tool-dispatch hook in `mcp-agent-mail-server/src/lib.rs`, and the DB append/resolve calls behind `AM_ATC_WRITE_MODE`. This path must stay append-friendly, bounded, and free of Git write amplification.
 - Warm path: ATC operator snapshots, `am robot atc`, System Health, and `/web-dashboard/*`. These surfaces should read already-computed ATC state and only fall back to local heuristics when the live server snapshot is unavailable.
 - Cold path: promoted policy bundles, transparency cards, replay artifacts, and operator-facing audit bundles. These may be written through `mcp-agent-mail-storage`, but only after they are intentionally compacted and selected.
 - Explicit non-owner boundary: `mcp-agent-mail-search-core`, share/export, and the WASM/browser mirror are consumers or transport layers. They should not become the canonical home of ATC learning policy, persistence, or attribution logic.
@@ -996,19 +996,18 @@ The `br-0qt6e` ATC learning work is intentionally cross-cutting, but it should n
 ### Verification ownership
 
 - `crates/mcp-agent-mail-core/src/experience.rs`: unit/property coverage for lifecycle validity, feature-vector stability, serialization, and idempotent resolution transitions.
-- `crates/mcp-agent-mail-db/src/schema.rs` plus future ATC DB query modules: migration coverage, insert/resolve semantics, rollup correctness, retention/compaction tests, and replay/reconstruct safety.
+- `crates/mcp-agent-mail-db/src/schema.rs` plus the ATC DB query modules: migration coverage, insert/resolve semantics, rollup correctness, retention/compaction tests, and replay/reconstruct safety.
 - `crates/mcp-agent-mail-server/src/atc.rs`: decision math, policy-bundle loading, safe-mode transitions, tick budgeting, and feedback/calibration tests.
 - `crates/mcp-agent-mail-server/src/lib.rs`, `tui_ws_state.rs`, `tui_screens/system_health.rs`, and `crates/mcp-agent-mail-cli/src/robot.rs`: snapshot publication, route contracts, robot fallback behavior, and operator-surface rendering tests.
-- `tests/e2e/` and performance harnesses: once append/resolve wiring exists, live-server E2E and soak/perf coverage should validate that ATC learning stays low-write-amplification and does not regress request/tick budgets.
+- `tests/e2e/` and performance harnesses: live-server E2E plus soak/perf coverage validate that ATC learning stays low-write-amplification and does not regress request/tick budgets.
 
-### Recommended implementation order
+### Rollout and hardening priorities
 
-1. Keep `mcp-agent-mail-core` as the schema-and-policy contract: finalize any remaining experience/evidence/baseline/config details there first.
-2. Add the dedicated ATC persistence/query surface in `mcp-agent-mail-db` on top of the existing v16 schema, including append, resolve, rollup, and retention APIs.
-3. Wire `mcp-agent-mail-server` to append experience rows from real dispatch events and to resolve them from real execution/outcome signals, using the existing ATC note and outcome entrypoints instead of inventing parallel paths.
-4. Expose the resulting state consistently through the existing snapshot surfaces: `atc_summary()`, `atc_operator_snapshot()`, `am robot atc`, System Health, and `/web-dashboard/*`.
-5. Only after the core/runtime path is real should additional operator artifacts, Git-promoted transparency bundles, or richer UI affordances be added.
-6. Land replay, E2E, and perf verification last, once the append/resolve boundaries are stable enough to benchmark and audit.
+1. Keep `mcp-agent-mail-core` as the schema-and-policy contract so experience/evidence/config changes stay centralized and reviewable.
+2. Preserve `mcp-agent-mail-db` as the only durable ATC mutation/query surface for append, resolve, rollup, retention, and replay behavior.
+3. Continue routing real runtime events through `atc_note_*` and `atc_record_outcome()` instead of duplicating learning logic in tools, UIs, or ad-hoc SQL paths.
+4. Keep robot, TUI, and browser/dashboard surfaces snapshot-driven consumers of `atc_operator_snapshot()` rather than alternate sources of ATC truth.
+5. Land remaining rollout/default-flip, data-minimization, and operator-hardening work on top of the existing live path rather than reopening seam ownership questions.
 
 ---
 

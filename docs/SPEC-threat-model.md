@@ -66,7 +66,7 @@ account boundaries and disk controls for confidentiality at rest.
 | Git archive integrity | Repo-relative path validation, scoped archive writes, audit-friendly history | Partial; Git commit signing is not the current baseline and tamper evidence depends on repo hygiene |
 | SQLite at-rest protection | OS-level file permissions and disk controls are the documented baseline | Partial; no built-in database encryption |
 | Secrets in logs and diagnostics | Many auth errors are normalized and startup checks catch some footguns | Partial; verbose logging changes can still leak secrets if reviewers are careless |
-| ATC data minimization | ATC learning is not yet the default hot path; privacy follow-up tracked in `br-bn0vb.22` | Gap remains until redaction/minimization work lands and the learning loop becomes production-default |
+| ATC data minimization | ATC learning is a validated opt-in hot path (`shadow`/`live` via `AM_ATC_WRITE_MODE`); privacy follow-up tracked in `br-bn0vb.22` | Partial; durable learning exists, but redaction/minimization work should land before any default-on promotion |
 | Installer integrity | `install.sh` supports `--verify` with checksum and Sigstore cosign validation | `✓` Available; provenance checks are still optional and operators can skip them |
 | Supply chain | Explicit `Cargo.lock`, release process, and documented verification paths | Partial; recommend recurring `cargo audit` / dependency review cadence |
 
@@ -92,7 +92,7 @@ Review this document:
 - whenever a new public-facing endpoint, transport, or browser route lands,
 - whenever bearer-token, JWT, or JWKS behavior changes,
 - whenever share/export crypto or installer verification changes,
-- whenever ATC moves from architecture-phase into live learning-phase,
+- whenever ATC write-mode defaults, rollout semantics, or data-minimization policy change,
 - and after any real security incident or near miss.
 
 Security incidents should append a dated lessons entry with:

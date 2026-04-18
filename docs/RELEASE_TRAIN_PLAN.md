@@ -167,8 +167,9 @@ This document answers a different question than the existing rollout docs:
   - retention/compaction/replay
   - observability and simulation
   - E2E validation
-- Documentation that still describes ATC as architecture-phase should remain
-  until this train has passed canary
+- Documentation that still describes ATC as blueprint-only or pre-learning is
+  now stale; Train E should replace it with rollout-mode language grounded in
+  the Train D evidence already in tree
 
 ### Definition of shippable
 
@@ -206,7 +207,8 @@ This document answers a different question than the existing rollout docs:
 ### Target outcomes
 
 - Promote ATC from shadow validation to broader rollout
-- Remove the README architecture-phase disclaimer only after Train D evidence
+- Train D evidence is now in tree; remove the README pre-learning disclaimer
+  and replace it with validated-but-gated rollout language
 - Close release cleanup and meta/documentation follow-through
 
 ### Candidate beads
