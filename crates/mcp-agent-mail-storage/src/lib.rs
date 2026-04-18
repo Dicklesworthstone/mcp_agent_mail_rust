@@ -100,6 +100,16 @@ pub struct MessageArchivePaths {
     pub inbox: Vec<PathBuf>,
 }
 
+/// Borrowed input for writing a batch of message bundles with one archive commit.
+#[derive(Debug, Clone, Copy)]
+pub struct MessageBundleBatchEntry<'a> {
+    pub message: &'a serde_json::Value,
+    pub body_md: &'a str,
+    pub sender: &'a str,
+    pub recipients: &'a [String],
+    pub extra_paths: &'a [String],
+}
+
 /// Metadata included in notification signal files when enabled.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationMessage {
@@ -537,24 +547,39 @@ fn wbq_drain_loop(
         }
 
         let mut errors = 0usize;
-        for envelope in batch {
-            // Critical-disk-pressure skipping is an enqueue-time decision only.
-            // Once an op has been accepted into the WBQ, the drain must attempt
-            // it rather than silently drop already-acknowledged archive work.
-            let r = wbq_execute_op(&envelope.op);
-            let latency_us = u64::try_from(
-                envelope
-                    .enqueued_at
-                    .elapsed()
-                    .as_micros()
-                    .min(u128::from(u64::MAX)),
-            )
-            .unwrap_or(u64::MAX);
-            metrics.storage.wbq_queue_latency_us.record(latency_us);
-            if let Err(e) = r {
-                tracing::warn!("[wbq-drain] op failed: {e}");
-                errors += 1;
+        let mut idx = 0usize;
+        while idx < batch.len() {
+            let end = wbq_message_bundle_batch_end(&batch, idx);
+            let envelopes = &batch[idx..end];
+            let result = if envelopes.len() > 1 {
+                wbq_execute_message_bundle_batch(envelopes)
+            } else {
+                wbq_execute_op(&envelopes[0].op)
+            };
+            for envelope in envelopes {
+                let latency_us = u64::try_from(
+                    envelope
+                        .enqueued_at
+                        .elapsed()
+                        .as_micros()
+                        .min(u128::from(u64::MAX)),
+                )
+                .unwrap_or(u64::MAX);
+                metrics.storage.wbq_queue_latency_us.record(latency_us);
             }
+            if let Err(error) = result {
+                if envelopes.len() > 1 {
+                    tracing::warn!(
+                        "[wbq-drain] batched message-bundle run failed ({} ops): {error}",
+                        envelopes.len()
+                    );
+                    errors += envelopes.len();
+                } else {
+                    tracing::warn!("[wbq-drain] op failed: {error}");
+                    errors += 1;
+                }
+            }
+            idx = end;
         }
 
         metrics.storage.wbq_drained_total.add(drained_u64);
@@ -615,6 +640,102 @@ fn wbq_drain_loop(
             WbqMsg::Shutdown => {} // already shutting down
         }
     }
+}
+
+fn message_bundle_batch_group_key(op: &WriteOp) -> Option<(&str, &Path, &str, &str)> {
+    match op {
+        WriteOp::MessageBundle {
+            project_slug,
+            config,
+            ..
+        } => Some((
+            project_slug.as_str(),
+            config.storage_root.as_path(),
+            config.git_author_name.as_str(),
+            config.git_author_email.as_str(),
+        )),
+        _ => None,
+    }
+}
+
+fn wbq_message_bundle_batch_end(batch: &[WbqOpEnvelope], start: usize) -> usize {
+    let Some(anchor_key) = message_bundle_batch_group_key(batch[start].op.as_ref()) else {
+        return start + 1;
+    };
+
+    let mut end = start + 1;
+    while end < batch.len() {
+        if message_bundle_batch_group_key(batch[end].op.as_ref()) != Some(anchor_key) {
+            break;
+        }
+        end += 1;
+    }
+    end
+}
+
+fn wbq_execute_message_bundle_batch(envelopes: &[WbqOpEnvelope]) -> Result<()> {
+    debug_assert!(!envelopes.is_empty());
+
+    let mut attempts = 0;
+    loop {
+        match wbq_execute_message_bundle_batch_inner(envelopes) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                attempts += 1;
+                if attempts >= 3 {
+                    return Err(e);
+                }
+                match &e {
+                    StorageError::Io(_)
+                    | StorageError::LockContention { .. }
+                    | StorageError::GitIndexLock { .. }
+                    | StorageError::LockTimeout(_) => {
+                        tracing::warn!(
+                            "[wbq-drain] batch failed (attempt {attempts}/3): {e}, retrying..."
+                        );
+                        std::thread::sleep(Duration::from_millis(50 * (1 << attempts)));
+                    }
+                    _ => return Err(e),
+                }
+            }
+        }
+    }
+}
+
+fn wbq_execute_message_bundle_batch_inner(envelopes: &[WbqOpEnvelope]) -> Result<()> {
+    let Some(WriteOp::MessageBundle {
+        project_slug,
+        config,
+        ..
+    }) = envelopes.first().map(|envelope| envelope.op.as_ref())
+    else {
+        return Err(StorageError::Io(std::io::Error::other(
+            "wbq message-bundle batch requires at least one message-bundle op",
+        )));
+    };
+
+    let archive = ensure_archive(config, project_slug)?;
+    let batch_entries = envelopes
+        .iter()
+        .map(|envelope| match envelope.op.as_ref() {
+            WriteOp::MessageBundle {
+                message_json,
+                body_md,
+                sender,
+                recipients,
+                extra_paths,
+                ..
+            } => MessageBundleBatchEntry {
+                message: message_json,
+                body_md,
+                sender,
+                recipients,
+                extra_paths,
+            },
+            _ => unreachable!("message-bundle batch slices are grouped before execution"),
+        })
+        .collect::<Vec<_>>();
+    write_message_batch_bundle(&archive, config, &batch_entries, None)
 }
 
 fn wbq_execute_op(op: &WriteOp) -> Result<()> {
@@ -4308,22 +4429,75 @@ fn redact_message_bcc_for_inbox(message: &serde_json::Value) -> serde_json::Valu
     redacted
 }
 
-/// Write a message bundle to the archive: canonical, outbox, and inbox copies.
-///
-/// The message is written with JSON frontmatter followed by the markdown body.
-#[allow(clippy::too_many_arguments)]
-pub fn write_message_bundle(
+struct MessageBundleCommitMeta {
+    auto_commit_message: String,
+    summary_line: String,
+}
+
+fn visible_recipient_label(visible_recipients: &[String]) -> String {
+    if visible_recipients.is_empty() {
+        "(hidden recipients)".to_string()
+    } else {
+        visible_recipients.join(", ")
+    }
+}
+
+fn build_message_bundle_commit_meta(
+    message: &serde_json::Value,
+    sender: &str,
+    visible_recipients: &[String],
+    timestamp_str: &str,
+) -> MessageBundleCommitMeta {
+    let thread_key = message
+        .get("thread_id")
+        .or_else(|| message.get("id"))
+        .and_then(|v| {
+            if v.is_string() {
+                v.as_str().map(String::from)
+            } else {
+                Some(v.to_string())
+            }
+        })
+        .unwrap_or_default();
+
+    let summary_line = format!(
+        "mail: {sender} -> {} | {}",
+        visible_recipient_label(visible_recipients),
+        message
+            .get("subject")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    );
+    let body_lines = [
+        "TOOL: send_message",
+        &format!("Agent: {sender}"),
+        &format!(
+            "Project: {}",
+            message
+                .get("project")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+        ),
+        &format!("Started: {timestamp_str}"),
+        "Status: SUCCESS",
+        &format!("Thread: {thread_key}"),
+    ];
+
+    MessageBundleCommitMeta {
+        auto_commit_message: format!("{summary_line}\n\n{}\n", body_lines.join("\n")),
+        summary_line,
+    }
+}
+
+fn append_message_bundle_files(
     archive: &ProjectArchive,
-    config: &Config,
     message: &serde_json::Value,
     body_md: &str,
     sender: &str,
     recipients: &[String],
     extra_paths: &[String],
-    commit_text: Option<&str>,
-) -> Result<()> {
-    let repo_root = archive_repo_root_checked(archive)?;
-    // Parse timestamp
+    rel_paths: &mut Vec<String>,
+) -> Result<MessageBundleCommitMeta> {
     let created = parse_message_timestamp(message);
     let timestamp_str = created.to_rfc3339();
     let visible_recipients = message_visible_recipients(message);
@@ -4343,8 +4517,6 @@ pub fn write_message_bundle(
             .unwrap_or(0),
     )?;
 
-    // Canonical/outbox copies preserve the full frontmatter for auditability.
-    // Recipient inbox copies must redact BCC so hidden recipients stay hidden.
     let full_content = render_message_bundle_content(message, body_md)?;
     let inbox_message = redact_message_bcc_for_inbox(message);
     let inbox_content = if inbox_message == *message {
@@ -4354,30 +4526,23 @@ pub fn write_message_bundle(
     };
     let inbox_content_ref = inbox_content.as_deref().unwrap_or(&full_content);
 
-    // Create directories and write files
-    let mut rel_paths = Vec::new();
-
-    // Canonical (ensure_parent_dir handled inside write_text)
     write_text(&paths.canonical, &full_content, true)?;
     rel_paths.push(rel_path_cached(
         &archive.canonical_repo_root,
         &paths.canonical,
     )?);
 
-    // Outbox
     write_text(&paths.outbox, &full_content, true)?;
     rel_paths.push(rel_path_cached(
         &archive.canonical_repo_root,
         &paths.outbox,
     )?);
 
-    // Inbox copies
     for inbox_path in &paths.inbox {
         write_text(inbox_path, inbox_content_ref, true)?;
         rel_paths.push(rel_path_cached(&archive.canonical_repo_root, inbox_path)?);
     }
 
-    // Thread digest
     if let Some(thread_id) = message.get("thread_id").and_then(serde_json::Value::as_str) {
         let thread_id = thread_id.trim();
         if !thread_id.is_empty() {
@@ -4400,57 +4565,139 @@ pub fn write_message_bundle(
         }
     }
 
-    // Extra paths
     for p in extra_paths {
         let p = validate_repo_relative_path("extra_path", p)?;
         rel_paths.push(p.to_string());
     }
 
-    // Build commit message
+    Ok(build_message_bundle_commit_meta(
+        message,
+        sender,
+        &visible_recipients,
+        &timestamp_str,
+    ))
+}
+
+fn dedup_repo_relative_paths(rel_paths: &mut Vec<String>) {
+    let mut seen = HashSet::with_capacity(rel_paths.len());
+    rel_paths.retain(|path| seen.insert(path.clone()));
+}
+
+fn build_batch_message_bundle_commit_message(summary_lines: &[String]) -> String {
+    const SUMMARY_LIMIT: usize = 32;
+
+    let mut msg = format!("batch: {} message bundles\n\n", summary_lines.len());
+    for line in summary_lines.iter().take(SUMMARY_LIMIT) {
+        msg.push_str("- ");
+        msg.push_str(line);
+        msg.push('\n');
+    }
+    if summary_lines.len() > SUMMARY_LIMIT {
+        msg.push_str(&format!(
+            "- ... (+{} more)\n",
+            summary_lines.len() - SUMMARY_LIMIT
+        ));
+    }
+    msg
+}
+
+/// Write multiple message bundles to the archive and enqueue a single async commit.
+pub fn write_message_batch_bundle(
+    archive: &ProjectArchive,
+    config: &Config,
+    entries: &[MessageBundleBatchEntry<'_>],
+    commit_text: Option<&str>,
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let repo_root = archive_repo_root_checked(archive)?;
+    let estimated_rel_paths = entries
+        .iter()
+        .map(|entry| {
+            2 + entry.recipients.len()
+                + entry.extra_paths.len()
+                + usize::from(
+                    entry
+                        .message
+                        .get("thread_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|thread_id| !thread_id.trim().is_empty()),
+                )
+        })
+        .sum();
+    let mut rel_paths = Vec::with_capacity(estimated_rel_paths);
+    let mut summary_lines = Vec::with_capacity(entries.len());
+    let mut single_auto_commit_message: Option<String> = None;
+
+    for entry in entries {
+        let commit_meta = append_message_bundle_files(
+            archive,
+            entry.message,
+            entry.body_md,
+            entry.sender,
+            entry.recipients,
+            entry.extra_paths,
+            &mut rel_paths,
+        )?;
+        if entries.len() == 1 {
+            single_auto_commit_message = Some(commit_meta.auto_commit_message);
+        }
+        summary_lines.push(commit_meta.summary_line);
+    }
+
+    dedup_repo_relative_paths(&mut rel_paths);
+
     let commit_message = if let Some(text) = commit_text {
         text.to_string()
+    } else if entries.len() == 1 {
+        single_auto_commit_message.unwrap_or_default()
     } else {
-        let thread_key = message
-            .get("thread_id")
-            .or_else(|| message.get("id"))
-            .and_then(|v| {
-                if v.is_string() {
-                    v.as_str().map(String::from)
-                } else {
-                    Some(v.to_string())
-                }
-            })
-            .unwrap_or_default();
-
-        let visible_recipient_label = if visible_recipients.is_empty() {
-            "(hidden recipients)".to_string()
-        } else {
-            visible_recipients.join(", ")
-        };
-        let subject = format!(
-            "mail: {sender} -> {} | {}",
-            visible_recipient_label,
-            message
-                .get("subject")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-        );
-        let body_lines = [
-            "TOOL: send_message",
-            &format!("Agent: {sender}"),
-            &format!(
-                "Project: {}",
-                message
-                    .get("project")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-            ),
-            &format!("Started: {timestamp_str}"),
-            "Status: SUCCESS",
-            &format!("Thread: {thread_key}"),
-        ];
-        format!("{subject}\n\n{}\n", body_lines.join("\n"))
+        build_batch_message_bundle_commit_message(&summary_lines)
     };
+
+    enqueue_async_commit(repo_root, config, &commit_message, &rel_paths);
+    Ok(())
+}
+
+/// Write a message bundle to the archive: canonical, outbox, and inbox copies.
+///
+/// The message is written with JSON frontmatter followed by the markdown body.
+#[allow(clippy::too_many_arguments)]
+pub fn write_message_bundle(
+    archive: &ProjectArchive,
+    config: &Config,
+    message: &serde_json::Value,
+    body_md: &str,
+    sender: &str,
+    recipients: &[String],
+    extra_paths: &[String],
+    commit_text: Option<&str>,
+) -> Result<()> {
+    let repo_root = archive_repo_root_checked(archive)?;
+    let mut rel_paths = Vec::with_capacity(
+        2 + recipients.len()
+            + extra_paths.len()
+            + usize::from(
+                message
+                    .get("thread_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|thread_id| !thread_id.trim().is_empty()),
+            ),
+    );
+    let commit_meta = append_message_bundle_files(
+        archive,
+        message,
+        body_md,
+        sender,
+        recipients,
+        extra_paths,
+        &mut rel_paths,
+    )?;
+    let commit_message = commit_text
+        .map(ToString::to_string)
+        .unwrap_or(commit_meta.auto_commit_message);
 
     enqueue_async_commit(repo_root, config, &commit_message, &rel_paths);
 
@@ -8775,6 +9022,187 @@ mod tests {
         );
     }
 
+    fn snapshot_archive_files(root: &Path) -> std::collections::BTreeMap<String, String> {
+        fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, String>) {
+            let mut entries: Vec<_> = fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                if path.file_name().and_then(|name| name.to_str()) == Some(".git") {
+                    continue;
+                }
+                if path.is_dir() {
+                    walk(root, &path, out);
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let content = fs::read_to_string(&path).unwrap();
+                out.insert(rel, content);
+            }
+        }
+
+        let mut out = std::collections::BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    #[test]
+    fn test_write_message_batch_bundle_matches_single_message_layout() {
+        let tmp_single = TempDir::new().unwrap();
+        let config_single = test_config(tmp_single.path());
+        let archive_single = ensure_archive(&config_single, "proj").unwrap();
+
+        let tmp_batch = TempDir::new().unwrap();
+        let config_batch = test_config(tmp_batch.path());
+        let archive_batch = ensure_archive(&config_batch, "proj").unwrap();
+
+        let messages = vec![
+            serde_json::json!({
+                "id": 1,
+                "subject": "Batch Layout One",
+                "created_ts": "2026-01-15T10:00:00Z",
+                "thread_id": "TKT-BATCH",
+                "project": "proj",
+            }),
+            serde_json::json!({
+                "id": 2,
+                "subject": "Batch Layout Two",
+                "created_ts": "2026-01-15T10:01:00Z",
+                "thread_id": "TKT-BATCH",
+                "project": "proj",
+            }),
+        ];
+        let recipients = vec!["RecipientAgent".to_string()];
+
+        for message in &messages {
+            write_message_bundle(
+                &archive_single,
+                &config_single,
+                message,
+                "Hello world!",
+                "SenderAgent",
+                &recipients,
+                &[],
+                None,
+            )
+            .unwrap();
+        }
+        flush_async_commits();
+
+        let batch_entries = messages
+            .iter()
+            .map(|message| MessageBundleBatchEntry {
+                message,
+                body_md: "Hello world!",
+                sender: "SenderAgent",
+                recipients: &recipients,
+                extra_paths: &[],
+            })
+            .collect::<Vec<_>>();
+        write_message_batch_bundle(&archive_batch, &config_batch, &batch_entries, None).unwrap();
+        flush_async_commits();
+
+        assert_eq!(
+            snapshot_archive_files(&archive_single.root),
+            snapshot_archive_files(&archive_batch.root)
+        );
+    }
+
+    #[test]
+    fn test_write_message_batch_bundle_keeps_bcc_inbox_private_from_thread_digest() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+
+        let message = serde_json::json!({
+            "id": 2,
+            "subject": "Private Batch Message",
+            "created_ts": "2026-01-15T10:00:00Z",
+            "thread_id": "TKT-BCC-BATCH",
+            "project": "proj",
+            "to": ["VisibleAgent"],
+            "cc": [],
+            "bcc": ["HiddenAgent"],
+        });
+        let recipients = vec!["VisibleAgent".to_string(), "HiddenAgent".to_string()];
+        let batch_entries = [MessageBundleBatchEntry {
+            message: &message,
+            body_md: "Hello world!",
+            sender: "SenderAgent",
+            recipients: &recipients,
+            extra_paths: &[],
+        }];
+
+        write_message_batch_bundle(&archive, &config, &batch_entries, None).unwrap();
+        flush_async_commits();
+
+        let hidden_inbox_dir = archive.root.join("agents/HiddenAgent/inbox/2026/01");
+        assert!(
+            hidden_inbox_dir.exists(),
+            "bcc recipient should still get inbox copy"
+        );
+
+        let hidden_inbox_path = fs::read_dir(&hidden_inbox_dir)
+            .unwrap()
+            .find_map(|entry| entry.ok().map(|entry| entry.path()))
+            .expect("hidden inbox path");
+        let (hidden_inbox_frontmatter, _) = read_message_file(&hidden_inbox_path).unwrap();
+        assert_eq!(hidden_inbox_frontmatter["bcc"], serde_json::json!([]));
+
+        let digest = archive.root.join("messages/threads/tkt-bcc-batch.md");
+        let digest_body = fs::read_to_string(&digest).unwrap();
+        assert!(digest_body.contains("VisibleAgent"));
+        assert!(!digest_body.contains("HiddenAgent"));
+    }
+
+    #[test]
+    fn test_write_message_batch_bundle_uses_single_commit_summary() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+
+        let messages = vec![
+            serde_json::json!({
+                "id": 1,
+                "subject": "Commit Summary One",
+                "created_ts": "2026-01-15T10:00:00Z",
+                "thread_id": "TKT-COMMIT",
+                "project": "proj",
+            }),
+            serde_json::json!({
+                "id": 2,
+                "subject": "Commit Summary Two",
+                "created_ts": "2026-01-15T10:01:00Z",
+                "thread_id": "TKT-COMMIT",
+                "project": "proj",
+            }),
+        ];
+        let recipients = vec!["RecipientAgent".to_string()];
+        let batch_entries = messages
+            .iter()
+            .map(|message| MessageBundleBatchEntry {
+                message,
+                body_md: "Hello world!",
+                sender: "SenderAgent",
+                recipients: &recipients,
+                extra_paths: &[],
+            })
+            .collect::<Vec<_>>();
+
+        write_message_batch_bundle(&archive, &config, &batch_entries, None).unwrap();
+        flush_async_commits();
+
+        let commits = get_recent_commits(&archive, 3, None).unwrap();
+        assert_eq!(commits[0].summary, "batch: 2 message bundles");
+    }
+
     #[test]
     fn test_list_agent_inbox_rejects_path_traversal() {
         let tmp = TempDir::new().unwrap();
@@ -11843,6 +12271,52 @@ mod tests {
         let archive = ensure_archive(&config, "wbq-msg-test").unwrap();
         let messages_dir = archive.root.join("messages");
         assert!(messages_dir.exists(), "messages/ directory should exist");
+    }
+
+    #[test]
+    fn wbq_drain_loop_message_bundle_burst_uses_batch_archive_commit() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+
+        let project_slug = "wbq-msg-batch-test";
+        let _archive = ensure_archive(&config, project_slug).unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+
+        for id in [41_i64, 42] {
+            let msg_json = serde_json::json!({
+                "id": id,
+                "from": "Sender",
+                "to": ["Receiver"],
+                "subject": format!("WBQ batch test {id}"),
+                "created": "2025-01-01T00:00:00+00:00",
+                "thread_id": "WBQ-BATCH",
+                "importance": "normal",
+            });
+
+            let op = WriteOp::MessageBundle {
+                project_slug: project_slug.to_string(),
+                config: config.clone(),
+                message_json: msg_json,
+                body_md: format!("Hello from WBQ batch message {id}"),
+                sender: "Sender".to_string(),
+                recipients: vec!["Receiver".to_string()],
+                extra_paths: vec![],
+            };
+
+            tx.send(WbqMsg::Op(WbqOpEnvelope {
+                enqueued_at: Instant::now(),
+                op: Box::new(op),
+            }))
+            .unwrap();
+        }
+        tx.send(WbqMsg::Shutdown).unwrap();
+
+        wbq_drain_loop(rx, Arc::new(AtomicU64::new(2)), 4, 4);
+        flush_async_commits();
+
+        let archive = ensure_archive(&config, project_slug).unwrap();
+        let commits = get_recent_commits(&archive, 3, None).unwrap();
+        assert_eq!(commits[0].summary, "batch: 2 message bundles");
     }
 
     #[test]

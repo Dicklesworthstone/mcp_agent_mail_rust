@@ -5,9 +5,9 @@
     clippy::significant_drop_tightening
 )]
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use fastmcp::{Budget, CallToolParams, Cx};
-use fastmcp_core::{block_on, Outcome, SessionState};
+use fastmcp_core::{Outcome, SessionState, block_on};
 use mcp_agent_mail_conformance::Fixtures;
 use mcp_agent_mail_db::search_planner::SearchQuery;
 use mcp_agent_mail_db::{DbPool, DbPoolConfig};
@@ -21,12 +21,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
-use tracing::field::{Field, Visit};
 use tracing::Subscriber;
+use tracing::field::{Field, Visit};
+use tracing_subscriber::Registry;
 use tracing_subscriber::layer::{Context, Layer};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::Registry;
 
 fn fixtures_path() -> std::path::PathBuf {
     // `CARGO_MANIFEST_DIR` is `crates/mcp-agent-mail` for this bench crate.
@@ -568,25 +568,35 @@ fn run_archive_harness_once() {
                         .expect("ensure_archive");
 
                     let t0 = Instant::now();
-                    for (msg_id, _) in (1_i64..).zip(0..batch_size) {
-                        let message_json = serde_json::json!({
-                            "id": msg_id,
-                            "project": project_slug,
-                            "subject": "bench batch",
-                            "created_ts": 1_700_000_000_000_000i64,
-                        });
-                        mcp_agent_mail_storage::write_message_bundle(
-                            &archive,
-                            &config,
-                            &message_json,
-                            "hello",
+                    let messages = (1_i64..)
+                        .take(batch_size)
+                        .map(|msg_id| {
+                            serde_json::json!({
+                                "id": msg_id,
+                                "project": project_slug,
+                                "subject": "bench batch",
+                                "created_ts": 1_700_000_000_000_000i64,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let no_extra_paths: &[String] = &[];
+                    let batch_entries = messages
+                        .iter()
+                        .map(|message| mcp_agent_mail_storage::MessageBundleBatchEntry {
+                            message,
+                            body_md: "hello",
                             sender,
-                            &recipients,
-                            &[],
-                            None,
-                        )
-                        .expect("write_message_bundle");
-                    }
+                            recipients: &recipients,
+                            extra_paths: no_extra_paths,
+                        })
+                        .collect::<Vec<_>>();
+                    mcp_agent_mail_storage::write_message_batch_bundle(
+                        &archive,
+                        &config,
+                        &batch_entries,
+                        None,
+                    )
+                    .expect("write_message_batch_bundle");
                     mcp_agent_mail_storage::flush_async_commits();
 
                     samples_us.push(t0.elapsed().as_micros() as u64);
@@ -869,6 +879,42 @@ fn run_archive_batch_sample(
     msg_id: &mut i64,
     sample_index: usize,
 ) -> u64 {
+    fn write_archive_batch_messages(
+        archive: &mcp_agent_mail_storage::ProjectArchive,
+        config: &mcp_agent_mail_core::Config,
+        project_slug: &str,
+        sender: &str,
+        recipients: &[String],
+        batch_size: usize,
+        msg_id: &mut i64,
+    ) {
+        let messages = (0..batch_size)
+            .map(|_| {
+                let message_json = serde_json::json!({
+                    "id": *msg_id,
+                    "project": project_slug,
+                    "subject": "bench batch",
+                    "created_ts": 1_700_000_000_000_000i64,
+                });
+                *msg_id += 1;
+                message_json
+            })
+            .collect::<Vec<_>>();
+        let no_extra_paths: &[String] = &[];
+        let batch_entries = messages
+            .iter()
+            .map(|message| mcp_agent_mail_storage::MessageBundleBatchEntry {
+                message,
+                body_md: "hello",
+                sender,
+                recipients,
+                extra_paths: no_extra_paths,
+            })
+            .collect::<Vec<_>>();
+        mcp_agent_mail_storage::write_message_batch_bundle(archive, config, &batch_entries, None)
+            .expect("write_message_batch_bundle");
+    }
+
     let sample_span = tracing::info_span!(
         "archive_batch.sample",
         batch_size,
@@ -879,32 +925,24 @@ fn run_archive_batch_sample(
 
     let t0 = Instant::now();
     {
-        let write_span =
-            tracing::info_span!("archive_batch.write_message_loop", batch_size, sample_index);
+        let write_span = tracing::info_span!(
+            "archive_batch.write_message_batch",
+            batch_size,
+            sample_index
+        );
         let _write_guard = write_span.entered();
-        for _ in 0..batch_size {
-            let message_span =
-                tracing::trace_span!("archive_batch.write_message_bundle", batch_size);
-            let _message_guard = message_span.entered();
-            let message_json = serde_json::json!({
-                "id": *msg_id,
-                "project": "bench-archive",
-                "subject": "bench batch",
-                "created_ts": 1_700_000_000_000_000i64,
-            });
-            mcp_agent_mail_storage::write_message_bundle(
-                archive,
-                config,
-                &message_json,
-                "hello",
-                sender,
-                recipients,
-                &[],
-                None,
-            )
-            .expect("write_message_bundle");
-            *msg_id += 1;
-        }
+        let message_span =
+            tracing::trace_span!("archive_batch.write_message_batch_bundle", batch_size);
+        let _message_guard = message_span.entered();
+        write_archive_batch_messages(
+            archive,
+            config,
+            "bench-archive",
+            sender,
+            recipients,
+            batch_size,
+            msg_id,
+        );
     }
 
     {
@@ -1280,26 +1318,38 @@ fn bench_archive_write(c: &mut Criterion) {
                         }
                         ArchiveScenario::BatchNoAttachments { batch_size } => {
                             for _ in 0..iters {
-                                for _ in 0..batch_size {
-                                    let message_json = serde_json::json!({
-                                        "id": msg_id,
-                                        "project": project_slug,
-                                        "subject": "bench batch",
-                                        "created_ts": 1_700_000_000_000_000i64,
-                                    });
-                                    mcp_agent_mail_storage::write_message_bundle(
-                                        &archive,
-                                        &config,
-                                        &message_json,
-                                        "hello",
-                                        sender,
-                                        &recipients,
-                                        &[],
-                                        None,
-                                    )
-                                    .expect("write_message_bundle");
-                                    msg_id += 1;
-                                }
+                                let messages = (0..batch_size)
+                                    .map(|_| {
+                                        let message_json = serde_json::json!({
+                                            "id": msg_id,
+                                            "project": project_slug,
+                                            "subject": "bench batch",
+                                            "created_ts": 1_700_000_000_000_000i64,
+                                        });
+                                        msg_id += 1;
+                                        message_json
+                                    })
+                                    .collect::<Vec<_>>();
+                                let no_extra_paths: &[String] = &[];
+                                let batch_entries = messages
+                                    .iter()
+                                    .map(|message| {
+                                        mcp_agent_mail_storage::MessageBundleBatchEntry {
+                                            message,
+                                            body_md: "hello",
+                                            sender,
+                                            recipients: &recipients,
+                                            extra_paths: no_extra_paths,
+                                        }
+                                    })
+                                    .collect::<Vec<_>>();
+                                mcp_agent_mail_storage::write_message_batch_bundle(
+                                    &archive,
+                                    &config,
+                                    &batch_entries,
+                                    None,
+                                )
+                                .expect("write_message_batch_bundle");
                                 mcp_agent_mail_storage::flush_async_commits();
                             }
                         }
@@ -1354,26 +1404,36 @@ fn bench_archive_write(c: &mut Criterion) {
 
                     for _ in 0..iters {
                         if let ArchiveScenario::BatchNoAttachments { batch_size } = scenario {
-                            for _ in 0..batch_size {
-                                let message_json = serde_json::json!({
-                                    "id": msg_id,
-                                    "project": project_slug,
-                                    "subject": "bench batch",
-                                    "created_ts": 1_700_000_000_000_000i64,
-                                });
-                                mcp_agent_mail_storage::write_message_bundle(
-                                    &archive,
-                                    &config,
-                                    &message_json,
-                                    "hello",
+                            let messages = (0..batch_size)
+                                .map(|_| {
+                                    let message_json = serde_json::json!({
+                                        "id": msg_id,
+                                        "project": project_slug,
+                                        "subject": "bench batch",
+                                        "created_ts": 1_700_000_000_000_000i64,
+                                    });
+                                    msg_id += 1;
+                                    message_json
+                                })
+                                .collect::<Vec<_>>();
+                            let no_extra_paths: &[String] = &[];
+                            let batch_entries = messages
+                                .iter()
+                                .map(|message| mcp_agent_mail_storage::MessageBundleBatchEntry {
+                                    message,
+                                    body_md: "hello",
                                     sender,
-                                    &recipients,
-                                    &[],
-                                    None,
-                                )
-                                .expect("write_message_bundle");
-                                msg_id += 1;
-                            }
+                                    recipients: &recipients,
+                                    extra_paths: no_extra_paths,
+                                })
+                                .collect::<Vec<_>>();
+                            mcp_agent_mail_storage::write_message_batch_bundle(
+                                &archive,
+                                &config,
+                                &batch_entries,
+                                None,
+                            )
+                            .expect("write_message_batch_bundle");
                             mcp_agent_mail_storage::flush_async_commits();
                         }
                     }

@@ -116,31 +116,33 @@ Budgets are set to ~2x the measured baseline p95 to absorb variance.
 | Single message (file attachment) | ~20.6ms | ~22.0ms | ~22.4ms | < 25ms | < 30ms | Includes WebP convert + manifest + audit + file-path body |
 | Batch 100 messages (no attachments) | ~1117.9ms | ~1316.6ms | ~1316.6ms | < 250ms | < 300ms | Cold fresh-repo burst per sample; use the warm-path profile update below for the decisive steady-state signal |
 
-### Warm-Path Profile Update (br-8qdh0.1, 2026-04-18)
+### Warm-Path Profile Update (br-8qdh0.3, 2026-04-18)
 
-Artifacts:
+Historical pre-fix analysis is preserved in:
+- `docs/PERF-archive-batch-profile-2026-04-18.md`
+
+Current post-fix artifacts:
 - `tests/artifacts/perf/archive_batch_100_spans.json`
 - `tests/artifacts/perf/archive_batch_scaling.csv`
 - `tests/artifacts/perf/archive_batch_100_flamegraph.svg`
 - `tests/artifacts/perf/archive_batch_100_profile.md`
-- `docs/PERF-archive-batch-profile-2026-04-18.md`
 
 Warm steady-state burst measurements (`MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 cargo bench ... archive_write_batch`):
 
 | Scenario | p50 | p95 | p99 | Note |
 |----------|-----|-----|-----|------|
-| batch-1 | ~11.9ms | ~12.7ms | ~15.0ms | Warm DB + warmed archive |
-| batch-10 | ~33.1ms | ~38.2ms | ~38.9ms | Some amortization already visible |
-| batch-100 | ~220.4ms | ~264.7ms | ~265.0ms | Near budget; ~14.7ms above p95 target |
+| batch-1 | ~11.7ms | ~12.4ms | ~13.5ms | Warm DB + warmed archive |
+| batch-10 | ~28.8ms | ~31.8ms | ~32.7ms | Storage-native batch write removes the old per-message loop overhead |
+| batch-100 | ~213.5ms | ~238.1ms | ~241.8ms | Under the `<250ms` p95 budget with ~`11.9ms` headroom |
 
 Scaling-law observation:
-- `batch-100 p95 / batch-1 p95 = 20.84x`, so the per-message cost at batch-100 is ~`0.208x` batch-1.
-- `wbq_flush` is negligible in the span trace; the cost is dominated by the write loop itself plus `flush_async_commits`.
+- `batch-100 p95 / batch-1 p95 = 19.27x`, so the per-message cost at batch-100 is ~`0.193x` batch-1.
+- `wbq_flush` remains negligible; the decisive cost is now the batch archive write plus `flush_async_commits`.
 
 Span roll-up for warm batch-100:
-- `archive_batch.write_message_loop`: ~2.04s cumulative across 12 samples (~77% of sampled wall time)
-- `archive_batch.flush_async_commits`: ~0.61s cumulative (~23%)
-- `archive_batch.wbq_flush`: ~420us cumulative (noise floor)
+- `archive_batch.write_message_batch` / `archive_batch.write_message_batch_bundle`: ~1.75s cumulative across 12 samples (~68% of sampled wall time)
+- `archive_batch.flush_async_commits`: ~0.82s cumulative (~32%)
+- `archive_batch.wbq_flush`: ~601us cumulative (noise floor)
 
 ### MCP Tool Handler Baselines (Criterion, 2026-02-08)
 
