@@ -3,6 +3,9 @@
 Practical guidance for starting, operating, troubleshooting, and recovering
 the AgentMailTUI interactive operations console.
 
+For copy-paste CLI workflows, see
+[`docs/OPERATOR_COOKBOOK.md`](OPERATOR_COOKBOOK.md).
+
 ---
 
 ## 1. Quick Start

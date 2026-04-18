@@ -269,6 +269,8 @@ Provides asynchronous multi-agent coordination via a mail metaphor: identities, 
 
 ### Documentation
 
+- Operator cookbook with canonical copy-paste recipes:
+  `docs/OPERATOR_COOKBOOK.md`
 - Deferred browser parity reference: `docs/SPEC-browser-parity-contract-deferred.md`
 - Threat model and security posture reference: `docs/SPEC-threat-model.md`
 - Parked prototype: `experimental/mcp-agent-mail-wasm/` is deferred prior art, not

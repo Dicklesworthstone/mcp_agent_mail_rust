@@ -845,7 +845,9 @@ All configuration via environment variables. The server reads them at startup vi
 
 For the full list of 100+ env vars, see `crates/mcp-agent-mail-core/src/config.rs`.
 
-For operations guidance and troubleshooting, see [docs/OPERATOR_RUNBOOK.md](docs/OPERATOR_RUNBOOK.md).
+For operations guidance and troubleshooting, see
+[docs/OPERATOR_RUNBOOK.md](docs/OPERATOR_RUNBOOK.md). For copy-paste operator
+recipes, see [docs/OPERATOR_COOKBOOK.md](docs/OPERATOR_COOKBOOK.md).
 
 ---
 
@@ -1557,6 +1559,7 @@ Common pitfalls
 
 | Document | Purpose |
 |----------|---------|
+| [OPERATOR_COOKBOOK.md](docs/OPERATOR_COOKBOOK.md) | Canonical copy-paste operator recipes for setup, triage, reservations, messaging, share/export, and diagnostics |
 | [OPERATOR_RUNBOOK.md](docs/OPERATOR_RUNBOOK.md) | Deployment, troubleshooting, diagnostics |
 | [DEVELOPER_GUIDE.md](docs/DEVELOPER_GUIDE.md) | Dev setup, debugging, testing |
 | [MIGRATION_GUIDE.md](docs/MIGRATION_GUIDE.md) | Python to Rust migration |
