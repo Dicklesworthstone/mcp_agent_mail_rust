@@ -184,7 +184,8 @@ pub mod timestamps;
 pub mod tracking;
 
 pub use atc_queries::{
-    ExpiredExperienceCandidate, OpenExperienceFilter, OpenExperienceSummary, RollupEntry,
+    CompactSummary, ExperienceStream, ExpiredExperienceCandidate, OpenExperienceFilter,
+    OpenExperienceSummary, RollupEntry, SequenceRange,
 };
 pub use cache::{CacheEntryCounts, CacheMetrics, CacheMetricsSnapshot, cache_metrics, read_cache};
 pub use coalesce::{CoalesceMap, CoalesceMetrics, CoalesceOutcome};

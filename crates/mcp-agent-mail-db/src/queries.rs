@@ -530,7 +530,9 @@ fn merge_context_patch(
     Ok(Some(serde_json::Value::Object(merged)))
 }
 
-fn decode_atc_experience_row(row: &SqlRow) -> std::result::Result<ExperienceRow, DbError> {
+pub(crate) fn decode_atc_experience_row(
+    row: &SqlRow,
+) -> std::result::Result<ExperienceRow, DbError> {
     let experience_id = row
         .get(0)
         .and_then(value_as_i64)
@@ -642,7 +644,7 @@ fn decode_atc_experience_row(row: &SqlRow) -> std::result::Result<ExperienceRow,
 const PROJECT_SELECT_ALL_SQL: &str =
     "SELECT id, slug, human_key, created_at FROM projects ORDER BY id ASC";
 pub type AtcRollupRow = (String, i64, i64, i64, i64, i64, i64, f64, f64, f64, f64);
-const ATC_EXPERIENCE_SELECT_COLUMNS_SQL: &str = "SELECT experience_id, decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem, decision_class, subject, project_key, policy_id, effect_kind, action, posterior_json, expected_loss, runner_up_action, runner_up_loss, evidence_summary, calibration_healthy, safe_mode_active, non_execution_json, outcome_json, features_json, feature_ext_json, feature_schema_version, created_ts, dispatched_ts, executed_ts, resolved_ts, context_json FROM atc_experiences";
+pub(crate) const ATC_EXPERIENCE_SELECT_COLUMNS_SQL: &str = "SELECT experience_id, decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem, decision_class, subject, project_key, policy_id, effect_kind, action, posterior_json, expected_loss, runner_up_action, runner_up_loss, evidence_summary, calibration_healthy, safe_mode_active, non_execution_json, outcome_json, features_json, feature_ext_json, feature_schema_version, created_ts, dispatched_ts, executed_ts, resolved_ts, context_json FROM atc_experiences";
 const FILE_RESERVATION_SELECT_COLUMNS_SQL: &str = "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts \
      FROM file_reservations";
 const AGENT_LINK_SELECT_COLUMNS_SQL: &str = "SELECT id, a_project_id, a_agent_id, b_project_id, b_agent_id, status, reason, created_ts, updated_ts, expires_ts \
@@ -1183,7 +1185,10 @@ pub fn reprocess_atc_feature_schema(
     result
 }
 
-async fn ensure_file_backed_atc_pool_initialized(cx: &Cx, pool: &DbPool) -> Outcome<(), DbError> {
+pub(crate) async fn ensure_file_backed_atc_pool_initialized(
+    cx: &Cx,
+    pool: &DbPool,
+) -> Outcome<(), DbError> {
     if pool.sqlite_path() == ":memory:" {
         return Outcome::Ok(());
     }
@@ -1769,13 +1774,15 @@ pub(crate) fn open_canonical_atc_conn(
     Ok(conn)
 }
 
-fn begin_canonical_atc_write_tx(conn: &crate::CanonicalDbConn) -> std::result::Result<(), DbError> {
+pub(crate) fn begin_canonical_atc_write_tx(
+    conn: &crate::CanonicalDbConn,
+) -> std::result::Result<(), DbError> {
     conn.execute_sync("BEGIN IMMEDIATE", &[])
         .map(|_| ())
         .map_err(|error| DbError::Sqlite(error.to_string()))
 }
 
-fn commit_canonical_atc_write_tx(
+pub(crate) fn commit_canonical_atc_write_tx(
     conn: &crate::CanonicalDbConn,
 ) -> std::result::Result<(), DbError> {
     conn.execute_sync("COMMIT", &[])
@@ -1783,7 +1790,7 @@ fn commit_canonical_atc_write_tx(
         .map_err(|error| DbError::Sqlite(error.to_string()))
 }
 
-fn rollback_canonical_atc_write_tx(conn: &crate::CanonicalDbConn) {
+pub(crate) fn rollback_canonical_atc_write_tx(conn: &crate::CanonicalDbConn) {
     let _ = conn.execute_sync("ROLLBACK", &[]);
 }
 
@@ -1797,7 +1804,7 @@ pub(crate) fn canonical_query_atc_rows(
         .map_err(|error| DbError::Sqlite(format!("{purpose}: {error}")))
 }
 
-fn canonical_execute_atc(
+pub(crate) fn canonical_execute_atc(
     conn: &crate::CanonicalDbConn,
     sql: &str,
     params: &[Value],

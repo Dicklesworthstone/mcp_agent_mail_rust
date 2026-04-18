@@ -9,7 +9,8 @@ use std::time::Instant;
 
 use asupersync::{Cx, Outcome};
 use mcp_agent_mail_core::atc_labeling::attribution_window;
-use mcp_agent_mail_core::experience::{EffectKind, ExperienceOutcome};
+use mcp_agent_mail_core::atc_retention::{LearningArtifactKind, retention_rule};
+use mcp_agent_mail_core::experience::{EffectKind, ExperienceOutcome, ExperienceRow};
 use sqlmodel_core::{Row, Value};
 
 use crate::error::DbError;
@@ -650,6 +651,8 @@ pub async fn query_rollups(cx: &Cx, pool: &DbPool) -> Outcome<Vec<RollupEntry>, 
 
 // ── Open experience read path ───────────────────────────────────────
 
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+
 /// Filter criteria for open experiences.
 #[derive(Debug, Clone, Default)]
 pub struct OpenExperienceFilter {
@@ -659,17 +662,74 @@ pub struct OpenExperienceFilter {
     pub subject: Option<String>,
     /// Only return experiences for this project.
     pub project_key: Option<String>,
+    /// Only return experiences created at or after this timestamp.
+    pub since_ts_micros: Option<i64>,
+    /// Only return experiences in this canonical stratum key.
+    pub stratum_key: Option<String>,
     /// Maximum number of rows to return.
     pub limit: Option<u32>,
 }
 
-const OPEN_EXPERIENCE_BASE_SQL: &str = "\
-    SELECT experience_id, decision_id, effect_id, trace_id, claim_id, \
-           evidence_id, state, subsystem, decision_class, subject, \
-           project_key, policy_id, effect_kind, action, \
-           expected_loss, created_ts, dispatched_ts, executed_ts \
-    FROM atc_experiences \
-    WHERE state IN ('open', 'dispatched', 'executed', 'planned')";
+/// Inclusive sequence bounds for replaying ATC experience rows.
+///
+/// `experience_id` is the durable monotone sequence for replay/audit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SequenceRange {
+    pub from_seq: Option<u64>,
+    pub to_seq: Option<u64>,
+}
+
+impl SequenceRange {
+    fn sql_bounds(self) -> Result<(Option<i64>, Option<i64>), DbError> {
+        let from_seq = self
+            .from_seq
+            .map(|value| {
+                i64::try_from(value).map_err(|_| {
+                    DbError::invalid(
+                        "from_seq",
+                        format!("from_seq exceeds SQLite INTEGER range: {value}"),
+                    )
+                })
+            })
+            .transpose()?;
+        let to_seq = self
+            .to_seq
+            .map(|value| {
+                i64::try_from(value).map_err(|_| {
+                    DbError::invalid(
+                        "to_seq",
+                        format!("to_seq exceeds SQLite INTEGER range: {value}"),
+                    )
+                })
+            })
+            .transpose()?;
+        if let (Some(from_seq), Some(to_seq)) = (from_seq, to_seq)
+            && from_seq > to_seq
+        {
+            return Err(DbError::invalid(
+                "range",
+                format!("from_seq {from_seq} must be <= to_seq {to_seq}"),
+            ));
+        }
+        Ok((from_seq, to_seq))
+    }
+}
+
+/// Stable replay payload for ATC raw experience rows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExperienceStream {
+    pub range: SequenceRange,
+    pub rows: Vec<ExperienceRow>,
+}
+
+/// Result of compacting aged ATC raw experience rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactSummary {
+    pub max_age_micros: i64,
+    pub cutoff_ts_micros: i64,
+    pub deleted_rows: usize,
+    pub preserved_rollups: bool,
+}
 
 /// Lightweight open-experience summary for the policy engine.
 #[derive(Debug, Clone)]
@@ -691,6 +751,28 @@ pub struct OpenExperienceSummary {
     pub executed_ts_micros: Option<i64>,
 }
 
+impl From<&ExperienceRow> for OpenExperienceSummary {
+    fn from(row: &ExperienceRow) -> Self {
+        Self {
+            experience_id: i64::try_from(row.experience_id).unwrap_or(i64::MAX),
+            decision_id: i64::try_from(row.decision_id).unwrap_or(i64::MAX),
+            effect_id: i64::try_from(row.effect_id).unwrap_or(i64::MAX),
+            trace_id: row.trace_id.clone(),
+            state: row.state.to_string(),
+            subsystem: row.subsystem.to_string(),
+            decision_class: row.decision_class.clone(),
+            subject: row.subject.clone(),
+            project_key: row.project_key.clone(),
+            effect_kind: row.effect_kind.to_string(),
+            action: row.action.clone(),
+            expected_loss: row.expected_loss,
+            created_ts_micros: row.created_ts_micros,
+            dispatched_ts_micros: row.dispatched_ts_micros,
+            executed_ts_micros: row.executed_ts_micros,
+        }
+    }
+}
+
 fn opt_i64(row: &Row, idx: usize) -> Option<i64> {
     row.get(idx).and_then(|v| match v {
         Value::BigInt(n) => Some(*n),
@@ -700,6 +782,7 @@ fn opt_i64(row: &Row, idx: usize) -> Option<i64> {
     })
 }
 
+#[cfg(test)]
 fn decode_open_experience(row: &Row) -> OpenExperienceSummary {
     OpenExperienceSummary {
         experience_id: row_i64_idx(row, 0),
@@ -725,8 +808,67 @@ fn decode_open_experience(row: &Row) -> OpenExperienceSummary {
     }
 }
 
-fn build_open_experience_query(filter: &OpenExperienceFilter) -> (String, Vec<Value>) {
-    let mut sql = String::from(OPEN_EXPERIENCE_BASE_SQL);
+fn parse_open_experience_stratum(raw: &str) -> Result<TouchedStratum, DbError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(DbError::invalid(
+            "stratum_key",
+            "stratum_key must not be empty",
+        ));
+    }
+
+    // Early fixtures used `|`; the current canonical form is `subsystem:effect:tier`.
+    let delimiter = if trimmed.contains(':') {
+        ':'
+    } else if trimmed.contains('|') {
+        '|'
+    } else {
+        return Err(DbError::invalid(
+            "stratum_key",
+            format!("invalid stratum_key '{trimmed}'; expected subsystem:effect_kind:risk_tier"),
+        ));
+    };
+    let parts = trimmed.split(delimiter).collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Err(DbError::invalid(
+            "stratum_key",
+            format!("invalid stratum_key '{trimmed}'; expected subsystem:effect_kind:risk_tier"),
+        ));
+    }
+
+    let subsystem = parts[0].trim();
+    let effect_kind = parts[1].trim();
+    let risk_tier = parts[2].trim().parse::<i32>().map_err(|error| {
+        DbError::invalid(
+            "stratum_key",
+            format!("invalid risk tier in stratum_key '{trimmed}': {error}"),
+        )
+    })?;
+    let canonical = stratum_for_row(subsystem, effect_kind).ok_or_else(|| {
+        DbError::invalid(
+            "stratum_key",
+            format!("unknown ATC stratum effect_kind '{effect_kind}'"),
+        )
+    })?;
+    if canonical.risk_tier != risk_tier {
+        return Err(DbError::invalid(
+            "stratum_key",
+            format!(
+                "risk tier {risk_tier} does not match canonical tier {} for {subsystem}:{effect_kind}",
+                canonical.risk_tier
+            ),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn build_open_experience_query(
+    filter: &OpenExperienceFilter,
+) -> Result<(String, Vec<Value>), DbError> {
+    let mut sql = format!(
+        "{} WHERE state IN ('open', 'dispatched', 'executed', 'planned')",
+        crate::queries::ATC_EXPERIENCE_SELECT_COLUMNS_SQL
+    );
     let mut params = Vec::new();
     if let Some(ref subsystem) = filter.subsystem {
         sql.push_str(" AND subsystem = ?");
@@ -740,27 +882,69 @@ fn build_open_experience_query(filter: &OpenExperienceFilter) -> (String, Vec<Va
         sql.push_str(" AND project_key = ?");
         params.push(Value::Text(project_key.clone()));
     }
-    sql.push_str(" ORDER BY created_ts DESC");
+    if let Some(since_ts_micros) = filter.since_ts_micros {
+        sql.push_str(" AND created_ts >= ?");
+        params.push(Value::BigInt(since_ts_micros));
+    }
+    if let Some(ref stratum_key) = filter.stratum_key {
+        let stratum = parse_open_experience_stratum(stratum_key)?;
+        sql.push_str(" AND subsystem = ? AND effect_kind = ?");
+        params.push(Value::Text(stratum.subsystem));
+        params.push(Value::Text(stratum.effect_kind));
+    }
+    sql.push_str(" ORDER BY created_ts DESC, experience_id DESC");
     if let Some(limit) = filter.limit {
         sql.push_str(&format!(" LIMIT {limit}"));
     }
-    (sql, params)
+    Ok((sql, params))
+}
+
+fn build_replay_query(range: SequenceRange) -> Result<(String, Vec<Value>), DbError> {
+    let (from_seq, to_seq) = range.sql_bounds()?;
+    let mut sql = String::from(crate::queries::ATC_EXPERIENCE_SELECT_COLUMNS_SQL);
+    let mut params = Vec::new();
+    if from_seq.is_some() || to_seq.is_some() {
+        sql.push_str(" WHERE ");
+        let mut wrote_any = false;
+        if let Some(from_seq) = from_seq {
+            sql.push_str("experience_id >= ?");
+            params.push(Value::BigInt(from_seq));
+            wrote_any = true;
+        }
+        if let Some(to_seq) = to_seq {
+            if wrote_any {
+                sql.push_str(" AND ");
+            }
+            sql.push_str("experience_id <= ?");
+            params.push(Value::BigInt(to_seq));
+        }
+    }
+    sql.push_str(" ORDER BY experience_id ASC");
+    Ok((sql, params))
+}
+
+fn decode_experience_rows(rows: &[Row]) -> Result<Vec<ExperienceRow>, DbError> {
+    let mut decoded = Vec::with_capacity(rows.len());
+    for row in rows {
+        decoded.push(crate::queries::decode_atc_experience_row(row)?);
+    }
+    Ok(decoded)
 }
 
 fn query_open_experiences_canonical(
     pool: &DbPool,
     filter: &OpenExperienceFilter,
-) -> Result<Vec<OpenExperienceSummary>, DbError> {
+) -> Result<Vec<ExperienceRow>, DbError> {
     let conn = crate::queries::open_canonical_atc_conn(pool, "query_open_experiences")?;
     let result = (|| {
-        let (sql, params) = build_open_experience_query(filter);
+        let (sql, params) = build_open_experience_query(filter)?;
         let rows = crate::queries::canonical_query_atc_rows(
             &conn,
             &sql,
             &params,
             "query_open_experiences",
         )?;
-        Ok(rows.iter().map(|r| decode_open_experience(r)).collect())
+        decode_experience_rows(&rows)
     })();
     crate::queries::close_canonical_db_conn(conn, "query_open_experiences connection");
     result
@@ -768,29 +952,225 @@ fn query_open_experiences_canonical(
 
 /// Read open/non-terminal experiences matching optional filters.
 ///
-/// Returns lightweight summaries — the policy engine doesn't need the
-/// full feature vectors or outcome payloads for state estimation.
+/// This returns full durable rows because the outcome sweep, operator surfaces,
+/// and transparency/debug paths all need the same underlying state machine
+/// contract, not an ad hoc projection.
 pub async fn query_open_experiences(
     cx: &Cx,
     pool: &DbPool,
-    filter: &OpenExperienceFilter,
-) -> Outcome<Vec<OpenExperienceSummary>, DbError> {
+    filter: OpenExperienceFilter,
+) -> Outcome<Vec<ExperienceRow>, DbError> {
     if pool.sqlite_path() != ":memory:" {
-        return match query_open_experiences_canonical(pool, filter) {
+        match crate::queries::ensure_file_backed_atc_pool_initialized(cx, pool).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+        return match query_open_experiences_canonical(pool, &filter) {
             Ok(rows) => Outcome::Ok(rows),
             Err(error) => Outcome::Err(error),
         };
     }
+
     let conn = match pool.acquire(cx).await {
         Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(DbError::Sqlite(e.to_string())),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
+        Outcome::Err(error) => return Outcome::Err(DbError::Sqlite(error.to_string())),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
-    let (sql, params) = build_open_experience_query(filter);
+    let (sql, params) = match build_open_experience_query(&filter) {
+        Ok(query) => query,
+        Err(error) => return Outcome::Err(error),
+    };
     match conn.query_sync(&sql, &params) {
-        Ok(rows) => Outcome::Ok(rows.iter().map(|r| decode_open_experience(r)).collect()),
+        Ok(rows) => match decode_experience_rows(&rows) {
+            Ok(rows) => Outcome::Ok(rows),
+            Err(error) => Outcome::Err(error),
+        },
         Err(error) => Outcome::Err(DbError::Sqlite(format!("query_open_experiences: {error}"))),
+    }
+}
+
+fn minimum_retention_compaction_age_micros() -> Result<i64, DbError> {
+    let rule = retention_rule(LearningArtifactKind::ResolvedExperienceRows).ok_or_else(|| {
+        DbError::Internal("missing ATC retention rule for resolved experience rows".to_string())
+    })?;
+    Ok(i64::from(rule.compact_after_days.unwrap_or(rule.hot_days)) * MICROS_PER_DAY)
+}
+
+fn validate_retention_compaction(
+    max_age_micros: i64,
+    preserve_rollups: bool,
+) -> Result<(), DbError> {
+    if max_age_micros <= 0 {
+        return Err(DbError::invalid(
+            "max_age_micros",
+            "max_age_micros must be positive",
+        ));
+    }
+
+    let minimum_age_micros = minimum_retention_compaction_age_micros()?;
+    if max_age_micros < minimum_age_micros {
+        return Err(DbError::invalid(
+            "max_age_micros",
+            format!(
+                "max_age_micros {max_age_micros} is below ATC retention policy minimum {minimum_age_micros}"
+            ),
+        ));
+    }
+
+    if !preserve_rollups {
+        let rollup_rule =
+            retention_rule(LearningArtifactKind::ExperienceRollups).ok_or_else(|| {
+                DbError::Internal("missing ATC retention rule for experience rollups".to_string())
+            })?;
+        return Err(DbError::invalid(
+            "preserve_rollups",
+            format!(
+                "rollups must remain queryable on the {:?} warm path while raw rows compact away",
+                rollup_rule.primary_plane
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn retention_compact_canonical(pool: &DbPool, cutoff_ts_micros: i64) -> Result<usize, DbError> {
+    let conn = crate::queries::open_canonical_atc_conn(pool, "retention_compact")?;
+    let result = (|| {
+        crate::queries::begin_canonical_atc_write_tx(&conn)?;
+        let deleted = crate::queries::canonical_execute_atc(
+            &conn,
+            "DELETE FROM atc_experiences \
+             WHERE state IN ('resolved', 'censored', 'expired') \
+               AND resolved_ts IS NOT NULL \
+               AND resolved_ts <= ?",
+            &[Value::BigInt(cutoff_ts_micros)],
+            "retention_compact delete",
+        )?;
+        crate::queries::commit_canonical_atc_write_tx(&conn)?;
+        Ok(deleted as usize)
+    })();
+    if result.is_err() {
+        crate::queries::rollback_canonical_atc_write_tx(&conn);
+    }
+    crate::queries::close_canonical_db_conn(conn, "retention_compact connection");
+    result
+}
+
+/// Delete aged resolved/censored/expired raw rows while preserving rollups.
+///
+/// The ATC retention contract keeps unresolved rows queryable and forces
+/// rollups to outlive raw resolved rows. This API enforces that policy.
+pub async fn retention_compact(
+    cx: &Cx,
+    pool: &DbPool,
+    max_age_micros: i64,
+    preserve_rollups: bool,
+) -> Outcome<CompactSummary, DbError> {
+    if let Err(error) = validate_retention_compaction(max_age_micros, preserve_rollups) {
+        return Outcome::Err(error);
+    }
+
+    let cutoff_ts_micros = crate::now_micros().saturating_sub(max_age_micros);
+    let deleted_rows = if pool.sqlite_path() != ":memory:" {
+        match crate::queries::ensure_file_backed_atc_pool_initialized(cx, pool).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+        match retention_compact_canonical(pool, cutoff_ts_micros) {
+            Ok(rows) => rows,
+            Err(error) => return Outcome::Err(error),
+        }
+    } else {
+        let conn = match pool.acquire(cx).await {
+            Outcome::Ok(c) => c,
+            Outcome::Err(error) => return Outcome::Err(DbError::Sqlite(error.to_string())),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        };
+        match conn.execute_sync(
+            "DELETE FROM atc_experiences \
+             WHERE state IN ('resolved', 'censored', 'expired') \
+               AND resolved_ts IS NOT NULL \
+               AND resolved_ts <= ?",
+            &[Value::BigInt(cutoff_ts_micros)],
+        ) {
+            Ok(rows) => rows as usize,
+            Err(error) => {
+                return Outcome::Err(DbError::Sqlite(format!(
+                    "retention_compact delete: {error}"
+                )));
+            }
+        }
+    };
+
+    Outcome::Ok(CompactSummary {
+        max_age_micros,
+        cutoff_ts_micros,
+        deleted_rows,
+        preserved_rollups: preserve_rollups,
+    })
+}
+
+fn replay_canonical(pool: &DbPool, range: SequenceRange) -> Result<ExperienceStream, DbError> {
+    let conn = crate::queries::open_canonical_atc_conn(pool, "replay_atc_experiences")?;
+    let result = (|| {
+        let (sql, params) = build_replay_query(range)?;
+        let rows = crate::queries::canonical_query_atc_rows(
+            &conn,
+            &sql,
+            &params,
+            "replay_atc_experiences",
+        )?;
+        Ok(ExperienceStream {
+            range,
+            rows: decode_experience_rows(&rows)?,
+        })
+    })();
+    crate::queries::close_canonical_db_conn(conn, "replay_atc_experiences connection");
+    result
+}
+
+/// Replay raw ATC experience rows in stable `experience_id` order.
+pub async fn replay(
+    cx: &Cx,
+    pool: &DbPool,
+    range: SequenceRange,
+) -> Outcome<ExperienceStream, DbError> {
+    if pool.sqlite_path() != ":memory:" {
+        match crate::queries::ensure_file_backed_atc_pool_initialized(cx, pool).await {
+            Outcome::Ok(()) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+        return match replay_canonical(pool, range) {
+            Ok(stream) => Outcome::Ok(stream),
+            Err(error) => Outcome::Err(error),
+        };
+    }
+
+    let conn = match pool.acquire(cx).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(error) => return Outcome::Err(DbError::Sqlite(error.to_string())),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let (sql, params) = match build_replay_query(range) {
+        Ok(query) => query,
+        Err(error) => return Outcome::Err(error),
+    };
+    match conn.query_sync(&sql, &params) {
+        Ok(rows) => match decode_experience_rows(&rows) {
+            Ok(rows) => Outcome::Ok(ExperienceStream { range, rows }),
+            Err(error) => Outcome::Err(error),
+        },
+        Err(error) => Outcome::Err(DbError::Sqlite(format!("replay_atc_experiences: {error}"))),
     }
 }
 
@@ -865,13 +1245,16 @@ pub async fn sweep_expired_experiences(
     pool: &DbPool,
     now_micros: i64,
 ) -> Outcome<Vec<ExpiredExperienceCandidate>, DbError> {
-    let filter = OpenExperienceFilter::default();
-    let open = match query_open_experiences(cx, pool, &filter).await {
+    let open = match query_open_experiences(cx, pool, OpenExperienceFilter::default()).await {
         Outcome::Ok(rows) => rows,
         Outcome::Err(e) => return Outcome::Err(e),
         Outcome::Cancelled(r) => return Outcome::Cancelled(r),
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
+    let open = open
+        .iter()
+        .map(OpenExperienceSummary::from)
+        .collect::<Vec<_>>();
     Outcome::Ok(find_expired_experiences(&open, now_micros))
 }
 
@@ -1042,6 +1425,56 @@ mod tests {
             Outcome::Ok(rows) => rows,
             Outcome::Err(error) => panic!("query_rollups failed: {error}"),
             Outcome::Cancelled(reason) => panic!("query_rollups cancelled: {reason:?}"),
+            Outcome::Panicked(payload) => std::panic::resume_unwind(Box::new(payload)),
+        }
+    }
+
+    fn query_open_rows(pool: &DbPool, filter: OpenExperienceFilter) -> Vec<ExperienceRow> {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build open-experience query runtime");
+        let cx = Cx::for_testing();
+        match runtime.block_on(query_open_experiences(&cx, pool, filter)) {
+            Outcome::Ok(rows) => rows,
+            Outcome::Err(error) => panic!("query_open_experiences failed: {error}"),
+            Outcome::Cancelled(reason) => {
+                panic!("query_open_experiences cancelled: {reason:?}");
+            }
+            Outcome::Panicked(payload) => std::panic::resume_unwind(Box::new(payload)),
+        }
+    }
+
+    fn run_retention_compact(
+        pool: &DbPool,
+        max_age_micros: i64,
+        preserve_rollups: bool,
+    ) -> CompactSummary {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build compaction runtime");
+        let cx = Cx::for_testing();
+        match runtime.block_on(retention_compact(
+            &cx,
+            pool,
+            max_age_micros,
+            preserve_rollups,
+        )) {
+            Outcome::Ok(summary) => summary,
+            Outcome::Err(error) => panic!("retention_compact failed: {error}"),
+            Outcome::Cancelled(reason) => panic!("retention_compact cancelled: {reason:?}"),
+            Outcome::Panicked(payload) => std::panic::resume_unwind(Box::new(payload)),
+        }
+    }
+
+    fn run_replay(pool: &DbPool, range: SequenceRange) -> ExperienceStream {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build replay runtime");
+        let cx = Cx::for_testing();
+        match runtime.block_on(replay(&cx, pool, range)) {
+            Outcome::Ok(stream) => stream,
+            Outcome::Err(error) => panic!("replay failed: {error}"),
+            Outcome::Cancelled(reason) => panic!("replay cancelled: {reason:?}"),
             Outcome::Panicked(payload) => std::panic::resume_unwind(Box::new(payload)),
         }
     }
@@ -1268,7 +1701,7 @@ mod tests {
     #[test]
     fn build_query_with_no_filter() {
         let filter = OpenExperienceFilter::default();
-        let (sql, params) = build_open_experience_query(&filter);
+        let (sql, params) = build_open_experience_query(&filter).expect("build query");
         assert!(sql.contains("WHERE state IN"));
         assert!(sql.contains("ORDER BY created_ts DESC"));
         assert!(!sql.contains("LIMIT"));
@@ -1278,17 +1711,230 @@ mod tests {
     #[test]
     fn build_query_with_all_filters() {
         let filter = OpenExperienceFilter {
-            subsystem: Some("liveness".to_string()),
             subject: Some("GreenCastle".to_string()),
             project_key: Some("proj-a".to_string()),
+            since_ts_micros: Some(1_000_000),
+            stratum_key: Some("liveness:probe:0".to_string()),
             limit: Some(50),
+            ..Default::default()
         };
-        let (sql, params) = build_open_experience_query(&filter);
-        assert!(sql.contains("AND subsystem = ?"));
+        let (sql, params) = build_open_experience_query(&filter).expect("build query");
         assert!(sql.contains("AND subject = ?"));
         assert!(sql.contains("AND project_key = ?"));
+        assert!(sql.contains("AND created_ts >= ?"));
+        assert!(sql.contains("AND subsystem = ? AND effect_kind = ?"));
         assert!(sql.contains("LIMIT 50"));
-        assert_eq!(params.len(), 3);
+        assert_eq!(params.len(), 5);
+    }
+
+    #[test]
+    fn query_open_experiences_respects_since_and_stratum_filters() {
+        let pool = test_pool();
+        let specs = vec![
+            TestExperienceSpec {
+                experience_id: 1,
+                subsystem: "liveness".to_string(),
+                effect_kind: "probe".to_string(),
+                state: "open".to_string(),
+                created_ts_micros: 1_000_000,
+                resolved_ts_micros: None,
+                correct: None,
+                actual_loss: None,
+                regret: None,
+            },
+            TestExperienceSpec {
+                experience_id: 2,
+                subsystem: "conflict".to_string(),
+                effect_kind: "release".to_string(),
+                state: "executed".to_string(),
+                created_ts_micros: 1_500_000,
+                resolved_ts_micros: None,
+                correct: None,
+                actual_loss: None,
+                regret: None,
+            },
+            TestExperienceSpec {
+                experience_id: 3,
+                subsystem: "conflict".to_string(),
+                effect_kind: "release".to_string(),
+                state: "open".to_string(),
+                created_ts_micros: 2_000_000,
+                resolved_ts_micros: None,
+                correct: None,
+                actual_loss: None,
+                regret: None,
+            },
+            TestExperienceSpec {
+                experience_id: 4,
+                subsystem: "conflict".to_string(),
+                effect_kind: "release".to_string(),
+                state: "resolved".to_string(),
+                created_ts_micros: 2_100_000,
+                resolved_ts_micros: Some(2_105_000),
+                correct: Some(true),
+                actual_loss: Some(0.0),
+                regret: Some(0.0),
+            },
+        ];
+        for spec in &specs {
+            insert_experience(&pool, spec);
+        }
+
+        let rows = query_open_rows(
+            &pool,
+            OpenExperienceFilter {
+                since_ts_micros: Some(1_400_000),
+                stratum_key: Some("conflict:release:2".to_string()),
+                limit: Some(10),
+                ..Default::default()
+            },
+        );
+        let ids = rows.iter().map(|row| row.experience_id).collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![3, 2]);
+        assert_eq!(rows[0].state.to_string(), "open");
+        assert_eq!(rows[1].state.to_string(), "executed");
+        assert!(
+            rows.iter()
+                .all(|row| row.subsystem.to_string() == "conflict"
+                    && row.effect_kind.to_string() == "release")
+        );
+    }
+
+    #[test]
+    fn retention_compact_deletes_old_terminal_rows_and_preserves_rollups() {
+        let pool = test_pool();
+        let max_age_micros = minimum_retention_compaction_age_micros().expect("policy age");
+        let now = crate::now_micros();
+        let old_resolved_ts = now - max_age_micros - 10_000_000;
+        let old_censored_ts = now - max_age_micros - 20_000_000;
+        let recent_resolved_ts = now - max_age_micros + 10_000_000;
+
+        let specs = vec![
+            TestExperienceSpec {
+                experience_id: 1,
+                subsystem: "liveness".to_string(),
+                effect_kind: "probe".to_string(),
+                state: "resolved".to_string(),
+                created_ts_micros: old_resolved_ts - 5_000,
+                resolved_ts_micros: Some(old_resolved_ts),
+                correct: Some(true),
+                actual_loss: Some(0.0),
+                regret: Some(0.0),
+            },
+            TestExperienceSpec {
+                experience_id: 2,
+                subsystem: "conflict".to_string(),
+                effect_kind: "release".to_string(),
+                state: "censored".to_string(),
+                created_ts_micros: old_censored_ts - 5_000,
+                resolved_ts_micros: Some(old_censored_ts),
+                correct: None,
+                actual_loss: None,
+                regret: None,
+            },
+            TestExperienceSpec {
+                experience_id: 3,
+                subsystem: "liveness".to_string(),
+                effect_kind: "probe".to_string(),
+                state: "resolved".to_string(),
+                created_ts_micros: recent_resolved_ts - 5_000,
+                resolved_ts_micros: Some(recent_resolved_ts),
+                correct: Some(false),
+                actual_loss: Some(1.0),
+                regret: Some(0.5),
+            },
+            TestExperienceSpec {
+                experience_id: 4,
+                subsystem: "liveness".to_string(),
+                effect_kind: "probe".to_string(),
+                state: "open".to_string(),
+                created_ts_micros: old_resolved_ts - 10_000,
+                resolved_ts_micros: None,
+                correct: None,
+                actual_loss: None,
+                regret: None,
+            },
+        ];
+        for spec in &specs {
+            insert_experience(&pool, spec);
+        }
+
+        run_refresh(&pool, now, now.max(1));
+        let before_rollups = fetch_rollups(&pool);
+        let summary = run_retention_compact(&pool, max_age_micros, true);
+        let after_rollups = fetch_rollups(&pool);
+        let replayed = run_replay(&pool, SequenceRange::default());
+        let ids = replayed
+            .rows
+            .iter()
+            .map(|row| row.experience_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(summary.deleted_rows, 2);
+        assert!(summary.preserved_rollups);
+        assert_eq!(before_rollups, after_rollups);
+        assert_eq!(ids, vec![3, 4]);
+    }
+
+    #[test]
+    fn replay_returns_rows_in_stable_sequence_order() {
+        let pool = test_pool();
+        let specs = vec![
+            TestExperienceSpec {
+                experience_id: 20,
+                subsystem: "liveness".to_string(),
+                effect_kind: "probe".to_string(),
+                state: "open".to_string(),
+                created_ts_micros: 3_000_000,
+                resolved_ts_micros: None,
+                correct: None,
+                actual_loss: None,
+                regret: None,
+            },
+            TestExperienceSpec {
+                experience_id: 5,
+                subsystem: "conflict".to_string(),
+                effect_kind: "release".to_string(),
+                state: "executed".to_string(),
+                created_ts_micros: 9_000_000,
+                resolved_ts_micros: None,
+                correct: None,
+                actual_loss: None,
+                regret: None,
+            },
+            TestExperienceSpec {
+                experience_id: 11,
+                subsystem: "liveness".to_string(),
+                effect_kind: "advisory".to_string(),
+                state: "resolved".to_string(),
+                created_ts_micros: 1_000_000,
+                resolved_ts_micros: Some(1_005_000),
+                correct: Some(true),
+                actual_loss: Some(0.1),
+                regret: Some(0.0),
+            },
+        ];
+        for spec in &specs {
+            insert_experience(&pool, spec);
+        }
+
+        let stream = run_replay(
+            &pool,
+            SequenceRange {
+                from_seq: Some(5),
+                to_seq: Some(20),
+            },
+        );
+        let ids = stream
+            .rows
+            .iter()
+            .map(|row| row.experience_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec![5, 11, 20]);
+        assert_eq!(stream.range.from_seq, Some(5));
+        assert_eq!(stream.range.to_seq, Some(20));
     }
 
     #[test]
