@@ -720,7 +720,14 @@ pub fn default_storage_root_path() -> PathBuf {
     let legacy = configured_home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".mcp_agent_mail_git_mailbox_repo");
-    if legacy.exists() {
+    // Only prefer the legacy path if it actually *contains* an archive.
+    // A bare-`exists()` check lets an empty `~/.mcp_agent_mail_git_mailbox_repo/`
+    // stub (left over from a prior install, or created by accident) win
+    // over a populated XDG archive — which then makes the pre-commit
+    // guard unable to locate any project (#95). Requiring `projects/`
+    // inside matches the invariant that `resolve_archive_root` later
+    // relies on anyway.
+    if legacy.join("projects").is_dir() {
         legacy
     } else {
         xdg_data_dir()
@@ -3933,7 +3940,9 @@ mod tests {
         let home = tmp.path().join("home");
         let legacy = home.join(".mcp_agent_mail_git_mailbox_repo");
         let xdg_data = tmp.path().join("xdg-data");
-        std::fs::create_dir_all(&legacy).expect("create legacy repo");
+        // A populated legacy archive has a `projects/` subdir; that's
+        // the invariant the resolver downstream checks for anyway.
+        std::fs::create_dir_all(legacy.join("projects")).expect("create legacy repo");
         std::fs::create_dir_all(&xdg_data).expect("create xdg data");
         let home_text = home.to_string_lossy().into_owned();
         let xdg_data_text = xdg_data.to_string_lossy().into_owned();
@@ -3947,6 +3956,35 @@ mod tests {
         );
 
         assert_eq!(resolved, legacy);
+    }
+
+    #[test]
+    fn default_storage_root_path_ignores_empty_legacy_dir_and_falls_back_to_xdg() {
+        // Regression for #95: an empty `~/.mcp_agent_mail_git_mailbox_repo`
+        // stub (from a prior install or accidental mkdir) used to be
+        // preferred via `legacy.exists()`, which then made the pre-commit
+        // guard fail to locate the real archive under XDG.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let legacy = home.join(".mcp_agent_mail_git_mailbox_repo");
+        let xdg_data = tmp.path().join("xdg-data");
+        std::fs::create_dir_all(&legacy).expect("create empty legacy stub");
+        std::fs::create_dir_all(&xdg_data).expect("create xdg data");
+        let home_text = home.to_string_lossy().into_owned();
+        let xdg_data_text = xdg_data.to_string_lossy().into_owned();
+
+        let resolved = with_process_env_overrides_for_test(
+            &[
+                ("HOME", home_text.as_str()),
+                ("XDG_DATA_HOME", xdg_data_text.as_str()),
+            ],
+            default_storage_root_path,
+        );
+
+        assert_eq!(
+            resolved,
+            xdg_data.join(XDG_APP_DIR).join("git_mailbox_repo")
+        );
     }
 
     // -----------------------------------------------------------------------

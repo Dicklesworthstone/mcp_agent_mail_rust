@@ -26175,9 +26175,9 @@ http_headers = { Authorization = "Bearer secret" }
                     conn.query_sync(&probe, &[]).is_ok(),
                     "table {expected} should exist after migration"
                 );
-                }
+            }
+            },
         );
-        }
     }
 
     #[test]

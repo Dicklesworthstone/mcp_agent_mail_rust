@@ -482,9 +482,14 @@ def default_storage_root():
         if value:
             return os.path.expanduser(value)
     
-    # Match Rust core's default_storage_root_path logic
+    # Match Rust core's default_storage_root_path logic.
+    # Only honor the legacy path if it actually *contains* an archive —
+    # an empty-directory stub at ~/.mcp_agent_mail_git_mailbox_repo (left
+    # over from a prior install, or created accidentally) used to win
+    # over the real XDG archive and make every commit fail with
+    # "guard could not locate archive for project '...'" (#95).
     legacy = os.path.expanduser("~/.mcp_agent_mail_git_mailbox_repo")
-    if os.path.exists(legacy):
+    if is_real_directory(os.path.join(legacy, "projects")):
         return legacy
         
     # XDG Data path fallback
