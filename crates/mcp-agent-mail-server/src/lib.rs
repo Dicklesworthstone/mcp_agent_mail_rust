@@ -9038,6 +9038,69 @@ impl HttpState {
                     self.config.storage_root.as_path(),
                     &mut body,
                 );
+                // Flip /health to 503 when the mailbox verdict is corrupt,
+                // so external supervisors observing only HTTP status detect
+                // the same "runtime silently auto-reconstructing" state
+                // that `durability_state=corrupt` already surfaces in logs.
+                // (See #94: a 24h `integrity_check` cadence plus silent
+                // archive-fallback previously let /health stay green while
+                // on-disk corruption persisted for hours.)
+                let status_code = match probe_runtime_durability_state(
+                    &self.config.database_url,
+                    self.config.storage_root.as_path(),
+                ) {
+                    Some(durability) => {
+                        body["durability_state"] =
+                            serde_json::json!(durability.to_string());
+                        if matches!(
+                            durability,
+                            mcp_agent_mail_db::DurabilityState::Corrupt
+                                | mcp_agent_mail_db::DurabilityState::Recovering
+                        ) {
+                            body["status"] = serde_json::json!("degraded");
+                            503
+                        } else if matches!(
+                            durability,
+                            mcp_agent_mail_db::DurabilityState::DegradedReadOnly
+                        ) {
+                            // Reads still work; keep 200 but signal the
+                            // degraded state in the body so callers can
+                            // opt into strict behavior.
+                            body["status"] = serde_json::json!("ready_degraded");
+                            200
+                        } else {
+                            200
+                        }
+                    }
+                    None => 200,
+                };
+                return Some(self.health_json_response(req, status_code, &body));
+            }
+            "/health/durability" => {
+                if !matches!(req.method, Http1Method::Get) {
+                    return Some(self.error_response(req, 405, "Method Not Allowed"));
+                }
+                // Dedicated sub-route for supervisors that want the runtime
+                // durability verdict without any readiness-gating side effects.
+                // Always returns 200 with the current verdict state as JSON so
+                // scrapers can diff `durability_state` across polls without
+                // misinterpreting transient 503s from /health.
+                let durability = probe_runtime_durability_state(
+                    &self.config.database_url,
+                    self.config.storage_root.as_path(),
+                );
+                let body = match durability {
+                    Some(state) => serde_json::json!({
+                        "durability_state": state.to_string(),
+                        "allows_reads": state.allows_reads(),
+                        "allows_writes": state.allows_writes(),
+                    }),
+                    None => serde_json::json!({
+                        "durability_state": "unknown",
+                        "allows_reads": true,
+                        "allows_writes": true,
+                    }),
+                };
                 return Some(self.health_json_response(req, 200, &body));
             }
             "/.well-known/oauth-authorization-server"
@@ -12813,6 +12876,28 @@ fn log_active_database(config: &mcp_agent_mail_core::Config) {
 /// and `version`.  Count queries are best-effort — if they fail the
 /// corresponding fields are set to `null` rather than degrading the overall
 /// readiness signal.
+/// Fast-path mailbox-verdict probe used by `/health` and
+/// `/health/durability` (#94). Returns `None` for :memory: DBs (where there
+/// is no file to probe) or when the verdict engine itself panics; both cases
+/// are indistinguishable from "healthy" from the supervisor's point of view,
+/// so we don't flip status code on them.
+fn probe_runtime_durability_state(
+    database_url: &str,
+    storage_root: &Path,
+) -> Option<mcp_agent_mail_db::DurabilityState> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(database_url) {
+        return None;
+    }
+    let verdict = mcp_agent_mail_db::compute_mailbox_verdict(
+        database_url,
+        storage_root,
+        &mcp_agent_mail_db::VerdictOptions::fast(),
+    );
+    Some(mcp_agent_mail_db::DurabilityState::from_mailbox_state(
+        verdict.state,
+    ))
+}
+
 fn enrich_readiness_response(
     database_url: &str,
     storage_root: &Path,

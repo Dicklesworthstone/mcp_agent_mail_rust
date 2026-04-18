@@ -100,7 +100,18 @@ pub struct Config {
     pub database_cache_budget_kb: usize,
     /// Run `PRAGMA quick_check` on pool initialization (default: true).
     pub integrity_check_on_startup: bool,
-    /// Hours between periodic full `PRAGMA integrity_check` runs (default: 24, 0 = disabled).
+    /// Hours between periodic full `PRAGMA integrity_check` runs
+    /// (default: 1, 0 = disabled).
+    ///
+    /// Historical note (#94): this used to default to 24h. In practice,
+    /// long-running `serve-http` instances can silently accumulate
+    /// `message_recipients` index inconsistencies between ticks while the
+    /// runtime's own archive-snapshot auto-recovery keeps `/health` green —
+    /// so a once-a-day cadence routinely hid real on-disk corruption for
+    /// many hours. 1h is short enough that an operator noticing stale
+    /// status flips it in under an hour, while still being long enough
+    /// that a full scan (which walks every page) stays well under
+    /// ambient write throughput.
     pub integrity_check_interval_hours: u64,
 
     // FrankenSQLite MVCC / RaptorQ
@@ -961,7 +972,7 @@ impl Default for Config {
             database_pool_timeout: None,
             database_cache_budget_kb: 512 * 1024, // 512 MiB
             integrity_check_on_startup: true,
-            integrity_check_interval_hours: 24,
+            integrity_check_interval_hours: 1,
 
             fsqlite_concurrent_mode: false,
             fsqlite_raptorq_enabled: true,
