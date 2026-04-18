@@ -6717,16 +6717,10 @@ fn atc_reservation_conflicts(
     )?;
     let mut conflicts = reservations.conflicts;
     if let Some(focus_agent) = focus_agent {
-        let has_focus = conflicts.iter().any(|conflict| {
+        conflicts.retain(|conflict| {
             conflict.agent_a.eq_ignore_ascii_case(focus_agent)
                 || conflict.agent_b.eq_ignore_ascii_case(focus_agent)
         });
-        if has_focus {
-            conflicts.retain(|conflict| {
-                conflict.agent_a.eq_ignore_ascii_case(focus_agent)
-                    || conflict.agent_b.eq_ignore_ascii_case(focus_agent)
-            });
-        }
     }
     Ok(conflicts)
 }
@@ -7333,16 +7327,10 @@ fn atc_conflict_data(
     limit: usize,
 ) -> AtcConflictData {
     if let Some(focus_agent) = focus_agent {
-        let has_focus = reservation_conflicts.iter().any(|conflict| {
+        reservation_conflicts.retain(|conflict| {
             conflict.agent_a.eq_ignore_ascii_case(focus_agent)
                 || conflict.agent_b.eq_ignore_ascii_case(focus_agent)
         });
-        if has_focus {
-            reservation_conflicts.retain(|conflict| {
-                conflict.agent_a.eq_ignore_ascii_case(focus_agent)
-                    || conflict.agent_b.eq_ignore_ascii_case(focus_agent)
-            });
-        }
     }
     reservation_conflicts.sort_by(|left, right| {
         left.agent_a
@@ -9459,6 +9447,28 @@ mod tests {
                 .and_then(|executions| executions.first())
                 .map(|execution| execution.trace_id.as_str()),
             Some("atc-trace-12")
+        );
+    }
+
+    #[test]
+    fn atc_conflict_data_hides_unrelated_conflicts_for_focused_agent() {
+        let data = atc_conflict_data(
+            &sample_atc_snapshot(),
+            vec![ReservationConflict {
+                agent_a: "AlphaAgent".to_string(),
+                path_a: "src/**".to_string(),
+                agent_b: "BetaAgent".to_string(),
+                path_b: "src/server/**".to_string(),
+            }],
+            Some("GammaAgent"),
+            None,
+            5,
+        );
+
+        assert!(
+            data.reservation_conflicts.is_empty(),
+            "focused agent without conflicts should not inherit unrelated contention: {:?}",
+            data.reservation_conflicts
         );
     }
 
