@@ -270,6 +270,7 @@ Provides asynchronous multi-agent coordination via a mail metaphor: identities, 
 ### Documentation
 
 - Deferred browser parity reference: `docs/SPEC-browser-parity-contract-deferred.md`
+- Threat model and security posture reference: `docs/SPEC-threat-model.md`
 - Parked prototype: `experimental/mcp-agent-mail-wasm/` is deferred prior art, not
   an active workspace crate or shipped browser surface
 
