@@ -18292,11 +18292,12 @@ mod tests {
                     .expect("ensure project");
                     let project_id = project.id.expect("project id");
 
+                    let sender_name = "BlueLake".to_string();
                     let sender = create_agent(
                         &cx,
                         &pool,
                         project_id,
-                        &format!("BlueLake{iteration}"),
+                        &sender_name,
                         "codex-cli",
                         "gpt-5",
                         Some("sender"),
@@ -18307,11 +18308,12 @@ mod tests {
                     .expect("create sender");
                     let sender_id = sender.id.expect("sender id");
 
+                    let recipient_name = "GreenStone".to_string();
                     let recipient = create_agent(
                         &cx,
                         &pool,
                         project_id,
-                        &format!("GreenStone{iteration}"),
+                        &recipient_name,
                         "codex-cli",
                         "gpt-5",
                         Some("recipient"),
@@ -18346,7 +18348,7 @@ mod tests {
                             .into_result()
                             .expect("list recipients");
                     assert_eq!(recipients.len(), 1, "recipient row should persist");
-                    assert_eq!(recipients[0].agent_id, recipient_id);
+                    assert_eq!(recipients[0].name, recipient_name);
                     assert_eq!(recipients[0].kind, "to");
                 });
 
