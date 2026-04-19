@@ -26,13 +26,14 @@
 //! ```
 
 use crate::integrity::{
-    CheckKind, MailboxIntegrityStatus, MailboxIntegrityVerdict, inspect_mailbox_integrity,
+    inspect_mailbox_integrity, CheckKind, MailboxIntegrityStatus, MailboxIntegrityVerdict,
 };
 use crate::pool::{
-    MailboxOwnershipDisposition, MailboxOwnershipState, MailboxRecoveryLockState,
-    MailboxSidecarState, inspect_mailbox_db_inventory, inspect_mailbox_ownership,
-    inspect_mailbox_recovery_lock, inspect_mailbox_sidecar_state, resolve_mailbox_sqlite_path,
+    inspect_mailbox_db_inventory, inspect_mailbox_ownership, inspect_mailbox_recovery_lock,
+    inspect_mailbox_sidecar_state, resolve_mailbox_sqlite_path,
     sqlite_compatibility_read_path_is_healthy, sqlite_primary_read_path_is_healthy,
+    MailboxOwnershipDisposition, MailboxOwnershipState, MailboxRecoveryLockState,
+    MailboxSidecarState,
 };
 use crate::reconstruct::{archive_missing_project_identities, scan_archive_message_inventory};
 use serde::{Deserialize, Serialize};
@@ -1816,11 +1817,9 @@ mod tests {
         assert!(!probe.passed);
         assert_eq!(probe.severity, ProbeSeverity::Warning);
         assert_eq!(probe.impact_state, MailboxState::Suspect);
-        assert!(
-            probe
-                .detail
-                .contains("Malformed or non-file SQLite sidecar artifact present")
-        );
+        assert!(probe
+            .detail
+            .contains("Malformed or non-file SQLite sidecar artifact present"));
     }
 
     #[test]
