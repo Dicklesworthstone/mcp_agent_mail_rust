@@ -23,7 +23,7 @@ use mcp_agent_mail_core::{
     FeatureVector, NonExecutionReason, ResolutionKind, infer_feature_schema_version,
     migrate_feature_payload, validate_transition,
 };
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sqlmodel::prelude::*;
 use sqlmodel_core::{Connection, Dialect, Error as SqlError, IsolationLevel, PreparedStatement};
 use sqlmodel_core::{Row as SqlRow, TransactionOps, Value};
@@ -644,6 +644,58 @@ pub(crate) fn decode_atc_experience_row(
 const PROJECT_SELECT_ALL_SQL: &str =
     "SELECT id, slug, human_key, created_at FROM projects ORDER BY id ASC";
 pub type AtcRollupRow = (String, i64, i64, i64, i64, i64, i64, f64, f64, f64, f64);
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct AtcRollupSnapshotRow {
+    stratum_key: String,
+    subsystem: String,
+    effect_kind: String,
+    risk_tier: i64,
+    total_count: i64,
+    resolved_count: i64,
+    censored_count: i64,
+    expired_count: i64,
+    correct_count: i64,
+    incorrect_count: i64,
+    total_regret: f64,
+    total_loss: f64,
+    ewma_loss: f64,
+    ewma_weight: f64,
+    delay_sum_micros: i64,
+    delay_count: i64,
+    delay_max_micros: i64,
+    last_updated_ts: i64,
+    compacted_total_count: i64,
+    compacted_resolved_count: i64,
+    compacted_censored_count: i64,
+    compacted_expired_count: i64,
+    compacted_correct_count: i64,
+    compacted_incorrect_count: i64,
+    compacted_total_regret: f64,
+    compacted_total_loss: f64,
+    compacted_ewma_loss: f64,
+    compacted_ewma_weight: f64,
+    compacted_delay_sum_micros: i64,
+    compacted_delay_count: i64,
+    compacted_delay_max_micros: i64,
+    compacted_last_updated_ts: i64,
+}
+
+const ATC_ROLLUP_SNAPSHOT_SELECT_SQL: &str = "\
+    SELECT stratum_key, subsystem, effect_kind, risk_tier, \
+           total_count, resolved_count, censored_count, expired_count, \
+           correct_count, incorrect_count, total_regret, total_loss, \
+           ewma_loss, ewma_weight, delay_sum_micros, delay_count, \
+           delay_max_micros, last_updated_ts, \
+           compacted_total_count, compacted_resolved_count, \
+           compacted_censored_count, compacted_expired_count, \
+           compacted_correct_count, compacted_incorrect_count, \
+           compacted_total_regret, compacted_total_loss, \
+           compacted_ewma_loss, compacted_ewma_weight, \
+           compacted_delay_sum_micros, compacted_delay_count, \
+           compacted_delay_max_micros, compacted_last_updated_ts \
+    FROM atc_experience_rollups ORDER BY stratum_key";
+
 pub(crate) const ATC_EXPERIENCE_SELECT_COLUMNS_SQL: &str = "SELECT experience_id, decision_id, effect_id, trace_id, claim_id, evidence_id, state, subsystem, decision_class, subject, project_key, policy_id, effect_kind, action, posterior_json, expected_loss, runner_up_action, runner_up_loss, evidence_summary, calibration_healthy, safe_mode_active, non_execution_json, outcome_json, features_json, feature_ext_json, feature_schema_version, created_ts, dispatched_ts, executed_ts, resolved_ts, context_json FROM atc_experiences";
 const FILE_RESERVATION_SELECT_COLUMNS_SQL: &str = "SELECT id, project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts \
      FROM file_reservations";
@@ -781,6 +833,19 @@ pub(crate) fn value_as_i64(value: &Value) -> Option<i64> {
         Value::Float(f) if f.is_finite() => Some(*f as i64),
         Value::Double(d) if d.is_finite() => Some(*d as i64),
         Value::Text(s) => s.parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn value_as_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Double(n) => Some(*n),
+        Value::Float(n) => Some(f64::from(*n)),
+        Value::BigInt(n) => Some(*n as f64),
+        Value::Int(n) => Some(f64::from(*n)),
+        Value::SmallInt(n) => Some(f64::from(*n)),
+        Value::TinyInt(n) => Some(f64::from(*n)),
+        Value::Text(s) => s.parse::<f64>().ok(),
         _ => None,
     }
 }
@@ -2549,13 +2614,84 @@ fn fetch_atc_rollups_file_backed(pool: &DbPool) -> std::result::Result<Vec<AtcRo
     result
 }
 
+fn row_text_or_default(row: &SqlRow, idx: usize) -> String {
+    row.get(idx)
+        .and_then(|value| match value {
+            Value::Text(text) => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn row_i64_or_default(row: &SqlRow, idx: usize) -> i64 {
+    row.get(idx).and_then(value_as_i64).unwrap_or(0)
+}
+
+fn row_f64_or_default(row: &SqlRow, idx: usize) -> f64 {
+    row.get(idx).and_then(value_as_f64).unwrap_or(0.0)
+}
+
+fn decode_atc_rollup_snapshot_row(row: &SqlRow) -> AtcRollupSnapshotRow {
+    AtcRollupSnapshotRow {
+        stratum_key: row_text_or_default(row, 0),
+        subsystem: row_text_or_default(row, 1),
+        effect_kind: row_text_or_default(row, 2),
+        risk_tier: row_i64_or_default(row, 3),
+        total_count: row_i64_or_default(row, 4),
+        resolved_count: row_i64_or_default(row, 5),
+        censored_count: row_i64_or_default(row, 6),
+        expired_count: row_i64_or_default(row, 7),
+        correct_count: row_i64_or_default(row, 8),
+        incorrect_count: row_i64_or_default(row, 9),
+        total_regret: row_f64_or_default(row, 10),
+        total_loss: row_f64_or_default(row, 11),
+        ewma_loss: row_f64_or_default(row, 12),
+        ewma_weight: row_f64_or_default(row, 13),
+        delay_sum_micros: row_i64_or_default(row, 14),
+        delay_count: row_i64_or_default(row, 15),
+        delay_max_micros: row_i64_or_default(row, 16),
+        last_updated_ts: row_i64_or_default(row, 17),
+        compacted_total_count: row_i64_or_default(row, 18),
+        compacted_resolved_count: row_i64_or_default(row, 19),
+        compacted_censored_count: row_i64_or_default(row, 20),
+        compacted_expired_count: row_i64_or_default(row, 21),
+        compacted_correct_count: row_i64_or_default(row, 22),
+        compacted_incorrect_count: row_i64_or_default(row, 23),
+        compacted_total_regret: row_f64_or_default(row, 24),
+        compacted_total_loss: row_f64_or_default(row, 25),
+        compacted_ewma_loss: row_f64_or_default(row, 26),
+        compacted_ewma_weight: row_f64_or_default(row, 27),
+        compacted_delay_sum_micros: row_i64_or_default(row, 28),
+        compacted_delay_count: row_i64_or_default(row, 29),
+        compacted_delay_max_micros: row_i64_or_default(row, 30),
+        compacted_last_updated_ts: row_i64_or_default(row, 31),
+    }
+}
+
+fn fetch_atc_rollup_snapshot_rows_file_backed(
+    pool: &DbPool,
+) -> std::result::Result<Vec<AtcRollupSnapshotRow>, DbError> {
+    let conn = open_canonical_atc_conn(pool, "snapshot_atc_rollups fetch")?;
+    let result = (|| {
+        let rows = canonical_query_atc_rows(
+            &conn,
+            ATC_ROLLUP_SNAPSHOT_SELECT_SQL,
+            &[],
+            "snapshot_atc_rollups fetch",
+        )?;
+        Ok(rows.iter().map(decode_atc_rollup_snapshot_row).collect())
+    })();
+    close_canonical_db_conn(conn, "canonical ATC rollup snapshot fetch connection");
+    result
+}
+
 // ── File-backed ATC rollup snapshot ─────────────────────────────────────
 
 fn snapshot_atc_rollups_file_backed(
     pool: &DbPool,
     now_micros: i64,
 ) -> std::result::Result<RollupSnapshot, DbError> {
-    let rollups = fetch_atc_rollups_file_backed(pool)?;
+    let rollups = fetch_atc_rollup_snapshot_rows_file_backed(pool)?;
     let payload = serde_json::to_string(&rollups)
         .map_err(|e| DbError::Internal(format!("snapshot rollups serialize: {e}")))?;
     let sha256 = sha256_hex(&payload);
@@ -12458,6 +12594,88 @@ mod tests {
             Outcome::Panicked(payload) => std::panic::resume_unwind(Box::new(payload)),
         }
         (cx, pool, dir)
+    }
+
+    #[test]
+    fn atc_rollup_snapshot_payload_preserves_compacted_baseline_fields() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("atc_rollup_snapshot_compacted.db");
+
+        let conn = open_canonical_atc_conn(&pool, "seed compacted rollup")
+            .expect("open canonical ATC connection");
+        canonical_execute_atc(
+            &conn,
+            "INSERT INTO atc_experience_rollups (\
+                stratum_key, subsystem, effect_kind, risk_tier,\
+                total_count, resolved_count, censored_count, expired_count,\
+                correct_count, incorrect_count, total_regret, total_loss,\
+                ewma_loss, ewma_weight, delay_sum_micros, delay_count,\
+                delay_max_micros, last_updated_ts,\
+                compacted_total_count, compacted_resolved_count,\
+                compacted_censored_count, compacted_expired_count,\
+                compacted_correct_count, compacted_incorrect_count,\
+                compacted_total_regret, compacted_total_loss,\
+                compacted_ewma_loss, compacted_ewma_weight,\
+                compacted_delay_sum_micros, compacted_delay_count,\
+                compacted_delay_max_micros, compacted_last_updated_ts\
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::Text("liveness:probe:0".to_string()),
+                Value::Text("liveness".to_string()),
+                Value::Text("probe".to_string()),
+                Value::Int(0),
+                Value::BigInt(7),
+                Value::BigInt(6),
+                Value::BigInt(0),
+                Value::BigInt(1),
+                Value::BigInt(5),
+                Value::BigInt(1),
+                Value::Double(0.75),
+                Value::Double(1.25),
+                Value::Double(0.40),
+                Value::Double(2.0),
+                Value::BigInt(12_000),
+                Value::BigInt(6),
+                Value::BigInt(4_000),
+                Value::BigInt(1_700_000_000_000_000),
+                Value::BigInt(4),
+                Value::BigInt(3),
+                Value::BigInt(0),
+                Value::BigInt(1),
+                Value::BigInt(2),
+                Value::BigInt(1),
+                Value::Double(0.50),
+                Value::Double(0.75),
+                Value::Double(0.25),
+                Value::Double(1.50),
+                Value::BigInt(8_000),
+                Value::BigInt(3),
+                Value::BigInt(3_000),
+                Value::BigInt(1_699_999_000_000_000),
+            ],
+            "seed compacted rollup",
+        )
+        .expect("seed compacted rollup");
+        close_canonical_db_conn(conn, "seed compacted rollup connection");
+
+        let snapshot = rt
+            .block_on(snapshot_atc_rollups(&cx, &pool, 1_700_000_100_000_000))
+            .into_result()
+            .expect("snapshot rollups");
+        let payload: serde_json::Value =
+            serde_json::from_str(&snapshot.payload).expect("snapshot payload JSON");
+        let first_row = payload
+            .as_array()
+            .and_then(|rows| rows.first())
+            .expect("snapshot row");
+
+        assert_eq!(first_row["compacted_total_count"], 4);
+        assert_eq!(first_row["compacted_resolved_count"], 3);
+        assert_eq!(first_row["compacted_last_updated_ts"], 1_699_999_000_000_000_i64);
     }
 
     fn make_insert_experience_test_row(
