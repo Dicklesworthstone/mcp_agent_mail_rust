@@ -2359,6 +2359,7 @@ name = "fsqlite-pager"
 version = "0.1.2"
 dependencies = [
  "argon2",
+ "bumpalo",
  "chacha20poly1305",
  "dashmap",
  "foldhash 0.1.5",

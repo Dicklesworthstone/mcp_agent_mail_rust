@@ -1329,6 +1329,7 @@ fn probe_schema_populated(db_path: &Path, archive_count: usize) -> ProbeResult {
             );
         }
     };
+    let conn = crate::guard_db_conn(conn, "mailbox_verdict::probe_schema_populated");
 
     let table_count = match conn.query_sync(
         "SELECT COUNT(*) AS table_count FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
