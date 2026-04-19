@@ -163,6 +163,14 @@ fn atc_tick_p95_micros(snapshot: &crate::AtcOperatorSnapshot) -> u64 {
         .unwrap_or(snapshot.last_tick_duration_micros)
 }
 
+fn atc_budget_observed(snapshot: &crate::AtcOperatorSnapshot) -> (&'static str, u64) {
+    if snapshot.source == "live" && snapshot.budget.kernel_total_micros > 0 {
+        ("kernel", snapshot.budget.kernel_total_micros)
+    } else {
+        ("tick", snapshot.last_tick_duration_micros)
+    }
+}
+
 fn atc_retention_status(snapshot: &crate::AtcOperatorSnapshot) -> String {
     if snapshot.observability.retention_rows_deleted_total > 0 {
         format!(
@@ -589,12 +597,15 @@ impl SystemHealthScreen {
         lines.push(Line::from_spans([
             Span::styled("Budget:    ", label_style),
             Span::styled(
-                format!(
-                    "{}us / {}us  p95≈{}us",
-                    snap.atc.last_tick_duration_micros,
-                    snap.atc.last_tick_budget_micros,
-                    atc_tick_p95_micros(&snap.atc)
-                ),
+                {
+                    let (observed_label, observed_micros) = atc_budget_observed(&snap.atc);
+                    format!(
+                        "{observed_label}={}us / {}us  p95≈{}us",
+                        observed_micros,
+                        snap.atc.last_tick_budget_micros,
+                        atc_tick_p95_micros(&snap.atc)
+                    )
+                },
                 if snap.atc.last_tick_budget_exceeded {
                     crate::tui_theme::text_warning(&tp)
                 } else {
@@ -2077,12 +2088,13 @@ fn add_atc_findings(out: &mut DiagnosticsSnapshot) {
     }
 
     if out.atc.last_tick_budget_exceeded {
+        let (observed_label, observed_micros) = atc_budget_observed(&out.atc);
         out.lines.push(ProbeLine {
             level: Level::Warn,
             name: "atc-budget",
             detail: format!(
-                "ATC tick exceeded budget: {}us > {}us",
-                out.atc.last_tick_duration_micros, out.atc.last_tick_budget_micros
+                "ATC {observed_label} exceeded budget: {}us > {}us",
+                observed_micros, out.atc.last_tick_budget_micros
             ),
             remediation: Some(
                 "Profile the ATC hot path before increasing the tick interval or budget.".into(),
@@ -3336,6 +3348,7 @@ mod tests {
                 }],
                 budget: crate::atc::AtcBudgetTelemetry {
                     mode: "pressure".to_string(),
+                    kernel_total_micros: 90,
                     budget_debt_micros: 44,
                     ..Default::default()
                 },
@@ -3375,6 +3388,12 @@ mod tests {
         assert!(out.lines.iter().any(|line| line.name == "atc-deadlocks"));
         assert!(out.lines.iter().any(|line| line.name == "atc-budget"));
         assert!(out.lines.iter().any(|line| line.name == "atc-budget-debt"));
+        assert!(out.lines.iter().any(|line| {
+            line.name == "atc-budget"
+                && line
+                    .detail
+                    .contains("ATC kernel exceeded budget: 90us > 60us")
+        }));
         assert!(
             out.lines
                 .iter()

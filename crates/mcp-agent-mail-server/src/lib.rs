@@ -4100,12 +4100,19 @@ fn atc_operator_tick_budget_status(
         tick_duration_micros,
         tick_budget_micros,
     );
-    let note = exceeded.then(|| {
-        let observed_micros = kernel_total_micros.unwrap_or(tick_duration_micros);
-        format!(
-            "ATC tick exceeded budget: {}us > {}us",
-            observed_micros, tick_budget_micros
-        )
+    let note = exceeded.then(|| match kernel_total_micros {
+        Some(kernel_micros) => {
+            format!(
+                "ATC kernel exceeded budget: {}us > {}us",
+                kernel_micros, tick_budget_micros
+            )
+        }
+        None => {
+            format!(
+                "ATC tick exceeded budget: {}us > {}us",
+                tick_duration_micros, tick_budget_micros
+            )
+        }
     });
     (exceeded, note)
 }
@@ -14599,7 +14606,10 @@ mod tests {
     fn atc_operator_budget_status_reports_kernel_runtime_when_available() {
         let (exceeded, note) = atc_operator_tick_budget_status(Some(7_500), 8_000, 5_000);
         assert!(exceeded);
-        assert_eq!(note.as_deref(), Some("ATC tick exceeded budget: 7500us > 5000us"));
+        assert_eq!(
+            note.as_deref(),
+            Some("ATC kernel exceeded budget: 7500us > 5000us")
+        );
     }
 
     #[test]
