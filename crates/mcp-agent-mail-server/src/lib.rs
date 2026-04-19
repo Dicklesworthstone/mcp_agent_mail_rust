@@ -22418,6 +22418,61 @@ first body
     }
 
     #[test]
+    fn health_durability_returns_200_with_schema() {
+        // Regression for #94 /health/durability sub-route: always 200 with
+        // { durability_state, allows_reads, allows_writes } so supervisors
+        // can diff the verdict without misinterpreting transient 503s from
+        // /health. For :memory: DBs the probe returns None, but we still
+        // emit a well-formed body with sane defaults.
+        let config = mcp_agent_mail_core::Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let req = make_request(Http1Method::Get, "/health/durability", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert!(
+            body.get("durability_state").is_some(),
+            "body must include durability_state field: {body}"
+        );
+        assert!(
+            body.get("allows_reads").and_then(|v| v.as_bool()).is_some(),
+            "body must include allows_reads bool: {body}"
+        );
+        assert!(
+            body.get("allows_writes").and_then(|v| v.as_bool()).is_some(),
+            "body must include allows_writes bool: {body}"
+        );
+    }
+
+    #[test]
+    fn health_durability_rejects_post_with_405() {
+        let config = mcp_agent_mail_core::Config::default();
+        let state = build_state(config);
+        let req = make_request(Http1Method::Post, "/health/durability", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 405);
+    }
+
+    #[test]
+    fn health_durability_bypasses_bearer_auth() {
+        // Like /healthz and /health, /health/durability must be reachable
+        // without the bearer token so k8s / systemd-style supervisors can
+        // probe it from outside the bearer-auth circle.
+        let config = mcp_agent_mail_core::Config {
+            http_bearer_token: Some("secret-token".to_string()),
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Default::default()
+        };
+        let state = build_state(config);
+        let req = make_request(Http1Method::Get, "/health/durability", &[]);
+        let resp = block_on(state.handle(req));
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
     fn well_known_oauth_returns_mcp_oauth_false() {
         let config = mcp_agent_mail_core::Config::default();
         let state = build_state(config);
