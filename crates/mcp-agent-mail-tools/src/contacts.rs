@@ -299,8 +299,20 @@ pub async fn request_contact(
     )
     .await?;
 
+    // Clamp caller-supplied TTL to [60s, 1 year], matching file_reservation_paths,
+    // acquire_build_slot, macro_file_reservation_cycle, and macro_contact_handshake.
+    // Without the upper bound, the DB writes expires_ts = now + ttl*1_000_000 (see
+    // queries::request_contact), which for an attacker-controlled i64::MAX pins the
+    // link as "pending" practically forever.
     let ttl = match ttl_seconds {
-        Some(t) if t > 0 => t.max(60),
+        Some(t) if t > 0 => {
+            if t < 60 {
+                tracing::warn!("contact ttl_seconds={t} clamped to minimum 60s");
+            } else if t > 31_536_000 {
+                tracing::warn!("contact ttl_seconds={t} clamped to maximum 31536000s (1 year)");
+            }
+            t.clamp(60, 31_536_000)
+        }
         _ => 604_800, // 7 days default
     };
     let link_out = mcp_agent_mail_db::queries::request_contact(
@@ -470,8 +482,17 @@ pub async fn respond_contact(
     )
     .await?;
 
+    // Mirror request_contact: clamp caller-supplied TTL to [60s, 1 year] so the DB's
+    // expires_ts = now + ttl*1_000_000 cannot be driven past a reasonable horizon.
     let ttl = match ttl_seconds {
-        Some(t) if t > 0 => t.max(60),
+        Some(t) if t > 0 => {
+            if t < 60 {
+                tracing::warn!("contact ttl_seconds={t} clamped to minimum 60s");
+            } else if t > 31_536_000 {
+                tracing::warn!("contact ttl_seconds={t} clamped to maximum 31536000s (1 year)");
+            }
+            t.clamp(60, 31_536_000)
+        }
         _ => 2_592_000, // 30 days default
     };
     let respond_out = mcp_agent_mail_db::queries::respond_contact(

@@ -938,8 +938,17 @@ pub async fn renew_file_reservations(
     let agent_name =
         mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
 
-    // Legacy parity: clamp too-small values up to 60 seconds.
+    // Legacy parity: clamp too-small values up to 60 seconds and too-large values
+    // to 1 year. Matches the warn-on-clamp pattern in file_reservation_paths and
+    // macro_file_reservation_cycle so silent clamping doesn't surprise callers.
     let extend = extend_seconds.map_or(1800, |t| t.clamp(60, 31_536_000));
+    if let Some(t) = extend_seconds {
+        if t < 60 {
+            tracing::warn!("extend_seconds={t} clamped to minimum 60s");
+        } else if t > 31_536_000 {
+            tracing::warn!("extend_seconds={t} clamped to maximum 31536000s (1 year)");
+        }
+    }
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;

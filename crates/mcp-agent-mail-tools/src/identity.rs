@@ -1877,7 +1877,7 @@ mod tests {
         )));
         assert!(!is_register_retryable(
             &mcp_agent_mail_db::DbError::NotFound {
-                entity: "agent".into(),
+                entity: "agent",
                 identifier: "BlueLake".into(),
             }
         ));
