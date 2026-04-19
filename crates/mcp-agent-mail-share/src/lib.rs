@@ -473,19 +473,30 @@ pub struct StoredExportConfig {
     pub scrub_preset: String,
 }
 
-fn coerce_int(value: Option<&Value>, default: i64) -> i64 {
-    let Some(value) = value else { return default };
-    if let Some(n) = value.as_i64() {
-        return n;
+fn parse_int_field(value: &Value, field: &'static str) -> ShareResult<i64> {
+    if let Some(number) = value.as_i64() {
+        return Ok(number);
     }
-    if let Some(s) = value.as_str() {
-        return s.parse::<i64>().unwrap_or(default);
+    if let Some(text) = value.as_str() {
+        return text
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| ShareError::Validation {
+                message: format!("{field} must be an integer-compatible string"),
+            });
     }
-    default
+    Err(ShareError::Validation {
+        message: format!("{field} must be an integer"),
+    })
 }
 
-fn get_object<'a>(root: &'a Value, key: &str) -> Option<&'a serde_json::Map<String, Value>> {
-    root.get(key)?.as_object()
+fn coerce_int(default: i64, candidates: &[(&'static str, Option<&Value>)]) -> ShareResult<i64> {
+    for (field, value) in candidates {
+        if let Some(value) = value {
+            return parse_int_field(value, field);
+        }
+    }
+    Ok(default)
 }
 
 fn get_str_list(value: Option<&Value>) -> Vec<String> {
@@ -503,15 +514,18 @@ fn get_str_list(value: Option<&Value>) -> Vec<String> {
 /// Load export configuration defaults from an existing bundle.
 pub fn load_bundle_export_config(bundle_dir: &Path) -> ShareResult<StoredExportConfig> {
     let manifest = load_bundle_manifest_json(bundle_dir)?;
+    let manifest_root = manifest.as_object().ok_or_else(|| ShareError::Validation {
+        message: "manifest.json must contain a JSON object".to_string(),
+    })?;
 
-    let export_config = get_object(&manifest, "export_config");
-    let attachments_section = get_object(&manifest, "attachments");
+    let export_config = manifest_root.get("export_config").and_then(Value::as_object);
+    let attachments_section = manifest_root.get("attachments").and_then(Value::as_object);
     let attachments_config = attachments_section
         .and_then(|v| v.get("config"))
         .and_then(|v| v.as_object());
-    let project_scope = get_object(&manifest, "project_scope");
-    let scrub_section = get_object(&manifest, "scrub");
-    let database_section = get_object(&manifest, "database");
+    let project_scope = manifest_root.get("project_scope").and_then(Value::as_object);
+    let scrub_section = manifest_root.get("scrub").and_then(Value::as_object);
+    let database_section = manifest_root.get("database").and_then(Value::as_object);
 
     let raw_projects = export_config
         .and_then(|v| v.get("projects"))
@@ -530,50 +544,90 @@ pub fn load_bundle_export_config(bundle_dir: &Path) -> ShareResult<StoredExportC
         .to_string();
 
     let inline_threshold = coerce_int(
-        export_config
-            .and_then(|v| v.get("inline_threshold"))
-            .or_else(|| attachments_config.and_then(|v| v.get("inline_threshold"))),
         INLINE_ATTACHMENT_THRESHOLD as i64,
-    );
+        &[
+            (
+                "manifest.export_config.inline_threshold",
+                export_config.and_then(|v| v.get("inline_threshold")),
+            ),
+            (
+                "manifest.attachments.config.inline_threshold",
+                attachments_config.and_then(|v| v.get("inline_threshold")),
+            ),
+        ],
+    )?;
     let detach_threshold = coerce_int(
-        export_config
-            .and_then(|v| v.get("detach_threshold"))
-            .or_else(|| attachments_config.and_then(|v| v.get("detach_threshold"))),
         DETACH_ATTACHMENT_THRESHOLD as i64,
-    );
+        &[
+            (
+                "manifest.export_config.detach_threshold",
+                export_config.and_then(|v| v.get("detach_threshold")),
+            ),
+            (
+                "manifest.attachments.config.detach_threshold",
+                attachments_config.and_then(|v| v.get("detach_threshold")),
+            ),
+        ],
+    )?;
     let chunk_threshold = coerce_int(
-        export_config.and_then(|v| v.get("chunk_threshold")),
         DEFAULT_CHUNK_THRESHOLD as i64,
-    );
+        &[(
+            "manifest.export_config.chunk_threshold",
+            export_config.and_then(|v| v.get("chunk_threshold")),
+        )],
+    )?;
 
     let chunk_manifest = database_section
         .and_then(|v| v.get("chunk_manifest"))
         .and_then(|v| v.as_object());
     let mut chunk_size = coerce_int(
-        export_config
-            .and_then(|v| v.get("chunk_size"))
-            .or_else(|| chunk_manifest.and_then(|v| v.get("chunk_size"))),
         DEFAULT_CHUNK_SIZE as i64,
-    );
+        &[
+            (
+                "manifest.export_config.chunk_size",
+                export_config.and_then(|v| v.get("chunk_size")),
+            ),
+            (
+                "manifest.database.chunk_manifest.chunk_size",
+                chunk_manifest.and_then(|v| v.get("chunk_size")),
+            ),
+        ],
+    )?;
 
     let chunk_config_path = bundle_dir.join("mailbox.sqlite3.config.json");
     match std::fs::symlink_metadata(&chunk_config_path) {
         Ok(metadata) if metadata.file_type().is_file() => {
-            if let Ok(text) = std::fs::read_to_string(&chunk_config_path)
-                && let Ok(config) = serde_json::from_str::<Value>(&text)
-                && let Some(obj) = config.as_object()
-            {
-                chunk_size = coerce_int(obj.get("chunk_size"), chunk_size);
-                let threshold = coerce_int(obj.get("threshold_bytes"), chunk_threshold);
-                return Ok(StoredExportConfig {
-                    projects,
-                    inline_threshold,
-                    detach_threshold,
-                    chunk_threshold: threshold,
-                    chunk_size,
-                    scrub_preset,
-                });
-            }
+            let text = std::fs::read_to_string(&chunk_config_path)?;
+            let config = serde_json::from_str::<Value>(&text).map_err(|error| {
+                ShareError::Validation {
+                    message: format!("invalid mailbox.sqlite3.config.json: {error}"),
+                }
+            })?;
+            let obj = config.as_object().ok_or_else(|| ShareError::Validation {
+                message: "mailbox.sqlite3.config.json must contain a JSON object".to_string(),
+            })?;
+            chunk_size = coerce_int(
+                chunk_size,
+                &[(
+                    "mailbox.sqlite3.config.json.chunk_size",
+                    obj.get("chunk_size"),
+                )],
+            )?;
+            let threshold = coerce_int(
+                chunk_threshold,
+                &[(
+                    "mailbox.sqlite3.config.json.threshold_bytes",
+                    obj.get("threshold_bytes"),
+                )],
+            )?;
+            return Ok(StoredExportConfig {
+                projects,
+                inline_threshold,
+                detach_threshold,
+                chunk_threshold: threshold,
+                chunk_size,
+                scrub_preset,
+            });
         }
         Ok(_) => {
             return Err(ShareError::Validation {
@@ -992,6 +1046,55 @@ mod tests {
             .expect_err("directory chunk config should fail validation");
         assert!(matches!(err, ShareError::Validation { .. }));
         assert!(err.to_string().contains("real file"));
+    }
+
+    #[test]
+    fn load_bundle_export_config_rejects_non_object_manifest_root() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("manifest.json"), "[1,2,3]").expect("write manifest");
+
+        let err =
+            load_bundle_export_config(dir.path()).expect_err("array manifest root should fail");
+        assert!(matches!(err, ShareError::Validation { .. }));
+        assert!(err.to_string().contains("manifest.json must contain a JSON object"));
+    }
+
+    #[test]
+    fn load_bundle_export_config_rejects_invalid_numeric_threshold_fields() {
+        let dir = tempdir().expect("tempdir");
+        let manifest = json!({
+            "export_config": {
+                "inline_threshold": "not_a_number",
+                "detach_threshold": null,
+                "chunk_size": false
+            }
+        });
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let err = load_bundle_export_config(dir.path())
+            .expect_err("invalid numeric threshold fields should fail validation");
+        assert!(matches!(err, ShareError::Validation { .. }));
+        assert!(err.to_string().contains("inline_threshold"));
+    }
+
+    #[test]
+    fn load_bundle_export_config_rejects_invalid_chunk_config_json() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("manifest.json"), "{}").expect("write manifest");
+        std::fs::write(
+            dir.path().join("mailbox.sqlite3.config.json"),
+            "{ invalid json",
+        )
+        .expect("write invalid chunk config");
+
+        let err = load_bundle_export_config(dir.path())
+            .expect_err("invalid chunk config json should fail validation");
+        assert!(matches!(err, ShareError::Validation { .. }));
+        assert!(err.to_string().contains("mailbox.sqlite3.config.json"));
     }
 
     #[test]

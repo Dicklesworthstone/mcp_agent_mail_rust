@@ -4024,7 +4024,7 @@ mod tests {
         );
     }
 
-    /// Manifest that is a JSON array instead of an object still fails gracefully.
+    /// Manifest that is a JSON array instead of an object is rejected.
     #[test]
     fn corrupt_manifest_json_array_instead_of_object() {
         let dir = tempfile::tempdir().unwrap();
@@ -4032,10 +4032,13 @@ mod tests {
         std::fs::create_dir_all(&bundle).unwrap();
         std::fs::write(bundle.join("manifest.json"), "[1, 2, 3]").unwrap();
 
-        // load_bundle_export_config treats non-object as having no fields, falls to defaults
-        let config = crate::load_bundle_export_config(&bundle).unwrap();
-        assert_eq!(config.scrub_preset, "standard");
-        assert!(config.projects.is_empty());
+        let result = crate::load_bundle_export_config(&bundle);
+        assert!(result.is_err(), "non-object manifest should be rejected");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("manifest.json must contain a JSON object"),
+            "error should mention invalid manifest root: {err_msg}"
+        );
     }
 
     /// No manifest.json file at all triggers ManifestNotFound error.
@@ -4424,7 +4427,7 @@ mod tests {
         );
     }
 
-    /// Manifest with wrong value types (e.g., string where int expected) uses defaults.
+    /// Manifest with wrong numeric value types is rejected during config loading.
     #[test]
     fn corrupt_manifest_wrong_value_types() {
         let dir = tempfile::tempdir().unwrap();
@@ -4443,19 +4446,15 @@ mod tests {
         )
         .unwrap();
 
-        let config = crate::load_bundle_export_config(&bundle).unwrap();
-        // "not_a_number" can't be parsed as i64, so falls back to default
-        assert_eq!(
-            config.inline_threshold,
-            crate::INLINE_ATTACHMENT_THRESHOLD as i64
+        let result = crate::load_bundle_export_config(&bundle);
+        assert!(result.is_err(), "invalid numeric field types should error");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("inline_threshold")
+                || err_msg.contains("detach_threshold")
+                || err_msg.contains("chunk_size"),
+            "error should identify the invalid threshold field: {err_msg}"
         );
-        // null falls back to default
-        assert_eq!(
-            config.detach_threshold,
-            crate::DETACH_ATTACHMENT_THRESHOLD as i64
-        );
-        // false falls back to default
-        assert_eq!(config.chunk_size, crate::DEFAULT_CHUNK_SIZE as i64);
     }
 
     /// Chunk manifest with version 0 (unexpected version) still deserializes.
