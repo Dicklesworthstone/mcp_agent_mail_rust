@@ -4527,10 +4527,8 @@ impl AtcEngine {
 
     fn push_reservation_event(&mut self, event: ReservationEvent) {
         if !matches!(event.kind, ReservationEventKind::Granted) {
-            self.reservation_last_outcome.insert(
-                event.agent.clone(),
-                (event.kind, event.timestamp_micros),
-            );
+            self.reservation_last_outcome
+                .insert(event.agent.clone(), (event.kind, event.timestamp_micros));
         }
         if self.reservation_event_log.len() >= MAX_RESERVATION_EVENT_LOG {
             self.reservation_event_log.pop_front();
