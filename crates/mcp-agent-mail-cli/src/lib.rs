@@ -24235,13 +24235,12 @@ mod tests {
             "sqlite:///tmp/wd/storage.sqlite3",
             Path::new("/tmp/wd"),
         );
+        // Check the key+value pair together so an unrelated `<integer>30</integer>`
+        // elsewhere (e.g. a future StartInterval) can't silently mask a
+        // ThrottleInterval regression back to launchd's 10s default.
         assert!(
-            plist.contains("<key>ThrottleInterval</key>"),
-            "plist must set ThrottleInterval to cap respawn rate: {plist}"
-        );
-        assert!(
-            plist.contains("<integer>30</integer>"),
-            "plist must set ThrottleInterval to 30 seconds: {plist}"
+            plist.contains("<key>ThrottleInterval</key>\n    <integer>30</integer>"),
+            "plist must set ThrottleInterval=30 as an adjacent key/value pair: {plist}"
         );
     }
 
