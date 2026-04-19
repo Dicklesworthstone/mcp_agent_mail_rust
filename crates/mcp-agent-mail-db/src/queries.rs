@@ -2733,9 +2733,16 @@ const RESTORE_ROLLUP_UPSERT_SQL: &str = "\
      total_count, resolved_count, censored_count, expired_count, \
      correct_count, incorrect_count, total_regret, total_loss, \
      ewma_loss, ewma_weight, delay_sum_micros, delay_count, delay_max_micros, \
-     last_updated_ts) \
-    VALUES (?, '', '', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?) \
+     last_updated_ts, compacted_total_count, compacted_resolved_count, \
+     compacted_censored_count, compacted_expired_count, compacted_correct_count, \
+     compacted_incorrect_count, compacted_total_regret, compacted_total_loss, \
+     compacted_ewma_loss, compacted_ewma_weight, compacted_delay_sum_micros, \
+     compacted_delay_count, compacted_delay_max_micros, compacted_last_updated_ts) \
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
     ON CONFLICT(stratum_key) DO UPDATE SET \
+     subsystem = excluded.subsystem, \
+     effect_kind = excluded.effect_kind, \
+     risk_tier = excluded.risk_tier, \
      total_count = excluded.total_count, \
      resolved_count = excluded.resolved_count, \
      censored_count = excluded.censored_count, \
@@ -2746,26 +2753,65 @@ const RESTORE_ROLLUP_UPSERT_SQL: &str = "\
      total_loss = excluded.total_loss, \
      ewma_loss = excluded.ewma_loss, \
      ewma_weight = excluded.ewma_weight, \
-     last_updated_ts = excluded.last_updated_ts";
+     delay_sum_micros = excluded.delay_sum_micros, \
+     delay_count = excluded.delay_count, \
+     delay_max_micros = excluded.delay_max_micros, \
+     last_updated_ts = excluded.last_updated_ts, \
+     compacted_total_count = excluded.compacted_total_count, \
+     compacted_resolved_count = excluded.compacted_resolved_count, \
+     compacted_censored_count = excluded.compacted_censored_count, \
+     compacted_expired_count = excluded.compacted_expired_count, \
+     compacted_correct_count = excluded.compacted_correct_count, \
+     compacted_incorrect_count = excluded.compacted_incorrect_count, \
+     compacted_total_regret = excluded.compacted_total_regret, \
+     compacted_total_loss = excluded.compacted_total_loss, \
+     compacted_ewma_loss = excluded.compacted_ewma_loss, \
+     compacted_ewma_weight = excluded.compacted_ewma_weight, \
+     compacted_delay_sum_micros = excluded.compacted_delay_sum_micros, \
+     compacted_delay_count = excluded.compacted_delay_count, \
+     compacted_delay_max_micros = excluded.compacted_delay_max_micros, \
+     compacted_last_updated_ts = excluded.compacted_last_updated_ts";
 
-fn restore_rollup_params(row: &AtcRollupRow, now_micros: i64) -> Vec<Value> {
+fn restore_rollup_params(row: &AtcRollupSnapshotRow) -> Vec<Value> {
     vec![
-        Value::Text(row.0.clone()),
-        Value::BigInt(row.1),
-        Value::BigInt(row.2),
-        Value::BigInt(row.3),
-        Value::BigInt(row.4),
-        Value::BigInt(row.5),
-        Value::BigInt(row.6),
-        Value::Double(row.7),
-        Value::Double(row.8),
-        Value::Double(row.9),
-        Value::Double(row.10),
-        Value::BigInt(now_micros),
+        Value::Text(row.stratum_key.clone()),
+        Value::Text(row.subsystem.clone()),
+        Value::Text(row.effect_kind.clone()),
+        Value::BigInt(row.risk_tier),
+        Value::BigInt(row.total_count),
+        Value::BigInt(row.resolved_count),
+        Value::BigInt(row.censored_count),
+        Value::BigInt(row.expired_count),
+        Value::BigInt(row.correct_count),
+        Value::BigInt(row.incorrect_count),
+        Value::Double(row.total_regret),
+        Value::Double(row.total_loss),
+        Value::Double(row.ewma_loss),
+        Value::Double(row.ewma_weight),
+        Value::BigInt(row.delay_sum_micros),
+        Value::BigInt(row.delay_count),
+        Value::BigInt(row.delay_max_micros),
+        Value::BigInt(row.last_updated_ts),
+        Value::BigInt(row.compacted_total_count),
+        Value::BigInt(row.compacted_resolved_count),
+        Value::BigInt(row.compacted_censored_count),
+        Value::BigInt(row.compacted_expired_count),
+        Value::BigInt(row.compacted_correct_count),
+        Value::BigInt(row.compacted_incorrect_count),
+        Value::Double(row.compacted_total_regret),
+        Value::Double(row.compacted_total_loss),
+        Value::Double(row.compacted_ewma_loss),
+        Value::Double(row.compacted_ewma_weight),
+        Value::BigInt(row.compacted_delay_sum_micros),
+        Value::BigInt(row.compacted_delay_count),
+        Value::BigInt(row.compacted_delay_max_micros),
+        Value::BigInt(row.compacted_last_updated_ts),
     ]
 }
 
-fn parse_rollup_payload(payload: &str) -> std::result::Result<Vec<AtcRollupRow>, DbError> {
+fn parse_rollup_payload(
+    payload: &str,
+) -> std::result::Result<Vec<AtcRollupSnapshotRow>, DbError> {
     serde_json::from_str(payload)
         .map_err(|e| DbError::Internal(format!("restore rollups deserialize: {e}")))
 }
@@ -2773,12 +2819,12 @@ fn parse_rollup_payload(payload: &str) -> std::result::Result<Vec<AtcRollupRow>,
 fn restore_atc_rollups_from_payload(
     conn: &crate::CanonicalDbConn,
     payload: &str,
-    now_micros: i64,
+    _now_micros: i64,
 ) -> std::result::Result<usize, DbError> {
     let rollups = parse_rollup_payload(payload)?;
     let mut restored = 0usize;
     for row in &rollups {
-        let params = restore_rollup_params(row, now_micros);
+        let params = restore_rollup_params(row);
         conn.execute_sync(RESTORE_ROLLUP_UPSERT_SQL, &params)
             .map_err(|e| DbError::Sqlite(format!("restore rollup upsert: {e}")))?;
         restored += 1;
@@ -2789,12 +2835,12 @@ fn restore_atc_rollups_from_payload(
 fn restore_atc_rollups_from_payload_pooled(
     conn: &crate::DbConn,
     payload: &str,
-    now_micros: i64,
+    _now_micros: i64,
 ) -> std::result::Result<usize, DbError> {
     let rollups = parse_rollup_payload(payload)?;
     let mut restored = 0usize;
     for row in &rollups {
-        let params = restore_rollup_params(row, now_micros);
+        let params = restore_rollup_params(row);
         conn.execute_sync(RESTORE_ROLLUP_UPSERT_SQL, &params)
             .map_err(|e| DbError::Sqlite(format!("restore rollup upsert: {e}")))?;
         restored += 1;
@@ -12091,10 +12137,7 @@ pub async fn snapshot_atc_rollups(
     let rows = match traw_query(
         cx,
         &tracked,
-        "SELECT stratum_key, total_count, resolved_count, censored_count, \
-         expired_count, correct_count, incorrect_count, total_regret, total_loss, \
-         ewma_loss, ewma_weight \
-         FROM atc_experience_rollups ORDER BY stratum_key",
+        ATC_ROLLUP_SNAPSHOT_SELECT_SQL,
         &[],
     )
     .await
@@ -12109,67 +12152,10 @@ pub async fn snapshot_atc_rollups(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     };
 
-    let mut rollups: Vec<AtcRollupRow> = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let stratum_key = row
-            .get(0)
-            .and_then(|v| match v {
-                Value::Text(s) => Some(s.clone()),
-                _ => None,
-            })
-            .unwrap_or_default();
-        let total = row.get(1).and_then(value_as_i64).unwrap_or(0);
-        let resolved = row.get(2).and_then(value_as_i64).unwrap_or(0);
-        let censored = row.get(3).and_then(value_as_i64).unwrap_or(0);
-        let expired = row.get(4).and_then(value_as_i64).unwrap_or(0);
-        let correct = row.get(5).and_then(value_as_i64).unwrap_or(0);
-        let incorrect = row.get(6).and_then(value_as_i64).unwrap_or(0);
-        let regret = row
-            .get(7)
-            .and_then(|v| match v {
-                Value::Double(f) => Some(*f),
-                Value::Float(f) => Some(f64::from(*f)),
-                _ => None,
-            })
-            .unwrap_or(0.0);
-        let loss = row
-            .get(8)
-            .and_then(|v| match v {
-                Value::Double(f) => Some(*f),
-                Value::Float(f) => Some(f64::from(*f)),
-                _ => None,
-            })
-            .unwrap_or(0.0);
-        let ewma = row
-            .get(9)
-            .and_then(|v| match v {
-                Value::Double(f) => Some(*f),
-                Value::Float(f) => Some(f64::from(*f)),
-                _ => None,
-            })
-            .unwrap_or(0.0);
-        let weight = row
-            .get(10)
-            .and_then(|v| match v {
-                Value::Double(f) => Some(*f),
-                Value::Float(f) => Some(f64::from(*f)),
-                _ => None,
-            })
-            .unwrap_or(0.0);
-        rollups.push((
-            stratum_key,
-            total,
-            resolved,
-            censored,
-            expired,
-            correct,
-            incorrect,
-            regret,
-            loss,
-            ewma,
-            weight,
-        ));
-    }
+    let rollups = rows
+        .iter()
+        .map(decode_atc_rollup_snapshot_row)
+        .collect::<Vec<_>>();
 
     let payload = match serde_json::to_string(&rollups) {
         Ok(p) => p,
