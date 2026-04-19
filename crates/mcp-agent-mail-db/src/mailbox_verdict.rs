@@ -26,14 +26,13 @@
 //! ```
 
 use crate::integrity::{
-    inspect_mailbox_integrity, CheckKind, MailboxIntegrityStatus, MailboxIntegrityVerdict,
+    CheckKind, MailboxIntegrityStatus, MailboxIntegrityVerdict, inspect_mailbox_integrity,
 };
 use crate::pool::{
-    inspect_mailbox_db_inventory, inspect_mailbox_ownership, inspect_mailbox_recovery_lock,
-    inspect_mailbox_sidecar_state, resolve_mailbox_sqlite_path,
-    sqlite_compatibility_read_path_is_healthy, sqlite_primary_read_path_is_healthy,
     MailboxOwnershipDisposition, MailboxOwnershipState, MailboxRecoveryLockState,
-    MailboxSidecarState,
+    MailboxSidecarState, inspect_mailbox_db_inventory, inspect_mailbox_ownership,
+    inspect_mailbox_recovery_lock, inspect_mailbox_sidecar_state, resolve_mailbox_sqlite_path,
+    sqlite_compatibility_read_path_is_healthy, sqlite_primary_read_path_is_healthy,
 };
 use crate::reconstruct::{archive_missing_project_identities, scan_archive_message_inventory};
 use serde::{Deserialize, Serialize};
@@ -775,6 +774,23 @@ impl VerdictOptions {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveStatePresence {
+    Empty,
+    Present,
+    Unknown,
+}
+
+impl ArchiveStatePresence {
+    fn from_archive_drift(drift: &MailboxArchiveDriftVerdict) -> Self {
+        if drift.archive_projects > 0 || drift.archive_agents > 0 || drift.archive_messages > 0 {
+            Self::Present
+        } else {
+            Self::Empty
+        }
+    }
+}
+
 // ============================================================================
 // Core verdict computation
 // ============================================================================
@@ -905,10 +921,12 @@ pub fn compute_mailbox_verdict(
     } else {
         inspect_archive_drift(&db_path, archive_root)
     };
-    probes.push(probe_schema_populated(
-        &db_path,
-        archive_drift.archive_messages,
-    ));
+    let archive_presence = if options.skip_archive_count {
+        inspect_archive_state_presence(archive_root)
+    } else {
+        ArchiveStatePresence::from_archive_drift(&archive_drift)
+    };
+    probes.push(probe_schema_populated(&db_path, archive_presence));
     if !options.skip_archive_count {
         probes.push(probe_archive_drift(
             &archive_drift,
@@ -1298,8 +1316,59 @@ fn probe_archive_drift(
     }
 }
 
+fn directory_has_entries(path: &Path) -> std::io::Result<bool> {
+    let mut entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(entries.next().transpose()?.is_some())
+}
+
+fn inspect_archive_state_presence(archive_root: &Path) -> ArchiveStatePresence {
+    let projects_dir = archive_root.join("projects");
+    let project_entries = match std::fs::read_dir(&projects_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ArchiveStatePresence::Empty;
+        }
+        Err(_) => return ArchiveStatePresence::Unknown,
+    };
+
+    for project_entry in project_entries {
+        let project_entry = match project_entry {
+            Ok(entry) => entry,
+            Err(_) => return ArchiveStatePresence::Unknown,
+        };
+        let file_type = match project_entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => return ArchiveStatePresence::Unknown,
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+
+        let project_path = project_entry.path();
+        if project_path.join("project.json").is_file() {
+            return ArchiveStatePresence::Present;
+        }
+        match directory_has_entries(&project_path.join("agents")) {
+            Ok(true) => return ArchiveStatePresence::Present,
+            Ok(false) => {}
+            Err(_) => return ArchiveStatePresence::Unknown,
+        }
+        match directory_has_entries(&project_path.join("messages")) {
+            Ok(true) => return ArchiveStatePresence::Present,
+            Ok(false) => {}
+            Err(_) => return ArchiveStatePresence::Unknown,
+        }
+    }
+
+    ArchiveStatePresence::Empty
+}
+
 /// Probe: Schema populated check.
-fn probe_schema_populated(db_path: &Path, archive_count: usize) -> ProbeResult {
+fn probe_schema_populated(db_path: &Path, archive_presence: ArchiveStatePresence) -> ProbeResult {
     if db_path.as_os_str() == ":memory:" {
         return ProbeResult::ok(
             "schema_populated",
@@ -1355,16 +1424,19 @@ fn probe_schema_populated(db_path: &Path, archive_count: usize) -> ProbeResult {
         )
         .is_ok_and(|rows| !rows.is_empty());
 
-    match (table_count, archive_count, has_messages_table) {
-        (0, 0, _) => ProbeResult::ok(
+    match (table_count, archive_presence, has_messages_table) {
+        (0, ArchiveStatePresence::Empty, _) => ProbeResult::ok(
             "schema_populated",
             "Database schema is empty and the archive is also empty",
         ),
-        (0, archive, _) if archive > 0 => ProbeResult::error(
+        (0, ArchiveStatePresence::Present, _) => ProbeResult::error(
             "schema_populated",
-            format!(
-                "Database schema is empty (sqlite_master == 0) while archive has {archive} messages"
-            ),
+            "Database schema is empty (sqlite_master == 0) while archive contains durable state",
+        ),
+        (0, ArchiveStatePresence::Unknown, _) => ProbeResult::warn_state(
+            "schema_populated",
+            "Database schema is empty (sqlite_master == 0) and archive state could not be verified",
+            MailboxState::Suspect,
         ),
         (tables, _, false) if tables > 0 => ProbeResult::warn_state(
             "schema_populated",
@@ -1713,7 +1785,10 @@ mod tests {
             true
         }
 
-        fn register_callsite(&self, _metadata: &'static Metadata<'static>) -> tracing::subscriber::Interest {
+        fn register_callsite(
+            &self,
+            _metadata: &'static Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
             tracing::subscriber::Interest::always()
         }
 
@@ -1909,9 +1984,11 @@ mod tests {
         assert!(!probe.passed);
         assert_eq!(probe.severity, ProbeSeverity::Warning);
         assert_eq!(probe.impact_state, MailboxState::Suspect);
-        assert!(probe
-            .detail
-            .contains("Malformed or non-file SQLite sidecar artifact present"));
+        assert!(
+            probe
+                .detail
+                .contains("Malformed or non-file SQLite sidecar artifact present")
+        );
     }
 
     #[test]
@@ -2275,7 +2352,7 @@ mod tests {
 
     #[test]
     fn probe_schema_populated_memory() {
-        let probe = probe_schema_populated(Path::new(":memory:"), 0);
+        let probe = probe_schema_populated(Path::new(":memory:"), ArchiveStatePresence::Empty);
         assert!(probe.passed);
         assert!(probe.detail.contains("In-memory"));
     }
@@ -2339,7 +2416,7 @@ mod tests {
         let conn = crate::DbConn::open_file(db_path.to_str().unwrap()).expect("open db");
         drop(conn);
 
-        let probe = probe_schema_populated(&db_path, 0);
+        let probe = probe_schema_populated(&db_path, ArchiveStatePresence::Empty);
         assert!(probe.passed);
         assert!(probe.detail.contains("empty") || probe.detail.contains("schema"));
     }
@@ -2362,7 +2439,7 @@ mod tests {
                 .expect("init schema");
             drop(seed_conn);
 
-            let probe = probe_schema_populated(&db_path, 0);
+            let probe = probe_schema_populated(&db_path, ArchiveStatePresence::Empty);
             assert!(probe.passed, "schema probe should pass: {probe:?}");
         });
 
@@ -2373,23 +2450,98 @@ mod tests {
     }
 
     #[test]
-    fn probe_schema_populated_empty_db_with_archive_is_error() {
+    fn probe_schema_populated_empty_db_with_archive_state_is_error() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("empty_with_archive.sqlite3");
         // Create an empty but valid SQLite file
         let conn = crate::DbConn::open_file(db_path.to_str().unwrap()).expect("open db");
         drop(conn);
 
-        // Simulate archive having 100 messages
-        let probe = probe_schema_populated(&db_path, 100);
+        let probe = probe_schema_populated(&db_path, ArchiveStatePresence::Present);
         assert!(!probe.passed);
         assert_eq!(probe.severity, ProbeSeverity::Error);
         assert!(
-            probe.detail.contains("sqlite_master == 0")
-                || probe.detail.contains("requires reconstruct"),
+            probe.detail.contains("sqlite_master == 0") || probe.detail.contains("durable state"),
             "unexpected detail: {}",
             probe.detail,
         );
+    }
+
+    #[test]
+    fn inspect_archive_state_presence_detects_project_metadata_without_messages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_dir = dir.path().join("projects").join("archive-project");
+        std::fs::create_dir_all(&project_dir).expect("create archive project dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"archive-project","human_key":"/archive-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+
+        assert_eq!(
+            inspect_archive_state_presence(dir.path()),
+            ArchiveStatePresence::Present
+        );
+    }
+
+    #[test]
+    fn compute_mailbox_verdict_fast_marks_archive_backed_empty_schema_broken() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        let project_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = project_dir.join("agents").join("Alice");
+        let messages_dir = project_dir.join("messages").join("2026").join("04");
+        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+        std::fs::create_dir_all(&messages_dir).expect("create message dir");
+        std::fs::write(
+            project_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
+        )
+        .expect("write project metadata");
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-04-01T00:00:00Z"}"#,
+        )
+        .expect("write agent profile");
+        std::fs::write(
+            messages_dir.join("2026-04-01T12-00-00Z__first__1.md"),
+            r#"---json
+{
+  "id": 1,
+  "from": "Alice",
+  "to": ["Bob"],
+  "subject": "First",
+  "importance": "normal",
+  "created_ts": "2026-04-01T12:00:00Z"
+}
+---
+
+first body
+"#,
+        )
+        .expect("write canonical message");
+
+        let db_path = dir.path().join("empty-fast.sqlite3");
+        let conn = crate::DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+        drop(conn);
+
+        let verdict = compute_mailbox_verdict(
+            &format!("sqlite:///{}", db_path.display()),
+            &storage_root,
+            &VerdictOptions::fast(),
+        );
+
+        assert_eq!(
+            verdict.state,
+            MailboxState::Broken,
+            "fast verdict must not treat archive-backed empty schema as healthy: {verdict:?}"
+        );
+        let schema_probe = verdict
+            .probes
+            .iter()
+            .find(|probe| probe.name == "schema_populated")
+            .expect("schema_populated probe present");
+        assert_eq!(schema_probe.severity, ProbeSeverity::Error);
     }
 
     // ── DurabilityState tests ────────────────────────────────────────
