@@ -23099,12 +23099,17 @@ fn service_install_systemd(
     std::fs::write(&unit_path, &unit_content)?;
     ftui_runtime::ftui_println!("Wrote {}", unit_path.display());
 
-    // Reload and enable+start
+    // Reload, enable, and RESTART. On a re-install (which is exactly how
+    // users will recover from the #96 crash-loop) the old service is still
+    // running with the old unit file; `enable --now` is `enable + start`,
+    // and `start` on a running service is a no-op — so the new unit
+    // content would never actually take effect. `restart` both starts a
+    // not-running service and picks up new unit content on an already-
+    // running one, so it's correct for fresh and re-install alike. This
+    // mirrors the launchd bootout+bootstrap pattern below.
     run_cmd("systemctl", &["--user", "daemon-reload"])?;
-    run_cmd(
-        "systemctl",
-        &["--user", "enable", "--now", SYSTEMD_UNIT_NAME],
-    )?;
+    run_cmd("systemctl", &["--user", "enable", SYSTEMD_UNIT_NAME])?;
+    run_cmd("systemctl", &["--user", "restart", SYSTEMD_UNIT_NAME])?;
 
     ftui_runtime::ftui_println!(
         "Service installed and started (systemd user unit: {})",
