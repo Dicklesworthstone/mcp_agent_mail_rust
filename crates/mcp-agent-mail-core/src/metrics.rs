@@ -1075,7 +1075,7 @@ impl SearchMetrics {
         self.tantivy_index_size_bytes.set(size_bytes);
         self.tantivy_doc_count.set(doc_count);
         self.tantivy_last_update_us
-            .set(u64::try_from(crate::timestamps::now_micros()).unwrap_or_default());
+            .set(u64::try_from(crate::timestamps::now_micros_raw()).unwrap_or_default());
     }
 
     #[allow(clippy::cast_precision_loss)]

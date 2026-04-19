@@ -487,20 +487,24 @@ mod tests {
     }
 
     #[test]
-    fn search_metrics_update_index_health_uses_skew_protected_timestamp() {
+    fn search_metrics_update_index_health_uses_raw_timestamp() {
         reset();
         let future = Utc::now().timestamp_micros() + 10_000_000_000; // +10_000s
         LAST_SYSTEM_TIME_US.store(future, Ordering::SeqCst);
 
         let metrics = crate::metrics::SearchMetrics::default();
+        let before = now_micros_raw();
         metrics.update_index_health(1024, 42);
+        let after = now_micros_raw();
 
         let snap = metrics.snapshot();
         assert_eq!(snap.tantivy_index_size_bytes, 1024);
         assert_eq!(snap.tantivy_doc_count, 42);
-        assert_eq!(
-            snap.tantivy_last_update_us,
-            u64::try_from(future + 1).expect("future timestamp should stay non-negative")
+        let recorded = i64::try_from(snap.tantivy_last_update_us)
+            .expect("metrics timestamp should stay representable as i64");
+        assert!(
+            recorded >= before && recorded <= after,
+            "metrics timestamp should reflect wall clock, not the monotonic skew guard: recorded={recorded} before={before} after={after} future={future}"
         );
     }
 
