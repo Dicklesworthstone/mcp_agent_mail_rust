@@ -1662,6 +1662,97 @@ impl std::fmt::Display for DurabilityTestArtifact {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Id, Metadata, Subscriber, span};
+
+    #[derive(Clone, Default)]
+    struct EventCapture {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+        next_id: Arc<AtomicU64>,
+    }
+
+    impl EventCapture {
+        fn saw_drop_close(&self) -> bool {
+            self.events
+                .lock()
+                .expect("event capture lock poisoned")
+                .iter()
+                .any(|event| {
+                    event.target == "fsqlite::runtime"
+                        && event
+                            .fields
+                            .iter()
+                            .any(|(name, value)| name == "event" && value.contains("drop_close"))
+                })
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct CapturedEvent {
+        target: &'static str,
+        fields: Vec<(String, String)>,
+    }
+
+    #[derive(Default)]
+    struct EventFieldCapture {
+        fields: Vec<(String, String)>,
+    }
+
+    impl Visit for EventFieldCapture {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+    }
+
+    impl Subscriber for EventCapture {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn register_callsite(&self, _metadata: &'static Metadata<'static>) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+            Some(tracing::metadata::LevelFilter::TRACE)
+        }
+
+        fn new_span(&self, _attrs: &span::Attributes<'_>) -> Id {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+            Id::from_u64(id)
+        }
+
+        fn record(&self, _span: &Id, _values: &span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = EventFieldCapture::default();
+            event.record(&mut fields);
+            self.events
+                .lock()
+                .expect("event capture lock poisoned")
+                .push(CapturedEvent {
+                    target: event.metadata().target(),
+                    fields: fields.fields,
+                });
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+
+        fn clone_span(&self, id: &Id) -> Id {
+            id.clone()
+        }
+
+        fn try_close(&self, _id: Id) -> bool {
+            true
+        }
+    }
 
     fn verdict_from_probes(
         probes: Vec<ProbeResult>,
@@ -2250,6 +2341,34 @@ mod tests {
         let probe = probe_schema_populated(&db_path, 0);
         assert!(probe.passed);
         assert!(probe.detail.contains("empty") || probe.detail.contains("schema"));
+    }
+
+    #[test]
+    fn probe_schema_populated_closes_health_probe_connection_explicitly() {
+        let capture = EventCapture::default();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("health-probe.sqlite3");
+
+        tracing::subscriber::with_default(capture.clone(), || {
+            let seed_conn =
+                crate::DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+            let seed_conn = crate::guard_db_conn(
+                seed_conn,
+                "mailbox_verdict::probe_schema_populated test seed",
+            );
+            seed_conn
+                .execute_raw(&crate::schema::init_schema_sql_base())
+                .expect("init schema");
+            drop(seed_conn);
+
+            let probe = probe_schema_populated(&db_path, 0);
+            assert!(probe.passed, "schema probe should pass: {probe:?}");
+        });
+
+        assert!(
+            !capture.saw_drop_close(),
+            "schema health probe must close its DB connection explicitly"
+        );
     }
 
     #[test]

@@ -12662,6 +12662,52 @@ mod tests {
         assert_eq!(first_row["compacted_total_count"], 4);
         assert_eq!(first_row["compacted_resolved_count"], 3);
         assert_eq!(first_row["compacted_last_updated_ts"], 1_699_999_000_000_000_i64);
+
+        let conn = open_canonical_atc_conn(&pool, "mutate compacted rollup")
+            .expect("open canonical ATC connection");
+        canonical_execute_atc(
+            &conn,
+            "UPDATE atc_experience_rollups SET \
+                subsystem = 'wrong', effect_kind = 'wrong', risk_tier = 9, \
+                compacted_total_count = 0, compacted_resolved_count = 0, \
+                compacted_last_updated_ts = 0 \
+             WHERE stratum_key = 'liveness:probe:0'",
+            &[],
+            "mutate compacted rollup",
+        )
+        .expect("mutate compacted rollup");
+        close_canonical_db_conn(conn, "mutate compacted rollup connection");
+
+        let restored = rt
+            .block_on(restore_atc_rollups(
+                &cx,
+                &pool,
+                &snapshot.payload,
+                1_700_000_200_000_000,
+            ))
+            .into_result()
+            .expect("restore rollups");
+        assert_eq!(restored, 1);
+
+        let conn = open_canonical_atc_conn(&pool, "verify compacted rollup restore")
+            .expect("open canonical ATC connection");
+        let rows = canonical_query_atc_rows(
+            &conn,
+            "SELECT subsystem, effect_kind, risk_tier, compacted_total_count, \
+                    compacted_resolved_count, compacted_last_updated_ts \
+             FROM atc_experience_rollups WHERE stratum_key = 'liveness:probe:0'",
+            &[],
+            "verify compacted rollup restore",
+        )
+        .expect("query restored compacted rollup");
+        close_canonical_db_conn(conn, "verify compacted rollup restore connection");
+        let row = rows.first().expect("restored rollup row");
+        assert_eq!(row_text_or_default(row, 0), "liveness");
+        assert_eq!(row_text_or_default(row, 1), "probe");
+        assert_eq!(row_i64_or_default(row, 2), 0);
+        assert_eq!(row_i64_or_default(row, 3), 4);
+        assert_eq!(row_i64_or_default(row, 4), 3);
+        assert_eq!(row_i64_or_default(row, 5), 1_699_999_000_000_000);
     }
 
     fn make_insert_experience_test_row(
