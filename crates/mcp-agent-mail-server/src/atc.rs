@@ -7190,7 +7190,7 @@ mod synthesis_tests {
                 &["src/**".to_string()],
                 true,
                 "proj-alpha",
-                i as i64,
+                i64::try_from(i).unwrap_or(i64::MAX),
             );
         }
         assert_eq!(
@@ -7246,7 +7246,7 @@ mod synthesis_tests {
                 &["x/**".to_string()],
                 false,
                 "proj-alpha",
-                (2_000_000 + i) as i64,
+                i64::try_from(2_000_000_usize.saturating_add(i)).unwrap_or(i64::MAX),
             );
         }
         // BlueLake's event is evicted from the ring buffer, but the

@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_lines)]
 
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::Path;
@@ -62,7 +63,7 @@ fn http_request(
     if !body.is_empty() {
         request.push_str("Content-Type: application/json\r\n");
     }
-    request.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+    let _ = write!(request, "Content-Length: {}\r\n\r\n", body.len());
 
     stream.write_all(request.as_bytes())?;
     if !body.is_empty() {
@@ -111,6 +112,7 @@ fn wait_for_readiness(port: u16, server_result_rx: &Receiver<std::io::Result<()>
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn call_tool(port: u16, id: u64, tool_name: &str, arguments: Value) -> Value {
     let request = json!({
         "jsonrpc": "2.0",
@@ -340,6 +342,7 @@ fn path_string(path: &Path) -> String {
     path.to_str().expect("utf8 path").to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn format_direct_send_message_diagnostic(
     rt: &Runtime,
     cx: &Cx,

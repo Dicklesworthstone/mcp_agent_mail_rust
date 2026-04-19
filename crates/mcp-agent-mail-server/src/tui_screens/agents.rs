@@ -619,9 +619,7 @@ impl AgentsScreen {
                 COL_MESSAGES => a.message_count.cmp(&b.message_count),
                 _ => std::cmp::Ordering::Equal,
             };
-            if self.sort_col == COL_HEALTH {
-                cmp
-            } else if self.sort_asc {
+            if self.sort_col == COL_HEALTH || self.sort_asc {
                 cmp
             } else {
                 cmp.reverse()
@@ -965,7 +963,7 @@ impl MailScreen for AgentsScreen {
                     self.sort_asc = !self.sort_asc;
                     self.rebuild_from_state(state);
                 }
-                KeyCode::Char('i') | KeyCode::Char('h') => {
+                KeyCode::Char('i' | 'h') => {
                     self.detail_visible = !self.detail_visible;
                 }
                 KeyCode::Char('J') => {
@@ -1893,7 +1891,7 @@ mod tests {
         };
         let unknown = test_agent_row("Cipher", "alpha", "codex-cli", "gpt-5", 100, 1);
 
-        let mut rows = vec![unknown.clone(), strong.clone(), weak.clone()];
+        let mut rows = vec![unknown, strong, weak];
         rows.sort_by(|left, right| agent_health_cmp(left, right, false));
         assert_eq!(
             rows.iter()

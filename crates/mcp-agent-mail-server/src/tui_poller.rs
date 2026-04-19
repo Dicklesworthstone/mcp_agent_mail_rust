@@ -96,10 +96,10 @@ struct AgentAckStats {
 
 #[derive(Debug, Clone, Default)]
 struct AgentReservationStats {
-    clean_count: u64,
-    late_release_count: u64,
-    expired_count: u64,
-    active_count: u64,
+    clean: u64,
+    late_release: u64,
+    expired: u64,
+    active: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1554,11 +1554,10 @@ fn fetch_agent_health_inputs(
                 .unwrap_or_default();
             let contact = contact_stats.get(&agent.id).cloned().unwrap_or_default();
             let contact_observed = contact.respected_count + contact.violation_count > 0;
-            let age = if agent.last_active_ts > 0 {
-                Some(now.saturating_sub(agent.last_active_ts).max(0) as u64)
-            } else {
-                None
-            };
+            let age = (agent.last_active_ts > 0)
+                .then_some(nonnegative_i64_to_u64(
+                    now.saturating_sub(agent.last_active_ts),
+                ));
             (
                 agent.id,
                 AgentHealthInputs {
@@ -1566,10 +1565,10 @@ fn fetch_agent_health_inputs(
                     ack_late_count: ack.late_count,
                     ack_pending_count: ack.pending_count,
                     ack_p50_latency_micros: ack.p50_latency_micros,
-                    reservation_clean_count: reservation.clean_count,
-                    reservation_late_release_count: reservation.late_release_count,
-                    reservation_expired_count: reservation.expired_count,
-                    reservation_active_count: reservation.active_count,
+                    reservation_clean_count: reservation.clean,
+                    reservation_late_release_count: reservation.late_release,
+                    reservation_expired_count: reservation.expired,
+                    reservation_active_count: reservation.active,
                     contact_policy_respected_count: contact_observed
                         .then_some(contact.respected_count),
                     contact_policy_violation_count: contact_observed
@@ -1630,10 +1629,11 @@ fn fetch_agent_ack_stats(
                 };
                 let entry = stats.entry(agent_id).or_default();
                 entry.on_time_count +=
-                    parse_raw_i64(&row, "ack_on_time").unwrap_or(0).max(0) as u64;
-                entry.late_count += parse_raw_i64(&row, "ack_late").unwrap_or(0).max(0) as u64;
+                    nonnegative_i64_to_u64(parse_raw_i64(&row, "ack_on_time").unwrap_or(0));
+                entry.late_count +=
+                    nonnegative_i64_to_u64(parse_raw_i64(&row, "ack_late").unwrap_or(0));
                 entry.pending_count +=
-                    parse_raw_i64(&row, "ack_pending").unwrap_or(0).max(0) as u64;
+                    nonnegative_i64_to_u64(parse_raw_i64(&row, "ack_pending").unwrap_or(0));
                 if let Some(latency) = parse_raw_i64(&row, "ack_latency_micros")
                     .and_then(|value| u64::try_from(value.max(0)).ok())
                 {
@@ -1658,6 +1658,10 @@ fn median_micros(values: &mut [u64]) -> u64 {
     } else {
         values[mid - 1].saturating_add(values[mid]) / 2
     }
+}
+
+fn nonnegative_i64_to_u64(value: i64) -> u64 {
+    value.max(0).cast_unsigned()
 }
 
 fn fetch_agent_reservation_stats(
@@ -1707,15 +1711,18 @@ fn fetch_agent_reservation_stats(
                     Some((
                         agent_id,
                         AgentReservationStats {
-                            clean_count: parse_raw_i64(&row, "clean_count").unwrap_or(0).max(0)
-                                as u64,
-                            late_release_count: parse_raw_i64(&row, "late_count")
-                                .unwrap_or(0)
-                                .max(0) as u64,
-                            expired_count: parse_raw_i64(&row, "expired_count").unwrap_or(0).max(0)
-                                as u64,
-                            active_count: parse_raw_i64(&row, "active_count").unwrap_or(0).max(0)
-                                as u64,
+                            clean: nonnegative_i64_to_u64(
+                                parse_raw_i64(&row, "clean_count").unwrap_or(0),
+                            ),
+                            late_release: nonnegative_i64_to_u64(
+                                parse_raw_i64(&row, "late_count").unwrap_or(0),
+                            ),
+                            expired: nonnegative_i64_to_u64(
+                                parse_raw_i64(&row, "expired_count").unwrap_or(0),
+                            ),
+                            active: nonnegative_i64_to_u64(
+                                parse_raw_i64(&row, "active_count").unwrap_or(0),
+                            ),
                         },
                     ))
                 })
@@ -1786,12 +1793,12 @@ fn fetch_agent_contact_stats(
                     Some((
                         agent_id,
                         AgentContactStats {
-                            respected_count: parse_raw_i64(&row, "respected_count")
-                                .unwrap_or(0)
-                                .max(0) as u64,
-                            violation_count: parse_raw_i64(&row, "violation_count")
-                                .unwrap_or(0)
-                                .max(0) as u64,
+                            respected_count: nonnegative_i64_to_u64(
+                                parse_raw_i64(&row, "respected_count").unwrap_or(0),
+                            ),
+                            violation_count: nonnegative_i64_to_u64(
+                                parse_raw_i64(&row, "violation_count").unwrap_or(0),
+                            ),
                         },
                     ))
                 })
@@ -1846,7 +1853,8 @@ fn fetch_agent_decision_counts(
                         .get_named::<String>("agent_name")
                         .ok()
                         .or_else(|| row.get_as::<String>(0).ok())?;
-                    let count = parse_raw_i64(&row, "decision_count").unwrap_or(0).max(0) as u64;
+                    let count =
+                        nonnegative_i64_to_u64(parse_raw_i64(&row, "decision_count").unwrap_or(0));
                     Some((name, count))
                 })
                 .collect()

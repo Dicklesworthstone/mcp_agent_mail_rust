@@ -4123,19 +4123,21 @@ fn atc_operator_tick_budget_status(
         tick_duration_micros,
         tick_budget_micros,
     );
-    let note = exceeded.then(|| match kernel_total_micros {
-        Some(kernel_micros) => {
-            format!(
-                "ATC kernel exceeded budget: {}us > {}us",
-                kernel_micros, tick_budget_micros
-            )
-        }
-        None => {
-            format!(
-                "ATC tick exceeded budget: {}us > {}us",
-                tick_duration_micros, tick_budget_micros
-            )
-        }
+    let note = exceeded.then(|| {
+        kernel_total_micros.map_or_else(
+            || {
+                format!(
+                    "ATC tick exceeded budget: {}us > {}us",
+                    tick_duration_micros, tick_budget_micros
+                )
+            },
+            |kernel_micros| {
+                format!(
+                    "ATC kernel exceeded budget: {}us > {}us",
+                    kernel_micros, tick_budget_micros
+                )
+            },
+        )
     });
     (exceeded, note)
 }
@@ -4144,6 +4146,7 @@ fn next_atc_rollup_refresh_micros(now_micros: i64) -> i64 {
     now_micros.saturating_add(ATC_ROLLUP_REFRESH_INTERVAL_MICROS)
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub(crate) struct AtcOperatorSnapshot {
     pub(crate) enabled: bool,
@@ -5491,7 +5494,7 @@ fn sweep_open_experiences_for_resolution(
                         "resolved ack-overdue ATC outcome"
                     );
                 }
-                Some("acknowledged") | Some("read") => {
+                Some("acknowledged" | "read") => {
                     ack_overdue_rows_skipped = ack_overdue_rows_skipped.saturating_add(1);
                     tracing::info!(
                         event = "atc.sweep.ack_race_detected",
@@ -9148,11 +9151,11 @@ impl HttpState {
                 // (See #94: a 24h `integrity_check` cadence plus silent
                 // archive-fallback previously let /health stay green while
                 // on-disk corruption persisted for hours.)
-                let status_code = match probe_runtime_durability_state(
+                let status_code = probe_runtime_durability_state(
                     &self.config.database_url,
                     self.config.storage_root.as_path(),
-                ) {
-                    Some(durability) => {
+                )
+                .map_or(200, |durability| {
                         use mcp_agent_mail_db::DurabilityState;
                         body["durability_state"] = serde_json::json!(durability.to_string());
                         // Exhaustive match so a future DurabilityState variant
@@ -9186,9 +9189,7 @@ impl HttpState {
                                 503
                             }
                         }
-                    }
-                    None => 200,
-                };
+                    });
                 return Some(self.health_json_response(req, status_code, &body));
             }
             "/health/durability" => {
@@ -9204,18 +9205,18 @@ impl HttpState {
                     &self.config.database_url,
                     self.config.storage_root.as_path(),
                 );
-                let body = match durability {
-                    Some(state) => serde_json::json!({
-                        "durability_state": state.to_string(),
-                        "allows_reads": state.allows_reads(),
-                        "allows_writes": state.allows_writes(),
-                    }),
-                    None => serde_json::json!({
+                let body = durability.map_or_else(
+                    || serde_json::json!({
                         "durability_state": "unknown",
                         "allows_reads": true,
                         "allows_writes": true,
                     }),
-                };
+                    |state| serde_json::json!({
+                        "durability_state": state.to_string(),
+                        "allows_reads": state.allows_reads(),
+                        "allows_writes": state.allows_writes(),
+                    }),
+                );
                 return Some(self.health_json_response(req, 200, &body));
             }
             "/.well-known/oauth-authorization-server"
@@ -11041,16 +11042,13 @@ fn build_slot_feature_ext(
 ) -> FeatureExtension {
     FeatureExtension::empty()
         .with_field("slot_hash", stable_atc_i64_hash(slot))
-        .with_field(
-            "branch_hash",
-            branch.map_or(0, |value| stable_atc_i64_hash(value)),
-        )
+        .with_field("branch_hash", branch.map_or(0, stable_atc_i64_hash))
         .with_field("ttl_seconds", ttl_seconds.unwrap_or_default().max(0))
         .with_field(
             "conflict_count",
             i64::try_from(conflict_count).unwrap_or(i64::MAX),
         )
-        .with_field("exclusive", if exclusive { 1 } else { 0 })
+        .with_field("exclusive", i64::from(exclusive))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11686,10 +11684,10 @@ fn atc_ack_overdue_window_micros(importance: Option<&str>) -> i64 {
     }
 }
 
-fn ack_overdue_candidate_for_experience<'a>(
-    experience: &'a ExperienceRow,
+fn ack_overdue_candidate_for_experience(
+    experience: &ExperienceRow,
     now_micros: i64,
-) -> Option<AckOverdueCandidate<'a>> {
+) -> Option<AckOverdueCandidate<'_>> {
     if experience.decision_class != "message_sent"
         || !atc_message_context_bool(experience, "ack_required")
     {
@@ -12100,7 +12098,7 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
         ExperienceState::Resolved => {
             let existing = existing_label.as_deref();
             if target_label == "acknowledged"
-                && matches!(existing, Some("read") | Some("ack_overdue"))
+                && matches!(existing, Some("read" | "ack_overdue"))
             {
                 let (note, event_name, upgrade_reason) = if existing == Some("ack_overdue") {
                     (

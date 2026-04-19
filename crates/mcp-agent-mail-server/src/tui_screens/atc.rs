@@ -1042,10 +1042,8 @@ fn subsystem_color(subsystem: &str, tp: &TuiThemePalette) -> ftui::PackedRgba {
 fn atc_agent_state_rank(state: &str) -> u8 {
     if state.eq_ignore_ascii_case("dead") {
         2
-    } else if state.eq_ignore_ascii_case("flaky") {
-        1
     } else {
-        0
+        u8::from(state.eq_ignore_ascii_case("flaky"))
     }
 }
 
@@ -1089,10 +1087,10 @@ fn atc_availability_color(
 }
 
 fn atc_policy_label(snapshot: &AtcOperatorSnapshot) -> String {
-    if !snapshot.policy.bundle_id.is_empty() {
-        snapshot.policy.bundle_id.clone()
-    } else {
+    if snapshot.policy.bundle_id.is_empty() {
         format!("rev-{}", snapshot.policy_revision)
+    } else {
+        snapshot.policy.bundle_id.clone()
     }
 }
 
@@ -1106,7 +1104,11 @@ fn format_timestamp_compact(timestamp_micros: i64) -> String {
 
 fn snapshot_age_micros(snapshot: &AtcOperatorSnapshot) -> Option<u64> {
     (snapshot.last_tick_micros > 0)
-        .then(|| mcp_agent_mail_db::now_micros().saturating_sub(snapshot.last_tick_micros) as u64)
+        .then(|| {
+            mcp_agent_mail_db::now_micros()
+                .saturating_sub(snapshot.last_tick_micros)
+                .cast_unsigned()
+        })
 }
 
 fn execution_status_label(execution: &AtcOperatorExecutionSnapshot) -> String {

@@ -1060,6 +1060,7 @@ thread_local! {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Full-text search and browsing across all messages.
+#[allow(clippy::struct_excessive_bools)]
 pub struct MessageBrowserScreen {
     search_input: TextInput,
     results: Vec<MessageEntry>,
