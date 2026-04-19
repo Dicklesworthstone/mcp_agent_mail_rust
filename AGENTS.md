@@ -376,7 +376,7 @@ mcp_agent_mail_rust/
 | 16 | ATC | Air Traffic Controller decision engine status and transparency cards |
 
 Key bindings: `?` help, `Ctrl+P`/`:` command palette, `/` global search, `.` action menu, `Ctrl+N` compose overlay, `Ctrl+Y` toast focus, `Ctrl+T`/`Shift+T` cycle theme, `m` toggle MCP/API, `q` quit.
-Webapp-parity keys: Messages `g` (Local/Global inbox), Threads `e/c` (expand/collapse all), Timeline `V` (Events/Commits/Combined), Contacts `n` (Table/Graph).
+Webapp-parity keys: Messages `g` (Local/Global inbox), Messages `s` (show/hide system messages — file reservations, contact requests, etc.; hidden by default), Threads `e/c` (expand/collapse all), Timeline `V` (Events/Commits/Combined), Contacts `n` (Table/Graph).
 
 ### Dual-Mode Interface
 
