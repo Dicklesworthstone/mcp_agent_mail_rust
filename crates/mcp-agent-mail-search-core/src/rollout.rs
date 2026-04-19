@@ -87,7 +87,11 @@ impl ShadowComparison {
             0.0
         };
 
-        let latency_delta_ms = v3_latency.as_millis() as i64 - legacy_latency.as_millis() as i64;
+        // Use saturating math: an unbounded `Duration` (e.g. a stuck v3 timing
+        // out at u128::MAX millis) must not panic the metrics path.
+        let v3_ms = i64::try_from(v3_latency.as_millis()).unwrap_or(i64::MAX);
+        let legacy_ms = i64::try_from(legacy_latency.as_millis()).unwrap_or(i64::MAX);
+        let latency_delta_ms = v3_ms.saturating_sub(legacy_ms);
 
         Self {
             result_overlap_pct,
@@ -196,8 +200,14 @@ impl ShadowMetrics {
         // Store overlap as fixed-point (pct * 10000)
         let overlap_fp = (comparison.result_overlap_pct * 10000.0) as u64;
         self.overlap_sum.fetch_add(overlap_fp, Ordering::Relaxed);
-        // Store latency delta with offset to handle negatives
-        let latency_offset = (comparison.latency_delta_ms + 1_000_000) as u64;
+        // Store latency delta with offset to handle negatives. Clamp to the
+        // range the offset trick can represent: a stuck v3 (or stuck legacy)
+        // could exceed ±1_000_000 ms (~16 minutes), and an unsaturated cast
+        // would corrupt the running sum via wrap-around.
+        let clamped_delta_ms = comparison
+            .latency_delta_ms
+            .clamp(-1_000_000, i64::MAX - 1_000_000);
+        let latency_offset = clamped_delta_ms.saturating_add(1_000_000) as u64;
         self.latency_delta_sum
             .fetch_add(latency_offset, Ordering::Relaxed);
     }
@@ -221,9 +231,13 @@ impl ShadowMetrics {
         };
 
         let avg_latency_delta = if total > 0 {
-            #[allow(clippy::cast_possible_wrap)]
-            let result = (latency_sum as i64 / total as i64) - 1_000_000;
-            result
+            // Compute the average in u64 first (no wrap), then peel back the
+            // offset using checked math so a saturated accumulator can't
+            // underflow into a bogus negative average.
+            let avg_offset = latency_sum / total;
+            i64::try_from(avg_offset)
+                .unwrap_or(i64::MAX)
+                .saturating_sub(1_000_000)
         } else {
             0
         };
