@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use mcp_agent_mail_db::DbConn;
+use mcp_agent_mail_db::guard_db_conn;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -1814,6 +1815,7 @@ fn run_sqlite_quick_check(db_path: &Path) -> Result<(), String> {
     let db_path_str = db_path.display().to_string();
     let conn =
         DbConn::open_file(&db_path_str).map_err(|e| format!("cannot open mailbox.sqlite3: {e}"))?;
+    let conn = guard_db_conn(conn, "share::deploy::run_sqlite_quick_check");
     let rows = conn
         .query_sync("PRAGMA quick_check", &[])
         .map_err(|e| format!("PRAGMA quick_check failed: {e}"))?;
@@ -1847,6 +1849,7 @@ fn validate_agent_mail_schema(db_path: &Path) -> Result<(), String> {
     let db_path_str = db_path.display().to_string();
     let conn =
         DbConn::open_file(&db_path_str).map_err(|e| format!("cannot open mailbox.sqlite3: {e}"))?;
+    let conn = guard_db_conn(conn, "share::deploy::validate_agent_mail_schema");
     let required = [
         ("projects", ["id", "slug", "human_key"].as_slice()),
         ("agents", ["id", "project_id", "name"].as_slice()),
