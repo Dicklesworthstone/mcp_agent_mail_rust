@@ -3854,6 +3854,9 @@ fn load_recipes() -> Vec<RecipeView> {
     let Some(conn) = crate::open_live_metadata_sync_db_connection(&config.database_url) else {
         return Vec::new();
     };
+    // Wrap in DbConnGuard so close_sync() runs at scope exit; otherwise every
+    // /mail recipe load drops a FrankenConnection, emitting drop_close WARN.
+    let conn = mcp_agent_mail_db::guard_db_conn(conn, "mail_ui::load_recipes");
     let recipes = mcp_agent_mail_db::search_recipes::list_recipes(&conn).unwrap_or_default();
     recipes
         .iter()

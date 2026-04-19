@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use mcp_agent_mail_core::{AgentHealthInputs, compute_agent_health};
 use mcp_agent_mail_db::DbConn;
+use mcp_agent_mail_db::guard_db_conn;
 use mcp_agent_mail_db::is_sqlite_recovery_error_message;
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel_core::{Error as SqlError, Row, Value};
@@ -1347,6 +1348,10 @@ fn refill_missing_detail_lists_from_sqlite(
     let Ok(conn) = crate::open_best_effort_sync_db_connection(sqlite_path) else {
         return;
     };
+    // Wrap in DbConnGuard so the connection is closed via close_sync() at scope
+    // exit. Without this, every refill emits the FrankenConnection drop_close
+    // WARN ("Connection dropped without explicit close()") in the TUI poll loop.
+    let conn = guard_db_conn(conn, "tui_poller::refill_missing_detail_lists");
 
     if snapshot.agents > 0 && snapshot.agents_list.is_empty() {
         snapshot.agents_list = fetch_agents_list(&conn);
