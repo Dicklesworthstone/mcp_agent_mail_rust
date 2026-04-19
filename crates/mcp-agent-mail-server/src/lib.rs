@@ -9086,6 +9086,16 @@ impl HttpState {
                         // Exhaustive match so a future DurabilityState variant
                         // addition is a compile error rather than silently
                         // falling through to 200.
+                        //
+                        // Mapping: 503 iff `allows_reads()` is false. Both
+                        // Recovering and Corrupt have allows_reads=false per the
+                        // durability state machine, so clients genuinely cannot
+                        // read during either — returning 200 would route
+                        // traffic at a service that can't serve it. The
+                        // `durability_state` + `status` fields still let
+                        // supervisors distinguish the two (Recovering is
+                        // self-healing; Corrupt needs operator intervention)
+                        // if they want to react differently.
                         match durability {
                             DurabilityState::Healthy => 200,
                             DurabilityState::DegradedReadOnly => {
@@ -9095,7 +9105,11 @@ impl HttpState {
                                 body["status"] = serde_json::json!("ready_degraded");
                                 200
                             }
-                            DurabilityState::Recovering | DurabilityState::Corrupt => {
+                            DurabilityState::Recovering => {
+                                body["status"] = serde_json::json!("recovering");
+                                503
+                            }
+                            DurabilityState::Corrupt => {
                                 body["status"] = serde_json::json!("degraded");
                                 503
                             }
