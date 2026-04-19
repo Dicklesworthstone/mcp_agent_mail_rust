@@ -6142,7 +6142,10 @@ pub struct ExtendedCommitInfo {
 /// Compute a human-readable relative date string.
 fn relative_date_from_secs(authored_secs: i64) -> String {
     let now = chrono::Utc::now().timestamp();
-    let delta = now - authored_secs;
+    // Use saturating_sub so a pathologically negative/future commit timestamp
+    // (e.g., corrupt or crafted `author.when().seconds()`) cannot panic in
+    // debug builds or wrap in release builds.
+    let delta = now.saturating_sub(authored_secs);
     if delta < 0 {
         return "just now".to_string();
     }
@@ -9168,7 +9171,7 @@ mod tests {
         let config = test_config(tmp.path());
         let archive = ensure_archive(&config, "proj").unwrap();
 
-        let messages = vec![
+        let messages = [
             serde_json::json!({
                 "id": 1,
                 "subject": "Commit Summary One",
