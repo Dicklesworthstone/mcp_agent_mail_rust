@@ -408,7 +408,7 @@ def get_push_files():
 
             for sha in commits:
                 diff_res = subprocess.run(
-                    ["git", "diff-tree", "-r", "--no-commit-id", "--name-status",
+                    ["git", "diff-tree", "--root", "-r", "--no-commit-id", "--name-status",
                      "-M", "--no-ext-diff", "--diff-filter=ACMRDTU", "-z", "-m", sha],
                     capture_output=True
                 )
@@ -1634,6 +1634,7 @@ pub fn get_push_paths(repo_root: &Path, stdin_lines: &str) -> GuardResult<Vec<St
                     .current_dir(repo_root)
                     .args([
                         "diff-tree",
+                        "--root",
                         "-r",
                         "--no-commit-id",
                         "--name-status",
@@ -2822,6 +2823,30 @@ mod tests {
     }
 
     #[test]
+    fn push_paths_initial_push_includes_root_commit_files() {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir");
+        run_git(&repo_dir, &["init", "-q"]);
+        run_git(&repo_dir, &["config", "user.email", "test@test.com"]);
+        run_git(&repo_dir, &["config", "user.name", "test"]);
+
+        std::fs::write(repo_dir.join("tracked.rs"), "fn main() {}\n").expect("write tracked");
+        run_git(&repo_dir, &["add", "tracked.rs"]);
+        run_git(&repo_dir, &["commit", "-qm", "initial"]);
+        let local_sha = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+
+        let stdin_lines = format!(
+            "refs/heads/main {local_sha} refs/heads/main 0000000000000000000000000000000000000000\n"
+        );
+        let paths = get_push_paths(&repo_dir, &stdin_lines).expect("push paths");
+        assert!(
+            paths.contains(&"tracked.rs".to_string()),
+            "expected tracked.rs in initial-push paths, got {paths:?}"
+        );
+    }
+
+    #[test]
     fn push_paths_new_branch_remote_zero_still_enumerates_commits() {
         let td = tempfile::TempDir::new().expect("tempdir");
         let repo_dir = td.path().join("repo");
@@ -3500,6 +3525,82 @@ mod tests {
                 || String::from_utf8_lossy(&output.stderr)
                     .contains("failed to enumerate pushed commits"),
             "expected push inspection failure, got stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    fn guard_plugin_pre_push_blocks_initial_push_root_commit_conflict() {
+        let Some(python) = python_executable() else {
+            return;
+        };
+
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        run_git(&repo_dir, &["init", "-q"]);
+        run_git(&repo_dir, &["config", "user.email", "test@test.com"]);
+        run_git(&repo_dir, &["config", "user.name", "test"]);
+        std::fs::write(repo_dir.join("tracked.rs"), "fn main() {}\n").expect("write tracked");
+        run_git(&repo_dir, &["add", "tracked.rs"]);
+        run_git(&repo_dir, &["commit", "-qm", "initial"]);
+        let head = run_git_stdout(&repo_dir, &["rev-parse", "HEAD"]);
+
+        let reservations_dir = repo_dir.join("file_reservations");
+        std::fs::create_dir_all(&reservations_dir).expect("mkdir reservations");
+        std::fs::write(
+            reservations_dir.join("conflict.json"),
+            serde_json::json!({
+                "path_pattern": "tracked.rs",
+                "agent_name": "OtherAgent",
+                "exclusive": true,
+                "expires_ts": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                "released_ts": serde_json::Value::Null,
+            })
+            .to_string(),
+        )
+        .expect("write reservation");
+
+        let script_path = td.path().join("guard_pre_push_initial.py");
+        std::fs::write(
+            &script_path,
+            render_guard_plugin_script(&repo_dir.to_string_lossy(), "pre-push"),
+        )
+        .expect("write guard script");
+
+        let mut child = Command::new(&python)
+            .current_dir(&repo_dir)
+            .env("AGENT_NAME", "PinkStone")
+            .arg(&script_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn guard script");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(
+                format!(
+                    "refs/heads/main {head} refs/heads/main 0000000000000000000000000000000000000000\n"
+                )
+                .as_bytes(),
+            )
+            .expect("write stdin");
+        let output = child.wait_with_output().expect("wait output");
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "guard should block initial-push root-commit conflicts: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("tracked.rs"),
+            "expected tracked.rs conflict in stderr, got stdout={}, stderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
