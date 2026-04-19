@@ -649,6 +649,10 @@ pub mod tool_util {
         } else {
             match mcp_agent_mail_db::DbConn::open_file(&sqlite_path) {
                 Ok(conn) => {
+                    let conn = mcp_agent_mail_db::guard_db_conn(
+                        conn,
+                        "tool_util::open_read_db_pool archive-ahead probe",
+                    );
                     let archive_ahead =
                         read_archive_is_ahead(&config.storage_root, &resolved_path, &conn);
                     drop(conn);

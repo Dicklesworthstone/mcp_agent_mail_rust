@@ -4090,6 +4090,26 @@ const fn atc_kernel_budget_exceeded(
     }
 }
 
+fn atc_operator_tick_budget_status(
+    kernel_total_micros: Option<u64>,
+    tick_duration_micros: u64,
+    tick_budget_micros: u64,
+) -> (bool, Option<String>) {
+    let exceeded = atc_kernel_budget_exceeded(
+        kernel_total_micros,
+        tick_duration_micros,
+        tick_budget_micros,
+    );
+    let note = exceeded.then(|| {
+        let observed_micros = kernel_total_micros.unwrap_or(tick_duration_micros);
+        format!(
+            "ATC tick exceeded budget: {}us > {}us",
+            observed_micros, tick_budget_micros
+        )
+    });
+    (exceeded, note)
+}
+
 fn next_atc_rollup_refresh_micros(now_micros: i64) -> i64 {
     now_micros.saturating_add(ATC_ROLLUP_REFRESH_INTERVAL_MICROS)
 }
@@ -6433,12 +6453,11 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
             .map(|summary| summary.budget.kernel_total_micros);
         let outer_loop_overhead_micros = kernel_total_micros
             .map_or(0, |kernel| tick_duration_micros.saturating_sub(kernel));
-        let note = tick_budget_exceeded.then(|| {
-            format!(
-                "ATC tick exceeded budget: {}us > {}us",
-                tick_duration_micros, tick_budget_micros
-            )
-        });
+        let (tick_budget_exceeded, note) = atc_operator_tick_budget_status(
+            kernel_total_micros,
+            tick_duration_micros,
+            tick_budget_micros,
+        );
         let snapshot = build_atc_operator_snapshot(
             live_summary,
             &recent_actions,
@@ -6464,11 +6483,7 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
             }
         }
 
-        if atc_kernel_budget_exceeded(
-            kernel_total_micros,
-            tick_duration_micros,
-            tick_budget_micros,
-        ) {
+        if tick_budget_exceeded {
             tracing::warn!(
                 duration_micros = tick_duration_micros,
                 kernel_micros = kernel_total_micros.unwrap_or(0),
@@ -14572,6 +14587,27 @@ mod tests {
     fn atc_kernel_budget_warn_kernel_at_budget_does_not_fire() {
         // Strict greater-than comparison preserves the existing semantics.
         assert!(!atc_kernel_budget_exceeded(Some(5_000), 5_000, 5_000));
+    }
+
+    #[test]
+    fn atc_operator_budget_status_suppresses_false_snapshot_alerts() {
+        let (exceeded, note) = atc_operator_tick_budget_status(Some(2_500), 50_000, 5_000);
+        assert!(!exceeded);
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn atc_operator_budget_status_reports_kernel_runtime_when_available() {
+        let (exceeded, note) = atc_operator_tick_budget_status(Some(7_500), 8_000, 5_000);
+        assert!(exceeded);
+        assert_eq!(note.as_deref(), Some("ATC tick exceeded budget: 7500us > 5000us"));
+    }
+
+    #[test]
+    fn atc_operator_budget_status_falls_back_to_wall_clock_without_summary() {
+        let (exceeded, note) = atc_operator_tick_budget_status(None, 8_000, 5_000);
+        assert!(exceeded);
+        assert_eq!(note.as_deref(), Some("ATC tick exceeded budget: 8000us > 5000us"));
     }
 
     #[test]

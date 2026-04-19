@@ -13,6 +13,7 @@
 
 use mcp_agent_mail_core::{Config, kpi_record_sample};
 use mcp_agent_mail_db::DbConn;
+use mcp_agent_mail_db::guard_db_conn;
 use mcp_agent_mail_db::pool::DbPoolConfig;
 use mcp_agent_mail_db::sqlmodel::Value;
 use mcp_agent_mail_db::timestamps::now_micros;
@@ -419,6 +420,7 @@ pub fn load_latest_persisted_metrics(database_url: &str, limit: usize) -> Vec<Pe
     let Some(conn) = open_metrics_connection(database_url) else {
         return Vec::new();
     };
+    let conn = guard_db_conn(conn, "tool_metrics::load_latest_persisted_metrics");
     let limit_i64 = i64::try_from(limit.clamp(1, 2_000)).unwrap_or(200);
     let sql = "SELECT s.tool_name, s.calls, s.errors, s.cluster, s.complexity, \
                       s.latency_avg_ms, s.latency_p50_ms, s.latency_p95_ms, s.latency_p99_ms, \
@@ -446,6 +448,7 @@ pub fn persisted_metric_store_size(database_url: &str) -> u64 {
     let Some(conn) = open_metrics_connection(database_url) else {
         return 0;
     };
+    let conn = guard_db_conn(conn, "tool_metrics::persisted_metric_store_size");
     let sql = format!("SELECT COUNT(*) AS c FROM {TOOL_METRICS_SNAPSHOTS_TABLE}");
     let rows = match conn.query_sync(&sql, &[]) {
         Ok(rows) => rows,
