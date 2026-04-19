@@ -4070,6 +4070,26 @@ const ATC_ROLLUP_REFRESH_INTERVAL_MICROS: i64 = 300_000_000;
 const ATC_ROLLUP_REFRESH_LOOKBACK_MICROS: i64 =
     mcp_agent_mail_db::atc_queries::DEFAULT_ROLLUP_REFRESH_LOOKBACK_MICROS;
 
+/// Decide whether to emit the ATC operator-tick budget WARN.
+///
+/// The configured `tick_budget_micros` bounds the *kernel* compute time, not the
+/// outer wall-clock loop iteration (which also covers periodic durable rollup
+/// refreshes, sweep queries, and population sync). Emitting WARN whenever the
+/// outer loop exceeds the kernel budget produces hundreds of false alarms per
+/// hour on the routine 5-minute rollup refresh. Only fire when the kernel
+/// itself overran. When `kernel_total_micros` is unavailable (no live summary)
+/// we fall back to the wall-clock duration so genuine starvation still surfaces.
+const fn atc_kernel_budget_exceeded(
+    kernel_total_micros: Option<u64>,
+    tick_duration_micros: u64,
+    tick_budget_micros: u64,
+) -> bool {
+    match kernel_total_micros {
+        Some(kernel) => kernel > tick_budget_micros,
+        None => tick_duration_micros > tick_budget_micros,
+    }
+}
+
 fn next_atc_rollup_refresh_micros(now_micros: i64) -> i64 {
     now_micros.saturating_add(ATC_ROLLUP_REFRESH_INTERVAL_MICROS)
 }
@@ -6408,9 +6428,11 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
             u64::try_from(started_at.elapsed().as_micros().min(u128::from(u64::MAX)))
                 .unwrap_or(u64::MAX);
         let tick_budget_exceeded = tick_duration_micros > tick_budget_micros;
-        let outer_loop_overhead_micros = live_summary.as_ref().map_or(0, |summary| {
-            tick_duration_micros.saturating_sub(summary.budget.kernel_total_micros)
-        });
+        let kernel_total_micros = live_summary
+            .as_ref()
+            .map(|summary| summary.budget.kernel_total_micros);
+        let outer_loop_overhead_micros = kernel_total_micros
+            .map_or(0, |kernel| tick_duration_micros.saturating_sub(kernel));
         let note = tick_budget_exceeded.then(|| {
             format!(
                 "ATC tick exceeded budget: {}us > {}us",
@@ -6442,9 +6464,15 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
             }
         }
 
-        if tick_budget_exceeded {
+        if atc_kernel_budget_exceeded(
+            kernel_total_micros,
+            tick_duration_micros,
+            tick_budget_micros,
+        ) {
             tracing::warn!(
                 duration_micros = tick_duration_micros,
+                kernel_micros = kernel_total_micros.unwrap_or(0),
+                outer_loop_overhead_micros,
                 budget_micros = tick_budget_micros,
                 "ATC operator tick exceeded configured budget"
             );
@@ -14516,6 +14544,34 @@ mod tests {
     #[test]
     fn next_atc_rollup_refresh_deadline_saturates() {
         assert_eq!(next_atc_rollup_refresh_micros(i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn atc_kernel_budget_warn_skips_outer_loop_overhead() {
+        // Routine 5-min rollup refresh: kernel within budget, wall-clock far over.
+        // This was the bug: the prior code WARNed every time the rollup refresh
+        // ran, producing 343× WARN spam in production.
+        assert!(!atc_kernel_budget_exceeded(Some(2_500), 50_000, 5_000));
+    }
+
+    #[test]
+    fn atc_kernel_budget_warn_fires_on_kernel_overrun() {
+        // Real kernel slowdown — the signal we actually care about.
+        assert!(atc_kernel_budget_exceeded(Some(7_500), 8_000, 5_000));
+    }
+
+    #[test]
+    fn atc_kernel_budget_warn_falls_back_to_wall_clock_when_summary_missing() {
+        // No live summary → conservative fallback to wall-clock (preserves prior
+        // behavior for genuine starvation when the kernel did not produce a summary).
+        assert!(atc_kernel_budget_exceeded(None, 50_000, 5_000));
+        assert!(!atc_kernel_budget_exceeded(None, 4_000, 5_000));
+    }
+
+    #[test]
+    fn atc_kernel_budget_warn_kernel_at_budget_does_not_fire() {
+        // Strict greater-than comparison preserves the existing semantics.
+        assert!(!atc_kernel_budget_exceeded(Some(5_000), 5_000, 5_000));
     }
 
     #[test]
