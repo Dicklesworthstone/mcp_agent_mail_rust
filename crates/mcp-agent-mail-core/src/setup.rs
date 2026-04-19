@@ -289,27 +289,37 @@ impl fmt::Display for ActionOutcome {
 // ---------------------------------------------------------------------------
 
 /// Generate a cryptographically random 64-char hex token (256-bit entropy).
-#[must_use]
-pub fn generate_token() -> String {
+pub fn generate_token() -> Result<String, SetupError> {
     let mut bytes = [0u8; 32];
-    let _ = getrandom::getrandom(&mut bytes);
+    fill_random_bytes(&mut bytes)?;
     let mut hex = String::with_capacity(64);
     for b in &bytes {
         use std::fmt::Write;
         let _ = write!(hex, "{b:02x}");
     }
-    hex
+    Ok(hex)
 }
 
 /// Generate a cryptographically random URL-safe registration token (256-bit entropy).
 ///
 /// Returns a 43-character base64url-encoded string (no padding) suitable for
 /// embedding in JSON responses and passing as `sender_token` parameters.
-#[must_use]
-pub fn generate_registration_token() -> String {
+pub fn generate_registration_token() -> Result<String, SetupError> {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).expect("CSPRNG failure: cannot generate secure token");
-    base64url_encode_nopad(&bytes)
+    fill_random_bytes(&mut bytes)?;
+    Ok(base64url_encode_nopad(&bytes))
+}
+
+fn fill_random_bytes(bytes: &mut [u8]) -> Result<(), SetupError> {
+    #[cfg(test)]
+    if TEST_RANDOM_FAILURE.with(std::cell::Cell::get) {
+        return Err(SetupError::Other(
+            "CSPRNG failure: test override requested random failure".into(),
+        ));
+    }
+
+    getrandom::getrandom(bytes)
+        .map_err(|error| SetupError::Other(format!("CSPRNG failure: cannot generate secure token: {error}")))
 }
 
 /// Base64url encode without padding (RFC 4648 Section 5).
@@ -362,6 +372,7 @@ pub fn constant_time_str_eq(a: &str, b: &str) -> bool {
 thread_local! {
     static TEST_ENV_OVERRIDES: std::cell::RefCell<std::collections::HashMap<String, Option<String>>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+    static TEST_RANDOM_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn env_value_for_setup(key: &str) -> Option<String> {
@@ -376,20 +387,19 @@ fn env_value_for_setup(key: &str) -> Option<String> {
 
 /// Resolve the bearer token from multiple sources in priority order:
 /// explicit flag > config.env file > `HTTP_BEARER_TOKEN` env var > generate new.
-#[must_use]
-pub fn resolve_token(explicit: Option<&str>, env_file: &Path) -> String {
+pub fn resolve_token(explicit: Option<&str>, env_file: &Path) -> Result<String, SetupError> {
     if let Some(t) = explicit
         && !t.is_empty()
     {
-        return t.to_string();
+        return Ok(t.to_string());
     }
     if let Some(t) = read_env_file_token(env_file) {
-        return t;
+        return Ok(t);
     }
     if let Some(t) = env_value_for_setup("HTTP_BEARER_TOKEN")
         && !t.is_empty()
     {
-        return t;
+        return Ok(t);
     }
     generate_token()
 }
@@ -1476,6 +1486,10 @@ mod tests {
         previous: EnvVarPrevious,
     }
 
+    struct RandomFailureGuard {
+        previous: bool,
+    }
+
     impl EnvVarGuard {
         fn unset(key: &str) -> Self {
             let previous = TEST_ENV_OVERRIDES.with(|cell| {
@@ -1491,6 +1505,13 @@ mod tests {
                 key: key.to_string(),
                 previous,
             }
+        }
+    }
+
+    impl RandomFailureGuard {
+        fn enable() -> Self {
+            let previous = TEST_RANDOM_FAILURE.with(|cell| cell.replace(true));
+            Self { previous }
         }
     }
 
@@ -1510,24 +1531,38 @@ mod tests {
         }
     }
 
+    impl Drop for RandomFailureGuard {
+        fn drop(&mut self) {
+            TEST_RANDOM_FAILURE.with(|cell| cell.set(self.previous));
+        }
+    }
+
     #[test]
     fn generate_token_is_64_hex_chars() {
-        let t = generate_token();
+        let t = generate_token().expect("token generation should succeed");
         assert_eq!(t.len(), 64);
         assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
     fn generate_token_unique_across_calls() {
-        let t1 = generate_token();
-        let t2 = generate_token();
+        let t1 = generate_token().expect("first token generation should succeed");
+        let t2 = generate_token().expect("second token generation should succeed");
         assert_ne!(t1, t2);
+    }
+
+    #[test]
+    fn generate_token_reports_rng_failure() {
+        let _guard = RandomFailureGuard::enable();
+        let error = generate_token().expect_err("rng failure should surface");
+        assert!(error.to_string().contains("CSPRNG failure"));
     }
 
     #[test]
     fn resolve_token_explicit_wins() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let t = resolve_token(Some("my-explicit-token"), tmp.path());
+        let t = resolve_token(Some("my-explicit-token"), tmp.path())
+            .expect("explicit token should resolve");
         assert_eq!(t, "my-explicit-token");
     }
 
@@ -1536,7 +1571,7 @@ mod tests {
         let _env = EnvVarGuard::unset("HTTP_BEARER_TOKEN");
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("no-such-env");
-        let t = resolve_token(None, &missing);
+        let t = resolve_token(None, &missing).expect("token should be generated");
         assert_eq!(t.len(), 64);
     }
 
@@ -1545,7 +1580,7 @@ mod tests {
         let _env = EnvVarGuard::unset("HTTP_BEARER_TOKEN");
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), "HTTP_BEARER_TOKEN=\"double-quoted-token\"\n").unwrap();
-        let t = resolve_token(None, tmp.path());
+        let t = resolve_token(None, tmp.path()).expect("env file token should resolve");
         assert_eq!(t, "double-quoted-token");
     }
 
@@ -1554,7 +1589,7 @@ mod tests {
         let _env = EnvVarGuard::unset("HTTP_BEARER_TOKEN");
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), "HTTP_BEARER_TOKEN='single-quoted-token'\n").unwrap();
-        let t = resolve_token(None, tmp.path());
+        let t = resolve_token(None, tmp.path()).expect("env file token should resolve");
         assert_eq!(t, "single-quoted-token");
     }
 
@@ -1563,9 +1598,19 @@ mod tests {
         let _env = EnvVarGuard::unset("HTTP_BEARER_TOKEN");
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("no-env");
-        let t = resolve_token(Some(""), &missing);
+        let t = resolve_token(Some(""), &missing).expect("token should be generated");
         // Empty explicit should not be used; should fall through to generate
         assert_eq!(t.len(), 64);
+    }
+
+    #[test]
+    fn resolve_token_propagates_rng_failure_when_generation_needed() {
+        let _env = EnvVarGuard::unset("HTTP_BEARER_TOKEN");
+        let _guard = RandomFailureGuard::enable();
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-env");
+        let error = resolve_token(None, &missing).expect_err("rng failure should surface");
+        assert!(error.to_string().contains("CSPRNG failure"));
     }
 
     #[test]
@@ -2609,7 +2654,7 @@ http_headers = { Authorization = "Bearer tok" }
 
     #[test]
     fn generate_registration_token_is_43_chars_base64url() {
-        let token = generate_registration_token();
+        let token = generate_registration_token().expect("token generation should succeed");
         // 32 bytes => ceil(32*4/3) = 43 chars without padding
         assert_eq!(token.len(), 43);
         // Only base64url characters (no +, /, or =)
@@ -2622,9 +2667,16 @@ http_headers = { Authorization = "Bearer tok" }
 
     #[test]
     fn generate_registration_token_unique() {
-        let a = generate_registration_token();
-        let b = generate_registration_token();
+        let a = generate_registration_token().expect("first token generation should succeed");
+        let b = generate_registration_token().expect("second token generation should succeed");
         assert_ne!(a, b, "two consecutive tokens must differ");
+    }
+
+    #[test]
+    fn generate_registration_token_reports_rng_failure() {
+        let _guard = RandomFailureGuard::enable();
+        let error = generate_registration_token().expect_err("rng failure should surface");
+        assert!(error.to_string().contains("CSPRNG failure"));
     }
 
     #[test]

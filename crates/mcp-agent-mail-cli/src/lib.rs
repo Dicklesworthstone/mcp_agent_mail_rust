@@ -3992,7 +3992,8 @@ fn run_setup_self_heal_for_server(config: &Config) -> CliResult<()> {
         .unwrap_or_else(|| PathBuf::from(".config"))
         .join("mcp-agent-mail")
         .join("config.env");
-    let resolved_token = setup::resolve_token(None, &config_env_file);
+    let resolved_token = setup::resolve_token(None, &config_env_file)
+        .map_err(|e| CliError::Other(format!("setup token resolution failed: {e}")))?;
     let agent_name = std::env::var("AGENT_MAIL_AGENT").unwrap_or_default();
     let skip_hooks = agent_name.is_empty();
 
@@ -7048,7 +7049,8 @@ pub(crate) fn handle_setup(action: SetupCommand) -> CliResult<()> {
                 .join("config.env");
 
             // Resolve token
-            let resolved_token = setup::resolve_token(token.as_deref(), &config_env_file);
+            let resolved_token = setup::resolve_token(token.as_deref(), &config_env_file)
+                .map_err(|e| CliError::Other(format!("setup token resolution failed: {e}")))?;
 
             // Parse agent filter
             let agents = match agent {
