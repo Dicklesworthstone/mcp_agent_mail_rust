@@ -2506,8 +2506,29 @@ fn parse_since_micros(s: &str) -> Result<i64, CliError> {
         .ok_or_else(|| CliError::InvalidArgument(format!("invalid --since timestamp: {s}")))
 }
 
-const ACK_OVERDUE_THRESHOLD_US: i64 = 30 * 60 * 1_000_000;
-const ACK_SLA_VIOLATION_THRESHOLD_US: i64 = 60 * 60 * 1_000_000;
+const MICROS_PER_SECOND: i64 = 1_000_000;
+const MICROS_PER_MINUTE: i64 = 60 * MICROS_PER_SECOND;
+const MICROS_PER_HOUR: i64 = 60 * MICROS_PER_MINUTE;
+const MICROS_PER_DAY: i64 = 24 * MICROS_PER_HOUR;
+
+const ACK_OVERDUE_THRESHOLD_US: i64 = 30 * MICROS_PER_MINUTE;
+const ACK_SLA_VIOLATION_THRESHOLD_US: i64 = MICROS_PER_HOUR;
+
+fn micros_ago(now_us: i64, delta_us: i64) -> i64 {
+    now_us.saturating_sub(delta_us)
+}
+
+fn micros_from_now(now_us: i64, delta_us: i64) -> i64 {
+    now_us.saturating_add(delta_us)
+}
+
+fn age_seconds_from_micros(now_us: i64, past_us: i64) -> i64 {
+    now_us.saturating_sub(past_us) / MICROS_PER_SECOND
+}
+
+fn remaining_seconds_from_micros(now_us: i64, future_us: i64) -> i64 {
+    future_us.saturating_sub(now_us) / MICROS_PER_SECOND
+}
 
 // ── Status command implementation ───────────────────────────────────────────
 
@@ -2870,7 +2891,7 @@ fn build_status(
             JOIN messages m ON m.id = mr.message_id
             WHERE mr.agent_id = ? AND m.project_id = ?
         ";
-        let threshold = now_us - ACK_OVERDUE_THRESHOLD_US;
+        let threshold = micros_ago(now_us, ACK_OVERDUE_THRESHOLD_US);
         let rows = conn
             .query_sync(
                 inbox_sql,
@@ -2896,7 +2917,7 @@ fn build_status(
     };
 
     // 2. Active agents (active in last 15 minutes)
-    let active_threshold = now_us - 15 * 60 * 1_000_000;
+    let active_threshold = micros_ago(now_us, 15 * MICROS_PER_MINUTE);
     let active_agents = conn
         .query_sync(
             "SELECT COUNT(*) AS cnt FROM agents WHERE project_id = ? AND last_active_ts > ?",
@@ -2908,7 +2929,7 @@ fn build_status(
         .unwrap_or(0) as usize;
 
     // 3. Recent messages (last hour)
-    let hour_ago = now_us - 3600 * 1_000_000;
+    let hour_ago = micros_ago(now_us, MICROS_PER_HOUR);
     let recent_messages = conn
         .query_sync(
             "SELECT COUNT(*) AS cnt FROM messages WHERE project_id = ? AND created_ts > ?",
@@ -2935,7 +2956,7 @@ fn build_status(
         .unwrap_or(0) as usize;
 
     // Reservations expiring soon (within 5 minutes)
-    let expiring_threshold = now_us + 5 * 60 * 1_000_000;
+    let expiring_threshold = micros_from_now(now_us, 5 * MICROS_PER_MINUTE);
     let reservations_expiring_soon = conn
         .query_sync(
             &format!(
@@ -2979,7 +3000,7 @@ fn build_status(
                 agent: None,
                 path: r.get_named("path_pattern").unwrap_or_default(),
                 exclusive: r.get_named::<i64>("exclusive").unwrap_or(1) != 0,
-                remaining_seconds: (expires - now_us) / 1_000_000,
+                remaining_seconds: remaining_seconds_from_micros(now_us, expires),
                 remaining: None,
                 granted_at: None,
             }
@@ -3019,7 +3040,7 @@ fn build_status(
             let subject = load_thread_subject(conn, project_id, &thread_id, true)?
                 .ok_or_else(|| CliError::Other(format!("top thread not found: {thread_id}")))?;
             let participants = load_thread_participants(conn, project_id, &thread_id)?.len();
-            let age_seconds = now_us.saturating_sub(last_ts) / 1_000_000;
+            let age_seconds = age_seconds_from_micros(now_us, last_ts);
             Ok(ThreadSummary {
                 id: thread_id,
                 subject,
@@ -3148,7 +3169,7 @@ fn build_inbox(
 ) -> Result<InboxResult, CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
     // ack_overdue threshold: 30 minutes
-    let ack_threshold = now_us - ACK_OVERDUE_THRESHOLD_US;
+    let ack_threshold = micros_ago(now_us, ACK_OVERDUE_THRESHOLD_US);
 
     // Build WHERE filter based on flags
     let bucket_filter = if urgent_only {
@@ -3238,7 +3259,7 @@ fn build_inbox(
             "required".to_string()
         };
 
-        let age_seconds = now_us.saturating_sub(created_ts) / 1_000_000;
+        let age_seconds = age_seconds_from_micros(now_us, created_ts);
 
         if bucket == 2 {
             overdue_ids.push(id);
@@ -3509,7 +3530,7 @@ fn build_outbox_entries(
             None
         };
 
-        let age_seconds = now_us.saturating_sub(created_ts) / 1_000_000;
+        let age_seconds = age_seconds_from_micros(now_us, created_ts);
         entries.push(InboxEntry {
             id,
             priority: "sent".to_string(),
@@ -3653,7 +3674,7 @@ fn build_thread(
             "required".to_string()
         };
 
-        let age_seconds = now_us.saturating_sub(created_ts) / 1_000_000;
+        let age_seconds = age_seconds_from_micros(now_us, created_ts);
 
         messages.push(ThreadMessage {
             position: idx + 1,
@@ -3668,7 +3689,7 @@ fn build_thread(
     }
 
     let last_activity = if last_ts > 0 {
-        format_age(now_us.saturating_sub(last_ts) / 1_000_000)
+        format_age(age_seconds_from_micros(now_us, last_ts))
     } else {
         "unknown".to_string()
     };
@@ -3933,7 +3954,7 @@ fn build_message(
         })
         .collect();
 
-    let age_seconds = now_us.saturating_sub(created_ts) / 1_000_000;
+    let age_seconds = age_seconds_from_micros(now_us, created_ts);
     let created_iso = mcp_agent_mail_db::micros_to_iso(created_ts);
 
     Ok(MessageContext {
@@ -4061,7 +4082,7 @@ fn build_search(
         *importance_counts.entry(importance.clone()).or_insert(0) += 1;
 
         let age_seconds = if created_ts > 0 {
-            now_us.saturating_sub(created_ts) / 1_000_000
+            age_seconds_from_micros(now_us, created_ts)
         } else {
             0
         };
@@ -4681,8 +4702,8 @@ fn build_reservations(
         let agent_name: String = row.get_named("agent_name").unwrap_or_default();
         let agent_id_row: i64 = row.get_named("agent_id").unwrap_or(0);
 
-        let remaining_seconds = expires_ts.saturating_sub(now_us) / 1_000_000;
-        let created_age = now_us.saturating_sub(created_ts) / 1_000_000;
+        let remaining_seconds = remaining_seconds_from_micros(now_us, expires_ts);
+        let created_age = age_seconds_from_micros(now_us, created_ts);
 
         let entry = ReservationEntry {
             agent: Some(agent_name.clone()),
@@ -4871,7 +4892,7 @@ fn build_timeline(
     let since_us = if let Some(s) = since {
         parse_since_micros(s)?
     } else {
-        now_us - 24 * 3600 * 1_000_000
+        micros_ago(now_us, MICROS_PER_DAY)
     };
 
     let mut events: Vec<TimelineEvent> = Vec::new();
@@ -5126,7 +5147,7 @@ fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
                    AND m.created_ts < ?",
                 &[
                     Value::BigInt(pid),
-                    Value::BigInt(now_us - ACK_OVERDUE_THRESHOLD_US),
+                    Value::BigInt(micros_ago(now_us, ACK_OVERDUE_THRESHOLD_US)),
                 ],
             )
             .map_err(|e| CliError::Other(format!("overview ack-overdue query failed: {e}")))?
@@ -5183,7 +5204,7 @@ fn build_analytics(
                AND m.created_ts < ?",
             &[
                 Value::BigInt(project_id),
-                Value::BigInt(now_us - ACK_SLA_VIOLATION_THRESHOLD_US),
+                Value::BigInt(micros_ago(now_us, ACK_SLA_VIOLATION_THRESHOLD_US)),
             ],
         )
         .map_err(|e| CliError::Other(format!("analytics ack-overdue query failed: {e}")))?
@@ -5261,7 +5282,7 @@ fn build_analytics(
     }
 
     // Check for expiring-soon reservations
-    let expiring_threshold = now_us + 10 * 60 * 1_000_000;
+    let expiring_threshold = micros_from_now(now_us, 10 * MICROS_PER_MINUTE);
     let active_reservation_join =
         active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
     let active_reservation_predicate = active_reservation_filter_sql(
@@ -5326,8 +5347,8 @@ fn build_analytics(
                )",
             &[
                 Value::BigInt(project_id),
-                Value::BigInt(now_us - 24 * 3600 * 1_000_000),
-                Value::BigInt(now_us - 24 * 3600 * 1_000_000),
+                Value::BigInt(micros_ago(now_us, MICROS_PER_DAY)),
+                Value::BigInt(micros_ago(now_us, MICROS_PER_DAY)),
             ],
         )
         .map_err(|e| CliError::Other(format!("analytics idle agents query failed: {e}")))?;
@@ -5404,8 +5425,8 @@ fn build_agents_with_health(
     }
 
     let now_us = mcp_agent_mail_db::now_micros();
-    let active_threshold = now_us - 15 * 60 * 1_000_000; // 15 min
-    let idle_threshold = now_us - 4 * 3600 * 1_000_000; // 4 hours
+    let active_threshold = micros_ago(now_us, 15 * MICROS_PER_MINUTE); // 15 min
+    let idle_threshold = micros_ago(now_us, 4 * MICROS_PER_HOUR); // 4 hours
     let health_enabled =
         health_target.is_some() || threshold.is_some() || sort_field == Some("health");
 
@@ -5469,10 +5490,10 @@ fn build_agents_with_health(
             continue;
         }
 
-        let age_seconds = now_us.saturating_sub(last_active_ts) / 1_000_000;
+        let age_seconds = age_seconds_from_micros(now_us, last_active_ts);
         let health = health_inputs
             .get(&agent_id)
-            .map(|inputs| compute_agent_health(inputs))
+            .map(compute_agent_health)
             .and_then(|scorecard| {
                 threshold
                     .is_none_or(|minimum| scorecard.grade >= minimum)
@@ -5585,15 +5606,15 @@ fn agent_health_view(scorecard: &AgentHealthScorecard, include_metrics: bool) ->
         grade: scorecard.grade.label().to_string(),
         needs_attention: scorecard.needs_attention(),
         decision_count: scorecard.decision_count,
-        metrics: include_metrics
-            .then(|| {
-                scorecard
-                    .metrics
-                    .iter()
-                    .map(agent_health_metric_row)
-                    .collect()
-            })
-            .unwrap_or_default(),
+        metrics: if include_metrics {
+            scorecard
+                .metrics
+                .iter()
+                .map(agent_health_metric_row)
+                .collect()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -5966,7 +5987,7 @@ fn build_contacts(conn: &DbConn, project_id: i64) -> Result<Vec<ContactRow>, Cli
         let reason: String = row.get_named("reason").unwrap_or_default();
         let updated_ts: i64 = row.get_named("updated_ts").unwrap_or(0);
 
-        let age = now_us.saturating_sub(updated_ts) / 1_000_000;
+        let age = age_seconds_from_micros(now_us, updated_ts);
 
         contacts.push(ContactRow {
             from,
@@ -6054,7 +6075,7 @@ fn build_projects(conn: &DbConn) -> Result<Vec<ProjectRow>, CliError> {
         let res_count: i64 = row.get_named("res_count").unwrap_or(0);
         let created_at: i64 = row.get_named("created_at").unwrap_or(0);
 
-        let age = now_us.saturating_sub(created_at) / 1_000_000;
+        let age = age_seconds_from_micros(now_us, created_at);
 
         projects.push(ProjectRow {
             slug,
@@ -6765,7 +6786,7 @@ fn build_local_atc_fallback_snapshot(
         let name: String = row.get_named("name").unwrap_or_default();
         let last_active_ts: i64 = row.get_named("last_active_ts").unwrap_or(0);
         let silence_secs = if last_active_ts > 0 {
-            now_us.saturating_sub(last_active_ts) / 1_000_000
+            age_seconds_from_micros(now_us, last_active_ts)
         } else {
             probe_interval_secs.saturating_mul(4)
         };
@@ -13242,8 +13263,7 @@ mod tests {
             Some("/tmp/demo-project"),
             Some("coralmarsh"),
         )
-        .err()
-        .expect("local db should still miss CoralMarsh");
+        .expect_err("local db should still miss CoralMarsh");
         assert!(
             should_try_archive_snapshot(
                 &err,
@@ -15797,6 +15817,32 @@ mod tests {
         assert_eq!(super::format_duration_human(4320), "1h 12m");
         assert_eq!(super::format_duration_human(7200), "2h 0m");
         assert_eq!(super::format_duration_human(86400), "24h 0m");
+    }
+
+    #[test]
+    fn micros_ago_saturates_at_i64_min() {
+        assert_eq!(super::micros_ago(i64::MIN, 1), i64::MIN);
+    }
+
+    #[test]
+    fn micros_from_now_saturates_at_i64_max() {
+        assert_eq!(super::micros_from_now(i64::MAX, 1), i64::MAX);
+    }
+
+    #[test]
+    fn age_seconds_from_micros_saturates_extreme_delta() {
+        assert_eq!(
+            super::age_seconds_from_micros(i64::MAX, i64::MIN),
+            i64::MAX / super::MICROS_PER_SECOND
+        );
+    }
+
+    #[test]
+    fn remaining_seconds_from_micros_saturates_extreme_delta() {
+        assert_eq!(
+            super::remaining_seconds_from_micros(i64::MIN, i64::MAX),
+            i64::MAX / super::MICROS_PER_SECOND
+        );
     }
 
     #[test]
