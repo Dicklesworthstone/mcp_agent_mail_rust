@@ -493,6 +493,9 @@ fn parse_int_field(value: &Value, field: &'static str) -> ShareResult<i64> {
 fn coerce_int(default: i64, candidates: &[(&'static str, Option<&Value>)]) -> ShareResult<i64> {
     for (field, value) in candidates {
         if let Some(value) = value {
+            if value.is_null() {
+                continue;
+            }
             return parse_int_field(value, field);
         }
     }
@@ -1079,6 +1082,71 @@ mod tests {
             .expect_err("invalid numeric threshold fields should fail validation");
         assert!(matches!(err, ShareError::Validation { .. }));
         assert!(err.to_string().contains("inline_threshold"));
+    }
+
+    #[test]
+    fn load_bundle_export_config_treats_null_thresholds_as_missing_when_fallbacks_exist() {
+        let dir = tempdir().expect("tempdir");
+        let manifest = json!({
+            "export_config": {
+                "inline_threshold": null,
+                "detach_threshold": null,
+                "chunk_threshold": null,
+                "chunk_size": null
+            },
+            "attachments": {
+                "config": {
+                    "inline_threshold": 1_500,
+                    "detach_threshold": 2_500
+                }
+            },
+            "database": {
+                "chunk_manifest": {
+                    "chunk_size": 3_072
+                }
+            }
+        });
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let cfg = load_bundle_export_config(dir.path()).expect("null thresholds should fall back");
+        assert_eq!(cfg.inline_threshold, 1_500);
+        assert_eq!(cfg.detach_threshold, 2_500);
+        assert_eq!(cfg.chunk_threshold, DEFAULT_CHUNK_THRESHOLD as i64);
+        assert_eq!(cfg.chunk_size, 3_072);
+    }
+
+    #[test]
+    fn load_bundle_export_config_treats_null_chunk_config_fields_as_missing() {
+        let dir = tempdir().expect("tempdir");
+        let manifest = json!({
+            "export_config": {
+                "chunk_threshold": 5_000,
+                "chunk_size": 6_000
+            }
+        });
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+        let chunk_cfg = json!({
+            "chunk_size": null,
+            "threshold_bytes": null
+        });
+        std::fs::write(
+            dir.path().join("mailbox.sqlite3.config.json"),
+            serde_json::to_string_pretty(&chunk_cfg).expect("serialize chunk config"),
+        )
+        .expect("write chunk config");
+
+        let cfg = load_bundle_export_config(dir.path())
+            .expect("null chunk config fields should preserve manifest values");
+        assert_eq!(cfg.chunk_size, 6_000);
+        assert_eq!(cfg.chunk_threshold, 5_000);
     }
 
     #[test]
