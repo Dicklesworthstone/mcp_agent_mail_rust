@@ -2515,7 +2515,10 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
             };
 
         if already_satisfied {
-            tracing::warn!(
+            // Expected on fresh-DB bootstrap (latest schema already in place) and on
+            // idempotent ALTER TABLE migrations that find their column already exists.
+            // Operator does not need a WARN; the migration row is still recorded below.
+            tracing::info!(
                 migration_id = %migration.id,
                 "migration preflight found schema already satisfies migration; recording migration without executing DDL"
             );
