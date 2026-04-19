@@ -723,11 +723,7 @@ fn compute_state_from_probes(probes: &[ProbeResult], recovery_lock_held: bool) -
         state = state.max_severity(probe.impact_state);
     }
 
-    if state == MailboxState::Escalate {
-        return state;
-    }
-
-    if recovery_lock_held {
+    if recovery_lock_held && state.severity() < MailboxState::Broken.severity() {
         MailboxState::Recovering
     } else {
         state
@@ -1961,6 +1957,16 @@ mod tests {
         ];
         let verdict = verdict_from_probes(probes, true);
         assert_eq!(verdict.state, MailboxState::Recovering);
+    }
+
+    #[test]
+    fn decisive_corruption_beats_recovery_lock_precedence() {
+        let probes = vec![ProbeResult::error(
+            "db_sanity",
+            "primary SQLite read-path health probe failed",
+        )];
+        let verdict = verdict_from_probes(probes, true);
+        assert_eq!(verdict.state, MailboxState::Broken);
     }
 
     #[test]
