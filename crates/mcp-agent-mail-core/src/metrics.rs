@@ -10,9 +10,9 @@
 
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Primitives
@@ -1071,15 +1071,11 @@ impl SearchMetrics {
     }
 
     /// Update Tantivy index health gauges.
-    #[allow(clippy::cast_possible_truncation)] // u128 micros won't overflow u64 for millennia
     pub fn update_index_health(&self, size_bytes: u64, doc_count: u64) {
         self.tantivy_index_size_bytes.set(size_bytes);
         self.tantivy_doc_count.set(doc_count);
-        self.tantivy_last_update_us.set(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_micros() as u64),
-        );
+        self.tantivy_last_update_us
+            .set(u64::try_from(crate::timestamps::now_micros()).unwrap_or_default());
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -1537,8 +1533,8 @@ mod tests {
 
     #[test]
     fn histogram_snapshot_benchmark_concurrent_read_write() {
-        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
         const NUM_WRITERS: usize = 4;
         const NUM_READERS: usize = 4;

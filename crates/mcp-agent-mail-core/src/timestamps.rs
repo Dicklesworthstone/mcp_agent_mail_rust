@@ -448,6 +448,63 @@ mod tests {
     }
 
     #[test]
+    fn evidence_ledger_entry_new_uses_skew_protected_timestamp() {
+        reset();
+        let future = Utc::now().timestamp_micros() + 10_000_000_000; // +10_000s
+        LAST_SYSTEM_TIME_US.store(future, Ordering::SeqCst);
+
+        let entry = crate::evidence_ledger::EvidenceLedgerEntry::new(
+            "decision-1",
+            "search.hybrid_budget",
+            "balanced",
+            0.5,
+            serde_json::json!({"query": "hello"}),
+        );
+
+        assert_eq!(entry.ts_micros, future + 1);
+    }
+
+    #[test]
+    fn evidence_ledger_record_uses_skew_protected_timestamp() {
+        reset();
+        let future = Utc::now().timestamp_micros() + 10_000_000_000; // +10_000s
+        LAST_SYSTEM_TIME_US.store(future, Ordering::SeqCst);
+
+        let ledger = crate::evidence_ledger::EvidenceLedger::new(8);
+        let seq = ledger.record(
+            "search.hybrid_budget",
+            serde_json::json!({"query": "hello"}),
+            "balanced",
+            Some("expected".to_string()),
+            0.5,
+            "test-model",
+        );
+        let recent = ledger.recent(1);
+
+        assert_eq!(seq, 1);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].ts_micros, future + 1);
+    }
+
+    #[test]
+    fn search_metrics_update_index_health_uses_skew_protected_timestamp() {
+        reset();
+        let future = Utc::now().timestamp_micros() + 10_000_000_000; // +10_000s
+        LAST_SYSTEM_TIME_US.store(future, Ordering::SeqCst);
+
+        let metrics = crate::metrics::SearchMetrics::default();
+        metrics.update_index_health(1024, 42);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.tantivy_index_size_bytes, 1024);
+        assert_eq!(snap.tantivy_doc_count, 42);
+        assert_eq!(
+            snap.tantivy_last_update_us,
+            u64::try_from(future + 1).expect("future timestamp should stay non-negative")
+        );
+    }
+
+    #[test]
     fn now_micros_raw_within_one_second_of_now_micros() {
         reset();
         let protected = now_micros();

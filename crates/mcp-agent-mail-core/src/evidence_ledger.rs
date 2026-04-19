@@ -17,7 +17,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -35,7 +34,7 @@ pub struct EvidenceLedgerEntry {
     /// Monotonic sequence number (assigned by [`EvidenceLedger`]).
     #[serde(default)]
     pub seq: u64,
-    /// Wall-clock timestamp in microseconds since Unix epoch.
+    /// Skew-protected timestamp in microseconds since Unix epoch.
     pub ts_micros: i64,
     /// Stable decision identifier for correlation across traces.
     pub decision_id: String,
@@ -79,7 +78,7 @@ impl EvidenceLedgerEntry {
     ) -> Self {
         Self {
             seq: 0,
-            ts_micros: Utc::now().timestamp_micros(),
+            ts_micros: crate::timestamps::now_micros(),
             decision_id: decision_id.into(),
             decision_point: decision_point.into(),
             action: action.into(),
@@ -235,7 +234,7 @@ impl EvidenceLedger {
         let dp: String = decision_point.into();
         let entry = EvidenceLedgerEntry {
             seq,
-            ts_micros: Utc::now().timestamp_micros(),
+            ts_micros: crate::timestamps::now_micros(),
             decision_id: format!("{dp}-{seq}"),
             decision_point: dp,
             action: action.into(),
