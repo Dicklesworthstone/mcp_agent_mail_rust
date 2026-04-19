@@ -12250,6 +12250,93 @@ mod tests {
         EffectKind, ExperienceOutcome, ExperienceState, ExperienceSubsystem, FeatureExtension,
         FeatureVector, NonExecutionReason,
     };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Id, Metadata, Subscriber, span};
+
+    #[derive(Clone, Default)]
+    struct EventCapture {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+        next_id: Arc<AtomicU64>,
+    }
+
+    impl EventCapture {
+        fn drop_close_count(&self) -> usize {
+            self.events
+                .lock()
+                .expect("event capture lock poisoned")
+                .iter()
+                .filter(|event| {
+                    event.target == "fsqlite::runtime"
+                        && event
+                            .fields
+                            .iter()
+                            .any(|(name, value)| name == "event" && value.contains("drop_close"))
+                })
+                .count()
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct CapturedEvent {
+        target: &'static str,
+        fields: Vec<(String, String)>,
+    }
+
+    #[derive(Default)]
+    struct EventFieldCapture {
+        fields: Vec<(String, String)>,
+    }
+
+    impl Visit for EventFieldCapture {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+    }
+
+    impl Subscriber for EventCapture {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn register_callsite(
+            &self,
+            _metadata: &'static Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::metadata::LevelFilter> {
+            Some(tracing::metadata::LevelFilter::TRACE)
+        }
+
+        fn new_span(&self, _attrs: &span::Attributes<'_>) -> Id {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+            Id::from_u64(id)
+        }
+
+        fn record(&self, _span: &Id, _values: &span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut fields = EventFieldCapture::default();
+            event.record(&mut fields);
+            self.events
+                .lock()
+                .expect("event capture lock poisoned")
+                .push(CapturedEvent {
+                    target: event.metadata().target(),
+                    fields: fields.fields,
+                });
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
 
     async fn set_agent_last_active_for_test(cx: &Cx, pool: &DbPool, agent_id: i64, ts: i64) {
         let conn = acquire_conn(cx, pool)
@@ -18148,6 +18235,133 @@ mod tests {
             .into_result()
             .expect("pooled handle should confirm committed message visibility");
         });
+    }
+
+    #[test]
+    fn create_message_with_recipients_pool_drop_surfaces_repeated_drop_close_warnings() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let capture = EventCapture::default();
+        let iterations = 3usize;
+
+        tracing::subscriber::with_default(capture.clone(), || {
+            let rt = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build runtime");
+
+            for iteration in 0..iterations {
+                let dir = tempdir().expect("tempdir");
+                let db_path = dir
+                    .path()
+                    .join(format!("message_recipients_drop_close_{iteration}.db"));
+                let seed_conn = crate::DbConn::open_file(db_path.display().to_string())
+                    .expect("open base schema connection");
+                let seed_conn = crate::guard_db_conn(
+                    seed_conn,
+                    "queries::tests message_recipients drop_close seed",
+                );
+                seed_conn
+                    .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+                    .expect("apply init PRAGMAs");
+                let init_sql = crate::schema::init_schema_sql_base();
+                seed_conn
+                    .execute_raw(&init_sql)
+                    .expect("initialize base schema");
+                drop(seed_conn);
+
+                let cfg = crate::pool::DbPoolConfig {
+                    database_url: format!("sqlite:///{}", db_path.display()),
+                    min_connections: 1,
+                    max_connections: 1,
+                    run_migrations: false,
+                    warmup_connections: 0,
+                    ..Default::default()
+                };
+                let pool = crate::create_pool(&cfg).expect("create pool");
+
+                rt.block_on(async {
+                    let cx = Cx::for_testing();
+                    let project = ensure_project(
+                        &cx,
+                        &pool,
+                        &format!("/tmp/am-message-recipient-drop-close-{iteration}"),
+                    )
+                    .await
+                    .into_result()
+                    .expect("ensure project");
+                    let project_id = project.id.expect("project id");
+
+                    let sender = create_agent(
+                        &cx,
+                        &pool,
+                        project_id,
+                        &format!("BlueLake{iteration}"),
+                        "codex-cli",
+                        "gpt-5",
+                        Some("sender"),
+                        Some("auto"),
+                    )
+                    .await
+                    .into_result()
+                    .expect("create sender");
+                    let sender_id = sender.id.expect("sender id");
+
+                    let recipient = create_agent(
+                        &cx,
+                        &pool,
+                        project_id,
+                        &format!("GreenStone{iteration}"),
+                        "codex-cli",
+                        "gpt-5",
+                        Some("recipient"),
+                        Some("auto"),
+                    )
+                    .await
+                    .into_result()
+                    .expect("create recipient");
+                    let recipient_id = recipient.id.expect("recipient id");
+
+                    let message = create_message_with_recipients(
+                        &cx,
+                        &pool,
+                        project_id,
+                        sender_id,
+                        &format!("drop-close-subject-{iteration}"),
+                        "body",
+                        Some("THREAD-DROP-CLOSE"),
+                        "normal",
+                        false,
+                        "[]",
+                        &[(recipient_id, "to")],
+                    )
+                    .await
+                    .into_result()
+                    .expect("create message with recipients");
+                    let message_id = message.id.expect("message id");
+
+                    let recipients =
+                        list_message_recipients_by_message(&cx, &pool, project_id, message_id)
+                            .await
+                            .into_result()
+                            .expect("list recipients");
+                    assert_eq!(recipients.len(), 1, "recipient row should persist");
+                    assert_eq!(recipients[0].agent_id, recipient_id);
+                    assert_eq!(recipients[0].kind, "to");
+                });
+
+                // Dropping the pool currently tears down idle sqlmodel_pool
+                // connections without an explicit Connection::close(), which
+                // FrankenConnection surfaces as `drop_close`.
+                drop(pool);
+            }
+        });
+
+        assert!(
+            capture.drop_close_count() >= iterations,
+            "expected at least {iterations} pooled drop_close warnings after repeated message_recipients writes, saw {}",
+            capture.drop_close_count()
+        );
     }
 
     #[test]

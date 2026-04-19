@@ -6447,7 +6447,6 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
         let tick_duration_micros =
             u64::try_from(started_at.elapsed().as_micros().min(u128::from(u64::MAX)))
                 .unwrap_or(u64::MAX);
-        let tick_budget_exceeded = tick_duration_micros > tick_budget_micros;
         let kernel_total_micros = live_summary
             .as_ref()
             .map(|summary| summary.budget.kernel_total_micros);
