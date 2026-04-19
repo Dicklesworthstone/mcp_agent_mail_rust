@@ -22442,7 +22442,9 @@ first body
             "body must include allows_reads bool: {body}"
         );
         assert!(
-            body.get("allows_writes").and_then(|v| v.as_bool()).is_some(),
+            body.get("allows_writes")
+                .and_then(|v| v.as_bool())
+                .is_some(),
             "body must include allows_writes bool: {body}"
         );
     }
