@@ -2269,7 +2269,7 @@ impl Drop for SnapshotDirGuard {
 }
 
 pub(crate) struct ObservabilitySyncDb {
-    conn: DbConn,
+    conn: Option<DbConn>,
     sqlite_path: String,
     #[cfg(test)]
     kind: ObservabilitySyncDbKind,
@@ -2279,7 +2279,7 @@ pub(crate) struct ObservabilitySyncDb {
 impl ObservabilitySyncDb {
     fn live(conn: DbConn, sqlite_path: String) -> Self {
         Self {
-            conn,
+            conn: Some(conn),
             sqlite_path,
             #[cfg(test)]
             kind: ObservabilitySyncDbKind::LiveSqlite,
@@ -2325,7 +2325,7 @@ impl ObservabilitySyncDb {
             )
         })?;
         Ok(Self {
-            conn,
+            conn: Some(conn),
             sqlite_path: sqlite_path_str,
             #[cfg(test)]
             kind: ObservabilitySyncDbKind::ArchiveSnapshot,
@@ -2334,16 +2334,32 @@ impl ObservabilitySyncDb {
     }
 
     pub(crate) fn conn(&self) -> &DbConn {
-        &self.conn
+        self.conn
+            .as_ref()
+            .expect("ObservabilitySyncDb::conn called after into_parts consumed the connection")
     }
 
-    pub(crate) fn into_parts(self) -> (DbConn, String, Option<SnapshotDirGuard>) {
-        (self.conn, self.sqlite_path, self._snapshot_dir)
+    pub(crate) fn into_parts(mut self) -> (DbConn, String, Option<SnapshotDirGuard>) {
+        let conn = self
+            .conn
+            .take()
+            .expect("ObservabilitySyncDb::into_parts called twice");
+        let sqlite_path = std::mem::take(&mut self.sqlite_path);
+        let snapshot_dir = self._snapshot_dir.take();
+        (conn, sqlite_path, snapshot_dir)
     }
 
     #[cfg(test)]
     fn uses_archive_snapshot(&self) -> bool {
         matches!(self.kind, ObservabilitySyncDbKind::ArchiveSnapshot)
+    }
+}
+
+impl Drop for ObservabilitySyncDb {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            mcp_agent_mail_db::close_db_conn(conn, "server observability sync db");
+        }
     }
 }
 
@@ -2365,7 +2381,8 @@ pub(crate) fn open_observability_db_pool(
 ) -> Result<ObservabilityDbPool, String> {
     let observed = open_observability_sync_db_connection(database_url, storage_root, context)?
         .ok_or_else(|| "database connection unavailable".to_string())?;
-    let (_conn, sqlite_path, snapshot_dir) = observed.into_parts();
+    let (conn, sqlite_path, snapshot_dir) = observed.into_parts();
+    mcp_agent_mail_db::close_db_conn(conn, "observability pool bootstrap sync conn");
     let cfg = DbPoolConfig {
         database_url: format!("sqlite:///{}", sqlite_path),
         storage_root: Some(storage_root.to_path_buf()),
@@ -2415,7 +2432,10 @@ pub(crate) fn open_observability_sync_db_connection(
                     drift = drift.readiness_error(),
                     "using archive-backed observability snapshot because the live sqlite index lags the Git archive"
                 );
-                drop(conn);
+                mcp_agent_mail_db::close_db_conn(
+                    conn,
+                    "observability live-sqlite fallback to archive snapshot (drift)",
+                );
                 ObservabilitySyncDb::archive_snapshot(
                     storage_root,
                     resolved_path.exists().then_some(resolved_path.as_path()),
@@ -2432,7 +2452,10 @@ pub(crate) fn open_observability_sync_db_connection(
                     error = %error,
                     "using archive-backed observability snapshot because the live sqlite inventory probe failed"
                 );
-                drop(conn);
+                mcp_agent_mail_db::close_db_conn(
+                    conn,
+                    "observability live-sqlite fallback to archive snapshot (probe failed)",
+                );
                 ObservabilitySyncDb::archive_snapshot(
                     storage_root,
                     resolved_path.exists().then_some(resolved_path.as_path()),
