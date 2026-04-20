@@ -28,8 +28,13 @@ impl PatternCache {
     }
 
     fn get_or_insert(&mut self, raw: &str) -> Arc<CompiledPattern> {
-        if let Some(compiled) = self.entries.get(raw) {
-            return Arc::clone(compiled);
+        if let Some(compiled) = self.entries.get(raw).cloned() {
+            // Move to back of order queue (LRU)
+            if let Some(pos) = self.order.iter().position(|x| x == raw) {
+                let val = self.order.remove(pos).unwrap();
+                self.order.push_back(val);
+            }
+            return compiled;
         }
 
         let compiled = Arc::new(CompiledPattern::new(raw));

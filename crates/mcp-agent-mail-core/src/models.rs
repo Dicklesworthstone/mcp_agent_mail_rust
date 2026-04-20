@@ -594,7 +594,7 @@ pub fn normalize_agent_name(name: &str) -> Option<String> {
         Cow::Borrowed(name)
     };
 
-    // Check per-thread LRU cache first.
+    // Check per-thread cache first.
     if let Some(cached) = NORM_CACHE.with(|c| c.borrow().get(lower.as_ref()).cloned()) {
         return Some(cached);
     }
