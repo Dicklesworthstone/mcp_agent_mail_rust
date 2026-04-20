@@ -17,6 +17,7 @@ git2.workspace = true
 globset.workspace = true
 chrono.workspace = true
 mcp-agent-mail-core = { workspace = true }
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

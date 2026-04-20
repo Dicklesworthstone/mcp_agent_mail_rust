@@ -328,6 +328,35 @@ fn scan_one_project(
 
     if apply && backup_path.is_some() {
         let _ = rotate_backups(project_path, config);
+
+        // br-8ujfs.6.4 (F4): regenerate packed-refs after a successful
+        // prune so the remaining refs are consolidated. Writes a
+        // backup of packed-refs (if present) under backup_path's sibling
+        // before running. `git pack-refs --all --prune` is atomic (new
+        // file + rename) and safe to run while we hold the flock.
+        match repack_refs(project_path, config) {
+            Ok(()) => {
+                actions.push(ActionRecord {
+                    op: "repacked_refs",
+                    project: project_display.clone(),
+                    ref_name: None,
+                    target_sha: None,
+                    reason: Some("git pack-refs --all --prune".to_string()),
+                    category: None,
+                });
+            }
+            Err(e) => {
+                apply_summary.errors += 1;
+                actions.push(ActionRecord {
+                    op: "repack_failed",
+                    project: project_display.clone(),
+                    ref_name: None,
+                    target_sha: None,
+                    reason: Some(format!("pack-refs failed: {e}")),
+                    category: None,
+                });
+            }
+        }
     }
 
     tracing::info!(
@@ -410,6 +439,56 @@ fn write_ref_backup(
     fs::write(&file, text.as_bytes())
         .map_err(|e| format!("write backup: {e}"))?;
     Ok(file)
+}
+
+/// Repack refs via `git pack-refs --all --prune` after a successful
+/// prune run. br-8ujfs.6.4 (F4).
+fn repack_refs(project_path: &Path, config: &Config) -> Result<(), String> {
+    // Backup packed-refs (if it exists) BEFORE running pack-refs.
+    let admin_dir = mcp_agent_mail_core::git_lock::admin_dir_for(project_path)
+        .ok_or_else(|| "admin dir unresolvable".to_string())?;
+    let packed_refs = admin_dir.join("packed-refs");
+    if packed_refs.is_file() {
+        let slug = project_slug(project_path);
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let dir = config
+            .storage_root
+            .join("backups")
+            .join("refs")
+            .join(&slug);
+        fs::create_dir_all(&dir).map_err(|e| format!("mkdir backup dir: {e}"))?;
+        let backup_file = dir.join(format!("{ts}-packed-refs.txt"));
+        fs::copy(&packed_refs, &backup_file)
+            .map_err(|e| format!("copy packed-refs backup: {e}"))?;
+        tracing::info!(
+            target: "mcp_agent_mail::doctor::fix_orphan_refs",
+            src = %packed_refs.display(),
+            dst = %backup_file.display(),
+            "packed_refs_backup_written"
+        );
+    }
+
+    // Run git pack-refs --all --prune via GitCmd.
+    let out = mcp_agent_mail_core::git_cmd::GitCmd::new(project_path)
+        .args(["pack-refs", "--all", "--prune"])
+        .run()
+        .map_err(|e| format!("pack-refs invocation: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "pack-refs exit {}: {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim(),
+        ));
+    }
+    tracing::info!(
+        target: "mcp_agent_mail::doctor::fix_orphan_refs",
+        project = %project_path.display(),
+        "packed_refs_rebuild_completed"
+    );
+    Ok(())
 }
 
 fn rotate_backups(project_path: &Path, config: &Config) -> Result<(), String> {

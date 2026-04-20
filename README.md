@@ -743,6 +743,41 @@ sequenceDiagram
 - **Option A (single project bus):** Register both repos under the same `project_key`. Keep reservation patterns specific (`frontend/**` vs `backend/**`).
 - **Option B (separate projects):** Each repo has its own `project_key`. Use `macro_contact_handshake` to link agents, then message directly. Keep a shared `thread_id` across repos.
 
+### External Git Coordination (opt-in)
+
+`mcp-agent-mail` serializes its own in-process git shell-outs via
+per-repo `flock` on `<repo>/.git/am.git-serialize.lock`. External tools
+(wrapper scripts, editor integrations, CI) can honor the same sentinel
+by invoking git through `scripts/git-with-amlock.sh`:
+
+```bash
+# one-time: put the wrapper on PATH
+install -m755 scripts/git-with-amlock.sh ~/.local/bin/git-with-amlock
+
+# per-shell: resolve an "am-aware" git for automation
+export GIT_BIN="$(command -v git-with-amlock || command -v git)"
+alias gitam='"$GIT_BIN"'
+
+# your automation invokes gitam instead of git:
+gitam status
+gitam commit -m 'synced'
+```
+
+**Scope of the mitigation:**
+
+- mcp-agent-mail's own in-process calls → always coordinated
+  (automatic).
+- External tools that opt into the wrapper → coordinated.
+- Your IDE running `git commit` directly, with no wrapper →
+  **still races**. The only complete mitigation for that case is to
+  set `AM_GIT_BINARY` to a safe git binary, or upgrade/downgrade the
+  system git. See the
+  [Known-bad git versions](#known-bad-git-versions) section.
+
+The wrapper honors `AM_GIT_BINARY` for binary selection and
+`AM_GIT_FLOCK_TIMEOUT_SECS` (default 60s) for the bounded wait cap.
+Exit code 75 (`EX_TEMPFAIL`) signals a flock timeout.
+
 ### With Beads Task Tracking
 
 Agent Mail pairs with [Beads](https://github.com/Dicklesworthstone/beads_rust) (`br`) for dependency-aware task selection:

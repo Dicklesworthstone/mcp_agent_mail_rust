@@ -302,10 +302,56 @@ HOOK_NAME = __HOOK_NAME_JSON__
 AGENT_NAME = os.environ.get("AGENT_NAME", "").strip()
 GUARD_MODE = os.environ.get("AGENT_MAIL_GUARD_MODE", "block")
 
+# br-8ujfs.5.5 (E5) — Python-side SIGSEGV retry for git 2.51.0 index race.
+# Matches the Rust retry policy (3 retries, 100/400/1600ms jittered).
+# Only retries on segfault-shaped exits (139 = 128+11, 135 = 128+7,
+# negative -11/-7 on POSIX); all other nonzero returncodes propagate.
+import random as _random
+import time as _time
+
+def _run_git_with_retry(args, **kwargs):
+    """subprocess.run wrapper that retries on SIGSEGV (git 2.51.0).
+
+    `args` is the full argv list (typically ["git", ...]).
+    Honors `AM_GIT_BINARY` if set, replacing argv[0]=="git".
+    kwargs are forwarded to subprocess.run unchanged.
+    """
+    env_bin = os.environ.get("AM_GIT_BINARY")
+    if env_bin and args and args[0] == "git":
+        args = [env_bin] + list(args[1:])
+
+    delays = (0.1, 0.4, 1.6)
+    max_retries = 3
+    last_result = None
+    for attempt in range(max_retries + 1):
+        last_result = subprocess.run(args, **kwargs)
+        rc = last_result.returncode
+        # segfault-like exits:
+        #   -11 / -7 on POSIX (signal), 139 / 135 via shell wrapping,
+        #   0xC0000005 on Windows.
+        is_segfault = rc in (-11, -7, 139, 135, 0xC0000005)
+        if not is_segfault:
+            return last_result
+        if attempt == max_retries:
+            sys.stderr.write(
+                "guard: git exited with signal %d %d times (known-bad 2.51.0). "
+                "Set AM_GIT_BINARY or upgrade git.\n" % (rc, attempt + 1)
+            )
+            return last_result
+        jitter = _random.uniform(0.75, 1.25)
+        sleep_s = delays[attempt] * jitter
+        sys.stderr.write(
+            "guard: git segfault (rc=%d, attempt %d/%d); retrying in %.2fs\n"
+            % (rc, attempt + 1, max_retries + 1, sleep_s)
+        )
+        _time.sleep(sleep_s)
+    return last_result
+
+
 def get_staged_files():
     """Get list of staged files from git (for pre-commit)."""
     try:
-        result = subprocess.run(
+        result = _run_git_with_retry(
             ["git", "diff", "--cached", "--name-status", "-M", "-z", "--diff-filter=ACMRDTU"],
             capture_output=True, check=True,
         )
@@ -390,7 +436,7 @@ def get_push_files():
                 rev_list_args = ["git", "rev-list", "--topo-order", f"{remote_sha}..{local_sha}"]
 
             # Get commits in range
-            res = subprocess.run(
+            res = _run_git_with_retry(
                 rev_list_args,
                 capture_output=True, text=True
             )
@@ -407,7 +453,7 @@ def get_push_files():
             commits = [c.strip() for c in res.stdout.splitlines() if c.strip()]
 
             for sha in commits:
-                diff_res = subprocess.run(
+                diff_res = _run_git_with_retry(
                     ["git", "diff-tree", "--root", "-r", "--no-commit-id", "--name-status",
                      "-M", "--no-ext-diff", "--diff-filter=ACMRDTU", "-z", "-m", sha],
                     capture_output=True
@@ -502,7 +548,7 @@ def default_storage_root():
 
 def get_repo_root():
     try:
-        result = subprocess.run(
+        result = _run_git_with_retry(
             ["git", "rev-parse", "--show-toplevel"],
             capture_output=True,
             text=True,
@@ -732,7 +778,7 @@ def get_active_reservations():
 def core_ignorecase_enabled():
     """Detect git core.ignorecase for path comparison parity with Rust guard."""
     try:
-        res = subprocess.run(
+        res = _run_git_with_retry(
             ["git", "config", "--bool", "core.ignorecase"],
             capture_output=True,
             text=True,
@@ -1563,15 +1609,66 @@ fn is_expired(ts_str: &str, now: &chrono::DateTime<chrono::Utc>) -> bool {
 // Git helpers: staged paths and push paths
 // ---------------------------------------------------------------------------
 
+/// Run a git Command with SIGSEGV retry (br-8ujfs.5.5 / E5).
+///
+/// The guard cannot use `run_git_locked` (it executes inside the user's
+/// pre-commit process, same pid as the git commit that invoked us;
+/// wrapping with flock would deadlock). But we CAN still retry on
+/// SIGSEGV locally — same bug, same fingerprint, same fix. Matches the
+/// policy in `mcp_agent_mail_core::git_cmd::GitCmd::run` (3 retries,
+/// 100/400/1600ms jittered). Only retries segfault-shaped exits.
+fn guard_run_git_with_retry(mut cmd: Command) -> std::io::Result<std::process::Output> {
+    const BACKOFFS_MS: [u64; 3] = [100, 400, 1600];
+    let mut last_output: Option<std::process::Output> = None;
+    for attempt in 0..=BACKOFFS_MS.len() {
+        let output = cmd.output()?;
+        let signal_segfault = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                matches!(output.status.signal(), Some(11) | Some(7))
+            }
+            #[cfg(not(unix))]
+            false
+        };
+        let code_segfault = matches!(output.status.code(), Some(139) | Some(135));
+        if !signal_segfault && !code_segfault {
+            return Ok(output);
+        }
+        if attempt >= BACKOFFS_MS.len() {
+            tracing::warn!(
+                target: "mcp_agent_mail::guard::segfault_retry",
+                attempt = attempt,
+                "guard_git_segfault_retry_exhausted"
+            );
+            last_output = Some(output);
+            break;
+        }
+        tracing::warn!(
+            target: "mcp_agent_mail::guard::segfault_retry",
+            attempt = attempt,
+            "guard_git_segfault_retry"
+        );
+        let base = BACKOFFS_MS[attempt];
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        let jitter = base / 2 + (nanos % base.max(1));
+        std::thread::sleep(std::time::Duration::from_millis(jitter));
+    }
+    Ok(last_output.expect("last_output set before break"))
+}
+
 /// Get staged file paths from git, including rename handling.
 ///
 /// Uses `git diff --cached --name-status -M -z` to capture both old and new names
 /// for renames (R status), and all modified/added/deleted paths.
 pub fn get_staged_paths(repo_root: &Path) -> GuardResult<Vec<String>> {
-    let output = Command::new("git")
-        .current_dir(repo_root)
-        .args(["diff", "--cached", "--name-status", "-M", "-z"])
-        .output()?;
+    let mut cmd = Command::new("git");
+    cmd.current_dir(repo_root)
+        .args(["diff", "--cached", "--name-status", "-M", "-z"]);
+    let output = guard_run_git_with_retry(cmd)?;
 
     if !output.status.success() {
         // Fail-closed: if git diff fails, return an error so the guard blocks
