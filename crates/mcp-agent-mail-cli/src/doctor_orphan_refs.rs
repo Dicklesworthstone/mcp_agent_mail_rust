@@ -410,9 +410,13 @@ fn write_ref_backup(
     findings: &[PrunableRef],
 ) -> Result<PathBuf, String> {
     let slug = project_slug(project_path);
+    // Microsecond resolution so two --apply runs in the same second
+    // don't clobber each other's backups. Microseconds is ~10x more
+    // precision than filesystem mtime typically reports, which is
+    // plenty for sort ordering.
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_micros() as u64)
         .unwrap_or(0);
     let dir = config.storage_root.join("backups").join("refs").join(&slug);
     fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
@@ -454,9 +458,10 @@ fn repack_refs(project_path: &Path, config: &Config) -> Result<(), String> {
     let packed_refs = admin_dir.join("packed-refs");
     if packed_refs.is_file() {
         let slug = project_slug(project_path);
+        // Microsecond resolution — see write_ref_backup for rationale.
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
+            .map(|d| d.as_micros() as u64)
             .unwrap_or(0);
         let dir = config.storage_root.join("backups").join("refs").join(&slug);
         fs::create_dir_all(&dir).map_err(|e| format!("mkdir backup dir: {e}"))?;
@@ -509,7 +514,10 @@ fn rotate_backups(project_path: &Path, config: &Config) -> Result<(), String> {
     let Ok(entries) = fs::read_dir(&dir) else {
         return Ok(());
     };
-    let mut files: Vec<(u64, PathBuf)> = entries
+    // Microsecond-precision mtime avoids tied sort keys when multiple
+    // backups land within the same second (e.g., a refs backup + its
+    // paired packed-refs backup from the same `--apply` run).
+    let mut files: Vec<(u128, PathBuf)> = entries
         .flatten()
         .filter_map(|e| {
             let meta = e.metadata().ok()?;
@@ -521,11 +529,13 @@ fn rotate_backups(project_path: &Path, config: &Config) -> Result<(), String> {
                 .ok()?
                 .duration_since(UNIX_EPOCH)
                 .ok()?
-                .as_secs();
+                .as_micros();
             Some((ts, e.path()))
         })
         .collect();
-    files.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts));
+    // Sort: newest mtime first; secondary by path (Reverse) so ties
+    // are deterministic across runs.
+    files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
     for (_, p) in files.iter().skip(BACKUP_RETENTION) {
         if let Err(e) = fs::remove_file(p) {
             tracing::warn!(

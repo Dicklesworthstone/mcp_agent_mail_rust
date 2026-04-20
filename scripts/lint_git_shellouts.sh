@@ -64,6 +64,13 @@ raw_hits=$(
 
 # Filter out hits that are inside #[cfg(test)] modules OR preceded by
 # a "shellout-allowed:" comment within 3 lines above.
+#
+# Boundary heuristic: a test-only scope is declared by `mod tests {`
+# (or `mod <name>_tests {`). A bare `#[cfg(test)]` preceding a single
+# item (fn / struct) does NOT flip the whole file into test scope —
+# production code often declares single test helpers intermixed with
+# production. We detect ONLY the `mod ...tests {` boundary, and treat
+# everything after it as test scope.
 hits=$(
     awk -v raw="$raw_hits" 'BEGIN {
         n = split(raw, lines, "\n")
@@ -78,15 +85,18 @@ hits=$(
             if (colon2 == 0) continue
             line_num = substr(rest, 1, colon2 - 1) + 0
 
-            # Read file once, cache #[cfg(test)] / mod tests { boundary.
+            # Read file once, cache the FIRST `mod *tests {` boundary.
+            # Only `mod tests {` / `mod <name>_tests {` counts —
+            # bare `#[cfg(test)]` on a single fn/struct does not flip
+            # the entire file below it into test scope.
             if (!(file in test_boundary)) {
                 test_boundary[file] = 1e12
                 fline = 0
                 while ((getline ln < file) > 0) {
                     fline++
-                    if (ln ~ /^[[:space:]]*#\[cfg\(test\)\][[:space:]]*$/ \
-                        || ln ~ /^[[:space:]]*mod tests[[:space:]]*\{/ \
-                        || ln ~ /^[[:space:]]*mod [a-z_]+_tests[[:space:]]*\{/) {
+                    if (ln ~ /^[[:space:]]*mod tests[[:space:]]*\{/ \
+                        || ln ~ /^[[:space:]]*mod [a-z_]+_tests[[:space:]]*\{/ \
+                        || ln ~ /^[[:space:]]*pub mod tests[[:space:]]*\{/) {
                         if (fline < test_boundary[file]) test_boundary[file] = fline
                     }
                 }
