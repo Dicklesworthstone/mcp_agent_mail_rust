@@ -4096,15 +4096,39 @@ pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError
         return Ok(false);
     }
     let path_str = path.to_string_lossy();
+
+    // GH#99: if open hits a header-only/truncated WAL (which the pager
+    // surfaces as "WAL file too small for header during rebuild"), one
+    // shot of cleaning the sidecar + retrying opens a healthy connection
+    // without escalating to the verdict engine's Broken/Corrupt state.
+    // Kept strictly to recovery-classified errors; corruption still short-
+    // circuits to `Ok(false)` below.
     let conn = match open_sqlite_file_with_lock_retry(path_str.as_ref()) {
         Ok(conn) => conn,
-        Err(e) => {
-            let msg = e.to_string();
+        Err(first_err) => {
+            let msg = first_err.to_string();
             if is_corruption_error_message(&msg) || is_sqlite_snapshot_conflict_error_message(&msg)
             {
                 return Ok(false);
             }
-            return Err(e);
+            if is_sqlite_recovery_error_message(&msg) {
+                cleanup_empty_wal_sidecar(path_str.as_ref());
+                match open_sqlite_file_with_lock_retry(path_str.as_ref()) {
+                    Ok(conn) => conn,
+                    Err(retry_err) => {
+                        let retry_msg = retry_err.to_string();
+                        if is_corruption_error_message(&retry_msg)
+                            || is_sqlite_recovery_error_message(&retry_msg)
+                            || is_sqlite_snapshot_conflict_error_message(&retry_msg)
+                        {
+                            return Ok(false);
+                        }
+                        return Err(retry_err);
+                    }
+                }
+            } else {
+                return Err(first_err);
+            }
         }
     };
 
@@ -4113,7 +4137,13 @@ pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError
         Ok(true) => {}
         Err(e) => {
             let msg = e.to_string();
-            if is_corruption_error_message(&msg) || is_sqlite_snapshot_conflict_error_message(&msg)
+            // Recovery-classified errors (including header-only WAL) are
+            // treated as "unhealthy but not corrupt" so the verdict engine
+            // does not flip to Broken; the integrity guard's recovery path
+            // still fires via is_sqlite_recovery_error_message.
+            if is_corruption_error_message(&msg)
+                || is_sqlite_snapshot_conflict_error_message(&msg)
+                || is_sqlite_recovery_error_message(&msg)
             {
                 return Ok(false);
             }
@@ -4126,7 +4156,9 @@ pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError
         Ok(true) => {}
         Err(e) => {
             let msg = e.to_string();
-            if is_corruption_error_message(&msg) || is_sqlite_snapshot_conflict_error_message(&msg)
+            if is_corruption_error_message(&msg)
+                || is_sqlite_snapshot_conflict_error_message(&msg)
+                || is_sqlite_recovery_error_message(&msg)
             {
                 return Ok(false);
             }
@@ -4141,6 +4173,7 @@ pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError
             let msg = e.to_string();
             if is_corruption_error_message(&msg)
                 || is_sqlite_snapshot_conflict_error_message(&msg)
+                || is_sqlite_recovery_error_message(&msg)
                 || msg.to_ascii_lowercase().contains("out of memory")
             {
                 return Ok(false);
