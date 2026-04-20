@@ -85,8 +85,7 @@ pub fn build_shim_git(dir: &Path, name: &str, behavior: &ShimBehavior) -> PathBu
 
     // Capture path to the real git NOW so the shim can forward without
     // recursing into itself.
-    let real_git =
-        which_real_git().unwrap_or_else(|| PathBuf::from("/usr/bin/git"));
+    let real_git = which_real_git().unwrap_or_else(|| PathBuf::from("/usr/bin/git"));
 
     // Serialize the exit sequence as bash strings.
     let exits_bash = behavior
@@ -273,10 +272,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn run(shim: &Path, args: &[&str]) -> (Option<i32>, String, Option<i32>) {
-        let out = Command::new(shim)
-            .args(args)
-            .output()
-            .expect("run shim");
+        let out = Command::new(shim).args(args).output().expect("run shim");
         let code = out.status.code();
         #[cfg(unix)]
         let signal = {
@@ -345,11 +341,10 @@ mod tests {
         // bash kill -SEGV $$ causes the shim process to die with signal 11.
         // Different shells may map this to exit 139 instead of reporting
         // signal; accept either.
-        let saw_segv = signal == Some(11)
-            || {
-                let out = Command::new(&shim).args(["status"]).output();
-                out.as_ref().map_or(false, |o| o.status.code() == Some(139))
-            };
+        let saw_segv = signal == Some(11) || {
+            let out = Command::new(&shim).args(["status"]).output();
+            out.as_ref().map_or(false, |o| o.status.code() == Some(139))
+        };
         assert!(saw_segv, "expected SIGSEGV or exit 139");
     }
 

@@ -1180,8 +1180,19 @@ Check that all parameters have valid values."
     // Generate and persist a registration token for sender identity verification.
     // Every registration (new or update) rotates the token so that only the
     // most recent registrant can prove ownership.
-    let mut registration_token = mcp_agent_mail_core::setup::generate_registration_token();
-    if let Some(agent_id) = row.id {
+    let mut registration_token = match mcp_agent_mail_core::setup::generate_registration_token() {
+        Ok(token) => token,
+        Err(error) => {
+            tracing::warn!(
+                "failed to generate registration_token for agent {}: {error}",
+                row.name
+            );
+            String::new()
+        }
+    };
+    if !registration_token.is_empty()
+        && let Some(agent_id) = row.id
+    {
         let token_update = mcp_agent_mail_db::queries::update_agent_registration_token(
             ctx.cx(),
             &pool,
@@ -1411,8 +1422,19 @@ Choose a different name (or omit the name to auto-generate one)."
     enqueue_agent_semantic_index(&row);
 
     // Generate and persist a registration token for sender identity verification.
-    let mut registration_token = mcp_agent_mail_core::setup::generate_registration_token();
-    if let Some(agent_id) = row.id {
+    let mut registration_token = match mcp_agent_mail_core::setup::generate_registration_token() {
+        Ok(token) => token,
+        Err(error) => {
+            tracing::warn!(
+                "failed to generate registration_token for agent {}: {error}",
+                row.name
+            );
+            String::new()
+        }
+    };
+    if !registration_token.is_empty()
+        && let Some(agent_id) = row.id
+    {
         let token_update = mcp_agent_mail_db::queries::update_agent_registration_token(
             ctx.cx(),
             &pool,

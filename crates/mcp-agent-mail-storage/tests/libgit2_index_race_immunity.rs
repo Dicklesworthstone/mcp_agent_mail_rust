@@ -37,8 +37,8 @@
 use std::panic;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -91,9 +91,7 @@ fn iso_now() -> String {
 
 fn git_version_string() -> String {
     match Command::new("git").arg("--version").output() {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => "<unavailable>".to_string(),
     }
 }
@@ -184,11 +182,7 @@ done
         .expect("spawn writer subprocess")
 }
 
-fn reader_loop(
-    repo: PathBuf,
-    stop: Arc<AtomicBool>,
-    stats: Arc<ReaderStats>,
-) {
+fn reader_loop(repo: PathBuf, stop: Arc<AtomicBool>, stats: Arc<ReaderStats>) {
     // Each iteration: open, walk statuses + index entries. Catch any panic
     // with `catch_unwind` so a panic doesn't propagate and mask the stat
     // accounting.

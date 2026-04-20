@@ -111,10 +111,7 @@ impl GitVersion {
     /// has fewer than two dot-separated segments or they don't parse
     /// as integers.
     pub fn parse_lax(s: &str) -> Option<Self> {
-        let head = s
-            .split_terminator(['-', '+'])
-            .next()
-            .unwrap_or(s);
+        let head = s.split_terminator(['-', '+']).next().unwrap_or(s);
         let mut it = head.split('.');
         let major = it.next()?.parse().ok()?;
         let minor = it.next()?.parse().ok()?;
@@ -480,10 +477,7 @@ pub enum KnownBadMatcher {
     /// Single exact match.
     Exact { version: String },
     /// `[min, max_exclusive)` half-open range.
-    Range {
-        min: String,
-        max_exclusive: String,
-    },
+    Range { min: String, max_exclusive: String },
 }
 
 impl KnownBadMatcher {
@@ -511,8 +505,7 @@ struct KnownBadFile {
 }
 
 /// Embedded default catalog, compiled in at build time.
-const EMBEDDED_CATALOG: &str =
-    include_str!("../data/known_bad_git_versions.json");
+const EMBEDDED_CATALOG: &str = include_str!("../data/known_bad_git_versions.json");
 
 static CATALOG_CACHE: OnceLock<Vec<KnownBadEntry>> = OnceLock::new();
 
@@ -541,9 +534,7 @@ fn load_catalog() -> &'static [KnownBadEntry] {
                 Ok(text) => match serde_json::from_str::<KnownBadFile>(&text) {
                     Ok(file) => {
                         for entry in file.entries {
-                            if let Some(existing) =
-                                out.iter_mut().find(|e| e.code == entry.code)
-                            {
+                            if let Some(existing) = out.iter_mut().find(|e| e.code == entry.code) {
                                 tracing::info!(
                                     target: "mcp_agent_mail::git_binary",
                                     code = %entry.code,
@@ -670,10 +661,15 @@ mod tests {
     }
 
     fn env_map(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + 'static {
-        let owned: Vec<(String, String)> =
-            pairs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect();
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
         move |k: &str| -> Option<String> {
-            owned.iter().find(|(name, _)| name == k).map(|(_, v)| v.clone())
+            owned
+                .iter()
+                .find(|(name, _)| name == k)
+                .map(|(_, v)| v.clone())
         }
     }
 
@@ -713,8 +709,7 @@ mod tests {
 
     #[test]
     fn match_known_bad_returns_structured_entry_for_2_51_0() {
-        let m = match_known_bad(GitVersion::new(2, 51, 0))
-            .expect("2.51.0 should match");
+        let m = match_known_bad(GitVersion::new(2, 51, 0)).expect("2.51.0 should match");
         assert_eq!(m.code, "GIT_2_51_0_INDEX_RACE");
         assert_eq!(m.severity, KnownBadSeverity::Fail);
         assert!(
@@ -862,7 +857,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let shim = build_shim_script(tmp.path(), "git", r#"echo "git version 2.51.0""#);
         let env = env_map(&[("AM_GIT_BINARY", shim.to_str().unwrap())]);
-        let r = resolve_git_binary_with_env(env).expect("2.51.0 shim should resolve (warn, not fail)");
+        let r =
+            resolve_git_binary_with_env(env).expect("2.51.0 shim should resolve (warn, not fail)");
         assert_eq!(r.version, GitVersion::new(2, 51, 0));
         assert!(r.version.is_known_bad());
     }

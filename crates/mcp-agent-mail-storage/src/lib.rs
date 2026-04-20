@@ -4050,11 +4050,8 @@ fn configure_archive_git_defaults(repo: &Repository) {
     // which persists into the repo's local config file.
     let local_cfg = full_cfg.open_level(git2::ConfigLevel::Local).ok();
 
-    let key_is_unset_locally = |key: &str| -> bool {
-        local_cfg
-            .as_ref()
-            .is_none_or(|c| c.get_entry(key).is_err())
-    };
+    let key_is_unset_locally =
+        |key: &str| -> bool { local_cfg.as_ref().is_none_or(|c| c.get_entry(key).is_err()) };
 
     if key_is_unset_locally("gc.auto") {
         let _ = full_cfg.set_i64("gc.auto", 256);

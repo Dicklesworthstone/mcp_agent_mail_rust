@@ -157,12 +157,7 @@ mod tests {
             |repo| run_cli_git(repo, &["rev-parse", "HEAD"]),
             |repo| {
                 let r = git2::Repository::open(repo).unwrap();
-                r.head()
-                    .unwrap()
-                    .peel_to_commit()
-                    .unwrap()
-                    .id()
-                    .to_string()
+                r.head().unwrap().peel_to_commit().unwrap().id().to_string()
             },
         );
     }

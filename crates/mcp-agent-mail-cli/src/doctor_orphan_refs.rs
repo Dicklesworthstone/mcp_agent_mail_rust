@@ -30,9 +30,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mcp_agent_mail_core::config::Config;
-use mcp_agent_mail_core::git_lock::{canonicalize_repo, RepoFlock};
+use mcp_agent_mail_core::git_lock::{RepoFlock, canonicalize_repo};
 use mcp_agent_mail_storage::recovery::{
-    detect_missing_refs, DetectionSummary, PrunableRef, RefCategory,
+    DetectionSummary, PrunableRef, RefCategory, detect_missing_refs,
 };
 
 use crate::output::CliOutputFormat;
@@ -104,7 +104,10 @@ pub fn run(
     let projects: Vec<PathBuf> = if all {
         enumerate_registered_projects(&config.storage_root)
     } else {
-        vec![project.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))]
+        vec![
+            project
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+        ]
     };
 
     if projects.is_empty() {
@@ -124,7 +127,9 @@ pub fn run(
     };
 
     for p in &projects {
-        report.projects.push(scan_one_project(p, &config, apply, force));
+        report
+            .projects
+            .push(scan_one_project(p, &config, apply, force));
     }
 
     aggregate_summary(&mut report);
@@ -171,20 +176,22 @@ fn scan_one_project(
     // repo concurrently with our prune — we'd rather wait than
     // interleave.
     let canonical = canonicalize_repo(project_path);
-    let _flock = canonical.as_ref().and_then(|c| match RepoFlock::acquire(c) {
-        Ok(f) => Some(f),
-        Err(e) => {
-            tracing::error!(
-                target: "mcp_agent_mail::doctor::fix_orphan_refs",
-                project = %project_display,
-                err = %e,
-                "flock_acquire_failed"
-            );
-            // Proceed without flock — the caller will see any damage
-            // we cause in the error column.
-            None
-        }
-    });
+    let _flock = canonical
+        .as_ref()
+        .and_then(|c| match RepoFlock::acquire(c) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                tracing::error!(
+                    target: "mcp_agent_mail::doctor::fix_orphan_refs",
+                    project = %project_display,
+                    err = %e,
+                    "flock_acquire_failed"
+                );
+                // Proceed without flock — the caller will see any damage
+                // we cause in the error column.
+                None
+            }
+        });
 
     // Detect.
     let findings = match detect_missing_refs(project_path) {
@@ -249,9 +256,7 @@ fn scan_one_project(
                         project: project_display.clone(),
                         ref_name: Some(finding.ref_name.clone()),
                         target_sha: Some(finding.target_sha.clone()),
-                        reason: Some(
-                            "unknown namespace; pass --force to prune".to_string(),
-                        ),
+                        reason: Some("unknown namespace; pass --force to prune".to_string()),
                         category: Some(finding.category),
                     });
                 }
@@ -383,13 +388,11 @@ fn scan_one_project(
 }
 
 fn prune_ref(project_path: &Path, ref_name: &str) -> Result<(), String> {
-    let repo = git2::Repository::open(project_path)
-        .map_err(|e| format!("open repo: {e}"))?;
+    let repo = git2::Repository::open(project_path).map_err(|e| format!("open repo: {e}"))?;
     let mut r = repo
         .find_reference(ref_name)
         .map_err(|e| format!("find_reference({ref_name}): {e}"))?;
-    r.delete()
-        .map_err(|e| format!("delete({ref_name}): {e}"))?;
+    r.delete().map_err(|e| format!("delete({ref_name}): {e}"))?;
     Ok(())
 }
 
@@ -403,19 +406,13 @@ fn write_ref_backup(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let dir = config
-        .storage_root
-        .join("backups")
-        .join("refs")
-        .join(&slug);
+    let dir = config.storage_root.join("backups").join("refs").join(&slug);
     fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
     let file = dir.join(format!("{ts}.txt"));
     let mut text = String::new();
     text.push_str(&format!("# fix-orphan-refs backup — {}\n", ts));
     text.push_str(&format!("# project: {}\n", project_path.display()));
-    text.push_str(
-        "# format: <status> <ref_name> <target_sha> <category> <reason>\n",
-    );
+    text.push_str("# format: <status> <ref_name> <target_sha> <category> <reason>\n");
     // Also dump ALL refs via libgit2 so a full restore is possible
     // from the backup alone.
     if let Ok(repo) = git2::Repository::open(project_path) {
@@ -436,8 +433,7 @@ fn write_ref_backup(
             f.ref_name, f.target_sha, f.category, f.reason,
         ));
     }
-    fs::write(&file, text.as_bytes())
-        .map_err(|e| format!("write backup: {e}"))?;
+    fs::write(&file, text.as_bytes()).map_err(|e| format!("write backup: {e}"))?;
     Ok(file)
 }
 
@@ -454,11 +450,7 @@ fn repack_refs(project_path: &Path, config: &Config) -> Result<(), String> {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let dir = config
-            .storage_root
-            .join("backups")
-            .join("refs")
-            .join(&slug);
+        let dir = config.storage_root.join("backups").join("refs").join(&slug);
         fs::create_dir_all(&dir).map_err(|e| format!("mkdir backup dir: {e}"))?;
         let backup_file = dir.join(format!("{ts}-packed-refs.txt"));
         fs::copy(&packed_refs, &backup_file)
@@ -493,11 +485,7 @@ fn repack_refs(project_path: &Path, config: &Config) -> Result<(), String> {
 
 fn rotate_backups(project_path: &Path, config: &Config) -> Result<(), String> {
     let slug = project_slug(project_path);
-    let dir = config
-        .storage_root
-        .join("backups")
-        .join("refs")
-        .join(&slug);
+    let dir = config.storage_root.join("backups").join("refs").join(&slug);
     let Ok(entries) = fs::read_dir(&dir) else {
         return Ok(());
     };
@@ -568,9 +556,7 @@ fn enumerate_registered_projects(storage_root: &Path) -> Vec<PathBuf> {
         }
         if let Ok(text) = fs::read_to_string(&pj)
             && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
-            && let Some(hk) = v
-                .get("human_key")
-                .and_then(|h| h.as_str())
+            && let Some(hk) = v.get("human_key").and_then(|h| h.as_str())
         {
             let p = PathBuf::from(hk);
             if p.exists() {
@@ -587,8 +573,7 @@ fn aggregate_summary(report: &mut Report) {
         report.summary.total_findings += p.summary.findings;
         if let Some(a) = &p.apply_result {
             report.summary.total_pruned += a.pruned;
-            report.summary.total_refused +=
-                a.refused_protected + a.refused_unknown_namespace;
+            report.summary.total_refused += a.refused_protected + a.refused_unknown_namespace;
         }
     }
 }

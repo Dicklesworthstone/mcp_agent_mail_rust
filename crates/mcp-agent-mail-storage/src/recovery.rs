@@ -80,11 +80,7 @@ pub fn ref_category(ref_name: &str) -> RefCategory {
     }
 
     // Safe-to-prune namespaces.
-    const SAFE_PREFIXES: &[&str] = &[
-        "refs/stash",
-        "refs/temp/",
-        "refs/original/",
-    ];
+    const SAFE_PREFIXES: &[&str] = &["refs/stash", "refs/temp/", "refs/original/"];
     if ref_name == "refs/stash" {
         return RefCategory::SafeToPrune;
     }

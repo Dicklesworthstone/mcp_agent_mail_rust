@@ -206,10 +206,7 @@ impl RepoFlock {
         Self::acquire_with_timeout(repo_canonical, timeout)
     }
 
-    pub fn acquire_with_timeout(
-        repo_canonical: &Path,
-        timeout: Duration,
-    ) -> io::Result<Self> {
+    pub fn acquire_with_timeout(repo_canonical: &Path, timeout: Duration) -> io::Result<Self> {
         let Some(path) = sentinel_path(repo_canonical) else {
             tracing::debug!(
                 target: "mcp_agent_mail::git_lock",

@@ -3800,7 +3800,9 @@ fn reservation_pathspec_ls_files_libgit2(
     if let Ok(index) = repo.index() {
         if let Ok(ps) = git2::Pathspec::new(std::iter::once(pathspec)) {
             for entry in index.iter() {
-                let Ok(rel_str) = std::str::from_utf8(&entry.path) else { continue };
+                let Ok(rel_str) = std::str::from_utf8(&entry.path) else {
+                    continue;
+                };
                 if ps.matches_path(
                     std::path::Path::new(rel_str),
                     git2::PathspecFlags::NO_MATCH_ERROR,
@@ -3853,14 +3855,7 @@ fn reservation_pathspec_ls_files_cli_fallback(
     let Ok(cmd_out) = Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args([
-            "ls-files",
-            "-c",
-            "-o",
-            "--exclude-standard",
-            "--",
-            git_glob,
-        ])
+        .args(["ls-files", "-c", "-o", "--exclude-standard", "--", git_glob])
         .output()
     else {
         return out;
@@ -3910,7 +3905,11 @@ fn reservation_git_latest_activity_micros(repo_root: &Path, pathspecs: &[String]
     }
 
     // Feature-flag escape hatch: re-enable CLI fallback if explicitly opted in.
-    if std::env::var("AM_GIT_RESERVATION_ACTIVITY_SHELL").ok().as_deref() == Some("1") {
+    if std::env::var("AM_GIT_RESERVATION_ACTIVITY_SHELL")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         tracing::warn!(
             target: "mcp_agent_mail::tools::reservations::activity",
             "reservation_activity_cli_fallback_enabled"
@@ -3990,7 +3989,9 @@ fn reservation_git_latest_activity_micros_libgit2(
 
     for oid_result in revwalk {
         let Ok(oid) = oid_result else { continue };
-        let Ok(commit) = repo.find_commit(oid) else { continue };
+        let Ok(commit) = repo.find_commit(oid) else {
+            continue;
+        };
 
         // For the FIRST commit (no parents) match against the tree
         // directly. For merge/regular commits, diff against parent 0
@@ -4002,9 +4003,15 @@ fn reservation_git_latest_activity_micros_libgit2(
                 .match_tree(&tree, git2::PathspecFlags::NO_MATCH_ERROR)
                 .is_ok()
         } else {
-            let Ok(parent) = commit.parent(0) else { continue };
-            let Ok(parent_tree) = parent.tree() else { continue };
-            let Ok(commit_tree) = commit.tree() else { continue };
+            let Ok(parent) = commit.parent(0) else {
+                continue;
+            };
+            let Ok(parent_tree) = parent.tree() else {
+                continue;
+            };
+            let Ok(commit_tree) = commit.tree() else {
+                continue;
+            };
             let mut diff_opts = git2::DiffOptions::new();
             for spec in &normalized {
                 diff_opts.pathspec(spec);
@@ -4166,17 +4173,12 @@ pub(crate) fn reservation_compute_pattern_activity(
         // `AM_GIT_LS_FILES_SHELL=1` re-enables the CLI path for one
         // release cycle.
         if let Some(repo_root) = repo_root {
-            let matched = if std::env::var("AM_GIT_LS_FILES_SHELL").ok().as_deref()
-                == Some("1")
-            {
+            let matched = if std::env::var("AM_GIT_LS_FILES_SHELL").ok().as_deref() == Some("1") {
                 tracing::warn!(
                     target: "mcp_agent_mail::tools::reservations::pathspec",
                     "pathspec_walk_cli_fallback_enabled"
                 );
-                reservation_pathspec_ls_files_cli_fallback(
-                    repo_root,
-                    &format!(":(glob){spec}"),
-                )
+                reservation_pathspec_ls_files_cli_fallback(repo_root, &format!(":(glob){spec}"))
             } else {
                 reservation_pathspec_ls_files_libgit2(repo_root, &spec)
             };

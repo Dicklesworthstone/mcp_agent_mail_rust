@@ -42,8 +42,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::git_binary::{resolve_git_binary, ResolvedGitBinary};
-use crate::git_lock::{canonicalize_repo, GitRepoLocks, ReentrancyGuard, RepoFlock};
+use crate::git_binary::{ResolvedGitBinary, resolve_git_binary};
+use crate::git_lock::{GitRepoLocks, ReentrancyGuard, RepoFlock, canonicalize_repo};
 
 /// Default wall-clock timeout for the git child process.
 pub const DEFAULT_GIT_EXEC_TIMEOUT_SECS: u64 = 120;

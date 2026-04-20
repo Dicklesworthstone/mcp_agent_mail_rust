@@ -17645,10 +17645,7 @@ fn mcp_config_url_matches_any_expected(actual_url: &str, expected_urls: &[String
 /// default) included in the emitted finding.
 fn git_binary_doctor_entry(path_or_name: &str, source: &str) -> serde_json::Value {
     use std::process::Command;
-    let out = match Command::new(path_or_name)
-        .arg("--version")
-        .output()
-    {
+    let out = match Command::new(path_or_name).arg("--version").output() {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
             return serde_json::json!({

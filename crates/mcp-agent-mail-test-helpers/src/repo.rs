@@ -53,8 +53,7 @@ impl RepoBuilder {
     #[must_use]
     pub fn new() -> Self {
         let (guard, path) = new_tempdir();
-        let repo =
-            Repository::init(&path).expect("Repository::init failed in test helpers");
+        let repo = Repository::init(&path).expect("Repository::init failed in test helpers");
         // Config required for commits.
         let mut cfg = repo.config().expect("config");
         cfg.set_str("user.name", "test-helpers").unwrap();
