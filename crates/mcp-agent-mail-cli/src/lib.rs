@@ -13492,10 +13492,17 @@ struct ProjectsAdoptRecord {
     human_key: String,
 }
 
+/// Invoke git with `args` in `cwd`, returning trimmed stdout.
+///
+/// br-8ujfs.4.1 (D1): routes through `mcp_agent_mail_core::git_cmd::GitCmd`
+/// to pick up AM_GIT_BINARY resolution + per-repo mutex + flock +
+/// SIGSEGV retry. Semantics preserved: None on nonzero exit or empty
+/// output.
 fn git_output_text(cwd: &Path, args: &[&str]) -> Option<String> {
-    let mut cmd = std::process::Command::new("git");
-    cmd.arg("-C").arg(cwd).args(args);
-    let output = cmd.output().ok()?;
+    let output = mcp_agent_mail_core::git_cmd::GitCmd::new(cwd)
+        .args(args)
+        .run()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -13676,15 +13683,20 @@ fn git_add_and_commit(
         return GitCommitOutcome::NothingToCommit;
     }
 
-    let add_output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .arg("add")
-        .args(rel_paths)
-        .output();
-    let add_output = match add_output {
-        Ok(output) => output,
-        Err(err) => return GitCommitOutcome::Failed(format!("git add failed: {err}")),
+    // br-8ujfs.4.1 (D1): route the `add` + `commit` pair through
+    // GitCmd so per-repo flock serializes against concurrent writers.
+    // Both calls share the same lock acquisition because they run
+    // back-to-back in the same thread (ReentrancyGuard would panic if
+    // we nested, but we acquire+release between calls).
+    let add_output = {
+        let mut cmd = mcp_agent_mail_core::git_cmd::GitCmd::new(repo_root).arg("add");
+        for p in rel_paths {
+            cmd = cmd.arg(p);
+        }
+        match cmd.run() {
+            Ok(o) => o,
+            Err(err) => return GitCommitOutcome::Failed(format!("git add failed: {err}")),
+        }
     };
     if !add_output.status.success() {
         return GitCommitOutcome::Failed(format!(
@@ -13693,9 +13705,7 @@ fn git_add_and_commit(
         ));
     }
 
-    let commit_output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+    let commit_output = mcp_agent_mail_core::git_cmd::GitCmd::new(repo_root)
         .arg("commit")
         .arg("-m")
         .arg(message)
@@ -13703,7 +13713,7 @@ fn git_add_and_commit(
         .env("GIT_AUTHOR_EMAIL", &config.git_author_email)
         .env("GIT_COMMITTER_NAME", &config.git_author_name)
         .env("GIT_COMMITTER_EMAIL", &config.git_author_email)
-        .output();
+        .run();
     let commit_output = match commit_output {
         Ok(output) => output,
         Err(err) => return GitCommitOutcome::Failed(format!("git commit failed: {err}")),
@@ -45118,11 +45128,10 @@ fn ensure_dir(path: &Path) -> CliResult<()> {
 }
 
 fn compute_git_branch(path: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(path)
+    // br-8ujfs.4.1 (D1): wrapped via GitCmd for per-repo locking.
+    let output = mcp_agent_mail_core::git_cmd::GitCmd::new(path)
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
+        .run()
         .ok()?;
     if !output.status.success() {
         return None;

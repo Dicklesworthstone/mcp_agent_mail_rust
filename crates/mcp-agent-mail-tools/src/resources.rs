@@ -3849,6 +3849,7 @@ fn reservation_pathspec_ls_files_cli_fallback(
     git_glob: &str,
 ) -> Vec<(std::path::PathBuf, Option<i64>)> {
     let mut out: Vec<(std::path::PathBuf, Option<i64>)> = Vec::new();
+    // shellout-allowed: br-8ujfs.3.3 CLI fallback, gated on AM_GIT_LS_FILES_SHELL=1.
     let Ok(cmd_out) = Command::new("git")
         .arg("-C")
         .arg(repo_root)
@@ -4034,6 +4035,7 @@ fn reservation_git_latest_activity_micros_cli_fallback(
 ) -> Option<i64> {
     let mut best: Option<i64> = None;
     for chunk in pathspecs.chunks(128) {
+        // shellout-allowed: br-8ujfs.3.2 CLI fallback, gated on AM_GIT_RESERVATION_ACTIVITY_SHELL=1.
         let Ok(out) = Command::new("git")
             .arg("-C")
             .arg(repo_root)

@@ -232,11 +232,15 @@ fn find_ancestor_path(start: &Path, name: &str) -> Option<std::path::PathBuf> {
 }
 
 /// Try to extract the git remote URL for the directory.
+///
+/// br-8ujfs.4.1 (D1): routes through GitCmd for per-repo locking.
+/// There's a duplicate helper in share::detection with the same name
+/// and body; TODO consolidate into a shared share::git helper module
+/// as a follow-up cleanup bead.
 fn git_remote_url(dir: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = mcp_agent_mail_core::git_cmd::GitCmd::new(dir)
         .args(["remote", "get-url", "origin"])
-        .current_dir(dir)
-        .output()
+        .run()
         .ok()?;
     if output.status.success() {
         let url = String::from_utf8_lossy(&output.stdout).trim().to_string();

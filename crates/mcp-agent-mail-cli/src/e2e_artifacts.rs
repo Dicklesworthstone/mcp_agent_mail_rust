@@ -196,11 +196,17 @@ pub struct GitInfo {
 
 impl GitInfo {
     /// Captures git info from the current directory.
+    ///
+    /// br-8ujfs.4.1 (D1): all three `git` invocations wrapped via
+    /// GitCmd so they share the per-repo mutex / flock / SIGSEGV
+    /// retry with other agents operating on the same repo.
     #[must_use]
     pub fn capture() -> Self {
-        let commit = std::process::Command::new("git")
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+        let commit = mcp_agent_mail_core::git_cmd::GitCmd::new(&cwd)
             .args(["rev-parse", "HEAD"])
-            .output()
+            .run()
             .ok()
             .and_then(|o| {
                 if o.status.success() {
@@ -213,9 +219,9 @@ impl GitInfo {
             })
             .unwrap_or_default();
 
-        let branch = std::process::Command::new("git")
+        let branch = mcp_agent_mail_core::git_cmd::GitCmd::new(&cwd)
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
+            .run()
             .ok()
             .and_then(|o| {
                 if o.status.success() {
@@ -228,9 +234,9 @@ impl GitInfo {
             })
             .unwrap_or_default();
 
-        let dirty = std::process::Command::new("git")
+        let dirty = mcp_agent_mail_core::git_cmd::GitCmd::new(&cwd)
             .args(["status", "--porcelain"])
-            .output()
+            .run()
             .ok()
             .map(|o| !o.stdout.is_empty())
             .unwrap_or(false);

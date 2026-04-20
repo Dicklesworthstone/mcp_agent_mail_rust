@@ -551,7 +551,12 @@ fn check_git_listed_activity(
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
 
-    let Ok(mut child) = Command::new("git")
+    // br-8ujfs.4.1 (D1): streaming pattern (kill-on-match) doesn't fit
+    // GitCmd's buffered-output model cleanly, but we can still pick up
+    // AM_GIT_BINARY so ops-set overrides work here. Leaving the raw
+    // Command::new in place and documenting it as an allowed exception.
+    let git_binary = mcp_agent_mail_core::git_binary::resolved_git_binary_path();
+    let Ok(mut child) = Command::new(&git_binary)
         .args([
             "-C",
             &workspace.to_string_lossy(),
@@ -774,9 +779,10 @@ fn git_head_oid_for_workspace(workspace: &Path) -> Option<String> {
     if !workspace.exists() {
         return None;
     }
-    let output = std::process::Command::new("git")
-        .args(["-C", &workspace.to_string_lossy(), "rev-parse", "HEAD"])
-        .output()
+    // br-8ujfs.4.1 (D1): route through GitCmd.
+    let output = mcp_agent_mail_core::git_cmd::GitCmd::new(workspace)
+        .args(["rev-parse", "HEAD"])
+        .run()
         .ok()?;
     if !output.status.success() {
         return None;
@@ -805,17 +811,11 @@ fn git_latest_commit_us(workspace: &Path, path_pattern: &str) -> Option<i64> {
         pattern
     };
 
-    let output = std::process::Command::new("git")
-        .args([
-            "-C",
-            &workspace.to_string_lossy(),
-            "log",
-            "-1",
-            "--format=%ct",
-            "--",
-            &pathspec,
-        ])
-        .output()
+    // br-8ujfs.4.1 (D1): route through GitCmd.
+    let output = mcp_agent_mail_core::git_cmd::GitCmd::new(workspace)
+        .args(["log", "-1", "--format=%ct", "--"])
+        .arg(&pathspec)
+        .run()
         .ok()?;
     if !output.status.success() {
         return None;
