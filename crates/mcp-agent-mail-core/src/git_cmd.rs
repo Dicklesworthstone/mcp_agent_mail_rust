@@ -497,43 +497,73 @@ fn run_child(
 }
 
 fn wait_with_timeout(child: &mut Child, timeout: Duration) -> GitRunOutcome {
+    // Spawn reader threads to drain stdout/stderr CONCURRENTLY with our
+    // wait loop. Without this, the child's pipe buffers (typically 64KiB
+    // each on Linux) can fill while we're in `try_wait`, blocking the
+    // child on write. Since we wait for the child to exit before
+    // reading, that produces a classic pipe deadlock: the child can't
+    // exit because its stdout is full, and we can't read because we're
+    // waiting for the child to exit. Timeout would fire on every large
+    // output. Concurrent drain eliminates this class of hang.
+    use std::io::Read;
+
+    let stdout_handle = child.stdout.take().map(|mut o| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::with_capacity(4096);
+            let _ = o.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut e| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::with_capacity(4096);
+            let _ = e.read_to_end(&mut buf);
+            buf
+        })
+    });
+
     let deadline = Instant::now() + timeout;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                // Drain stdout/stderr before classifying.
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(mut o) = child.stdout.take() {
-                    use std::io::Read;
-                    let _ = o.read_to_end(&mut stdout);
-                }
-                if let Some(mut e) = child.stderr.take() {
-                    use std::io::Read;
-                    let _ = e.read_to_end(&mut stderr);
-                }
-                // classify_exit needs the ExitStatus; we also want to
-                // attach stdout/stderr for Finished.
-                let outcome = classify_exit(status);
-                return match outcome {
-                    GitRunOutcome::Finished(_) => GitRunOutcome::Finished(Output {
-                        status,
-                        stdout,
-                        stderr,
-                    }),
-                    other => other,
-                };
-            }
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // Still join readers so their thread/resource don't
+                    // leak; buffers may be partial but that's OK.
+                    let _ = stdout_handle.map(|h| h.join());
+                    let _ = stderr_handle.map(|h| h.join());
                     return GitRunOutcome::Timeout { after: timeout };
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
-            Err(e) => return GitRunOutcome::Error(e),
+            Err(e) => {
+                let _ = stdout_handle.map(|h| h.join());
+                let _ = stderr_handle.map(|h| h.join());
+                return GitRunOutcome::Error(e);
+            }
         }
+    };
+
+    // Child exited — readers will finish promptly (pipes EOF on child
+    // exit). Join them to collect their captured bytes.
+    let stdout_bytes = stdout_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let stderr_bytes = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
+    // classify_exit needs the ExitStatus; we attach the captured
+    // stdout/stderr for the Finished branch.
+    match classify_exit(status) {
+        GitRunOutcome::Finished(_) => GitRunOutcome::Finished(Output {
+            status,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        }),
+        other => other,
     }
 }
 

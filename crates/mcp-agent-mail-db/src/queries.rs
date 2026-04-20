@@ -1200,12 +1200,11 @@ pub fn reprocess_atc_feature_schema(
                 parse_json_optional::<FeatureVector>(row_opt_text(row, 2), "features_json")?;
             let feature_ext =
                 parse_json_optional::<FeatureExtension>(row_opt_text(row, 3), "feature_ext_json")?;
-            let migrated = migrate_feature_payload(
-                stored_schema_version,
-                features,
-                feature_ext.clone(),
-            )
-            .map_err(|error| DbError::invalid("feature_schema_version", error.to_string()))?;
+            let migrated =
+                migrate_feature_payload(stored_schema_version, features, feature_ext.clone())
+                    .map_err(|error| {
+                        DbError::invalid("feature_schema_version", error.to_string())
+                    })?;
             let needs_update = stored_schema_version != migrated.schema_version
                 || features != migrated.features
                 || feature_ext != migrated.feature_ext;
@@ -1514,9 +1513,77 @@ async fn verify_agent_visible_after_commit(
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
                registration_token \
                FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
-               ORDER BY id ASC LIMIT 1";
+               LIMIT 1";
     let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
-    match durability_probe_query(cx, pool, sql, &params).await {
+    let fresh_result = match durability_probe_query(cx, pool, sql, &params).await {
+        Outcome::Ok(rows) => rows.first().map_or_else(
+            || {
+                Outcome::Err(DbError::Internal(format!(
+                    "agent row not visible after commit for {project_id}:{name}"
+                )))
+            },
+            |row| Outcome::Ok(decode_agent_row_indexed(row)),
+        ),
+        Outcome::Err(e) => Outcome::Err(e),
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    };
+    let Outcome::Err(fresh_error) = &fresh_result else {
+        return fresh_result;
+    };
+    if pool.sqlite_path() == ":memory:" || !is_agent_visibility_probe_consistency_error(fresh_error)
+    {
+        return fresh_result;
+    }
+    match verify_agent_visible_on_pooled_handle(cx, pool, project_id, name).await {
+        Outcome::Ok(agent) => {
+            tracing::warn!(
+                project_id,
+                agent = %name,
+                fresh_error = %fresh_error,
+                "fresh durability probe missed committed agent visibility; pooled runtime handle confirmed row"
+            );
+            Outcome::Ok(agent)
+        }
+        Outcome::Err(pooled_error) => {
+            tracing::warn!(
+                project_id,
+                agent = %name,
+                fresh_error = %fresh_error,
+                pooled_error = %pooled_error,
+                "fresh and pooled agent visibility probes both failed after commit"
+            );
+            fresh_result
+        }
+        Outcome::Cancelled(r) => Outcome::Cancelled(r),
+        Outcome::Panicked(p) => Outcome::Panicked(p),
+    }
+}
+
+fn is_agent_visibility_probe_consistency_error(error: &DbError) -> bool {
+    matches!(error, DbError::Internal(message) if message.contains("agent row not visible after commit"))
+}
+
+async fn verify_agent_visible_on_pooled_handle(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    name: &str,
+) -> Outcome<AgentRow, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+    let tracked = tracked(&*conn);
+    let sql = "SELECT id, project_id, name, program, model, task_description, \
+               inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+               registration_token \
+               FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
+               LIMIT 1";
+    let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
         Outcome::Ok(rows) => rows.first().map_or_else(
             || {
                 Outcome::Err(DbError::Internal(format!(
@@ -2809,9 +2876,7 @@ fn restore_rollup_params(row: &AtcRollupSnapshotRow) -> Vec<Value> {
     ]
 }
 
-fn parse_rollup_payload(
-    payload: &str,
-) -> std::result::Result<Vec<AtcRollupSnapshotRow>, DbError> {
+fn parse_rollup_payload(payload: &str) -> std::result::Result<Vec<AtcRollupSnapshotRow>, DbError> {
     serde_json::from_str(payload)
         .map_err(|e| DbError::Internal(format!("restore rollups deserialize: {e}")))
 }
@@ -3549,6 +3614,32 @@ pub async fn ensure_project(
         Outcome::Panicked(p) => return Outcome::Panicked(p),
     }
 
+    // The row doesn't exist yet — we're about to INSERT. This is the only
+    // path where the ephemeral-fixture guard should fire. Lookups of
+    // already-existing rows (from the SELECT above or the cache) pass
+    // through unchanged so operators can still interact with pre-existing
+    // data, even if it accumulated before this guard landed.
+    //
+    // Refuse to register project paths whose path segments match known
+    // test-fixture naming patterns (tempfile.mkdtemp, t.TempDir(), .tmpXXXXXX).
+    // These historically leaked into the real user archive whenever tests
+    // bypassed the ephemeral-storage reroute (e.g., by calling this function
+    // directly with a real DB pool). Set AM_ALLOW_EPHEMERAL_PROJECT_ROOTS=1
+    // to opt out (real integration tests that need to register such paths).
+    if mcp_agent_mail_core::ephemeral::is_ephemeral_project_path(human_key)
+        && !mcp_agent_mail_core::ephemeral::ephemeral_project_roots_allowed()
+    {
+        return Outcome::Err(DbError::invalid(
+            "human_key",
+            format!(
+                "Refusing to register project path `{human_key}` — one of its segments matches \
+                 a test-fixture naming pattern (tempfile.mkdtemp / Go TestXxx / .tmpXXXXXX). \
+                 This guard prevents test tempdirs from polluting the real mailbox archive. \
+                 Set AM_ALLOW_EPHEMERAL_PROJECT_ROOTS=1 if this registration is intentional."
+            ),
+        ));
+    }
+
     // Use an explicit write transaction and conflict-safe insert so project creation
     // participates in concurrent writer mode.
     let fresh = match run_with_mvcc_retry(cx, "ensure_project", || async {
@@ -3936,6 +4027,19 @@ pub async fn register_agent(
         ));
     }
     let now = now_micros();
+    let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
+                     inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
+                     registration_token \
+                     FROM agents \
+                     WHERE project_id = ? AND name = ? COLLATE NOCASE \
+                     LIMIT 1";
+    let fetch_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
+    let existing_before = match durability_probe_query(cx, pool, fetch_sql, &fetch_params).await {
+        Outcome::Ok(rows) => rows.first().map(decode_agent_row_indexed),
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
     let (provisional, durable) = {
         let conn = match acquire_conn(cx, pool).await {
             Outcome::Ok(c) => c,
@@ -3947,150 +4051,134 @@ pub async fn register_agent(
         let (provisional, inserted_new) = {
             let tracked = tracked(&*conn);
             match run_with_mvcc_retry(cx, "register_agent", || async {
-                let is_agent_unique_violation = |err: &DbError| match err {
-                    DbError::Sqlite(msg) => {
-                        let msg = msg.to_ascii_lowercase();
-                        msg.contains("unique constraint failed")
-                            && (msg.contains("project_id") || msg.contains("name"))
-                    }
-                    _ => false,
-                };
-
                 try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
 
-                // Update-first strategy keeps id stable even if backend UPSERT conflict handling
-                // changes, and avoids duplicate row creation under mixed SQLite variants.
-                let mut normalize_sets = vec!["program = ?", "model = ?", "last_active_ts = ?"];
                 let program_s = program.to_string();
                 let model_s = model.to_string();
                 let name_s = name.to_string();
-                let mut normalize_base_params = vec![
+                let insert_task_desc = task_description.unwrap_or_default().to_string();
+                let attach_pol = attachments_policy.map_or_else(
+                    || "auto".to_string(),
+                    std::string::ToString::to_string,
+                );
+                let insert_sql = "INSERT INTO agents \
+                    (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt) \
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                    ON CONFLICT(project_id, name) DO NOTHING";
+                let insert_params = [
+                    Value::BigInt(project_id),
+                    Value::Text(name_s.clone()),
                     Value::Text(program_s.clone()),
                     Value::Text(model_s.clone()),
+                    Value::Text(insert_task_desc.clone()),
                     Value::BigInt(now),
+                    Value::BigInt(now),
+                    Value::Text(attach_pol.clone()),
+                    Value::Text("auto".to_string()),
+                    Value::BigInt(i64::from(reaper_exempt.unwrap_or(false))),
                 ];
-
-                // Keep behavior consistent with insert path: omitted task_description clears
-                // to empty string instead of preserving stale content.
-                normalize_sets.push("task_description = ?");
-                let insert_task_desc = task_description.unwrap_or_default().to_string();
-                normalize_base_params.push(Value::Text(insert_task_desc.clone()));
-                if let Some(ap) = attachments_policy {
-                    normalize_sets.push("attachments_policy = ?");
-                    normalize_base_params.push(Value::Text(ap.to_string()));
-                }
-                if let Some(exempt) = reaper_exempt {
-                    normalize_sets.push("reaper_exempt = ?");
-                    normalize_base_params.push(Value::BigInt(i64::from(exempt)));
-                }
-
-                let normalize_sql = format!(
-                    "UPDATE agents SET {} WHERE project_id = ? AND name = ? COLLATE NOCASE",
-                    normalize_sets.join(", ")
-                );
-                let mut normalize_params = normalize_base_params.clone();
-                normalize_params.push(Value::BigInt(project_id));
-                normalize_params.push(Value::Text(name_s.clone()));
-                let _updated_rows = try_in_tx!(
-                    cx,
-                    &tracked,
-                    map_sql_outcome(
-                        traw_execute(cx, &tracked, &normalize_sql, &normalize_params).await
-                    )
-                );
-
-                let fetch_sql = "SELECT id, project_id, name, program, model, task_description, \
-                                 inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-                                 registration_token \
-                                 FROM agents \
-                                 WHERE project_id = ? AND name = ? COLLATE NOCASE \
-                                 ORDER BY id ASC \
-                                 LIMIT 1";
-
                 let mut inserted_new = false;
-                let fresh = {
-                    let fetch_params = [Value::BigInt(project_id), Value::Text(name_s.clone())];
-                    let existing_rows = try_in_tx!(
+                let mut inserted_id = None;
+                if existing_before.is_none() {
+                    let inserted_rows = try_in_tx!(
                         cx,
                         &tracked,
-                        map_sql_outcome(traw_query(cx, &tracked, fetch_sql, &fetch_params).await)
+                        map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
                     );
-
-                    if let Some(existing) = existing_rows.first().map(decode_agent_row_indexed) {
-                        existing
-                    } else {
-                    let insert_sql = "INSERT INTO agents \
-                        (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt) \
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-                        let attach_pol = attachments_policy.map_or_else(
-                            || "auto".to_string(),
-                            std::string::ToString::to_string,
-                        );
-                        let insert_params = [
-                            Value::BigInt(project_id),
-                            Value::Text(name_s.clone()),
-                            Value::Text(program_s),
-                            Value::Text(model_s),
-                            Value::Text(insert_task_desc),
-                            Value::BigInt(now),
-                            Value::BigInt(now),
-                            Value::Text(attach_pol),
-                            Value::Text("auto".to_string()),
-                            Value::BigInt(i64::from(reaper_exempt.unwrap_or(false))),
-                        ];
-                        match map_sql_outcome(
-                            traw_execute(cx, &tracked, insert_sql, &insert_params).await,
-                        ) {
-                            Outcome::Ok(_) => {
-                                inserted_new = true;
-                            }
-                            Outcome::Err(e) if is_agent_unique_violation(&e) => {
-                                // Concurrent insert race: row now exists, so apply normalize update.
-                                let mut retry_params = normalize_base_params;
-                                retry_params.push(Value::BigInt(project_id));
-                                retry_params.push(Value::Text(name.to_string()));
-                                let _retried_rows = try_in_tx!(
-                                    cx,
-                                    &tracked,
-                                    map_sql_outcome(
-                                        traw_execute(cx, &tracked, &normalize_sql, &retry_params)
-                                            .await
-                                    )
-                                );
-                            }
-                            Outcome::Err(e) => {
-                                rollback_tx(cx, &tracked).await;
-                                return Outcome::Err(e);
-                            }
-                            Outcome::Cancelled(r) => {
-                                rollback_tx(cx, &tracked).await;
-                                return Outcome::Cancelled(r);
-                            }
-                            Outcome::Panicked(p) => {
-                                rollback_tx(cx, &tracked).await;
-                                return Outcome::Panicked(p);
-                            }
-                        }
-
-                        let fetch_params =
-                            [Value::BigInt(project_id), Value::Text(name.to_string())];
-                        let rows = try_in_tx!(
+                    inserted_new = inserted_rows > 0;
+                    if inserted_new {
+                        let id_rows = try_in_tx!(
                             cx,
                             &tracked,
-                            map_sql_outcome(traw_query(cx, &tracked, fetch_sql, &fetch_params).await)
+                            map_sql_outcome(
+                                traw_query(cx, &tracked, "SELECT last_insert_rowid() AS id", &[]).await
+                            )
                         );
-                        let Some(fresh) = rows.first().map(decode_agent_row_indexed) else {
+                        let Some(id) = id_rows.first().and_then(row_first_i64) else {
                             rollback_tx(cx, &tracked).await;
                             return Outcome::Err(DbError::Internal(format!(
-                                "agent upsert succeeded but re-select failed for {project_id}:{name}"
+                                "agent insert succeeded but last_insert_rowid() returned no row for {project_id}:{name}"
                             )));
                         };
-                        fresh
+                        inserted_id = Some(id);
                     }
-                };
+                }
+
+                if !inserted_new {
+                    // Keep behavior consistent with insert path: omitted task_description clears
+                    // to empty string instead of preserving stale content.
+                    let mut normalize_sets = vec!["program = ?", "model = ?", "last_active_ts = ?"];
+                    let mut normalize_params = vec![
+                        Value::Text(program_s.clone()),
+                        Value::Text(model_s.clone()),
+                        Value::BigInt(now),
+                        Value::Text(insert_task_desc.clone()),
+                    ];
+                    normalize_sets.push("task_description = ?");
+                    if let Some(ap) = attachments_policy {
+                        normalize_sets.push("attachments_policy = ?");
+                        normalize_params.push(Value::Text(ap.to_string()));
+                    }
+                    if let Some(exempt) = reaper_exempt {
+                        normalize_sets.push("reaper_exempt = ?");
+                        normalize_params.push(Value::BigInt(i64::from(exempt)));
+                    }
+                    let normalize_sql = format!(
+                        "UPDATE agents SET {} WHERE project_id = ? AND name = ? COLLATE NOCASE",
+                        normalize_sets.join(", ")
+                    );
+                    normalize_params.push(Value::BigInt(project_id));
+                    normalize_params.push(Value::Text(name_s.clone()));
+                    let updated_rows = try_in_tx!(
+                        cx,
+                        &tracked,
+                        map_sql_outcome(
+                            traw_execute(cx, &tracked, &normalize_sql, &normalize_params).await
+                        )
+                    );
+                    if updated_rows == 0 {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(DbError::Internal(format!(
+                            "agent upsert affected zero rows for {project_id}:{name}"
+                        )));
+                    }
+                }
 
                 try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
-                Outcome::Ok((fresh, inserted_new))
+
+                let build_inserted_agent = || AgentRow {
+                    id: inserted_id,
+                    project_id,
+                    name: name_s.clone(),
+                    program: program_s.clone(),
+                    model: model_s.clone(),
+                    task_description: insert_task_desc.clone(),
+                    inception_ts: now,
+                    last_active_ts: now,
+                    attachments_policy: attach_pol.clone(),
+                    contact_policy: "auto".to_string(),
+                    reaper_exempt: i64::from(reaper_exempt.unwrap_or(false)),
+                    registration_token: None,
+                };
+                let mut provisional = if inserted_new {
+                    build_inserted_agent()
+                } else if let Some(existing) = existing_before.clone() {
+                    existing
+                } else {
+                    build_inserted_agent()
+                };
+                provisional.program = program_s;
+                provisional.model = model_s;
+                provisional.task_description = insert_task_desc;
+                provisional.last_active_ts = now;
+                if let Some(ap) = attachments_policy {
+                    provisional.attachments_policy = ap.to_string();
+                }
+                if let Some(exempt) = reaper_exempt {
+                    provisional.reaper_exempt = i64::from(exempt);
+                }
+
+                Outcome::Ok((provisional, inserted_new))
             })
             .await
             {
@@ -4203,7 +4291,7 @@ pub async fn create_agent(
                              inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
                              registration_token \
                              FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
-                             ORDER BY id ASC LIMIT 1";
+                             LIMIT 1";
             let fetch_params = [Value::BigInt(project_id), Value::Text(name.to_string())];
 
             // Fast duplicate check before insert.
@@ -4376,7 +4464,7 @@ pub async fn get_agent(
                inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
                registration_token \
                FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
-               ORDER BY id ASC LIMIT 1";
+               LIMIT 1";
     let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
 
     match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
@@ -12134,14 +12222,7 @@ pub async fn snapshot_atc_rollups(
     };
     let tracked = tracked(&*conn);
 
-    let rows = match traw_query(
-        cx,
-        &tracked,
-        ATC_ROLLUP_SNAPSHOT_SELECT_SQL,
-        &[],
-    )
-    .await
-    {
+    let rows = match traw_query(cx, &tracked, ATC_ROLLUP_SNAPSHOT_SELECT_SQL, &[]).await {
         Outcome::Ok(r) => r,
         Outcome::Err(e) => {
             return Outcome::Err(DbError::Internal(format!(
@@ -12748,7 +12829,10 @@ mod tests {
 
         assert_eq!(first_row["compacted_total_count"], 4);
         assert_eq!(first_row["compacted_resolved_count"], 3);
-        assert_eq!(first_row["compacted_last_updated_ts"], 1_699_999_000_000_000_i64);
+        assert_eq!(
+            first_row["compacted_last_updated_ts"],
+            1_699_999_000_000_000_i64
+        );
 
         let conn = open_canonical_atc_conn(&pool, "mutate compacted rollup")
             .expect("open canonical ATC connection");
@@ -15047,6 +15131,75 @@ mod tests {
             assert_eq!(fetched.program, "codex-cli");
             assert_eq!(fetched.model, "gpt-5");
             assert_eq!(fetched.id, registered.id);
+        });
+    }
+
+    #[test]
+    fn register_agent_succeeds_after_runtime_migrations() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("register_agent_runtime_schema.db");
+        let database_url = format!("sqlite:///{}", db_path.display());
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+        let init_cfg = crate::pool::DbPoolConfig {
+            database_url: database_url.clone(),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let init_pool = crate::create_pool(&init_cfg).expect("initialize runtime schema");
+        rt.block_on(async {
+            let init_conn = init_pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("acquire initialized runtime schema");
+            drop(init_conn);
+        });
+        drop(init_pool);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url,
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-runtime-agent-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            let registered = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "SilentRiver",
+                "codex-cli",
+                "gpt-5",
+                Some("runtime schema registration"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register agent on runtime schema");
+
+            assert!(registered.id.is_some(), "register should assign id");
+            assert_eq!(registered.name, "SilentRiver");
+            assert_eq!(registered.program, "codex-cli");
         });
     }
 

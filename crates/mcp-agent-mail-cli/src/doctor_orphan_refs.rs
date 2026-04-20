@@ -332,13 +332,16 @@ fn scan_one_project(
     }
 
     if apply && backup_path.is_some() {
-        let _ = rotate_backups(project_path, config);
-
         // br-8ujfs.6.4 (F4): regenerate packed-refs after a successful
         // prune so the remaining refs are consolidated. Writes a
-        // backup of packed-refs (if present) under backup_path's sibling
-        // before running. `git pack-refs --all --prune` is atomic (new
-        // file + rename) and safe to run while we hold the flock.
+        // backup of packed-refs (if present) in the same backup dir
+        // before running. `git pack-refs --all --prune` is atomic
+        // (new file + rename) and safe to run while we hold the flock.
+        //
+        // Note: we rotate AFTER repack_refs (not before) so the
+        // packed-refs backup it writes is included in the retention
+        // calculation. Otherwise a repack backup would escape the
+        // first rotation and only get reaped on the next apply.
         match repack_refs(project_path, config) {
             Ok(()) => {
                 actions.push(ActionRecord {
@@ -362,6 +365,11 @@ fn scan_one_project(
                 });
             }
         }
+
+        // Rotate after ALL backups are written (prune-time refs backup
+        // + repack-time packed-refs backup) so retention reaps every
+        // backup from this run fairly.
+        let _ = rotate_backups(project_path, config);
     }
 
     tracing::info!(
@@ -464,8 +472,20 @@ fn repack_refs(project_path: &Path, config: &Config) -> Result<(), String> {
     }
 
     // Run git pack-refs --all --prune via GitCmd.
+    //
+    // The caller (scan_one_project) already holds a RepoFlock for this
+    // repo, acquired at the top of the scan. Re-acquiring it here
+    // through GitCmd would open a second fd-level fcntl lock for the
+    // same process on the same file — POSIX semantics let this
+    // succeed but replace the lock, so the INNER RepoFlock's drop
+    // would release the kernel lock even though the outer RepoFlock
+    // is still alive, creating a brief window where no lock is held.
+    // Use `.skip_flock()` to avoid the double-acquire entirely. We
+    // still take the in-process mutex (cheap, idempotent-safe) so
+    // cross-thread serialization within the process remains intact.
     let out = mcp_agent_mail_core::git_cmd::GitCmd::new(project_path)
         .args(["pack-refs", "--all", "--prune"])
+        .skip_flock()
         .run()
         .map_err(|e| format!("pack-refs invocation: {e}"))?;
     if !out.status.success() {

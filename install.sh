@@ -2270,8 +2270,18 @@ check_git_version_known_bad() {
   # at runtime via AM_EXTRA_KNOWN_BAD_GIT_JSON (see bead A7); keeping the
   # installer check narrow avoids coupling the installer to a runtime
   # catalog that isn't available until after install.
+  #
+  # The glob patterns below catch:
+  #   - upstream       : "2.51.0"
+  #   - Git for Windows: "2.51.0.windows.1" (and .2, .3, ...) via 2.51.0.*
+  #   - distro suffix  : "2.51.0-1ubuntu1", "2.51.0-1debian1" via 2.51.0-*
+  #   - build metadata : "2.51.0+git20260101" via 2.51.0+*
+  # Any version string that STARTS with "2.51.0" plus a separator ('.',
+  # '-', or '+') is flagged. Bare "2.51.0.rc1" and "2.51.0-rc1" also
+  # match — pre-release or not, if you're shipping a 2.51.0 derivative
+  # the race is presumed present until proven otherwise.
   case "$git_version" in
-    2.51.0)
+    2.51.0 | 2.51.0.* | 2.51.0-* | 2.51.0+*)
       warn "[AM_INSTALL_WARN GIT_2_51_0_KNOWN_BAD]"
       warn ""
       warn "Detected git 2.51.0 ($git_bin) which has a concurrency bug"

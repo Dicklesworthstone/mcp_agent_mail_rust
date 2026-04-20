@@ -355,6 +355,11 @@ fn pid_hint_max_age_secs() -> u64 {
 /// This is a cross-platform replacement for lsof-based detection. It uses:
 /// 1. `TcpListener::bind()` to check if the port is available
 /// 2. HTTP health check to identify if an existing listener is Agent Mail
+/// 3. A `connect()` probe to distinguish an active listener from a stale
+///    `AddrInUse` caused by kernel socket cleanup (TIME_WAIT on accepted
+///    peers after the server process exits, brief windows during process
+///    teardown, etc.). If nothing is actually accepting connections,
+///    the bind failure is transient and the port is reported as `Free`.
 ///
 /// # Arguments
 /// * `host` - The host address to check (e.g., "127.0.0.1")
@@ -401,9 +406,77 @@ pub fn check_port_status(host: &str, port: u16) -> PortStatus {
         return PortStatus::AgentMailServer;
     }
 
+    // Step 4: Neither health nor PID-based identification flagged an Agent
+    // Mail process, but `bind()` still failed. That normally means some
+    // unrelated process is listening — but it can also mean the port has
+    // *no* listener and bind() is transiently refusing because lingering
+    // TIME_WAIT peers (or an in-flight teardown from a just-killed server)
+    // block the local address. An active listener answers `connect()`
+    // within milliseconds on loopback; a port with nothing accepting
+    // returns `ECONNREFUSED` immediately. If connect refuses, report the
+    // port as free so the caller can retry bind with `SO_REUSEADDR` and
+    // proceed instead of surfacing a spurious "Unknown process listening"
+    // error to the operator.
+    if !port_has_active_listener(host, port) {
+        tracing::debug!(
+            %addr,
+            "bind() returned AddrInUse but nothing is accepting on this port — \
+             treating as Free (likely TIME_WAIT residue from a recently-killed server)"
+        );
+        return PortStatus::Free;
+    }
+
     PortStatus::OtherProcess {
         description: format!("Unknown process listening on {addr}"),
     }
+}
+
+/// Returns `true` if at least one resolved socket address for `host:port`
+/// answers a `connect()` without returning `ECONNREFUSED`.
+///
+/// Used as an authoritative cross-platform signal that *something* is
+/// accepting on the port, independent of `ss`/`lsof` availability or
+/// permissions. `ECONNREFUSED` is a direct kernel answer that the port
+/// has no listener; timeouts and other errors are treated conservatively
+/// as "might be a listener" so we don't mistakenly declare a wedged or
+/// firewalled listener to be absent.
+fn port_has_active_listener(host: &str, port: u16) -> bool {
+    let connect_host = normalize_connect_host_for_health_check(host);
+    let host_for_resolution = connect_host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or_else(|| connect_host.as_ref());
+    let Ok(addrs) = (host_for_resolution, port).to_socket_addrs() else {
+        // Name resolution failed — we can't prove absence of a listener, so
+        // remain conservative and treat the port as occupied.
+        return true;
+    };
+
+    let mut any_attempted = false;
+    for addr in addrs {
+        any_attempted = true;
+        match TcpStream::connect_timeout(&addr, HEALTH_CHECK_TIMEOUT) {
+            Ok(stream) => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                return true;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+            Err(_) => {
+                // Timeout / unreachable / other: be conservative — do not
+                // conclude "no listener" on the basis of an ambiguous error.
+                return true;
+            }
+        }
+    }
+
+    if !any_attempted {
+        // No addresses resolved — can't prove absence of a listener. Stay
+        // conservative and treat the port as occupied.
+        return true;
+    }
+    // Every resolved address returned ECONNREFUSED. No process is accepting
+    // on this port — bind() is failing transiently.
+    false
 }
 
 fn normalize_bind_host_for_socket(host: &str) -> std::borrow::Cow<'_, str> {
@@ -2727,6 +2800,31 @@ fn shared_runtime_startup_probes(config: &Config) -> Vec<ProbeResult> {
     ]
 }
 
+/// Best-effort rotation of old backup detritus in `storage_root`. Errors are
+/// logged at warn level and otherwise ignored — rotation failures must never
+/// prevent the server from starting.
+fn rotate_backups_best_effort(config: &Config) {
+    let keep = crate::backup_rotation::resolved_keep_per_kind();
+    match crate::backup_rotation::rotate_storage_backups(&config.storage_root, keep) {
+        Ok(report) if report.removed > 0 => {
+            tracing::info!(
+                removed = report.removed,
+                kept = report.kept,
+                bytes_reclaimed = report.bytes_reclaimed,
+                "backup rotation reclaimed disk in storage_root"
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(
+                storage_root = %config.storage_root.display(),
+                %err,
+                "backup rotation failed; continuing"
+            );
+        }
+    }
+}
+
 /// Run the full HTTP/TUI startup probe set.
 #[must_use]
 pub fn run_startup_probes(config: &Config) -> StartupReport {
@@ -2744,6 +2842,14 @@ pub fn run_http_startup_preflight_probes(config: &Config) -> StartupReport {
         check_port_status(&config.http_host, config.http_port),
         PortStatus::AgentMailServer
     );
+
+    // Best-effort housekeeping — rotate old backup detritus in `storage_root`,
+    // but only when no Agent Mail server is already running. Running it during
+    // a live server's steady state risks racing against an in-flight corrupt-
+    // or reconstruct-backup write; we let the next cold start handle cleanup.
+    if !existing_agent_mail_server {
+        rotate_backups_best_effort(config);
+    }
     let mut results = vec![
         probe_http_path(config),
         probe_auth(config),
@@ -3380,6 +3486,53 @@ mod tests {
         );
 
         // Explicitly drop to release
+        drop(listener);
+    }
+
+    #[test]
+    fn port_has_active_listener_returns_true_when_something_is_bound() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind to random port");
+        let port = listener.local_addr().expect("listener addr").port();
+
+        assert!(
+            port_has_active_listener("127.0.0.1", port),
+            "expected active listener to be detected on 127.0.0.1:{port}"
+        );
+
+        drop(listener);
+    }
+
+    #[test]
+    fn port_has_active_listener_returns_false_when_nothing_is_bound() {
+        // Grab a port, release it, then probe: connect() should return
+        // ECONNREFUSED because nothing is listening on that address. This
+        // is the key signal we use to distinguish a transient AddrInUse
+        // (e.g., TIME_WAIT residue after a just-killed server) from a
+        // truly-occupied port.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind to random port");
+        let port = listener.local_addr().expect("listener addr").port();
+        drop(listener);
+
+        assert!(
+            !port_has_active_listener("127.0.0.1", port),
+            "expected no active listener on released port 127.0.0.1:{port}"
+        );
+    }
+
+    #[test]
+    fn port_has_active_listener_handles_wildcard_host() {
+        // A wildcard bind host (0.0.0.0) is normalized to a loopback target
+        // for the connect probe — otherwise the probe would try to reach
+        // every local interface. This test pins that behavior: a listener
+        // bound to 127.0.0.1 should be visible when probing "0.0.0.0".
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind to random port");
+        let port = listener.local_addr().expect("listener addr").port();
+
+        assert!(
+            port_has_active_listener("0.0.0.0", port),
+            "expected wildcard-host probe to detect loopback listener on port {port}"
+        );
+
         drop(listener);
     }
 
