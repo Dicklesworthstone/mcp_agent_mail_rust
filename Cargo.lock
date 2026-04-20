@@ -4737,6 +4737,7 @@ dependencies = [
  "fs2",
  "ftui",
  "ftui-runtime",
+ "git2",
  "glob",
  "hex",
  "json5",
@@ -4812,6 +4813,7 @@ dependencies = [
  "sqlmodel-frankensqlite",
  "tempfile",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -4870,6 +4872,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -4955,6 +4958,7 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "include_dir",
+ "mcp-agent-mail-core",
  "mcp-agent-mail-db",
  "regex",
  "serde",
@@ -4988,6 +4992,15 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "mcp-agent-mail-test-helpers"
+version = "0.2.45"
+dependencies = [
+ "git2",
+ "tempfile",
  "tracing",
 ]
 

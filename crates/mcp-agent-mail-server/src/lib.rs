@@ -72,6 +72,7 @@ pub const COMPAT_MCP_ALIASES: &[&str] = &["/api", "/mcp"];
 mod ack_ttl;
 pub mod atc;
 pub mod atc_replay;
+pub mod backup_rotation;
 mod cleanup;
 pub mod console;
 mod disk_monitor;
@@ -6483,8 +6484,8 @@ fn run_atc_operator_loop(config: mcp_agent_mail_core::Config, stop: Arc<AtomicBo
         let kernel_total_micros = live_summary
             .as_ref()
             .map(|summary| summary.budget.kernel_total_micros);
-        let outer_loop_overhead_micros = kernel_total_micros
-            .map_or(0, |kernel| tick_duration_micros.saturating_sub(kernel));
+        let outer_loop_overhead_micros =
+            kernel_total_micros.map_or(0, |kernel| tick_duration_micros.saturating_sub(kernel));
         let (tick_budget_exceeded, note) = atc_operator_tick_budget_status(
             kernel_total_micros,
             tick_duration_micros,
@@ -9156,40 +9157,40 @@ impl HttpState {
                     self.config.storage_root.as_path(),
                 )
                 .map_or(200, |durability| {
-                        use mcp_agent_mail_db::DurabilityState;
-                        body["durability_state"] = serde_json::json!(durability.to_string());
-                        // Exhaustive match so a future DurabilityState variant
-                        // addition is a compile error rather than silently
-                        // falling through to 200.
-                        //
-                        // Mapping: 503 iff `allows_reads()` is false. Both
-                        // Recovering and Corrupt have allows_reads=false per the
-                        // durability state machine, so clients genuinely cannot
-                        // read during either — returning 200 would route
-                        // traffic at a service that can't serve it. The
-                        // `durability_state` + `status` fields still let
-                        // supervisors distinguish the two (Recovering is
-                        // self-healing; Corrupt needs operator intervention)
-                        // if they want to react differently.
-                        match durability {
-                            DurabilityState::Healthy => 200,
-                            DurabilityState::DegradedReadOnly => {
-                                // Reads still work; keep 200 but signal the
-                                // degraded state in the body so callers can
-                                // opt into strict behavior.
-                                body["status"] = serde_json::json!("ready_degraded");
-                                200
-                            }
-                            DurabilityState::Recovering => {
-                                body["status"] = serde_json::json!("recovering");
-                                503
-                            }
-                            DurabilityState::Corrupt => {
-                                body["status"] = serde_json::json!("degraded");
-                                503
-                            }
+                    use mcp_agent_mail_db::DurabilityState;
+                    body["durability_state"] = serde_json::json!(durability.to_string());
+                    // Exhaustive match so a future DurabilityState variant
+                    // addition is a compile error rather than silently
+                    // falling through to 200.
+                    //
+                    // Mapping: 503 iff `allows_reads()` is false. Both
+                    // Recovering and Corrupt have allows_reads=false per the
+                    // durability state machine, so clients genuinely cannot
+                    // read during either — returning 200 would route
+                    // traffic at a service that can't serve it. The
+                    // `durability_state` + `status` fields still let
+                    // supervisors distinguish the two (Recovering is
+                    // self-healing; Corrupt needs operator intervention)
+                    // if they want to react differently.
+                    match durability {
+                        DurabilityState::Healthy => 200,
+                        DurabilityState::DegradedReadOnly => {
+                            // Reads still work; keep 200 but signal the
+                            // degraded state in the body so callers can
+                            // opt into strict behavior.
+                            body["status"] = serde_json::json!("ready_degraded");
+                            200
                         }
-                    });
+                        DurabilityState::Recovering => {
+                            body["status"] = serde_json::json!("recovering");
+                            503
+                        }
+                        DurabilityState::Corrupt => {
+                            body["status"] = serde_json::json!("degraded");
+                            503
+                        }
+                    }
+                });
                 return Some(self.health_json_response(req, status_code, &body));
             }
             "/health/durability" => {
@@ -9206,16 +9207,20 @@ impl HttpState {
                     self.config.storage_root.as_path(),
                 );
                 let body = durability.map_or_else(
-                    || serde_json::json!({
-                        "durability_state": "unknown",
-                        "allows_reads": true,
-                        "allows_writes": true,
-                    }),
-                    |state| serde_json::json!({
-                        "durability_state": state.to_string(),
-                        "allows_reads": state.allows_reads(),
-                        "allows_writes": state.allows_writes(),
-                    }),
+                    || {
+                        serde_json::json!({
+                            "durability_state": "unknown",
+                            "allows_reads": true,
+                            "allows_writes": true,
+                        })
+                    },
+                    |state| {
+                        serde_json::json!({
+                            "durability_state": state.to_string(),
+                            "allows_reads": state.allows_reads(),
+                            "allows_writes": state.allows_writes(),
+                        })
+                    },
                 );
                 return Some(self.health_json_response(req, 200, &body));
             }
@@ -12097,9 +12102,7 @@ fn record_atc_message_outcome_from_tool_payload_with_pool(
         }
         ExperienceState::Resolved => {
             let existing = existing_label.as_deref();
-            if target_label == "acknowledged"
-                && matches!(existing, Some("read" | "ack_overdue"))
-            {
+            if target_label == "acknowledged" && matches!(existing, Some("read" | "ack_overdue")) {
                 let (note, event_name, upgrade_reason) = if existing == Some("ack_overdue") {
                     (
                         "upgrade_ack_overdue_to_acknowledged",
@@ -14637,7 +14640,10 @@ mod tests {
     fn atc_operator_budget_status_falls_back_to_wall_clock_without_summary() {
         let (exceeded, note) = atc_operator_tick_budget_status(None, 8_000, 5_000);
         assert!(exceeded);
-        assert_eq!(note.as_deref(), Some("ATC tick exceeded budget: 8000us > 5000us"));
+        assert_eq!(
+            note.as_deref(),
+            Some("ATC tick exceeded budget: 8000us > 5000us")
+        );
     }
 
     #[test]

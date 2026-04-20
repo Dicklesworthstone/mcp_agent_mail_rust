@@ -520,6 +520,125 @@ pub const fn resolve_ephemeral_class(
 }
 
 // ============================================================================
+// Narrow "test-fixture leak" predicate (B2/B3 — archive pollution guard)
+// ============================================================================
+//
+// Unlike `classify_ephemeral` — which is broad and drives the ephemeral
+// storage reroute — `is_ephemeral_project_path` is intentionally narrow:
+// it matches only path segments whose *shape* screams "this was created by
+// a test harness". The goal is to catch leaks from call sites that bypass
+// the reroute (direct `queries::ensure_project` calls, benchmarks, etc.)
+// and end up writing into the real user archive.
+//
+// Patterns are drawn directly from the pollution incident of 2026-04-19,
+// where 1576+ test-fixture project roots had accumulated in the production
+// archive. All four patterns below are represented in that incident.
+
+/// Does a path segment look like a `tempfile.mkdtemp()` / `tempfile::TempDir`
+/// random suffix?
+///
+/// Both Python `tempfile.mkdtemp()` and Rust's `tempfile::TempDir` produce
+/// directory names of the form `tmp` + 6-10 lowercase alphanumerics,
+/// optionally followed by `-`-prefixed metadata. Examples:
+/// `tmp0jdv7c`, `tmpa0tiqx-project-root`, `tmp23baj9-project-root`.
+fn looks_like_mkdtemp_segment(segment: &str) -> bool {
+    let Some(rest) = segment.strip_prefix("tmp") else {
+        return false;
+    };
+    let alnum_run: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let len = alnum_run.len();
+    if !(6..=10).contains(&len) {
+        return false;
+    }
+    // mkdtemp uses lowercase-ish alphanumerics; reject obvious mixed-case words
+    // like "tmpOverride" or "tmpFixtureConfig" that aren't actually tempdirs.
+    if !alnum_run
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
+        return false;
+    }
+    let tail = &rest[alnum_run.len()..];
+    tail.is_empty() || tail.starts_with('-')
+}
+
+/// Does a path segment look like a Go `t.TempDir()` / `TestXxx` directory?
+///
+/// Go's `testing` package names subtest tempdirs `<TestName><timestamp>`,
+/// producing segments like `TestInitCmd_NoArgs2809542922` or
+/// `TestHandleListMailProjects_Branch2592788348`.
+fn looks_like_go_test_segment(segment: &str) -> bool {
+    if !segment.starts_with("Test") {
+        return false;
+    }
+    let rest = &segment[4..];
+    let first = rest.chars().next();
+    if !matches!(first, Some(c) if c.is_ascii_uppercase()) {
+        return false;
+    }
+    if !rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    // Trailing digit run ≥ 6 is the timestamp signature.
+    let digit_suffix_len = rest
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .count();
+    digit_suffix_len >= 6
+}
+
+/// Returns `true` if `human_key` contains a path segment that matches a
+/// known test-fixture naming pattern (`tempfile.mkdtemp`, `t.TempDir()`,
+/// `.tmpXXXXXX`). Narrower than `classify_ephemeral`: this is specifically
+/// the "refuse to write into the real archive" check, not the
+/// "reroute to isolated storage" check.
+///
+/// Does not canonicalize; operates on the given string so `/tmp/foo` is
+/// **not** rejected (that's a valid ephemeral project that should be
+/// rerouted, not rejected).
+#[must_use]
+pub fn is_ephemeral_project_path(human_key: &str) -> bool {
+    let normalized = human_key.replace('\\', "/");
+    for segment in normalized.split('/') {
+        if segment.is_empty() {
+            continue;
+        }
+        if looks_like_mkdtemp_segment(segment) {
+            return true;
+        }
+        if looks_like_go_test_segment(segment) {
+            return true;
+        }
+        // `.tmpXXXXXX` — older Rust tempfile style + some CI runners.
+        if let Some(rest) = segment.strip_prefix(".tmp")
+            && rest.len() >= 6
+            && rest.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns `true` when the operator has opted in to allow ephemeral
+/// project roots to be registered into the archive. Honors the standard
+/// `process_env_value` harness so tests and integration harnesses can
+/// override it without touching the real process env.
+///
+/// Accepts the same truthy vocabulary as [`crate::config::parse_bool`]
+/// (`1`/`true`/`t`/`yes`/`y`, case-insensitive) for consistency.
+#[must_use]
+pub fn ephemeral_project_roots_allowed() -> bool {
+    crate::config::process_env_value("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS")
+        .map(|v| crate::config::parse_bool(&v, false))
+        .unwrap_or(false)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -920,5 +1039,143 @@ mod tests {
         );
         assert_eq!(class, EphemeralClass::LikelyEphemeral);
         assert!(signals.path_contains_test);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // is_ephemeral_project_path — the narrow pollution-guard predicate.
+    // Rejects the specific test-fixture naming patterns observed in the
+    // 2026-04-19 archive pollution incident (1500+ leaked project roots).
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_ephemeral_project_path_matches_python_tempfile_mkdtemp_pattern() {
+        // Observed: tmp0jdv7c-project-root, tmp0rhizz-project-root, ...
+        assert!(is_ephemeral_project_path(
+            "/data/tmp/tmp0jdv7c-project-root"
+        ));
+        assert!(is_ephemeral_project_path(
+            "/data/tmp/tmpa0tiqx-project-root"
+        ));
+        assert!(is_ephemeral_project_path(
+            "/data/tmp/tmp23baj9-project-root"
+        ));
+        // Bare mkdtemp directory without our suffix
+        assert!(is_ephemeral_project_path("/tmp/tmpabcdef"));
+    }
+
+    #[test]
+    fn is_ephemeral_project_path_matches_go_testing_tmpdir_pattern() {
+        // Observed: data-tmp-ntm-go-tmp-testinitcmd-noargs2809542922-001
+        // which came from: /data/tmp/ntm-go/tmp/TestInitCmd_NoArgs2809542922/001
+        assert!(is_ephemeral_project_path(
+            "/data/tmp/ntm-go/tmp/TestInitCmd_NoArgs2809542922/001"
+        ));
+        assert!(is_ephemeral_project_path(
+            "/var/tmp/TestHandleListMailProjects_Branch2592788348/002"
+        ));
+    }
+
+    #[test]
+    fn is_ephemeral_project_path_rejects_plain_temp_paths() {
+        // Plain /tmp/foo is a legitimate ephemeral project that should be
+        // *rerouted* by compute_ephemeral_storage_root, NOT rejected here.
+        assert!(!is_ephemeral_project_path("/tmp/foo"));
+        assert!(!is_ephemeral_project_path("/tmp"));
+        assert!(!is_ephemeral_project_path("/var/tmp/shared-work"));
+    }
+
+    #[test]
+    fn is_ephemeral_project_path_rejects_production_paths() {
+        assert!(!is_ephemeral_project_path("/data/projects/backend"));
+        assert!(!is_ephemeral_project_path("/home/user/work/my-app"));
+        assert!(!is_ephemeral_project_path(
+            "/data/projects/mcp_agent_mail_rust"
+        ));
+        // Paths that merely *contain* the substring "tmp" shouldn't match
+        assert!(!is_ephemeral_project_path("/home/user/tmp-workspace"));
+        assert!(!is_ephemeral_project_path("/data/projects/my-tmpfs-cache"));
+    }
+
+    #[test]
+    fn is_ephemeral_project_path_matches_dot_tmp_style() {
+        // `.tmpXXXXXX` is the older Rust tempfile naming, still seen in some CI.
+        assert!(is_ephemeral_project_path("/data/work/.tmpAbC123/project"));
+    }
+
+    #[test]
+    fn is_ephemeral_project_path_tolerates_mixed_case_words() {
+        // `tmpOverride`, `tmpFixtureConfig` are legitimate code names — not mkdtemp.
+        assert!(!is_ephemeral_project_path("/data/projects/tmpOverride"));
+        assert!(!is_ephemeral_project_path(
+            "/data/projects/backend/src/tmpFixtureConfig"
+        ));
+    }
+
+    #[test]
+    fn is_ephemeral_project_path_handles_windows_separators() {
+        // Backslashes are normalized to forward slashes before scanning.
+        assert!(is_ephemeral_project_path(
+            r"C:\Users\runner\tmpabc123-project-root"
+        ));
+        assert!(!is_ephemeral_project_path(r"C:\work\my-project"));
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // ephemeral_project_roots_allowed — env-override escape hatch.
+    // ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn ephemeral_project_roots_allowed_honors_env_override() {
+        // Verify both the "off by default" and "on when set" semantics
+        // using the explicit test env override so we don't depend on
+        // whatever the process env happens to contain.
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "")],
+            || assert!(!ephemeral_project_roots_allowed()),
+        );
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1")],
+            || assert!(ephemeral_project_roots_allowed()),
+        );
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "true")],
+            || assert!(ephemeral_project_roots_allowed()),
+        );
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "yes")],
+            || assert!(ephemeral_project_roots_allowed()),
+        );
+        // Short variants supported by parse_bool
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "t")],
+            || assert!(ephemeral_project_roots_allowed()),
+        );
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "y")],
+            || assert!(ephemeral_project_roots_allowed()),
+        );
+        // Case-insensitive
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "TRUE")],
+            || assert!(ephemeral_project_roots_allowed()),
+        );
+        // Non-affirmative values don't count
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "0")],
+            || assert!(!ephemeral_project_roots_allowed()),
+        );
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "false")],
+            || assert!(!ephemeral_project_roots_allowed()),
+        );
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "no")],
+            || assert!(!ephemeral_project_roots_allowed()),
+        );
+        // Unknown values default to false.
+        crate::config::with_process_env_overrides_for_test(
+            &[("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "maybe")],
+            || assert!(!ephemeral_project_roots_allowed()),
+        );
     }
 }
