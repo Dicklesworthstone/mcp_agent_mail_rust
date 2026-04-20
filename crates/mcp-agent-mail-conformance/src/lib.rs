@@ -31,7 +31,7 @@ impl Fixtures {
     }
 
     pub fn load_default() -> Result<Self, FixtureLoadError> {
-        Self::load(FIXTURE_PATH)
+        Self::load(Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_PATH))
     }
 
     fn validate(&self) -> Result<(), FixtureLoadError> {

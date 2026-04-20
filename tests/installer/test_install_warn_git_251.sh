@@ -197,5 +197,77 @@ if grep -q 'AM_INSTALL_WARN' <<<"$output_d"; then
 fi
 step "scenario D PASSED: clean skip when no git"
 
+# -----------------------------------------------------------------------
+# Scenario E: Git for Windows — "git version 2.51.0.windows.1" → warn.
+# -----------------------------------------------------------------------
+step "scenario E: shim reports 2.51.0.windows.1"
+build_shim "2.51.0.windows.1"
+set +e
+output_e=$(PATH="$tmp/bin:$PATH" bash -c "source '$extract'; check_git_version_known_bad" 2>&1)
+rc_e=$?
+set -e
+echo "=== scenario E (git 2.51.0.windows.1) ===" >&3
+echo "$output_e" >&3
+
+if [ "$rc_e" -ne 0 ]; then
+    echo "FAIL: 2.51.0.windows.1 scenario exited $rc_e" >&2
+    exit 1
+fi
+if ! grep -q 'AM_INSTALL_WARN GIT_2_51_0_KNOWN_BAD' <<<"$output_e"; then
+    echo "FAIL: 2.51.0.windows.1 should have matched the known-bad glob" >&2
+    echo "Captured:" >&2
+    echo "$output_e" >&2
+    exit 1
+fi
+step "scenario E PASSED: .windows.1 derivative flagged"
+
+# -----------------------------------------------------------------------
+# Scenario F: Ubuntu package suffix — "git version 2.51.0-1ubuntu1" → warn.
+# -----------------------------------------------------------------------
+step "scenario F: shim reports 2.51.0-1ubuntu1"
+build_shim "2.51.0-1ubuntu1"
+set +e
+output_f=$(PATH="$tmp/bin:$PATH" bash -c "source '$extract'; check_git_version_known_bad" 2>&1)
+rc_f=$?
+set -e
+echo "=== scenario F (git 2.51.0-1ubuntu1) ===" >&3
+echo "$output_f" >&3
+
+if [ "$rc_f" -ne 0 ]; then
+    echo "FAIL: 2.51.0-1ubuntu1 scenario exited $rc_f" >&2
+    exit 1
+fi
+if ! grep -q 'AM_INSTALL_WARN GIT_2_51_0_KNOWN_BAD' <<<"$output_f"; then
+    echo "FAIL: 2.51.0-1ubuntu1 should have matched the known-bad glob" >&2
+    echo "Captured:" >&2
+    echo "$output_f" >&2
+    exit 1
+fi
+step "scenario F PASSED: -1ubuntu1 derivative flagged"
+
+# -----------------------------------------------------------------------
+# Scenario G: 2.51.1 (post-fix version) → no warn.
+# -----------------------------------------------------------------------
+step "scenario G: shim reports 2.51.1 (post-fix)"
+build_shim "2.51.1"
+set +e
+output_g=$(PATH="$tmp/bin:$PATH" bash -c "source '$extract'; check_git_version_known_bad" 2>&1)
+rc_g=$?
+set -e
+echo "=== scenario G (git 2.51.1) ===" >&3
+echo "$output_g" >&3
+
+if [ "$rc_g" -ne 0 ]; then
+    echo "FAIL: 2.51.1 scenario exited $rc_g" >&2
+    exit 1
+fi
+if grep -q 'AM_INSTALL_WARN GIT_2_51_0_KNOWN_BAD' <<<"$output_g"; then
+    echo "FAIL: 2.51.1 should NOT have been flagged (post-fix version)" >&2
+    echo "Captured:" >&2
+    echo "$output_g" >&2
+    exit 1
+fi
+step "scenario G PASSED: 2.51.1 correctly not flagged"
+
 step "ALL SCENARIOS PASSED"
 echo "OK" >&3

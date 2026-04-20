@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Auto-increment ID field names that are non-deterministic across test runs.
@@ -17,6 +18,8 @@ const AUTO_INCREMENT_ID_KEYS: &[&str] = &["id", "message_id", "reply_to"];
 const TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS: &str = "3600";
 const TEST_SEARCH_ENGINE: &str = "legacy";
 const RUST_NATIVE_FIXTURE_DIR: &str = "tests/conformance/fixtures/rust_native";
+const LEGACY_FIXTURE_REPO_INSTALL_PATH: &str = "/tmp/agent-mail-fixtures/repo_install";
+const LEGACY_FIXTURE_REPO_UNINSTALL_PATH: &str = "/tmp/agent-mail-fixtures/repo_uninstall";
 
 /// Tests in this file mutate process-wide environment variables (Rust has no per-test env isolation).
 /// The Rust test harness runs tests in parallel by default, so serialize any env mutations and
@@ -491,10 +494,11 @@ impl Drop for EnvVarGuard {
 }
 
 fn load_tool_filter_fixtures() -> ToolFilterFixtures {
-    let path = "tests/conformance/fixtures/tool_filter/cases.json";
-    let raw = std::fs::read_to_string(path).expect("tool filter fixtures missing");
-    let fixtures: ToolFilterFixtures =
-        serde_json::from_str(&raw).expect("tool filter fixtures invalid JSON");
+    let path = crate_root().join("tests/conformance/fixtures/tool_filter/cases.json");
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+    let fixtures: ToolFilterFixtures = serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()));
     assert!(
         !fixtures.version.trim().is_empty(),
         "tool filter fixtures version must be non-empty"
@@ -535,6 +539,13 @@ fn load_rust_native_tool_fixtures() -> Vec<RustNativeToolFixtureFile> {
         .collect()
 }
 
+fn rust_native_tool_names() -> BTreeSet<String> {
+    load_rust_native_tool_fixtures()
+        .into_iter()
+        .map(|fixture| fixture.tool)
+        .collect()
+}
+
 fn extract_tool_names_from_directory(value: &Value) -> Vec<String> {
     let mut names = Vec::new();
     let Some(clusters) = value.get("clusters").and_then(|v| v.as_array()) else {
@@ -553,8 +564,8 @@ fn extract_tool_names_from_directory(value: &Value) -> Vec<String> {
     names
 }
 
-fn args_from_case(case: &Case) -> Option<Value> {
-    args_from_value(&case.input)
+fn args_from_case(case: &Case, tokens: &BTreeMap<String, String>) -> Option<Value> {
+    args_from_value(&resolved_value(&case.input, tokens))
 }
 
 fn args_from_value(input: &Value) -> Option<Value> {
@@ -598,6 +609,16 @@ fn resolved_value(value: &Value, tokens: &BTreeMap<String, String>) -> Value {
     out
 }
 
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(message) => (*message).to_string(),
+            Err(_) => "non-string panic payload".to_string(),
+        },
+    }
+}
+
 fn load_rust_native_golden(path: &str) -> Value {
     let full_path = conformance_fixture_root().join(path);
     let raw = std::fs::read_to_string(&full_path)
@@ -619,9 +640,16 @@ fn execute_tool(
         arguments,
         meta: None,
     };
-    let result = router
-        .handle_tools_call(cx, *req_id, params, budget, SessionState::new(), None, None)
-        .map_err(|e| e.message)?;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.handle_tools_call(cx, *req_id, params, budget, SessionState::new(), None, None)
+    }))
+    .map_err(|payload| {
+        format!(
+            "tool {tool_name} panicked: {}",
+            panic_payload_to_string(payload)
+        )
+    })?
+    .map_err(|e| e.message)?;
     *req_id += 1;
 
     if result.is_error {
@@ -674,6 +702,161 @@ struct FixtureEnv {
     _env_guard: EnvVarGuard,
     fixtures: Fixtures,
     router: fastmcp::Router,
+    tokens: BTreeMap<String, String>,
+}
+
+fn init_fixture_repo(repo_dir: &Path) {
+    std::fs::create_dir_all(repo_dir)
+        .unwrap_or_else(|e| panic!("create fixture repo dir {}: {e}", repo_dir.display()));
+    if repo_dir.join(".git").exists() {
+        return;
+    }
+
+    let status = std::process::Command::new("git")
+        .args(["init", "--quiet", "-b", "main"])
+        .current_dir(repo_dir)
+        .status()
+        .unwrap_or_else(|e| panic!("git init {}: {e}", repo_dir.display()));
+    assert!(
+        status.success(),
+        "git init failed for {} with status {status}",
+        repo_dir.display()
+    );
+}
+
+fn initialize_runtime_mailbox(database_url: &str) {
+    let Some(sqlite_path) =
+        mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(database_url)
+    else {
+        return;
+    };
+    let cfg = mcp_agent_mail_db::DbPoolConfig {
+        database_url: database_url.to_string(),
+        min_connections: 1,
+        max_connections: 1,
+        run_migrations: true,
+        warmup_connections: 0,
+        ..Default::default()
+    };
+    let pool = mcp_agent_mail_db::create_pool(&cfg)
+        .unwrap_or_else(|e| panic!("initialize runtime mailbox {}: {e}", sqlite_path.display()));
+    let cx = Cx::for_testing();
+    let conn = fastmcp_core::block_on(pool.acquire(&cx))
+        .into_result()
+        .unwrap_or_else(|e| panic!("acquire runtime mailbox {}: {e}", sqlite_path.display()));
+    drop(conn);
+    drop(pool);
+}
+
+fn insert_open_contact_test_agent(
+    cx: &Cx,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_id: i64,
+    agent_name: &str,
+    program: &str,
+    model: &str,
+    task_description: &str,
+) {
+    fastmcp_core::block_on(mcp_agent_mail_db::queries::insert_system_agent(
+        cx,
+        pool,
+        project_id,
+        agent_name,
+        program,
+        model,
+        task_description,
+    ))
+    .into_result()
+    .unwrap_or_else(|e| panic!("insert test agent {project_id}:{agent_name}: {e}"));
+}
+
+fn next_test_message_id() -> i64 {
+    static NEXT_ID: AtomicI64 = AtomicI64::new(1_000_000);
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn sql_quote(raw: &str) -> String {
+    raw.replace('\'', "''")
+}
+
+fn insert_test_message(
+    cx: &Cx,
+    pool: &mcp_agent_mail_db::DbPool,
+    project_id: i64,
+    sender_name: &str,
+    recipient_name: &str,
+    subject: &str,
+    body_md: &str,
+    thread_id: Option<&str>,
+) {
+    let sender = fastmcp_core::block_on(mcp_agent_mail_db::queries::get_agent(
+        cx,
+        pool,
+        project_id,
+        sender_name,
+    ))
+    .into_result()
+    .unwrap_or_else(|e| panic!("lookup sender {project_id}:{sender_name}: {e}"));
+    let sender_id = sender
+        .id
+        .unwrap_or_else(|| panic!("sender {project_id}:{sender_name} missing id"));
+
+    let recipient = fastmcp_core::block_on(mcp_agent_mail_db::queries::get_agent(
+        cx,
+        pool,
+        project_id,
+        recipient_name,
+    ))
+    .into_result()
+    .unwrap_or_else(|e| panic!("lookup recipient {project_id}:{recipient_name}: {e}"));
+    let recipient_id = recipient
+        .id
+        .unwrap_or_else(|| panic!("recipient {project_id}:{recipient_name} missing id"));
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|e| panic!("DATABASE_URL must be set for test message seeding: {e}"));
+    let sqlite_path = mcp_agent_mail_core::disk::sqlite_file_path_from_database_url(&database_url)
+        .unwrap_or_else(|| panic!("DATABASE_URL is not a sqlite file url: {database_url}"));
+    let sqlite_path_str = sqlite_path.to_string_lossy().to_string();
+    let conn = mcp_agent_mail_db::open_sqlite_file_with_recovery(&sqlite_path_str)
+        .unwrap_or_else(|e| panic!("open sqlite {}: {e}", sqlite_path.display()));
+
+    let message_id = next_test_message_id();
+    let created_ts = mcp_agent_mail_db::now_micros();
+    let recipients_json = serde_json::json!({
+        "to": [recipient.name.clone()],
+        "cc": [],
+        "bcc": [],
+    })
+    .to_string();
+    let thread_sql = thread_id.map_or_else(
+        || "NULL".to_string(),
+        |value| format!("'{}'", sql_quote(value)),
+    );
+    let message_sql = format!(
+        "INSERT INTO messages \
+         (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, recipients_json, attachments) \
+         VALUES ({message_id}, {project_id}, {sender_id}, {thread_sql}, '{}', '{}', 'normal', 0, {created_ts}, '{}', '[]')",
+        sql_quote(subject),
+        sql_quote(body_md),
+        sql_quote(&recipients_json),
+    );
+    conn.execute_raw(&message_sql).unwrap_or_else(|e| {
+        panic!(
+            "insert test message {project_id}:{sender_name}->{recipient_name}:{subject} into {}: {e}",
+            sqlite_path.display()
+        )
+    });
+
+    let recipient_sql = format!(
+        "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts) \
+         VALUES ({message_id}, {recipient_id}, 'to', NULL, NULL)"
+    );
+    conn.execute_raw(&recipient_sql).unwrap_or_else(|e| {
+        panic!(
+            "insert test recipient row {project_id}:{sender_name}->{recipient_name}:{subject} into {}: {e}",
+            sqlite_path.display()
+        )
+    });
 }
 
 /// Set up env vars, run all tool fixtures, and return the environment for further assertions.
@@ -682,6 +865,9 @@ fn setup_fixture_env() -> FixtureEnv {
     let db_path = tmp.path().join("db.sqlite3");
     let db_url = format!("sqlite://{}", db_path.display());
     let storage_root = tmp.path().join("archive");
+    let fixture_repos_root = tmp.path().join("agent-mail-fixtures");
+    let repo_install_dir = fixture_repos_root.join("repo_install");
+    let repo_uninstall_dir = fixture_repos_root.join("repo_uninstall");
     let storage_root_str = storage_root
         .to_str()
         .expect("storage_root must be valid UTF-8");
@@ -695,11 +881,15 @@ fn setup_fixture_env() -> FixtureEnv {
         // Deterministic LLM paths for llm_mode=true conformance fixtures.
         ("LLM_ENABLED", "1"),
         ("MCP_AGENT_MAIL_LLM_STUB", "1"),
-        ("SEARCH_ROLLOUT_ENGINE", "legacy"),
         ("TOOLS_FILTER_PROFILE", "full"),
         ("TOOLS_FILTER_MODE", "include"),
         ("TOOLS_FILTER_CLUSTERS", ""),
         ("TOOLS_FILTER_TOOLS", ""),
+        (
+            "AM_STARTUP_SEARCH_BACKFILL_DELAY_SECS",
+            TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS,
+        ),
+        ("AM_SEARCH_ENGINE", TEST_SEARCH_ENGINE),
         ("MCP_AGENT_MAIL_OUTPUT_FORMAT", ""),
         ("TOON_DEFAULT_FORMAT", ""),
         ("TOON_BIN", ""),
@@ -708,27 +898,30 @@ fn setup_fixture_env() -> FixtureEnv {
         ("AGENT_NAME_ENFORCEMENT_MODE", "coerce"),
     ]);
 
-    for repo_name in &["repo_install", "repo_uninstall"] {
-        let repo_dir = std::path::Path::new("/tmp/agent-mail-fixtures").join(repo_name);
-        std::fs::create_dir_all(&repo_dir).expect("create fixture repo dir");
-        if !repo_dir.join(".git").exists() {
-            std::process::Command::new("git")
-                .args(["init", "--quiet", "-b", "main"])
-                .current_dir(&repo_dir)
-                .status()
-                .expect("git init");
-        }
-    }
+    init_fixture_repo(&repo_install_dir);
+    init_fixture_repo(&repo_uninstall_dir);
+    initialize_runtime_mailbox(&db_url);
 
     let fixtures = Fixtures::load_default().expect("failed to load fixtures");
     let config = mcp_agent_mail_core::Config::from_env();
     let router = mcp_agent_mail_server::build_server(&config).into_router();
+    let tokens = BTreeMap::from([
+        (
+            LEGACY_FIXTURE_REPO_INSTALL_PATH.to_string(),
+            repo_install_dir.to_string_lossy().to_string(),
+        ),
+        (
+            LEGACY_FIXTURE_REPO_UNINSTALL_PATH.to_string(),
+            repo_uninstall_dir.to_string_lossy().to_string(),
+        ),
+    ]);
 
     FixtureEnv {
         tmp,
         _env_guard: env_guard,
         fixtures,
         router,
+        tokens,
     }
 }
 
@@ -761,6 +954,30 @@ fn load_and_validate_fixture_schema() {
 }
 
 #[test]
+fn resolved_value_rewrites_legacy_fixture_repo_paths() {
+    let value = serde_json::json!({
+        "install": LEGACY_FIXTURE_REPO_INSTALL_PATH,
+        "nested": {
+            "uninstall": LEGACY_FIXTURE_REPO_UNINSTALL_PATH,
+        }
+    });
+    let tokens = BTreeMap::from([
+        (
+            LEGACY_FIXTURE_REPO_INSTALL_PATH.to_string(),
+            "/tmp/test-install".to_string(),
+        ),
+        (
+            LEGACY_FIXTURE_REPO_UNINSTALL_PATH.to_string(),
+            "/tmp/test-uninstall".to_string(),
+        ),
+    ]);
+
+    let resolved = resolved_value(&value, &tokens);
+    assert_eq!(resolved["install"], "/tmp/test-install");
+    assert_eq!(resolved["nested"]["uninstall"], "/tmp/test-uninstall");
+}
+
+#[test]
 fn run_fixtures_against_rust_server_router() {
     let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let env = setup_fixture_env();
@@ -786,19 +1003,28 @@ fn run_fixtures_against_rust_server_router() {
         for case in &tool_fixture.cases {
             let params = CallToolParams {
                 name: tool_name.clone(),
-                arguments: args_from_case(case),
+                arguments: args_from_case(case, &env.tokens),
                 meta: None,
             };
 
-            let result = router.handle_tools_call(
-                &cx,
-                req_id,
-                params,
-                &budget,
-                SessionState::new(),
-                None,
-                None,
-            );
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                router.handle_tools_call(
+                    &cx,
+                    req_id,
+                    params,
+                    &budget,
+                    SessionState::new(),
+                    None,
+                    None,
+                )
+            }))
+            .unwrap_or_else(|payload| {
+                panic!(
+                    "tool {tool_name} case {} panicked: {}",
+                    case.name,
+                    panic_payload_to_string(payload)
+                )
+            });
             req_id += 1;
 
             match (&case.expect.ok, &case.expect.err) {
@@ -1609,8 +1835,7 @@ fn tool_filter_profiles_match_fixtures() {
 
 #[test]
 fn rust_native_fixture_coverage_matches_classification() {
-    let fixtures = load_rust_native_tool_fixtures();
-    let actual: BTreeSet<String> = fixtures.into_iter().map(|fixture| fixture.tool).collect();
+    let actual = rust_native_tool_names();
     let expected: BTreeSet<String> = [
         "cleanup_pane_identities",
         "list_agents",
@@ -1635,6 +1860,8 @@ fn run_rust_native_fixtures_against_rust_server_router() {
     let cx = Cx::for_testing();
     let budget = Budget::INFINITE;
     let mut req_id: u64 = 50_000;
+    let pool = mcp_agent_mail_db::create_pool(&mcp_agent_mail_db::DbPoolConfig::from_env())
+        .expect("create rust-native conformance pool");
 
     for fixture in fixtures {
         for case in fixture.cases {
@@ -1700,7 +1927,71 @@ fn run_rust_native_fixtures_against_rust_server_router() {
             }
 
             for tool_call in &case.setup.tool_calls {
-                let arguments = args_from_value(&resolved_value(&tool_call.input, &tokens));
+                let resolved_input = resolved_value(&tool_call.input, &tokens);
+                if tool_call.name == "register_agent" && fixture.tool != "list_agents" {
+                    let project_key = resolved_input
+                        .get("project_key")
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "rust-native tool {} case {} setup register_agent missing project_key",
+                                fixture.tool, case.name
+                            )
+                        });
+                    let project = fastmcp_core::block_on(
+                        mcp_agent_mail_db::queries::get_project_by_human_key(
+                            &cx,
+                            &pool,
+                            project_key,
+                        ),
+                    )
+                    .into_result()
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "rust-native tool {} case {} setup register_agent project lookup failed for {}: {e}",
+                            fixture.tool, case.name, project_key
+                        )
+                    });
+                    let project_id = project.id.unwrap_or_else(|| {
+                        panic!(
+                            "rust-native tool {} case {} setup register_agent project {} missing id",
+                            fixture.tool, case.name, project_key
+                        )
+                    });
+                    let agent_name = resolved_input
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "rust-native tool {} case {} setup register_agent missing name",
+                                fixture.tool, case.name
+                            )
+                        });
+                    let program = resolved_input
+                        .get("program")
+                        .and_then(Value::as_str)
+                        .unwrap_or("test");
+                    let model = resolved_input
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .unwrap_or("test-model");
+                    let task_description = resolved_input
+                        .get("task_description")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Rust-native fixture register_agent setup");
+                    insert_open_contact_test_agent(
+                        &cx,
+                        &pool,
+                        project_id,
+                        agent_name,
+                        program,
+                        model,
+                        task_description,
+                    );
+                    continue;
+                }
+
+                let arguments = args_from_value(&resolved_input);
                 match execute_tool(
                     router,
                     &cx,
@@ -1904,9 +2195,15 @@ fn product_bus_tools_end_to_end_across_linked_projects() {
         ("STORAGE_ROOT", storage.to_str().unwrap_or_default()),
         ("WORKTREES_ENABLED", "1"),
         ("TOOLS_FILTER_ENABLED", "0"),
+        (
+            "AM_STARTUP_SEARCH_BACKFILL_DELAY_SECS",
+            TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS,
+        ),
+        ("AM_SEARCH_ENGINE", TEST_SEARCH_ENGINE),
         ("LLM_ENABLED", "0"),
         ("AGENT_NAME_ENFORCEMENT_MODE", "coerce"),
     ]);
+    initialize_runtime_mailbox(&db_url);
 
     let config = mcp_agent_mail_core::Config::from_env();
     let router = mcp_agent_mail_server::build_server(&config).into_router();
@@ -1976,58 +2273,57 @@ fn product_bus_tools_end_to_end_across_linked_projects() {
         .and_then(Value::as_i64)
         .expect("ensure_project gamma should include numeric id");
 
-    for (project_key, agent_name) in [
-        (project_a_key.as_str(), "BlueLake"),
-        (project_a_key.as_str(), "GreenCastle"),
-        (project_b_key.as_str(), "BlueLake"),
-        (project_b_key.as_str(), "RedHarbor"),
-        (project_c_key.as_str(), "BlueLake"),
-        (project_c_key.as_str(), "PurpleBear"),
+    let pool = mcp_agent_mail_db::create_pool(&mcp_agent_mail_db::DbPoolConfig::from_env())
+        .expect("create conformance product_bus pool");
+    for (project_id, agent_name) in [
+        (project_a_id, "BlueLake"),
+        (project_a_id, "GreenCastle"),
+        (project_b_id, "BlueLake"),
+        (project_b_id, "RedHarbor"),
+        (project_c_id, "BlueLake"),
+        (project_c_id, "PurpleBear"),
     ] {
-        let _ = call_tool_json(
-            "register_agent",
-            serde_json::json!({
-                "project_key": project_key,
-                "program": "test",
-                "model": "test-model",
-                "name": agent_name
-            }),
+        insert_open_contact_test_agent(
+            &cx,
+            &pool,
+            project_id,
+            agent_name,
+            "test",
+            "test-model",
+            "Product bus conformance fixture",
         );
     }
 
     let shared_thread = "product-bus-thread-e2e";
-    let _ = call_tool_json(
-        "send_message",
-        serde_json::json!({
-            "project_key": project_a_key,
-            "sender_name": "GreenCastle",
-            "to": ["BlueLake"],
-            "subject": "product-bus-e2e alpha",
-            "body_md": "- [ ] ACTION alpha follow-up",
-            "thread_id": shared_thread
-        }),
+    insert_test_message(
+        &cx,
+        &pool,
+        project_a_id,
+        "GreenCastle",
+        "BlueLake",
+        "product-bus-e2e alpha",
+        "- [ ] ACTION alpha follow-up",
+        Some(shared_thread),
     );
-    let _ = call_tool_json(
-        "send_message",
-        serde_json::json!({
-            "project_key": project_b_key,
-            "sender_name": "RedHarbor",
-            "to": ["BlueLake"],
-            "subject": "product-bus-e2e beta",
-            "body_md": "- [ ] ACTION beta follow-up",
-            "thread_id": shared_thread
-        }),
+    insert_test_message(
+        &cx,
+        &pool,
+        project_b_id,
+        "RedHarbor",
+        "BlueLake",
+        "product-bus-e2e beta",
+        "- [ ] ACTION beta follow-up",
+        Some(shared_thread),
     );
-    let _ = call_tool_json(
-        "send_message",
-        serde_json::json!({
-            "project_key": project_c_key,
-            "sender_name": "PurpleBear",
-            "to": ["BlueLake"],
-            "subject": "product-bus-e2e gamma unlinked",
-            "body_md": "- [ ] ACTION gamma follow-up",
-            "thread_id": shared_thread
-        }),
+    insert_test_message(
+        &cx,
+        &pool,
+        project_c_id,
+        "PurpleBear",
+        "BlueLake",
+        "product-bus-e2e gamma unlinked",
+        "- [ ] ACTION gamma follow-up",
+        Some(shared_thread),
     );
 
     let product_key = "a1b2c3d4e5f6a7b8c9d0";
@@ -2192,29 +2488,40 @@ fn collect_files_recursive(base: &std::path::Path, dir: &std::path::Path, out: &
 #[test]
 fn fixture_schema_drift_guard() {
     let fixtures = Fixtures::load_default().expect("failed to load fixtures");
+    let rust_native_tools = rust_native_tool_names();
 
-    // Every tool in TOOL_CLUSTER_MAP must have at least one fixture case.
-    let tool_names: Vec<&str> = mcp_agent_mail_tools::TOOL_CLUSTER_MAP
+    // Every registered tool must be covered by either Python-parity fixtures or
+    // a rust-native fixture file when parity is intentionally deferred.
+    let tool_names: BTreeSet<&str> = mcp_agent_mail_tools::TOOL_CLUSTER_MAP
         .iter()
         .map(|(name, _)| *name)
         .collect();
     for tool_name in &tool_names {
+        let python_fixture = fixtures.tools.get(*tool_name);
+        let rust_native_fixture = rust_native_tools.contains(*tool_name);
         assert!(
-            fixtures.tools.contains_key(*tool_name),
-            "tool {tool_name} is registered in TOOL_CLUSTER_MAP but has no fixture"
+            python_fixture.is_some() || rust_native_fixture,
+            "tool {tool_name} is registered in TOOL_CLUSTER_MAP but has no Python-parity or rust-native fixture"
         );
-        let fixture = &fixtures.tools[*tool_name];
-        assert!(
-            !fixture.cases.is_empty(),
-            "tool {tool_name} fixture has zero cases"
-        );
+        if let Some(fixture) = python_fixture {
+            assert!(
+                !fixture.cases.is_empty(),
+                "tool {tool_name} Python-parity fixture has zero cases"
+            );
+        }
     }
 
     // Every fixture tool must be in TOOL_CLUSTER_MAP (no stale fixtures).
     for tool_name in fixtures.tools.keys() {
         assert!(
-            tool_names.contains(&tool_name.as_str()),
+            tool_names.contains(tool_name.as_str()),
             "fixture tool {tool_name} is not in TOOL_CLUSTER_MAP (stale fixture?)"
+        );
+    }
+    for tool_name in &rust_native_tools {
+        assert!(
+            tool_names.contains(tool_name.as_str()),
+            "rust-native fixture tool {tool_name} is not in TOOL_CLUSTER_MAP (stale fixture?)"
         );
     }
 
@@ -2583,11 +2890,17 @@ fn toon_format_resolution_json_fallback() {
         ("DATABASE_URL", &db_url),
         ("STORAGE_ROOT", storage.to_str().unwrap()),
         ("TOOLS_FILTER_ENABLED", "0"),
+        (
+            "AM_STARTUP_SEARCH_BACKFILL_DELAY_SECS",
+            TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS,
+        ),
+        ("AM_SEARCH_ENGINE", TEST_SEARCH_ENGINE),
         ("TOON_BIN", ""),
         ("TOON_TRU_BIN", ""),
         ("MCP_AGENT_MAIL_OUTPUT_FORMAT", ""),
         ("AGENT_NAME_ENFORCEMENT_MODE", "coerce"),
     ]);
+    initialize_runtime_mailbox(&db_url);
 
     let config = mcp_agent_mail_core::Config::from_env();
     let router = mcp_agent_mail_server::build_server(&config).into_router();
@@ -2630,80 +2943,84 @@ fn llm_mode_parameter_accepted_by_tools() {
         ("DATABASE_URL", &db_url),
         ("STORAGE_ROOT", storage.to_str().unwrap()),
         ("TOOLS_FILTER_ENABLED", "0"),
+        (
+            "AM_STARTUP_SEARCH_BACKFILL_DELAY_SECS",
+            TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS,
+        ),
+        ("AM_SEARCH_ENGINE", TEST_SEARCH_ENGINE),
         ("TOON_BIN", ""),
         ("TOON_TRU_BIN", ""),
         ("MCP_AGENT_MAIL_OUTPUT_FORMAT", ""),
         ("AGENT_NAME_ENFORCEMENT_MODE", "coerce"),
     ]);
+    initialize_runtime_mailbox(&db_url);
 
     let config = mcp_agent_mail_core::Config::from_env();
     let router = mcp_agent_mail_server::build_server(&config).into_router();
     let cx = Cx::for_testing();
     let budget = Budget::INFINITE;
     let mut req_id: u64 = 1;
+    let project_key = tmp
+        .path()
+        .join("llm-mode-test-project")
+        .to_string_lossy()
+        .to_string();
 
-    // Set up project + agents + message for summarize_thread
-    let setup_calls: Vec<(&str, Value)> = vec![
-        (
-            "ensure_project",
-            serde_json::json!({"human_key": "/tmp/llm-mode-test-project"}),
-        ),
-        (
-            "register_agent",
-            serde_json::json!({
-                "project_key": "/tmp/llm-mode-test-project",
-                "program": "test",
-                "model": "test-model",
-                "name": "BlueLake"
-            }),
-        ),
-        (
-            "register_agent",
-            serde_json::json!({
-                "project_key": "/tmp/llm-mode-test-project",
-                "program": "test",
-                "model": "test-model",
-                "name": "GreenCastle"
-            }),
-        ),
-        (
-            "send_message",
-            serde_json::json!({
-                "project_key": "/tmp/llm-mode-test-project",
-                "sender_name": "BlueLake",
-                "to": ["GreenCastle"],
-                "subject": "LLM mode test",
-                "body_md": "Testing llm_mode=false parameter.",
-                "thread_id": "llm-test-thread"
-            }),
-        ),
-    ];
+    // Set up project + agents + message for summarize_thread.
+    let params = CallToolParams {
+        name: "ensure_project".to_string(),
+        arguments: Some(serde_json::json!({ "human_key": project_key.as_str() })),
+        meta: None,
+    };
+    let result = router.handle_tools_call(
+        &cx,
+        req_id,
+        params,
+        &budget,
+        SessionState::new(),
+        None,
+        None,
+    );
+    req_id += 1;
+    let call_result = result.unwrap_or_else(|e| panic!("ensure_project setup failed: {e}"));
+    assert!(!call_result.is_error, "ensure_project setup returned error");
+    let ensure_project_json = decode_json_from_tool_content(&call_result.content)
+        .expect("ensure_project should return JSON");
+    let project_id = ensure_project_json
+        .get("id")
+        .and_then(Value::as_i64)
+        .expect("ensure_project should return numeric id");
 
-    for (tool_name, args) in setup_calls {
-        let params = CallToolParams {
-            name: tool_name.to_string(),
-            arguments: Some(args),
-            meta: None,
-        };
-        let result = router.handle_tools_call(
+    let pool = mcp_agent_mail_db::create_pool(&mcp_agent_mail_db::DbPoolConfig::from_env())
+        .expect("create conformance llm_mode pool");
+    for agent_name in ["BlueLake", "GreenCastle"] {
+        insert_open_contact_test_agent(
             &cx,
-            req_id,
-            params,
-            &budget,
-            SessionState::new(),
-            None,
-            None,
+            &pool,
+            project_id,
+            agent_name,
+            "test",
+            "test-model",
+            "LLM mode conformance fixture",
         );
-        req_id += 1;
-        let call_result = result.unwrap_or_else(|e| panic!("{tool_name} setup failed: {e}"));
-        assert!(!call_result.is_error, "{tool_name} setup returned error");
     }
+
+    insert_test_message(
+        &cx,
+        &pool,
+        project_id,
+        "BlueLake",
+        "GreenCastle",
+        "LLM mode test",
+        "Testing llm_mode=false parameter.",
+        Some("llm-test-thread"),
+    );
 
     // summarize_thread with llm_mode=false should succeed (no LLM call attempted).
     let params = CallToolParams {
         name: "summarize_thread".to_string(),
         arguments: Some(serde_json::json!({
-            "project_key": "/tmp/llm-mode-test-project",
+            "project_key": project_key.as_str(),
             "thread_id": "llm-test-thread",
             "llm_mode": false
         })),
@@ -2736,11 +3053,12 @@ fn llm_mode_parameter_accepted_by_tools() {
     let params = CallToolParams {
         name: "macro_prepare_thread".to_string(),
         arguments: Some(serde_json::json!({
-            "project_key": "/tmp/llm-mode-test-project",
+            "project_key": project_key.as_str(),
             "agent_name": "GreenCastle",
             "thread_id": "llm-test-thread",
             "program": "test",
             "model": "test-model",
+            "register_if_missing": false,
             "llm_mode": false
         })),
         meta: None,

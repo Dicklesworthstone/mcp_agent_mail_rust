@@ -2900,9 +2900,7 @@ impl MessageBrowserScreen {
         self.results = results;
         self.results_generation = self.results_generation.wrapping_add(1);
         self.prune_selection_to_visible();
-        self.total_results = total
-            .saturating_add(live_added)
-            .saturating_sub(hidden);
+        self.total_results = total.saturating_add(live_added).saturating_sub(hidden);
 
         // Clamp cursor
         if self.results.is_empty() {
@@ -6137,12 +6135,8 @@ mod tests {
         assert!(is_system_message_subject(
             "[build-slot] Acquired worktree slot"
         ));
-        assert!(is_system_message_subject(
-            "Contact request from RubyKnoll"
-        ));
-        assert!(is_system_message_subject(
-            "  [system] Heartbeat OK"
-        ));
+        assert!(is_system_message_subject("Contact request from RubyKnoll"));
+        assert!(is_system_message_subject("  [system] Heartbeat OK"));
     }
 
     #[test]

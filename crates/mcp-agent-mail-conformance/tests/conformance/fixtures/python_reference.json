@@ -60,9 +60,7 @@
                   "over_80_for_s": 0,
                   "warning": false
                 }
-              },
-              "semantic_indexing": null,
-              "two_tier_indexing": null
+              }
             }
           },
           "normalize": {
@@ -70,7 +68,8 @@
               "/database_url",
               "/disk",
               "/health_level",
-              "/semantic_indexing",
+              "/recovery",
+              "/semantic_readiness",
               "/pool_utilization/acquire_p50_ms",
               "/pool_utilization/acquire_p95_ms",
               "/pool_utilization/acquire_p99_ms",
@@ -97,8 +96,7 @@
               "/queues/commit_coalescer/latency_p95_ms",
               "/queues/commit_coalescer/latency_p99_ms",
               "/queues/commit_coalescer/over_80_for_s",
-              "/queues/commit_coalescer/warning",
-              "/two_tier_indexing"
+              "/queues/commit_coalescer/warning"
             ]
           }
         }

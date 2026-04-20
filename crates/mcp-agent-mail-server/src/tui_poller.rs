@@ -1554,10 +1554,9 @@ fn fetch_agent_health_inputs(
                 .unwrap_or_default();
             let contact = contact_stats.get(&agent.id).cloned().unwrap_or_default();
             let contact_observed = contact.respected_count + contact.violation_count > 0;
-            let age = (agent.last_active_ts > 0)
-                .then_some(nonnegative_i64_to_u64(
-                    now.saturating_sub(agent.last_active_ts),
-                ));
+            let age = (agent.last_active_ts > 0).then_some(nonnegative_i64_to_u64(
+                now.saturating_sub(agent.last_active_ts),
+            ));
             (
                 agent.id,
                 AgentHealthInputs {

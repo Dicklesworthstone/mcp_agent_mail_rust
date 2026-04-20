@@ -521,12 +521,16 @@ pub fn load_bundle_export_config(bundle_dir: &Path) -> ShareResult<StoredExportC
         message: "manifest.json must contain a JSON object".to_string(),
     })?;
 
-    let export_config = manifest_root.get("export_config").and_then(Value::as_object);
+    let export_config = manifest_root
+        .get("export_config")
+        .and_then(Value::as_object);
     let attachments_section = manifest_root.get("attachments").and_then(Value::as_object);
     let attachments_config = attachments_section
         .and_then(|v| v.get("config"))
         .and_then(|v| v.as_object());
-    let project_scope = manifest_root.get("project_scope").and_then(Value::as_object);
+    let project_scope = manifest_root
+        .get("project_scope")
+        .and_then(Value::as_object);
     let scrub_section = manifest_root.get("scrub").and_then(Value::as_object);
     let database_section = manifest_root.get("database").and_then(Value::as_object);
 
@@ -601,11 +605,10 @@ pub fn load_bundle_export_config(bundle_dir: &Path) -> ShareResult<StoredExportC
     match std::fs::symlink_metadata(&chunk_config_path) {
         Ok(metadata) if metadata.file_type().is_file() => {
             let text = std::fs::read_to_string(&chunk_config_path)?;
-            let config = serde_json::from_str::<Value>(&text).map_err(|error| {
-                ShareError::Validation {
+            let config =
+                serde_json::from_str::<Value>(&text).map_err(|error| ShareError::Validation {
                     message: format!("invalid mailbox.sqlite3.config.json: {error}"),
-                }
-            })?;
+                })?;
             let obj = config.as_object().ok_or_else(|| ShareError::Validation {
                 message: "mailbox.sqlite3.config.json must contain a JSON object".to_string(),
             })?;
@@ -1059,7 +1062,10 @@ mod tests {
         let err =
             load_bundle_export_config(dir.path()).expect_err("array manifest root should fail");
         assert!(matches!(err, ShareError::Validation { .. }));
-        assert!(err.to_string().contains("manifest.json must contain a JSON object"));
+        assert!(
+            err.to_string()
+                .contains("manifest.json must contain a JSON object")
+        );
     }
 
     #[test]

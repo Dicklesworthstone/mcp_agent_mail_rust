@@ -1103,12 +1103,11 @@ fn format_timestamp_compact(timestamp_micros: i64) -> String {
 }
 
 fn snapshot_age_micros(snapshot: &AtcOperatorSnapshot) -> Option<u64> {
-    (snapshot.last_tick_micros > 0)
-        .then(|| {
-            mcp_agent_mail_db::now_micros()
-                .saturating_sub(snapshot.last_tick_micros)
-                .cast_unsigned()
-        })
+    (snapshot.last_tick_micros > 0).then(|| {
+        mcp_agent_mail_db::now_micros()
+            .saturating_sub(snapshot.last_tick_micros)
+            .cast_unsigned()
+    })
 }
 
 fn execution_status_label(execution: &AtcOperatorExecutionSnapshot) -> String {
