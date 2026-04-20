@@ -1681,7 +1681,7 @@ fn guard_run_git_with_retry(mut cmd: Command) -> std::io::Result<std::process::O
         //   span = base / 2           (half the base)
         //   low  = base - span / 2    (~ 0.75 * base)
         //   jitter ∈ [low, low + span)
-        // For base=100 → [75, 125), base=400 → [275, 475), base=1600 → [1100, 1900).
+        // For base=100 → [75, 125), base=400 → [300, 500), base=1600 → [1200, 2000).
         let span = base / 2;
         let low = base - span / 2;
         let nanos = std::time::SystemTime::now()
