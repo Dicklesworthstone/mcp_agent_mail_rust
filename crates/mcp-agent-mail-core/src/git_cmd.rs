@@ -539,6 +539,11 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> GitRunOutcome {
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(e) => {
+                // try_wait failure (rare: EINTR, ECHILD, etc.). Best-effort
+                // reap — otherwise the child becomes a zombie for the rest
+                // of the server's lifetime.
+                let _ = child.kill();
+                let _ = child.wait();
                 let _ = stdout_handle.map(|h| h.join());
                 let _ = stderr_handle.map(|h| h.join());
                 return GitRunOutcome::Error(e);

@@ -400,6 +400,7 @@ fn spawn_with_timeout(path: &Path, timeout: Duration) -> Result<String, GitBinar
             }
             Err(e) => {
                 let _ = child.kill();
+                let _ = child.wait();
                 return Err(GitBinaryError::SpawnFailed {
                     path: path.to_path_buf(),
                     source: e,

@@ -209,10 +209,9 @@ fn scan_one_project(
         }
     };
 
-    // Scanned-refs count isn't cheap via libgit2 walk — derive it
-    // approximately from findings.len() + a heuristic so it's non-None.
-    // A proper scan count can be added via a follow-up bead.
-    let scanned_refs = findings.len();
+    // Count total refs via libgit2 so the report shows the true
+    // denominator (findings / scanned) rather than just findings.
+    let scanned_refs = count_refs(project_path).unwrap_or_else(|| findings.len());
     let summary = DetectionSummary::from_findings(scanned_refs, &findings);
 
     let mut actions = Vec::<ActionRecord>::new();
@@ -237,9 +236,10 @@ fn scan_one_project(
                     project: project_display.clone(),
                     ref_name: Some(finding.ref_name.clone()),
                     target_sha: Some(finding.target_sha.clone()),
-                    reason: Some(format!(
+                    reason: Some(
                         "protected ref (main/master/HEAD); operator must intervene manually"
-                    )),
+                            .to_string(),
+                    ),
                     category: Some(finding.category),
                 });
             }
@@ -393,6 +393,15 @@ fn scan_one_project(
         backup_path,
         error: None,
     }
+}
+
+/// Count ALL refs in the repo via libgit2. `None` if the repo can't be
+/// opened or the reference iterator fails — caller falls back to
+/// findings.len() for a non-panic display.
+fn count_refs(project_path: &Path) -> Option<usize> {
+    let repo = git2::Repository::open(project_path).ok()?;
+    let refs = repo.references().ok()?;
+    Some(refs.flatten().count())
 }
 
 fn prune_ref(project_path: &Path, ref_name: &str) -> Result<(), String> {
