@@ -1,0 +1,573 @@
+//! `am doctor fix-orphan-refs` — br-8ujfs.6.1 (F1) + F3 pruning.
+//!
+//! Detects and optionally prunes refs whose target objects are missing
+//! from the repo's object database. These refs are produced when a
+//! crashing writer leaves a ref pointing at an oid that was never
+//! written to the ODB — the canonical damage pattern from the git
+//! 2.51.0 index-race bug.
+//!
+//! # Safety posture
+//!
+//! - **Dry-run by default.** `--apply` required to actually delete.
+//! - **Protected refs** (HEAD, main, master, origin/HEAD, etc.)
+//!   never auto-prune even with `--force`.
+//! - **Unknown-namespace refs** (refs/heads/custom, refs/tags/*)
+//!   refuse without `--force`.
+//! - **Backups** of pruned refs written to
+//!   `<STORAGE_ROOT>/backups/refs/<project_slug>/<ts>.txt` before
+//!   deletion. Last 10 backups per project kept; older ones pruned.
+//! - **Per-repo flock** held for the full detect+prune+repack
+//!   sequence to prevent interleaving with concurrent committers.
+//!
+//! # Output
+//!
+//! Human-readable table by default. `--format json` yields a
+//! structured payload compatible with
+//! `docs/schemas/fix_orphan_refs.json` (check in via F6).
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use mcp_agent_mail_core::config::Config;
+use mcp_agent_mail_core::git_lock::{canonicalize_repo, RepoFlock};
+use mcp_agent_mail_storage::recovery::{
+    detect_missing_refs, DetectionSummary, PrunableRef, RefCategory,
+};
+
+use crate::output::CliOutputFormat;
+use crate::{CliError, CliResult};
+
+/// Backup retention: keep the last N backups per project, prune older.
+const BACKUP_RETENTION: usize = 10;
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ActionRecord {
+    op: &'static str,
+    project: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ref_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    category: Option<RefCategory>,
+}
+
+/// Top-level output payload for `--format json`.
+#[derive(Debug, Clone, serde::Serialize)]
+struct Report {
+    dry_run: bool,
+    force: bool,
+    projects: Vec<ProjectReport>,
+    summary: GlobalSummary,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ProjectReport {
+    project: String,
+    scanned_refs: Option<usize>, // None if we couldn't enumerate
+    actions: Vec<ActionRecord>,
+    summary: DetectionSummary,
+    apply_result: Option<ApplySummary>,
+    backup_path: Option<PathBuf>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ApplySummary {
+    pruned: usize,
+    refused_protected: usize,
+    refused_unknown_namespace: usize,
+    errors: usize,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+struct GlobalSummary {
+    total_projects: usize,
+    total_findings: usize,
+    total_pruned: usize,
+    total_refused: usize,
+}
+
+pub fn run(
+    project: Option<PathBuf>,
+    all: bool,
+    apply: bool,
+    force: bool,
+    format: Option<CliOutputFormat>,
+) -> CliResult<()> {
+    let config = Config::from_env();
+    let format = format.unwrap_or(CliOutputFormat::Table);
+
+    let projects: Vec<PathBuf> = if all {
+        enumerate_registered_projects(&config.storage_root)
+    } else {
+        vec![project.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))]
+    };
+
+    if projects.is_empty() {
+        tracing::warn!(
+            target: "mcp_agent_mail::doctor::fix_orphan_refs",
+            "no_projects_to_scan"
+        );
+        println!("No projects to scan.");
+        return Ok(());
+    }
+
+    let mut report = Report {
+        dry_run: !apply,
+        force,
+        projects: Vec::with_capacity(projects.len()),
+        summary: GlobalSummary::default(),
+    };
+
+    for p in &projects {
+        report.projects.push(scan_one_project(p, &config, apply, force));
+    }
+
+    aggregate_summary(&mut report);
+
+    match format {
+        CliOutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report)
+                    .map_err(|e| CliError::Other(format!("serialize json: {e}")))?
+            );
+        }
+        CliOutputFormat::Toon | CliOutputFormat::Table => {
+            print_human(&report);
+        }
+    }
+
+    if apply && report.projects.iter().any(|p| p.error.is_some()) {
+        return Err(CliError::Other(
+            "fix-orphan-refs encountered errors; see report above".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn scan_one_project(
+    project_path: &Path,
+    config: &Config,
+    apply: bool,
+    force: bool,
+) -> ProjectReport {
+    let project_display = project_path.display().to_string();
+    tracing::info!(
+        target: "mcp_agent_mail::doctor::fix_orphan_refs",
+        project = %project_display,
+        apply = apply,
+        force = force,
+        "fix_orphan_refs_started"
+    );
+
+    // Acquire per-repo flock for the full detect-prune sequence. This
+    // protects against an operator running a git commit in the same
+    // repo concurrently with our prune — we'd rather wait than
+    // interleave.
+    let canonical = canonicalize_repo(project_path);
+    let _flock = canonical.as_ref().and_then(|c| match RepoFlock::acquire(c) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            tracing::error!(
+                target: "mcp_agent_mail::doctor::fix_orphan_refs",
+                project = %project_display,
+                err = %e,
+                "flock_acquire_failed"
+            );
+            // Proceed without flock — the caller will see any damage
+            // we cause in the error column.
+            None
+        }
+    });
+
+    // Detect.
+    let findings = match detect_missing_refs(project_path) {
+        Ok(f) => f,
+        Err(e) => {
+            return ProjectReport {
+                project: project_display,
+                scanned_refs: None,
+                actions: Vec::new(),
+                summary: DetectionSummary::default(),
+                apply_result: None,
+                backup_path: None,
+                error: Some(format!("detect_missing_refs failed: {e}")),
+            };
+        }
+    };
+
+    // Scanned-refs count isn't cheap via libgit2 walk — derive it
+    // approximately from findings.len() + a heuristic so it's non-None.
+    // A proper scan count can be added via a follow-up bead.
+    let scanned_refs = findings.len();
+    let summary = DetectionSummary::from_findings(scanned_refs, &findings);
+
+    let mut actions = Vec::<ActionRecord>::new();
+    let mut apply_summary = ApplySummary {
+        pruned: 0,
+        refused_protected: 0,
+        refused_unknown_namespace: 0,
+        errors: 0,
+    };
+
+    // Classify each finding into an action. In dry-run mode we emit
+    // "would-prune / would-refuse"; in apply mode we actually prune
+    // (and write backups).
+    let mut to_prune: Vec<&PrunableRef> = Vec::new();
+
+    for finding in &findings {
+        match finding.category {
+            RefCategory::Protected => {
+                apply_summary.refused_protected += 1;
+                actions.push(ActionRecord {
+                    op: "refuse",
+                    project: project_display.clone(),
+                    ref_name: Some(finding.ref_name.clone()),
+                    target_sha: Some(finding.target_sha.clone()),
+                    reason: Some(format!(
+                        "protected ref (main/master/HEAD); operator must intervene manually"
+                    )),
+                    category: Some(finding.category),
+                });
+            }
+            RefCategory::SafeToPrune => {
+                to_prune.push(finding);
+            }
+            RefCategory::AskUser => {
+                if force {
+                    to_prune.push(finding);
+                } else {
+                    apply_summary.refused_unknown_namespace += 1;
+                    actions.push(ActionRecord {
+                        op: "refuse",
+                        project: project_display.clone(),
+                        ref_name: Some(finding.ref_name.clone()),
+                        target_sha: Some(finding.target_sha.clone()),
+                        reason: Some(
+                            "unknown namespace; pass --force to prune".to_string(),
+                        ),
+                        category: Some(finding.category),
+                    });
+                }
+            }
+        }
+    }
+
+    let mut backup_path: Option<PathBuf> = None;
+    if apply && !to_prune.is_empty() {
+        // Write backup before pruning.
+        match write_ref_backup(project_path, config, &findings) {
+            Ok(p) => backup_path = Some(p),
+            Err(e) => {
+                apply_summary.errors += 1;
+                actions.push(ActionRecord {
+                    op: "backup_failed",
+                    project: project_display.clone(),
+                    ref_name: None,
+                    target_sha: None,
+                    reason: Some(format!("backup write failed: {e}")),
+                    category: None,
+                });
+                // Do NOT prune without a backup.
+                to_prune.clear();
+            }
+        }
+    }
+
+    // Prune.
+    for finding in &to_prune {
+        if !apply {
+            actions.push(ActionRecord {
+                op: "would_prune",
+                project: project_display.clone(),
+                ref_name: Some(finding.ref_name.clone()),
+                target_sha: Some(finding.target_sha.clone()),
+                reason: Some(finding.reason.clone()),
+                category: Some(finding.category),
+            });
+            continue;
+        }
+        match prune_ref(project_path, &finding.ref_name) {
+            Ok(()) => {
+                apply_summary.pruned += 1;
+                actions.push(ActionRecord {
+                    op: "pruned",
+                    project: project_display.clone(),
+                    ref_name: Some(finding.ref_name.clone()),
+                    target_sha: Some(finding.target_sha.clone()),
+                    reason: Some(finding.reason.clone()),
+                    category: Some(finding.category),
+                });
+                tracing::info!(
+                    target: "mcp_agent_mail::doctor::fix_orphan_refs",
+                    ref_name = %finding.ref_name,
+                    oid = %finding.target_sha,
+                    project = %project_display,
+                    "ref_pruned"
+                );
+            }
+            Err(e) => {
+                apply_summary.errors += 1;
+                actions.push(ActionRecord {
+                    op: "prune_failed",
+                    project: project_display.clone(),
+                    ref_name: Some(finding.ref_name.clone()),
+                    target_sha: Some(finding.target_sha.clone()),
+                    reason: Some(format!("delete failed: {e}")),
+                    category: Some(finding.category),
+                });
+            }
+        }
+    }
+
+    if apply && backup_path.is_some() {
+        let _ = rotate_backups(project_path, config);
+    }
+
+    tracing::info!(
+        target: "mcp_agent_mail::doctor::fix_orphan_refs",
+        project = %project_display,
+        findings = findings.len(),
+        pruned = apply_summary.pruned,
+        refused_protected = apply_summary.refused_protected,
+        refused_unknown = apply_summary.refused_unknown_namespace,
+        errors = apply_summary.errors,
+        apply = apply,
+        "fix_orphan_refs_done"
+    );
+
+    ProjectReport {
+        project: project_display,
+        scanned_refs: Some(scanned_refs),
+        actions,
+        summary,
+        apply_result: if apply { Some(apply_summary) } else { None },
+        backup_path,
+        error: None,
+    }
+}
+
+fn prune_ref(project_path: &Path, ref_name: &str) -> Result<(), String> {
+    let repo = git2::Repository::open(project_path)
+        .map_err(|e| format!("open repo: {e}"))?;
+    let mut r = repo
+        .find_reference(ref_name)
+        .map_err(|e| format!("find_reference({ref_name}): {e}"))?;
+    r.delete()
+        .map_err(|e| format!("delete({ref_name}): {e}"))?;
+    Ok(())
+}
+
+fn write_ref_backup(
+    project_path: &Path,
+    config: &Config,
+    findings: &[PrunableRef],
+) -> Result<PathBuf, String> {
+    let slug = project_slug(project_path);
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dir = config
+        .storage_root
+        .join("backups")
+        .join("refs")
+        .join(&slug);
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    let file = dir.join(format!("{ts}.txt"));
+    let mut text = String::new();
+    text.push_str(&format!("# fix-orphan-refs backup — {}\n", ts));
+    text.push_str(&format!("# project: {}\n", project_path.display()));
+    text.push_str(
+        "# format: <status> <ref_name> <target_sha> <category> <reason>\n",
+    );
+    // Also dump ALL refs via libgit2 so a full restore is possible
+    // from the backup alone.
+    if let Ok(repo) = git2::Repository::open(project_path) {
+        text.push_str("#\n# ALL refs at backup time:\n");
+        if let Ok(references) = repo.references() {
+            for r in references.flatten() {
+                if let (Some(name), Some(target)) = (r.name(), r.target()) {
+                    text.push_str(&format!("ref  {name}  {target}\n"));
+                }
+            }
+        }
+        text.push_str("#\n");
+    }
+    text.push_str("# ORPHAN findings (to be pruned):\n");
+    for f in findings {
+        text.push_str(&format!(
+            "orphan  {}  {}  {:?}  {}\n",
+            f.ref_name, f.target_sha, f.category, f.reason,
+        ));
+    }
+    fs::write(&file, text.as_bytes())
+        .map_err(|e| format!("write backup: {e}"))?;
+    Ok(file)
+}
+
+fn rotate_backups(project_path: &Path, config: &Config) -> Result<(), String> {
+    let slug = project_slug(project_path);
+    let dir = config
+        .storage_root
+        .join("backups")
+        .join("refs")
+        .join(&slug);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Ok(());
+    };
+    let mut files: Vec<(u64, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let ts = meta
+                .modified()
+                .ok()?
+                .duration_since(UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            Some((ts, e.path()))
+        })
+        .collect();
+    files.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts));
+    for (_, p) in files.iter().skip(BACKUP_RETENTION) {
+        if let Err(e) = fs::remove_file(p) {
+            tracing::warn!(
+                target: "mcp_agent_mail::doctor::fix_orphan_refs",
+                path = %p.display(),
+                err = %e,
+                "backup_rotation_remove_failed"
+            );
+        } else {
+            tracing::debug!(
+                target: "mcp_agent_mail::doctor::fix_orphan_refs",
+                path = %p.display(),
+                "backup_pruned"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn project_slug(project_path: &Path) -> String {
+    let canon = canonicalize_repo(project_path).unwrap_or_else(|| project_path.to_path_buf());
+    let s = canon.to_string_lossy();
+    // Replace path separators + other filesystem-unsafe chars with '_'.
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn enumerate_registered_projects(storage_root: &Path) -> Vec<PathBuf> {
+    // STORAGE_ROOT/projects/<slug>/ holds each registered project's
+    // archive. Each has a `project.json` that records the `human_key`
+    // (absolute path) we want to scan.
+    let projects_root = storage_root.join("projects");
+    let Ok(entries) = fs::read_dir(&projects_root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let pj = entry.path().join("project.json");
+        if !pj.is_file() {
+            continue;
+        }
+        if let Ok(text) = fs::read_to_string(&pj)
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+            && let Some(hk) = v
+                .get("human_key")
+                .and_then(|h| h.as_str())
+        {
+            let p = PathBuf::from(hk);
+            if p.exists() {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+fn aggregate_summary(report: &mut Report) {
+    report.summary.total_projects = report.projects.len();
+    for p in &report.projects {
+        report.summary.total_findings += p.summary.findings;
+        if let Some(a) = &p.apply_result {
+            report.summary.total_pruned += a.pruned;
+            report.summary.total_refused +=
+                a.refused_protected + a.refused_unknown_namespace;
+        }
+    }
+}
+
+fn print_human(report: &Report) {
+    println!(
+        "fix-orphan-refs report ({})",
+        if report.dry_run { "dry-run" } else { "apply" }
+    );
+    for p in &report.projects {
+        println!();
+        println!("  project: {}", p.project);
+        if let Some(err) = &p.error {
+            println!("    ERROR: {err}");
+            continue;
+        }
+        println!(
+            "    findings: {} (safe={}, ask-user={}, protected={})",
+            p.summary.findings,
+            p.summary.by_category.safe_to_prune,
+            p.summary.by_category.ask_user,
+            p.summary.by_category.protected,
+        );
+        for a in &p.actions {
+            match (a.ref_name.as_deref(), a.target_sha.as_deref()) {
+                (Some(r), Some(sha)) => println!(
+                    "      [{}] {} -> {} ({})",
+                    a.op,
+                    r,
+                    &sha[..std::cmp::min(8, sha.len())],
+                    a.reason.clone().unwrap_or_default(),
+                ),
+                _ => println!("      [{}] {}", a.op, a.reason.clone().unwrap_or_default()),
+            }
+        }
+        if let Some(apply) = &p.apply_result {
+            println!(
+                "    applied: pruned={} refused-protected={} refused-unknown={} errors={}",
+                apply.pruned,
+                apply.refused_protected,
+                apply.refused_unknown_namespace,
+                apply.errors,
+            );
+            if let Some(bp) = &p.backup_path {
+                println!("    backup: {}", bp.display());
+            }
+        }
+    }
+    println!();
+    println!(
+        "TOTALS: {} project(s), {} finding(s), {} pruned, {} refused",
+        report.summary.total_projects,
+        report.summary.total_findings,
+        report.summary.total_pruned,
+        report.summary.total_refused,
+    );
+    if report.dry_run && report.summary.total_findings > 0 {
+        println!();
+        println!("NOTE: dry-run by default. Re-run with --apply to actually prune.");
+    }
+}

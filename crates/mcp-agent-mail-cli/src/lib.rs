@@ -16,6 +16,7 @@
 pub mod bench;
 pub mod ci;
 pub mod context;
+pub mod doctor_orphan_refs;
 pub mod e2e_artifacts;
 pub mod e2e_runner;
 pub mod golden;
@@ -1675,6 +1676,38 @@ pub enum DoctorCommand {
         /// Output JSON (shorthand for machine-readable output).
         #[arg(long)]
         json: bool,
+    },
+
+    /// Detect and optionally prune refs whose target objects are missing
+    /// from the repo's object database. These refs are produced when a
+    /// crashing writer (e.g., git 2.51.0 segfault mid-stash) leaves
+    /// a ref pointing at an oid that was never written to the ODB.
+    ///
+    /// Safe-by-default (dry-run is the default; --apply required to
+    /// actually prune). Protected refs (HEAD, main, master) are never
+    /// auto-pruned even with --force. Backups of pruned refs are
+    /// written to `<STORAGE_ROOT>/backups/refs/<project_slug>/`.
+    #[command(name = "fix-orphan-refs")]
+    FixOrphanRefs {
+        /// Project path to operate on. Defaults to current working
+        /// directory. Mutually exclusive with --all.
+        #[arg(long, short = 'p', conflicts_with = "all")]
+        project: Option<PathBuf>,
+        /// Iterate over every registered project under STORAGE_ROOT.
+        #[arg(long)]
+        all: bool,
+        /// Actually delete the refs we'd otherwise only report on.
+        /// Without this flag, the command runs as a dry-run.
+        #[arg(long)]
+        apply: bool,
+        /// Bypass the "refuse unknown namespace" safety gate. Has
+        /// NO effect on Protected refs (HEAD, main, master); those
+        /// always refuse.
+        #[arg(long)]
+        force: bool,
+        /// Output format: human (default) or json.
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
     },
 }
 
@@ -4597,6 +4630,13 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             apply_mode,
         } => handle_doctor_archive_normalize(dry_run, yes, json, apply_mode),
         DoctorCommand::Fix { dry_run, yes, json } => handle_doctor_fix(dry_run, yes, json),
+        DoctorCommand::FixOrphanRefs {
+            project,
+            all,
+            apply,
+            force,
+            format,
+        } => handle_doctor_fix_orphan_refs(project, all, apply, force, format),
     }
 }
 
@@ -19639,6 +19679,19 @@ fn fix_mcp_config_toml_text(
         fixed.push('\n');
     }
     Some(fixed)
+}
+
+/// Entry point for `am doctor fix-orphan-refs` — br-8ujfs.6.1 (F1).
+///
+/// See [`crate::doctor_orphan_refs`] for implementation.
+fn handle_doctor_fix_orphan_refs(
+    project: Option<PathBuf>,
+    all: bool,
+    apply: bool,
+    force: bool,
+    format: Option<output::CliOutputFormat>,
+) -> CliResult<()> {
+    crate::doctor_orphan_refs::run(project, all, apply, force, format)
 }
 
 fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {

@@ -17,7 +17,9 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Component, Path, PathBuf};
-use std::process::Stdio;
+// `Stdio` is referenced fully-qualified in the two remaining sites
+// (lines ~1290); removed the bare `use` after bead C5 deleted the
+// read-tree shell-out.
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -7401,25 +7403,20 @@ fn reset_index_to_head(repo: &Repository, index: &mut git2::Index) -> Result<()>
 }
 
 /// Best-effort cleanup of staged/index state after a failed commit attempt.
+///
+/// Previously had a `git -C <workdir> read-tree HEAD` shell-out as a
+/// "try CLI git first, fall back to libgit2" path. Removed under bead
+/// br-8ujfs.3.5 (C5): the CLI git branch was redundant with the
+/// libgit2 recovery below (`reset_index_to_head` + `index.write`) and
+/// added a race surface against the 2.51.0 `.git/index` bug. The
+/// libgit2 path handles every case we care about — regular repos,
+/// unborn HEAD (via `try_clear_for_empty_head`), detached HEAD,
+/// submodules. See `docs/GIT_SHELLOUT_AUDIT.md` #2.
 fn try_restore_index_to_head(repo: &Repository) -> Result<()> {
     if let Some(workdir) = repo.workdir() {
-        // Heal stale lock artifacts before trying external git index sync.
+        // Heal stale lock artifacts so the libgit2 write has a clean
+        // `.git/index` to acquire.
         let _ = try_clean_stale_git_lock(workdir, 300.0);
-        match std::process::Command::new("git")
-            .arg("-C")
-            .arg(workdir)
-            .arg("read-tree")
-            .arg("HEAD")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        {
-            Ok(status) if status.success() => return Ok(()),
-            _ => {
-                // Fall through to libgit2-based recovery path.
-            }
-        }
     }
 
     // Re-open to avoid stale ref views from long-lived handles.
