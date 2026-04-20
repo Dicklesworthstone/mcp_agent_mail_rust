@@ -314,29 +314,55 @@ def _run_git_with_retry(args, **kwargs):
 
     `args` is the full argv list (typically ["git", ...]).
     Honors `AM_GIT_BINARY` if set, replacing argv[0]=="git".
-    kwargs are forwarded to subprocess.run unchanged.
+    kwargs are forwarded to subprocess.run, but note that `check=True`
+    is handled by this wrapper — we capture check_requested, force
+    check=False internally so the retry loop can inspect returncode
+    on segfault-shaped exits, and re-raise CalledProcessError ourselves
+    ONLY on the final non-retryable failure. Without this, callers
+    that pass check=True would see the first segfault as an exception
+    and bypass the retry entirely.
     """
     env_bin = os.environ.get("AM_GIT_BINARY")
     if env_bin and args and args[0] == "git":
         args = [env_bin] + list(args[1:])
 
+    check_requested = kwargs.pop("check", False)
+
     delays = (0.1, 0.4, 1.6)
     max_retries = 3
     last_result = None
     for attempt in range(max_retries + 1):
-        last_result = subprocess.run(args, **kwargs)
+        last_result = subprocess.run(args, check=False, **kwargs)
         rc = last_result.returncode
         # segfault-like exits:
         #   -11 / -7 on POSIX (signal), 139 / 135 via shell wrapping,
         #   0xC0000005 on Windows.
         is_segfault = rc in (-11, -7, 139, 135, 0xC0000005)
         if not is_segfault:
+            # Non-segfault outcome (success OR other error).
+            # If caller requested check=True and we saw a nonzero
+            # non-segfault exit, emulate subprocess.run's behavior
+            # by raising CalledProcessError.
+            if check_requested and rc != 0:
+                raise subprocess.CalledProcessError(
+                    rc,
+                    args,
+                    output=getattr(last_result, "stdout", None),
+                    stderr=getattr(last_result, "stderr", None),
+                )
             return last_result
         if attempt == max_retries:
             sys.stderr.write(
                 "guard: git exited with signal %d %d times (known-bad 2.51.0). "
                 "Set AM_GIT_BINARY or upgrade git.\n" % (rc, attempt + 1)
             )
+            if check_requested:
+                raise subprocess.CalledProcessError(
+                    rc,
+                    args,
+                    output=getattr(last_result, "stdout", None),
+                    stderr=getattr(last_result, "stderr", None),
+                )
             return last_result
         jitter = _random.uniform(0.75, 1.25)
         sleep_s = delays[attempt] * jitter
