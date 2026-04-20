@@ -1676,11 +1676,20 @@ fn guard_run_git_with_retry(mut cmd: Command) -> std::io::Result<std::process::O
             "guard_git_segfault_retry"
         );
         let base = BACKOFFS_MS[attempt];
+        // Jitter formula MUST match mcp_agent_mail_core::git_cmd::jitter_ms
+        // so the guard's retry cadence is identical to the server's.
+        //   span = base / 2           (half the base)
+        //   low  = base - span / 2    (~ 0.75 * base)
+        //   jitter ∈ [low, low + span)
+        // For base=100 → [75, 125), base=400 → [275, 475), base=1600 → [1100, 1900).
+        let span = base / 2;
+        let low = base - span / 2;
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos() as u64)
             .unwrap_or(0);
-        let jitter = base / 2 + (nanos % base.max(1));
+        let offset = nanos % span.max(1);
+        let jitter = low + offset;
         std::thread::sleep(std::time::Duration::from_millis(jitter));
     }
     Ok(last_output.expect("last_output set before break"))
