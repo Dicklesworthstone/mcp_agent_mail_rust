@@ -3825,6 +3825,16 @@ async fn initialize_sqlite_file_once(
 #[must_use]
 pub fn is_corruption_error_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
+    // NOTE: "wal file too small" intentionally NOT listed here.
+    //
+    // A truncated/header-only WAL (e.g. "WAL file too small for header during
+    // rebuild: read 0, need 32") is a *recoverable* sidecar state — the main
+    // DB image still passes PRAGMA integrity_check — not data corruption.
+    // Treating it as corruption flipped the mailbox verdict to Broken on every
+    // startup after a disk-full incident, even after archive reconstruct, and
+    // silently disabled the MCP read surface (see GH#99). The string stays
+    // classified as a recovery-error via is_sqlite_recovery_error_message so
+    // the WAL sidecar gets cleaned up, without escalating to Broken.
     lower.contains("database disk image is malformed")
         || lower.contains("malformed database schema")
         || lower.contains("database schema is corrupt")
@@ -3837,7 +3847,6 @@ pub fn is_corruption_error_message(message: &str) -> bool {
         || lower.contains("page checksum mismatch")
         || lower.contains("header checksum mismatch")
         || lower.contains("no healthy backup was found")
-        || lower.contains("wal file too small")
 }
 
 #[allow(clippy::result_large_err)]
@@ -3923,7 +3932,11 @@ fn sqlite_canonical_incremental_check_is_ok(
 /// on the next write.  We also remove SHM files whose companion WAL was
 /// removed, since the SHM is meaningless without a WAL.
 fn cleanup_empty_wal_sidecar(sqlite_path: &str) {
-    /// Minimum size for a valid SQLite WAL file (32-byte header).
+    /// Size of a SQLite WAL file that contains only the 32-byte header and no
+    /// committed frames. Anything `<=` this is safe to delete: SQLite will
+    /// recreate the WAL on the next write, and no durable frame data exists
+    /// that could be lost. Frames are 24-byte header + page_size bytes, so
+    /// the smallest valid frame is well above 32 bytes (min page size = 512).
     const WAL_HEADER_BYTES: u64 = 32;
 
     let db_path = Path::new(sqlite_path);
@@ -3939,11 +3952,16 @@ fn cleanup_empty_wal_sidecar(sqlite_path: &str) {
         wal_os.push("-wal");
         let wal_path = PathBuf::from(wal_os);
         match std::fs::metadata(&wal_path) {
-            Ok(meta) if meta.len() < WAL_HEADER_BYTES => {
+            // Remove WAL files that are header-only or smaller (<= 32 bytes).
+            // GH#99: a 32-byte header-only WAL (normal post-init state) was
+            // tripping "WAL file too small for header during rebuild" on
+            // checkpoint, which the verdict engine used to escalate to
+            // Broken/corrupt. Cleaning it up here prevents that cycle.
+            Ok(meta) if meta.len() <= WAL_HEADER_BYTES => {
                 tracing::warn!(
                     path = %wal_path.display(),
                     size = meta.len(),
-                    "removing truncated WAL sidecar (<{WAL_HEADER_BYTES} bytes; prevents 'WAL file too small for header' errors)"
+                    "removing header-only/truncated WAL sidecar (<={WAL_HEADER_BYTES} bytes; prevents 'WAL file too small for header' errors)"
                 );
                 let _ = std::fs::remove_file(&wal_path);
                 wal_removed = true;
@@ -10430,7 +10448,16 @@ mod tests {
         assert!(is_sqlite_recovery_error_message(
             "WAL file too small for header during rebuild: read 0, need 32"
         ));
-        assert!(is_corruption_error_message(
+    }
+
+    #[test]
+    fn corruption_error_does_not_flag_wal_too_small() {
+        // GH#99: a header-only WAL tripping "WAL file too small" on checkpoint
+        // is a recoverable sidecar state, not data corruption. Treating it as
+        // corruption flips the mailbox verdict to Broken and silently disables
+        // the MCP read surface, even though PRAGMA integrity_check still says
+        // ok. The string must classify as recovery-error but NOT corruption.
+        assert!(!is_corruption_error_message(
             "WAL file too small for header during rebuild: read 0, need 32"
         ));
     }
@@ -10465,16 +10492,41 @@ mod tests {
             .expect("create table");
         drop(conn);
 
-        // Create a WAL sidecar with enough bytes to look like a valid header
-        // (>= 32 bytes).  The cleanup function only removes WAL files shorter
-        // than the 32-byte SQLite WAL header.
+        // Create a WAL sidecar with header + at least one frame's worth of
+        // bytes (> 32 bytes). Cleanup must preserve anything with actual
+        // frame data, since those frames may be durable writes not yet
+        // checkpointed into the main DB.
         let wal_path = dir.path().join("preserve_test.db-wal");
         std::fs::write(&wal_path, [0xAA; 64]).expect("create wal");
         assert!(wal_path.exists());
 
         cleanup_empty_wal_sidecar(db_path.to_str().unwrap());
 
-        assert!(wal_path.exists(), "WAL >= 32 bytes should be preserved");
+        assert!(wal_path.exists(), "WAL > 32 bytes should be preserved");
+    }
+
+    #[test]
+    fn cleanup_empty_wal_sidecar_removes_header_only_wal() {
+        // GH#99: a 32-byte header-only WAL (normal post-init state) was
+        // causing "WAL file too small for header during rebuild" on
+        // checkpoint. Cleaning it up here short-circuits that cycle.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("header_only_test.db");
+        let conn = DbConn::open_file(db_path.to_str().unwrap()).expect("open");
+        conn.execute_raw("CREATE TABLE t (x INTEGER)")
+            .expect("create table");
+        drop(conn);
+
+        let wal_path = dir.path().join("header_only_test.db-wal");
+        std::fs::write(&wal_path, [0x00; 32]).expect("create header-only wal");
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 32);
+
+        cleanup_empty_wal_sidecar(db_path.to_str().unwrap());
+
+        assert!(
+            !wal_path.exists(),
+            "header-only (32-byte) WAL should be removed"
+        );
     }
 
     #[test]

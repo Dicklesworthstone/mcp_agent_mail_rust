@@ -12092,7 +12092,14 @@ fn download_file_sync(url: &str) -> Result<Vec<u8>, String> {
     let url_owned = url.to_string();
     let result = rt.block_on(async move {
         let cx = asupersync::Cx::for_testing();
-        let client = asupersync::http::h1::HttpClient::new();
+        // Release tarballs ship both `am` and `mcp-agent-mail` binaries and
+        // are already ~33 MB, so the asupersync default 16 MB body limit
+        // rejects the download outright (GH#99 side note). 256 MB leaves
+        // generous headroom for future binary growth without being unbounded.
+        const MAX_RELEASE_ARCHIVE_BYTES: usize = 256 * 1024 * 1024;
+        let client = asupersync::http::h1::HttpClient::builder()
+            .max_body_size(MAX_RELEASE_ARCHIVE_BYTES)
+            .build();
         let headers = vec![
             ("User-Agent".to_string(), "mcp-agent-mail-cli".to_string()),
             ("Accept".to_string(), "application/octet-stream".to_string()),
@@ -17643,23 +17650,23 @@ fn mcp_config_url_matches_any_expected(actual_url: &str, expected_urls: &[String
 /// Probe a specific git binary and return a doctor-check JSON entry.
 /// `source` is a short tag ("env" for AM_GIT_BINARY, "path" for system
 /// default) included in the emitted finding.
+///
+/// Uses a 5-second wall-clock timeout so `am doctor check` can't hang
+/// forever on a malicious or deadlocked git binary — the bug we're
+/// actively trying to detect should not itself become a DoS vector.
 fn git_binary_doctor_entry(path_or_name: &str, source: &str) -> serde_json::Value {
-    use std::process::Command;
-    let out = match Command::new(path_or_name).arg("--version").output() {
-        Ok(o) if o.status.success() => o,
-        Ok(o) => {
-            return serde_json::json!({
-                "check": format!("git_binary_{source}"),
-                "status": "warn",
-                "detail": format!(
-                    "git --version failed (exit {}): {}",
-                    o.status.code().unwrap_or(-1),
-                    String::from_utf8_lossy(&o.stderr).trim(),
-                ),
-                "source": source,
-                "path": path_or_name,
-            });
-        }
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let mut child = match Command::new(path_or_name)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
         Err(e) => {
             return serde_json::json!({
                 "check": format!("git_binary_{source}"),
@@ -17670,6 +17677,77 @@ fn git_binary_doctor_entry(path_or_name: &str, source: &str) -> serde_json::Valu
             });
         }
     };
+
+    // Concurrent drain so the pipe can never back-pressure the child.
+    let stdout_h = child.stdout.take().map(|mut o| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = o.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_h = child.stderr.take().map(|mut e| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = e.read_to_end(&mut buf);
+            buf
+        })
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_h.map(|h| h.join());
+                    let _ = stderr_h.map(|h| h.join());
+                    return serde_json::json!({
+                        "check": format!("git_binary_{source}"),
+                        "status": "fail",
+                        "detail": format!("git --version timed out after 5s: {path_or_name}"),
+                        "source": source,
+                        "path": path_or_name,
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => {
+                let _ = stdout_h.map(|h| h.join());
+                let _ = stderr_h.map(|h| h.join());
+                return serde_json::json!({
+                    "check": format!("git_binary_{source}"),
+                    "status": "warn",
+                    "detail": format!("git --version wait failed: {e}"),
+                    "source": source,
+                    "path": path_or_name,
+                });
+            }
+        }
+    };
+    let stdout_bytes = stdout_h.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stderr_bytes = stderr_h.and_then(|h| h.join().ok()).unwrap_or_default();
+
+    let out = std::process::Output {
+        status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    };
+    if !out.status.success() {
+        return serde_json::json!({
+            "check": format!("git_binary_{source}"),
+            "status": "warn",
+            "detail": format!(
+                "git --version failed (exit {}): {}",
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stderr).trim(),
+            ),
+            "source": source,
+            "path": path_or_name,
+        });
+    }
     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let version = mcp_agent_mail_core::GitVersion::parse_lax(
         stdout.strip_prefix("git version ").unwrap_or(&stdout),
