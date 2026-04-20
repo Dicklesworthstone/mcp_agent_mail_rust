@@ -3773,12 +3773,265 @@ fn reservation_git_pathspec(workspace_rel: &Path, normalized_pattern: &str) -> S
     out
 }
 
+/// libgit2-backed pathspec walker for C3 (br-8ujfs.3.3). Returns
+/// `(path, modified_micros)` tuples for every tracked + untracked file
+/// matching `pathspec` that is NOT gitignored. Matches the semantics
+/// of `git ls-files -c -o --exclude-standard -- :(glob)<spec>`.
+fn reservation_pathspec_ls_files_libgit2(
+    repo_root: &Path,
+    pathspec: &str,
+) -> Vec<(std::path::PathBuf, Option<i64>)> {
+    let mut out: Vec<(std::path::PathBuf, Option<i64>)> = Vec::new();
+
+    let repo = match git2::Repository::open(repo_root) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(
+                target: "mcp_agent_mail::tools::reservations::pathspec",
+                repo = %repo_root.display(),
+                err = %e,
+                "pathspec_walk_open_failed"
+            );
+            return out;
+        }
+    };
+
+    // First: tracked files that match. Use the index directly.
+    if let Ok(index) = repo.index() {
+        if let Ok(ps) = git2::Pathspec::new(std::iter::once(pathspec)) {
+            for entry in index.iter() {
+                let Ok(rel_str) = std::str::from_utf8(&entry.path) else { continue };
+                if ps.matches_path(
+                    std::path::Path::new(rel_str),
+                    git2::PathspecFlags::NO_MATCH_ERROR,
+                ) {
+                    let candidate = repo_root.join(rel_str);
+                    let modified_us = std::fs::metadata(&candidate)
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(reservation_system_time_to_micros);
+                    out.push((candidate, modified_us));
+                }
+            }
+        }
+    }
+
+    // Second: untracked (but not gitignored) files via statuses.
+    let mut status_opts = git2::StatusOptions::new();
+    status_opts
+        .include_untracked(true)
+        .include_ignored(false)
+        .recurse_untracked_dirs(true)
+        .include_unmodified(false);
+    status_opts.pathspec(pathspec);
+
+    if let Ok(statuses) = repo.statuses(Some(&mut status_opts)) {
+        for se in statuses.iter() {
+            let Some(path_str) = se.path() else { continue };
+            let candidate = repo_root.join(path_str);
+            let modified_us = std::fs::metadata(&candidate)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(reservation_system_time_to_micros);
+            out.push((candidate, modified_us));
+            if out.len() >= 5000 {
+                break;
+            }
+        }
+    }
+
+    out
+}
+
+/// CLI fallback for the pathspec walk, gated by AM_GIT_LS_FILES_SHELL=1.
+fn reservation_pathspec_ls_files_cli_fallback(
+    repo_root: &Path,
+    git_glob: &str,
+) -> Vec<(std::path::PathBuf, Option<i64>)> {
+    let mut out: Vec<(std::path::PathBuf, Option<i64>)> = Vec::new();
+    let Ok(cmd_out) = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "ls-files",
+            "-c",
+            "-o",
+            "--exclude-standard",
+            "--",
+            git_glob,
+        ])
+        .output()
+    else {
+        return out;
+    };
+    if !cmd_out.status.success() {
+        return out;
+    }
+    for rel in String::from_utf8_lossy(&cmd_out.stdout).lines().take(5000) {
+        let candidate = repo_root.join(rel);
+        let modified_us = std::fs::metadata(&candidate)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(reservation_system_time_to_micros);
+        out.push((candidate, modified_us));
+    }
+    out
+}
+
+/// Find the most recent commit timestamp (in microseconds) touching any
+/// of the given pathspecs.
+///
+/// Originally shelled out to `git -C <repo> log -1 --format=%ct -- <spec...>`;
+/// migrated to libgit2 under bead br-8ujfs.3.2 (C2) to avoid the
+/// git 2.51.0 `.git/index` race. The libgit2 path walks commits via
+/// `Revwalk` in `Sort::TIME` order and returns the first commit whose
+/// diff-against-parent touches any of the pathspecs.
+///
+/// # Semantics (must match the old CLI path)
+///
+/// - Returns microseconds-since-epoch of the commit's author time.
+///   (CLI `%ct` returns committer seconds; libgit2 uses `commit.time()`
+///   which is also committer time. Same field. Verified in parity tests.)
+/// - Returns `None` if:
+///   - pathspecs is empty
+///   - repo cannot be opened (not a git repo, corrupted, etc.)
+///   - HEAD is unborn
+///   - no commit touches any of the pathspecs
+///
+/// # Feature-flag escape hatch
+///
+/// Setting `AM_GIT_RESERVATION_ACTIVITY_SHELL=1` re-enables the legacy
+/// CLI shell-out for one release cycle. Emits a WARN log on each call
+/// so ops know they're on the legacy path.
 fn reservation_git_latest_activity_micros(repo_root: &Path, pathspecs: &[String]) -> Option<i64> {
     if pathspecs.is_empty() {
         return None;
     }
 
-    // Chunk to avoid exceeding OS arg limits when globs expand to many matches.
+    // Feature-flag escape hatch: re-enable CLI fallback if explicitly opted in.
+    if std::env::var("AM_GIT_RESERVATION_ACTIVITY_SHELL").ok().as_deref() == Some("1") {
+        tracing::warn!(
+            target: "mcp_agent_mail::tools::reservations::activity",
+            "reservation_activity_cli_fallback_enabled"
+        );
+        return reservation_git_latest_activity_micros_cli_fallback(repo_root, pathspecs);
+    }
+
+    let start = std::time::Instant::now();
+    let result = reservation_git_latest_activity_micros_libgit2(repo_root, pathspecs);
+    tracing::debug!(
+        target: "mcp_agent_mail::tools::reservations::activity",
+        repo = %repo_root.display(),
+        patterns = pathspecs.len(),
+        duration_ms = start.elapsed().as_millis() as u64,
+        found = result.is_some(),
+        via = "libgit2",
+        "reservation_activity_result"
+    );
+    result
+}
+
+/// libgit2-backed implementation.
+fn reservation_git_latest_activity_micros_libgit2(
+    repo_root: &Path,
+    pathspecs: &[String],
+) -> Option<i64> {
+    let repo = match git2::Repository::open(repo_root) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(
+                target: "mcp_agent_mail::tools::reservations::activity",
+                repo = %repo_root.display(),
+                err = %e,
+                "reservation_activity_open_failed"
+            );
+            return None;
+        }
+    };
+
+    // Strip the CLI-git `:(glob)` pathspec prefix — libgit2's
+    // `git2::Pathspec` uses wildmatch by default, which already matches
+    // the `:(glob)` semantic. Leaving the prefix in would make libgit2
+    // interpret it as a literal filename, returning no matches.
+    let normalized: Vec<String> = pathspecs
+        .iter()
+        .map(|s| {
+            s.strip_prefix(":(glob)")
+                .or_else(|| s.strip_prefix(":(icase)"))
+                .unwrap_or(s)
+                .to_string()
+        })
+        .collect();
+
+    let pathspec = match git2::Pathspec::new(normalized.iter()) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(
+                target: "mcp_agent_mail::tools::reservations::activity",
+                err = %e,
+                "reservation_activity_pathspec_invalid"
+            );
+            return None;
+        }
+    };
+
+    let mut revwalk = match repo.revwalk() {
+        Ok(w) => w,
+        Err(_) => return None,
+    };
+    if revwalk.push_head().is_err() {
+        // Unborn HEAD — nothing to walk.
+        return None;
+    }
+    if revwalk.set_sorting(git2::Sort::TIME).is_err() {
+        return None;
+    }
+
+    for oid_result in revwalk {
+        let Ok(oid) = oid_result else { continue };
+        let Ok(commit) = repo.find_commit(oid) else { continue };
+
+        // For the FIRST commit (no parents) match against the tree
+        // directly. For merge/regular commits, diff against parent 0
+        // (`git log` default) and check if the pathspec matches any
+        // delta.
+        let touched = if commit.parent_count() == 0 {
+            let Ok(tree) = commit.tree() else { continue };
+            pathspec
+                .match_tree(&tree, git2::PathspecFlags::NO_MATCH_ERROR)
+                .is_ok()
+        } else {
+            let Ok(parent) = commit.parent(0) else { continue };
+            let Ok(parent_tree) = parent.tree() else { continue };
+            let Ok(commit_tree) = commit.tree() else { continue };
+            let mut diff_opts = git2::DiffOptions::new();
+            for spec in &normalized {
+                diff_opts.pathspec(spec);
+            }
+            let Ok(diff) = repo.diff_tree_to_tree(
+                Some(&parent_tree),
+                Some(&commit_tree),
+                Some(&mut diff_opts),
+            ) else {
+                continue;
+            };
+            diff.deltas().len() > 0
+        };
+
+        if touched {
+            return Some(commit.time().seconds().saturating_mul(1_000_000));
+        }
+    }
+
+    None
+}
+
+/// Legacy CLI path, kept for the one-release feature-flag escape hatch
+/// (AM_GIT_RESERVATION_ACTIVITY_SHELL=1). Removed in a follow-up bead.
+fn reservation_git_latest_activity_micros_cli_fallback(
+    repo_root: &Path,
+    pathspecs: &[String],
+) -> Option<i64> {
     let mut best: Option<i64> = None;
     for chunk in pathspecs.chunks(128) {
         let Ok(out) = Command::new("git")
@@ -3900,33 +4153,37 @@ pub(crate) fn reservation_compute_pattern_activity(
             workspace_rel.unwrap_or_else(|| std::path::Path::new("")),
             &normalized,
         );
-        let git_glob = format!(":(glob){spec}");
 
-        if let Some(repo_root) = repo_root
-            && let Ok(out) = Command::new("git")
-                .arg("-C")
-                .arg(repo_root)
-                .args([
-                    "ls-files",
-                    "-c",
-                    "-o",
-                    "--exclude-standard",
-                    "--",
-                    &git_glob,
-                ])
-                .output()
-            && out.status.success()
-        {
-            for rel in String::from_utf8_lossy(&out.stdout).lines().take(5000) {
-                let candidate = repo_root.join(rel);
-                let Ok(meta) = std::fs::metadata(&candidate) else {
-                    continue;
-                };
+        // Pathspec expansion — br-8ujfs.3.3 (C3).
+        //
+        // Previously shelled out `git -C <repo> ls-files -c -o
+        // --exclude-standard -- :(glob)<spec>` to enumerate both
+        // tracked and untracked files matching the pattern. Migrated
+        // to libgit2 via `Repository::statuses(include_untracked +
+        // !include_ignored)` + pathspec filter. Escape hatch:
+        // `AM_GIT_LS_FILES_SHELL=1` re-enables the CLI path for one
+        // release cycle.
+        if let Some(repo_root) = repo_root {
+            let matched = if std::env::var("AM_GIT_LS_FILES_SHELL").ok().as_deref()
+                == Some("1")
+            {
+                tracing::warn!(
+                    target: "mcp_agent_mail::tools::reservations::pathspec",
+                    "pathspec_walk_cli_fallback_enabled"
+                );
+                reservation_pathspec_ls_files_cli_fallback(
+                    repo_root,
+                    &format!(":(glob){spec}"),
+                )
+            } else {
+                reservation_pathspec_ls_files_libgit2(repo_root, &spec)
+            };
+
+            for (candidate, micros_opt) in matched {
+                let _ = candidate;
                 matched_paths = true;
-                if let Ok(modified) = meta.modified()
-                    && let Some(micros) = reservation_system_time_to_micros(modified)
-                {
-                    fs_latest = Some(fs_latest.map_or(micros, |prev| prev.max(micros)));
+                if let Some(m) = micros_opt {
+                    fs_latest = Some(fs_latest.map_or(m, |prev| prev.max(m)));
                 }
             }
         }

@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+// `use std::process::Command;` removed under br-8ujfs.3.4 (C4); all
+// git invocations now go through `crate::git_cmd::GitCmd`.
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -164,17 +165,32 @@ fn resolve_path(human_key: &str) -> PathBuf {
     })
 }
 
+/// Invoke git with the given args in `repo`, returning trimmed stdout.
+///
+/// br-8ujfs.3.4 (C4): this originally shelled out via
+/// `Command::new("git").arg("-C")...`. It now routes through
+/// [`crate::git_cmd::GitCmd`] which picks up:
+///   - AM_GIT_BINARY resolution (bead A5),
+///   - per-repo in-process mutex (bead B2),
+///   - per-repo OS flock on `.git/am.git-serialize.lock` (bead B3),
+///   - SIGSEGV detection + 3-retry loop (beads E1/E2),
+///   - 120s wall-clock timeout and structured tracing.
+///
+/// Semantics are preserved: we still spawn `git <args...>` with the
+/// current directory set to `repo`, read stdout, and return it trimmed
+/// (or `None` on nonzero exit / empty output).
+///
+/// Full libgit2 migration (replacing each `--show-toplevel` /
+/// `--git-common-dir` / `config --get` callsite with the corresponding
+/// `git2::Repository::*` method) is deferred to a follow-up bead. The
+/// wrap here already eliminates the self-race surface that was the
+/// primary C4 motivation.
 fn git_cmd(repo: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    let out = crate::git_cmd::GitCmd::new(repo).args(args).run().ok()?;
+    if !out.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if text.is_empty() { None } else { Some(text) }
 }
 

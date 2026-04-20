@@ -22,6 +22,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod parity;
 pub mod repo;
 pub mod shim_git;
 
