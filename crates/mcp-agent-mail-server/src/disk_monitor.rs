@@ -150,6 +150,18 @@ fn monitor_loop(config: &Config) {
                 rss_bytes = mem_sample.rss_bytes,
                 "memory pressure level changed"
             );
+
+            // Reclaim when dropping from higher pressure down to Ok.
+            if mem_pressure == mcp_agent_mail_core::memory::MemoryPressure::Ok {
+                #[cfg(target_os = "linux")]
+                {
+                    tracing::info!("memory pressure returned to Ok; triggering malloc_trim");
+                    // SAFETY: malloc_trim(0) is thread-safe and safe to call.
+                    unsafe {
+                        nix::libc::malloc_trim(0);
+                    }
+                }
+            }
         }
         last_memory_pressure = mem_pressure;
     }
