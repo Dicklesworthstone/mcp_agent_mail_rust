@@ -23,7 +23,7 @@ pub struct HostingHint {
 #[must_use]
 pub fn detect_hosting_hints(output_dir: &Path) -> Vec<HostingHint> {
     let mut hints: Vec<HostingHint> = Vec::new();
-    let git_remote = git_remote_url(output_dir);
+    let git_remote = crate::git::git_remote_url(output_dir);
 
     detect_github_pages(output_dir, git_remote.as_deref(), &mut hints);
     detect_cloudflare_pages(output_dir, git_remote.as_deref(), &mut hints);
@@ -39,7 +39,7 @@ fn detect_github_pages(output_dir: &Path, git_remote: Option<&str>, hints: &mut 
     let mut signals = Vec::new();
 
     // Check for GitHub Actions workflows
-    let workflows_dir = find_ancestor_path(output_dir, ".github/workflows");
+    let workflows_dir = crate::git::find_ancestor_path(output_dir, ".github/workflows");
     if let Some(dir) = workflows_dir
         && crate::is_real_dir(&dir)
         && let Ok(entries) = std::fs::read_dir(&dir)
@@ -105,7 +105,7 @@ fn detect_cloudflare_pages(
 ) {
     let mut signals = Vec::new();
 
-    if find_ancestor_path(output_dir, "wrangler.toml").is_some() {
+    if crate::git::find_ancestor_path(output_dir, "wrangler.toml").is_some() {
         signals.push("wrangler.toml found".to_string());
     }
 
@@ -136,7 +136,7 @@ fn detect_cloudflare_pages(
 fn detect_netlify(output_dir: &Path, git_remote: Option<&str>, hints: &mut Vec<HostingHint>) {
     let mut signals = Vec::new();
 
-    if find_ancestor_path(output_dir, "netlify.toml").is_some() {
+    if crate::git::find_ancestor_path(output_dir, "netlify.toml").is_some() {
         signals.push("netlify.toml found".to_string());
     }
 
@@ -168,7 +168,7 @@ fn detect_s3(output_dir: &Path, hints: &mut Vec<HostingHint>) {
     let mut signals = Vec::new();
 
     // Check for deploy scripts referencing S3
-    let scripts_dir = find_ancestor_path(output_dir, "scripts");
+    let scripts_dir = crate::git::find_ancestor_path(output_dir, "scripts");
     if let Some(dir) = scripts_dir
         && crate::is_real_dir(&dir)
         && let Ok(entries) = std::fs::read_dir(&dir)
@@ -208,47 +208,6 @@ fn detect_s3(output_dir: &Path, hints: &mut Vec<HostingHint>) {
             signals,
         });
     }
-}
-
-/// Walk ancestor directories looking for a specific file/dir.
-fn find_ancestor_path(start: &Path, name: &str) -> Option<std::path::PathBuf> {
-    let search_root = if crate::is_real_file(start) {
-        start.parent()?
-    } else if crate::is_real_dir(start) {
-        start
-    } else {
-        return None;
-    };
-
-    for current in search_root.ancestors() {
-        let candidate = current.join(name);
-        if std::fs::symlink_metadata(&candidate)
-            .is_ok_and(|metadata| metadata.file_type().is_file() || metadata.file_type().is_dir())
-        {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-/// Try to extract the git remote URL for the directory.
-///
-/// br-8ujfs.4.1 (D1): routes through GitCmd for per-repo locking.
-/// There's a duplicate helper in share::detection with the same name
-/// and body; TODO consolidate into a shared share::git helper module
-/// as a follow-up cleanup bead.
-fn git_remote_url(dir: &Path) -> Option<String> {
-    let output = mcp_agent_mail_core::git_cmd::GitCmd::new(dir)
-        .args(["remote", "get-url", "origin"])
-        .run()
-        .ok()?;
-    if output.status.success() {
-        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !url.is_empty() {
-            return Some(url);
-        }
-    }
-    None
 }
 
 /// Check if path is inside a `docs/` directory.
@@ -455,7 +414,7 @@ mod tests {
     fn find_ancestor_path_finds_in_current() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("marker.txt"), "").unwrap();
-        let result = find_ancestor_path(dir.path(), "marker.txt");
+        let result = crate::git::find_ancestor_path(dir.path(), "marker.txt");
         assert!(result.is_some());
     }
 
@@ -465,14 +424,14 @@ mod tests {
         std::fs::write(dir.path().join("marker.txt"), "").unwrap();
         let child = dir.path().join("child");
         std::fs::create_dir_all(&child).unwrap();
-        let result = find_ancestor_path(&child, "marker.txt");
+        let result = crate::git::find_ancestor_path(&child, "marker.txt");
         assert!(result.is_some());
     }
 
     #[test]
     fn find_ancestor_path_returns_none_for_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let result = find_ancestor_path(dir.path(), "nonexistent.xyz");
+        let result = crate::git::find_ancestor_path(dir.path(), "nonexistent.xyz");
         assert!(result.is_none());
     }
 
@@ -486,7 +445,7 @@ mod tests {
         }
         std::fs::create_dir_all(&nested).unwrap();
 
-        let result = find_ancestor_path(&nested, "marker.txt");
+        let result = crate::git::find_ancestor_path(&nested, "marker.txt");
         assert_eq!(result, Some(dir.path().join("marker.txt")));
     }
 
