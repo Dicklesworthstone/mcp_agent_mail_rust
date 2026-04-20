@@ -3891,7 +3891,7 @@ fn parse_date_to_micros(s: &str) -> Option<i64> {
 
 /// Parse "YYYY-MM-DD" to end-of-day microseconds (23:59:59.999999).
 fn parse_date_to_micros_end(s: &str) -> Option<i64> {
-    parse_date_to_micros(s).map(|ts| ts + 86_400_000_000 - 1)
+    parse_date_to_micros(s).map(|ts| ts.saturating_add(86_400_000_000 - 1))
 }
 
 fn truncate_body(body: &str, max: usize) -> String {

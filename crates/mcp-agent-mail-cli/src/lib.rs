@@ -17702,8 +17702,9 @@ fn git_binary_doctor_entry(path_or_name: &str, source: &str) -> serde_json::Valu
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let _ = stdout_h.map(|h| h.join());
-                    let _ = stderr_h.map(|h| h.join());
+                    // We intentionally drop the reader thread handles without joining them.
+                    // If `kill()` failed and the child is still running (e.g. a grandchild
+                    // inherited the pipe), `join()` would hang forever.
                     return serde_json::json!({
                         "check": format!("git_binary_{source}"),
                         "status": "fail",
@@ -17720,8 +17721,9 @@ fn git_binary_doctor_entry(path_or_name: &str, source: &str) -> serde_json::Valu
                 // the git_cmd::wait_with_timeout fix (bfc2d913).
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = stdout_h.map(|h| h.join());
-                let _ = stderr_h.map(|h| h.join());
+                // We intentionally drop the reader thread handles without joining them.
+                // If `kill()` failed and the child is still running (e.g. a grandchild
+                // inherited the pipe), `join()` would hang forever.
                 return serde_json::json!({
                     "check": format!("git_binary_{source}"),
                     "status": "warn",

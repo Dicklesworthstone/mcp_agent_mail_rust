@@ -1650,6 +1650,9 @@ fn fetch_agent_ack_stats(
 }
 
 fn median_micros(values: &mut [u64]) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
     values.sort_unstable();
     let mid = values.len() / 2;
     if values.len() % 2 == 1 {
