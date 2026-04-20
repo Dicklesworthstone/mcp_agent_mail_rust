@@ -11,6 +11,8 @@
 //! - Agent profile writes
 //! - Notification signals
 
+pub mod recovery;
+
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write as IoWrite;
@@ -3787,6 +3789,14 @@ fn repo_cache_insert(root: &Path) {
     map.insert(root.to_path_buf(), true);
 }
 
+#[cfg(test)]
+fn repo_cache_clear_for_test() {
+    let mut guard = REPO_CACHE.lock();
+    if let Some(map) = guard.as_mut() {
+        map.clear();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Directory existence cache — avoids repeated stat() syscalls from
 // create_dir_all() on directories that already exist.
@@ -4016,9 +4026,57 @@ pub fn write_project_metadata_with_config(
     Ok(())
 }
 
+/// Configure `git gc` / `maintenance` / `repack` defaults on the archive repo
+/// so long-running servers don't accumulate an unbounded loose-object pile.
+///
+/// Idempotent. Only sets keys that aren't already configured, so an operator
+/// who has tuned their archive by hand is never overridden.
+///
+/// Why this matters: every mail event does a `git add + commit`, and git's
+/// stock `gc.auto=6700` means a busy mailbox can sit on hundreds of thousands
+/// of loose objects for days before auto-gc kicks in. Lowering `gc.auto` to
+/// 256 makes auto-repack fire during normal commit paths. `gc.pruneExpire=now`
+/// lets unreferenced objects be reaped immediately (safe for a forward-only
+/// archive that never rewrites history).
+fn configure_archive_git_defaults(repo: &Repository) {
+    let Ok(mut full_cfg) = repo.config() else {
+        tracing::debug!("archive gc config skipped: repo.config() unavailable");
+        return;
+    };
+    // Read local-only view so a user's global ~/.gitconfig doesn't hide our
+    // archive-local tuning. Write-back still happens through `full_cfg`,
+    // which persists into the repo's local config file.
+    let local_cfg = full_cfg.open_level(git2::ConfigLevel::Local).ok();
+
+    let key_is_unset_locally = |key: &str| -> bool {
+        local_cfg
+            .as_ref()
+            .is_none_or(|c| c.get_entry(key).is_err())
+    };
+
+    if key_is_unset_locally("gc.auto") {
+        let _ = full_cfg.set_i64("gc.auto", 256);
+    }
+    if key_is_unset_locally("gc.autoPackLimit") {
+        let _ = full_cfg.set_i64("gc.autoPackLimit", 4);
+    }
+    if key_is_unset_locally("gc.pruneExpire") {
+        let _ = full_cfg.set_str("gc.pruneExpire", "now");
+    }
+    if key_is_unset_locally("maintenance.auto") {
+        let _ = full_cfg.set_bool("maintenance.auto", true);
+    }
+    if key_is_unset_locally("repack.writeBitmaps") {
+        let _ = full_cfg.set_bool("repack.writeBitmaps", true);
+    }
+}
+
 /// Initialize a git repository at `root` if one does not already exist.
 ///
-/// Configures gpgsign=false and writes `.gitattributes`.
+/// Configures gpgsign=false, archive-specific gc defaults, and writes
+/// `.gitattributes`. For pre-existing archives, applies the gc defaults once
+/// per process so older installs don't keep accumulating loose objects.
+///
 /// Returns `true` if a new repo was created, `false` if it already existed.
 fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
     if repo_cache_contains(root) {
@@ -4027,6 +4085,12 @@ fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
 
     let git_dir = root.join(".git");
     if git_dir.exists() {
+        // Pre-existing archive: apply gc defaults once. `configure_archive_git_defaults`
+        // is idempotent and respects operator-set values, so this is safe to run
+        // every time a cold process first opens the archive.
+        if let Ok(existing) = Repository::open(root) {
+            configure_archive_git_defaults(&existing);
+        }
         repo_cache_insert(root);
         return Ok(false);
     }
@@ -4039,6 +4103,9 @@ fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
         let mut repo_config = repo.config()?;
         let _ = repo_config.set_bool("commit.gpgsign", false);
     }
+
+    // Apply archive-specific gc/maintenance tuning.
+    configure_archive_git_defaults(&repo);
 
     // Write .gitattributes
     let attrs_path = root.join(".gitattributes");
@@ -15861,5 +15928,119 @@ Test body.
         assert_eq!(report.sampled, 0);
         assert_eq!(report.found, 0);
         assert_eq!(report.missing, 0);
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Archive gc defaults (A1-A5: loose-object accumulation mitigation)
+    // ────────────────────────────────────────────────────────────────
+
+    fn read_git_config_str(repo: &Repository, key: &str) -> Option<String> {
+        let cfg = repo.config().ok()?;
+        cfg.get_string(key).ok()
+    }
+
+    #[test]
+    fn configure_archive_git_defaults_sets_gc_auto_on_fresh_repo() {
+        let dir = TempDir::new().unwrap();
+        let repo = Repository::init(dir.path()).expect("init test repo");
+
+        configure_archive_git_defaults(&repo);
+
+        assert_eq!(
+            read_git_config_str(&repo, "gc.auto").as_deref(),
+            Some("256")
+        );
+        assert_eq!(
+            read_git_config_str(&repo, "gc.autoPackLimit").as_deref(),
+            Some("4")
+        );
+        assert_eq!(
+            read_git_config_str(&repo, "gc.pruneExpire").as_deref(),
+            Some("now")
+        );
+        assert_eq!(
+            read_git_config_str(&repo, "maintenance.auto").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            read_git_config_str(&repo, "repack.writeBitmaps").as_deref(),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn configure_archive_git_defaults_preserves_existing_operator_values() {
+        let dir = TempDir::new().unwrap();
+        let repo = Repository::init(dir.path()).expect("init test repo");
+
+        // Operator has tuned gc.auto to a non-default value. Our helper must
+        // respect this and never overwrite it.
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_i64("gc.auto", 1000).unwrap();
+            cfg.set_bool("maintenance.auto", false).unwrap();
+        }
+
+        configure_archive_git_defaults(&repo);
+
+        assert_eq!(
+            read_git_config_str(&repo, "gc.auto").as_deref(),
+            Some("1000"),
+            "operator-set gc.auto must not be overwritten"
+        );
+        assert_eq!(
+            read_git_config_str(&repo, "maintenance.auto").as_deref(),
+            Some("false"),
+            "operator-set maintenance.auto must not be overwritten"
+        );
+        // Keys the operator did not touch still get our defaults.
+        assert_eq!(
+            read_git_config_str(&repo, "gc.autoPackLimit").as_deref(),
+            Some("4")
+        );
+    }
+
+    #[test]
+    fn ensure_repo_applies_gc_defaults_on_fresh_init() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+        let config = test_config(&root);
+
+        let created = ensure_repo(&root, &config).expect("ensure_repo");
+        assert!(created, "expected fresh init to create a new repo");
+
+        let repo = Repository::open(&root).expect("open newly-created repo");
+        assert_eq!(
+            read_git_config_str(&repo, "gc.auto").as_deref(),
+            Some("256"),
+            "fresh archive init must apply gc.auto=256"
+        );
+    }
+
+    #[test]
+    fn ensure_repo_migrates_gc_defaults_on_preexisting_archive() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_path_buf();
+
+        // Create a .git manually WITHOUT our gc defaults. A fresh
+        // `Repository::init` never sets gc.auto locally, so when ensure_repo
+        // later walks the "already exists" branch, `configure_archive_git_defaults`
+        // will see the key as unset locally and apply our tuning.
+        Repository::init(&root).expect("manual pre-existing init");
+
+        // Force the per-process cache to miss so ensure_repo runs its
+        // "already exists" branch (otherwise it returns Ok(false) early).
+        repo_cache_clear_for_test();
+
+        let config = test_config(&root);
+        let created = ensure_repo(&root, &config).expect("ensure_repo");
+        assert!(!created, "expected ensure_repo to see pre-existing .git");
+
+        let repo = Repository::open(&root).expect("open migrated repo");
+        assert_eq!(
+            read_git_config_str(&repo, "gc.auto").as_deref(),
+            Some("256"),
+            "pre-existing archive must have gc.auto=256 migrated in"
+        );
     }
 }

@@ -12,6 +12,7 @@ members = [
   "crates/mcp-agent-mail-share",
   "crates/mcp-agent-mail-conformance",
   "crates/mcp-agent-mail-search-core",
+  "crates/mcp-agent-mail-test-helpers",
 ]
 exclude = ["experimental/*"]
 
@@ -64,6 +65,7 @@ mcp-agent-mail-guard = { path = "crates/mcp-agent-mail-guard" }
 mcp-agent-mail-share = { path = "crates/mcp-agent-mail-share", default-features = false }
 mcp-agent-mail-conformance = { path = "crates/mcp-agent-mail-conformance" }
 mcp-agent-mail-search-core = { path = "crates/mcp-agent-mail-search-core" }
+mcp-agent-mail-test-helpers = { path = "crates/mcp-agent-mail-test-helpers" }
 
 # Core ecosystem deps
 franken-agent-detection = "0.1.3"

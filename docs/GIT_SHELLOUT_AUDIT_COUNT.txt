@@ -1,0 +1,36 @@
+# Baseline shell-out count (br-8ujfs.3.1)
+# Captured: 2026-04-19
+# Update this file whenever Track C/D beads land; accompany the update
+# with a matching revision of docs/GIT_SHELLOUT_AUDIT.md.
+#
+# The D2 lint compares `scripts/count_git_shellouts.sh` output against
+# this baseline; drift without an audit update causes CI to fail.
+
+TOTAL_OCCURRENCES=45
+
+# Per-crate breakdown (from initial audit — 2026-04-19):
+# crates/mcp-agent-mail-cli/src/e2e_artifacts.rs          : 3
+# crates/mcp-agent-mail-cli/src/lib.rs                    : 8
+# crates/mcp-agent-mail-cli/tests/cli_json_snapshots.rs   : 1
+# crates/mcp-agent-mail-cli/tests/integration_runs.rs     : 3
+# crates/mcp-agent-mail-conformance/tests/conformance.rs  : 1
+# crates/mcp-agent-mail-conformance/tests/contact_enforcement_outage.rs : 2
+# crates/mcp-agent-mail-core/src/identity.rs              : 1
+# crates/mcp-agent-mail-guard/src/lib.rs                  : 6
+# crates/mcp-agent-mail-server/src/cleanup.rs             : 13
+# crates/mcp-agent-mail-server/src/tui_screens/timeline.rs: 1
+# crates/mcp-agent-mail-share/src/detection.rs            : 1
+# crates/mcp-agent-mail-share/src/hosting.rs              : 1
+# crates/mcp-agent-mail-storage/src/lib.rs                : 1
+# crates/mcp-agent-mail-tools/src/resources.rs            : 3
+
+# Classification targets (after Tracks C/D/E complete):
+# MIGRATE       : 8 sites reduce to 0 literal occurrences (uses git2 crate)
+# WRAP          : 7 sites migrate to GitCmd builder (still show in count)
+# KEEP_GUARD    : 4 sites remain (inside user's pre-commit hook)
+# TEST_FIXTURE  : 26 sites remain by design
+# DELETE        : 1 site removed
+#
+# Post-fix expected: 45 - 8 (MIGRATE) - 1 (DELETE) = 36 residual.
+# Of those 36, only the 4 KEEP_GUARD sites may remain as bare
+# `Command::new("git")`; the other 32 live in tests or tests/.

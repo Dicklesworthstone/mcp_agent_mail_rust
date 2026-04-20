@@ -43,6 +43,9 @@ pub mod evidence_ledger;
 pub mod experience;
 pub mod flags;
 pub mod flake_triage;
+pub mod git_binary;
+pub mod git_cmd;
+pub mod git_lock;
 pub mod identity;
 pub mod intern;
 pub mod kpi;
@@ -121,6 +124,15 @@ pub use experience::{
     ExperienceSubsystem, FEATURE_SCHEMA_VERSION, FEATURE_VERSION, FeatureExtension, FeatureVector,
     NonExecutionReason, ResolutionKind, contains_secret, infer_feature_schema_version, loss_to_bp,
     migrate_feature_payload, prob_to_bp, saturating_u8, saturating_u16, validate_transition,
+};
+pub use git_binary::{
+    GitBinaryError, GitVersion, ResolvedGitBinary, resolve_git_binary,
+    resolve_git_binary_with_env, resolved_git_binary_path,
+};
+pub use git_cmd::{DEFAULT_GIT_EXEC_TIMEOUT_SECS, GitCmd, GitRunOutcome};
+pub use git_lock::{
+    DEFAULT_FLOCK_TIMEOUT_SECS, GitRepoLocks, ReentrancyGuard, RepoFlock, admin_dir_for,
+    canonicalize_repo, sentinel_path,
 };
 pub use identity::{ProjectIdentity, compute_project_slug, resolve_project_identity, slugify};
 pub use intern::{InternedStr, intern, intern_count, pre_intern, pre_intern_policies};

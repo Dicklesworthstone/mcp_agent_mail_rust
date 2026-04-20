@@ -23,6 +23,7 @@ sha1.workspace = true
 fs2.workspace = true
 globset.workspace = true
 sqlmodel-frankensqlite.workspace = true
+tracing.workspace = true
 
 [features]
 # Optional local filesystem probes for installed coding-agent CLIs.
