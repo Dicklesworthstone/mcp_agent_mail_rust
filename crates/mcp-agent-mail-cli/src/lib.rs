@@ -1232,7 +1232,7 @@ pub enum AcksCommand {
     Remind {
         project: String,
         agent: String,
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(i64).range(0..))]
         min_age_minutes: i64,
         #[arg(long, default_value_t = 50)]
         limit: i64,
@@ -1240,7 +1240,7 @@ pub enum AcksCommand {
     Overdue {
         project: String,
         agent: String,
-        #[arg(long, default_value_t = 60)]
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(i64).range(0..))]
         ttl_minutes: i64,
         #[arg(long, default_value_t = 50)]
         limit: i64,
@@ -9758,7 +9758,7 @@ fn handle_file_reservations_with_conn(
                 return Ok(());
             };
             let minutes = minutes.unwrap_or(30);
-            let threshold_us = now_us.saturating_add(minutes.saturating_mul(60_000_000));
+            let threshold_us = now_us.saturating_add(saturating_minutes_to_micros(minutes));
             let active_reservation_predicate =
                 active_reservation_predicate_sql("file_reservations");
             let sql = format!(
@@ -9858,7 +9858,7 @@ fn handle_file_reservations_with_conn(
             }
 
             // Create reservations.
-            let expires_us = now_us + ttl.saturating_mul(1_000_000);
+            let expires_us = now_us.saturating_add(saturating_seconds_to_micros(ttl));
             let mut granted: Vec<serde_json::Value> = Vec::new();
             for path in &paths {
                 conn.query_sync(
@@ -9921,7 +9921,7 @@ fn handle_file_reservations_with_conn(
         } => {
             let project = crate::context::resolve_project(conn, &project)?;
             let extend = extend_seconds.max(60);
-            let extend_us = extend.saturating_mul(1_000_000);
+            let extend_us = saturating_seconds_to_micros(extend);
 
             let project_id = project.id;
             let agent_id = crate::context::resolve_agent(conn, project_id, &agent)?.id;
@@ -10134,6 +10134,21 @@ fn handle_acks(action: AcksCommand) -> CliResult<()> {
     handle_acks_with_conn(opened.conn(), action)
 }
 
+const CLI_MICROS_PER_SECOND: i64 = 1_000_000;
+const CLI_MICROS_PER_MINUTE: i64 = 60 * CLI_MICROS_PER_SECOND;
+
+fn saturating_seconds_to_micros(seconds: i64) -> i64 {
+    seconds.max(0).saturating_mul(CLI_MICROS_PER_SECOND)
+}
+
+fn saturating_minutes_to_micros(minutes: i64) -> i64 {
+    minutes.max(0).saturating_mul(CLI_MICROS_PER_MINUTE)
+}
+
+fn saturating_age_minutes_since(now_us: i64, created_ts: i64) -> i64 {
+    now_us.saturating_sub(created_ts) / CLI_MICROS_PER_MINUTE
+}
+
 fn handle_acks_with_conn(conn: &mcp_agent_mail_db::DbConn, action: AcksCommand) -> CliResult<()> {
     let now_us = mcp_agent_mail_db::timestamps::now_micros();
 
@@ -10193,7 +10208,7 @@ fn handle_acks_with_conn(conn: &mcp_agent_mail_db::DbConn, action: AcksCommand) 
             let project_id = crate::context::resolve_project(conn, &project)?.id;
             let agent_id = crate::context::resolve_agent(conn, project_id, &agent)?.id;
             // Stale acks: ack_required but not acked, older than min_age_minutes
-            let cutoff = now_us - min_age_minutes * 60 * 1_000_000;
+            let cutoff = now_us.saturating_sub(saturating_minutes_to_micros(min_age_minutes));
             let rows = conn
                 .query_sync(
                     &format!(
@@ -10227,8 +10242,10 @@ fn handle_acks_with_conn(conn: &mcp_agent_mail_db::DbConn, action: AcksCommand) 
                 let id: i64 = r.get_named("id").unwrap_or(0);
                 let subject: String = r.get_named("subject").unwrap_or_default();
                 let sender: String = r.get_named("sender_name").unwrap_or_default();
-                let age_min =
-                    (now_us - r.get_named::<i64>("created_ts").unwrap_or(now_us)) / 60_000_000;
+                let age_min = saturating_age_minutes_since(
+                    now_us,
+                    r.get_named::<i64>("created_ts").unwrap_or(now_us),
+                );
                 table.add_row(vec![
                     id.to_string(),
                     sender,
@@ -10248,7 +10265,7 @@ fn handle_acks_with_conn(conn: &mcp_agent_mail_db::DbConn, action: AcksCommand) 
             let project_id = crate::context::resolve_project(conn, &project)?.id;
             let agent_id = crate::context::resolve_agent(conn, project_id, &agent)?.id;
             // Overdue acks: ack_required, not acked, older than ttl_minutes
-            let cutoff = now_us - ttl_minutes * 60 * 1_000_000;
+            let cutoff = now_us.saturating_sub(saturating_minutes_to_micros(ttl_minutes));
             let rows = conn
                 .query_sync(
                     &format!(
@@ -10282,8 +10299,10 @@ fn handle_acks_with_conn(conn: &mcp_agent_mail_db::DbConn, action: AcksCommand) 
                 let id: i64 = r.get_named("id").unwrap_or(0);
                 let subject: String = r.get_named("subject").unwrap_or_default();
                 let sender: String = r.get_named("sender_name").unwrap_or_default();
-                let age_min =
-                    (now_us - r.get_named::<i64>("created_ts").unwrap_or(now_us)) / 60_000_000;
+                let age_min = saturating_age_minutes_since(
+                    now_us,
+                    r.get_named::<i64>("created_ts").unwrap_or(now_us),
+                );
                 table.add_row(vec![
                     id.to_string(),
                     sender,
@@ -10338,7 +10357,7 @@ fn handle_contacts_with_conn(
         } => {
             let fmt = output::CliOutputFormat::resolve(format, json);
             let ttl = ttl_seconds.max(60);
-            let expires_us = now_us + ttl.saturating_mul(1_000_000);
+            let expires_us = now_us.saturating_add(saturating_seconds_to_micros(ttl));
 
             // Resolve project and agents.
             let project_id = crate::context::resolve_project(conn, &project_key)?.id;
@@ -10411,7 +10430,7 @@ fn handle_contacts_with_conn(
             let approved = if reject { false } else { accept };
             let new_status = if approved { "approved" } else { "blocked" };
             let ttl = ttl_seconds.max(60);
-            let expires_us = now_us + ttl.saturating_mul(1_000_000);
+            let expires_us = now_us.saturating_add(saturating_seconds_to_micros(ttl));
 
             let project_id = crate::context::resolve_project(conn, &project_key)?.id;
 
@@ -17571,6 +17590,103 @@ fn mcp_config_url_matches_any_expected(actual_url: &str, expected_urls: &[String
         .any(|expected_url| mcp_config_urls_match_for_status(actual_url, expected_url))
 }
 
+/// Probe a specific git binary and return a doctor-check JSON entry.
+/// `source` is a short tag ("env" for AM_GIT_BINARY, "path" for system
+/// default) included in the emitted finding.
+fn git_binary_doctor_entry(path_or_name: &str, source: &str) -> serde_json::Value {
+    use std::process::Command;
+    let out = match Command::new(path_or_name)
+        .arg("--version")
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            return serde_json::json!({
+                "check": format!("git_binary_{source}"),
+                "status": "warn",
+                "detail": format!(
+                    "git --version failed (exit {}): {}",
+                    o.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&o.stderr).trim(),
+                ),
+                "source": source,
+                "path": path_or_name,
+            });
+        }
+        Err(e) => {
+            return serde_json::json!({
+                "check": format!("git_binary_{source}"),
+                "status": if source == "env" { "fail" } else { "warn" },
+                "detail": format!("cannot spawn {path_or_name}: {e}"),
+                "source": source,
+                "path": path_or_name,
+            });
+        }
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let version = mcp_agent_mail_core::GitVersion::parse_lax(
+        stdout.strip_prefix("git version ").unwrap_or(&stdout),
+    );
+    let Some(v) = version else {
+        return serde_json::json!({
+            "check": format!("git_binary_{source}"),
+            "status": "warn",
+            "detail": format!("unparseable version output: {stdout:?}"),
+            "source": source,
+            "path": path_or_name,
+        });
+    };
+    match mcp_agent_mail_core::match_known_bad(v) {
+        Some(entry) => {
+            let status = match entry.severity {
+                mcp_agent_mail_core::KnownBadSeverity::Fail => "fail",
+                mcp_agent_mail_core::KnownBadSeverity::Warn => "warn",
+            };
+            serde_json::json!({
+                "check": format!("git_binary_{source}"),
+                "status": status,
+                "code": entry.code,
+                "version": v.to_string(),
+                "summary": entry.summary,
+                "fingerprint": entry.fingerprint,
+                "remediation_ref": entry.remediation_ref,
+                "source": source,
+                "path": path_or_name,
+                "detail": format!(
+                    "git {} at {} is KNOWN BAD ({}): {}. Remediation: {}",
+                    v, path_or_name, entry.code, entry.summary, entry.remediation_ref,
+                ),
+            })
+        }
+        None => serde_json::json!({
+            "check": format!("git_binary_{source}"),
+            "status": "ok",
+            "version": v.to_string(),
+            "source": source,
+            "path": path_or_name,
+            "detail": format!("git {} at {} is not on the known-bad list", v, path_or_name),
+        }),
+    }
+}
+
+/// Emit doctor-check entries for both the resolver (AM_GIT_BINARY or
+/// default) AND the default PATH git, so operators see when their
+/// override is shadowing a still-broken system binary.
+fn push_git_version_findings(checks: &mut Vec<serde_json::Value>) {
+    match std::env::var("AM_GIT_BINARY") {
+        Ok(v) if !v.trim().is_empty() => {
+            checks.push(git_binary_doctor_entry(v.trim(), "env"));
+            // Also report the default git separately so operators see
+            // divergence (override vs system).
+            checks.push(git_binary_doctor_entry("git", "path"));
+        }
+        _ => {
+            // Just the single PATH entry.
+            checks.push(git_binary_doctor_entry("git", "path"));
+        }
+    }
+}
+
 fn handle_doctor_check_with(
     database_url: &str,
     storage_root: &Path,
@@ -17793,6 +17909,15 @@ fn handle_doctor_check_with(
             }
         }
     }
+
+    // Check 1d: Git binary version — flag known-bad versions (br-8ujfs.1.2 / A2).
+    //
+    // Reports on BOTH the resolver used by mcp-agent-mail (AM_GIT_BINARY
+    // if set, else system PATH) AND the default system git on PATH, so
+    // operators see whether their resolver override is still shadowing a
+    // broken default. Exit code semantics stay at the existing fail=1 /
+    // warn=1 aggregate; KNOWN_BAD findings register as FAIL.
+    push_git_version_findings(&mut checks);
 
     // Check 2: Storage root exists
     let storage_ok = storage_root.exists();
@@ -23083,12 +23208,11 @@ fn service_install_systemd(
     // If DATABASE_URL points outside the storage root (custom layout), make
     // sure the SQLite parent directory exists too so `am migrate` on first
     // launch can open the DB file without surprise.
-    if let Some(db_path) = abs_db_url.strip_prefix("sqlite://") {
-        if let Some(parent) = Path::new(db_path).parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-        }
+    if let Some(db_path) = abs_db_url.strip_prefix("sqlite://")
+        && let Some(parent) = Path::new(db_path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = std::fs::create_dir_all(parent);
     }
 
     let unit_content = build_systemd_unit_content(
@@ -23219,12 +23343,11 @@ fn service_install_launchd(
             abs_storage_root.display()
         ))
     })?;
-    if let Some(db_path) = abs_db_url.strip_prefix("sqlite://") {
-        if let Some(parent) = Path::new(db_path).parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-        }
+    if let Some(db_path) = abs_db_url.strip_prefix("sqlite://")
+        && let Some(parent) = Path::new(db_path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        let _ = std::fs::create_dir_all(parent);
     }
 
     let plist_content = build_launchd_plist_content(
@@ -35135,6 +35258,34 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn clap_rejects_negative_acks_windows() {
+        let remind = Cli::try_parse_from([
+            "am",
+            "acks",
+            "remind",
+            "proj",
+            "BlueLake",
+            "--min-age-minutes",
+            "-1",
+        ]);
+        assert!(
+            remind.is_err(),
+            "negative min-age-minutes should be rejected"
+        );
+
+        let overdue = Cli::try_parse_from([
+            "am",
+            "acks",
+            "overdue",
+            "proj",
+            "BlueLake",
+            "--ttl-minutes",
+            "-1",
+        ]);
+        assert!(overdue.is_err(), "negative ttl-minutes should be rejected");
+    }
+
+    #[test]
     fn clap_parses_config_set_port() {
         let cli = Cli::try_parse_from(["am", "config", "set-port", "9999"]).unwrap();
         match cli.command.expect("expected command") {
@@ -37299,6 +37450,46 @@ startup_timeout_sec = 42
             output.contains("OVERDUE") && output.contains("RedFox"),
             "expected overdue ack in output, got: {output}"
         );
+    }
+
+    #[test]
+    fn integration_acks_overdue_saturates_huge_ttl_minutes() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_acks_with_conn(
+            &conn,
+            AcksCommand::Overdue {
+                project: "test-proj".to_string(),
+                agent: "BlueLake".to_string(),
+                ttl_minutes: i64::MAX,
+                limit: 50,
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(
+            result.is_ok(),
+            "acks overdue should saturate huge ttl_minutes: {result:?}"
+        );
+        assert!(
+            output.contains("No overdue acks."),
+            "expected huge ttl_minutes to produce an empty overdue set, got: {output}"
+        );
+    }
+
+    #[test]
+    fn ack_time_helpers_clamp_negative_and_future_values() {
+        assert_eq!(saturating_minutes_to_micros(-1), 0);
+        assert_eq!(saturating_minutes_to_micros(i64::MAX), i64::MAX);
+        assert_eq!(saturating_seconds_to_micros(-1), 0);
+        assert_eq!(saturating_seconds_to_micros(i64::MAX), i64::MAX);
+        assert_eq!(saturating_age_minutes_since(60_000_000, 120_000_000), 0);
+        assert_eq!(saturating_age_minutes_since(180_000_000, 60_000_000), 2);
     }
 
     #[test]

@@ -2235,6 +2235,62 @@ preflight_checks() {
   check_write_permissions
   check_existing_install
   check_network
+  check_git_version_known_bad
+}
+
+# ──────────────────────────────────────────────────────────────────────────
+# check_git_version_known_bad — br-8ujfs.1.3 (A3)
+#
+# Warn (non-fatal) if the system git is a version known to have multi-agent
+# concurrency bugs that corrupt .git/index. The primary motivating bug is
+# git 2.51.0's cache_entry index-race (SIGSEGV at ip 0x1db250; see
+# docs/GIT_251_FINDINGS.md).
+#
+# Detection honors AM_GIT_BINARY if the operator has already set it, so
+# existing mitigations don't spuriously re-trigger this warning.
+#
+# Output: stderr warning only. NEVER aborts install. Emits a marker
+# string (AM_INSTALL_WARN GIT_2_51_0_KNOWN_BAD) so tests + ops can grep
+# for it reliably.
+# ──────────────────────────────────────────────────────────────────────────
+check_git_version_known_bad() {
+  local git_bin="${AM_GIT_BINARY:-git}"
+  local git_version=""
+  if command -v "$git_bin" >/dev/null 2>&1; then
+    git_version=$("$git_bin" --version 2>/dev/null | awk '{print $3}' | head -n1 || true)
+  fi
+
+  if [ -z "$git_version" ]; then
+    verbose "check_git_version_known_bad: git not found on PATH — skipping"
+    return 0
+  fi
+  verbose "check_git_version_known_bad: detected $git_bin = $git_version"
+
+  # Currently only 2.51.0 is flagged. Additional versions are data-driven
+  # at runtime via AM_EXTRA_KNOWN_BAD_GIT_JSON (see bead A7); keeping the
+  # installer check narrow avoids coupling the installer to a runtime
+  # catalog that isn't available until after install.
+  case "$git_version" in
+    2.51.0)
+      warn "[AM_INSTALL_WARN GIT_2_51_0_KNOWN_BAD]"
+      warn ""
+      warn "Detected git 2.51.0 ($git_bin) which has a concurrency bug"
+      warn "that corrupts .git/index under multi-agent load."
+      warn "Symptoms: kernel-log segfaults, 'fatal: bad object HEAD',"
+      warn "orphan stashes, ahead/behind counts showing -1."
+      warn ""
+      warn "Remediation (in order):"
+      warn "  1. Set AM_GIT_BINARY=/path/to/git-2.50.x in your shell profile"
+      warn "  2. Upgrade system git to >= 2.51.1 once it is released"
+      warn "  3. Run 'am doctor fix-orphan-refs --all --dry-run' on damaged repos"
+      warn ""
+      warn "Details: RECOVERY_RUNBOOK.md#git-2-51-0-index-race"
+      warn ""
+      ;;
+    *)
+      verbose "check_git_version_known_bad: $git_version is not on the known-bad list"
+      ;;
+  esac
 }
 
 maybe_add_path() {

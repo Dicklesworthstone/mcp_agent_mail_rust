@@ -1333,6 +1333,29 @@ What `check` inspects:
 | Empty inbox | Verify recipient names match exactly and messages were sent to that agent |
 | Search returns nothing | Try simpler terms and fewer filters; inspect diagnostics in `search_messages` explain output |
 | Pre-commit guard blocking | Check `am robot reservations --conflicts` for active reservations |
+| Kernel-log `segfault ... ip 0x1db250 ... in git[...]` | System has **git 2.51.0** which races `.git/index` under multi-agent load. See [Known-bad git versions](#known-bad-git-versions) below. |
+| `fatal: bad object HEAD` or orphan stashes that appear after sessions | Same as above. Set `AM_GIT_BINARY` to a safer git, then run `am doctor fix-orphan-refs --all --dry-run`. |
+
+### Known-bad git versions
+
+mcp-agent-mail invokes `git` in a handful of places (pre-commit guard,
+share export, reservation activity probes, project identity detection).
+Some git versions have multi-process concurrency bugs that corrupt
+`.git/index` under load:
+
+| Version | Status | Primary mitigation |
+|---------|--------|---------------------|
+| **2.51.0** | KNOWN BAD — segfaults in `cache_entry` walk under concurrent index writes (IP `0x1db250`). Ubuntu 25.10 "questing" is the main affected distro. | `export AM_GIT_BINARY=/path/to/git-2.50.x/bin/git` and/or upgrade to 2.51.1+ when available. See `RECOVERY_RUNBOOK.md#git-2-51-0-index-race`. |
+
+Run `am doctor check` to see whether your system git is flagged. The
+check emits a structured finding (code `GIT_2_51_0_INDEX_RACE`, exit
+code 3 in CI mode) so pipelines can gate on it.
+
+`AM_GIT_BINARY` overrides the resolver used by all in-process git
+shell-outs (identity detection, reservation activity, share/hosting,
+etc.). libgit2 calls (vendored) are unaffected — they don't exhibit
+this bug. Operators who have already migrated a path to libgit2 don't
+need to do anything.
 
 ---
 

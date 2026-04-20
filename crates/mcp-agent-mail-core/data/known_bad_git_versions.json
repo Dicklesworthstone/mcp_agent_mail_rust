@@ -1,0 +1,29 @@
+{
+  "$schema": "known_bad_git_versions_v1",
+  "comment": [
+    "Known-bad git versions embedded in mcp-agent-mail-core.",
+    "Extend via AM_EXTRA_KNOWN_BAD_GIT_JSON=<path> (user entries merge).",
+    "Suppress specific codes via AM_IGNORE_KNOWN_BAD_GIT=CODE1,CODE2.",
+    "",
+    "Entry schema:",
+    "  code              : UPPER_SNAKE_CASE, globally unique",
+    "  match.kind        : 'exact' or 'range'",
+    "  match.version     : 'X.Y.Z' (kind=exact)",
+    "  match.min         : 'X.Y.Z' inclusive (kind=range)",
+    "  match.max_exclusive: 'X.Y.Z' exclusive upper bound (kind=range)",
+    "  severity          : 'fail' or 'warn'",
+    "  summary           : single-line operator-facing description",
+    "  fingerprint       : optional kernel-log signature for grep",
+    "  remediation_ref   : doc path + anchor"
+  ],
+  "entries": [
+    {
+      "code": "GIT_2_51_0_INDEX_RACE",
+      "match": { "kind": "exact", "version": "2.51.0" },
+      "severity": "fail",
+      "summary": "git 2.51.0 segfaults under concurrent .git/index access",
+      "fingerprint": "ip 0x1db250, error 4 reading cache_entry",
+      "remediation_ref": "RECOVERY_RUNBOOK.md#git-2-51-0-index-race"
+    }
+  ]
+}

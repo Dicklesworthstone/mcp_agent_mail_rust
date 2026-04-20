@@ -126,7 +126,8 @@ pub use experience::{
     migrate_feature_payload, prob_to_bp, saturating_u8, saturating_u16, validate_transition,
 };
 pub use git_binary::{
-    GitBinaryError, GitVersion, ResolvedGitBinary, resolve_git_binary,
+    GitBinaryError, GitVersion, KnownBadEntry, KnownBadMatcher, KnownBadSeverity,
+    ResolvedGitBinary, known_bad_git_versions, match_known_bad, resolve_git_binary,
     resolve_git_binary_with_env, resolved_git_binary_path,
 };
 pub use git_cmd::{DEFAULT_GIT_EXEC_TIMEOUT_SECS, GitCmd, GitRunOutcome};

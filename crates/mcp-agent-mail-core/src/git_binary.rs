@@ -87,14 +87,39 @@ impl GitVersion {
         }
     }
 
-    /// Is this version in the known-bad list?
+    /// Is this version in the known-bad list (after applying the
+    /// `AM_IGNORE_KNOWN_BAD_GIT` suppress list)?
     ///
-    /// Currently only matches 2.51.0 (the primary motivating bug). Future
-    /// additions should be made via A7 (data-driven known-bad list)
-    /// rather than edited here directly.
+    /// The list itself is data-driven via
+    /// `crates/mcp-agent-mail-core/data/known_bad_git_versions.json`
+    /// plus an optional per-operator extension at
+    /// `AM_EXTRA_KNOWN_BAD_GIT_JSON`. Call [`match_known_bad`] to get
+    /// the full finding entry (code, severity, fingerprint,
+    /// remediation) instead of just a boolean.
     #[must_use]
-    pub const fn is_known_bad(self) -> bool {
-        self.major == 2 && self.minor == 51 && self.patch == 0
+    pub fn is_known_bad(self) -> bool {
+        match_known_bad(self).is_some()
+    }
+
+    /// Lex-ordered tuple for range comparisons.
+    fn as_tuple(self) -> (u32, u32, u32) {
+        (self.major, self.minor, self.patch)
+    }
+
+    /// Parse `"X.Y.Z"` (with tolerated `-rc1`/`.windows.1`/`+build`
+    /// suffixes) into a [`GitVersion`]. Returns `None` if the string
+    /// has fewer than two dot-separated segments or they don't parse
+    /// as integers.
+    pub fn parse_lax(s: &str) -> Option<Self> {
+        let head = s
+            .split_terminator(['-', '+'])
+            .next()
+            .unwrap_or(s);
+        let mut it = head.split('.');
+        let major = it.next()?.parse().ok()?;
+        let minor = it.next()?.parse().ok()?;
+        let patch = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        Some(Self::new(major, minor, patch))
     }
 }
 
@@ -421,6 +446,189 @@ pub fn resolved_git_binary_path() -> PathBuf {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Data-driven known-bad catalog — br-8ujfs.1.7 (A7).
+// ---------------------------------------------------------------------------
+
+/// Severity level for a known-bad-version finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KnownBadSeverity {
+    /// Loud: doctor check flags with exit 3 in CI mode.
+    Fail,
+    /// Quieter: doctor check flags as informational.
+    Warn,
+}
+
+/// One catalog entry as loaded from the embedded JSON or a user override.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct KnownBadEntry {
+    pub code: String,
+    #[serde(rename = "match")]
+    pub matcher: KnownBadMatcher,
+    pub severity: KnownBadSeverity,
+    pub summary: String,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    pub remediation_ref: String,
+}
+
+/// How an entry matches a version.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum KnownBadMatcher {
+    /// Single exact match.
+    Exact { version: String },
+    /// `[min, max_exclusive)` half-open range.
+    Range {
+        min: String,
+        max_exclusive: String,
+    },
+}
+
+impl KnownBadMatcher {
+    fn matches(&self, v: GitVersion) -> bool {
+        match self {
+            Self::Exact { version } => {
+                matches!(GitVersion::parse_lax(version), Some(target) if target == v)
+            }
+            Self::Range { min, max_exclusive } => {
+                let Some(lo) = GitVersion::parse_lax(min) else {
+                    return false;
+                };
+                let Some(hi) = GitVersion::parse_lax(max_exclusive) else {
+                    return false;
+                };
+                v.as_tuple() >= lo.as_tuple() && v.as_tuple() < hi.as_tuple()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct KnownBadFile {
+    entries: Vec<KnownBadEntry>,
+}
+
+/// Embedded default catalog, compiled in at build time.
+const EMBEDDED_CATALOG: &str =
+    include_str!("../data/known_bad_git_versions.json");
+
+static CATALOG_CACHE: OnceLock<Vec<KnownBadEntry>> = OnceLock::new();
+
+fn load_catalog() -> &'static [KnownBadEntry] {
+    CATALOG_CACHE.get_or_init(|| {
+        let mut out: Vec<KnownBadEntry> = Vec::new();
+
+        // Load embedded defaults.
+        match serde_json::from_str::<KnownBadFile>(EMBEDDED_CATALOG) {
+            Ok(file) => out.extend(file.entries),
+            Err(e) => {
+                tracing::error!(
+                    target: "mcp_agent_mail::git_binary",
+                    err = %e,
+                    "known_bad_embedded_parse_failed"
+                );
+            }
+        }
+
+        // Optionally merge user extensions. User entries with the same
+        // `code` override defaults; new codes are appended.
+        if let Ok(user_path) = std::env::var("AM_EXTRA_KNOWN_BAD_GIT_JSON")
+            && !user_path.trim().is_empty()
+        {
+            match std::fs::read_to_string(&user_path) {
+                Ok(text) => match serde_json::from_str::<KnownBadFile>(&text) {
+                    Ok(file) => {
+                        for entry in file.entries {
+                            if let Some(existing) =
+                                out.iter_mut().find(|e| e.code == entry.code)
+                            {
+                                tracing::info!(
+                                    target: "mcp_agent_mail::git_binary",
+                                    code = %entry.code,
+                                    path = %user_path,
+                                    "known_bad_user_override"
+                                );
+                                *existing = entry;
+                            } else {
+                                out.push(entry);
+                            }
+                        }
+                    }
+                    Err(e) => tracing::error!(
+                        target: "mcp_agent_mail::git_binary",
+                        err = %e,
+                        path = %user_path,
+                        "known_bad_user_parse_failed"
+                    ),
+                },
+                Err(e) => tracing::warn!(
+                    target: "mcp_agent_mail::git_binary",
+                    err = %e,
+                    path = %user_path,
+                    "known_bad_user_file_unreadable"
+                ),
+            }
+        }
+
+        tracing::info!(
+            target: "mcp_agent_mail::git_binary",
+            entries = out.len(),
+            "known_bad_catalog_loaded"
+        );
+        out
+    })
+}
+
+/// Return the entry (if any) that matches `version` and is not
+/// suppressed by `AM_IGNORE_KNOWN_BAD_GIT`.
+///
+/// Never allocates on the hot path after first call (catalog is cached
+/// in a `OnceLock`). Suppress-list parsing also cached.
+#[must_use]
+pub fn match_known_bad(version: GitVersion) -> Option<&'static KnownBadEntry> {
+    static SUPPRESS: OnceLock<Vec<String>> = OnceLock::new();
+    let suppress = SUPPRESS.get_or_init(|| {
+        std::env::var("AM_IGNORE_KNOWN_BAD_GIT")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+
+    for entry in load_catalog() {
+        if suppress.iter().any(|c| c == &entry.code) {
+            continue;
+        }
+        if entry.matcher.matches(version) {
+            return Some(entry);
+        }
+    }
+    None
+}
+
+/// Expose the full (post-suppression) catalog for the `am doctor check`
+/// surface. Returns only entries not listed in
+/// `AM_IGNORE_KNOWN_BAD_GIT`.
+#[must_use]
+pub fn known_bad_git_versions() -> Vec<&'static KnownBadEntry> {
+    static SUPPRESS: OnceLock<Vec<String>> = OnceLock::new();
+    let suppress = SUPPRESS.get_or_init(|| {
+        std::env::var("AM_IGNORE_KNOWN_BAD_GIT")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+    load_catalog()
+        .iter()
+        .filter(|e| !suppress.iter().any(|c| c == &e.code))
+        .collect()
+}
+
 /// Test-only: reset the cache. Lets unit tests exercise the cold path
 /// repeatedly without process restart.
 #[cfg(test)]
@@ -501,6 +709,85 @@ mod tests {
         assert!(!GitVersion::new(2, 51, 1).is_known_bad());
         assert!(!GitVersion::new(2, 50, 0).is_known_bad());
         assert!(!GitVersion::new(2, 52, 0).is_known_bad());
+    }
+
+    #[test]
+    fn match_known_bad_returns_structured_entry_for_2_51_0() {
+        let m = match_known_bad(GitVersion::new(2, 51, 0))
+            .expect("2.51.0 should match");
+        assert_eq!(m.code, "GIT_2_51_0_INDEX_RACE");
+        assert_eq!(m.severity, KnownBadSeverity::Fail);
+        assert!(
+            m.summary.to_lowercase().contains("2.51.0"),
+            "summary should mention 2.51.0: {}",
+            m.summary
+        );
+        assert!(
+            m.remediation_ref.contains("RECOVERY_RUNBOOK.md"),
+            "remediation_ref should point at runbook: {}",
+            m.remediation_ref
+        );
+    }
+
+    #[test]
+    fn match_known_bad_returns_none_for_safe_versions() {
+        assert!(match_known_bad(GitVersion::new(2, 50, 2)).is_none());
+        assert!(match_known_bad(GitVersion::new(2, 51, 1)).is_none());
+        assert!(match_known_bad(GitVersion::new(2, 52, 0)).is_none());
+        assert!(match_known_bad(GitVersion::new(2, 40, 0)).is_none());
+    }
+
+    #[test]
+    fn known_bad_matcher_exact() {
+        let m = KnownBadMatcher::Exact {
+            version: "2.51.0".to_string(),
+        };
+        assert!(m.matches(GitVersion::new(2, 51, 0)));
+        assert!(!m.matches(GitVersion::new(2, 51, 1)));
+        assert!(!m.matches(GitVersion::new(2, 50, 0)));
+    }
+
+    #[test]
+    fn known_bad_matcher_range_inclusive_exclusive() {
+        let m = KnownBadMatcher::Range {
+            min: "2.51.0".to_string(),
+            max_exclusive: "2.52.0".to_string(),
+        };
+        assert!(m.matches(GitVersion::new(2, 51, 0)), "inclusive lower");
+        assert!(m.matches(GitVersion::new(2, 51, 1)));
+        assert!(m.matches(GitVersion::new(2, 51, 99)));
+        assert!(!m.matches(GitVersion::new(2, 52, 0)), "exclusive upper");
+        assert!(!m.matches(GitVersion::new(2, 50, 9)));
+    }
+
+    #[test]
+    fn parse_lax_handles_suffixes() {
+        assert_eq!(
+            GitVersion::parse_lax("2.51.0"),
+            Some(GitVersion::new(2, 51, 0))
+        );
+        assert_eq!(
+            GitVersion::parse_lax("2.51.0.windows.1"),
+            Some(GitVersion::new(2, 51, 0))
+        );
+        assert_eq!(
+            GitVersion::parse_lax("2.52.0-rc1"),
+            Some(GitVersion::new(2, 52, 0))
+        );
+        assert_eq!(
+            GitVersion::parse_lax("2.51.0+build.5"),
+            Some(GitVersion::new(2, 51, 0))
+        );
+        assert_eq!(GitVersion::parse_lax("not-a-version"), None);
+    }
+
+    #[test]
+    fn known_bad_git_versions_lists_at_least_the_core_entry() {
+        let list = known_bad_git_versions();
+        assert!(
+            list.iter().any(|e| e.code == "GIT_2_51_0_INDEX_RACE"),
+            "core catalog must contain GIT_2_51_0_INDEX_RACE"
+        );
     }
 
     #[test]
