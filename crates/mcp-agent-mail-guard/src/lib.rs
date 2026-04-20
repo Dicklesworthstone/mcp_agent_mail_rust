@@ -1754,7 +1754,7 @@ pub fn get_push_paths(repo_root: &Path, stdin_lines: &str) -> GuardResult<Vec<St
 
         // Prefer per-commit path enumeration (legacy guard.py parity): this catches paths
         // that were touched in any pushed commit, even if the net diff ends up empty.
-        let rev_list = rev_list_cmd.output()?;
+        let rev_list = guard_run_git_with_retry(rev_list_cmd)?;
 
         if rev_list.status.success() {
             for sha in String::from_utf8_lossy(&rev_list.stdout)
@@ -1762,22 +1762,21 @@ pub fn get_push_paths(repo_root: &Path, stdin_lines: &str) -> GuardResult<Vec<St
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
-                let output = Command::new("git")
-                    .current_dir(repo_root)
-                    .args([
-                        "diff-tree",
-                        "--root",
-                        "-r",
-                        "--no-commit-id",
-                        "--name-status",
-                        "-M",
-                        "--no-ext-diff",
-                        "--diff-filter=ACMRDTU",
-                        "-z",
-                        "-m",
-                        sha,
-                    ])
-                    .output()?;
+                let mut diff_tree_cmd = Command::new("git");
+                diff_tree_cmd.current_dir(repo_root).args([
+                    "diff-tree",
+                    "--root",
+                    "-r",
+                    "--no-commit-id",
+                    "--name-status",
+                    "-M",
+                    "--no-ext-diff",
+                    "--diff-filter=ACMRDTU",
+                    "-z",
+                    "-m",
+                    sha,
+                ]);
+                let output = guard_run_git_with_retry(diff_tree_cmd)?;
 
                 if output.status.success() {
                     let paths = parse_name_status_z(&output.stdout)?;
@@ -1793,10 +1792,11 @@ pub fn get_push_paths(repo_root: &Path, stdin_lines: &str) -> GuardResult<Vec<St
             }
         } else if let Some(range) = diff_range {
             // Fallback: net diff across the range (less precise, but better than nothing).
-            let output = Command::new("git")
+            let mut diff_cmd = Command::new("git");
+            diff_cmd
                 .current_dir(repo_root)
-                .args(["diff", "--name-status", "-M", "-z", &range])
-                .output()?;
+                .args(["diff", "--name-status", "-M", "-z", &range]);
+            let output = guard_run_git_with_retry(diff_cmd)?;
 
             if output.status.success() {
                 let paths = parse_name_status_z(&output.stdout)?;

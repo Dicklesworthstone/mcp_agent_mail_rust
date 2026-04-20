@@ -445,7 +445,12 @@ fn run_child(
     {
         use std::io::Write;
         if let Err(e) = stdin.write_all(bytes) {
+            // Drop the stdin handle FIRST so the child sees EOF and can
+            // exit promptly, then reap. Otherwise child.wait() could
+            // hang waiting for a child that's still blocked on stdin.
+            drop(stdin);
             let _ = child.kill();
+            let _ = child.wait();
             return GitRunOutcome::Error(e);
         }
     }
