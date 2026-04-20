@@ -80,10 +80,15 @@ pub fn ref_category(ref_name: &str) -> RefCategory {
     }
 
     // Safe-to-prune namespaces.
-    const SAFE_PREFIXES: &[&str] = &["refs/stash", "refs/temp/", "refs/original/"];
+    //
+    // Note: `refs/stash` is a LEAF ref (git stores multiple stashes as a
+    // reflog on a single ref tip, not as a namespace), so it's matched
+    // exactly rather than via starts_with — otherwise `refs/stashy/foo`
+    // would also match, which is wrong.
     if ref_name == "refs/stash" {
         return RefCategory::SafeToPrune;
     }
+    const SAFE_PREFIXES: &[&str] = &["refs/temp/", "refs/original/"];
     for prefix in SAFE_PREFIXES {
         if ref_name.starts_with(prefix) {
             return RefCategory::SafeToPrune;
@@ -338,6 +343,17 @@ mod tests {
         );
         assert_eq!(ref_category("refs/tags/v1.0"), RefCategory::AskUser);
         assert_eq!(ref_category("refs/notes/commits"), RefCategory::AskUser);
+    }
+
+    #[test]
+    fn ref_category_refs_stash_is_leaf_not_prefix() {
+        // `refs/stash` is a SINGLE ref (git stores multiple stashes as a
+        // reflog on that tip). Anything that merely starts with "refs/stash"
+        // — say `refs/stashy/*` from a user's ad-hoc naming — must NOT
+        // inherit the SafeToPrune category.
+        assert_eq!(ref_category("refs/stash"), RefCategory::SafeToPrune);
+        assert_eq!(ref_category("refs/stashy/foo"), RefCategory::AskUser);
+        assert_eq!(ref_category("refs/stash-backup"), RefCategory::AskUser);
     }
 
     #[test]
