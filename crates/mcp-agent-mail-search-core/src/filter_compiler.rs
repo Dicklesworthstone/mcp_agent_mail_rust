@@ -81,8 +81,8 @@ impl CompiledFilters {
 pub fn compile_filters(filter: &SearchFilter, handles: &FieldHandles) -> CompiledFilters {
     let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
 
-    // Sender filter (exact match on STRING field)
-    if let Some(ref sender) = filter.sender {
+    // Sender filter (exact match on STRING field). `agent` is an alias.
+    if let Some(ref sender) = filter.sender.as_ref().or(filter.agent.as_ref()) {
         clauses.push(term_filter(handles.sender, sender));
     }
 
@@ -603,6 +603,17 @@ mod tests {
             let (index, handles) = setup_index();
             let filter = SearchFilter {
                 sender: Some("BlueLake".to_string()),
+                ..SearchFilter::default()
+            };
+            let ids = search_with_filter(&index, &handles, &filter);
+            assert_eq!(ids, vec![1]);
+        }
+
+        #[test]
+        fn filter_by_agent_alias() {
+            let (index, handles) = setup_index();
+            let filter = SearchFilter {
+                agent: Some("BlueLake".to_string()),
                 ..SearchFilter::default()
             };
             let ids = search_with_filter(&index, &handles, &filter);
