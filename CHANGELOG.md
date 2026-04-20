@@ -10,37 +10,188 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## Unreleased
 
+(no in-flight changes)
+
+---
+
+## [v0.2.46](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.2.46) — 2026-04-20 **[Release]**
+
+94 commits since v0.2.45 | [Compare](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/compare/v0.2.45...v0.2.46)
+
+Rolls up the git 2.51.0 concurrency hardening epic (`br-8ujfs`), ATC learning-loop
+closure (`br-bn0vb`), TUI UX surfaces (`br-bb0gt`), MCP protocol-compliance coverage
+(`br-a2k3h`), and five rounds of review-driven fix sweeps (`review-r1` through
+`review-r5`). Tail of the release adds three post-epic git child-reap / retry fixes
+and a storage ref-classification bug fix.
+
+### Git 2.51.0 Concurrency Hardening (`br-8ujfs` epic)
+
+- Foundation + data-driven known-bad git version catalog; `am doctor check` surfaces
+  a `GIT_2_51_0_INDEX_RACE` finding (exit code 3 in CI mode) when the system git is
+  flagged. See `RECOVERY_RUNBOOK.md#git-2-51-0-index-race`.
+- `AM_GIT_BINARY` override plumbed through every in-process git shell-out path
+  (guard, share export, reservation activity probes, project identity detection).
+- Pre-push hook handler wraps all three `get_push_paths` git calls in the SIGSEGV
+  retry wrapper with bounded backoff/jitter aligned to `core::git_cmd::jitter_ms`.
+- New `scripts/git-with-amlock.sh` wrapper for external tools and editors to honor
+  the same per-repo `flock` sentinel mcp-agent-mail uses in-process.
+- `am doctor fix-orphan-refs` command (F1/F3): scans for refs orphaned by the
+  2.51.0 index race and can prune or archive them with `--dry-run` / `--apply`.
+- Selected hot-path git operations migrated from shell-out to libgit2 (C2/C3/C4/C7)
+  with a parity harness (`C5` removes the legacy `read-tree` path).
+- Auto-repack schedule (F4) + B5 wrappers + D1/D2 lint guards against adding new
+  un-wrapped git shell-outs.
+- Docs: A6 baseline script, H2 verification runbook, README "Known-bad git
+  versions" table, AGENTS.md external-git coordination section.
+
+### ATC Learning Loop (`br-bn0vb` epic)
+
+- v17 schema surface (`br-bn0vb.28`): additive migrations for the ATC leader-lease
+  table, ATC privacy classification columns on `atc_experiences`, and rollup
+  snapshot metadata storage. Upgrade tests prove fresh/latest convergence, pre-v17
+  row preservation with default backfill, and archive reconstruction coverage.
+- v22 compacted-history baseline columns so post-retention refreshes keep their
+  stratum stats intact (`br-bn0vb`).
+- Live snapshot wiring: `am robot atc` (`br-bn0vb.12`), TUI ATC screens
+  (`br-bn0vb.13`), and E2E learning-loop closure tests (`br-bn0vb.14`).
+- Retention + replay APIs (`br-bn0vb.5`), retention soak harness (`br-bn0vb.16`),
+  `am atc explain` decision debugger (`br-bn0vb.30`), and `am atc simulate`
+  dry-run CLI (`br-bn0vb.31`).
+- Build-slot ATC observations wired (`br-bn0vb.8`); rollout disclaimer retired
+  (`br-bn0vb.17`).
+
+### TUI UX (`br-bb0gt` epic)
+
+- Context-aware TUI help surfaces (`br-bb0gt.2`).
+- Agent health scoring surfaces in the TUI (`br-bb0gt.5`).
+- Feature flag registry scaffolding (`br-bb0gt.3`).
+- Cross-epic E2E integration suite (`br-bb0gt.4`).
+
+### MCP Protocol + E2E Coverage
+
+- MCP protocol compliance coverage added (`br-a2k3h.8`).
+- E2E harness fails fast when the server binary build fails (`br-blnuh`).
+- Cross-epic integration suite added (`br-bb0gt.4`).
+
+### Review Sweeps (r1 → r5)
+
+- **review-r1**: 3 clippy lints across core + server; histogram metric helper
+  hardening; 5 surface findings.
+- **review-r2**: clock skew + poison recovery in ATC event log; stale ATC resolve
+  rejection; agent-scoped ATC conflict focus.
+- **review-r3**: reservation outcome eviction per-agent fallback cache; ambiguous
+  TUI snapshot backfill fix; hide unrelated focused ATC rows; sweep-complete
+  lint/style/test polish.
+- **review-r4**: null share config treated as missing; malformed share bundle
+  config rejected; root commits included in guard pre-push checks; skew-protected
+  core timestamps; drop-close regression test for queries; mailbox verdict
+  formatting.
+- **review-r5**: saturating_sub on commit-time delta; contact TTL clamp +
+  warn-on-clamp in renew; ShadowMetrics latency-delta arithmetic hardened;
+  robot timestamp math hardened; mcp-agent-mail-server clippy backlog cleared.
+
+### Bug Fixes
+
+- **Storage** — `ref_category` no longer misclassifies `refs/stashy/*` as
+  `SafeToPrune` (5b3b01c3). `SAFE_PREFIXES` was missing the trailing slash on
+  `"refs/stash"`, so non-standard refs like `refs/stashy/foo` or
+  `refs/stash-backup` could be auto-pruned by `am doctor fix-orphan-refs --apply`.
+- **CLI + guard + core** — zombie-leak / SIGSEGV retry tail (bfc2d913, 5ba093de,
+  b697c1be, 057fdde0). Three separate paths in the doctor git-version prober,
+  pre-push hook handler, and guard backoff were reaping children on normal exit
+  but leaking on `try_wait` / stdin-write error paths. All now force-reap before
+  propagating the error. Jitter formula + doc comments aligned.
+- **DB** — probe paths now treat WAL-recovery errors as retryable-unhealthy
+  rather than hard errors (16cbc162); benign WAL-too-small no longer flips the
+  verdict to Broken (67116e6a).
+- **Core + server + CLI** — pipe-deadlock drain fix, doctor-orphan-refs rotation
+  ordering, startup port probe hardening, DB agent-visibility probe, git 2.51.x
+  distro-variant detection (ac012b0d).
+- **Server** — bounded backup rotation; narrow test-fixture path guard;
+  cargo-test-harness predicate (61609559).
+- **Atc-rollup** — preserve compacted baseline fields across the canonical
+  snapshot payload (3f378dfb); use `AtcRollupSnapshotRow` + full compacted-baseline
+  columns on restore upsert (d4ad92b3); silence rollup-refresh WARN spam
+  (01a2e7c5).
+- **DbConnGuard sweep** — wrap on-demand DB connections across mail-ui TUI poller
+  (003df507), ATC tool-metrics/tools/resources probes (076992a3), mcp-share deploy
+  quick_check + schema-validation probes (4c12a22f), observability-sync drops
+  (a2493b11), and mailbox-verdict schema probe (dc6e9856).
+- **Mailbox verdict** — decisive corruption beats recovery-lock precedence in
+  `compute_state_from_probes` (94ddf38d); archive-backed empty schemas detected
+  in fast mode via `ArchiveStatePresence` (0d3e19b4).
+- **TUI messages** — autogenerated coordination messages (file reservations,
+  contact requests, system notifications) hidden by default (a8fe7358).
+- **Metrics** — `tantivy_last_update_us` now uses raw wall-clock, not the
+  skew-protected clock (143c067a).
+- **Setup** — propagate CSPRNG failures instead of silently returning empty or
+  panicking tokens (57120a21).
+- **Health** — `/health` body distinguishes recovering from corrupt (f49ffb65);
+  `/health/durability` regression net added (36fdaed6).
+- **Service** — systemd restart on re-install so the new unit takes effect
+  (582b6ccd); macOS launchd `ThrottleInterval=30` to match systemd `RestartSec`
+  (28bb678c).
+- **Install** — capture service status output unconditionally in readiness-check
+  failure path (5c07bb28); thread bearer token through `setup_claude_code_mcp_via_cli`
+  (fb8d372d); clarify Claude Code vs Claude Desktop candidate-scan comment (e0607707).
+
 ### Performance
 
-- **Archive batch write performance fixed** (`br-8qdh0.6`). Warm `batch-100` message writes now measure `238.053ms` p95 and `241.759ms` p99, improving the README historical baseline from roughly `1076ms` p95 to an under-budget steady-state path.
+- **Archive batch write performance fixed** (`br-8qdh0.6`). Warm `batch-100`
+  message writes now measure ~238ms p95 and ~242ms p99, improving the README
+  historical baseline from roughly 1076ms p95 to an under-budget steady-state path.
+- **Archive read path baselines characterized** (`br-8qdh0.13`).
+- Artifacts: perf baselines refreshed from the 2026-04-18 rerun (e6bf19ac);
+  legacy archive-baseline, flamegraph, and extended-dim perf files untracked
+  (1603412b).
 
 ### Documentation
 
-- **Documentation alignment sweep completed** (`br-o217s.7`). Final consistency checks removed stale count phrasing from the operator docs, updated the rollout playbook to the current 37-tool / 25-resource surface, clarified legacy incident notes as pre-16-screen historical artifacts, and kept the conformance audit/README aligned with the live router.
-- **Reality-check epilogue completed** (`br-ldpdv`). Re-ran the post-epic audit against the live repo surface, confirmed the five original reality-check epics are closed, fixed deferred-browser doc drift so `/mail/ws-state` stays documented as a supported robot/TUI polling endpoint while `/web-dashboard/*` and `/mail/ws-input` remain deferred, and found no new untracked gap category.
-
-### Database
-
-- **ATC v17 schema surface reserved and tested** (`br-bn0vb.28`). Added additive `v17_*` migrations for the ATC leader-lease table, ATC privacy classification columns on `atc_experiences`, and rollup snapshot metadata storage. Upgrade coverage now proves fresh/latest convergence, pre-v17 row preservation with default backfill, DB-level privacy-classification constraints, and archive reconstruction of the new schema surface.
+- **Documentation alignment sweep completed** (`br-o217s.7`). Final consistency
+  checks removed stale count phrasing from the operator docs, updated the
+  rollout playbook to the current 37-tool / 25-resource surface, clarified
+  legacy incident notes as pre-16-screen historical artifacts, and kept the
+  conformance audit/README aligned with the live router.
+- **Reality-check epilogue completed** (`br-ldpdv`). Re-ran the post-epic audit
+  against the live repo surface, confirmed the five original reality-check epics
+  are closed, fixed deferred-browser doc drift so `/mail/ws-state` stays
+  documented as a supported robot/TUI polling endpoint while `/web-dashboard/*`
+  and `/mail/ws-input` remain deferred.
 
 ### Deferred
 
-- **Browser TUI mirror and WASM frontend deferred** (br-il53l). After evaluating the
-  ship-or-retire decision (br-il53l.1), the browser TUI mirror (`/web-dashboard/*`,
-  `/mail/ws-input`) and the standalone `mcp-agent-mail-wasm` crate
-  are deferred indefinitely. All six browser-mirror HTTP endpoints now return
-  `501 Not Implemented` with a pointer to `docs/SPEC-browser-parity-contract-deferred.md`.
-  The shared `/mail/ws-state` polling endpoint remains live for robot/TUI snapshot
-  consumers and should not be treated as proof that browser parity shipped.
-  The underlying modules (`tui_ws_state.rs`, `tui_ws_input.rs`, `tui_web_dashboard.rs`)
-  remain in the codebase and are tested at the module level, so the feature can be
-  re-enabled when the browser parity contract is finalized.
-  - The `mcp-agent-mail-wasm` crate has been moved to `experimental/` and removed from
-    workspace members.
-  - README: "Browser State Sync Endpoint" section removed; "Web Dashboard" section
-    replaced with deferred notice.
-  - AGENTS.md: WASM mentions removed from shipped-surface claims.
-  - Commits: 087df379, 550f808f, 63abfcd4, 938dba54.
+- **Browser TUI mirror and WASM frontend deferred** (`br-il53l`). After
+  evaluating the ship-or-retire decision (br-il53l.1), the browser TUI mirror
+  (`/web-dashboard/*`, `/mail/ws-input`) and the standalone
+  `mcp-agent-mail-wasm` crate are deferred indefinitely. All six browser-mirror
+  HTTP endpoints now return `501 Not Implemented` with a pointer to
+  `docs/SPEC-browser-parity-contract-deferred.md`. The shared `/mail/ws-state`
+  polling endpoint remains live for robot/TUI snapshot consumers and should not
+  be treated as proof that browser parity shipped.
+  - The `mcp-agent-mail-wasm` crate has been moved to `experimental/` and
+    removed from workspace members.
+
+### Style / Internals
+
+- Cargo fmt + `const fn` / `#[must_use]` hardening sweep across core, server,
+  tools (fd72998e).
+- `db/atc_queries` rustfmt + naming consistency pass across the rollup hot path
+  (df9b1492).
+- `.gitignore` narrowed `test_*.rs` re-include and added `atc-bench` /
+  `target-local` / `target-review` dirs (bfbb2cb7).
+
+---
+
+## [v0.2.45](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.2.45) — 2026-04-18 **[Release]**
+
+Re-pin of `asupersync` to commit 310ff61f and version bump. See compare view for the
+full content delta against v0.2.42.
+
+---
+
+## [v0.2.43](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.2.43) — 2026-04-17 **[Tag only]**
+
+## [v0.2.44](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.2.44) — 2026-04-18 **[Tag only]**
 
 ---
 
