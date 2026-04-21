@@ -4645,12 +4645,20 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
         let pat_activity = if let Some(val) = pattern_activity_cache.get(&row.path_pattern) {
             val.clone()
         } else {
-            let computed = reservation_compute_pattern_activity(
-                workspace.as_deref(),
-                repo_root,
-                workspace_rel,
-                &row.path_pattern,
-            );
+            let path_pattern = row.path_pattern.clone();
+            let workspace_clone = workspace.as_deref().map(std::path::PathBuf::from);
+            let repo_root_clone = repo_root.map(std::path::PathBuf::from);
+            let workspace_rel_clone = workspace_rel.map(std::path::PathBuf::from);
+
+            let computed = asupersync::runtime::spawn_blocking(move || {
+                reservation_compute_pattern_activity(
+                    workspace_clone.as_deref(),
+                    repo_root_clone.as_deref(),
+                    workspace_rel_clone.as_deref(),
+                    &path_pattern,
+                )
+            })
+            .await;
             pattern_activity_cache.insert(row.path_pattern.clone(), computed.clone());
             computed
         };
