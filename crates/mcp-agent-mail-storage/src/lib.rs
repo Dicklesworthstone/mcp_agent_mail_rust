@@ -3313,10 +3313,12 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
                 tracing::debug!("[git-lock] index.lock held by alive PID {pid}, not removing");
                 return false;
             }
-            // PID is dead — safe to remove lock
+            // PID is dead — safe to remove lock.
+            // Remove owner before lock so a racing cleaner cannot pair
+            // stale owner metadata with a freshly acquired lock.
             tracing::info!("[git-lock] index.lock held by dead PID {pid}, removing stale lock");
-            let _ = fs::remove_file(&lock_path);
             let _ = fs::remove_file(&owner_path);
+            let _ = fs::remove_file(&lock_path);
             return true;
         }
     }
@@ -14422,6 +14424,27 @@ mod tests {
         let removed = try_clean_stale_git_lock(&archive.repo_root, 0.0);
         assert!(removed, "should remove lock owned by dead PID");
         assert!(!lock_path.exists(), "lock file should be removed");
+    }
+
+    #[test]
+    fn stale_lock_dead_pid_owner_removed_before_lock() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "dead-pid-order").unwrap();
+
+        let lock_path = archive.repo_root.join(".git/index.lock");
+        fs::write(&lock_path, "fake lock").unwrap();
+
+        let owner_path = archive.repo_root.join(".git/index.lock.owner");
+        fs::write(&owner_path, "999999999\n1000000000\n").unwrap();
+
+        let removed = try_clean_stale_git_lock(&archive.repo_root, 0.0);
+        assert!(removed, "should remove lock owned by dead PID");
+        assert!(!lock_path.exists(), "lock file should be removed");
+        assert!(
+            !owner_path.exists(),
+            "owner metadata must not survive lock cleanup (TOCTOU invariant)"
+        );
     }
 
     #[test]

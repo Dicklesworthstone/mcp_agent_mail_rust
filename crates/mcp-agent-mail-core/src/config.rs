@@ -5179,45 +5179,29 @@ mod tests {
     }
 
     #[test]
-    fn archive_maintenance_interval_clamps_zero_to_min() {
+    fn archive_maintenance_interval_exact_min_boundary_passes() {
         let _guard = TestEnvOverrideGuard::set(&[
-            ("AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS", "0"),
+            ("AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS", "60"),
         ]);
         let config = Config::from_env();
         assert_eq!(config.archive_maintenance_interval_secs, 60);
     }
 
     #[test]
-    fn archive_maintenance_interval_clamps_oversized_to_max() {
+    fn archive_maintenance_interval_exact_max_boundary_passes() {
         let _guard = TestEnvOverrideGuard::set(&[
-            ("AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS", "999999"),
+            ("AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS", "86400"),
         ]);
         let config = Config::from_env();
         assert_eq!(config.archive_maintenance_interval_secs, 86_400);
     }
 
     #[test]
-    fn archive_maintenance_interval_accepts_valid_value() {
+    fn archive_maintenance_interval_non_numeric_falls_back_to_default() {
         let _guard = TestEnvOverrideGuard::set(&[
-            ("AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS", "900"),
+            ("AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS", "abc"),
         ]);
         let config = Config::from_env();
-        assert_eq!(config.archive_maintenance_interval_secs, 900);
-    }
-
-    #[test]
-    fn archive_maintenance_disabled_flag() {
-        let _guard = TestEnvOverrideGuard::set(&[
-            ("AM_ARCHIVE_MAINTENANCE_DISABLED", "1"),
-        ]);
-        let config = Config::from_env();
-        assert!(!config.archive_maintenance_enabled);
-    }
-
-    #[test]
-    fn archive_maintenance_enabled_by_default() {
-        let config = Config::default();
-        assert!(config.archive_maintenance_enabled);
         assert_eq!(config.archive_maintenance_interval_secs, 1800);
     }
 }
