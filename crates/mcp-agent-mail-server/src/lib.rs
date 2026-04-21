@@ -4121,6 +4121,14 @@ fn configured_dispatch_hard_grace_secs() -> u64 {
 
 type SharedPermit = Arc<Mutex<Option<DispatchPermit>>>;
 
+struct SharedPermitGuard(SharedPermit);
+
+impl Drop for SharedPermitGuard {
+    fn drop(&mut self) {
+        drop(self.0.lock().unwrap_or_else(|e| e.into_inner()).take());
+    }
+}
+
 async fn run_cancellable_blocking_dispatch<T, F>(
     method: String,
     dispatch_timeout_secs: u64,
@@ -4137,7 +4145,7 @@ where
     let closure_permit = Arc::clone(&shared_permit);
     let spawn_future =
         asupersync::runtime::spawn_blocking(move || {
-            let _permit_guard = closure_permit;
+            let _permit_guard = SharedPermitGuard(closure_permit);
             work(worker_cancel)
         });
 
@@ -10153,13 +10161,12 @@ to skip auth for local requests.</p>
         let dispatch_timeout_secs = self.request_timeout_secs;
         let dispatch_cx = self.request_cx();
         let worker_cx = dispatch_cx.clone();
-        let shared_permit: SharedPermit = Arc::new(Mutex::new(Some(permit)));
         let result = run_cancellable_blocking_dispatch(
             method.clone(),
             dispatch_timeout_secs,
             dispatch_cx,
             DispatchCancel::new(),
-            Arc::clone(&shared_permit),
+            Arc::new(Mutex::new(Some(permit))),
             move |cancel| {
                 arc_self.dispatch_inner_with_cx(request, &worker_cx, &cancel)
             },
@@ -14706,13 +14713,12 @@ mod tests {
         let cancel_observed_worker = Arc::clone(&cancel_observed);
         let release_worker_clone = Arc::clone(&release_worker);
 
-        let shared_permit: SharedPermit = Arc::new(Mutex::new(Some(permit)));
         let result: Result<(), McpError> = block_on(run_cancellable_blocking_dispatch(
             "test/permit-lifetime".to_string(),
             1,
             Cx::for_request_with_budget(Budget::INFINITE),
             DispatchCancel::new(),
-            Arc::clone(&shared_permit),
+            Arc::new(Mutex::new(Some(permit))),
             move |cancel| {
                 loop {
                     if cancel.is_requested() {
@@ -14761,22 +14767,21 @@ mod tests {
     #[test]
     fn dispatch_hard_grace_force_releases_permit_when_closure_ignores_cancel() {
         mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[("AM_DISPATCH_HARD_GRACE_SECS", "2")],
+            &[("AM_DISPATCH_HARD_GRACE_SECS", "5")],
             || {
                 let permit = DispatchPermit::try_acquire().expect("permit available");
                 let before = DISPATCH_INFLIGHT.load(Ordering::Relaxed);
                 assert!(before >= 1);
 
-                let shared_permit: SharedPermit = Arc::new(Mutex::new(Some(permit)));
                 let result: Result<(), McpError> = block_on(run_cancellable_blocking_dispatch(
                     "test/zombie-closure".to_string(),
                     1,
                     Cx::for_request_with_budget(Budget::INFINITE),
                     DispatchCancel::new(),
-                    Arc::clone(&shared_permit),
+                    Arc::new(Mutex::new(Some(permit))),
                     move |_cancel| {
                         // Deliberately ignore cancellation — simulate a stuck closure.
-                        std::thread::sleep(Duration::from_secs(60));
+                        std::thread::sleep(Duration::from_secs(10));
                         Ok(())
                     },
                 ));
@@ -14790,10 +14795,10 @@ mod tests {
                     "permit must remain held during grace window"
                 );
 
-                // Wait for the hard grace timeout (2s) + epsilon.
+                // Wait for the hard grace timeout (5s) + epsilon.
                 let wait_started = Instant::now();
                 while DISPATCH_INFLIGHT.load(Ordering::Relaxed) >= before
-                    && wait_started.elapsed() < Duration::from_secs(5)
+                    && wait_started.elapsed() < Duration::from_secs(7)
                 {
                     std::thread::sleep(Duration::from_millis(50));
                 }
