@@ -12130,6 +12130,7 @@ fn handle_self_update_check_result(result: &UpdateCheckResult) -> CliResult<()> 
 fn memory_sink_bytes(sink: StreamingSink) -> Vec<u8> {
     match sink {
         StreamingSink::Memory(buf) => buf,
+        StreamingSink::MemoryWithLimit(buf, _, _) => buf,
         StreamingSink::File(_) => unreachable!("test constructed a memory sink"),
     }
 }
@@ -12198,6 +12199,9 @@ const DOWNLOAD_PROGRESS_INTERVAL: u64 = 5 * 1024 * 1024;
 enum StreamingSink {
     /// Collect the response into an in-memory buffer.
     Memory(Vec<u8>),
+    /// Collect into memory with an explicit cap for archive formats that
+    /// require a seekable in-memory reader.
+    MemoryWithLimit(Vec<u8>, u64, &'static str),
     /// Write the response incrementally to an on-disk file.
     File(std::fs::File),
 }
@@ -12206,6 +12210,7 @@ impl StreamingSink {
     fn max_bytes(&self) -> u64 {
         match self {
             Self::Memory(_) => MAX_METADATA_BYTES,
+            Self::MemoryWithLimit(_, max_bytes, _) => *max_bytes,
             Self::File(_) => MAX_RELEASE_ARCHIVE_BYTES,
         }
     }
@@ -12213,13 +12218,14 @@ impl StreamingSink {
     fn cap_label(&self) -> &'static str {
         match self {
             Self::Memory(_) => "metadata download",
+            Self::MemoryWithLimit(_, _, cap_label) => cap_label,
             Self::File(_) => "release asset",
         }
     }
 
     fn write_all(&mut self, data: &[u8]) -> Result<(), String> {
         match self {
-            Self::Memory(buf) => {
+            Self::Memory(buf) | Self::MemoryWithLimit(buf, _, _) => {
                 buf.extend_from_slice(data);
                 Ok(())
             }
@@ -12369,7 +12375,17 @@ fn download_file_sync(url: &str) -> Result<Vec<u8>, String> {
     download_streaming(url, &mut sink, false)?;
     match sink {
         StreamingSink::Memory(buf) => Ok(buf),
-        StreamingSink::File(_) => unreachable!("sink was constructed as Memory"),
+        _ => unreachable!("sink was constructed as Memory"),
+    }
+}
+
+fn download_archive_memory_sync(url: &str) -> Result<Vec<u8>, String> {
+    let mut sink =
+        StreamingSink::MemoryWithLimit(Vec::new(), MAX_RELEASE_ARCHIVE_BYTES, "release asset");
+    download_streaming(url, &mut sink, true)?;
+    match sink {
+        StreamingSink::MemoryWithLimit(buf, _, _) => Ok(buf),
+        _ => unreachable!("sink was constructed as MemoryWithLimit"),
     }
 }
 
@@ -12558,7 +12574,7 @@ fn download_and_verify_release(version: &str) -> Result<DownloadedRelease, Strin
         // so in-memory buffering is still fine here. The streaming
         // download path still applies — it just writes into a Vec<u8>
         // without the old 16 MiB cap.
-        let archive_data = download_file_sync(&asset_url)?;
+        let archive_data = download_archive_memory_sync(&asset_url)?;
         ftui_runtime::ftui_eprintln!("Downloaded {} bytes", archive_data.len());
         if !verify_sha256(&archive_data, &expected_hash) {
             return Err(
@@ -54300,6 +54316,14 @@ fn self_update_metadata_sink_rejects_oversize_before_extending_vec() {
         "chunk must not be appended after the metadata cap is exceeded"
     );
     assert!(MAX_METADATA_BYTES <= 16 * 1024 * 1024);
+}
+
+#[test]
+fn self_update_archive_memory_sink_keeps_release_cap() {
+    let sink =
+        StreamingSink::MemoryWithLimit(Vec::new(), MAX_RELEASE_ARCHIVE_BYTES, "release asset");
+    assert_eq!(sink.max_bytes(), MAX_RELEASE_ARCHIVE_BYTES);
+    assert_eq!(sink.cap_label(), "release asset");
 }
 
 #[test]
