@@ -4108,11 +4108,25 @@ fn dispatch_timeout_error(method: &str, dispatch_timeout_secs: u64) -> McpError 
     )
 }
 
+const DEFAULT_DISPATCH_HARD_GRACE_SECS: u64 = 30;
+const MIN_DISPATCH_HARD_GRACE_SECS: u64 = 5;
+const MAX_DISPATCH_HARD_GRACE_SECS: u64 = 300;
+
+fn configured_dispatch_hard_grace_secs() -> u64 {
+    mcp_agent_mail_core::config::env_value("AM_DISPATCH_HARD_GRACE_SECS")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_DISPATCH_HARD_GRACE_SECS)
+        .clamp(MIN_DISPATCH_HARD_GRACE_SECS, MAX_DISPATCH_HARD_GRACE_SECS)
+}
+
+type SharedPermit = Arc<Mutex<Option<DispatchPermit>>>;
+
 async fn run_cancellable_blocking_dispatch<T, F>(
     method: String,
     dispatch_timeout_secs: u64,
     dispatch_cx: Cx,
     cancel: DispatchCancel,
+    shared_permit: SharedPermit,
     work: F,
 ) -> Result<T, McpError>
 where
@@ -4120,7 +4134,12 @@ where
     F: FnOnce(DispatchCancel) -> Result<T, McpError> + Send + 'static,
 {
     let worker_cancel = cancel.clone();
-    let spawn_future = asupersync::runtime::spawn_blocking(move || work(worker_cancel));
+    let closure_permit = Arc::clone(&shared_permit);
+    let spawn_future =
+        asupersync::runtime::spawn_blocking(move || {
+            let _permit_guard = closure_permit;
+            work(worker_cancel)
+        });
 
     if dispatch_timeout_secs == 0 {
         return spawn_future.await;
@@ -4137,10 +4156,36 @@ where
         Ok(inner) => inner,
         Err(_elapsed) => {
             cancel.request(&dispatch_cx);
+
+            let grace_secs = configured_dispatch_hard_grace_secs();
+            let grace_permit = Arc::clone(&shared_permit);
+            let grace_method = method.clone();
+            std::thread::Builder::new()
+                .name("dispatch-hard-grace".into())
+                .spawn(move || {
+                    std::thread::sleep(Duration::from_secs(grace_secs));
+                    if let Some(permit) = grace_permit
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                    {
+                        tracing::error!(
+                            method = %grace_method,
+                            grace_secs,
+                            "hard grace timeout: force-releasing dispatch permit for \
+                             zombie blocking work that ignored cancellation"
+                        );
+                        drop(permit);
+                    }
+                })
+                .ok();
+
             tracing::error!(
                 method = %method,
                 dispatch_timeout_secs,
-                "dispatch spawn_blocking timed out; cancellation requested for blocking work"
+                grace_secs,
+                "dispatch spawn_blocking timed out; cancellation requested, \
+                 permit will be force-released after {grace_secs}s grace"
             );
             Err(dispatch_timeout_error(&method, dispatch_timeout_secs))
         }
@@ -10108,13 +10153,14 @@ to skip auth for local requests.</p>
         let dispatch_timeout_secs = self.request_timeout_secs;
         let dispatch_cx = self.request_cx();
         let worker_cx = dispatch_cx.clone();
+        let shared_permit: SharedPermit = Arc::new(Mutex::new(Some(permit)));
         let result = run_cancellable_blocking_dispatch(
             method.clone(),
             dispatch_timeout_secs,
             dispatch_cx,
             DispatchCancel::new(),
+            Arc::clone(&shared_permit),
             move |cancel| {
-                let _permit = permit; // hold permit until blocking work finishes
                 arc_self.dispatch_inner_with_cx(request, &worker_cx, &cancel)
             },
         )
@@ -14660,13 +14706,14 @@ mod tests {
         let cancel_observed_worker = Arc::clone(&cancel_observed);
         let release_worker_clone = Arc::clone(&release_worker);
 
+        let shared_permit: SharedPermit = Arc::new(Mutex::new(Some(permit)));
         let result: Result<(), McpError> = block_on(run_cancellable_blocking_dispatch(
             "test/permit-lifetime".to_string(),
             1,
             Cx::for_request_with_budget(Budget::INFINITE),
             DispatchCancel::new(),
+            Arc::clone(&shared_permit),
             move |cancel| {
-                let _permit = permit;
                 loop {
                     if cancel.is_requested() {
                         cancel_observed_worker.store(true, Ordering::Release);
@@ -14708,6 +14755,54 @@ mod tests {
             DISPATCH_INFLIGHT.load(Ordering::Relaxed),
             before - 1,
             "permit must release after the cancelled blocking work exits"
+        );
+    }
+
+    #[test]
+    fn dispatch_hard_grace_force_releases_permit_when_closure_ignores_cancel() {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_DISPATCH_HARD_GRACE_SECS", "2")],
+            || {
+                let permit = DispatchPermit::try_acquire().expect("permit available");
+                let before = DISPATCH_INFLIGHT.load(Ordering::Relaxed);
+                assert!(before >= 1);
+
+                let shared_permit: SharedPermit = Arc::new(Mutex::new(Some(permit)));
+                let result: Result<(), McpError> = block_on(run_cancellable_blocking_dispatch(
+                    "test/zombie-closure".to_string(),
+                    1,
+                    Cx::for_request_with_budget(Budget::INFINITE),
+                    DispatchCancel::new(),
+                    Arc::clone(&shared_permit),
+                    move |_cancel| {
+                        // Deliberately ignore cancellation — simulate a stuck closure.
+                        std::thread::sleep(Duration::from_secs(60));
+                        Ok(())
+                    },
+                ));
+
+                assert!(result.is_err(), "dispatch timeout must return an error");
+
+                // Permit should still be held immediately after timeout (grace not expired).
+                assert_eq!(
+                    DISPATCH_INFLIGHT.load(Ordering::Relaxed),
+                    before,
+                    "permit must remain held during grace window"
+                );
+
+                // Wait for the hard grace timeout (2s) + epsilon.
+                let wait_started = Instant::now();
+                while DISPATCH_INFLIGHT.load(Ordering::Relaxed) >= before
+                    && wait_started.elapsed() < Duration::from_secs(5)
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                assert_eq!(
+                    DISPATCH_INFLIGHT.load(Ordering::Relaxed),
+                    before - 1,
+                    "hard grace timeout must force-release the permit"
+                );
+            },
         );
     }
 
@@ -17895,11 +17990,13 @@ first body
         let cx_observer = cx.clone();
 
         let started = Instant::now();
+        let no_permit: SharedPermit = Arc::new(Mutex::new(None));
         let result: Result<(), McpError> = block_on(run_cancellable_blocking_dispatch(
             "test/long-running-dispatch".to_string(),
             1,
             cx,
             DispatchCancel::new(),
+            no_permit,
             move |cancel| {
                 let work_started = Instant::now();
                 while work_started.elapsed() < Duration::from_secs(30) {
