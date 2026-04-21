@@ -137,10 +137,7 @@ fn monitor_loop(config: &Config) {
             last_pressure = pressure;
         }
 
-        // Sample memory and attempt post-spike reclaim.
-        // When memory pressure drops from Warning/Critical back to Ok,
-        // call malloc_trim to release retained allocator pages to the OS.
-        // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/15
+        // Sample memory and report pressure transitions.
         let mem_sample = mcp_agent_mail_core::memory::sample_and_record(config);
         let mem_pressure = mem_sample.pressure;
         if last_memory_pressure != mem_pressure {
@@ -150,18 +147,6 @@ fn monitor_loop(config: &Config) {
                 rss_bytes = mem_sample.rss_bytes,
                 "memory pressure level changed"
             );
-
-            // Reclaim when dropping from higher pressure down to Ok.
-            if mem_pressure == mcp_agent_mail_core::memory::MemoryPressure::Ok {
-                #[cfg(target_os = "linux")]
-                {
-                    tracing::info!("memory pressure returned to Ok; triggering malloc_trim");
-                    // SAFETY: malloc_trim(0) is thread-safe and safe to call.
-                    unsafe {
-                        nix::libc::malloc_trim(0);
-                    }
-                }
-            }
         }
         last_memory_pressure = mem_pressure;
     }
