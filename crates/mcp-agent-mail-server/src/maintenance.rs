@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
@@ -23,6 +23,7 @@ static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
 
 const STARTUP_DELAY_SECS: u64 = 15;
 const MIN_INTERVAL_SECS: u64 = 60;
+const MAINTENANCE_COMMAND_TIMEOUT_SECS: u64 = 20 * 60;
 
 #[derive(Debug, Clone, Default)]
 pub struct MaintenanceReport {
@@ -196,6 +197,7 @@ pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
 
     // Poll the child process, checking for shutdown signal so we don't
     // block server exit if git maintenance hangs.
+    let started = Instant::now();
     let output = loop {
         match child.try_wait() {
             Ok(Some(_status)) => break child.wait_with_output(),
@@ -208,6 +210,19 @@ pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
                         pack_count_before: pack_before,
                         disk_bytes_before: disk_before,
                         error: Some("interrupted by shutdown".to_string()),
+                        ..Default::default()
+                    };
+                }
+                if started.elapsed() >= Duration::from_secs(MAINTENANCE_COMMAND_TIMEOUT_SECS) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return MaintenanceReport {
+                        loose_before,
+                        pack_count_before: pack_before,
+                        disk_bytes_before: disk_before,
+                        error: Some(format!(
+                            "timed out after {MAINTENANCE_COMMAND_TIMEOUT_SECS}s"
+                        )),
                         ..Default::default()
                     };
                 }
