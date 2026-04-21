@@ -159,6 +159,12 @@ clippy.log
 clippy_output.*
 clippy_out.*
 
+# Agent-generated git-log / diff scratch dumps at repo root
+# (captured by agents for analysis; never meant to be tracked)
+/git_log*.txt
+/.git_log*.txt
+/diffs*.txt
+
 # SQLite memory-mode test DB files (leaked by in-memory URI tests)
 crates/mcp-agent-mail-db/file:*
 
