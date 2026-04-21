@@ -77,6 +77,7 @@ mod cleanup;
 pub mod console;
 mod disk_monitor;
 mod integrity_guard;
+pub mod maintenance;
 mod mail_ui;
 mod markdown;
 mod retention;
@@ -1288,6 +1289,7 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
 
     integrity_guard::start(config);
     disk_monitor::start(config);
+    maintenance::start(config);
     mcp_agent_mail_storage::wbq_start();
 
     // Initialize the Air Traffic Controller engine for proactive agent coordination.
@@ -1323,6 +1325,7 @@ pub fn run_stdio(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
         stop_atc_operator_runtime();
         integrity_guard::shutdown();
         disk_monitor::shutdown();
+        maintenance::shutdown();
         mcp_agent_mail_storage::wbq_shutdown();
         mcp_agent_mail_storage::flush_async_commits();
         Ok(())
@@ -2588,6 +2591,7 @@ fn start_tui_db_background_workers(config: &mcp_agent_mail_core::Config) {
     ack_ttl::start(config);
     tool_metrics::start(config);
     retention::start(config);
+    maintenance::start(config);
     if config.integrity_check_on_startup {
         integrity_guard::defer_next_proactive_backup();
     }
@@ -2770,6 +2774,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     ack_ttl::start(config);
     tool_metrics::start(config);
     retention::start(config);
+    maintenance::start(config);
     integrity_guard::start(config);
     disk_monitor::start(config);
     start_advisory_consistency_probe(config);
@@ -2789,6 +2794,7 @@ pub fn run_http(config: &mcp_agent_mail_core::Config) -> std::io::Result<()> {
     cleanup::shutdown();
     integrity_guard::shutdown();
     disk_monitor::shutdown();
+    maintenance::shutdown();
     stop_atc_operator_runtime();
     mcp_agent_mail_storage::wbq_shutdown();
     mcp_agent_mail_storage::flush_async_commits();
@@ -2928,6 +2934,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
         cleanup::shutdown();
         integrity_guard::shutdown();
         disk_monitor::shutdown();
+        maintenance::shutdown();
         stop_atc_operator_runtime();
         mcp_agent_mail_storage::wbq_shutdown();
         mcp_agent_mail_storage::flush_async_commits();
@@ -2953,6 +2960,7 @@ pub fn run_http_with_tui(config: &mcp_agent_mail_core::Config) -> std::io::Resul
     cleanup::shutdown();
     integrity_guard::shutdown();
     disk_monitor::shutdown();
+    maintenance::shutdown();
     stop_atc_operator_runtime();
     mcp_agent_mail_storage::wbq_shutdown();
     mcp_agent_mail_storage::flush_async_commits();

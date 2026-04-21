@@ -154,6 +154,10 @@ pub struct Config {
     pub disk_space_fatal_mb: u64,
     pub disk_space_check_interval_seconds: u64,
 
+    // Archive git maintenance (background loose-object repack)
+    pub archive_maintenance_enabled: bool,
+    pub archive_maintenance_interval_secs: u64,
+
     // Memory pressure monitoring (RSS-based)
     pub memory_warning_mb: u64,
     pub memory_critical_mb: u64,
@@ -1119,6 +1123,10 @@ impl Default for Config {
             disk_space_fatal_mb: 10,
             disk_space_check_interval_seconds: 60,
 
+            // Archive git maintenance
+            archive_maintenance_enabled: true,
+            archive_maintenance_interval_secs: 1800, // 30 minutes
+
             // Memory pressure monitoring
             memory_warning_mb: 2048,  // 2 GB
             memory_critical_mb: 4096, // 4 GB
@@ -1554,6 +1562,13 @@ impl Config {
         config.disk_space_check_interval_seconds = env_u64(
             "DISK_SPACE_CHECK_INTERVAL_SECONDS",
             config.disk_space_check_interval_seconds,
+        );
+
+        // Archive git maintenance
+        config.archive_maintenance_enabled = !env_truthy("AM_ARCHIVE_MAINTENANCE_DISABLED");
+        config.archive_maintenance_interval_secs = env_u64(
+            "AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS",
+            config.archive_maintenance_interval_secs,
         );
 
         // Memory pressure monitoring

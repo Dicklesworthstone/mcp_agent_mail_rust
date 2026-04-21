@@ -1709,6 +1709,18 @@ pub enum DoctorCommand {
         #[arg(long, value_parser)]
         format: Option<output::CliOutputFormat>,
     },
+
+    /// Run git maintenance (loose-object repack) on the archive repository.
+    ///
+    /// One-shot manual invocation of the same maintenance cycle that runs
+    /// in the background every 30 minutes. Useful after bulk imports or
+    /// incident recovery. Prints before/after stats.
+    #[command(name = "pack-archive")]
+    PackArchive {
+        /// Output JSON (shorthand for machine-readable output).
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -4637,7 +4649,81 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             force,
             format,
         } => handle_doctor_fix_orphan_refs(project, all, apply, force, format),
+        DoctorCommand::PackArchive { json } => handle_doctor_pack_archive(json),
     }
+}
+
+fn handle_doctor_pack_archive(json: bool) -> CliResult<()> {
+    let config = mcp_agent_mail_core::Config::from_env();
+    let git_dir = mcp_agent_mail_server::maintenance::resolve_archive_git_dir(&config)
+        .ok_or_else(|| {
+            CliError::Other(format!(
+                "could not locate archive .git directory under {}",
+                config.storage_root.display()
+            ))
+        })?;
+
+    let report = mcp_agent_mail_server::maintenance::run_maintenance(&git_dir);
+
+    if json {
+        let obj = serde_json::json!({
+            "success": report.success,
+            "git_dir": git_dir.display().to_string(),
+            "loose_before": report.loose_before,
+            "loose_after": report.loose_after,
+            "pack_count_before": report.pack_count_before,
+            "pack_count_after": report.pack_count_after,
+            "disk_bytes_before": report.disk_bytes_before,
+            "disk_bytes_after": report.disk_bytes_after,
+            "error": report.error,
+        });
+        println!("{}", serde_json::to_string_pretty(&obj).unwrap_or_default());
+    } else {
+        if let Some(err) = &report.error {
+            eprintln!("ERROR: {err}");
+        }
+        println!("Archive maintenance: {}", if report.success { "OK" } else { "FAILED" });
+        println!();
+        println!(
+            "  {:>20}  {:>10}  {:>10}",
+            "", "Before", "After"
+        );
+        println!(
+            "  {:>20}  {:>10}  {:>10}",
+            "Loose objects",
+            report.loose_before.map_or("-".to_string(), |v| v.to_string()),
+            report.loose_after.map_or("-".to_string(), |v| v.to_string()),
+        );
+        println!(
+            "  {:>20}  {:>10}  {:>10}",
+            "Pack files",
+            report.pack_count_before.map_or("-".to_string(), |v| v.to_string()),
+            report.pack_count_after.map_or("-".to_string(), |v| v.to_string()),
+        );
+        let fmt_bytes = |b: Option<u64>| -> String {
+            match b {
+                Some(bytes) if bytes >= 1024 * 1024 => format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0)),
+                Some(bytes) if bytes >= 1024 => format!("{:.1} KB", bytes as f64 / 1024.0),
+                Some(bytes) => format!("{bytes} B"),
+                None => "-".to_string(),
+            }
+        };
+        println!(
+            "  {:>20}  {:>10}  {:>10}",
+            "Disk usage",
+            fmt_bytes(report.disk_bytes_before),
+            fmt_bytes(report.disk_bytes_after),
+        );
+        if let (Some(before), Some(after)) = (report.disk_bytes_before, report.disk_bytes_after) {
+            let reclaimed = before.saturating_sub(after);
+            if reclaimed > 0 {
+                println!();
+                println!("  Reclaimed: {}", fmt_bytes(Some(reclaimed)));
+            }
+        }
+    }
+
+    if report.success { Ok(()) } else { Err(CliError::Other("maintenance failed".into())) }
 }
 
 fn handle_guard(action: GuardCommand) -> CliResult<()> {
