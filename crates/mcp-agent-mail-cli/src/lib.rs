@@ -12126,6 +12126,14 @@ fn handle_self_update_check_result(result: &UpdateCheckResult) -> CliResult<()> 
     Ok(())
 }
 
+#[cfg(test)]
+fn memory_sink_bytes(sink: StreamingSink) -> Vec<u8> {
+    match sink {
+        StreamingSink::Memory(buf) => buf,
+        StreamingSink::File(_) => unreachable!("test constructed a memory sink"),
+    }
+}
+
 /// Detect the current platform target triple (mirrors install.sh detect_platform).
 fn detect_platform_target() -> Option<String> {
     let os = std::env::consts::OS;
@@ -12173,6 +12181,15 @@ struct DownloadedRelease {
 /// attacker-controlled mirror trying to exhaust disk/memory).
 const MAX_RELEASE_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Upper bound for small self-update metadata downloads such as
+/// `SHA256SUMS`. The v0.2.46 checksum manifest is 444 bytes, so 4 MiB leaves
+/// large operational headroom without allowing a bad metadata response to
+/// inflate the process RSS toward the release-archive cap.
+const MAX_METADATA_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Initial allocation for small self-update metadata buffers.
+const INITIAL_METADATA_CAPACITY: usize = 1024;
+
 /// Log a download-progress line every N bytes received.
 const DOWNLOAD_PROGRESS_INTERVAL: u64 = 5 * 1024 * 1024;
 
@@ -12186,6 +12203,20 @@ enum StreamingSink {
 }
 
 impl StreamingSink {
+    fn max_bytes(&self) -> u64 {
+        match self {
+            Self::Memory(_) => MAX_METADATA_BYTES,
+            Self::File(_) => MAX_RELEASE_ARCHIVE_BYTES,
+        }
+    }
+
+    fn cap_label(&self) -> &'static str {
+        match self {
+            Self::Memory(_) => "metadata download",
+            Self::File(_) => "release asset",
+        }
+    }
+
     fn write_all(&mut self, data: &[u8]) -> Result<(), String> {
         match self {
             Self::Memory(buf) => {
@@ -12201,16 +12232,37 @@ impl StreamingSink {
     }
 }
 
-/// Stream an HTTP GET response into `sink`, enforcing the release-archive
-/// size cap and emitting progress logs every `DOWNLOAD_PROGRESS_INTERVAL`
-/// bytes when `show_progress` is set (used for the large release tarball,
-/// suppressed for small metadata like `SHA256SUMS`).
+fn write_download_chunk(
+    sink: &mut StreamingSink,
+    data: &[u8],
+    received: &mut u64,
+    max_bytes: u64,
+    cap_label: &str,
+) -> Result<(), String> {
+    *received = received.saturating_add(data.len() as u64);
+    if *received > max_bytes {
+        return Err(format!(
+            "{cap_label} exceeds safety cap of {max_bytes} bytes (got {})",
+            *received
+        ));
+    }
+    sink.write_all(data)
+}
+
+/// Stream an HTTP GET response into `sink`, enforcing the sink-specific size
+/// cap and emitting progress logs every `DOWNLOAD_PROGRESS_INTERVAL` bytes
+/// when `show_progress` is set (used for the large release tarball, suppressed
+/// for small metadata like `SHA256SUMS`).
 ///
 /// Unlike the pre-GH#100 implementation this does NOT buffer the entire
 /// response into memory behind an asupersync `max_body_size` cap — large
 /// downloads stream directly to the sink, so the HTTP client never hits
 /// `body exceeds size limit` for legitimate release artifacts.
-fn download_streaming(url: &str, sink: &mut StreamingSink, show_progress: bool) -> Result<(), String> {
+fn download_streaming(
+    url: &str,
+    sink: &mut StreamingSink,
+    show_progress: bool,
+) -> Result<(), String> {
     use asupersync::bytes::Buf;
     use asupersync::http::{Body, Frame};
     use asupersync::runtime::RuntimeBuilder;
@@ -12220,17 +12272,17 @@ fn download_streaming(url: &str, sink: &mut StreamingSink, show_progress: bool) 
         .map_err(|e| format!("runtime error: {e}"))?;
 
     let url_owned = url.to_string();
+    let max_bytes = sink.max_bytes();
+    let cap_label = sink.cap_label();
 
     rt.block_on(async move {
         let cx = asupersync::Cx::for_testing();
         // Build without an explicit max_body_size: we enforce our own cap
-        // below via `received > MAX_RELEASE_ARCHIVE_BYTES`. Using the
-        // streaming API means the asupersync default 16 MiB cap is not
-        // applied — it only limits the non-streaming `request()` path.
+        // below before writing each chunk to the sink. Using the streaming
+        // API means the asupersync default 16 MiB cap is not applied — it
+        // only limits the non-streaming `request()` path.
         let client = asupersync::http::h1::HttpClient::builder()
-            .max_body_size(
-                usize::try_from(MAX_RELEASE_ARCHIVE_BYTES).unwrap_or(usize::MAX),
-            )
+            .max_body_size(usize::try_from(max_bytes).unwrap_or(usize::MAX))
             .build();
         let headers = vec![
             ("User-Agent".to_string(), "mcp-agent-mail-cli".to_string()),
@@ -12284,14 +12336,7 @@ fn download_streaming(url: &str, sink: &mut StreamingSink, show_progress: bool) 
             while buf.has_remaining() {
                 let chunk = buf.chunk();
                 let len = chunk.len();
-                received = received.saturating_add(len as u64);
-                if received > MAX_RELEASE_ARCHIVE_BYTES {
-                    return Err(format!(
-                        "release asset exceeds safety cap of {} bytes (got {received})",
-                        MAX_RELEASE_ARCHIVE_BYTES
-                    ));
-                }
-                sink.write_all(chunk)?;
+                write_download_chunk(sink, chunk, &mut received, max_bytes, cap_label)?;
                 buf.advance(len);
 
                 if show_progress && received >= next_progress_at {
@@ -12320,7 +12365,7 @@ fn download_streaming(url: &str, sink: &mut StreamingSink, show_progress: bool) 
 /// For the large release tarball, prefer [`download_file_to_path`] which
 /// streams to disk.
 fn download_file_sync(url: &str) -> Result<Vec<u8>, String> {
-    let mut sink = StreamingSink::Memory(Vec::new());
+    let mut sink = StreamingSink::Memory(Vec::with_capacity(INITIAL_METADATA_CAPACITY));
     download_streaming(url, &mut sink, false)?;
     match sink {
         StreamingSink::Memory(buf) => Ok(buf),
@@ -54215,6 +54260,46 @@ fn handle_self_update_check_result_returns_error_on_failed_check() {
     })
     .expect_err("failed update checks should return an error");
     assert!(format!("{err}").contains("update check failed"));
+}
+
+#[test]
+fn self_update_metadata_sink_accepts_normal_sha256sums() {
+    let checksum_body = b"657db4a15791fcdee16d2ad7561972d024325a37fc04e074e18d7d01cc3d8e99  mcp-agent-mail-aarch64-apple-darwin.tar.xz\n";
+    let mut sink = StreamingSink::Memory(Vec::with_capacity(INITIAL_METADATA_CAPACITY));
+    let max_bytes = sink.max_bytes();
+    let cap_label = sink.cap_label();
+    let mut received = 0;
+
+    write_download_chunk(
+        &mut sink,
+        checksum_body,
+        &mut received,
+        max_bytes,
+        cap_label,
+    )
+    .expect("normal checksum metadata should fit under metadata cap");
+
+    assert_eq!(received, checksum_body.len() as u64);
+    assert_eq!(memory_sink_bytes(sink), checksum_body);
+}
+
+#[test]
+fn self_update_metadata_sink_rejects_oversize_before_extending_vec() {
+    let mut sink = StreamingSink::Memory(Vec::with_capacity(INITIAL_METADATA_CAPACITY));
+    let max_bytes = sink.max_bytes();
+    let cap_label = sink.cap_label();
+    let mut received = max_bytes - 1;
+
+    let err = write_download_chunk(&mut sink, b"xy", &mut received, max_bytes, cap_label)
+        .expect_err("metadata over the cap should fail");
+
+    assert!(err.contains("metadata download exceeds safety cap"));
+    assert_eq!(received, max_bytes + 1);
+    assert!(
+        memory_sink_bytes(sink).is_empty(),
+        "chunk must not be appended after the metadata cap is exceeded"
+    );
+    assert!(MAX_METADATA_BYTES <= 16 * 1024 * 1024);
 }
 
 #[test]
