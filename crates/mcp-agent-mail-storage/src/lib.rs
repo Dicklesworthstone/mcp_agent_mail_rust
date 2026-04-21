@@ -13,7 +13,7 @@
 
 pub mod recovery;
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write as IoWrite;
 use std::path::{Component, Path, PathBuf};
@@ -24,14 +24,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use git2::{ErrorCode, IndexAddOption, Repository, Signature};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha1::Digest as Sha1Digest;
 use thiserror::Error;
 
-use mcp_agent_mail_core::{LockLevel, OrderedMutex, OrderedRwLock, config::Config};
+use mcp_agent_mail_core::{
+    LockLevel, OrderedMutex, OrderedRwLock,
+    config::{self, Config},
+};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -1319,8 +1322,39 @@ pub struct CommitQueueStats {
     pub batched: usize,
     pub commits: usize,
     pub avg_batch_size: f64,
+    #[serde(default)]
+    pub batch_size_histogram: BTreeMap<usize, u64>,
     pub queue_size: usize,
     pub errors: usize,
+}
+
+fn record_batch_size_samples(
+    stats: &mut CommitQueueStats,
+    sizes: &mut VecDeque<usize>,
+    batch_size: usize,
+    sample_count: usize,
+) {
+    if batch_size == 0 || sample_count == 0 {
+        return;
+    }
+
+    let added = u64::try_from(sample_count).unwrap_or(u64::MAX);
+    let entry = stats.batch_size_histogram.entry(batch_size).or_insert(0);
+    *entry = entry.saturating_add(added);
+
+    for _ in 0..sample_count {
+        sizes.push_back(batch_size);
+    }
+    while sizes.len() > 100 {
+        sizes.pop_front();
+    }
+
+    let avg = if sizes.is_empty() {
+        0.0
+    } else {
+        sizes.iter().sum::<usize>() as f64 / sizes.len() as f64
+    };
+    stats.avg_batch_size = (avg * 100.0).round() / 100.0;
 }
 
 /// Commit queue that batches multiple commits to reduce git contention.
@@ -1523,17 +1557,7 @@ impl CommitQueue {
         stats.commits += 1;
 
         let mut sizes = self.batch_sizes.lock().unwrap_or_else(|e| e.into_inner());
-        sizes.push_back(batch_size);
-        if sizes.len() > 100 {
-            sizes.pop_front();
-        }
-
-        let avg = if sizes.is_empty() {
-            0.0
-        } else {
-            sizes.iter().sum::<usize>() as f64 / sizes.len() as f64
-        };
-        stats.avg_batch_size = (avg * 100.0).round() / 100.0;
+        record_batch_size_samples(&mut stats, &mut sizes, batch_size, 1);
     }
 
     /// Get queue statistics.
@@ -1584,6 +1608,7 @@ pub fn get_commit_queue() -> &'static OrderedMutex<Option<CommitQueue>> {
 #[derive(Clone)]
 struct CoalescerCommitFields {
     enqueued_at: Instant,
+    enqueued_wall: DateTime<Utc>,
     git_author_name: String,
     git_author_email: String,
     message: String,
@@ -1593,6 +1618,8 @@ struct CoalescerCommitFields {
 struct CoalescerSpillRepo {
     pending_requests: u64,
     earliest_enqueued_at: Instant,
+    earliest_enqueued_wall: DateTime<Utc>,
+    latest_enqueued_wall: DateTime<Utc>,
     dirty_all: bool,
     paths: BTreeSet<String>,
     git_author_name: String,
@@ -1605,6 +1632,8 @@ struct CoalescerSpilledWork {
     repo_root: PathBuf,
     pending_requests: u64,
     earliest_enqueued_at: Instant,
+    earliest_enqueued_wall: DateTime<Utc>,
+    latest_enqueued_wall: DateTime<Utc>,
     dirty_all: bool,
     paths: Vec<String>,
     git_author_name: String,
@@ -1700,6 +1729,8 @@ pub struct CommitCoalescer {
     work_cv: Arc<(Mutex<u64>, std::sync::Condvar)>,
     /// Signal workers to shut down.
     shutdown: Arc<AtomicBool>,
+    /// Force workers to drain immediately, bypassing the time-based batch window.
+    force_flush: Arc<AtomicBool>,
     /// Global stats (backward-compatible aggregate view).
     stats: Arc<Mutex<CommitQueueStats>>,
     pending_requests: Arc<AtomicU64>,
@@ -1709,11 +1740,18 @@ pub struct CommitCoalescer {
     worker_count: usize,
 }
 
-// Coalescer timing defaults. Worker and batch limits come from `Config`.
-/// Default flush interval for the coalescer (50ms).
-pub const DEFAULT_COALESCER_FLUSH_MS: u64 = 50;
+// Coalescer defaults. Queue and worker limits still come from `Config`.
+/// Default number of archive events to coalesce before committing.
+pub const DEFAULT_ARCHIVE_BATCH_EVENTS: usize = 32;
+/// Default archive batch flush interval in milliseconds.
+pub const DEFAULT_ARCHIVE_BATCH_MS: u64 = 1_000;
+/// Backward-compatible alias for callers that still reference the old constant.
+pub const DEFAULT_COALESCER_FLUSH_MS: u64 = DEFAULT_ARCHIVE_BATCH_MS;
+/// Guardrail against accidental zero-sized batches.
+const MIN_ARCHIVE_BATCH_EVENTS: usize = 1;
 /// Guardrail against accidental zero-duration flush intervals.
 const MIN_COALESCER_FLUSH_MS: u64 = 5;
+const MAX_COALESCER_FLUSH_MS: u64 = 5_000;
 const MIN_COALESCER_FLUSH_INTERVAL: Duration = Duration::from_millis(MIN_COALESCER_FLUSH_MS);
 
 const COMMIT_COALESCER_SOFT_CAP: u64 = 8_192;
@@ -1725,6 +1763,39 @@ const COALESCER_SPILL_MESSAGE_LINE_MAX_CHARS: usize = 120;
 #[inline]
 fn clamp_coalescer_flush_interval(interval: Duration) -> Duration {
     interval.max(MIN_COALESCER_FLUSH_INTERVAL)
+}
+
+fn parse_archive_batch_usize(primary_key: &str, legacy_key: &str, default: usize) -> usize {
+    config::env_value(primary_key)
+        .or_else(|| config::env_value(legacy_key))
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn parse_archive_batch_u64(primary_key: &str, legacy_key: &str, default: u64) -> u64 {
+    config::env_value(primary_key)
+        .or_else(|| config::env_value(legacy_key))
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn configured_coalescer_flush_interval() -> Duration {
+    let ms = parse_archive_batch_u64(
+        "AM_ARCHIVE_BATCH_MS",
+        "AM_COALESCER_FLUSH_MS",
+        DEFAULT_ARCHIVE_BATCH_MS,
+    )
+    .clamp(MIN_COALESCER_FLUSH_MS, MAX_COALESCER_FLUSH_MS);
+    Duration::from_millis(ms)
+}
+
+fn configured_coalescer_batch_size() -> usize {
+    parse_archive_batch_usize(
+        "AM_ARCHIVE_BATCH_EVENTS",
+        "AM_COALESCER_MAX_BATCH_SIZE",
+        DEFAULT_ARCHIVE_BATCH_EVENTS,
+    )
+    .clamp(MIN_ARCHIVE_BATCH_EVENTS, COMMIT_COALESCER_SOFT_CAP as usize)
 }
 
 /// Auto-detect worker count bounded by `Config::coalescer_max_workers`.
@@ -1753,6 +1824,7 @@ impl CommitCoalescer {
             Arc::new(Mutex::new(HashMap::new()));
         let work_cv = Arc::new((Mutex::new(0_u64), std::sync::Condvar::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let force_flush = Arc::new(AtomicBool::new(false));
 
         let worker_count = coalescer_worker_count();
 
@@ -1760,6 +1832,7 @@ impl CommitCoalescer {
             let w_repos = Arc::clone(&repos);
             let w_cv = Arc::clone(&work_cv);
             let w_shutdown = Arc::clone(&shutdown);
+            let w_force_flush = Arc::clone(&force_flush);
             let w_stats = Arc::clone(&stats);
             let w_sizes = Arc::clone(&batch_sizes);
             let w_pending = Arc::clone(&pending_requests);
@@ -1771,6 +1844,7 @@ impl CommitCoalescer {
                         w_repos,
                         w_cv,
                         w_shutdown,
+                        w_force_flush,
                         w_stats,
                         w_sizes,
                         w_pending,
@@ -1792,6 +1866,7 @@ impl CommitCoalescer {
             repos,
             work_cv,
             shutdown,
+            force_flush,
             stats,
             pending_requests,
             _batch_sizes: batch_sizes,
@@ -1835,6 +1910,8 @@ impl CommitCoalescer {
         let entry = guard.inner.get_or_insert_with(|| CoalescerSpillRepo {
             pending_requests: 0,
             earliest_enqueued_at: fields.enqueued_at,
+            earliest_enqueued_wall: fields.enqueued_wall,
+            latest_enqueued_wall: fields.enqueued_wall,
             dirty_all: false,
             paths: BTreeSet::new(),
             git_author_name: fields.git_author_name.clone(),
@@ -1848,6 +1925,12 @@ impl CommitCoalescer {
         rq.depth.fetch_add(1, Ordering::Relaxed);
         if fields.enqueued_at < entry.earliest_enqueued_at {
             entry.earliest_enqueued_at = fields.enqueued_at;
+        }
+        if fields.enqueued_wall < entry.earliest_enqueued_wall {
+            entry.earliest_enqueued_wall = fields.enqueued_wall;
+        }
+        if fields.enqueued_wall > entry.latest_enqueued_wall {
+            entry.latest_enqueued_wall = fields.enqueued_wall;
         }
 
         entry.git_author_name = fields.git_author_name;
@@ -1902,6 +1985,7 @@ impl CommitCoalescer {
         let enqueued_at = Instant::now();
         let fields = CoalescerCommitFields {
             enqueued_at,
+            enqueued_wall: Utc::now(),
             git_author_name: config.git_author_name.clone(),
             git_author_email: config.git_author_email.clone(),
             message,
@@ -1965,6 +2049,7 @@ impl CommitCoalescer {
     /// commits are persisted before proceeding.
     pub fn flush_sync(&self) {
         let deadline = Instant::now() + Duration::from_secs(30);
+        self.force_flush.store(true, Ordering::Release);
 
         loop {
             // Wake all workers
@@ -2000,6 +2085,8 @@ impl CommitCoalescer {
 
             std::thread::sleep(Duration::from_millis(5));
         }
+
+        self.force_flush.store(false, Ordering::Release);
     }
 
     /// Get coalescer statistics (aggregate across all repos).
@@ -2047,10 +2134,87 @@ impl CommitCoalescer {
 
 impl Drop for CommitCoalescer {
     fn drop(&mut self) {
-        // Signal all workers to exit
+        // Drain queued commits before worker shutdown so scoped/test instances
+        // preserve the same graceful-shutdown contract as the server signal path.
+        self.flush_sync();
         self.shutdown.store(true, Ordering::Release);
         let (_, cvar) = &*self.work_cv;
         cvar.notify_all();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoalescerRepoReadiness {
+    Ready,
+    Waiting(Duration),
+    Empty,
+}
+
+fn coalescer_repo_readiness(
+    rq: &RepoQueue,
+    max_batch_size: usize,
+    flush_interval: Duration,
+    force_flush: bool,
+) -> CoalescerRepoReadiness {
+    let depth = rq.depth.load(Ordering::Relaxed);
+    if depth == 0 {
+        return CoalescerRepoReadiness::Empty;
+    }
+    if force_flush || depth >= u64::try_from(max_batch_size).unwrap_or(u64::MAX) {
+        return CoalescerRepoReadiness::Ready;
+    }
+
+    let mut earliest: Option<Instant> = None;
+    {
+        let q = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if q.len() >= max_batch_size {
+            return CoalescerRepoReadiness::Ready;
+        }
+        if let Some(front) = q.front() {
+            earliest = Some(front.enqueued_at);
+        }
+    }
+
+    {
+        let spill = rq.spill.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(repo) = spill.inner.as_ref() {
+            if repo.pending_requests >= u64::try_from(max_batch_size).unwrap_or(u64::MAX) {
+                return CoalescerRepoReadiness::Ready;
+            }
+            earliest = match earliest {
+                Some(current) => Some(current.min(repo.earliest_enqueued_at)),
+                None => Some(repo.earliest_enqueued_at),
+            };
+        }
+    }
+
+    let Some(earliest) = earliest else {
+        return CoalescerRepoReadiness::Empty;
+    };
+
+    let elapsed = earliest.elapsed();
+    if elapsed >= flush_interval {
+        CoalescerRepoReadiness::Ready
+    } else {
+        CoalescerRepoReadiness::Waiting(flush_interval - elapsed)
+    }
+}
+
+fn coalescer_wait_for_due_work(
+    work_cv: &Arc<(Mutex<u64>, std::sync::Condvar)>,
+    shutdown: &Arc<AtomicBool>,
+    wait_for: Duration,
+) {
+    let (lock, cvar) = &**work_cv;
+    let mut wake_tokens = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if *wake_tokens == 0 && !shutdown.load(Ordering::Relaxed) {
+        let (guard, _) = cvar
+            .wait_timeout(wake_tokens, wait_for)
+            .unwrap_or_else(|e| e.into_inner());
+        wake_tokens = guard;
+    }
+    if *wake_tokens > 0 {
+        *wake_tokens -= 1;
     }
 }
 
@@ -2070,6 +2234,7 @@ fn coalescer_pool_worker(
     repos: Arc<Mutex<HashMap<PathBuf, Arc<RepoQueue>>>>,
     work_cv: Arc<(Mutex<u64>, std::sync::Condvar)>,
     shutdown: Arc<AtomicBool>,
+    force_flush: Arc<AtomicBool>,
     stats: Arc<Mutex<CommitQueueStats>>,
     batch_sizes: Arc<Mutex<VecDeque<usize>>>,
     pending_requests: Arc<AtomicU64>,
@@ -2105,17 +2270,25 @@ fn coalescer_pool_worker(
 
         // Phase 2: Pick a repo via LRS (least-recently-serviced) scheduling
         loop {
+            let max_batch_size = configured_coalescer_batch_size();
+            let force_now = force_flush.load(Ordering::Acquire);
+            let mut next_due: Option<Duration> = None;
             let chosen: Option<(PathBuf, Arc<RepoQueue>)> = {
                 let repos_guard = repos.lock().unwrap_or_else(|e| e.into_inner());
                 let mut best: Option<(PathBuf, Arc<RepoQueue>, u64)> = None;
                 for (path, rq) in repos_guard.iter() {
-                    let depth = rq.depth.load(Ordering::Relaxed);
-                    if depth == 0 {
-                        continue;
-                    }
                     // Skip repos already being processed by another worker
                     if rq.processing.load(Ordering::Relaxed) {
                         continue;
+                    }
+                    match coalescer_repo_readiness(rq, max_batch_size, flush_interval, force_now) {
+                        CoalescerRepoReadiness::Ready => {}
+                        CoalescerRepoReadiness::Waiting(wait_for) => {
+                            next_due =
+                                Some(next_due.map_or(wait_for, |current| current.min(wait_for)));
+                            continue;
+                        }
+                        CoalescerRepoReadiness::Empty => continue,
                     }
                     let serviced = rq.last_serviced_us.load(Ordering::Relaxed);
                     if best
@@ -2129,6 +2302,13 @@ fn coalescer_pool_worker(
             };
 
             let Some((repo_root, rq)) = chosen else {
+                if let Some(wait_for) = next_due {
+                    coalescer_wait_for_due_work(&work_cv, &shutdown, wait_for);
+                    if shutdown.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    continue;
+                }
                 break; // No more work available; go back to Phase 1
             };
 
@@ -2169,7 +2349,7 @@ fn self_process_repo(
     repos: &Arc<Mutex<HashMap<PathBuf, Arc<RepoQueue>>>>,
     work_cv: &Arc<(Mutex<u64>, std::sync::Condvar)>,
 ) {
-    let max_batch_size = Config::get().coalescer_max_batch_size;
+    let max_batch_size = configured_coalescer_batch_size();
 
     // RAII guard to ensure processing flag is cleared even on panic
     struct ProcessingGuard<'a> {
@@ -2473,6 +2653,8 @@ fn coalescer_drain_repo_spill(rq: &RepoQueue, repo_root: &Path) -> Option<Coales
         repo_root: repo_root.to_path_buf(),
         pending_requests: repo.pending_requests,
         earliest_enqueued_at: repo.earliest_enqueued_at,
+        earliest_enqueued_wall: repo.earliest_enqueued_wall,
+        latest_enqueued_wall: repo.latest_enqueued_wall,
         dirty_all: repo.dirty_all,
         paths: repo.paths.into_iter().collect(),
         git_author_name: repo.git_author_name,
@@ -2503,6 +2685,8 @@ fn coalescer_restore_spilled_work(rq: &RepoQueue, work: CoalescerSpilledWork) {
     let repo = spill.inner.get_or_insert_with(|| CoalescerSpillRepo {
         pending_requests: 0,
         earliest_enqueued_at: work.earliest_enqueued_at,
+        earliest_enqueued_wall: work.earliest_enqueued_wall,
+        latest_enqueued_wall: work.latest_enqueued_wall,
         dirty_all: false,
         paths: BTreeSet::new(),
         git_author_name: work.git_author_name.clone(),
@@ -2515,6 +2699,12 @@ fn coalescer_restore_spilled_work(rq: &RepoQueue, work: CoalescerSpilledWork) {
     repo.message_total = repo.message_total.saturating_add(work.message_total);
     if work.earliest_enqueued_at < repo.earliest_enqueued_at {
         repo.earliest_enqueued_at = work.earliest_enqueued_at;
+    }
+    if work.earliest_enqueued_wall < repo.earliest_enqueued_wall {
+        repo.earliest_enqueued_wall = work.earliest_enqueued_wall;
+    }
+    if work.latest_enqueued_wall > repo.latest_enqueued_wall {
+        repo.latest_enqueued_wall = work.latest_enqueued_wall;
     }
 
     repo.git_author_name = work.git_author_name;
@@ -2559,6 +2749,34 @@ fn coalescer_reconcile_repo_depth(rq: &RepoQueue) -> u64 {
     actual
 }
 
+fn format_coalescer_ts(ts: DateTime<Utc>) -> String {
+    ts.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn coalescer_batch_commit_message(requests: &[CoalescerCommitFields]) -> String {
+    let Some(first) = requests.first() else {
+        return "batch: 0 events".to_string();
+    };
+
+    let mut ts_first = first.enqueued_wall;
+    let mut ts_last = first.enqueued_wall;
+    for request in &requests[1..] {
+        if request.enqueued_wall < ts_first {
+            ts_first = request.enqueued_wall;
+        }
+        if request.enqueued_wall > ts_last {
+            ts_last = request.enqueued_wall;
+        }
+    }
+
+    format!(
+        "batch: {} events ({} – {})",
+        requests.len(),
+        format_coalescer_ts(ts_first),
+        format_coalescer_ts(ts_last),
+    )
+}
+
 fn coalescer_commit_spilled_work(
     work: &CoalescerSpilledWork,
     stats: &Arc<Mutex<CommitQueueStats>>,
@@ -2578,11 +2796,17 @@ fn coalescer_commit_spilled_work(
         ..Config::default()
     };
 
-    let mut msg = format!("spill: {} ops coalesced", work.pending_requests);
+    let mut msg = format!(
+        "batch: {} events ({} – {})",
+        work.pending_requests,
+        format_coalescer_ts(work.earliest_enqueued_wall),
+        format_coalescer_ts(work.latest_enqueued_wall),
+    );
     if work.dirty_all {
-        msg.push_str(" (commit-all)");
+        msg.push_str("\n\ncommit-all spill overflow\n");
+    } else {
+        msg.push_str("\n\n");
     }
-    msg.push_str("\n\n");
 
     let visible = work.message_first_lines.len() as u64;
     for line in &work.message_first_lines {
@@ -2620,17 +2844,13 @@ fn coalescer_commit_spilled_work(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if commit_count > 0 {
-                sizes.push_back(batch_size);
-                if sizes.len() > 100 {
-                    sizes.pop_front();
-                }
+                record_batch_size_samples(
+                    &mut s,
+                    &mut sizes,
+                    batch_size,
+                    usize::try_from(commit_count).unwrap_or(usize::MAX),
+                );
             }
-            let avg = if sizes.is_empty() {
-                0.0
-            } else {
-                sizes.iter().sum::<usize>() as f64 / sizes.len() as f64
-            };
-            s.avg_batch_size = (avg * 100.0).round() / 100.0;
             CoalescerSpillOutcome {
                 committed_requests: batch_u64,
                 committed_commits: commit_count,
@@ -2654,6 +2874,8 @@ fn coalescer_commit_spilled_work(
                     repo_root: work.repo_root.clone(),
                     pending_requests: work.pending_requests,
                     earliest_enqueued_at: work.earliest_enqueued_at,
+                    earliest_enqueued_wall: work.earliest_enqueued_wall,
+                    latest_enqueued_wall: work.latest_enqueued_wall,
                     dirty_all: work.dirty_all,
                     paths: work.paths.clone(),
                     git_author_name: work.git_author_name.clone(),
@@ -2709,10 +2931,7 @@ fn coalescer_commit_batch(
     }
 
     // Keep batch commits bounded to avoid enormous commits under load.
-    let commit_result = if can_merge
-        && requests.len() > 1
-        && requests.len() <= Config::get().coalescer_max_batch_size
-    {
+    let commit_result = if can_merge && requests.len() <= configured_coalescer_batch_size() {
         // Merge all into a single commit
         let merged_paths: Vec<String> = requests
             .iter()
@@ -2727,11 +2946,11 @@ fn coalescer_commit_batch(
             })
             .collect();
 
-        let combined_msg = format!(
-            "batch: {} ops coalesced\n\n{}",
-            requests.len(),
-            summary_lines.join("\n")
-        );
+        let mut combined_msg = coalescer_batch_commit_message(requests);
+        if !summary_lines.is_empty() {
+            combined_msg.push_str("\n\n");
+            combined_msg.push_str(&summary_lines.join("\n"));
+        }
 
         coalescer_commit_with_retry(repo_root, &config, &combined_msg, &merged_paths)
             .map(|()| (1, requests.len()))
@@ -2788,18 +3007,7 @@ fn coalescer_commit_batch(
             let mut sizes = batch_sizes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for _ in 0..total {
-                sizes.push_back(1);
-            }
-            while sizes.len() > 100 {
-                sizes.pop_front();
-            }
-            let avg = if sizes.is_empty() {
-                0.0
-            } else {
-                sizes.iter().sum::<usize>() as f64 / sizes.len() as f64
-            };
-            s.avg_batch_size = (avg * 100.0).round() / 100.0;
+            record_batch_size_samples(&mut s, &mut sizes, 1, total);
 
             return CoalescerCommitOutcome {
                 committed_requests: u64::try_from(committed).unwrap_or(u64::MAX),
@@ -2821,18 +3029,14 @@ fn coalescer_commit_batch(
             let mut sizes = batch_sizes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for _ in 0..num_commits {
-                sizes.push_back(batched_items / num_commits);
+            if num_commits > 0 {
+                record_batch_size_samples(
+                    &mut s,
+                    &mut sizes,
+                    batched_items / num_commits,
+                    num_commits,
+                );
             }
-            while sizes.len() > 100 {
-                sizes.pop_front();
-            }
-            let avg = if sizes.is_empty() {
-                0.0
-            } else {
-                sizes.iter().sum::<usize>() as f64 / sizes.len() as f64
-            };
-            s.avg_batch_size = (avg * 100.0).round() / 100.0;
             CoalescerCommitOutcome {
                 committed_requests: u64::try_from(batched_items).unwrap_or(u64::MAX),
                 committed_commits: u64::try_from(num_commits).unwrap_or(u64::MAX),
@@ -3044,8 +3248,7 @@ static COMMIT_COALESCER: OnceLock<CommitCoalescer> = OnceLock::new();
 
 /// Get the global commit coalescer (spawns worker on first call).
 pub fn get_commit_coalescer() -> &'static CommitCoalescer {
-    COMMIT_COALESCER
-        .get_or_init(|| CommitCoalescer::new(Duration::from_millis(DEFAULT_COALESCER_FLUSH_MS)))
+    COMMIT_COALESCER.get_or_init(|| CommitCoalescer::new(configured_coalescer_flush_interval()))
 }
 
 /// Enqueue an async git commit via the global coalescer.
@@ -8163,6 +8366,108 @@ mod tests {
     fn coalescer_flush_interval_preserves_reasonable_values() {
         let interval = Duration::from_millis(50);
         assert_eq!(clamp_coalescer_flush_interval(interval), interval);
+    }
+
+    #[test]
+    fn configured_coalescer_flush_interval_reads_env_override() {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ARCHIVE_BATCH_MS", "250")],
+            || {
+                assert_eq!(
+                    configured_coalescer_flush_interval(),
+                    Duration::from_millis(250)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn configured_coalescer_batch_size_reads_env_override() {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_ARCHIVE_BATCH_EVENTS", "64")],
+            || {
+                assert_eq!(configured_coalescer_batch_size(), 64);
+            },
+        );
+    }
+
+    fn test_repo_queue() -> RepoQueue {
+        RepoQueue {
+            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            spill: std::sync::Mutex::new(CoalescerSpillState::default()),
+            depth: AtomicU64::new(0),
+            processing: AtomicBool::new(false),
+            last_serviced_us: AtomicU64::new(0),
+            metrics: RepoCommitMetrics::default(),
+        }
+    }
+
+    #[test]
+    fn coalescer_repo_readiness_waits_until_flush_window_or_batch_threshold() {
+        let rq = test_repo_queue();
+        {
+            let mut q = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.push_back(CoalescerCommitFields {
+                enqueued_at: Instant::now(),
+                enqueued_wall: Utc::now(),
+                git_author_name: "Ready".to_string(),
+                git_author_email: "ready@example.com".to_string(),
+                message: "one".to_string(),
+                rel_paths: vec!["one.txt".to_string()],
+            });
+        }
+        rq.depth.store(1, Ordering::Relaxed);
+
+        let readiness = coalescer_repo_readiness(&rq, 2, Duration::from_secs(3_600), false);
+        assert!(
+            matches!(readiness, CoalescerRepoReadiness::Waiting(wait) if wait > Duration::ZERO),
+            "single fresh event should wait for the flush window, got {readiness:?}"
+        );
+        assert_eq!(
+            coalescer_repo_readiness(&rq, 2, Duration::from_secs(3_600), true),
+            CoalescerRepoReadiness::Ready
+        );
+
+        {
+            let mut q = rq.queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.push_back(CoalescerCommitFields {
+                enqueued_at: Instant::now(),
+                enqueued_wall: Utc::now(),
+                git_author_name: "Ready".to_string(),
+                git_author_email: "ready@example.com".to_string(),
+                message: "two".to_string(),
+                rel_paths: vec!["two.txt".to_string()],
+            });
+        }
+        rq.depth.store(2, Ordering::Relaxed);
+
+        assert_eq!(
+            coalescer_repo_readiness(&rq, 2, Duration::from_secs(3_600), false),
+            CoalescerRepoReadiness::Ready
+        );
+    }
+
+    #[test]
+    fn coalescer_batch_commit_message_uses_event_count_and_wall_range() {
+        let early = DateTime::parse_from_rfc3339("2026-04-21T04:00:00Z")
+            .expect("valid early timestamp")
+            .with_timezone(&Utc);
+        let late = DateTime::parse_from_rfc3339("2026-04-21T04:00:02Z")
+            .expect("valid late timestamp")
+            .with_timezone(&Utc);
+        let mk_req = |message: &str, ts| CoalescerCommitFields {
+            enqueued_at: Instant::now(),
+            enqueued_wall: ts,
+            git_author_name: "Batch".to_string(),
+            git_author_email: "batch@example.com".to_string(),
+            message: message.to_string(),
+            rel_paths: vec![format!("{message}.txt")],
+        };
+
+        assert_eq!(
+            coalescer_batch_commit_message(&[mk_req("late", late), mk_req("early", early)]),
+            "batch: 2 events (2026-04-21T04:00:00Z – 2026-04-21T04:00:02Z)"
+        );
     }
 
     fn unique_human_key(prefix: &str) -> String {
@@ -13737,6 +14042,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
         let request = CoalescerCommitFields {
             enqueued_at: std::time::Instant::now(),
+            enqueued_wall: Utc::now(),
             git_author_name: "Test".to_string(),
             git_author_email: "test@example.com".to_string(),
             message: "broken commit".to_string(),
@@ -13768,6 +14074,7 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
         let ok_request = CoalescerCommitFields {
             enqueued_at: std::time::Instant::now(),
+            enqueued_wall: Utc::now(),
             git_author_name: "Test".to_string(),
             git_author_email: "test@example.com".to_string(),
             message: "good commit".to_string(),
@@ -13775,6 +14082,7 @@ mod tests {
         };
         let failing_request = CoalescerCommitFields {
             enqueued_at: std::time::Instant::now(),
+            enqueued_wall: Utc::now(),
             git_author_name: "Test".to_string(),
             git_author_email: "test@example.com".to_string(),
             message: "broken commit".to_string(),
@@ -13813,6 +14121,8 @@ mod tests {
             repo_root: std::path::PathBuf::from("/tmp/fake-repo"),
             pending_requests: 2,
             earliest_enqueued_at: std::time::Instant::now(),
+            earliest_enqueued_wall: Utc::now(),
+            latest_enqueued_wall: Utc::now(),
             dirty_all: false,
             paths: vec!["a.txt".to_string(), "b.txt".to_string()],
             git_author_name: "Spill".to_string(),
@@ -13847,6 +14157,7 @@ mod tests {
             &rq,
             CoalescerCommitFields {
                 enqueued_at: std::time::Instant::now(),
+                enqueued_wall: Utc::now(),
                 git_author_name: "Spill".to_string(),
                 git_author_email: "spill@example.com".to_string(),
                 message: "first".to_string(),
@@ -13857,6 +14168,7 @@ mod tests {
             &rq,
             CoalescerCommitFields {
                 enqueued_at: std::time::Instant::now(),
+                enqueued_wall: Utc::now(),
                 git_author_name: "Spill".to_string(),
                 git_author_email: "spill@example.com".to_string(),
                 message: "second".to_string(),
@@ -13892,6 +14204,7 @@ mod tests {
         };
         let mk_req = |message: &str, path: &str| CoalescerCommitFields {
             enqueued_at: std::time::Instant::now(),
+            enqueued_wall: Utc::now(),
             git_author_name: "Panic".to_string(),
             git_author_email: "panic@example.com".to_string(),
             message: message.to_string(),
@@ -13903,6 +14216,8 @@ mod tests {
             repo_root: std::path::PathBuf::from("/tmp/fake-repo"),
             pending_requests: 2,
             earliest_enqueued_at: std::time::Instant::now(),
+            earliest_enqueued_wall: Utc::now(),
+            latest_enqueued_wall: Utc::now(),
             dirty_all: false,
             paths: vec!["spill-a.txt".to_string(), "spill-b.txt".to_string()],
             git_author_name: "Spill".to_string(),
@@ -14814,6 +15129,8 @@ mod tests {
         let mut repo = CoalescerSpillRepo {
             pending_requests: 3,
             earliest_enqueued_at: Instant::now(),
+            earliest_enqueued_wall: Utc::now(),
+            latest_enqueued_wall: Utc::now(),
             dirty_all: false,
             paths: BTreeSet::new(),
             git_author_name: "test".to_string(),
