@@ -22748,26 +22748,33 @@ mod tests {
         /// lengths, Unicode confusables, and repeated operators.
         #[test]
         fn fts_pathological_corpus() {
+            let quotes_1k = "\"".repeat(1000);
+            let quoted_terms_500 = "\"a\" ".repeat(500);
+            let empty_pairs_200 = "\"\"".repeat(200);
+            let a_10k = "a".repeat(10_000);
+            let test_2k = "test ".repeat(2000);
+            let or_1k = "OR ".repeat(1000);
+            let near_500 = "NEAR(".repeat(500);
+            let nested_parens = format!("{}test{}", "(".repeat(500), ")".repeat(500));
+            let tabs_1k = format!("a{}b", "\t".repeat(1000));
+            let wildcards_100 = format!("{}x", "*".repeat(100));
+
             let cases: Vec<(&str, &str)> = vec![
-                // Deeply nested/repeated quotes
-                (&"\"".repeat(1000), "1000 quotes"),
-                (&"\"a\" ".repeat(500), "500 quoted terms"),
-                (&"\"\"".repeat(200), "200 empty quote pairs"),
-                // Extreme lengths
-                (&"a".repeat(10_000), "10K single char"),
-                (&"test ".repeat(2000), "2K repeated terms"),
-                (&"OR ".repeat(1000), "1K operators"),
-                (&"NEAR(".repeat(500), "500 NEAR opens"),
-                // Unicode confusables
+                (&quotes_1k, "1000 quotes"),
+                (&quoted_terms_500, "500 quoted terms"),
+                (&empty_pairs_200, "200 empty quote pairs"),
+                (&a_10k, "10K single char"),
+                (&test_2k, "2K repeated terms"),
+                (&or_1k, "1K operators"),
+                (&near_500, "500 NEAR opens"),
                 ("\u{FF21}\u{FF2E}\u{FF24}", "fullwidth AND"),
                 ("\u{200B}test\u{200B}", "zero-width space wrapped"),
                 ("\u{2000}\u{2001}\u{2002}\u{2003}", "various Unicode spaces"),
                 ("\u{202E}injection\u{202C}", "RTL override"),
                 ("\u{FEFF}bom\u{FEFF}", "BOM chars"),
-                // Mixed pathological
-                (&format!("{}test{}", "(".repeat(500), ")".repeat(500)), "500 nested parens"),
-                (&format!("a{}b", "\t".repeat(1000)), "1K tabs"),
-                (&format!("{}{}", "*".repeat(100), "x"), "100 leading wildcards"),
+                (&nested_parens, "500 nested parens"),
+                (&tabs_1k, "1K tabs"),
+                (&wildcards_100, "100 leading wildcards"),
                 ("col1:injection col2:attack {col3}:payload", "FTS5 column filters"),
                 ("NEAR(attack payload, 1) AND ^prefix", "FTS5 proximity + prefix"),
             ];
