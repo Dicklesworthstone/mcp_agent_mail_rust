@@ -14,7 +14,7 @@
 //!
 //! Each signal includes confidence level and explanation for user transparency.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::wizard::{DetectedEnvironment, DetectedSignal, DetectionConfidence, HostingProvider};
 
@@ -140,7 +140,9 @@ fn detect_github_pages_with_remote(cwd: &Path, git_remote: Option<&str>) -> Vec<
     }
 
     // Check for docs/ directory (common GitHub Pages pattern)
-    if crate::git::find_ancestor_path(cwd, "docs").is_some_and(|docs_dir| crate::is_real_dir(&docs_dir)) {
+    if crate::git::find_ancestor_path(cwd, "docs")
+        .is_some_and(|docs_dir| crate::is_real_dir(&docs_dir))
+    {
         signals.push(DetectedSignal {
             source: "filesystem".to_string(),
             detail: "docs/ directory exists (common Pages pattern)".to_string(),
@@ -333,7 +335,7 @@ fn detect_git_context(cwd: &Path, env: &mut DetectedEnvironment) {
     }
 
     // Get remote URL
-    if let Some(url) = git_remote_url(cwd) {
+    if let Some(url) = crate::git::git_remote_url(cwd) {
         env.git_remote_url = Some(url.clone());
 
         // Extract GitHub repo if applicable
@@ -527,96 +529,6 @@ fn confidence_order(c: DetectionConfidence) -> u8 {
     }
 }
 
-/// Detect the technical stack used in a given project directory.
-pub fn detect_technologies(project_root: &Path, opts: &DetectionOptions) -> ProjectTechnologies {
-    // ... existing code ...
-    if let Some(mut existing) = existing {
-        if existing.git_remote.is_none() {
-            existing.git_remote = crate::git::git_remote_url(project_root);
-        }
-        return existing;
-    }
-
-    let mut tech = ProjectTechnologies {
-        // ... existing code ...
-        git_remote: crate::git::git_remote_url(project_root),
-    };
-
-    if !tech.is_nextjs && !tech.is_rust {
-        // ... existing code ...
-    }
-    // ... existing code ...
-}
-
-/// Read Cargo.toml and return the parsed `Value`.
-fn read_cargo_toml(dir: &Path) -> Result<Value, std::io::Error> {
-    let cargo_toml = dir.join("Cargo.toml");
-    if !crate::is_real_file(&cargo_toml) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("Cargo.toml not not found in {}", dir.display()),
-        ));
-    }
-
-    let content = std::fs::read_to_string(&cargo_toml)?;
-    let mut parser = Parser::new(&content);
-    let mut value = Value::default();
-
-    while let Some(item) = parser.next() {
-        match item {
-            Item::Value(key, val) => {
-                if let Some(key) = key {
-                    if key == "name" {
-                        if let Some(name) = val.as_str() {
-                            value["name"] = Value::String(name.to_string());
-                        }
-                    } else if key == "version" {
-                        if let Some(version) = val.as_str() {
-                            value["version"] = Value::String(version.to_string());
-                        }
-                    } else if key == "description" {
-                        if let Some(description) = val.as_str() {
-                            value["description"] = Value::String(description.to_string());
-                        }
-                    } else if key == "license" {
-                        if let Some(license) = val.as_str() {
-                            value["license"] = Value::String(license.to_string());
-                        }
-                    } else if key == "repository" {
-                        if let Some(repo) = val.as_str() {
-                            value["repository"] = Value::String(repo.to_string());
-                        }
-                    } else if key == "homepage" {
-                        if let Some(homepage) = val.as_str() {
-                            value["homepage"] = Value::String(homepage.to_string());
-                        }
-                    } else if key == "keywords" {
-                        if let Some(keywords) = val.as_array() {
-                            value["keywords"] = Value::Array(keywords.iter().map(|k| Value::String(k.as_str().unwrap().to_string())).collect());
-                        }
-                    } else if key == "categories" {
-                        if let Some(categories) = val.as_array() {
-                            value["categories"] = Value::Array(categories.iter().map(|c| Value::String(c.as_str().unwrap().to_string())).collect());
-                        }
-                    }
-                }
-            }
-            Item::Table(name) => {
-                if name == "package" {
-                    value["package"] = Value::Object(read_cargo_toml_table(&mut parser)?);
-                } else if name == "dependencies" {
-                    value["dependencies"] = Value::Object(read_cargo_toml_table(&mut parser)?);
-                } else if name == "dev-dependencies" {
-                    value["dev-dependencies"] = Value::Object(read_cargo_toml_table(&mut parser)?);
-                }
-            }
-            _ => (),
-        }
-    }
-
-    Ok(value)
-}
-
 /// Obscure sensitive ID for logging.
 fn obscure_id(id: &str) -> String {
     if id.len() <= 8 {
@@ -788,8 +700,8 @@ mod tests {
         }
         std::fs::create_dir_all(&nested).expect("create nested dirs");
 
-        let found =
-            crate::git::find_ancestor_path(&nested, "wrangler.toml").expect("expected deep ancestor path");
+        let found = crate::git::find_ancestor_path(&nested, "wrangler.toml")
+            .expect("expected deep ancestor path");
         assert_eq!(found, marker);
     }
 
@@ -803,7 +715,10 @@ mod tests {
         std::fs::write(&target, "name = \"demo\"").expect("write target");
         symlink(&target, dir.path().join("wrangler.toml")).expect("symlink marker");
 
-        assert_eq!(crate::git::find_ancestor_path(dir.path(), "wrangler.toml"), None);
+        assert_eq!(
+            crate::git::find_ancestor_path(dir.path(), "wrangler.toml"),
+            None
+        );
     }
 
     #[test]
@@ -816,7 +731,9 @@ mod tests {
         let env = detect_environment(Some(&bundle), dir.path());
         assert_eq!(env.existing_bundle, Some(bundle.clone()));
         assert!(
-            env.signals.iter().any(|s| s.detail.contains("Bundle found at")),
+            env.signals
+                .iter()
+                .any(|s| s.detail.contains("Bundle found at")),
             "expected bundle-detected signal"
         );
     }
@@ -831,7 +748,9 @@ mod tests {
         let env = detect_environment(Some(&bundle), dir.path());
         assert_eq!(env.existing_bundle, None);
         assert!(
-            env.signals.iter().all(|s| !s.detail.contains("Bundle found at")),
+            env.signals
+                .iter()
+                .all(|s| !s.detail.contains("Bundle found at")),
             "invalid manifests should not count as existing bundles"
         );
     }
@@ -852,7 +771,9 @@ mod tests {
         let env = detect_environment(Some(&linked), dir.path());
         assert_eq!(env.existing_bundle, None);
         assert!(
-            env.signals.iter().all(|s| !s.detail.contains("Bundle found at")),
+            env.signals
+                .iter()
+                .all(|s| !s.detail.contains("Bundle found at")),
             "symlinked bundle roots should not count as existing bundles"
         );
     }
