@@ -4061,6 +4061,92 @@ impl Drop for DispatchPermit {
     }
 }
 
+#[derive(Clone, Default)]
+struct DispatchCancel {
+    requested: Arc<AtomicBool>,
+}
+
+impl DispatchCancel {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn request(&self, cx: &Cx) {
+        self.requested.store(true, Ordering::Release);
+        cx.set_cancel_requested(true);
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    fn check(&self) -> Result<(), McpError> {
+        if self.is_requested() {
+            Err(dispatch_cancelled_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn dispatch_cancelled_error() -> McpError {
+    McpError::new(McpErrorCode::InternalError, "Request cancelled")
+}
+
+fn dispatch_checkpoint(cx: &Cx, cancel: &DispatchCancel) -> Result<(), McpError> {
+    cancel.check()?;
+    cx.checkpoint().map_err(|_| dispatch_cancelled_error())
+}
+
+fn dispatch_timeout_error(method: &str, dispatch_timeout_secs: u64) -> McpError {
+    McpError::new(
+        McpErrorCode::InternalError,
+        format!(
+            "Request timed out after {dispatch_timeout_secs}s \
+             (method={method}). The database may be under heavy contention."
+        ),
+    )
+}
+
+async fn run_cancellable_blocking_dispatch<T, F>(
+    method: String,
+    dispatch_timeout_secs: u64,
+    dispatch_cx: Cx,
+    cancel: DispatchCancel,
+    work: F,
+) -> Result<T, McpError>
+where
+    T: Send + 'static,
+    F: FnOnce(DispatchCancel) -> Result<T, McpError> + Send + 'static,
+{
+    let worker_cancel = cancel.clone();
+    let spawn_future = asupersync::runtime::spawn_blocking(move || work(worker_cancel));
+
+    if dispatch_timeout_secs == 0 {
+        return spawn_future.await;
+    }
+
+    let mut spawn_future = Box::pin(spawn_future);
+    match timeout(
+        wall_now(),
+        Duration::from_secs(dispatch_timeout_secs),
+        spawn_future.as_mut(),
+    )
+    .await
+    {
+        Ok(inner) => inner,
+        Err(_elapsed) => {
+            cancel.request(&dispatch_cx);
+            tracing::error!(
+                method = %method,
+                dispatch_timeout_secs,
+                "dispatch spawn_blocking timed out; cancellation requested for blocking work"
+            );
+            Err(dispatch_timeout_error(&method, dispatch_timeout_secs))
+        }
+    }
+}
+
 static LIVE_DASHBOARD: std::sync::LazyLock<Mutex<Option<Arc<StartupDashboard>>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
 
@@ -10019,41 +10105,20 @@ to skip auth for local requests.</p>
             });
         };
 
-        let hard_timeout_secs = self.request_timeout_secs.saturating_add(5);
-        let spawn_future = asupersync::runtime::spawn_blocking(move || {
-            let _permit = permit; // hold permit until blocking work finishes
-            arc_self.dispatch_inner(request)
-        });
-
-        let result = if hard_timeout_secs == 5 && self.request_timeout_secs == 0 {
-            // request_timeout_secs == 0 means no timeout (infinite budget).
-            spawn_future.await
-        } else {
-            match timeout(
-                wall_now(),
-                std::time::Duration::from_secs(hard_timeout_secs),
-                spawn_future,
-            )
-            .await
-            {
-                Ok(inner) => inner,
-                Err(_elapsed) => {
-                    tracing::error!(
-                        method = %method,
-                        hard_timeout_secs,
-                        "dispatch spawn_blocking timed out — likely SQLite busy_timeout \
-                         exceeded the request budget; returning error to caller"
-                    );
-                    Err(McpError::new(
-                        McpErrorCode::InternalError,
-                        format!(
-                            "Request timed out after {hard_timeout_secs}s \
-                             (method={method}). The database may be under heavy contention."
-                        ),
-                    ))
-                }
-            }
-        };
+        let dispatch_timeout_secs = self.request_timeout_secs;
+        let dispatch_cx = self.request_cx();
+        let worker_cx = dispatch_cx.clone();
+        let result = run_cancellable_blocking_dispatch(
+            method.clone(),
+            dispatch_timeout_secs,
+            dispatch_cx,
+            DispatchCancel::new(),
+            move |cancel| {
+                let _permit = permit; // hold permit until blocking work finishes
+                arc_self.dispatch_inner_with_cx(request, &worker_cx, &cancel)
+            },
+        )
+        .await;
 
         match result {
             Ok(value) => id.map(|req_id| JsonRpcResponse::success(req_id, value)),
@@ -10065,15 +10130,21 @@ to skip auth for local requests.</p>
 
     #[allow(clippy::too_many_lines)]
     fn dispatch_inner(&self, request: JsonRpcRequest) -> Result<serde_json::Value, McpError> {
+        let cx = self.request_cx();
+        let cancel = DispatchCancel::new();
+        self.dispatch_inner_with_cx(request, &cx, &cancel)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn dispatch_inner_with_cx(
+        &self,
+        request: JsonRpcRequest,
+        cx: &Cx,
+        cancel: &DispatchCancel,
+    ) -> Result<serde_json::Value, McpError> {
         let request_id = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let budget = if self.request_timeout_secs == 0 {
-            Budget::INFINITE
-        } else {
-            // Use wall_now() + duration for a RELATIVE deadline, not an absolute epoch time.
-            let deadline = wall_now() + std::time::Duration::from_secs(self.request_timeout_secs);
-            Budget::new().with_deadline(deadline)
-        };
-        let cx = Cx::for_request_with_budget(budget);
+        dispatch_checkpoint(cx, cancel)?;
+        let budget = cx.budget();
         let mut session = Session::new(self.server_info.clone(), self.server_capabilities.clone());
 
         match request.method.as_str() {
@@ -10081,7 +10152,7 @@ to skip auth for local requests.</p>
                 let params: fastmcp_protocol::InitializeParams = parse_params(request.params)?;
                 let out = self
                     .router
-                    .handle_initialize(&cx, &mut session, params, None)?;
+                    .handle_initialize(cx, &mut session, params, None)?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "initialized" | "notifications/cancelled" | "logging/setLevel" => {
@@ -10092,7 +10163,7 @@ to skip auth for local requests.</p>
                     parse_params_or_default(request.params)?;
                 let out = self
                     .router
-                    .handle_tools_list(&cx, params, Some(session.state()))?;
+                    .handle_tools_list(cx, params, Some(session.state()))?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "tools/call" => {
@@ -10187,8 +10258,9 @@ to skip auth for local requests.</p>
                         None
                     };
 
+                dispatch_checkpoint(cx, cancel)?;
                 let result = self.router.handle_tools_call(
-                    &cx,
+                    cx,
                     request_id,
                     params,
                     &budget,
@@ -10196,6 +10268,7 @@ to skip auth for local requests.</p>
                     None,
                     None,
                 );
+                dispatch_checkpoint(cx, cancel)?;
 
                 let (queries, query_time_ms, per_table_sorted) =
                     if let Some((ref tracker, ref _guard)) = tracker_state {
@@ -10334,14 +10407,14 @@ to skip auth for local requests.</p>
                     parse_params_or_default(request.params)?;
                 let out = self
                     .router
-                    .handle_resources_list(&cx, params, Some(session.state()))?;
+                    .handle_resources_list(cx, params, Some(session.state()))?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "resources/templates/list" => {
                 let params: fastmcp_protocol::ListResourceTemplatesParams =
                     parse_params_or_default(request.params)?;
                 let out = self.router.handle_resource_templates_list(
-                    &cx,
+                    cx,
                     params,
                     Some(session.state()),
                 )?;
@@ -10351,8 +10424,9 @@ to skip auth for local requests.</p>
                 let params: fastmcp_protocol::ReadResourceParams = parse_params(request.params)?;
                 // Extract format from resource URI query params (TOON support)
                 let format_value = extract_format_from_uri(&params.uri);
+                dispatch_checkpoint(cx, cancel)?;
                 let out = self.router.handle_resources_read(
-                    &cx,
+                    cx,
                     request_id,
                     &params,
                     &budget,
@@ -10360,6 +10434,7 @@ to skip auth for local requests.</p>
                     None,
                     None,
                 )?;
+                dispatch_checkpoint(cx, cancel)?;
                 let mut value = serde_json::to_value(out).map_err(McpError::from)?;
                 if let Some(ref fmt) = format_value {
                     apply_toon_to_content(&mut value, "contents", fmt, &self.config);
@@ -10372,13 +10447,13 @@ to skip auth for local requests.</p>
                     parse_params_or_default(request.params)?;
                 let out = self
                     .router
-                    .handle_prompts_list(&cx, params, Some(session.state()))?;
+                    .handle_prompts_list(cx, params, Some(session.state()))?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "prompts/get" => {
                 let params: fastmcp_protocol::GetPromptParams = parse_params(request.params)?;
                 let out = self.router.handle_prompts_get(
-                    &cx,
+                    cx,
                     request_id,
                     params,
                     &budget,
@@ -10391,22 +10466,22 @@ to skip auth for local requests.</p>
             "tasks/list" => {
                 let params: fastmcp_protocol::ListTasksParams =
                     parse_params_or_default(request.params)?;
-                let out = self.router.handle_tasks_list(&cx, params, None)?;
+                let out = self.router.handle_tasks_list(cx, params, None)?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "tasks/get" => {
                 let params: fastmcp_protocol::GetTaskParams = parse_params(request.params)?;
-                let out = self.router.handle_tasks_get(&cx, params, None)?;
+                let out = self.router.handle_tasks_get(cx, params, None)?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "tasks/cancel" => {
                 let params: fastmcp_protocol::CancelTaskParams = parse_params(request.params)?;
-                let out = self.router.handle_tasks_cancel(&cx, params, None)?;
+                let out = self.router.handle_tasks_cancel(cx, params, None)?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "tasks/submit" => {
                 let params: fastmcp_protocol::SubmitTaskParams = parse_params(request.params)?;
-                let out = self.router.handle_tasks_submit(&cx, params, None)?;
+                let out = self.router.handle_tasks_submit(cx, params, None)?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             _ => Err(McpError::new(
@@ -14576,6 +14651,67 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_timeout_keeps_permit_until_blocking_work_stops() {
+        let permit = DispatchPermit::try_acquire().expect("permit available");
+        let before = DISPATCH_INFLIGHT.load(Ordering::Relaxed);
+        assert!(before >= 1);
+        let cancel_observed = Arc::new(AtomicBool::new(false));
+        let release_worker = Arc::new(AtomicBool::new(false));
+        let cancel_observed_worker = Arc::clone(&cancel_observed);
+        let release_worker_clone = Arc::clone(&release_worker);
+
+        let result: Result<(), McpError> = block_on(run_cancellable_blocking_dispatch(
+            "test/permit-lifetime".to_string(),
+            1,
+            Cx::for_request_with_budget(Budget::INFINITE),
+            DispatchCancel::new(),
+            move |cancel| {
+                let _permit = permit;
+                loop {
+                    if cancel.is_requested() {
+                        cancel_observed_worker.store(true, Ordering::Release);
+                        while !release_worker_clone.load(Ordering::Acquire) {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        return Err(dispatch_cancelled_error());
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            },
+        ));
+
+        assert!(result.is_err(), "dispatch timeout must return an error");
+        let wait_started = Instant::now();
+        while !cancel_observed.load(Ordering::Acquire)
+            && wait_started.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            cancel_observed.load(Ordering::Acquire),
+            "blocking work must observe cancellation before permit release"
+        );
+        assert_eq!(
+            DISPATCH_INFLIGHT.load(Ordering::Relaxed),
+            before,
+            "permit must remain held while blocking work is still running"
+        );
+
+        release_worker.store(true, Ordering::Release);
+        let release_started = Instant::now();
+        while DISPATCH_INFLIGHT.load(Ordering::Relaxed) >= before
+            && release_started.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            DISPATCH_INFLIGHT.load(Ordering::Relaxed),
+            before - 1,
+            "permit must release after the cancelled blocking work exits"
+        );
+    }
+
+    #[test]
     fn normalized_probe_host_maps_wildcards_to_loopback() {
         assert_eq!(normalized_probe_host("0.0.0.0"), "127.0.0.1");
         assert_eq!(normalized_probe_host("::"), "::1");
@@ -17746,6 +17882,61 @@ first body
         assert!(
             resp.error.is_some(),
             "unknown method must return an error response"
+        );
+    }
+
+    #[test]
+    fn dispatch_timeout_requests_blocking_work_cancellation() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let cancel_observed = Arc::new(AtomicBool::new(false));
+        let finished_worker = Arc::clone(&finished);
+        let cancel_observed_worker = Arc::clone(&cancel_observed);
+        let cx = Cx::for_request_with_budget(Budget::INFINITE);
+        let cx_observer = cx.clone();
+
+        let started = Instant::now();
+        let result: Result<(), McpError> = block_on(run_cancellable_blocking_dispatch(
+            "test/long-running-dispatch".to_string(),
+            1,
+            cx,
+            DispatchCancel::new(),
+            move |cancel| {
+                let work_started = Instant::now();
+                while work_started.elapsed() < Duration::from_secs(30) {
+                    if cancel.is_requested() {
+                        cancel_observed_worker.store(true, Ordering::Release);
+                        finished_worker.store(true, Ordering::Release);
+                        return Err(dispatch_cancelled_error());
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                finished_worker.store(true, Ordering::Release);
+                Ok(())
+            },
+        ));
+
+        assert!(result.is_err(), "dispatch timeout must return an error");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "timeout response should return near the configured 1s dispatch timeout"
+        );
+        assert!(
+            cx_observer.is_cancel_requested(),
+            "timeout must mark the dispatch Cx cancelled"
+        );
+
+        let grace_started = Instant::now();
+        while !finished.load(Ordering::Acquire) && grace_started.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            cancel_observed.load(Ordering::Acquire),
+            "blocking work must observe the cooperative cancellation token"
+        );
+        assert!(
+            finished.load(Ordering::Acquire),
+            "blocking work must stop within the cancellation grace period"
         );
     }
 
