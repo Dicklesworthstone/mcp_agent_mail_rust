@@ -3269,8 +3269,8 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
                     tracing::info!(
                         "[git-lock] index.lock owner PID {pid} reused (start ticks mismatch), removing stale lock"
                     );
-                    let _ = fs::remove_file(&lock_path);
                     let _ = fs::remove_file(&owner_path);
+                    let _ = fs::remove_file(&lock_path);
                     return true;
                 }
 
@@ -3288,8 +3288,8 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
                             "[git-lock] index.lock held by alive PID {pid} but start ticks unavailable, force clean (age > {:.1}s)",
                             max_age_seconds * 2.0
                         );
-                        let _ = fs::remove_file(&lock_path);
                         let _ = fs::remove_file(&owner_path);
+                        let _ = fs::remove_file(&lock_path);
                         return true;
                     }
 
@@ -3305,8 +3305,8 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
                     tracing::info!(
                         "[git-lock] legacy owner format with alive PID {pid} and stale age, removing lock"
                     );
-                    let _ = fs::remove_file(&lock_path);
                     let _ = fs::remove_file(&owner_path);
+                    let _ = fs::remove_file(&lock_path);
                     return true;
                 }
 
@@ -3328,8 +3328,8 @@ fn try_clean_stale_git_lock(repo_root: &Path, max_age_seconds: f64) -> bool {
         && age > max_age_seconds
     {
         tracing::info!("[git-lock] removing stale index.lock (age={age:.1}s > {max_age_seconds}s)");
-        let _ = fs::remove_file(&lock_path);
         let _ = fs::remove_file(&owner_path);
+        let _ = fs::remove_file(&lock_path);
         return true;
     }
     false
