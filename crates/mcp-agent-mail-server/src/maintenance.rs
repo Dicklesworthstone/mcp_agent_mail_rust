@@ -161,7 +161,7 @@ pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
     let pack_before = count_pack_files(git_dir);
     let disk_before = measure_objects_disk_usage(git_dir);
 
-    let result = Command::new("nice")
+    let mut child = match Command::new("nice")
         .args([
             "-n",
             "19",
@@ -180,9 +180,46 @@ pub fn run_maintenance(git_dir: &Path) -> MaintenanceReport {
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .output();
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            return MaintenanceReport {
+                loose_before,
+                pack_count_before: pack_before,
+                disk_bytes_before: disk_before,
+                error: Some(e.to_string()),
+                ..Default::default()
+            };
+        }
+    };
 
-    let (success, error) = match result {
+    // Poll the child process, checking for shutdown signal so we don't
+    // block server exit if git maintenance hangs.
+    let output = loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break child.wait_with_output(),
+            Ok(None) => {
+                if SHUTDOWN.load(Ordering::Acquire) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return MaintenanceReport {
+                        loose_before,
+                        pack_count_before: pack_before,
+                        disk_bytes_before: disk_before,
+                        error: Some("interrupted by shutdown".to_string()),
+                        ..Default::default()
+                    };
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(e) => {
+                break Err(e);
+            }
+        }
+    };
+
+    let (success, error) = match output {
         Ok(output) if output.status.success() => (true, None),
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
