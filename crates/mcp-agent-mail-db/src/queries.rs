@@ -6584,6 +6584,16 @@ pub fn sanitize_fts_query(query: &str) -> Option<String> {
     }
     let mut result = result.trim().to_string();
 
+    // Strip FTS5 metacharacters (defense-in-depth against re-enablement)
+    result.retain(|c| !matches!(c, '{' | '}' | '^' | '[' | ']' | '~' | '\\'));
+    while result.contains("  ") {
+        result = result.replace("  ", " ");
+    }
+    let mut result = result.trim().to_string();
+    if result.is_empty() || !result.chars().any(char::is_alphanumeric) {
+        return None;
+    }
+
     // Quote hyphenated tokens to prevent FTS5 from interpreting hyphens as operators.
     // Match: POL-358, FEAT-123, foo-bar-baz (not already quoted)
     result = quote_hyphenated_tokens(&result);
@@ -22640,6 +22650,147 @@ mod tests {
                     prop_assert!(!sanitized.contains("; DROP"));
                     prop_assert!(!sanitized.contains("--"));
                     prop_assert!(!sanitized.is_empty());
+                }
+            }
+
+            /// (a) MATCH-syntax escaping: sanitized output must never contain
+            /// FTS5 operators that could alter query semantics when interpolated
+            /// into a MATCH clause (even though FTS5 is currently decommissioned,
+            /// this guards against future re-enablement).
+            #[test]
+            fn prop_fts_sanitize_no_match_operators(query in ".*") {
+                if let Some(sanitized) = sanitize_fts_query(&query) {
+                    prop_assert!(!sanitized.contains("/*"), "C-style comment open in sanitized output");
+                    prop_assert!(!sanitized.contains("*/"), "C-style comment close in sanitized output");
+                    // Column filter syntax: {col}: or col:
+                    prop_assert!(!sanitized.contains('{'), "FTS5 column filter brace in sanitized output");
+                    prop_assert!(!sanitized.contains('}'), "FTS5 column filter brace in sanitized output");
+                    // Caret prefix operator
+                    prop_assert!(!sanitized.contains('^'), "FTS5 initial-token operator in sanitized output");
+                    // Square brackets (column filter alt syntax)
+                    prop_assert!(!sanitized.contains('['), "bracket in sanitized output");
+                    prop_assert!(!sanitized.contains(']'), "bracket in sanitized output");
+                    // Tilde (NEAR proximity)
+                    prop_assert!(!sanitized.contains('~'), "tilde/proximity operator in sanitized output");
+                    // Backslash has no FTS5 meaning; must not appear raw
+                    prop_assert!(!sanitized.contains('\\'), "backslash in sanitized output");
+                }
+            }
+
+            /// Full pipeline: extract_like_terms → like_escape → wrap in %...%
+            /// must produce only parameterizable LIKE patterns with no unescaped
+            /// wildcards regardless of input.
+            #[test]
+            fn prop_like_pipeline_safe(query in "\\PC{0,500}") {
+                let terms = extract_like_terms(&query, 10);
+                for term in &terms {
+                    prop_assert!(term.len() >= 2, "term too short: {:?}", term);
+                    let upper = term.to_ascii_uppercase();
+                    prop_assert!(
+                        !["AND", "OR", "NOT", "NEAR"].contains(&upper.as_str()),
+                        "stopword leaked: {:?}", term
+                    );
+                    let escaped = like_escape(term);
+                    let pattern = format!("%{}%", escaped);
+                    // The wrapping %...% are the only unescaped wildcards
+                    let inner = &pattern[1..pattern.len() - 1];
+                    let chars: Vec<char> = inner.chars().collect();
+                    let mut i = 0;
+                    while i < chars.len() {
+                        if chars[i] == '\\' {
+                            i += 2;
+                        } else {
+                            prop_assert!(
+                                chars[i] != '%' && chars[i] != '_',
+                                "unescaped LIKE wildcard in pattern: {:?}", pattern
+                            );
+                            i += 1;
+                        }
+                    }
+                }
+                prop_assert!(terms.len() <= 10, "exceeded max_terms");
+            }
+        }
+
+        /// (b) Control-character handling: embedded NULL, CR/LF, ESC, and other
+        /// C0/C1 control bytes must not cause panics or produce SQL-unsafe output.
+        #[test]
+        fn fts_control_character_corpus() {
+            let inputs: Vec<&[u8]> = vec![
+                b"hello\x00world",
+                b"test\x01\x02\x03",
+                b"query\x1b[31mred",     // ANSI escape
+                b"line\r\nbreak",
+                b"tab\there",
+                b"null\x00",
+                b"\x00\x00\x00",
+                b"mixed\x00\x0a\x0d\x1b\x7fend",
+                b"valid prefix\x00hidden suffix",
+                b"\xc0\xaf",             // overlong UTF-8
+                b"\xfe\xff",             // invalid UTF-8 BOM
+                b"ok\xe2\x80\x8b\x00z",  // zero-width space + null
+            ];
+            for raw in &inputs {
+                let query = String::from_utf8_lossy(raw);
+                let _ = sanitize_fts_query(&query);
+                let terms = extract_like_terms(&query, 5);
+                for term in &terms {
+                    let escaped = like_escape(term);
+                    assert!(
+                        !escaped.contains('\x00'),
+                        "NULL byte survived pipeline for input {:?}", raw
+                    );
+                }
+            }
+        }
+
+        /// (c) Pathological query structures: deeply nested quotes, extreme
+        /// lengths, Unicode confusables, and repeated operators.
+        #[test]
+        fn fts_pathological_corpus() {
+            let cases: Vec<(&str, &str)> = vec![
+                // Deeply nested/repeated quotes
+                (&"\"".repeat(1000), "1000 quotes"),
+                (&"\"a\" ".repeat(500), "500 quoted terms"),
+                (&"\"\"".repeat(200), "200 empty quote pairs"),
+                // Extreme lengths
+                (&"a".repeat(10_000), "10K single char"),
+                (&"test ".repeat(2000), "2K repeated terms"),
+                (&"OR ".repeat(1000), "1K operators"),
+                (&"NEAR(".repeat(500), "500 NEAR opens"),
+                // Unicode confusables
+                ("\u{FF21}\u{FF2E}\u{FF24}", "fullwidth AND"),
+                ("\u{200B}test\u{200B}", "zero-width space wrapped"),
+                ("\u{2000}\u{2001}\u{2002}\u{2003}", "various Unicode spaces"),
+                ("\u{202E}injection\u{202C}", "RTL override"),
+                ("\u{FEFF}bom\u{FEFF}", "BOM chars"),
+                // Mixed pathological
+                (&format!("{}test{}", "(".repeat(500), ")".repeat(500)), "500 nested parens"),
+                (&format!("a{}b", "\t".repeat(1000)), "1K tabs"),
+                (&format!("{}{}", "*".repeat(100), "x"), "100 leading wildcards"),
+                ("col1:injection col2:attack {col3}:payload", "FTS5 column filters"),
+                ("NEAR(attack payload, 1) AND ^prefix", "FTS5 proximity + prefix"),
+            ];
+
+            for (input, label) in &cases {
+                let sanitized = sanitize_fts_query(input);
+                if let Some(ref s) = sanitized {
+                    assert!(!s.is_empty(), "{label}: sanitized to empty string");
+                    assert!(!s.contains("--"), "{label}: SQL comment marker survived");
+                    assert!(!s.contains("/*"), "{label}: C-comment open survived");
+                    assert!(!s.contains("*/"), "{label}: C-comment close survived");
+                }
+
+                let terms = extract_like_terms(input, 10);
+                assert!(terms.len() <= 10, "{label}: exceeded max_terms");
+                for term in &terms {
+                    assert!(term.len() >= 2, "{label}: term too short: {term:?}");
+                    let escaped = like_escape(term);
+                    let unescaped = escaped
+                        .replace("\\%", "%")
+                        .replace("\\_", "_")
+                        .replace("\\\\", "\\");
+                    assert_eq!(unescaped, *term, "{label}: like_escape round-trip failed");
                 }
             }
         }
