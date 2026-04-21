@@ -1,11 +1,11 @@
 {
-  "run_id": "1776537463_30539",
+  "run_id": "1776714254_2662730",
   "arch": "x86_64",
   "os": "linux",
   "warm_db": true,
   "environment": {
     "repo_root": "/data/projects/mcp_agent_mail_rust",
-    "cargo_target_dir": "/data/projects/mcp_agent_mail_rust/target",
+    "cargo_target_dir": "/data/tmp/cargo-target",
     "rustc_version": "rustc 1.97.0-nightly (17584a181 2026-04-13)\nbinary: rustc\ncommit-hash: 17584a181979f04f2aaad867332c22db1caa511a\ncommit-date: 2026-04-13\nhost: x86_64-unknown-linux-gnu\nrelease: 1.97.0-nightly\nLLVM version: 22.1.2",
     "kernel_release": "6.17.0-22-generic",
     "filesystem": "btrfs",
@@ -15,8 +15,8 @@
     "storage_transport": null
   },
   "reproduction": {
-    "warm_profile_command": "rch exec -- env CARGO_TARGET_DIR=/data/projects/mcp_agent_mail_rust/target MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch",
-    "flamegraph_command": "env CARGO_TARGET_DIR=/data/projects/mcp_agent_mail_rust/target cargo flamegraph -p mcp-agent-mail --bench benchmarks --root -- archive_write_batch",
+    "warm_profile_command": "rch exec -- env CARGO_TARGET_DIR=/data/tmp/cargo-target MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch",
+    "flamegraph_command": "env CARGO_TARGET_DIR=/data/tmp/cargo-target cargo flamegraph -p mcp-agent-mail --bench benchmarks --root -- archive_write_batch",
     "cross_engineer_target": "Reproduce within 10% on similar CPU/storage/filesystem/kernel hardware within 30 days",
     "dry_run_validated": true
   },
@@ -66,176 +66,176 @@
     {
       "batch_size": 1,
       "samples_us": [
-        18687,
-        21865,
-        23410,
-        24839,
-        19644,
-        18403,
-        21768,
-        23854,
-        26403,
-        18435,
-        22536,
-        24265,
-        23307,
-        19410,
-        22273,
-        25922,
-        21001,
-        20793,
-        23625,
-        27101,
-        18559,
-        24149,
-        25583,
-        23138,
-        19821,
-        21968,
-        25962,
-        23882,
-        21751,
-        24086,
-        28642,
-        18756,
-        22203,
-        25228,
-        27090,
-        19981,
-        23830,
-        28650,
-        20244,
-        24109
+        68869,
+        68619,
+        69291,
+        73555,
+        68174,
+        68486,
+        70461,
+        79002,
+        76674,
+        78637,
+        78170,
+        70337,
+        66881,
+        98489,
+        64608,
+        66681,
+        65472,
+        73962,
+        82104,
+        89011,
+        91029,
+        43402,
+        79374,
+        79444,
+        73379,
+        75999,
+        72230,
+        75706,
+        83422,
+        70186,
+        73213,
+        64972,
+        69303,
+        86881,
+        86149,
+        73596,
+        75732,
+        87229,
+        80102,
+        86445
       ],
-      "p50_us": 23307,
-      "p95_us": 27101,
-      "p99_us": 28650,
-      "p99_9_us": 28650,
-      "p99_99_us": 28650,
-      "max_us": 28650,
-      "throughput_elements_per_sec": 43.71
+      "p50_us": 73962,
+      "p95_us": 89011,
+      "p99_us": 98489,
+      "p99_9_us": 98489,
+      "p99_99_us": 98489,
+      "max_us": 98489,
+      "throughput_elements_per_sec": 13.31
     },
     {
       "batch_size": 10,
       "samples_us": [
-        140276,
-        154429,
-        144223,
-        144996,
-        146551,
-        133938,
-        141086,
-        145074,
-        142453,
-        138435,
-        144289,
-        153507,
-        135039,
-        142313,
-        142372,
-        133076,
-        140232,
-        147990,
-        133583,
-        135824,
-        159740,
-        143433,
-        141411,
-        143509,
-        143971
+        681017,
+        745194,
+        643660,
+        982449,
+        677447,
+        709212,
+        784734,
+        894050,
+        965201,
+        902850,
+        737258,
+        712531,
+        692239,
+        683326,
+        995748,
+        1479396,
+        1396050,
+        1408371,
+        1187095,
+        1097469,
+        1395918,
+        865822,
+        1030959,
+        704882,
+        741704
       ],
-      "p50_us": 142453,
-      "p95_us": 154429,
-      "p99_us": 159740,
-      "p99_9_us": 159740,
-      "p99_99_us": 159740,
-      "max_us": 159740,
-      "throughput_elements_per_sec": 69.99
+      "p50_us": 865822,
+      "p95_us": 1408371,
+      "p99_us": 1479396,
+      "p99_9_us": 1479396,
+      "p99_99_us": 1479396,
+      "max_us": 1479396,
+      "throughput_elements_per_sec": 10.82
     },
     {
       "batch_size": 50,
       "samples_us": [
-        658381,
-        687992,
-        665739,
-        1925691,
-        705503,
-        678366,
-        683122,
-        689903,
-        761699,
-        682683,
-        673937,
-        1490815,
-        665588,
-        680469,
-        670081
+        3740131,
+        4354253,
+        3738426,
+        2140059,
+        687897,
+        684819,
+        700337,
+        688927,
+        946320,
+        707231,
+        687398,
+        686140,
+        730466,
+        709445,
+        957671
       ],
-      "p50_us": 682683,
-      "p95_us": 1490815,
-      "p99_us": 1925691,
-      "p99_9_us": 1925691,
-      "p99_99_us": 1925691,
-      "max_us": 1925691,
-      "throughput_elements_per_sec": 60.88
+      "p50_us": 709445,
+      "p95_us": 3740131,
+      "p99_us": 4354253,
+      "p99_9_us": 4354253,
+      "p99_99_us": 4354253,
+      "max_us": 4354253,
+      "throughput_elements_per_sec": 33.85
     },
     {
       "batch_size": 100,
       "samples_us": [
-        1314800,
-        1389681,
-        1327095,
-        1414050,
-        1243241,
-        1260230,
-        3491133,
-        7640550,
-        3287846,
-        1325385,
-        1273434,
-        1276587
+        1325835,
+        1374760,
+        1345266,
+        1409432,
+        1413710,
+        1354521,
+        1385488,
+        1343860,
+        1357254,
+        1349642,
+        1354017,
+        1372928
       ],
-      "p50_us": 1327095,
-      "p95_us": 3491133,
-      "p99_us": 7640550,
-      "p99_9_us": 7640550,
-      "p99_99_us": 7640550,
-      "max_us": 7640550,
-      "throughput_elements_per_sec": 45.72
+      "p50_us": 1357254,
+      "p95_us": 1409432,
+      "p99_us": 1413710,
+      "p99_9_us": 1413710,
+      "p99_99_us": 1413710,
+      "max_us": 1413710,
+      "throughput_elements_per_sec": 73.23
     },
     {
       "batch_size": 500,
       "samples_us": [
-        7088480,
-        6837512,
-        6438268,
-        6406866,
-        6417133,
-        6306312
+        7002085,
+        6358781,
+        6359986,
+        6297271,
+        6421551,
+        6571195
       ],
-      "p50_us": 6438268,
-      "p95_us": 7088480,
-      "p99_us": 7088480,
-      "p99_9_us": 7088480,
-      "p99_99_us": 7088480,
-      "max_us": 7088480,
-      "throughput_elements_per_sec": 75.96
+      "p50_us": 6421551,
+      "p95_us": 7002085,
+      "p99_us": 7002085,
+      "p99_9_us": 7002085,
+      "p99_99_us": 7002085,
+      "max_us": 7002085,
+      "throughput_elements_per_sec": 76.9
     },
     {
       "batch_size": 1000,
       "samples_us": [
-        14461498,
-        13063438,
-        13091095,
-        12949540
+        13235783,
+        12892171,
+        12863717,
+        13231423
       ],
-      "p50_us": 13091095,
-      "p95_us": 14461498,
-      "p99_us": 14461498,
-      "p99_9_us": 14461498,
-      "p99_99_us": 14461498,
-      "max_us": 14461498,
-      "throughput_elements_per_sec": 74.67
+      "p50_us": 13231423,
+      "p95_us": 13235783,
+      "p99_us": 13235783,
+      "p99_9_us": 13235783,
+      "p99_99_us": 13235783,
+      "max_us": 13235783,
+      "throughput_elements_per_sec": 76.59
     }
   ],
   "batch_100_spans": [
@@ -247,7 +247,7 @@
         "batch_size": "100",
         "sample_index": "0"
       },
-      "duration_us": 1246770
+      "duration_us": 1257686
     },
     {
       "name": "archive_batch.write_message_batch",
@@ -257,7 +257,7 @@
         "batch_size": "100",
         "sample_index": "0"
       },
-      "duration_us": 1246777
+      "duration_us": 1257692
     },
     {
       "name": "archive_batch.flush_async_commits",
@@ -267,7 +267,7 @@
         "batch_size": "100",
         "sample_index": "0"
       },
-      "duration_us": 67977
+      "duration_us": 68128
     },
     {
       "name": "archive_batch.wbq_flush",
@@ -288,7 +288,7 @@
         "elements": "100",
         "sample_index": "0"
       },
-      "duration_us": 1314800
+      "duration_us": 1325835
     },
     {
       "name": "archive_batch.write_message_batch_bundle",
@@ -298,7 +298,7 @@
         "batch_size": "100",
         "sample_index": "1"
       },
-      "duration_us": 1322674
+      "duration_us": 1307236
     },
     {
       "name": "archive_batch.write_message_batch",
@@ -308,7 +308,7 @@
         "batch_size": "100",
         "sample_index": "1"
       },
-      "duration_us": 1322680
+      "duration_us": 1307243
     },
     {
       "name": "archive_batch.flush_async_commits",
@@ -318,7 +318,7 @@
         "batch_size": "100",
         "sample_index": "1"
       },
-      "duration_us": 66896
+      "duration_us": 67381
     },
     {
       "name": "archive_batch.wbq_flush",
@@ -328,7 +328,7 @@
         "batch_size": "100",
         "sample_index": "1"
       },
-      "duration_us": 0
+      "duration_us": 1
     },
     {
       "name": "archive_batch.sample",
@@ -339,7 +339,7 @@
         "elements": "100",
         "sample_index": "1"
       },
-      "duration_us": 1389682
+      "duration_us": 1374761
     },
     {
       "name": "archive_batch.write_message_batch_bundle",
@@ -349,7 +349,7 @@
         "batch_size": "100",
         "sample_index": "2"
       },
-      "duration_us": 1259907
+      "duration_us": 1277215
     },
     {
       "name": "archive_batch.write_message_batch",
@@ -359,7 +359,7 @@
         "batch_size": "100",
         "sample_index": "2"
       },
-      "duration_us": 1259913
+      "duration_us": 1277220
     },
     {
       "name": "archive_batch.flush_async_commits",
@@ -369,7 +369,7 @@
         "batch_size": "100",
         "sample_index": "2"
       },
-      "duration_us": 67165
+      "duration_us": 68022
     },
     {
       "name": "archive_batch.wbq_flush",
@@ -390,7 +390,7 @@
         "elements": "100",
         "sample_index": "2"
       },
-      "duration_us": 1327095
+      "duration_us": 1345266
     },
     {
       "name": "archive_batch.write_message_batch_bundle",
@@ -400,7 +400,7 @@
         "batch_size": "100",
         "sample_index": "3"
       },
-      "duration_us": 1346894
+      "duration_us": 1332124
     },
     {
       "name": "archive_batch.write_message_batch",
@@ -410,7 +410,7 @@
         "batch_size": "100",
         "sample_index": "3"
       },
-      "duration_us": 1346901
+      "duration_us": 1332131
     },
     {
       "name": "archive_batch.flush_async_commits",
@@ -420,7 +420,7 @@
         "batch_size": "100",
         "sample_index": "3"
       },
-      "duration_us": 67098
+      "duration_us": 77251
     },
     {
       "name": "archive_batch.wbq_flush",
@@ -441,7 +441,7 @@
         "elements": "100",
         "sample_index": "3"
       },
-      "duration_us": 1414050
+      "duration_us": 1409432
     },
     {
       "name": "archive_batch.write_message_batch_bundle",
@@ -451,7 +451,7 @@
         "batch_size": "100",
         "sample_index": "4"
       },
-      "duration_us": 1170968
+      "duration_us": 1346562
     },
     {
       "name": "archive_batch.write_message_batch",
@@ -461,7 +461,7 @@
         "batch_size": "100",
         "sample_index": "4"
       },
-      "duration_us": 1170975
+      "duration_us": 1346568
     },
     {
       "name": "archive_batch.flush_async_commits",
@@ -471,7 +471,7 @@
         "batch_size": "100",
         "sample_index": "4"
       },
-      "duration_us": 72246
+      "duration_us": 67117
     },
     {
       "name": "archive_batch.wbq_flush",
@@ -492,7 +492,7 @@
         "elements": "100",
         "sample_index": "4"
       },
-      "duration_us": 1243242
+      "duration_us": 1413710
     },
     {
       "name": "archive_batch.write_message_batch_bundle",
@@ -502,7 +502,7 @@
         "batch_size": "100",
         "sample_index": "5"
       },
-      "duration_us": 1187759
+      "duration_us": 1282340
     },
     {
       "name": "archive_batch.write_message_batch",
@@ -512,7 +512,7 @@
         "batch_size": "100",
         "sample_index": "5"
       },
-      "duration_us": 1187766
+      "duration_us": 1282347
     },
     {
       "name": "archive_batch.flush_async_commits",
@@ -522,7 +522,7 @@
         "batch_size": "100",
         "sample_index": "5"
       },
-      "duration_us": 72445
+      "duration_us": 72150
     },
     {
       "name": "archive_batch.wbq_flush",
@@ -543,7 +543,7 @@
         "elements": "100",
         "sample_index": "5"
       },
-      "duration_us": 1260231
+      "duration_us": 1354521
     },
     {
       "name": "archive_batch.write_message_batch_bundle",
@@ -553,7 +553,7 @@
         "batch_size": "100",
         "sample_index": "6"
       },
-      "duration_us": 3423308
+      "duration_us": 1307376
     },
     {
       "name": "archive_batch.write_message_batch",
@@ -563,7 +563,7 @@
         "batch_size": "100",
         "sample_index": "6"
       },
-      "duration_us": 3423314
+      "duration_us": 1307383
     },
     {
       "name": "archive_batch.flush_async_commits",
@@ -573,7 +573,7 @@
         "batch_size": "100",
         "sample_index": "6"
       },
-      "duration_us": 67644
+      "duration_us": 77970
     },
     {
       "name": "archive_batch.wbq_flush",
@@ -594,7 +594,7 @@
         "elements": "100",
         "sample_index": "6"
       },
-      "duration_us": 3491133
+      "duration_us": 1385489
     },
     {
       "name": "archive_batch.write_message_batch_bundle",
@@ -604,7 +604,7 @@
         "batch_size": "100",
         "sample_index": "7"
       },
-      "duration_us": 7558264
+      "duration_us": 1271744
     },
     {
       "name": "archive_batch.write_message_batch",
@@ -614,7 +614,7 @@
         "batch_size": "100",
         "sample_index": "7"
       },
-      "duration_us": 7558270
+      "duration_us": 1271751
     },
     {
       "name": "archive_batch.flush_async_commits",
@@ -624,7 +624,7 @@
         "batch_size": "100",
         "sample_index": "7"
       },
-      "duration_us": 82217
+      "duration_us": 72087
     },
     {
       "name": "archive_batch.wbq_flush",
@@ -645,7 +645,7 @@
         "elements": "100",
         "sample_index": "7"
       },
-      "duration_us": 7640551
+      "duration_us": 1343860
     },
     {
       "name": "archive_batch.write_message_batch_bundle",
@@ -655,7 +655,7 @@
         "batch_size": "100",
         "sample_index": "8"
       },
-      "duration_us": 3215450
+      "duration_us": 1279940
     },
     {
       "name": "archive_batch.write_message_batch",
@@ -665,7 +665,7 @@
         "batch_size": "100",
         "sample_index": "8"
       },
-      "duration_us": 3215456
+      "duration_us": 1279947
     },
     {
       "name": "archive_batch.flush_async_commits",
@@ -675,7 +675,7 @@
         "batch_size": "100",
         "sample_index": "8"
       },
-      "duration_us": 72368
+      "duration_us": 77281
     },
     {
       "name": "archive_batch.wbq_flush",
@@ -696,7 +696,7 @@
         "elements": "100",
         "sample_index": "8"
       },
-      "duration_us": 3287846
+      "duration_us": 1357254
     },
     {
       "name": "archive_batch.write_message_batch_bundle",
@@ -706,7 +706,7 @@
         "batch_size": "100",
         "sample_index": "9"
       },
-      "duration_us": 1247697
+      "duration_us": 1271824
     },
     {
       "name": "archive_batch.write_message_batch",
@@ -716,7 +716,7 @@
         "batch_size": "100",
         "sample_index": "9"
       },
-      "duration_us": 1247704
+      "duration_us": 1271831
     },
     {
       "name": "archive_batch.flush_async_commits",
@@ -726,7 +726,7 @@
         "batch_size": "100",
         "sample_index": "9"
       },
-      "duration_us": 77643
+      "duration_us": 77787
     },
     {
       "name": "archive_batch.wbq_flush",
@@ -747,7 +747,7 @@
         "elements": "100",
         "sample_index": "9"
       },
-      "duration_us": 1325386
+      "duration_us": 1349642
     },
     {
       "name": "archive_batch.write_message_batch_bundle",
@@ -757,7 +757,7 @@
         "batch_size": "100",
         "sample_index": "10"
       },
-      "duration_us": 1190892
+      "duration_us": 1276178
     },
     {
       "name": "archive_batch.write_message_batch",
@@ -767,7 +767,7 @@
         "batch_size": "100",
         "sample_index": "10"
       },
-      "duration_us": 1190899
+      "duration_us": 1276185
     },
     {
       "name": "archive_batch.flush_async_commits",
@@ -777,7 +777,7 @@
         "batch_size": "100",
         "sample_index": "10"
       },
-      "duration_us": 82513
+      "duration_us": 77812
     },
     {
       "name": "archive_batch.wbq_flush",
@@ -798,7 +798,7 @@
         "elements": "100",
         "sample_index": "10"
       },
-      "duration_us": 1273434
+      "duration_us": 1354018
     },
     {
       "name": "archive_batch.write_message_batch_bundle",
@@ -808,7 +808,7 @@
         "batch_size": "100",
         "sample_index": "11"
       },
-      "duration_us": 1199143
+      "duration_us": 1295496
     },
     {
       "name": "archive_batch.write_message_batch",
@@ -818,7 +818,7 @@
         "batch_size": "100",
         "sample_index": "11"
       },
-      "duration_us": 1199150
+      "duration_us": 1295503
     },
     {
       "name": "archive_batch.flush_async_commits",
@@ -828,7 +828,7 @@
         "batch_size": "100",
         "sample_index": "11"
       },
-      "duration_us": 77416
+      "duration_us": 77402
     },
     {
       "name": "archive_batch.wbq_flush",
@@ -849,7 +849,7 @@
         "elements": "100",
         "sample_index": "11"
       },
-      "duration_us": 1276587
+      "duration_us": 1372928
     }
   ],
   "traceEvents": [
@@ -858,7 +858,7 @@
       "cat": "archive_batch",
       "ph": "X",
       "ts": 0,
-      "dur": 1246770,
+      "dur": 1257686,
       "pid": 1,
       "tid": 0,
       "args": {
@@ -870,8 +870,8 @@
       "name": "archive_batch.write_message_batch",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 1246770,
-      "dur": 1246777,
+      "ts": 1257686,
+      "dur": 1257692,
       "pid": 1,
       "tid": 0,
       "args": {
@@ -883,8 +883,8 @@
       "name": "archive_batch.flush_async_commits",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2493547,
-      "dur": 67977,
+      "ts": 2515378,
+      "dur": 68128,
       "pid": 1,
       "tid": 0,
       "args": {
@@ -896,7 +896,7 @@
       "name": "archive_batch.wbq_flush",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2561524,
+      "ts": 2583506,
       "dur": 0,
       "pid": 1,
       "tid": 0,
@@ -909,8 +909,8 @@
       "name": "archive_batch.sample",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2561524,
-      "dur": 1314800,
+      "ts": 2583506,
+      "dur": 1325835,
       "pid": 1,
       "tid": 0,
       "args": {
@@ -924,7 +924,7 @@
       "cat": "archive_batch",
       "ph": "X",
       "ts": 0,
-      "dur": 1322674,
+      "dur": 1307236,
       "pid": 1,
       "tid": 1,
       "args": {
@@ -936,8 +936,8 @@
       "name": "archive_batch.write_message_batch",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 1322674,
-      "dur": 1322680,
+      "ts": 1307236,
+      "dur": 1307243,
       "pid": 1,
       "tid": 1,
       "args": {
@@ -949,8 +949,8 @@
       "name": "archive_batch.flush_async_commits",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2645354,
-      "dur": 66896,
+      "ts": 2614479,
+      "dur": 67381,
       "pid": 1,
       "tid": 1,
       "args": {
@@ -962,8 +962,8 @@
       "name": "archive_batch.wbq_flush",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2712250,
-      "dur": 0,
+      "ts": 2681860,
+      "dur": 1,
       "pid": 1,
       "tid": 1,
       "args": {
@@ -975,8 +975,8 @@
       "name": "archive_batch.sample",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2712250,
-      "dur": 1389682,
+      "ts": 2681861,
+      "dur": 1374761,
       "pid": 1,
       "tid": 1,
       "args": {
@@ -990,7 +990,7 @@
       "cat": "archive_batch",
       "ph": "X",
       "ts": 0,
-      "dur": 1259907,
+      "dur": 1277215,
       "pid": 1,
       "tid": 2,
       "args": {
@@ -1002,8 +1002,8 @@
       "name": "archive_batch.write_message_batch",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 1259907,
-      "dur": 1259913,
+      "ts": 1277215,
+      "dur": 1277220,
       "pid": 1,
       "tid": 2,
       "args": {
@@ -1015,8 +1015,8 @@
       "name": "archive_batch.flush_async_commits",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2519820,
-      "dur": 67165,
+      "ts": 2554435,
+      "dur": 68022,
       "pid": 1,
       "tid": 2,
       "args": {
@@ -1028,7 +1028,7 @@
       "name": "archive_batch.wbq_flush",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2586985,
+      "ts": 2622457,
       "dur": 0,
       "pid": 1,
       "tid": 2,
@@ -1041,8 +1041,8 @@
       "name": "archive_batch.sample",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2586985,
-      "dur": 1327095,
+      "ts": 2622457,
+      "dur": 1345266,
       "pid": 1,
       "tid": 2,
       "args": {
@@ -1056,7 +1056,7 @@
       "cat": "archive_batch",
       "ph": "X",
       "ts": 0,
-      "dur": 1346894,
+      "dur": 1332124,
       "pid": 1,
       "tid": 3,
       "args": {
@@ -1068,8 +1068,8 @@
       "name": "archive_batch.write_message_batch",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 1346894,
-      "dur": 1346901,
+      "ts": 1332124,
+      "dur": 1332131,
       "pid": 1,
       "tid": 3,
       "args": {
@@ -1081,8 +1081,8 @@
       "name": "archive_batch.flush_async_commits",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2693795,
-      "dur": 67098,
+      "ts": 2664255,
+      "dur": 77251,
       "pid": 1,
       "tid": 3,
       "args": {
@@ -1094,7 +1094,7 @@
       "name": "archive_batch.wbq_flush",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2760893,
+      "ts": 2741506,
       "dur": 0,
       "pid": 1,
       "tid": 3,
@@ -1107,8 +1107,8 @@
       "name": "archive_batch.sample",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2760893,
-      "dur": 1414050,
+      "ts": 2741506,
+      "dur": 1409432,
       "pid": 1,
       "tid": 3,
       "args": {
@@ -1122,7 +1122,7 @@
       "cat": "archive_batch",
       "ph": "X",
       "ts": 0,
-      "dur": 1170968,
+      "dur": 1346562,
       "pid": 1,
       "tid": 4,
       "args": {
@@ -1134,8 +1134,8 @@
       "name": "archive_batch.write_message_batch",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 1170968,
-      "dur": 1170975,
+      "ts": 1346562,
+      "dur": 1346568,
       "pid": 1,
       "tid": 4,
       "args": {
@@ -1147,8 +1147,8 @@
       "name": "archive_batch.flush_async_commits",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2341943,
-      "dur": 72246,
+      "ts": 2693130,
+      "dur": 67117,
       "pid": 1,
       "tid": 4,
       "args": {
@@ -1160,7 +1160,7 @@
       "name": "archive_batch.wbq_flush",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2414189,
+      "ts": 2760247,
       "dur": 0,
       "pid": 1,
       "tid": 4,
@@ -1173,8 +1173,8 @@
       "name": "archive_batch.sample",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2414189,
-      "dur": 1243242,
+      "ts": 2760247,
+      "dur": 1413710,
       "pid": 1,
       "tid": 4,
       "args": {
@@ -1188,7 +1188,7 @@
       "cat": "archive_batch",
       "ph": "X",
       "ts": 0,
-      "dur": 1187759,
+      "dur": 1282340,
       "pid": 1,
       "tid": 5,
       "args": {
@@ -1200,8 +1200,8 @@
       "name": "archive_batch.write_message_batch",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 1187759,
-      "dur": 1187766,
+      "ts": 1282340,
+      "dur": 1282347,
       "pid": 1,
       "tid": 5,
       "args": {
@@ -1213,8 +1213,8 @@
       "name": "archive_batch.flush_async_commits",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2375525,
-      "dur": 72445,
+      "ts": 2564687,
+      "dur": 72150,
       "pid": 1,
       "tid": 5,
       "args": {
@@ -1226,7 +1226,7 @@
       "name": "archive_batch.wbq_flush",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2447970,
+      "ts": 2636837,
       "dur": 0,
       "pid": 1,
       "tid": 5,
@@ -1239,8 +1239,8 @@
       "name": "archive_batch.sample",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2447970,
-      "dur": 1260231,
+      "ts": 2636837,
+      "dur": 1354521,
       "pid": 1,
       "tid": 5,
       "args": {
@@ -1254,7 +1254,7 @@
       "cat": "archive_batch",
       "ph": "X",
       "ts": 0,
-      "dur": 3423308,
+      "dur": 1307376,
       "pid": 1,
       "tid": 6,
       "args": {
@@ -1266,8 +1266,8 @@
       "name": "archive_batch.write_message_batch",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 3423308,
-      "dur": 3423314,
+      "ts": 1307376,
+      "dur": 1307383,
       "pid": 1,
       "tid": 6,
       "args": {
@@ -1279,8 +1279,8 @@
       "name": "archive_batch.flush_async_commits",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 6846622,
-      "dur": 67644,
+      "ts": 2614759,
+      "dur": 77970,
       "pid": 1,
       "tid": 6,
       "args": {
@@ -1292,7 +1292,7 @@
       "name": "archive_batch.wbq_flush",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 6914266,
+      "ts": 2692729,
       "dur": 0,
       "pid": 1,
       "tid": 6,
@@ -1305,8 +1305,8 @@
       "name": "archive_batch.sample",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 6914266,
-      "dur": 3491133,
+      "ts": 2692729,
+      "dur": 1385489,
       "pid": 1,
       "tid": 6,
       "args": {
@@ -1320,7 +1320,7 @@
       "cat": "archive_batch",
       "ph": "X",
       "ts": 0,
-      "dur": 7558264,
+      "dur": 1271744,
       "pid": 1,
       "tid": 7,
       "args": {
@@ -1332,8 +1332,8 @@
       "name": "archive_batch.write_message_batch",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 7558264,
-      "dur": 7558270,
+      "ts": 1271744,
+      "dur": 1271751,
       "pid": 1,
       "tid": 7,
       "args": {
@@ -1345,8 +1345,8 @@
       "name": "archive_batch.flush_async_commits",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 15116534,
-      "dur": 82217,
+      "ts": 2543495,
+      "dur": 72087,
       "pid": 1,
       "tid": 7,
       "args": {
@@ -1358,7 +1358,7 @@
       "name": "archive_batch.wbq_flush",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 15198751,
+      "ts": 2615582,
       "dur": 0,
       "pid": 1,
       "tid": 7,
@@ -1371,8 +1371,8 @@
       "name": "archive_batch.sample",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 15198751,
-      "dur": 7640551,
+      "ts": 2615582,
+      "dur": 1343860,
       "pid": 1,
       "tid": 7,
       "args": {
@@ -1386,7 +1386,7 @@
       "cat": "archive_batch",
       "ph": "X",
       "ts": 0,
-      "dur": 3215450,
+      "dur": 1279940,
       "pid": 1,
       "tid": 8,
       "args": {
@@ -1398,8 +1398,8 @@
       "name": "archive_batch.write_message_batch",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 3215450,
-      "dur": 3215456,
+      "ts": 1279940,
+      "dur": 1279947,
       "pid": 1,
       "tid": 8,
       "args": {
@@ -1411,8 +1411,8 @@
       "name": "archive_batch.flush_async_commits",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 6430906,
-      "dur": 72368,
+      "ts": 2559887,
+      "dur": 77281,
       "pid": 1,
       "tid": 8,
       "args": {
@@ -1424,7 +1424,7 @@
       "name": "archive_batch.wbq_flush",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 6503274,
+      "ts": 2637168,
       "dur": 0,
       "pid": 1,
       "tid": 8,
@@ -1437,8 +1437,8 @@
       "name": "archive_batch.sample",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 6503274,
-      "dur": 3287846,
+      "ts": 2637168,
+      "dur": 1357254,
       "pid": 1,
       "tid": 8,
       "args": {
@@ -1452,7 +1452,7 @@
       "cat": "archive_batch",
       "ph": "X",
       "ts": 0,
-      "dur": 1247697,
+      "dur": 1271824,
       "pid": 1,
       "tid": 9,
       "args": {
@@ -1464,8 +1464,8 @@
       "name": "archive_batch.write_message_batch",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 1247697,
-      "dur": 1247704,
+      "ts": 1271824,
+      "dur": 1271831,
       "pid": 1,
       "tid": 9,
       "args": {
@@ -1477,8 +1477,8 @@
       "name": "archive_batch.flush_async_commits",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2495401,
-      "dur": 77643,
+      "ts": 2543655,
+      "dur": 77787,
       "pid": 1,
       "tid": 9,
       "args": {
@@ -1490,7 +1490,7 @@
       "name": "archive_batch.wbq_flush",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2573044,
+      "ts": 2621442,
       "dur": 0,
       "pid": 1,
       "tid": 9,
@@ -1503,8 +1503,8 @@
       "name": "archive_batch.sample",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2573044,
-      "dur": 1325386,
+      "ts": 2621442,
+      "dur": 1349642,
       "pid": 1,
       "tid": 9,
       "args": {
@@ -1518,7 +1518,7 @@
       "cat": "archive_batch",
       "ph": "X",
       "ts": 0,
-      "dur": 1190892,
+      "dur": 1276178,
       "pid": 1,
       "tid": 10,
       "args": {
@@ -1530,8 +1530,8 @@
       "name": "archive_batch.write_message_batch",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 1190892,
-      "dur": 1190899,
+      "ts": 1276178,
+      "dur": 1276185,
       "pid": 1,
       "tid": 10,
       "args": {
@@ -1543,8 +1543,8 @@
       "name": "archive_batch.flush_async_commits",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2381791,
-      "dur": 82513,
+      "ts": 2552363,
+      "dur": 77812,
       "pid": 1,
       "tid": 10,
       "args": {
@@ -1556,7 +1556,7 @@
       "name": "archive_batch.wbq_flush",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2464304,
+      "ts": 2630175,
       "dur": 0,
       "pid": 1,
       "tid": 10,
@@ -1569,8 +1569,8 @@
       "name": "archive_batch.sample",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2464304,
-      "dur": 1273434,
+      "ts": 2630175,
+      "dur": 1354018,
       "pid": 1,
       "tid": 10,
       "args": {
@@ -1584,7 +1584,7 @@
       "cat": "archive_batch",
       "ph": "X",
       "ts": 0,
-      "dur": 1199143,
+      "dur": 1295496,
       "pid": 1,
       "tid": 11,
       "args": {
@@ -1596,8 +1596,8 @@
       "name": "archive_batch.write_message_batch",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 1199143,
-      "dur": 1199150,
+      "ts": 1295496,
+      "dur": 1295503,
       "pid": 1,
       "tid": 11,
       "args": {
@@ -1609,8 +1609,8 @@
       "name": "archive_batch.flush_async_commits",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2398293,
-      "dur": 77416,
+      "ts": 2590999,
+      "dur": 77402,
       "pid": 1,
       "tid": 11,
       "args": {
@@ -1622,7 +1622,7 @@
       "name": "archive_batch.wbq_flush",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2475709,
+      "ts": 2668401,
       "dur": 0,
       "pid": 1,
       "tid": 11,
@@ -1635,8 +1635,8 @@
       "name": "archive_batch.sample",
       "cat": "archive_batch",
       "ph": "X",
-      "ts": 2475709,
-      "dur": 1276587,
+      "ts": 2668401,
+      "dur": 1372928,
       "pid": 1,
       "tid": 11,
       "args": {
@@ -1649,65 +1649,65 @@
   "top_categories": [
     {
       "category": "archive_batch.sample",
-      "cumulative_us": 26244037,
+      "cumulative_us": 16386716,
       "count": 12,
-      "p50_us": 1327095,
-      "p95_us": 3491133,
-      "avg_us": 2187003,
-      "max_us": 7640551
+      "p50_us": 1357254,
+      "p95_us": 1409432,
+      "avg_us": 1365559,
+      "max_us": 1413710
     },
     {
       "category": "archive_batch.write_message_batch",
-      "cumulative_us": 25369805,
+      "cumulative_us": 15505801,
       "count": 12,
-      "p50_us": 1259913,
-      "p95_us": 3423314,
-      "avg_us": 2114150,
-      "max_us": 7558270
+      "p50_us": 1282347,
+      "p95_us": 1332131,
+      "avg_us": 1292150,
+      "max_us": 1346568
     },
     {
       "category": "archive_batch.write_message_batch_bundle",
-      "cumulative_us": 25369726,
+      "cumulative_us": 15505721,
       "count": 12,
-      "p50_us": 1259907,
-      "p95_us": 3423308,
-      "avg_us": 2114143,
-      "max_us": 7558264
+      "p50_us": 1282340,
+      "p95_us": 1332124,
+      "avg_us": 1292143,
+      "max_us": 1346562
     },
     {
       "category": "archive_batch.flush_async_commits",
-      "cumulative_us": 873628,
+      "cumulative_us": 880388,
       "count": 12,
-      "p50_us": 72368,
-      "p95_us": 82217,
-      "avg_us": 72802,
-      "max_us": 82513
+      "p50_us": 77251,
+      "p95_us": 77812,
+      "avg_us": 73365,
+      "max_us": 77970
     },
     {
       "category": "archive_batch.wbq_flush",
-      "cumulative_us": 0,
+      "cumulative_us": 1,
       "count": 12,
       "p50_us": 0,
       "p95_us": 0,
       "avg_us": 0,
-      "max_us": 0
+      "max_us": 1
     }
   ],
   "hypothesis_evaluations": [
     {
       "name": "coalescer batching",
       "supports_or_rejects": "rejects",
-      "evidence": "write_message_batch dominates at 25369726us cumulative while flush_async_commits is secondary at 873628us"
+      "evidence": "write_message_batch dominates at 15505721us cumulative while flush_async_commits is secondary at 880388us"
     },
     {
       "name": "fsync per msg",
       "supports_or_rejects": "rejects",
-      "evidence": "wbq_flush is only 0us cumulative versus 873628us for flush_async_commits, so the final wait is not the dominant lever"
+      "evidence": "wbq_flush is only 1us cumulative versus 880388us for flush_async_commits, so the final wait is not the dominant lever"
     },
     {
       "name": "file layout",
       "supports_or_rejects": "supports",
-      "evidence": "per-message archive burst work still dominates the profile at 25369726us cumulative"
+      "evidence": "per-message archive burst work still dominates the profile at 15505721us cumulative"
     },
     {
       "name": "SQLite per-msg txn",
@@ -1722,8 +1722,8 @@
     {
       "name": "lock thrash",
       "supports_or_rejects": "rejects",
-      "evidence": "scaling remains batch-10 p95 is 5.70x batch-1, batch-50 p95 is 55.01x batch-1, batch-100 p95 is 128.82x batch-1, batch-500 p95 is 261.56x batch-1, batch-1000 p95 is 533.61x batch-1; batch-10 amortizes to 0.570x batch-1 per message, batch-50 amortizes to 1.100x batch-1 per message, batch-100 amortizes to 1.288x batch-1 per message, batch-500 amortizes to 0.523x batch-1 per message, batch-1000 amortizes to 0.534x batch-1 per message. Overall scaling remains sublinear through batch-1000., which does not resemble lock-driven blow-up"
+      "evidence": "scaling remains batch-10 p95 is 15.82x batch-1, batch-50 p95 is 42.02x batch-1, batch-100 p95 is 15.83x batch-1, batch-500 p95 is 78.67x batch-1, batch-1000 p95 is 148.70x batch-1; batch-10 amortizes to 1.582x batch-1 per message, batch-50 amortizes to 0.840x batch-1 per message, batch-100 amortizes to 0.158x batch-1 per message, batch-500 amortizes to 0.157x batch-1 per message, batch-1000 amortizes to 0.149x batch-1 per message. Overall scaling remains sublinear through batch-1000., which does not resemble lock-driven blow-up"
     }
   ],
-  "scaling_law_note": "batch-10 p95 is 5.70x batch-1, batch-50 p95 is 55.01x batch-1, batch-100 p95 is 128.82x batch-1, batch-500 p95 is 261.56x batch-1, batch-1000 p95 is 533.61x batch-1; batch-10 amortizes to 0.570x batch-1 per message, batch-50 amortizes to 1.100x batch-1 per message, batch-100 amortizes to 1.288x batch-1 per message, batch-500 amortizes to 0.523x batch-1 per message, batch-1000 amortizes to 0.534x batch-1 per message. Overall scaling remains sublinear through batch-1000."
+  "scaling_law_note": "batch-10 p95 is 15.82x batch-1, batch-50 p95 is 42.02x batch-1, batch-100 p95 is 15.83x batch-1, batch-500 p95 is 78.67x batch-1, batch-1000 p95 is 148.70x batch-1; batch-10 amortizes to 1.582x batch-1 per message, batch-50 amortizes to 0.840x batch-1 per message, batch-100 amortizes to 0.158x batch-1 per message, batch-500 amortizes to 0.157x batch-1 per message, batch-1000 amortizes to 0.149x batch-1 per message. Overall scaling remains sublinear through batch-1000."
 }
