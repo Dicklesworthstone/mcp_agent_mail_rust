@@ -94,8 +94,10 @@ ASSET_DIR="${MOCK_ROOT}/releases/download/v${CURRENT_VERSION}"
 ASSET_PATH="${ASSET_DIR}/${ASSET_NAME}"
 mkdir -p "${ASSET_DIR}"
 
-# Keep payload intentionally tiny to avoid HTTP body-size limits while still
-# exercising checksum/replace behavior in the self-update path.
+# Include deterministic incompressible padding so the mocked tarball exceeds
+# the old asupersync non-streaming 16 MiB body limit. That keeps this E2E tied
+# to the streaming self-update path instead of only proving tiny artifact
+# replacement.
 PAYLOAD_STAGE="${WORK}/payload"
 mkdir -p "${PAYLOAD_STAGE}"
 cat > "${PAYLOAD_STAGE}/am" <<EOF
@@ -144,7 +146,39 @@ echo "mcp-agent-mail ${CURRENT_VERSION}"
 EOF
 chmod +x "${PAYLOAD_STAGE}/mcp-agent-mail"
 
-tar -cJf "${ASSET_PATH}" -C "${PAYLOAD_STAGE}" am mcp-agent-mail
+STREAMING_SENTINEL_SIZE=$((17 * 1024 * 1024))
+python3 - "${PAYLOAD_STAGE}/streaming-sentinel.bin" "${STREAMING_SENTINEL_SIZE}" <<'PY'
+import hashlib
+import sys
+
+path = sys.argv[1]
+remaining = int(sys.argv[2])
+counter = 0
+
+with open(path, "wb") as fh:
+    while remaining > 0:
+        block = hashlib.sha256(counter.to_bytes(8, "little")).digest()
+        size = min(len(block), remaining)
+        fh.write(block[:size])
+        remaining -= size
+        counter += 1
+PY
+
+tar -cJf "${ASSET_PATH}" -C "${PAYLOAD_STAGE}" am mcp-agent-mail streaming-sentinel.bin
+ASSET_BYTES="$(wc -c < "${ASSET_PATH}" | tr -d '[:space:]')"
+OLD_HTTP_BODY_LIMIT_BYTES=$((16 * 1024 * 1024))
+e2e_case_banner "mock release asset exceeds streaming threshold"
+e2e_save_artifact "mock_asset_size.txt" "asset_bytes=${ASSET_BYTES}
+old_http_body_limit_bytes=${OLD_HTTP_BODY_LIMIT_BYTES}
+streaming_sentinel_bytes=${STREAMING_SENTINEL_SIZE}"
+if [ "${ASSET_BYTES}" -gt "${OLD_HTTP_BODY_LIMIT_BYTES}" ]; then
+    e2e_pass "mock tarball exceeds old non-streaming body limit (${ASSET_BYTES} bytes)"
+else
+    e2e_fail "mock tarball should exceed old non-streaming body limit (${ASSET_BYTES} bytes)"
+    e2e_summary
+    exit 1
+fi
+
 ASSET_SHA="$(e2e_sha256 "${ASSET_PATH}")"
 printf "%s  %s\n" "${ASSET_SHA}" "${ASSET_NAME}" > "${ASSET_PATH}.sha256"
 
