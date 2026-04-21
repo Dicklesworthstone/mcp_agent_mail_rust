@@ -1566,10 +1566,24 @@ impl Config {
 
         // Archive git maintenance
         config.archive_maintenance_enabled = !env_truthy("AM_ARCHIVE_MAINTENANCE_DISABLED");
-        config.archive_maintenance_interval_secs = env_u64(
-            "AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS",
-            config.archive_maintenance_interval_secs,
-        );
+        {
+            const MIN_MAINTENANCE_INTERVAL_SECS: u64 = 60;
+            const MAX_MAINTENANCE_INTERVAL_SECS: u64 = 86_400;
+            let raw = env_u64(
+                "AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS",
+                config.archive_maintenance_interval_secs,
+            );
+            if raw < MIN_MAINTENANCE_INTERVAL_SECS || raw > MAX_MAINTENANCE_INTERVAL_SECS {
+                tracing::warn!(
+                    raw,
+                    min = MIN_MAINTENANCE_INTERVAL_SECS,
+                    max = MAX_MAINTENANCE_INTERVAL_SECS,
+                    "AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS out of bounds; clamping"
+                );
+            }
+            config.archive_maintenance_interval_secs =
+                raw.clamp(MIN_MAINTENANCE_INTERVAL_SECS, MAX_MAINTENANCE_INTERVAL_SECS);
+        }
 
         // Memory pressure monitoring
         config.memory_warning_mb = env_u64("MEMORY_WARNING_MB", config.memory_warning_mb);
@@ -3199,6 +3213,42 @@ mod tests {
         let config = Config::from_env();
         assert!(!config.log_tool_calls_enabled);
         assert_eq!(config.log_tool_calls_result_max_chars, 1234);
+    }
+
+    #[test]
+    fn test_archive_maintenance_interval_clamps_low() {
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS", "5"),
+        ]);
+        let config = Config::from_env();
+        assert_eq!(config.archive_maintenance_interval_secs, 60);
+    }
+
+    #[test]
+    fn test_archive_maintenance_interval_clamps_high() {
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS", "999999"),
+        ]);
+        let config = Config::from_env();
+        assert_eq!(config.archive_maintenance_interval_secs, 86_400);
+    }
+
+    #[test]
+    fn test_archive_maintenance_interval_accepts_valid() {
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS", "900"),
+        ]);
+        let config = Config::from_env();
+        assert_eq!(config.archive_maintenance_interval_secs, 900);
+    }
+
+    #[test]
+    fn test_archive_maintenance_disabled_via_env() {
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_ARCHIVE_MAINTENANCE_DISABLED", "1"),
+        ]);
+        let config = Config::from_env();
+        assert!(!config.archive_maintenance_enabled);
     }
 
     #[test]
@@ -5126,5 +5176,48 @@ mod tests {
             root_a, root_b,
             "same ephemeral path must always produce the same isolated root"
         );
+    }
+
+    #[test]
+    fn archive_maintenance_interval_clamps_zero_to_min() {
+        let _guard = TestEnvOverrideGuard::set(&[
+            ("AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS", "0"),
+        ]);
+        let config = Config::from_env();
+        assert_eq!(config.archive_maintenance_interval_secs, 60);
+    }
+
+    #[test]
+    fn archive_maintenance_interval_clamps_oversized_to_max() {
+        let _guard = TestEnvOverrideGuard::set(&[
+            ("AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS", "999999"),
+        ]);
+        let config = Config::from_env();
+        assert_eq!(config.archive_maintenance_interval_secs, 86_400);
+    }
+
+    #[test]
+    fn archive_maintenance_interval_accepts_valid_value() {
+        let _guard = TestEnvOverrideGuard::set(&[
+            ("AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS", "900"),
+        ]);
+        let config = Config::from_env();
+        assert_eq!(config.archive_maintenance_interval_secs, 900);
+    }
+
+    #[test]
+    fn archive_maintenance_disabled_flag() {
+        let _guard = TestEnvOverrideGuard::set(&[
+            ("AM_ARCHIVE_MAINTENANCE_DISABLED", "1"),
+        ]);
+        let config = Config::from_env();
+        assert!(!config.archive_maintenance_enabled);
+    }
+
+    #[test]
+    fn archive_maintenance_enabled_by_default() {
+        let config = Config::default();
+        assert!(config.archive_maintenance_enabled);
+        assert_eq!(config.archive_maintenance_interval_secs, 1800);
     }
 }
