@@ -280,49 +280,6 @@ dependencies = [
 
 [[package]]
 name = "asupersync"
-version = "0.2.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0348801439f904e16ef77c54e0ea053e3821a52d8875a77b3d4ac803ad8d0662"
-dependencies = [
- "base64 0.22.1",
- "bincode-next",
- "crossbeam-deque",
- "crossbeam-queue",
- "franken-decision 0.2.9",
- "franken-evidence 0.2.9",
- "franken-kernel 0.2.9",
- "futures-lite",
- "getrandom 0.4.2",
- "hashbrown 0.15.5",
- "hmac 0.12.1",
- "js-sys",
- "libc",
- "memchr",
- "nix 0.31.2",
- "parking_lot",
- "pin-project",
- "polling",
- "rmp-serde",
- "serde",
- "serde_json",
- "sha1 0.10.6",
- "sha2 0.10.9",
- "signal-hook 0.3.18",
- "slab",
- "smallvec",
- "socket2",
- "tempfile",
- "thiserror",
- "tracing",
- "tracing-subscriber",
- "visibility",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
-name = "asupersync"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db67031367cd5b385762deac048036624af34eb5261c69b89a387fa22ff73aab"
@@ -333,9 +290,9 @@ dependencies = [
  "crc32fast",
  "crossbeam-deque",
  "crossbeam-queue",
- "franken-decision 0.3.0",
- "franken-evidence 0.3.0",
- "franken-kernel 0.3.0",
+ "franken-decision",
+ "franken-evidence",
+ "franken-kernel",
  "futures-lite",
  "getrandom 0.4.2",
  "hashbrown 0.17.0",
@@ -1880,11 +1837,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-client"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bcf6559ba58f838f154e77e3b2e54e5e3543b9c60b26202f85deff25fc56158b"
+version = "0.3.0"
 dependencies = [
- "asupersync 0.2.9",
+ "asupersync",
  "dirs",
  "fastmcp-core",
  "fastmcp-protocol",
@@ -1897,9 +1852,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-console"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19c919ae71d13eb11e0274d8c00e9459030706236a2ed49fa6891eb0addcac5e"
+version = "0.3.0"
 dependencies = [
  "fastmcp-core",
  "fastmcp-protocol",
@@ -1916,11 +1869,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-core"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d5a7e2673923fcb76a3db600016190e21a10ebcbdf21101e9d16c851781f725"
+version = "0.3.0"
 dependencies = [
- "asupersync 0.2.9",
+ "asupersync",
  "log",
  "serde",
  "serde_json",
@@ -1928,9 +1879,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-derive"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07be902381e09a27d219208d57cbafacf0f8d23906690748bedc6413d8722a21"
+version = "0.3.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1939,9 +1888,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-protocol"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b2d1fab59e97487e486ca704be8a16d09e9500cae269cda066ee8c324eb7872"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "fastmcp-core",
@@ -1952,11 +1899,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-rust"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e96b07aa7b161033c8a140c5c1bbbed6c63731123b32005e4bed1b1ba1fdac73"
+version = "0.3.0"
 dependencies = [
- "asupersync 0.2.9",
+ "asupersync",
  "fastmcp-client",
  "fastmcp-core",
  "fastmcp-derive",
@@ -1969,11 +1914,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-server"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88e3a9ff78ea1284ff5e8955da384ebf1fa1893286e3c3ae622bf16a08a29550"
+version = "0.3.0"
 dependencies = [
- "asupersync 0.2.9",
+ "asupersync",
  "base64 0.22.1",
  "chrono",
  "fastmcp-client",
@@ -1991,11 +1934,9 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-transport"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ffa5958541ed6a4fad0d6edafe531f4ce33e9b91509296c9edd81c4a2f5d99c"
+version = "0.3.0"
 dependencies = [
- "asupersync 0.2.9",
+ "asupersync",
  "fastmcp-core",
  "fastmcp-protocol",
  "getrandom 0.4.2",
@@ -2138,34 +2079,13 @@ dependencies = [
 
 [[package]]
 name = "franken-decision"
-version = "0.2.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b33fa1070b94d690c87242247a8e402afbbf983b3f770d5ef45f61fb600f6349"
-dependencies = [
- "franken-evidence 0.2.9",
- "franken-kernel 0.2.9",
- "serde",
-]
-
-[[package]]
-name = "franken-decision"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caa668d9d7417aeee0ee03d185c667cf423ee8368a7b579947c83dd5e1c89510"
 dependencies = [
- "franken-evidence 0.3.0",
- "franken-kernel 0.3.0",
+ "franken-evidence",
+ "franken-kernel",
  "serde",
-]
-
-[[package]]
-name = "franken-evidence"
-version = "0.2.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "055cfe4bb1cc6706adf273e41d75d941b10be8ada0ff4ae5f2f564d91cf24a90"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -2180,15 +2100,6 @@ dependencies = [
 
 [[package]]
 name = "franken-kernel"
-version = "0.2.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d5127a59ac195a757e4fdad400ad808528e9b435d1188ef22e8ae079c868114"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "franken-kernel"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6aff78b47d49216308598be2eb0a37694b10d81e9b9cea2263986dea61d4a7fc"
@@ -2198,9 +2109,9 @@ dependencies = [
 
 [[package]]
 name = "frankensearch"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "frankensearch-core",
  "frankensearch-embed",
  "frankensearch-fusion",
@@ -2212,9 +2123,9 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-core"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2226,9 +2137,9 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-embed"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "dirs",
  "fastembed",
  "frankensearch-core",
@@ -2242,10 +2153,10 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-fusion"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ahash",
- "asupersync 0.3.0",
+ "asupersync",
  "frankensearch-core",
  "frankensearch-embed",
  "frankensearch-index",
@@ -2261,7 +2172,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-index"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "ahash",
  "crc32fast",
@@ -2276,9 +2187,9 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-lexical"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "frankensearch-core",
  "rayon",
  "serde",
@@ -2289,9 +2200,9 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-rerank"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "dirs",
  "frankensearch-core",
  "ort",
@@ -2361,7 +2272,7 @@ dependencies = [
 name = "fsqlite-core"
 version = "0.1.2"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "blake3",
  "foldhash 0.1.5",
  "fsqlite-ast",
@@ -2561,7 +2472,7 @@ dependencies = [
 name = "fsqlite-types"
 version = "0.1.2"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "bitflags",
  "blake3",
  "fsqlite-error",
@@ -2578,7 +2489,7 @@ dependencies = [
 name = "fsqlite-vdbe"
 version = "0.1.2"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "crossbeam-deque",
  "fsqlite-ast",
  "fsqlite-btree",
@@ -2600,7 +2511,7 @@ name = "fsqlite-vfs"
 version = "0.1.3"
 dependencies = [
  "advisory-lock",
- "asupersync 0.3.0",
+ "asupersync",
  "fsqlite-error",
  "fsqlite-observability 0.1.2",
  "fsqlite-types",
@@ -2615,7 +2526,7 @@ dependencies = [
 name = "fsqlite-wal"
 version = "0.1.2"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "blake3",
  "crc32c",
  "fsqlite-error",
@@ -4912,7 +4823,7 @@ dependencies = [
 name = "mcp-agent-mail-cli"
 version = "0.2.46"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "beads_rust",
  "chrono",
  "clap",
@@ -4954,7 +4865,7 @@ dependencies = [
 name = "mcp-agent-mail-conformance"
 version = "0.2.46"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "chrono",
  "clap",
  "fastmcp-core",
@@ -5004,7 +4915,7 @@ dependencies = [
 name = "mcp-agent-mail-db"
 version = "0.2.46"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "chrono",
  "criterion",
  "dirs",
@@ -5094,7 +5005,7 @@ name = "mcp-agent-mail-server"
 version = "0.2.46"
 dependencies = [
  "ammonia",
- "asupersync 0.3.0",
+ "asupersync",
  "base64 0.22.1",
  "chrono",
  "comrak",
@@ -5158,7 +5069,7 @@ dependencies = [
 name = "mcp-agent-mail-storage"
 version = "0.2.46"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "base64 0.22.1",
  "chrono",
  "fastmcp-core",
@@ -5192,7 +5103,7 @@ dependencies = [
 name = "mcp-agent-mail-tools"
 version = "0.2.46"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "chrono",
  "fastmcp-core",
  "fastmcp-protocol",
@@ -7425,7 +7336,7 @@ dependencies = [
 name = "sqlmodel"
 version = "0.2.1"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "serde",
  "serde_json",
  "sqlmodel-core",
@@ -7440,7 +7351,7 @@ dependencies = [
 name = "sqlmodel-core"
 version = "0.2.1"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "regex",
  "serde",
  "serde_json",
@@ -7451,7 +7362,7 @@ dependencies = [
 name = "sqlmodel-frankensqlite"
 version = "0.2.1"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "fsqlite",
  "fsqlite-core",
  "fsqlite-error",
@@ -7475,7 +7386,7 @@ dependencies = [
 name = "sqlmodel-pool"
 version = "0.2.1"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "sqlmodel-core",
  "tracing",
 ]
@@ -7484,7 +7395,7 @@ dependencies = [
 name = "sqlmodel-query"
 version = "0.2.1"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "serde",
  "sqlmodel-core",
  "tracing",
@@ -7494,7 +7405,7 @@ dependencies = [
 name = "sqlmodel-schema"
 version = "0.2.1"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "serde",
  "sqlmodel-core",
  "sqlmodel-macros",
@@ -7505,7 +7416,7 @@ dependencies = [
 name = "sqlmodel-session"
 version = "0.2.1"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "serde",
  "serde_json",
  "sqlmodel-core",
@@ -7517,7 +7428,7 @@ dependencies = [
 name = "sqlmodel-sqlite"
 version = "0.2.1"
 dependencies = [
- "asupersync 0.3.0",
+ "asupersync",
  "libsqlite3-sys",
  "serde",
  "serde_json",

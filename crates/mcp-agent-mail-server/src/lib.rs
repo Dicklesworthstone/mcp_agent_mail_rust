@@ -10320,6 +10320,11 @@ to skip auth for local requests.</p>
                     SessionState::new(),
                     None,
                     None,
+                    // fastmcp 0.3 added an 8th argument — an optional
+                    // BidirectionalSenders handle for server-initiated
+                    // request flow. We don't drive any bidirectional
+                    // requests from the MCP dispatch layer, so `None`.
+                    None,
                 );
                 dispatch_checkpoint(cx, cancel)?;
 
@@ -10486,6 +10491,8 @@ to skip auth for local requests.</p>
                     SessionState::new(),
                     None,
                     None,
+                    // fastmcp 0.3 added the 8th BidirectionalSenders arg.
+                    None,
                 )?;
                 dispatch_checkpoint(cx, cancel)?;
                 let mut value = serde_json::to_value(out).map_err(McpError::from)?;
@@ -10512,6 +10519,8 @@ to skip auth for local requests.</p>
                     &budget,
                     SessionState::new(),
                     None,
+                    None,
+                    // fastmcp 0.3 added the 8th BidirectionalSenders arg.
                     None,
                 )?;
                 serde_json::to_value(out).map_err(McpError::from)

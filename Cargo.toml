@@ -27,11 +27,11 @@ authors = ["Jeff Emanuel"]
 
 [workspace.dependencies]
 # Required internal dependencies (local projects)
-fastmcp = { version = "0.2.0", package = "fastmcp-rust" }
-fastmcp-core = "0.2.0"
-fastmcp-server = "0.2.0"
-fastmcp-transport = "0.2.0"
-fastmcp-protocol = "0.2.0"
+fastmcp = { version = "0.3.0", package = "fastmcp-rust" }
+fastmcp-core = "0.3.0"
+fastmcp-server = "0.3.0"
+fastmcp-transport = "0.3.0"
+fastmcp-protocol = "0.3.0"
 
 asupersync = { version = "0.3.0", features = ["tls-webpki-roots"] }
 
@@ -105,11 +105,11 @@ indexmap = "2"
 nix = "0.31.1"
 
 # frankensearch: two-tier hybrid search engine + optional cross-encoder rerank
-frankensearch = { version = "0.1.0", path = "../frankensearch/frankensearch", features = ["hybrid", "rerank"] }
-frankensearch-core = { version = "0.1.2", path = "../frankensearch/crates/frankensearch-core" }
-frankensearch-embed = { version = "0.1.3", path = "../frankensearch/crates/frankensearch-embed" }
-frankensearch-index = { version = "0.1.2", path = "../frankensearch/crates/frankensearch-index" }
-frankensearch-fusion = { version = "0.1.0", path = "../frankensearch/crates/frankensearch-fusion" }
+frankensearch = { version = "0.3.0", path = "../frankensearch/frankensearch", features = ["hybrid", "rerank"] }
+frankensearch-core = { version = "0.2.0", path = "../frankensearch/crates/frankensearch-core" }
+frankensearch-embed = { version = "0.2.0", path = "../frankensearch/crates/frankensearch-embed" }
+frankensearch-index = { version = "0.2.0", path = "../frankensearch/crates/frankensearch-index" }
+frankensearch-fusion = { version = "0.2.0", path = "../frankensearch/crates/frankensearch-fusion" }
 
 # Two-tier search dependencies (legacy, being replaced by frankensearch)
 half = "2"
@@ -153,7 +153,24 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
-# asupersync + franken-* now pulled from crates.io v0.3.0 — no patch needed.
+# asupersync + franken-* are pulled from crates.io v0.3.0 directly —
+# no sibling path patch needed.
+#
+# fastmcp-rust is temporarily force-patched to the sibling checkout
+# until its own v0.3 release propagates to crates.io. The currently
+# published fastmcp 0.2.1 on crates.io still depends on asupersync
+# 0.2.9, which would bifurcate the asupersync graph against our own
+# 0.3.0 direct dep (producing hundreds of "multiple different versions
+# of crate `asupersync`" Cx/Outcome type mismatches). Once fastmcp 0.3
+# lands on crates.io, bump the [workspace.dependencies] entries for
+# fastmcp / fastmcp-core / fastmcp-server / fastmcp-transport /
+# fastmcp-protocol to "0.3" and delete this block.
+fastmcp-rust = { path = "../fastmcp_rust/crates/fastmcp" }
+fastmcp-core = { path = "../fastmcp_rust/crates/fastmcp-core" }
+fastmcp-server = { path = "../fastmcp_rust/crates/fastmcp-server" }
+fastmcp-transport = { path = "../fastmcp_rust/crates/fastmcp-transport" }
+fastmcp-protocol = { path = "../fastmcp_rust/crates/fastmcp-protocol" }
+
 beads_rust = { path = "../beads_rust" }
 # sqlmodel/frankensqlite stack: force latest local /dp checkouts to avoid stale registry builds.
 sqlmodel = { path = "../sqlmodel_rust/crates/sqlmodel" }
