@@ -4494,17 +4494,26 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
             continue;
         }
 
-        let pat_activity = pattern_activity_cache
-            .entry(row.path_pattern.clone())
-            .or_insert_with(|| {
+        let pat_activity = if let Some(val) = pattern_activity_cache.get(&row.path_pattern) {
+            val.clone()
+        } else {
+            let path_pattern = row.path_pattern.clone();
+            let workspace_clone = workspace.as_deref().map(std::path::PathBuf::from);
+            let repo_root_clone = repo_root.map(std::path::PathBuf::from);
+            let workspace_rel_clone = workspace_rel.map(std::path::PathBuf::from);
+
+            let computed = asupersync::runtime::spawn_blocking(move || {
                 reservation_compute_pattern_activity(
-                    workspace.as_deref(),
-                    repo_root,
-                    workspace_rel,
-                    &row.path_pattern,
+                    workspace_clone.as_deref(),
+                    repo_root_clone.as_deref(),
+                    workspace_rel_clone.as_deref(),
+                    &path_pattern,
                 )
             })
-            .clone();
+            .await;
+            pattern_activity_cache.insert(row.path_pattern.clone(), computed.clone());
+            computed
+        };
         let recent_fs = pat_activity
             .fs_activity_micros
             .is_some_and(|ts| now_micros.saturating_sub(ts) <= grace_micros);
