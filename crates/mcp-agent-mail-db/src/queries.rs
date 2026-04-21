@@ -6586,6 +6586,16 @@ pub fn sanitize_fts_query(query: &str) -> Option<String> {
 
     // Strip FTS5 metacharacters (defense-in-depth against re-enablement)
     result.retain(|c| !matches!(c, '{' | '}' | '^' | '[' | ']' | '~' | '\\'));
+    // Re-strip comment markers that may have formed after metachar removal (e.g. "/[*" → "/*")
+    while result.contains("--") {
+        result = result.replace("--", " ");
+    }
+    while result.contains("/*") {
+        result = result.replace("/*", " ");
+    }
+    while result.contains("*/") {
+        result = result.replace("*/", " ");
+    }
     while result.contains("  ") {
         result = result.replace("  ", " ");
     }
