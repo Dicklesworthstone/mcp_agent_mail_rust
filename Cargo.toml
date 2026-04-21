@@ -161,10 +161,12 @@ inherits = "release"     # Benchmarks use same optimizations as release
 # published fastmcp 0.2.1 on crates.io still depends on asupersync
 # 0.2.9, which would bifurcate the asupersync graph against our own
 # 0.3.0 direct dep (producing hundreds of "multiple different versions
-# of crate `asupersync`" Cx/Outcome type mismatches). Once fastmcp 0.3
-# lands on crates.io, bump the [workspace.dependencies] entries for
-# fastmcp / fastmcp-core / fastmcp-server / fastmcp-transport /
-# fastmcp-protocol to "0.3" and delete this block.
+# of crate `asupersync`" Cx/Outcome type mismatches).
+#
+# The [workspace.dependencies] entries above are already set to
+# "0.3.0", so the only cleanup step once fastmcp 0.3 lands on
+# crates.io is to delete this block (plus the five fastmcp-* lines
+# below). cargo will then resolve all five from the registry.
 fastmcp-rust = { path = "../fastmcp_rust/crates/fastmcp" }
 fastmcp-core = { path = "../fastmcp_rust/crates/fastmcp-core" }
 fastmcp-server = { path = "../fastmcp_rust/crates/fastmcp-server" }
