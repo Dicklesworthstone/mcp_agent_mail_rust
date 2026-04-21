@@ -12080,9 +12080,53 @@ struct DownloadedRelease {
     version: String,
 }
 
-/// Download a file from a URL to a local path using asupersync HttpClient.
-/// Returns the response body bytes.
-fn download_file_sync(url: &str) -> Result<Vec<u8>, String> {
+/// Upper bound on the response body size we will accept for self-update
+/// downloads. The Linux release tarball ships both `am` and `mcp-agent-mail`
+/// binaries and is currently ~40 MB; 1 GiB leaves ample headroom for future
+/// binary growth while still bounding pathological responses (e.g. an
+/// attacker-controlled mirror trying to exhaust disk/memory).
+const MAX_RELEASE_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Log a download-progress line every N bytes received.
+const DOWNLOAD_PROGRESS_INTERVAL: u64 = 5 * 1024 * 1024;
+
+/// Sink for streaming-download output: either an in-memory buffer (for
+/// small assets like `SHA256SUMS`) or an on-disk file (for release tarballs).
+enum StreamingSink {
+    /// Collect the response into an in-memory buffer.
+    Memory(Vec<u8>),
+    /// Write the response incrementally to an on-disk file.
+    File(std::fs::File),
+}
+
+impl StreamingSink {
+    fn write_all(&mut self, data: &[u8]) -> Result<(), String> {
+        match self {
+            Self::Memory(buf) => {
+                buf.extend_from_slice(data);
+                Ok(())
+            }
+            Self::File(file) => {
+                use std::io::Write;
+                file.write_all(data)
+                    .map_err(|e| format!("write to disk: {e}"))
+            }
+        }
+    }
+}
+
+/// Stream an HTTP GET response into `sink`, enforcing the release-archive
+/// size cap and emitting progress logs every `DOWNLOAD_PROGRESS_INTERVAL`
+/// bytes when `show_progress` is set (used for the large release tarball,
+/// suppressed for small metadata like `SHA256SUMS`).
+///
+/// Unlike the pre-GH#100 implementation this does NOT buffer the entire
+/// response into memory behind an asupersync `max_body_size` cap — large
+/// downloads stream directly to the sink, so the HTTP client never hits
+/// `body exceeds size limit` for legitimate release artifacts.
+fn download_streaming(url: &str, sink: &mut StreamingSink, show_progress: bool) -> Result<(), String> {
+    use asupersync::bytes::Buf;
+    use asupersync::http::{Body, Frame};
     use asupersync::runtime::RuntimeBuilder;
 
     let rt = RuntimeBuilder::current_thread()
@@ -12090,22 +12134,25 @@ fn download_file_sync(url: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("runtime error: {e}"))?;
 
     let url_owned = url.to_string();
-    let result = rt.block_on(async move {
+
+    rt.block_on(async move {
         let cx = asupersync::Cx::for_testing();
-        // Release tarballs ship both `am` and `mcp-agent-mail` binaries and
-        // are already ~33 MB, so the asupersync default 16 MB body limit
-        // rejects the download outright (GH#99 side note). 256 MB leaves
-        // generous headroom for future binary growth without being unbounded.
-        const MAX_RELEASE_ARCHIVE_BYTES: usize = 256 * 1024 * 1024;
+        // Build without an explicit max_body_size: we enforce our own cap
+        // below via `received > MAX_RELEASE_ARCHIVE_BYTES`. Using the
+        // streaming API means the asupersync default 16 MiB cap is not
+        // applied — it only limits the non-streaming `request()` path.
         let client = asupersync::http::h1::HttpClient::builder()
-            .max_body_size(MAX_RELEASE_ARCHIVE_BYTES)
+            .max_body_size(
+                usize::try_from(MAX_RELEASE_ARCHIVE_BYTES).unwrap_or(usize::MAX),
+            )
             .build();
         let headers = vec![
             ("User-Agent".to_string(), "mcp-agent-mail-cli".to_string()),
             ("Accept".to_string(), "application/octet-stream".to_string()),
         ];
-        client
-            .request(
+
+        let mut streaming = client
+            .request_streaming(
                 &cx,
                 asupersync::http::h1::Method::Get,
                 &url_owned,
@@ -12113,18 +12160,104 @@ fn download_file_sync(url: &str) -> Result<Vec<u8>, String> {
                 vec![],
             )
             .await
-    });
+            .map_err(|e| format!("HTTP error: {e}"))?;
 
-    let response = result.map_err(|e| format!("HTTP error: {e}"))?;
+        let status = streaming.head.status;
+        if status == 404 {
+            return Err(format!("asset not found (404): {url_owned}"));
+        }
+        if status != 200 {
+            return Err(format!("HTTP {status}: {url_owned}"));
+        }
 
-    if response.status == 404 {
-        return Err(format!("asset not found (404): {url}"));
+        // Optional Content-Length hint for progress; zero when unknown
+        // (e.g. chunked transfer encoding).
+        let total_bytes: Option<u64> = streaming
+            .head
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, v)| v.parse::<u64>().ok());
+
+        let mut received: u64 = 0;
+        let mut next_progress_at: u64 = DOWNLOAD_PROGRESS_INTERVAL;
+
+        loop {
+            let frame = std::future::poll_fn(|poll_cx| {
+                std::pin::Pin::new(&mut streaming.body).poll_frame(poll_cx)
+            })
+            .await;
+            let Some(frame) = frame else {
+                break;
+            };
+            let frame = frame.map_err(|e| format!("HTTP body error: {e}"))?;
+            let Frame::Data(mut buf) = frame else {
+                // Ignore Frame::Trailers — we only care about data.
+                continue;
+            };
+            while buf.has_remaining() {
+                let chunk = buf.chunk();
+                let len = chunk.len();
+                received = received.saturating_add(len as u64);
+                if received > MAX_RELEASE_ARCHIVE_BYTES {
+                    return Err(format!(
+                        "release asset exceeds safety cap of {} bytes (got {received})",
+                        MAX_RELEASE_ARCHIVE_BYTES
+                    ));
+                }
+                sink.write_all(chunk)?;
+                buf.advance(len);
+
+                if show_progress && received >= next_progress_at {
+                    match total_bytes {
+                        Some(total) if total > 0 => {
+                            let pct = (received as f64 / total as f64 * 100.0).min(100.0);
+                            ftui_runtime::ftui_eprintln!(
+                                "  downloaded {received}/{total} bytes ({pct:.0}%)"
+                            );
+                        }
+                        _ => {
+                            ftui_runtime::ftui_eprintln!("  downloaded {received} bytes");
+                        }
+                    }
+                    next_progress_at = received.saturating_add(DOWNLOAD_PROGRESS_INTERVAL);
+                }
+            }
+        }
+
+        Ok(())
+    })
+}
+
+/// Download a small URL (e.g. `SHA256SUMS`) into an in-memory buffer.
+///
+/// For the large release tarball, prefer [`download_file_to_path`] which
+/// streams to disk.
+fn download_file_sync(url: &str) -> Result<Vec<u8>, String> {
+    let mut sink = StreamingSink::Memory(Vec::new());
+    download_streaming(url, &mut sink, false)?;
+    match sink {
+        StreamingSink::Memory(buf) => Ok(buf),
+        StreamingSink::File(_) => unreachable!("sink was constructed as Memory"),
     }
-    if response.status != 200 {
-        return Err(format!("HTTP {}: {url}", response.status));
-    }
+}
 
-    Ok(response.body)
+/// Download a URL directly to an on-disk path, streaming chunk-by-chunk
+/// so the entire payload never resides in memory. Used for the ~40 MB
+/// release tarball to keep `am self-update` lightweight even on memory-
+/// constrained hosts.
+fn download_file_to_path(url: &str, dest: &Path) -> Result<(), String> {
+    let file = std::fs::File::create(dest)
+        .map_err(|e| format!("create {}: {e}", dest.display()))?;
+    let mut sink = StreamingSink::File(file);
+    let result = download_streaming(url, &mut sink, true);
+    // Drop the sink so the File handle is closed before we hash it.
+    drop(sink);
+    if result.is_err() {
+        // Clean up a partial/corrupt download so a retry starts fresh.
+        let _ = std::fs::remove_file(dest);
+    }
+    result
 }
 
 /// Verify SHA256 checksum of downloaded data against a checksum file.
@@ -12133,6 +12266,27 @@ fn verify_sha256(data: &[u8], expected_hex: &str) -> bool {
     let hash = Sha256::digest(data);
     let actual = hex::encode(hash);
     actual == expected_hex.trim().to_lowercase()
+}
+
+/// Verify the SHA256 checksum of a file on disk against an expected hex
+/// digest. Streams the file in fixed-size chunks so we never load the full
+/// archive into memory just to hash it.
+fn verify_sha256_file(path: &Path, expected_hex: &str) -> Result<bool, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).map_err(|e| format!("open for hashing: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| format!("read for hashing: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let actual = hex::encode(hasher.finalize());
+    Ok(actual == expected_hex.trim().to_lowercase())
 }
 
 /// Extract binaries from a .tar.xz archive into a temporary directory.
@@ -12231,33 +12385,56 @@ fn download_and_verify_release(version: &str) -> Result<DownloadedRelease, Strin
         .ok_or_else(|| format!("no checksum found for {filename} in SHA256SUMS"))?
         .to_string();
 
-    // Download the archive
-    ftui_runtime::ftui_eprintln!("Downloading {filename}...");
-    let archive_data = download_file_sync(&asset_url)?;
-    ftui_runtime::ftui_eprintln!("Downloaded {} bytes", archive_data.len());
-
-    // Verify SHA256
-    if !verify_sha256(&archive_data, &expected_hash) {
-        return Err("SHA256 checksum verification failed — download may be corrupted".to_string());
-    }
-    ftui_runtime::ftui_eprintln!("Checksum verified.");
-
-    // Create temp directory for extraction
+    // Create temp directory for extraction before the download so the
+    // streaming sink has a stable path to write into.
     let tmp_dir = std::env::temp_dir().join(format!("am-update-{version}"));
     if tmp_dir.exists() {
         std::fs::remove_dir_all(&tmp_dir).map_err(|e| format!("clean temp dir: {e}"))?;
     }
     std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("create temp dir: {e}"))?;
 
-    // Extract
+    // Download the archive. Large (.tar.xz) release tarballs stream
+    // directly to disk — they never reside in memory — so the updater
+    // works even on RAM-constrained hosts and is not subject to any HTTP
+    // response body-size cap (see GH#100).
+    ftui_runtime::ftui_eprintln!("Downloading {filename}...");
+    let archive_path = tmp_dir.join(&filename);
+
+    // Extract (archive payload streams to disk; Zip path reuses an
+    // in-memory buffer because `zip::ZipArchive` needs a `Seek` reader).
     if filename.ends_with(".tar.xz") {
-        // Write to file first (tar reads from file)
-        let archive_path = tmp_dir.join(&filename);
-        std::fs::write(&archive_path, &archive_data).map_err(|e| format!("write archive: {e}"))?;
+        download_file_to_path(&asset_url, &archive_path)?;
+        let size_bytes = std::fs::metadata(&archive_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        ftui_runtime::ftui_eprintln!("Downloaded {size_bytes} bytes");
+
+        // Verify SHA256 by streaming the file from disk.
+        if !verify_sha256_file(&archive_path, &expected_hash)? {
+            let _ = std::fs::remove_file(&archive_path);
+            return Err(
+                "SHA256 checksum verification failed — download may be corrupted".to_string(),
+            );
+        }
+        ftui_runtime::ftui_eprintln!("Checksum verified.");
+
         extract_tar_xz(&archive_path, &tmp_dir)?;
         // Clean up the archive file
         let _ = std::fs::remove_file(&archive_path);
     } else if filename.ends_with(".zip") {
+        // Windows zip archives are substantially smaller than the
+        // Linux tarball (no debug symbols on Windows release builds),
+        // so in-memory buffering is still fine here. The streaming
+        // download path still applies — it just writes into a Vec<u8>
+        // without the old 16 MiB cap.
+        let archive_data = download_file_sync(&asset_url)?;
+        ftui_runtime::ftui_eprintln!("Downloaded {} bytes", archive_data.len());
+        if !verify_sha256(&archive_data, &expected_hash) {
+            return Err(
+                "SHA256 checksum verification failed — download may be corrupted".to_string(),
+            );
+        }
+        ftui_runtime::ftui_eprintln!("Checksum verified.");
         extract_zip(&archive_data, &tmp_dir)?;
     } else {
         return Err(format!("unsupported archive format: {filename}"));
