@@ -144,9 +144,9 @@ New coverage required for `br-8qdh0.3`:
 - `write_message_batch_bundle_handles_thread_digest_updates_in_order`
 
 Verification plan for the implementation bead:
-- `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_ivsummit_perf cargo check -p mcp-agent-mail --bench benchmarks`
+- `rch exec -- cargo check -p mcp-agent-mail --bench benchmarks`
 - `rch exec -- cargo test -p mcp-agent-mail-storage`
-- `rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_ivsummit_perf cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch`
+- `rch exec -- cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch`
 - update `benches/BUDGETS.md` only after the new numbers are captured
 
 ## Decision

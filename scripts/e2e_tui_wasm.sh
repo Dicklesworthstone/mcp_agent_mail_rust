@@ -155,11 +155,6 @@ resolve_binary() {
         return
     fi
 
-    if [ -x "/data/tmp/cargo-target/debug/mcp-agent-mail" ]; then
-        printf '%s\n' "/data/tmp/cargo-target/debug/mcp-agent-mail"
-        return
-    fi
-
     if command -v mcp-agent-mail >/dev/null 2>&1; then
         command -v mcp-agent-mail
         return

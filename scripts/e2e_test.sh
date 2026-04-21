@@ -42,7 +42,7 @@ _c_yellow='\033[0;33m'
 
 run_e2e_cargo() {
     if command -v rch >/dev/null 2>&1; then
-        rch exec -- cargo "$@"
+        rch exec -- env -u CARGO_TARGET_DIR cargo "$@"
     else
         cargo "$@"
     fi

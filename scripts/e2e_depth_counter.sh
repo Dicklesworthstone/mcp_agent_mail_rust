@@ -30,8 +30,6 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 0
 fi
 
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/data/tmp/cargo-target}"
-
 # ── Case 1: Interleaved increment/decrement (32 threads) ────────────────
 e2e_case_banner "interleaved_inc_dec_32_threads"
 e2e_mark_case_start "case01_interleavedincdec32threads"

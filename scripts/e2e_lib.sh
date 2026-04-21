@@ -32,8 +32,8 @@ if [ -z "${TMPDIR:-}" ]; then
     fi
 fi
 
-# Cargo target dir: avoid multi-agent contention.
-# Keep this colocated with TMPDIR so workers without /data/tmp still resolve to a valid path.
+# Cargo target dir for local fallback builds. Do not pass this through rch;
+# remote workers manage their own target paths.
 if [ -z "${CARGO_TARGET_DIR:-}" ]; then
     export CARGO_TARGET_DIR="${TMPDIR%/}/cargo-target"
 fi
@@ -57,16 +57,16 @@ e2e_run_cargo() {
         if command -v timeout >/dev/null 2>&1; then
             if [ "${E2E_RCH_MOCK_CIRCUIT_OPEN}" = "1" ]; then
                 timeout "${E2E_RCH_TIMEOUT_SECONDS}" \
-                    env RCH_MOCK_CIRCUIT_OPEN=1 rch exec -- cargo "$@"
+                    env RCH_MOCK_CIRCUIT_OPEN=1 rch exec -- env -u CARGO_TARGET_DIR cargo "$@"
             else
                 timeout "${E2E_RCH_TIMEOUT_SECONDS}" \
-                    rch exec -- cargo "$@"
+                    rch exec -- env -u CARGO_TARGET_DIR cargo "$@"
             fi
         else
             if [ "${E2E_RCH_MOCK_CIRCUIT_OPEN}" = "1" ]; then
-                env RCH_MOCK_CIRCUIT_OPEN=1 rch exec -- cargo "$@"
+                env RCH_MOCK_CIRCUIT_OPEN=1 rch exec -- env -u CARGO_TARGET_DIR cargo "$@"
             else
-                rch exec -- cargo "$@"
+                rch exec -- env -u CARGO_TARGET_DIR cargo "$@"
             fi
         fi
         return $?

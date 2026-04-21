@@ -1181,8 +1181,8 @@ am e2e run --project . tui_full_traversal  # traversal + flash + soak regression
 # Benchmarks
 cargo bench -p mcp-agent-mail
 
-# Multi-agent builds: isolate target dir to avoid lock contention
-export CARGO_TARGET_DIR="/tmp/target-$(whoami)-am"
+# Multi-agent builds: offload heavy cargo work through rch
+rch exec -- cargo check --workspace --all-targets
 ```
 
 ### E2E Entrypoint Policy (T9.9)

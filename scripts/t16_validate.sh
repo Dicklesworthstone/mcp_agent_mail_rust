@@ -27,7 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SUITES_DIR="${PROJECT_ROOT}/tests/e2e"
 
-CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/data/tmp/cargo-target}"
+CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${TMPDIR:-/tmp}/cargo-target}"
 export CARGO_TARGET_DIR
 
 FAIL_FAST="${T16_FAIL_FAST:-1}"

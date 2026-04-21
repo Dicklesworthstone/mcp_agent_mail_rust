@@ -877,7 +877,6 @@ git revert --no-edit 99bc2663
 3. Rebuild and redeploy the reverted revision.
    Use `rch` for the heavy compile path:
 ```bash
-export CARGO_TARGET_DIR=/tmp/target-$(whoami)-am
 rch exec -- cargo check -p mcp-agent-mail --bench benchmarks
 rch exec -- cargo test -p mcp-agent-mail-storage
 ```
@@ -912,7 +911,6 @@ Before allowing a new archive perf candidate back into rollout, rerun the
 storage stress and batch benchmark guardrails on the reverted-or-fixed branch:
 
 ```bash
-export CARGO_TARGET_DIR=/tmp/target-$(whoami)-am
 rch exec -- cargo test -p mcp-agent-mail-storage --test stress_pipeline -- --nocapture
 MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 \
   rch exec -- cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch

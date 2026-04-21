@@ -45,7 +45,6 @@ is_truthy() {
 # Avoid shared target-dir races when this suite runs under parallel workspace tests.
 if is_truthy "${AM_TUI_A11Y_ISOLATE_TARGET_DIR}"; then
     if [ -z "${CARGO_TARGET_DIR:-}" ] \
-        || [ "${CARGO_TARGET_DIR}" = "/data/tmp/cargo-target" ] \
         || [ "${CARGO_TARGET_DIR}" = "${TMP_BASE}/cargo-target" ]; then
         export CARGO_TARGET_DIR="${TMP_BASE}/cargo-target-${E2E_SUITE}-$$"
     fi

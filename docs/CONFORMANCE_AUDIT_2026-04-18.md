@@ -102,7 +102,7 @@ Post-`3813da8f` note:
 - Targeted verification command attempted:
 
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/tmp/target-$(whoami)-am cargo test -p mcp-agent-mail-conformance rust_native -- --nocapture
+rch exec -- cargo test -p mcp-agent-mail-conformance rust_native -- --nocapture
 ```
 
 Latest result from remote worker `vmi1293453`:
@@ -116,8 +116,8 @@ The historical full-suite results below predate that refresh and should not be r
 Command sequence run on 2026-04-18:
 
 ```bash
-CARGO_TARGET_DIR=/tmp/target-$(whoami)-am rch exec -- cargo test -p mcp-agent-mail-conformance --test conformance_debug -- --nocapture
-CARGO_TARGET_DIR=/tmp/target-$(whoami)-am rch exec -- cargo test -p mcp-agent-mail-conformance -- --nocapture
+rch exec -- cargo test -p mcp-agent-mail-conformance --test conformance_debug -- --nocapture
+rch exec -- cargo test -p mcp-agent-mail-conformance -- --nocapture
 ```
 
 Audit cross-check test:

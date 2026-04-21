@@ -172,7 +172,7 @@ am golden verify
 # 4b. Native check-inbox command is available
 am check-inbox --help
 # Compatibility shim fallback (only for native regressions):
-# PATH="/data/tmp/cargo-target/release:$PATH" legacy/hooks/check_inbox.sh --help
+# PATH="target/release:$PATH" legacy/hooks/check_inbox.sh --help
 
 # 5. Verify-live E2E artifacts exist (native path authoritative)
 am e2e run --project . share_verify_live

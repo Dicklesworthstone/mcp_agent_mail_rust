@@ -18,7 +18,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=e2e_lib.sh
 source "${SCRIPT_DIR}/e2e_lib.sh"
 
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/data/tmp/cargo-target}"
 CLI_BIN="${CARGO_TARGET_DIR}/debug/am"
 MCP_BIN="${CARGO_TARGET_DIR}/debug/mcp-agent-mail"
 

@@ -75,7 +75,7 @@ now_iso() {
 RUN_ID="post-cutover-cleanup-agent-mail-$(date -u '+%Y%m%dT%H%M%SZ')-$(date +%s%N)-$$"
 RUN_DIR="${LOG_ROOT}/${RUN_ID}"
 RUN_SUFFIX="${RUN_ID##*-}"
-CARGO_TARGET_DIR="${POST_CUTOVER_CARGO_TARGET_DIR:-/data/tmp/target-post-cutover-cleanup-${RUN_SUFFIX}}"
+CARGO_TARGET_DIR="${POST_CUTOVER_CARGO_TARGET_DIR:-rch-managed-default}"
 EVENTS_JSONL="${RUN_DIR}/events.jsonl"
 TRANSCRIPT_TXT="${RUN_DIR}/terminal_transcript.txt"
 SUMMARY_JSON="${RUN_DIR}/summary.json"
@@ -88,7 +88,7 @@ mkdir -p "${RUN_DIR}"
 : > "${TRANSCRIPT_TXT}"
 
 cat > "${REPLAY_TXT}" <<EOF_REPLAY
-cd ${ROOT_DIR} && POST_CUTOVER_CARGO_TARGET_DIR=${CARGO_TARGET_DIR} POST_CUTOVER_FORCE_LOCAL_CIRCUIT=${POST_CUTOVER_FORCE_LOCAL_CIRCUIT:-0} scripts/e2e/post_cutover_cleanup_agent_mail.sh --mode ${MODE} --execution ${EXECUTION_MODE}
+cd ${ROOT_DIR} && POST_CUTOVER_FORCE_LOCAL_CIRCUIT=${POST_CUTOVER_FORCE_LOCAL_CIRCUIT:-0} scripts/e2e/post_cutover_cleanup_agent_mail.sh --mode ${MODE} --execution ${EXECUTION_MODE}
 EOF_REPLAY
 
 STAGE_STARTED_COUNT=0
@@ -275,14 +275,14 @@ trap on_exit EXIT
 
 emit_event "session.init" "ok" "post_cutover_cleanup.session.init" "Session initialized"
 
-run_stage "compile.search_core_hybrid" "env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} ${RCH_PREFIX} cargo check -p mcp-agent-mail-search-core --all-targets --features hybrid"
-run_stage "lint.search_core_hybrid" "env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} ${RCH_PREFIX} cargo clippy -p mcp-agent-mail-search-core --all-targets --features hybrid -- -D warnings"
-run_stage "unit.search_core.fs_probe_doc_key_roundtrip" "env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} ${RCH_PREFIX} cargo test -p mcp-agent-mail-search-core --features hybrid fs_probe_doc_key_roundtrip -- --nocapture"
-run_stage "unit.search_core.from_fs_phase" "env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} ${RCH_PREFIX} cargo test -p mcp-agent-mail-search-core --features hybrid from_fs_phase_ -- --nocapture"
-run_stage "integration.db.select_best_two_tier_results" "env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} ${RCH_PREFIX} cargo test -p mcp-agent-mail-db --features hybrid select_best_two_tier_results -- --nocapture"
+run_stage "compile.search_core_hybrid" "${RCH_PREFIX} cargo check -p mcp-agent-mail-search-core --all-targets --features hybrid"
+run_stage "lint.search_core_hybrid" "${RCH_PREFIX} cargo clippy -p mcp-agent-mail-search-core --all-targets --features hybrid -- -D warnings"
+run_stage "unit.search_core.fs_probe_doc_key_roundtrip" "${RCH_PREFIX} cargo test -p mcp-agent-mail-search-core --features hybrid fs_probe_doc_key_roundtrip -- --nocapture"
+run_stage "unit.search_core.from_fs_phase" "${RCH_PREFIX} cargo test -p mcp-agent-mail-search-core --features hybrid from_fs_phase_ -- --nocapture"
+run_stage "integration.db.select_best_two_tier_results" "${RCH_PREFIX} cargo test -p mcp-agent-mail-db --features hybrid select_best_two_tier_results -- --nocapture"
 
 if [[ "$MODE" == "all" ]]; then
-  run_stage "e2e.search_v3_stdio" "env CARGO_TARGET_DIR=${CARGO_TARGET_DIR} ${RCH_PREFIX} bash tests/e2e/test_search_v3_stdio.sh"
+  run_stage "e2e.search_v3_stdio" "${RCH_PREFIX} bash tests/e2e/test_search_v3_stdio.sh"
 fi
 
 if command -v ubs >/dev/null 2>&1; then

@@ -9,14 +9,12 @@ BEAD_ID="br-8qdh0.8"
 
 RUN_ID="$(date -u '+%s_%6N')"
 OUTPUT_DIR="${PROJECT_ROOT}/tests/artifacts/bench/archive_baseline/${RUN_ID}"
-CARGO_TARGET_DIR_DEFAULT="${TMPDIR:-/tmp}/target-$(whoami)-am"
-CARGO_TARGET_DIR_VALUE="${CARGO_TARGET_DIR:-${CARGO_TARGET_DIR_DEFAULT}}"
-BENCH_COMMAND="MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 rch exec -- env CARGO_TARGET_DIR=${CARGO_TARGET_DIR_VALUE} cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch"
+BENCH_COMMAND="MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 rch exec -- cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch"
 OUTPUT_DIR_EXPLICIT=0
 
 usage() {
     cat <<'USAGE'
-Usage: scripts/bench_baseline.sh [--output-dir <path>] [--run-id <value>] [--target-dir <path>]
+Usage: scripts/bench_baseline.sh [--output-dir <path>] [--run-id <value>]
 
 Captures the current hardware/environment fingerprint, runs the archive batch
 benchmark with the profiling side-artifacts enabled, and writes a timestamped
@@ -61,8 +59,8 @@ while [ $# -gt 0 ]; do
             shift 2
             ;;
         --target-dir)
-            CARGO_TARGET_DIR_VALUE="${2:-}"
-            shift 2
+            printf 'error: --target-dir is not supported for rch remote benchmarks; let rch manage the worker target dir.\n' >&2
+            exit 2
             ;;
         --bench-root)
             BENCH_ROOT="${2:-}"
@@ -84,7 +82,7 @@ if [ "${OUTPUT_DIR_EXPLICIT}" -eq 0 ]; then
     OUTPUT_DIR="${PROJECT_ROOT}/tests/artifacts/bench/archive_baseline/${RUN_ID}"
 fi
 
-BENCH_COMMAND="MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 rch exec -- env CARGO_TARGET_DIR=${CARGO_TARGET_DIR_VALUE} cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch"
+BENCH_COMMAND="MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 rch exec -- cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch"
 
 require_cmd jq
 require_cmd rch
@@ -185,7 +183,7 @@ fingerprint_json="$(jq -n \
     --arg storage_transport "${storage_transport}" \
     --arg storage_size "${storage_size}" \
     --arg cpu_governor "${cpu_governor}" \
-    --arg target_dir "${CARGO_TARGET_DIR_VALUE}" \
+    --arg target_dir "rch-managed-default" \
     --arg rust_toolchain_file "${rust_toolchain_file}" \
     --arg rustc_verbose "${rustc_verbose}" \
     --arg bench_git_commit "${bench_git_commit}" \
@@ -250,7 +248,7 @@ printf '==> %s\n' "${BENCH_COMMAND}"
 cd "${BENCH_ROOT}"
 set +e
 MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 \
-    rch exec -- env CARGO_TARGET_DIR="${CARGO_TARGET_DIR_VALUE}" cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch \
+    rch exec -- cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch \
     2>&1 | tee "${bench_log}"
 bench_exit="${PIPESTATUS[0]}"
 set -e

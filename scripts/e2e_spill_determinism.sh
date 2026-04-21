@@ -40,9 +40,6 @@ for cmd in cargo python3; do
     fi
 done
 
-# Ensure this suite is deterministic and reproducible.
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/data/tmp/cargo-target}"
-
 STRESS_CMD=(
     e2e_run_cargo test -p mcp-agent-mail-storage
     spill_drain_repeated_seeded_permutations_are_stable

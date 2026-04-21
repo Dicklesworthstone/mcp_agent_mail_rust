@@ -37,8 +37,7 @@ Reference cold harness:
 Canonical warm profile command:
 
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/data/projects/mcp_agent_mail_rust/target \
-  MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 \
+rch exec -- env MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 \
   cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch
 ```
 
@@ -52,8 +51,7 @@ env CARGO_TARGET_DIR=/data/projects/mcp_agent_mail_rust/target \
 Artifact-emitting verification lane used for this supplement:
 
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/data/projects/mcp_agent_mail_rust/target \
-  cargo test -p mcp-agent-mail --test archive_perf_reporting -- --nocapture
+rch exec -- cargo test -p mcp-agent-mail --test archive_perf_reporting -- --nocapture
 ```
 
 Cross-engineer target:
