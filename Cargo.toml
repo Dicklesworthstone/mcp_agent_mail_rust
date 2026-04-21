@@ -33,7 +33,7 @@ fastmcp-server = "0.2.0"
 fastmcp-transport = "0.2.0"
 fastmcp-protocol = "0.2.0"
 
-asupersync = { version = "0.2.9", features = ["tls-webpki-roots"] }
+asupersync = { version = "0.3.0", features = ["tls-webpki-roots"] }
 
 sqlmodel = "0.2.1"
 sqlmodel-core = "0.2.1"
@@ -153,11 +153,7 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
-asupersync = { path = "../asupersync" }
-asupersync-macros = { path = "../asupersync/asupersync-macros" }
-franken-kernel = { path = "../asupersync/franken_kernel" }
-franken-evidence = { path = "../asupersync/franken_evidence" }
-franken-decision = { path = "../asupersync/franken_decision" }
+# asupersync + franken-* now pulled from crates.io v0.3.0 — no patch needed.
 beads_rust = { path = "../beads_rust" }
 # sqlmodel/frankensqlite stack: force latest local /dp checkouts to avoid stale registry builds.
 sqlmodel = { path = "../sqlmodel_rust/crates/sqlmodel" }
@@ -198,7 +194,5 @@ ftui-text = { path = "../frankentui/crates/ftui-text" }
 ftui-backend = { path = "../frankentui/crates/ftui-backend" }
 ftui-i18n = { path = "../frankentui/crates/ftui-i18n" }
 
-# Redirect frankensearch's git-pinned asupersync to local path so Cx types unify.
-[patch."https://github.com/Dicklesworthstone/asupersync"]
-asupersync = { path = "../asupersync" }
-asupersync-macros = { path = "../asupersync/asupersync-macros" }
+# asupersync git-pin redirect removed — frankensearch's v0.3.0 release should
+# also reference crates.io asupersync so Cx types unify without a patch block.
