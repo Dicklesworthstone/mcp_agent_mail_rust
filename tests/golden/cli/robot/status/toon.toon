@@ -1,0 +1,23 @@
+_meta:
+  command: robot status
+  timestamp: "2026-01-02T03:04:05Z"
+  format: toon
+  version: "1.0"
+  project: /workspace/project-alpha
+  agent: RedFox
+_alerts[1]{severity,summary,action}:
+  warn,One reservation expires soon,am robot reservations --expiring=30
+_actions[1]: am robot inbox --urgent
+health: ok
+unread: 2
+urgent: 1
+ack_required: 1
+ack_overdue: 0
+active_reservations: 1
+reservations_expiring_soon: 0
+active_agents: 2
+recent_messages: 3
+my_reservations[1]{agent,path,exclusive,remaining_seconds,remaining,granted_at}:
+  RedFox,crates/mcp-agent-mail-cli/src/**,true,3600,1h,"2026-01-02T03:00:00Z"
+top_threads[1]{id,subject,participants,messages,last_activity}:
+  br-robot-golden,Freeze robot output,2,3,"2026-01-02T03:04:00Z"

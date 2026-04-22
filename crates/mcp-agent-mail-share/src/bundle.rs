@@ -1875,6 +1875,43 @@ pub struct ViewerMetaInfo {
 mod tests {
     use super::*;
 
+    fn repo_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("CARGO_MANIFEST_DIR should be crates/mcp-agent-mail-share")
+            .to_path_buf()
+    }
+
+    fn update_goldens_requested() -> bool {
+        std::env::var_os("UPDATE_GOLDENS").is_some() || std::env::var_os("UPDATE_GOLDEN").is_some()
+    }
+
+    fn assert_repo_golden(rel_path: &str, actual: &str) {
+        let path = repo_root().join("tests/golden").join(rel_path);
+        if update_goldens_requested() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create golden fixture directory");
+            }
+            std::fs::write(&path, actual).expect("update golden fixture");
+            eprintln!("updated golden fixture: {}", path.display());
+            return;
+        }
+
+        let mut expected = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+            panic!("failed to read golden fixture {}: {err}", path.display())
+        });
+        if expected.ends_with('\n') && !actual.ends_with('\n') {
+            expected.pop();
+        }
+        assert_eq!(
+            expected,
+            actual,
+            "golden fixture mismatch for {}; rerun with UPDATE_GOLDENS=1",
+            path.display()
+        );
+    }
+
     fn test_scrub_summary() -> ScrubSummary {
         ScrubSummary {
             preset: "standard".to_string(),
@@ -3876,6 +3913,146 @@ mod tests {
                 "keys should be alphabetically sorted"
             );
         }
+    }
+
+    #[test]
+    fn manifest_standard_golden_snapshot() {
+        let scope = ProjectScopeResult {
+            projects: vec![crate::scope::ProjectRecord {
+                id: 7,
+                slug: "project-alpha".to_string(),
+                human_key: "/workspace/project-alpha".to_string(),
+            }],
+            identifiers: vec!["project-alpha".to_string()],
+            removed_count: 1,
+            remaining: test_remaining_counts(),
+        };
+        let scrub = ScrubSummary {
+            preset: "standard".to_string(),
+            pseudonym_salt: "salt-123".to_string(),
+            agents_total: 2,
+            agents_pseudonymized: 2,
+            ack_flags_cleared: 1,
+            recipients_cleared: 1,
+            file_reservations_removed: 1,
+            agent_links_removed: 1,
+            secrets_replaced: 3,
+            attachments_sanitized: 1,
+            bodies_redacted: 0,
+            attachments_cleared: 0,
+        };
+        let attachments = AttachmentManifest {
+            stats: AttachmentStats {
+                inline: 1,
+                copied: 1,
+                externalized: 0,
+                missing: 0,
+                bytes_copied: 42,
+            },
+            config: AttachmentConfig {
+                inline_threshold: 65_536,
+                detach_threshold: 26_214_400,
+            },
+            items: vec![AttachmentItem {
+                message_id: 7,
+                mode: "file".to_string(),
+                sha256: Some("abc123".to_string()),
+                media_type: Some("text/plain".to_string()),
+                bytes: Some(42),
+                original_path: Some("attachments/audit.txt".to_string()),
+                bundle_path: Some("attachments/ab/abc123.txt".to_string()),
+            }],
+        };
+        let chunk = ChunkManifest {
+            version: 1,
+            chunk_size: 4_194_304,
+            chunk_count: 2,
+            pattern: "chunks/{index:05d}.bin".to_string(),
+            original_bytes: 8_388_608,
+            threshold_bytes: 4_194_304,
+        };
+        let hosting = vec![HostingHint {
+            id: "github-pages".to_string(),
+            title: "GitHub Pages".to_string(),
+            summary: "Static bundle can be published with Pages".to_string(),
+            instructions: vec!["ignored by manifest".to_string()],
+            signals: vec!["Git remote: github.com/example/project".to_string()],
+        }];
+        let viewer = ViewerDataManifest {
+            messages_path: "viewer/data/messages.json".to_string(),
+            meta_info: ViewerMetaInfo {
+                generated_at: "2026-01-02T03:04:05Z".to_string(),
+                message_count: 3,
+                messages_cached: 3,
+                fts_enabled: true,
+            },
+        };
+        let viewer_sri = HashMap::from([
+            (
+                "vendor/sql-wasm.js".to_string(),
+                "sha256-sql-wasm".to_string(),
+            ),
+            (
+                "viewer/index.html".to_string(),
+                "sha256-viewer-index".to_string(),
+            ),
+        ]);
+
+        let mut manifest = sort_json_keys(&build_manifest(
+            &scope,
+            &scrub,
+            &attachments,
+            Some(&chunk),
+            chunk.threshold_bytes,
+            chunk.chunk_size,
+            &hosting,
+            true,
+            "mailbox.sqlite3",
+            "db-sha256",
+            12_345,
+            Some(&viewer),
+            &viewer_sri,
+        ));
+        manifest["generated_at"] = Value::String("<TIMESTAMP>".to_string());
+        let actual = serde_json::to_string_pretty(&manifest).expect("serialize manifest");
+
+        assert_repo_golden("share/bundle/manifest_standard.json", &actual);
+    }
+
+    #[test]
+    fn bundle_file_manifest_sha256_golden_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("bundle");
+        std::fs::create_dir_all(root.join("attachments/ab")).expect("create attachments");
+        std::fs::create_dir_all(root.join("viewer/data")).expect("create viewer data");
+        std::fs::write(root.join(".nojekyll"), b"").expect("write nojekyll");
+        std::fs::write(
+            root.join("index.html"),
+            b"<!doctype html>\n<title>Agent Mail</title>\n",
+        )
+        .expect("write index");
+        std::fs::write(
+            root.join("viewer/data/messages.json"),
+            b"{\"messages\":[]}\n",
+        )
+        .expect("write messages");
+        std::fs::write(root.join("attachments/ab/abc123.txt"), b"attachment\n")
+            .expect("write attachment");
+
+        let mut entries = Vec::new();
+        collect_entries(&root, &root, &mut entries).expect("collect entries");
+        entries.sort();
+
+        let mut actual = String::new();
+        for rel_path in entries {
+            let sha = sha256_file(&root.join(&rel_path)).expect("sha256 file");
+            actual.push_str(&sha);
+            actual.push_str("  ");
+            actual.push_str(&rel_path);
+            actual.push('\n');
+        }
+
+        assert_repo_golden("share/bundle/file_manifest.sha256", &actual);
     }
 
     // =========================================================================

@@ -529,7 +529,9 @@ pub fn load_bundle_export_config(bundle_dir: &Path) -> ShareResult<StoredExportC
     let attachments_config = attachments_section
         .and_then(|v| v.get("config"))
         .and_then(|v| v.as_object());
-    let project_scope = manifest_root.get("project_scope").and_then(Value::as_object);
+    let project_scope = manifest_root
+        .get("project_scope")
+        .and_then(Value::as_object);
     let scrub_section = manifest_root.get("scrub").and_then(Value::as_object);
     let database_section = manifest_root.get("database").and_then(Value::as_object);
 

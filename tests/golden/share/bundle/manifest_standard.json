@@ -1,0 +1,105 @@
+{
+  "attachments": {
+    "config": {
+      "detach_threshold": 26214400,
+      "inline_threshold": 65536
+    },
+    "items": [
+      {
+        "bundle_path": "attachments/ab/abc123.txt",
+        "bytes": 42,
+        "media_type": "text/plain",
+        "message_id": 7,
+        "mode": "file",
+        "original_path": "attachments/audit.txt",
+        "sha256": "abc123"
+      }
+    ],
+    "stats": {
+      "bytes_copied": 42,
+      "copied": 1,
+      "externalized": 0,
+      "inline": 1,
+      "missing": 0
+    }
+  },
+  "database": {
+    "chunk_manifest": {
+      "chunk_count": 2,
+      "chunk_size": 4194304,
+      "original_bytes": 8388608,
+      "pattern": "chunks/{index:05d}.bin",
+      "threshold_bytes": 4194304,
+      "version": 1
+    },
+    "chunked": true,
+    "fts_enabled": true,
+    "path": "mailbox.sqlite3",
+    "sha256": "db-sha256",
+    "size_bytes": 12345
+  },
+  "export_config": {
+    "chunk_size": 4194304,
+    "chunk_threshold": 4194304,
+    "detach_threshold": 26214400,
+    "inline_threshold": 65536,
+    "projects": [
+      "project-alpha"
+    ],
+    "scrub_preset": "standard"
+  },
+  "exporter_version": "0.2.46",
+  "generated_at": "<TIMESTAMP>",
+  "hosting": {
+    "detected": [
+      {
+        "id": "github-pages",
+        "signals": [
+          "Git remote: github.com/example/project"
+        ],
+        "summary": "Static bundle can be published with Pages",
+        "title": "GitHub Pages"
+      }
+    ]
+  },
+  "project_scope": {
+    "included": [
+      {
+        "human_key": "/workspace/project-alpha",
+        "slug": "project-alpha"
+      }
+    ],
+    "removed_count": 1,
+    "requested": [
+      "project-alpha"
+    ]
+  },
+  "schema_version": "0.1.0",
+  "scrub": {
+    "ack_flags_cleared": 1,
+    "agent_links_removed": 1,
+    "agents_pseudonymized": 2,
+    "agents_total": 2,
+    "attachments_cleared": 0,
+    "attachments_sanitized": 1,
+    "bodies_redacted": 0,
+    "file_reservations_removed": 1,
+    "preset": "standard",
+    "pseudonym_salt": "salt-123",
+    "recipients_cleared": 1,
+    "secrets_replaced": 3
+  },
+  "viewer": {
+    "messages": "viewer/data/messages.json",
+    "meta_info": {
+      "fts_enabled": true,
+      "generated_at": "2026-01-02T03:04:05Z",
+      "message_count": 3,
+      "messages_cached": 3
+    },
+    "sri": {
+      "vendor/sql-wasm.js": "sha256-sql-wasm",
+      "viewer/index.html": "sha256-viewer-index"
+    }
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "_meta": {
+    "command": "robot status",
+    "timestamp": "2026-01-02T03:04:05Z",
+    "format": "json",
+    "version": "1.0",
+    "project": "/workspace/project-alpha",
+    "agent": "RedFox"
+  },
+  "_alerts": [
+    {
+      "severity": "warn",
+      "summary": "One reservation expires soon",
+      "action": "am robot reservations --expiring=30"
+    }
+  ],
+  "_actions": [
+    "am robot inbox --urgent"
+  ],
+  "health": "ok",
+  "unread": 2,
+  "urgent": 1,
+  "ack_required": 1,
+  "ack_overdue": 0,
+  "active_reservations": 1,
+  "reservations_expiring_soon": 0,
+  "active_agents": 2,
+  "recent_messages": 3,
+  "my_reservations": [
+    {
+      "agent": "RedFox",
+      "path": "crates/mcp-agent-mail-cli/src/**",
+      "exclusive": true,
+      "remaining_seconds": 3600,
+      "remaining": "1h",
+      "granted_at": "2026-01-02T03:00:00Z"
+    }
+  ],
+  "top_threads": [
+    {
+      "id": "br-robot-golden",
+      "subject": "Freeze robot output",
+      "participants": 2,
+      "messages": 3,
+      "last_activity": "2026-01-02T03:04:00Z"
+    }
+  ]
+}
