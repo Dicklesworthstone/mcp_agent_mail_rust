@@ -24,6 +24,7 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
           git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
@@ -53,6 +54,7 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
           git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
@@ -99,6 +101,7 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite ../frankensqlite
           git clone --depth 1 https://github.com/Dicklesworthstone/frankentui ../frankentui
           git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust ../beads_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/fastmcp_rust ../fastmcp_rust
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
