@@ -601,6 +601,7 @@ impl ReadCache {
     /// a concurrent `invalidate_agent_scoped` cannot remove the by-key entry
     /// and skip the by-id cleanup between the two insertions.
     /// Lock ordering (rank 22 → 23) is respected.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn put_agent_scoped(&self, scope: &str, agent: &AgentRow) {
         let scope_fp = scope_fingerprint(scope);
         let shared = Arc::new(agent.clone());
@@ -627,6 +628,7 @@ impl ReadCache {
     ///
     /// Holds the `agents_by_key` write lock for the entire operation (same
     /// rationale as `put_agent_scoped`). Lock ordering (rank 22 → 23).
+    #[allow(clippy::significant_drop_tightening)]
     pub fn warm_agents_scoped(&self, scope: &str, agents: &[AgentRow]) {
         let scope_fp = scope_fingerprint(scope);
         let prepared: Vec<_> = agents
@@ -706,6 +708,7 @@ impl ReadCache {
     /// Holds the `agents_by_key` write lock for the entire operation so that
     /// a concurrent `put_agent` cannot re-insert between the by-key removal
     /// and the by-id cleanup. Lock ordering (rank 22 → 23) is respected.
+    #[allow(clippy::significant_drop_tightening)]
     pub fn invalidate_agent_scoped(
         &self,
         scope: &str,
@@ -1777,11 +1780,28 @@ mod tests {
         /// Operation enum for interleaved dual-index coherency proptest.
         #[derive(Debug, Clone)]
         enum CacheOp {
-            Put { name_idx: usize, project_id: i64 },
-            Invalidate { name_idx: usize, project_id: i64, with_id: bool },
-            Touch { name_idx: usize, project_id: i64, ts: i64 },
-            GetByKey { name_idx: usize, project_id: i64 },
-            GetById { name_idx: usize, project_id: i64 },
+            Put {
+                name_idx: usize,
+                project_id: i64,
+            },
+            Invalidate {
+                name_idx: usize,
+                project_id: i64,
+                with_id: bool,
+            },
+            Touch {
+                name_idx: usize,
+                project_id: i64,
+                ts: i64,
+            },
+            GetByKey {
+                name_idx: usize,
+                project_id: i64,
+            },
+            GetById {
+                name_idx: usize,
+                project_id: i64,
+            },
         }
 
         fn arb_cache_op() -> impl Strategy<Value = CacheOp> {
@@ -1804,8 +1824,7 @@ mod tests {
         }
 
         const AGENT_NAMES: [&str; 8] = [
-            "Alpha", "Bravo", "Charlie", "Delta",
-            "Echo", "Foxtrot", "Golf", "Hotel",
+            "Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf", "Hotel",
         ];
 
         #[allow(clippy::cast_possible_wrap)]
@@ -1825,21 +1844,20 @@ mod tests {
                 .cloned()
                 .collect();
             for key in &key_entries {
-                if let Some(entry) = by_key.peek(key) {
-                    if let Some(agent_id) = entry.value.id {
-                        let id_key = (scope_fp, agent_id);
-                        if let Some(id_entry) = by_id.peek(&id_key) {
-                            assert_eq!(
-                                entry.value.name.to_ascii_lowercase(),
-                                id_entry.value.name.to_ascii_lowercase(),
-                                "by_key and by_id disagree on name for id={agent_id}",
-                            );
-                            assert_eq!(
-                                entry.value.project_id,
-                                id_entry.value.project_id,
-                                "by_key and by_id disagree on project_id for id={agent_id}",
-                            );
-                        }
+                if let Some(entry) = by_key.peek(key)
+                    && let Some(agent_id) = entry.value.id
+                {
+                    let id_key = (scope_fp, agent_id);
+                    if let Some(id_entry) = by_id.peek(&id_key) {
+                        assert_eq!(
+                            entry.value.name.to_ascii_lowercase(),
+                            id_entry.value.name.to_ascii_lowercase(),
+                            "by_key and by_id disagree on name for id={agent_id}",
+                        );
+                        assert_eq!(
+                            entry.value.project_id, id_entry.value.project_id,
+                            "by_key and by_id disagree on project_id for id={agent_id}",
+                        );
                     }
                 }
             }
