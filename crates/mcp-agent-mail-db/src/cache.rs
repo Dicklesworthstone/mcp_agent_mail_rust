@@ -699,6 +699,10 @@ impl ReadCache {
     }
 
     /// Invalidate a specific agent entry in a DB scope.
+    ///
+    /// Holds the `agents_by_key` write lock for the entire operation so that
+    /// a concurrent `put_agent` cannot re-insert between the by-key removal
+    /// and the by-id cleanup. Lock ordering (rank 22 → 23) is respected.
     pub fn invalidate_agent_scoped(
         &self,
         scope: &str,
@@ -709,9 +713,11 @@ impl ReadCache {
         let scope_fp = scope_fingerprint(scope);
         let name_lower = name.to_ascii_lowercase();
         let key = (scope_fp, project_id, InternedStr::new(&name_lower));
-        let mut cache = self.agents_by_key.write();
-        let removed_id = cache.remove(&key).and_then(|a| a.value.id);
-        drop(cache); // release key map lock first
+
+        // Hold by_key write lock for the entire invalidation to prevent a
+        // concurrent put_agent from inserting into both indexes mid-cleanup.
+        let mut by_key_cache = self.agents_by_key.write();
+        let removed_id = by_key_cache.remove(&key).and_then(|a| a.value.id);
 
         let mut agent_ids_to_remove = Vec::new();
         if let Some(agent_id) = id.or(removed_id) {
@@ -719,28 +725,35 @@ impl ReadCache {
         }
 
         if id.is_none() {
-            let id_cache = self.agents_by_id.read();
-            agent_ids_to_remove.extend(id_cache.keys().filter_map(|(entry_scope, agent_id)| {
-                if *entry_scope != scope_fp {
-                    return None;
-                }
-                let lookup_key = (*entry_scope, *agent_id);
-                let entry = id_cache.peek(&lookup_key)?;
-                (entry.value.project_id == project_id
-                    && entry.value.name.eq_ignore_ascii_case(name))
-                .then_some(*agent_id)
-            }));
-        }
-
-        agent_ids_to_remove.sort_unstable();
-        agent_ids_to_remove.dedup();
-
-        if !agent_ids_to_remove.is_empty() {
+            // Use a write lock directly (avoids read → release → write cycle
+            // on the same rank while still holding the by_key lock at rank 22).
             let mut id_cache = self.agents_by_id.write();
-            for agent_id in agent_ids_to_remove {
+            let matching: Vec<_> = id_cache
+                .keys()
+                .filter_map(|(entry_scope, agent_id)| {
+                    if *entry_scope != scope_fp {
+                        return None;
+                    }
+                    let lookup_key = (*entry_scope, *agent_id);
+                    let entry = id_cache.peek(&lookup_key)?;
+                    (entry.value.project_id == project_id
+                        && entry.value.name.eq_ignore_ascii_case(name))
+                    .then_some(*agent_id)
+                })
+                .collect();
+            agent_ids_to_remove.extend(matching);
+            agent_ids_to_remove.sort_unstable();
+            agent_ids_to_remove.dedup();
+            for &agent_id in &agent_ids_to_remove {
                 id_cache.remove(&(scope_fp, agent_id));
             }
+        } else if !agent_ids_to_remove.is_empty() {
+            let mut id_cache = self.agents_by_id.write();
+            for agent_id in &agent_ids_to_remove {
+                id_cache.remove(&(scope_fp, *agent_id));
+            }
         }
+        // by_key_cache dropped here — atomic with by_id cleanup
     }
 
     // -------------------------------------------------------------------------
@@ -2212,5 +2225,74 @@ mod tests {
         cache.invalidate_inbox_stats(1);
         assert!(cache.get_inbox_stats(1).is_none());
         assert!(cache.get_inbox_stats(2).is_some());
+    }
+
+    // ── br-pf84h: dual-index coherency race regression ─────────────────
+
+    #[test]
+    fn invalidate_then_put_leaves_consistent_dual_index() {
+        let cache = ReadCache::new();
+
+        cache.put_agent(&make_agent_with_id("RedCat", 2, 55));
+        cache.invalidate_agent(2, "RedCat", None);
+
+        assert!(cache.get_agent(2, "RedCat").is_none());
+        assert!(cache.get_agent_by_id(55).is_none());
+
+        cache.put_agent(&make_agent_with_id("RedCat", 2, 56));
+        assert_eq!(cache.get_agent(2, "RedCat").unwrap().id, Some(56));
+        assert_eq!(cache.get_agent_by_id(56).unwrap().id, Some(56));
+        assert!(cache.get_agent_by_id(55).is_none());
+    }
+
+    #[test]
+    fn concurrent_invalidate_put_dual_index_consistency() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let cache = Arc::new(ReadCache::with_capacity(1000));
+
+        for round in 0..500 {
+            let old_id = round * 2;
+            let new_id = round * 2 + 1;
+            cache.put_agent(&make_agent_with_id("RaceAgent", 7, old_id));
+
+            let barrier = Arc::new(Barrier::new(2));
+            let c1 = Arc::clone(&cache);
+            let b1 = Arc::clone(&barrier);
+            let c2 = Arc::clone(&cache);
+            let b2 = Arc::clone(&barrier);
+
+            let t1 = thread::spawn(move || {
+                b1.wait();
+                c1.invalidate_agent(7, "RaceAgent", None);
+            });
+            let t2 = thread::spawn(move || {
+                b2.wait();
+                c2.put_agent(&make_agent_with_id("RaceAgent", 7, new_id));
+            });
+
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            let by_key = cache.get_agent(7, "RaceAgent");
+            let by_id_new = cache.get_agent_by_id(new_id);
+
+            match (by_key.as_ref(), by_id_new.as_ref()) {
+                (Some(_), Some(_)) | (None, None) => {}
+                (Some(a), None) => panic!(
+                    "round {round}: by_key has agent (id={:?}) but by_id({new_id}) miss — \
+                     dual-index desync",
+                    a.id
+                ),
+                (None, Some(a)) => panic!(
+                    "round {round}: by_id({new_id}) has '{}' but by_key miss — \
+                     dual-index desync",
+                    a.name
+                ),
+            }
+
+            cache.invalidate_agent(7, "RaceAgent", Some(new_id));
+        }
     }
 }
