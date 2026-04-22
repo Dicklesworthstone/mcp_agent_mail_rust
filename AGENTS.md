@@ -365,7 +365,7 @@ mcp_agent_mail_rust/
 | 5 | Search | Query bar + facets + results + preview |
 | 6 | Reservations | File reservations with TTL countdowns |
 | 7 | Tool Metrics | Per-tool latency and call counts |
-| 8 | SystemHealth | Connection probes, disk/memory, circuit breakers |
+| 8 | SystemHealth | Connection probes, ATC operator status, anomaly cards |
 | 9 | Timeline | Chronological event timeline with inspector |
 | 10 | Projects | Project list and routing helpers |
 | 11 | Contacts | Contact graph and policy surface |
