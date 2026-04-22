@@ -156,15 +156,15 @@ fn expected_description_prefixes() -> HashMap<&'static str, &'static str> {
     );
     m.insert(
         "resource://mailbox/{agent}",
-        "List recent messages in an agent's mailbox with lightweight Git commit context.",
+        "List recent messages in an agent's mailbox with commit metadata fields.",
     );
     m.insert(
         "resource://mailbox-with-commits/{agent}",
-        "List recent messages in an agent's mailbox with commit metadata including diff summaries.",
+        "List recent messages in an agent's mailbox with commit metadata fields, including explicit unavailable markers",
     );
     m.insert(
         "resource://outbox/{agent}",
-        "List messages sent by the agent, enriched with commit metadata",
+        "List messages sent by the agent with commit metadata fields.",
     );
     m.insert(
         "resource://product/{key}",

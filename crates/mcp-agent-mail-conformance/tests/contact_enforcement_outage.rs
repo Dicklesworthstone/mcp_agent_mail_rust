@@ -22,6 +22,9 @@ use std::sync::{Mutex, OnceLock};
 // Helpers
 // ---------------------------------------------------------------------------
 
+const TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS: &str = "3600";
+const TEST_SEARCH_ENGINE: &str = "legacy";
+
 /// Tests in this file mutate process-wide env vars and share global metrics.
 /// Serialize them to avoid races.
 fn env_lock() -> &'static Mutex<()> {
@@ -40,6 +43,30 @@ impl EnvGuard {
             let old = std::env::var(*key).ok();
             previous.push(((*key).to_string(), old));
             unsafe { std::env::set_var(key, value) };
+        }
+        if !vars
+            .iter()
+            .any(|(key, _)| *key == "AM_STARTUP_SEARCH_BACKFILL_DELAY_SECS")
+        {
+            let key = "AM_STARTUP_SEARCH_BACKFILL_DELAY_SECS";
+            let old = std::env::var(key).ok();
+            previous.push((key.to_string(), old));
+            unsafe { std::env::set_var(key, TEST_STARTUP_SEARCH_BACKFILL_DELAY_SECS) };
+        }
+        if !vars.iter().any(|(key, _)| *key == "AM_SEARCH_ENGINE") {
+            let key = "AM_SEARCH_ENGINE";
+            let old = std::env::var(key).ok();
+            previous.push((key.to_string(), old));
+            unsafe { std::env::set_var(key, TEST_SEARCH_ENGINE) };
+        }
+        if !vars
+            .iter()
+            .any(|(key, _)| *key == "AM_ALLOW_EPHEMERAL_PROJECT_ROOTS")
+        {
+            let key = "AM_ALLOW_EPHEMERAL_PROJECT_ROOTS";
+            let old = std::env::var(key).ok();
+            previous.push((key.to_string(), old));
+            unsafe { std::env::set_var(key, "1") };
         }
         mcp_agent_mail_core::Config::reset_cached();
         Self { previous }
@@ -117,6 +144,36 @@ fn bypass_counter() -> u64 {
         .load()
 }
 
+fn ensure_project_direct(project_key: &str) {
+    let pool_config = mcp_agent_mail_db::pool::DbPoolConfig::from_env();
+    let pool = mcp_agent_mail_db::pool::get_or_create_pool(&pool_config)
+        .expect("direct setup should create DB pool");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("direct setup runtime should build");
+    let cx = Cx::for_testing();
+
+    match runtime.block_on(mcp_agent_mail_db::queries::ensure_project(
+        &cx,
+        &pool,
+        project_key,
+    )) {
+        asupersync::Outcome::Ok(_) => {}
+        asupersync::Outcome::Err(error) => {
+            panic!("direct setup ensure_project failed: {error:?}");
+        }
+        asupersync::Outcome::Cancelled(reason) => {
+            panic!("direct setup ensure_project cancelled: {reason:?}");
+        }
+        asupersync::Outcome::Panicked(payload) => {
+            panic!(
+                "direct setup ensure_project panicked: {}",
+                payload.message()
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test: DB outage at contact enforcement produces fail-open + counter bump
 // ---------------------------------------------------------------------------
@@ -173,20 +230,10 @@ fn contact_enforcement_db_outage_fail_open() {
 
     // ── Phase 1: Set up healthy DB state ──────────────────────────────────
 
-    // 1a. Ensure project
-    let project_result = call_tool(
-        &router,
-        &cx,
-        &budget,
-        "ensure_project",
-        json!({ "human_key": project_key }),
-        &mut req_id,
-    )
-    .expect("ensure_project should succeed");
-    assert!(
-        project_result.get("slug").is_some(),
-        "project should have a slug: {project_result}"
-    );
+    // 1a. Ensure project. This test exercises contact-enforcement outage
+    // behavior, so seed the project directly and keep setup independent from
+    // the ensure_project tool's own conformance surface.
+    ensure_project_direct(project_key);
 
     // 1b. Register sender agent
     call_tool(
@@ -478,15 +525,7 @@ fn contact_enforcement_outage_counter_atomicity() {
     mcp_agent_mail_tools::reset_tool_metrics();
 
     // Set up project + agents
-    call_tool(
-        &router,
-        &cx,
-        &budget,
-        "ensure_project",
-        json!({ "human_key": project_key }),
-        &mut req_id,
-    )
-    .expect("ensure_project");
+    ensure_project_direct(project_key);
 
     call_tool(
         &router,

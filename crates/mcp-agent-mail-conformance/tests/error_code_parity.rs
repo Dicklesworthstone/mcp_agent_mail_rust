@@ -1,3 +1,6 @@
+// Note: unsafe required for env::set_var in Rust 2024.
+#![allow(unsafe_code)]
+
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use fastmcp::McpError;
@@ -8,9 +11,78 @@ use std::collections::BTreeSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tempfile::TempDir;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+struct EnvGuard {
+    previous: Vec<(String, Option<String>)>,
+    _temp_dir: TempDir,
+}
+
+impl EnvGuard {
+    fn new() -> Self {
+        let temp_dir = tempfile::TempDir::new().expect("create isolated error parity tempdir");
+        let db_path = temp_dir.path().join("error_code_parity.sqlite3");
+        let db_url = format!("sqlite://{}", db_path.display());
+        let storage_root = temp_dir.path().join("archive");
+        std::fs::create_dir_all(&storage_root).expect("create isolated error parity archive root");
+
+        let vars = vec![
+            ("DATABASE_URL".to_string(), db_url),
+            (
+                "STORAGE_ROOT".to_string(),
+                storage_root.to_string_lossy().into_owned(),
+            ),
+            (
+                "AM_STARTUP_SEARCH_BACKFILL_DELAY_SECS".to_string(),
+                "3600".to_string(),
+            ),
+            ("AM_SEARCH_ENGINE".to_string(), "legacy".to_string()),
+            (
+                "AM_ALLOW_EPHEMERAL_PROJECT_ROOTS".to_string(),
+                "1".to_string(),
+            ),
+            ("TOOLS_FILTER_ENABLED".to_string(), "0".to_string()),
+            ("TOOLS_FILTER_PROFILE".to_string(), "full".to_string()),
+            (
+                "AGENT_NAME_ENFORCEMENT_MODE".to_string(),
+                "coerce".to_string(),
+            ),
+        ];
+
+        let mut previous = Vec::new();
+        for (key, value) in vars {
+            previous.push((key.clone(), std::env::var(&key).ok()));
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+        mcp_agent_mail_core::Config::reset_cached();
+
+        Self {
+            previous,
+            _temp_dir: temp_dir,
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in self.previous.drain(..) {
+            match value {
+                Some(value) => unsafe {
+                    std::env::set_var(key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(key);
+                },
+            }
+        }
+        mcp_agent_mail_core::Config::reset_cached();
+    }
+}
 
 const PLACEHOLDER_PATTERNS: &[&str] = &[
     "YOUR_PROJECT",
@@ -39,6 +111,7 @@ where
     let _lock = TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _env = EnvGuard::new();
     let cx = Cx::for_testing();
     let rt = RuntimeBuilder::current_thread()
         .build()
@@ -164,29 +237,38 @@ fn extract_slug_from_ensure_project_response(project_json: &str) -> String {
 fn error_code_catalog_is_stable() {
     let actual = collect_declared_error_codes();
     let expected: BTreeSet<String> = [
+        "AGENT_NOT_FOUND",
         "ARCHIVE_ERROR",
+        "BROADCAST_DISABLED",
         "CONFIGURATION_ERROR",
+        "CONFLICT",
         "CONTACT_BLOCKED",
         "CONTACT_REQUIRED",
         "DATABASE_CORRUPTION",
         "DATABASE_ERROR",
         "DATABASE_POOL_EXHAUSTED",
+        "DATABASE_RECOVERED",
         "DISK_FULL",
         "EMPTY_MODEL",
         "EMPTY_PATHS",
         "EMPTY_PROGRAM",
         "FEATURE_DISABLED",
-        "INVALID_AGENT_NAME",
+        "IDENTITY_NOT_FOUND",
         "INVALID_ARGUMENT",
         "INVALID_LIMIT",
         "INVALID_PATH",
+        "INVALID_PATHS",
         "INVALID_THREAD_ID",
         "INVALID_TIMESTAMP",
         "MISSING_FIELD",
+        "MISSING_PANE_ID",
         "NOT_FOUND",
         "RECIPIENT_NOT_FOUND",
         "RESERVATION_ACTIVE",
         "RESOURCE_BUSY",
+        "SENDER_TOKEN_MISMATCH",
+        "SUSPICIOUS_PATTERN",
+        "TOO_MANY_PATHS",
         "TYPE_ERROR",
         "UNHANDLED_EXCEPTION",
     ]
@@ -385,9 +467,10 @@ fn not_found_without_suggestions_and_missing_agent_have_expected_payload_fields(
         let project_key = format!("/tmp/error-parity-agent-{}", unique_suffix());
         let random_key = format!("qzxw-unrelated-project-{}", unique_suffix());
 
-        ensure_project(&ctx, project_key.clone(), None)
+        let project_json = ensure_project(&ctx, project_key.clone(), None)
             .await
             .expect("ensure_project should succeed");
+        let project_slug = extract_slug_from_ensure_project_response(&project_json);
         register_agent(
             &ctx,
             project_key.clone(),
@@ -430,27 +513,30 @@ fn not_found_without_suggestions_and_missing_agent_have_expected_payload_fields(
         );
 
         eprintln!("[not_found_without_suggestions] scenario=missing_agent");
-        let missing_agent_err = whois(&ctx, project_key, "UnknownAgent".to_string(), None, None)
-            .await
-            .expect_err("missing agent should fail");
-        let payload = assert_error_envelope(&missing_agent_err, "missing_agent", "NOT_FOUND", true);
+        let missing_agent_err = whois(
+            &ctx,
+            project_key.clone(),
+            "UnknownAgent".to_string(),
+            None,
+            None,
+        )
+        .await
+        .expect_err("missing agent should fail");
+        let payload =
+            assert_error_envelope(&missing_agent_err, "missing_agent", "AGENT_NOT_FOUND", true);
         let data = payload
             .get("data")
             .and_then(Value::as_object)
             .expect("missing_agent: expected error.data object");
         assert_eq!(
-            data.get("entity").and_then(Value::as_str),
-            Some("Agent"),
-            "missing_agent: expected data.entity=Agent"
+            data.get("agent_name").and_then(Value::as_str),
+            Some("UnknownAgent"),
+            "missing_agent: expected data.agent_name=UnknownAgent"
         );
-        let ident = data
-            .get("identifier")
-            .and_then(Value::as_str)
-            .expect("missing_agent: expected data.identifier");
-        // DB layer formats as "{project_id}:{agent_name}"
-        assert!(
-            ident.ends_with("UnknownAgent"),
-            "missing_agent: expected data.identifier to end with UnknownAgent, got: {ident}"
+        assert_eq!(
+            data.get("project").and_then(Value::as_str),
+            Some(project_slug.as_str()),
+            "missing_agent: expected data.project to match resolved slug"
         );
     });
 }

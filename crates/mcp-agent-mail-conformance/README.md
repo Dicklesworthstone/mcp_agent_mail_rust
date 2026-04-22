@@ -20,6 +20,7 @@ This crate keeps the live Rust router honest against the legacy Python reference
 - 34 tools have Python behavior fixtures in `tests/conformance/fixtures/python_reference.json`.
 - 3 tools are Rust-native extensions: `resolve_pane_identity`, `cleanup_pane_identities`, and `list_agents`.
 - All 3 Rust-native tools are covered by dedicated golden fixtures under `tests/conformance/fixtures/rust_native/`.
+- The former tool fixture gap tracked by `br-a2k3h.3` is closed by the dedicated Rust-native fixture lane.
 - The live Rust router exposes 25 logical resource templates after collapsing `?{query}` variants.
 - 23 resource templates have Python behavior fixtures.
 - 2 Rust-only resources, `resource://tooling/metrics_core` and `resource://tooling/diagnostics`, are unit-tested in `mcp-agent-mail-tools` but still lack conformance fixtures. They are tracked by `br-a2k3h.4` and `br-a2k3h.6`.

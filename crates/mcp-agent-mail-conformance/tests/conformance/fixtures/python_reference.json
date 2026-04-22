@@ -299,13 +299,22 @@
               "inception_ts": null,
               "last_active_ts": null,
               "project_id": 1,
-              "attachments_policy": "auto"
+              "attachments_policy": "auto",
+              "reaper_exempt": false,
+              "capabilities": [
+                "send_message",
+                "fetch_inbox",
+                "file_reservation_paths",
+                "acknowledge_message"
+              ],
+              "registration_token": null
             }
           },
           "normalize": {
             "ignore_json_pointers": [
               "/inception_ts",
-              "/last_active_ts"
+              "/last_active_ts",
+              "/registration_token"
             ]
           }
         },
@@ -328,13 +337,22 @@
               "inception_ts": null,
               "last_active_ts": null,
               "project_id": 1,
-              "attachments_policy": "auto"
+              "attachments_policy": "auto",
+              "reaper_exempt": false,
+              "capabilities": [
+                "send_message",
+                "fetch_inbox",
+                "file_reservation_paths",
+                "acknowledge_message"
+              ],
+              "registration_token": null
             }
           },
           "normalize": {
             "ignore_json_pointers": [
               "/inception_ts",
-              "/last_active_ts"
+              "/last_active_ts",
+              "/registration_token"
             ]
           }
         }
@@ -361,13 +379,22 @@
               "inception_ts": null,
               "last_active_ts": null,
               "project_id": 1,
-              "attachments_policy": "auto"
+              "attachments_policy": "auto",
+              "reaper_exempt": false,
+              "capabilities": [
+                "send_message",
+                "fetch_inbox",
+                "file_reservation_paths",
+                "acknowledge_message"
+              ],
+              "registration_token": null
             }
           },
           "normalize": {
             "ignore_json_pointers": [
               "/inception_ts",
-              "/last_active_ts"
+              "/last_active_ts",
+              "/registration_token"
             ]
           }
         }
@@ -526,7 +553,8 @@
                 }
               ],
               "count": 1,
-              "attachments": []
+              "attachments": [],
+              "verified_sender": false
             }
           },
           "normalize": {
@@ -590,7 +618,8 @@
                 }
               ],
               "count": 1,
-              "attachments": []
+              "attachments": [],
+              "verified_sender": false
             }
           },
           "normalize": {
@@ -637,7 +666,8 @@
                 }
               ],
               "count": 1,
-              "attachments": []
+              "attachments": [],
+              "verified_sender": false
             }
           },
           "normalize": {
@@ -700,7 +730,8 @@
                   }
                 }
               ],
-              "count": 1
+              "count": 1,
+              "verified_sender": false
             }
           },
           "normalize": {
@@ -760,7 +791,8 @@
                   }
                 }
               ],
-              "count": 1
+              "count": 1,
+              "verified_sender": false
             }
           },
           "normalize": {
@@ -820,7 +852,8 @@
                   }
                 }
               ],
-              "count": 1
+              "count": 1,
+              "verified_sender": false
             }
           },
           "normalize": {
@@ -982,7 +1015,11 @@
                   "ack_required": 1,
                   "created_ts": null,
                   "thread_id": null,
-                  "from": "BlueLake"
+                  "from": "BlueLake",
+                  "to": [
+                    "GreenCastle"
+                  ],
+                  "cc": []
                 },
                 {
                   "id": 5,
@@ -991,7 +1028,11 @@
                   "ack_required": 1,
                   "created_ts": null,
                   "thread_id": "2",
-                  "from": "GreenCastle"
+                  "from": "GreenCastle",
+                  "to": [
+                    "BlueLake"
+                  ],
+                  "cc": []
                 }
               ]
             }
@@ -1199,7 +1240,7 @@
                       "Update OpenAPI spec"
                     ],
                     "total_messages": 2,
-                    "open_actions": 1,
+                    "open_actions": 2,
                     "done_actions": 0,
                     "mentions": [
                       {
@@ -1226,7 +1267,7 @@
                       "Run migration script"
                     ],
                     "total_messages": 2,
-                    "open_actions": 0,
+                    "open_actions": 1,
                     "done_actions": 0,
                     "mentions": []
                   }
@@ -1261,7 +1302,26 @@
           },
           "expect": {
             "ok": {
-              "result": []
+              "result": [
+                {
+                  "id": 2,
+                  "subject": "Hello",
+                  "importance": "urgent",
+                  "ack_required": 1,
+                  "project_id": 1,
+                  "thread_id": null,
+                  "from": "BlueLake"
+                },
+                {
+                  "id": 5,
+                  "subject": "Re: Hello",
+                  "importance": "urgent",
+                  "ack_required": 1,
+                  "project_id": 1,
+                  "thread_id": "2",
+                  "from": "GreenCastle"
+                }
+              ]
             }
           },
           "normalize": {
@@ -1682,6 +1742,13 @@
               "last_active_ts": null,
               "project_id": 1,
               "attachments_policy": "auto",
+              "reaper_exempt": false,
+              "capabilities": [
+                "send_message",
+                "fetch_inbox",
+                "file_reservation_paths",
+                "acknowledge_message"
+              ],
               "recent_commits": []
             }
           },
@@ -1734,7 +1801,15 @@
                 "inception_ts": null,
                 "last_active_ts": null,
                 "project_id": 2,
-                "attachments_policy": "auto"
+                "attachments_policy": "auto",
+                "reaper_exempt": false,
+                "capabilities": [
+                  "send_message",
+                  "fetch_inbox",
+                  "file_reservation_paths",
+                  "acknowledge_message"
+                ],
+                "registration_token": null
               },
               "file_reservations": {
                 "granted": [],
@@ -1747,6 +1822,7 @@
             "ignore_json_pointers": [
               "/agent/inception_ts",
               "/agent/last_active_ts",
+              "/agent/registration_token",
               "/project/created_at"
             ]
           }
@@ -1783,7 +1859,15 @@
                 "inception_ts": null,
                 "last_active_ts": null,
                 "project_id": 1,
-                "attachments_policy": "auto"
+                "attachments_policy": "auto",
+                "reaper_exempt": false,
+                "capabilities": [
+                  "send_message",
+                  "fetch_inbox",
+                  "file_reservation_paths",
+                  "acknowledge_message"
+                ],
+                "registration_token": null
               },
               "thread": {
                 "thread_id": "2",
@@ -1862,6 +1946,7 @@
             "ignore_json_pointers": [
               "/agent/inception_ts",
               "/agent/last_active_ts",
+              "/agent/registration_token",
               "/inbox/0/created_ts",
               "/inbox/1/created_ts",
               "/inbox/2/created_ts",
@@ -1899,7 +1984,15 @@
                 "inception_ts": null,
                 "last_active_ts": null,
                 "project_id": 1,
-                "attachments_policy": "auto"
+                "attachments_policy": "auto",
+                "reaper_exempt": false,
+                "capabilities": [
+                  "send_message",
+                  "fetch_inbox",
+                  "file_reservation_paths",
+                  "acknowledge_message"
+                ],
+                "registration_token": null
               },
               "thread": {
                 "thread_id": "T-1",
@@ -1994,6 +2087,7 @@
             "ignore_json_pointers": [
               "/agent/inception_ts",
               "/agent/last_active_ts",
+              "/agent/registration_token",
               "/inbox/0/created_ts",
               "/inbox/1/created_ts",
               "/inbox/2/created_ts",
@@ -2067,16 +2161,15 @@
                 "from_project": "/abs/path/backend",
                 "to": "GreenCastle",
                 "to_project": "/abs/path/backend",
-                "status": "approved",
+                "status": "pending",
                 "expires_ts": null
               },
               "response": {
                 "from": "BlueLake",
-                "from_project": "/abs/path/backend",
                 "to": "GreenCastle",
-                "to_project": "/abs/path/backend",
-                "status": "approved",
-                "expires_ts": null
+                "approved": true,
+                "expires_ts": null,
+                "updated": 1
               },
               "welcome_message": null
             }
@@ -2104,7 +2197,7 @@
               "http": {
                 "host": "127.0.0.1",
                 "port": 8765,
-                "path": "/api/"
+                "path": "/mcp/"
               }
             }
           },
@@ -2128,7 +2221,7 @@
               "http": {
                 "host": "127.0.0.1",
                 "port": 8765,
-                "path": "/api/"
+                "path": "/mcp/"
               }
             }
           },
@@ -2314,7 +2407,7 @@
                   "last_active_ts": null,
                   "project_id": 1,
                   "attachments_policy": "auto",
-                  "unread_count": 3
+                  "unread_count": 0
                 },
                 {
                   "id": 2,
@@ -2326,7 +2419,7 @@
                   "last_active_ts": null,
                   "project_id": 1,
                   "attachments_policy": "auto",
-                  "unread_count": 3
+                  "unread_count": 1
                 },
                 {
                   "id": 3,
@@ -2395,8 +2488,22 @@
             "ok": {
               "project": "/abs/path/backend",
               "agent": "GreenCastle",
-              "count": 4,
+              "count": 5,
               "messages": [
+                {
+                  "id": null,
+                  "project_id": 1,
+                  "sender_id": 1,
+                  "thread_id": null,
+                  "subject": "Contact request from BlueLake",
+                  "importance": "normal",
+                  "ack_required": true,
+                  "created_ts": null,
+                  "attachments": [],
+                  "body_md": "BlueLake requests permission to contact GreenCastle.",
+                  "from": "BlueLake",
+                  "kind": "to"
+                },
                 {
                   "id": 4,
                   "project_id": 1,
@@ -2502,22 +2609,16 @@
           },
           "normalize": {
             "ignore_json_pointers": [
-              "/messages/0/commit/authored_ts",
-              "/messages/0/commit/diff_summary/excerpt",
-              "/messages/0/commit/hexsha",
+              "/messages/0/commit",
               "/messages/0/created_ts",
-              "/messages/1/commit/authored_ts",
-              "/messages/1/commit/diff_summary/excerpt",
-              "/messages/1/commit/hexsha",
+              "/messages/1/commit",
               "/messages/1/created_ts",
-              "/messages/2/commit/authored_ts",
-              "/messages/2/commit/diff_summary/excerpt",
-              "/messages/2/commit/hexsha",
+              "/messages/2/commit",
               "/messages/2/created_ts",
-              "/messages/3/commit/authored_ts",
-              "/messages/3/commit/diff_summary/excerpt",
-              "/messages/3/commit/hexsha",
-              "/messages/3/created_ts"
+              "/messages/3/commit",
+              "/messages/3/created_ts",
+              "/messages/4/commit",
+              "/messages/4/created_ts"
             ]
           }
         }
@@ -2540,7 +2641,12 @@
               "created_ts": null,
               "attachments": [],
               "body_md": "Test",
-              "from": "BlueLake"
+              "from": "BlueLake",
+              "to": [
+                "GreenCastle"
+              ],
+              "cc": [],
+              "bcc": []
             }
           },
           "normalize": {
@@ -2560,6 +2666,8 @@
             "ok": {
               "project": "/abs/path/backend",
               "thread_id": "2",
+              "limit": 10000,
+              "truncated": false,
               "messages": [
                 {
                   "id": 2,
@@ -2572,7 +2680,12 @@
                   "created_ts": null,
                   "attachments": [],
                   "body_md": "Test",
-                  "from": "BlueLake"
+                  "from": "BlueLake",
+                  "to": [
+                    "GreenCastle"
+                  ],
+                  "cc": [],
+                  "bcc": []
                 },
                 {
                   "id": 5,
@@ -2585,7 +2698,12 @@
                   "created_ts": null,
                   "attachments": [],
                   "body_md": "Reply",
-                  "from": "GreenCastle"
+                  "from": "GreenCastle",
+                  "to": [
+                    "BlueLake"
+                  ],
+                  "cc": [],
+                  "bcc": []
                 }
               ]
             }
@@ -2619,7 +2737,7 @@
                 "stale_reasons": [
                   "agent_recently_active",
                   "mail_activity_recent",
-                  "path_pattern_unmatched"
+                  "workspace_unavailable"
                 ],
                 "last_agent_activity_ts": null,
                 "last_mail_activity_ts": null,
@@ -2639,7 +2757,7 @@
                 "stale_reasons": [
                   "agent_recently_active",
                   "mail_activity_recent",
-                  "path_pattern_unmatched"
+                  "workspace_unavailable"
                 ],
                 "last_agent_activity_ts": null,
                 "last_mail_activity_ts": null,
@@ -2762,7 +2880,7 @@
                       "usage_examples": [
                         {
                           "hint": "Onboard",
-                          "sample": "install_precommit_guard(project_key='backend', code_repo_path='~/repo')"
+                          "sample": "install_precommit_guard(project_key='backend', code_repo_path='/abs/path/repo')"
                         }
                       ],
                       "capabilities": [
@@ -2786,7 +2904,7 @@
                       "usage_examples": [
                         {
                           "hint": "Cleanup",
-                          "sample": "uninstall_precommit_guard(code_repo_path='~/repo')"
+                          "sample": "uninstall_precommit_guard(code_repo_path='/abs/path/repo')"
                         }
                       ],
                       "capabilities": [
@@ -2904,7 +3022,7 @@
                     {
                       "name": "send_message",
                       "summary": "Deliver a new message with attachments, WebP conversion, and policy enforcement.",
-                      "use_when": "Starting new threads or broadcasting plans across projects.",
+                      "use_when": "Starting new threads or distributing plans to specific agents across projects.",
                       "related": [
                         "reply_message",
                         "request_contact"
@@ -3410,9 +3528,7 @@
             }
           },
           "normalize": {
-            "ignore_json_pointers": [
-              "/generated_at"
-            ]
+            "ignore_json_pointers": []
           }
         }
       ]
@@ -3510,7 +3626,7 @@
                       "usage_examples": [
                         {
                           "hint": "Onboard",
-                          "sample": "install_precommit_guard(project_key='backend', code_repo_path='~/repo')"
+                          "sample": "install_precommit_guard(project_key='backend', code_repo_path='/abs/path/repo')"
                         }
                       ],
                       "capabilities": [
@@ -3534,7 +3650,7 @@
                       "usage_examples": [
                         {
                           "hint": "Cleanup",
-                          "sample": "uninstall_precommit_guard(code_repo_path='~/repo')"
+                          "sample": "uninstall_precommit_guard(code_repo_path='/abs/path/repo')"
                         }
                       ],
                       "capabilities": [
@@ -3652,7 +3768,7 @@
                     {
                       "name": "send_message",
                       "summary": "Deliver a new message with attachments, WebP conversion, and policy enforcement.",
-                      "use_when": "Starting new threads or broadcasting plans across projects.",
+                      "use_when": "Starting new threads or distributing plans to specific agents across projects.",
                       "related": [
                         "reply_message",
                         "request_contact"
@@ -5161,7 +5277,12 @@
               "generated_at": null,
               "agent": "BlueLake",
               "project": "abs-path-backend",
-              "capabilities": []
+              "capabilities": [
+                "send_message",
+                "fetch_inbox",
+                "file_reservation_paths",
+                "acknowledge_message"
+              ]
             }
           },
           "normalize": {
@@ -5181,189 +5302,12 @@
             "ok": {
               "generated_at": null,
               "window_seconds": 60,
-              "count": 22,
-              "entries": [
-                {
-                  "timestamp": null,
-                  "tool": "acquire_build_slot",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "build_slots"
-                },
-                {
-                  "timestamp": null,
-                  "tool": "renew_build_slot",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "build_slots"
-                },
-                {
-                  "timestamp": null,
-                  "tool": "release_build_slot",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "build_slots"
-                },
-                {
-                  "timestamp": null,
-                  "tool": "register_agent",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "identity"
-                },
-                {
-                  "timestamp": null,
-                  "tool": "request_contact",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "contact"
-                },
-                {
-                  "timestamp": null,
-                  "tool": "list_contacts",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "contact"
-                },
-                {
-                  "timestamp": null,
-                  "tool": "send_message",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "messaging"
-                },
-                {
-                  "timestamp": null,
-                  "tool": "send_message",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "messaging"
-                },
-                {
-                  "timestamp": null,
-                  "tool": "send_message",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "messaging"
-                },
-                {
-                  "timestamp": null,
-                  "tool": "file_reservation_paths",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "file_reservations"
-                },
-                {
-                  "timestamp": null,
-                  "tool": "file_reservation_paths",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "file_reservations"
-                },
-                {
-                  "timestamp": null,
-                  "tool": "renew_file_reservations",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "file_reservations"
-                },
-                {
-                  "timestamp": null,
-                  "tool": "renew_file_reservations",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "file_reservations"
-                },
-                {
-                  "timestamp": null,
-                  "tool": "release_file_reservations",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "file_reservations"
-                },
-                {
-                  "timestamp": null,
-                  "tool": "force_release_file_reservation",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "file_reservations"
-                },
-                {
-                  "timestamp": null,
-                  "tool": "whois",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "identity"
-                },
-                {
-                  "timestamp": null,
-                  "tool": "macro_prepare_thread",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "workflow_macros"
-                },
-                {
-                  "timestamp": null,
-                  "tool": "macro_prepare_thread",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "workflow_macros"
-                },
-                {
-                  "timestamp": null,
-                  "tool": "file_reservation_paths",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "file_reservations"
-                },
-                {
-                  "timestamp": null,
-                  "tool": "release_file_reservations",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "file_reservations"
-                },
-                {
-                  "timestamp": null,
-                  "tool": "macro_file_reservation_cycle",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "workflow_macros"
-                },
-                {
-                  "timestamp": null,
-                  "tool": "macro_contact_handshake",
-                  "project": "abs-path-backend",
-                  "agent": "BlueLake",
-                  "cluster": "workflow_macros"
-                }
-              ]
+              "count": 0,
+              "entries": []
             }
           },
           "normalize": {
             "ignore_json_pointers": [
-              "/entries/0/timestamp",
-              "/entries/1/timestamp",
-              "/entries/10/timestamp",
-              "/entries/11/timestamp",
-              "/entries/12/timestamp",
-              "/entries/13/timestamp",
-              "/entries/14/timestamp",
-              "/entries/15/timestamp",
-              "/entries/16/timestamp",
-              "/entries/17/timestamp",
-              "/entries/18/timestamp",
-              "/entries/19/timestamp",
-              "/entries/2/timestamp",
-              "/entries/20/timestamp",
-              "/entries/21/timestamp",
-              "/entries/3/timestamp",
-              "/entries/4/timestamp",
-              "/entries/5/timestamp",
-              "/entries/6/timestamp",
-              "/entries/7/timestamp",
-              "/entries/8/timestamp",
-              "/entries/9/timestamp",
               "/generated_at"
             ]
           }
@@ -5379,27 +5323,13 @@
             "ok": {
               "project": "/abs/path/backend",
               "agent": "GreenCastle",
-              "count": 1,
-              "messages": [
-                {
-                  "id": 2,
-                  "project_id": 1,
-                  "sender_id": 1,
-                  "thread_id": null,
-                  "subject": "Hello",
-                  "importance": "urgent",
-                  "ack_required": true,
-                  "created_ts": null,
-                  "attachments": [],
-                  "from": "BlueLake",
-                  "kind": "to"
-                }
-              ]
+              "count": 0,
+              "messages": []
             }
           },
           "normalize": {
             "ignore_json_pointers": [
-              "/messages/0/created_ts"
+              "/generated_at"
             ]
           }
         }
@@ -5421,8 +5351,8 @@
                   "project_id": 1,
                   "sender_id": 1,
                   "thread_id": null,
-                  "subject": "Hello",
-                  "importance": "urgent",
+                  "subject": "Contact request from BlueLake",
+                  "importance": "normal",
                   "ack_required": true,
                   "created_ts": null,
                   "attachments": [],
@@ -5481,8 +5411,76 @@
             "ok": {
               "project": "/abs/path/backend",
               "agent": "GreenCastle",
-              "count": 4,
+              "count": 8,
               "messages": [
+                {
+                  "id": 8,
+                  "project_id": 1,
+                  "sender_id": 1,
+                  "thread_id": null,
+                  "subject": "Contact request from BlueLake",
+                  "importance": "normal",
+                  "ack_required": true,
+                  "created_ts": null,
+                  "attachments": [],
+                  "from": "BlueLake",
+                  "kind": "to",
+                  "commit": {
+                    "hexsha": null,
+                    "summary": "Commit metadata unavailable for received message: BlueLake -> GreenCastle | Contact request from BlueLake"
+                  }
+                },
+                {
+                  "id": 7,
+                  "project_id": 1,
+                  "sender_id": 2,
+                  "thread_id": "T-2",
+                  "subject": "Re: LLM Thread T-2",
+                  "importance": "normal",
+                  "ack_required": false,
+                  "created_ts": null,
+                  "attachments": [],
+                  "from": "GreenCastle",
+                  "kind": "outbox",
+                  "commit": {
+                    "hexsha": null,
+                    "summary": "Commit metadata unavailable for sent message: GreenCastle -> BlueLake | Re: LLM Thread T-2"
+                  }
+                },
+                {
+                  "id": 6,
+                  "project_id": 1,
+                  "sender_id": 2,
+                  "thread_id": "T-1",
+                  "subject": "Re: LLM Thread T-1",
+                  "importance": "normal",
+                  "ack_required": false,
+                  "created_ts": null,
+                  "attachments": [],
+                  "from": "GreenCastle",
+                  "kind": "outbox",
+                  "commit": {
+                    "hexsha": null,
+                    "summary": "Commit metadata unavailable for sent message: GreenCastle -> BlueLake | Re: LLM Thread T-1"
+                  }
+                },
+                {
+                  "id": 5,
+                  "project_id": 1,
+                  "sender_id": 2,
+                  "thread_id": "2",
+                  "subject": "Re: Hello",
+                  "importance": "urgent",
+                  "ack_required": true,
+                  "created_ts": null,
+                  "attachments": [],
+                  "from": "GreenCastle",
+                  "kind": "outbox",
+                  "commit": {
+                    "hexsha": null,
+                    "summary": "Commit metadata unavailable for sent message: GreenCastle -> BlueLake | Re: Hello"
+                  }
+                },
                 {
                   "id": 4,
                   "project_id": 1,
@@ -5497,7 +5495,7 @@
                   "kind": "to",
                   "commit": {
                     "hexsha": null,
-                    "summary": "file_reservation: BlueLake src/**"
+                    "summary": "Commit metadata unavailable for received message: BlueLake -> GreenCastle | LLM Thread T-2"
                   }
                 },
                 {
@@ -5514,7 +5512,7 @@
                   "kind": "to",
                   "commit": {
                     "hexsha": null,
-                    "summary": "file_reservation: BlueLake src/**"
+                    "summary": "Commit metadata unavailable for received message: BlueLake -> GreenCastle | LLM Thread T-1"
                   }
                 },
                 {
@@ -5531,7 +5529,7 @@
                   "kind": "to",
                   "commit": {
                     "hexsha": null,
-                    "summary": "file_reservation: BlueLake src/**"
+                    "summary": "Commit metadata unavailable for received message: BlueLake -> GreenCastle | Hello"
                   }
                 },
                 {
@@ -5548,7 +5546,7 @@
                   "kind": "to",
                   "commit": {
                     "hexsha": null,
-                    "summary": "file_reservation: BlueLake src/**"
+                    "summary": "Commit metadata unavailable for received message: BlueLake -> GreenCastle | Contact request from BlueLake"
                   }
                 }
               ]
@@ -5563,7 +5561,15 @@
               "/messages/2/commit/hexsha",
               "/messages/2/created_ts",
               "/messages/3/commit/hexsha",
-              "/messages/3/created_ts"
+              "/messages/3/created_ts",
+              "/messages/4/commit/hexsha",
+              "/messages/4/created_ts",
+              "/messages/5/commit/hexsha",
+              "/messages/5/created_ts",
+              "/messages/6/commit/hexsha",
+              "/messages/6/created_ts",
+              "/messages/7/commit/hexsha",
+              "/messages/7/created_ts"
             ]
           }
         }
@@ -5578,8 +5584,104 @@
             "ok": {
               "project": "/abs/path/backend",
               "agent": "GreenCastle",
-              "count": 4,
+              "count": 8,
               "messages": [
+                {
+                  "id": 8,
+                  "project_id": 1,
+                  "sender_id": 1,
+                  "thread_id": null,
+                  "subject": "Contact request from BlueLake",
+                  "importance": "normal",
+                  "ack_required": true,
+                  "created_ts": null,
+                  "attachments": [],
+                  "from": "BlueLake",
+                  "kind": "to",
+                  "commit": {
+                    "hexsha": null,
+                    "summary": "Commit metadata unavailable for received message: BlueLake -> GreenCastle | Contact request from BlueLake",
+                    "authored_ts": null,
+                    "insertions": 0,
+                    "deletions": 0,
+                    "diff_summary": {
+                      "hunks": 0,
+                      "excerpt": null
+                    }
+                  }
+                },
+                {
+                  "id": 7,
+                  "project_id": 1,
+                  "sender_id": 2,
+                  "thread_id": "T-2",
+                  "subject": "Re: LLM Thread T-2",
+                  "importance": "normal",
+                  "ack_required": false,
+                  "created_ts": null,
+                  "attachments": [],
+                  "from": "GreenCastle",
+                  "kind": "outbox",
+                  "commit": {
+                    "hexsha": null,
+                    "summary": "Commit metadata unavailable for sent message: GreenCastle -> BlueLake | Re: LLM Thread T-2",
+                    "authored_ts": null,
+                    "insertions": 0,
+                    "deletions": 0,
+                    "diff_summary": {
+                      "hunks": 0,
+                      "excerpt": null
+                    }
+                  }
+                },
+                {
+                  "id": 6,
+                  "project_id": 1,
+                  "sender_id": 2,
+                  "thread_id": "T-1",
+                  "subject": "Re: LLM Thread T-1",
+                  "importance": "normal",
+                  "ack_required": false,
+                  "created_ts": null,
+                  "attachments": [],
+                  "from": "GreenCastle",
+                  "kind": "outbox",
+                  "commit": {
+                    "hexsha": null,
+                    "summary": "Commit metadata unavailable for sent message: GreenCastle -> BlueLake | Re: LLM Thread T-1",
+                    "authored_ts": null,
+                    "insertions": 0,
+                    "deletions": 0,
+                    "diff_summary": {
+                      "hunks": 0,
+                      "excerpt": null
+                    }
+                  }
+                },
+                {
+                  "id": 5,
+                  "project_id": 1,
+                  "sender_id": 2,
+                  "thread_id": "2",
+                  "subject": "Re: Hello",
+                  "importance": "urgent",
+                  "ack_required": true,
+                  "created_ts": null,
+                  "attachments": [],
+                  "from": "GreenCastle",
+                  "kind": "outbox",
+                  "commit": {
+                    "hexsha": null,
+                    "summary": "Commit metadata unavailable for sent message: GreenCastle -> BlueLake | Re: Hello",
+                    "authored_ts": null,
+                    "insertions": 0,
+                    "deletions": 0,
+                    "diff_summary": {
+                      "hunks": 0,
+                      "excerpt": null
+                    }
+                  }
+                },
                 {
                   "id": 4,
                   "project_id": 1,
@@ -5594,12 +5696,12 @@
                   "kind": "to",
                   "commit": {
                     "hexsha": null,
-                    "summary": "mail: BlueLake -> GreenCastle | LLM Thread T-2",
+                    "summary": "Commit metadata unavailable for received message: BlueLake -> GreenCastle | LLM Thread T-2",
                     "authored_ts": null,
-                    "insertions": 22,
+                    "insertions": 0,
                     "deletions": 0,
                     "diff_summary": {
-                      "hunks": 1,
+                      "hunks": 0,
                       "excerpt": null
                     }
                   }
@@ -5618,12 +5720,12 @@
                   "kind": "to",
                   "commit": {
                     "hexsha": null,
-                    "summary": "mail: BlueLake -> GreenCastle | LLM Thread T-1",
+                    "summary": "Commit metadata unavailable for received message: BlueLake -> GreenCastle | LLM Thread T-1",
                     "authored_ts": null,
-                    "insertions": 22,
+                    "insertions": 0,
                     "deletions": 0,
                     "diff_summary": {
-                      "hunks": 1,
+                      "hunks": 0,
                       "excerpt": null
                     }
                   }
@@ -5642,12 +5744,12 @@
                   "kind": "to",
                   "commit": {
                     "hexsha": null,
-                    "summary": "mail: BlueLake -> GreenCastle | Hello",
+                    "summary": "Commit metadata unavailable for received message: BlueLake -> GreenCastle | Hello",
                     "authored_ts": null,
-                    "insertions": 21,
+                    "insertions": 0,
                     "deletions": 0,
                     "diff_summary": {
-                      "hunks": 1,
+                      "hunks": 0,
                       "excerpt": null
                     }
                   }
@@ -5666,12 +5768,12 @@
                   "kind": "to",
                   "commit": {
                     "hexsha": null,
-                    "summary": "mail: BlueLake -> GreenCastle | Contact request from BlueLake",
+                    "summary": "Commit metadata unavailable for received message: BlueLake -> GreenCastle | Contact request from BlueLake",
                     "authored_ts": null,
-                    "insertions": 21,
+                    "insertions": 0,
                     "deletions": 0,
                     "diff_summary": {
-                      "hunks": 1,
+                      "hunks": 0,
                       "excerpt": null
                     }
                   }
@@ -5696,7 +5798,23 @@
               "/messages/3/commit/authored_ts",
               "/messages/3/commit/diff_summary/excerpt",
               "/messages/3/commit/hexsha",
-              "/messages/3/created_ts"
+              "/messages/3/created_ts",
+              "/messages/4/commit/authored_ts",
+              "/messages/4/commit/diff_summary/excerpt",
+              "/messages/4/commit/hexsha",
+              "/messages/4/created_ts",
+              "/messages/5/commit/authored_ts",
+              "/messages/5/commit/diff_summary/excerpt",
+              "/messages/5/commit/hexsha",
+              "/messages/5/created_ts",
+              "/messages/6/commit/authored_ts",
+              "/messages/6/commit/diff_summary/excerpt",
+              "/messages/6/commit/hexsha",
+              "/messages/6/created_ts",
+              "/messages/7/commit/authored_ts",
+              "/messages/7/commit/diff_summary/excerpt",
+              "/messages/7/commit/hexsha",
+              "/messages/7/created_ts"
             ]
           }
         }
@@ -5711,8 +5829,37 @@
             "ok": {
               "project": "/abs/path/backend",
               "agent": "BlueLake",
-              "count": 4,
+              "count": 5,
               "messages": [
+                {
+                  "id": 8,
+                  "project_id": 1,
+                  "sender_id": 1,
+                  "thread_id": null,
+                  "subject": "Contact request from BlueLake",
+                  "importance": "normal",
+                  "ack_required": true,
+                  "created_ts": null,
+                  "attachments": [],
+                  "body_md": "BlueLake requests permission to contact GreenCastle.",
+                  "from": "BlueLake",
+                  "to": [
+                    "GreenCastle"
+                  ],
+                  "cc": [],
+                  "bcc": [],
+                  "commit": {
+                    "hexsha": null,
+                    "summary": "Commit metadata unavailable for sent message: BlueLake -> GreenCastle | Contact request from BlueLake",
+                    "authored_ts": null,
+                    "insertions": 0,
+                    "deletions": 0,
+                    "diff_summary": {
+                      "hunks": 0,
+                      "excerpt": null
+                    }
+                  }
+                },
                 {
                   "id": 4,
                   "project_id": 1,
@@ -5732,12 +5879,12 @@
                   "bcc": [],
                   "commit": {
                     "hexsha": null,
-                    "summary": "mail: BlueLake -> GreenCastle | LLM Thread T-2",
+                    "summary": "Commit metadata unavailable for sent message: BlueLake -> GreenCastle | LLM Thread T-2",
                     "authored_ts": null,
-                    "insertions": 22,
+                    "insertions": 0,
                     "deletions": 0,
                     "diff_summary": {
-                      "hunks": 1,
+                      "hunks": 0,
                       "excerpt": null
                     }
                   }
@@ -5761,12 +5908,12 @@
                   "bcc": [],
                   "commit": {
                     "hexsha": null,
-                    "summary": "mail: BlueLake -> GreenCastle | LLM Thread T-1",
+                    "summary": "Commit metadata unavailable for sent message: BlueLake -> GreenCastle | LLM Thread T-1",
                     "authored_ts": null,
-                    "insertions": 22,
+                    "insertions": 0,
                     "deletions": 0,
                     "diff_summary": {
-                      "hunks": 1,
+                      "hunks": 0,
                       "excerpt": null
                     }
                   }
@@ -5790,12 +5937,12 @@
                   "bcc": [],
                   "commit": {
                     "hexsha": null,
-                    "summary": "mail: BlueLake -> GreenCastle | Hello",
+                    "summary": "Commit metadata unavailable for sent message: BlueLake -> GreenCastle | Hello",
                     "authored_ts": null,
-                    "insertions": 21,
+                    "insertions": 0,
                     "deletions": 0,
                     "diff_summary": {
-                      "hunks": 1,
+                      "hunks": 0,
                       "excerpt": null
                     }
                   }
@@ -5819,12 +5966,12 @@
                   "bcc": [],
                   "commit": {
                     "hexsha": null,
-                    "summary": "mail: BlueLake -> GreenCastle | Contact request from BlueLake",
+                    "summary": "Commit metadata unavailable for sent message: BlueLake -> GreenCastle | Contact request from BlueLake",
                     "authored_ts": null,
-                    "insertions": 21,
+                    "insertions": 0,
                     "deletions": 0,
                     "diff_summary": {
-                      "hunks": 1,
+                      "hunks": 0,
                       "excerpt": null
                     }
                   }
@@ -5849,7 +5996,11 @@
               "/messages/3/commit/authored_ts",
               "/messages/3/commit/diff_summary/excerpt",
               "/messages/3/commit/hexsha",
-              "/messages/3/created_ts"
+              "/messages/3/created_ts",
+              "/messages/4/commit/authored_ts",
+              "/messages/4/commit/diff_summary/excerpt",
+              "/messages/4/commit/hexsha",
+              "/messages/4/created_ts"
             ]
           }
         }

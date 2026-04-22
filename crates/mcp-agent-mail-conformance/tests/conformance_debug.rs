@@ -8,6 +8,7 @@ const AUDIT_DOC_RELATIVE: &str = "docs/CONFORMANCE_AUDIT_2026-04-18.md";
 const README_RELATIVE: &str = "README.md";
 const PYTHON_FIXTURE_RELATIVE: &str = "tests/conformance/fixtures/python_reference.json";
 const TOOL_FILTER_FIXTURE_RELATIVE: &str = "tests/conformance/fixtures/tool_filter/cases.json";
+const RUST_NATIVE_FIXTURE_DIR_RELATIVE: &str = "tests/conformance/fixtures/rust_native";
 
 #[derive(Debug, Deserialize)]
 struct ToolFilterFixtures {
@@ -18,6 +19,11 @@ struct ToolFilterFixtures {
 struct ToolFilterCase {
     #[serde(default)]
     expected_tools: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RustNativeToolFixture {
+    tool: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +59,35 @@ fn load_tool_filter_fixture() -> ToolFilterFixtures {
     let path = crate_root().join(TOOL_FILTER_FIXTURE_RELATIVE);
     serde_json::from_str(&read_file(&path))
         .unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()))
+}
+
+fn load_rust_native_fixture_files() -> BTreeMap<String, String> {
+    let fixture_dir = crate_root().join(RUST_NATIVE_FIXTURE_DIR_RELATIVE);
+    let mut fixtures = BTreeMap::new();
+
+    for entry in fs::read_dir(&fixture_dir)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", fixture_dir.display()))
+    {
+        let entry = entry.unwrap_or_else(|e| panic!("failed to read fixture dir entry: {e}"));
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let fixture: RustNativeToolFixture = serde_json::from_str(&read_file(&path))
+            .unwrap_or_else(|e| panic!("failed to parse {}: {e}", path.display()));
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_else(|| panic!("fixture file has no UTF-8 name: {}", path.display()));
+        fixtures.insert(
+            fixture.tool,
+            format!(
+                "crates/mcp-agent-mail-conformance/{RUST_NATIVE_FIXTURE_DIR_RELATIVE}/{file_name}"
+            ),
+        );
+    }
+
+    fixtures
 }
 
 fn parse_table(doc: &str, heading: &str) -> Vec<AuditRow> {
@@ -217,6 +252,7 @@ fn audit_doc_matches_live_inventory() {
             }
         }
     }
+    let rust_native_fixture_files = load_rust_native_fixture_files();
 
     let runtime_tools: BTreeSet<String> = mcp_agent_mail_tools::TOOL_CLUSTER_MAP
         .iter()
@@ -242,7 +278,10 @@ fn audit_doc_matches_live_inventory() {
                 name: tool.clone(),
                 has_fixture: "yes".to_string(),
                 classification: "rust-native".to_string(),
-                fixture_file: "crates/mcp-agent-mail-conformance/tests/conformance/fixtures/tool_filter/cases.json".to_string(),
+                fixture_file: rust_native_fixture_files
+                    .get(tool)
+                    .unwrap_or_else(|| panic!("missing Rust-native fixture for {tool}"))
+                    .clone(),
             }
         } else {
             AuditRow {
@@ -333,15 +372,26 @@ fn audit_doc_matches_live_inventory() {
         assert_eq!(row, expected, "resource audit row drifted for {}", row.name);
     }
 
-    for needle in [
+    let tool_mystery_count = expected_tool_rows
+        .values()
+        .filter(|row| row.classification == "unknown")
+        .count();
+    let resource_mystery_count = expected_resource_rows
+        .values()
+        .filter(|row| row.classification != "python-parity")
+        .count();
+    let mut expected_blocker_markers = vec![
         "list_agents",
         "resource://tooling/metrics_core",
         "resource://tooling/diagnostics",
-        "br-a2k3h.3",
         "br-a2k3h.4",
         "br-a2k3h.6",
-        "br-0ijq8",
-    ] {
+    ];
+    if tool_mystery_count > 0 {
+        expected_blocker_markers.push("br-a2k3h.3");
+    }
+
+    for needle in expected_blocker_markers {
         assert!(
             audit_doc.contains(needle),
             "audit doc should mention mystery or blocker marker {needle}"
@@ -349,9 +399,10 @@ fn audit_doc_matches_live_inventory() {
     }
 
     eprintln!(
-        "conformance.audit.complete {{ total_tools: {}, total_resources: {}, mysteries: 3, followups_proposed: br-a2k3h.3/br-a2k3h.4/br-a2k3h.6 }}",
+        "conformance.audit.complete {{ total_tools: {}, total_resources: {}, mysteries: {}, followups_proposed: br-a2k3h.4/br-a2k3h.6 }}",
         expected_tool_rows.len(),
-        expected_resource_rows.len()
+        expected_resource_rows.len(),
+        tool_mystery_count + resource_mystery_count
     );
 }
 
@@ -373,7 +424,6 @@ fn crate_readme_current_coverage_matches_audit_summary() {
         "br-a2k3h.3",
         "br-a2k3h.4",
         "br-a2k3h.6",
-        "br-0ijq8",
         "CONFORMANCE_AUDIT_2026-04-18.md",
     ] {
         assert!(

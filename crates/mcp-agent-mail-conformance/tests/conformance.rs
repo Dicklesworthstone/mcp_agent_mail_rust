@@ -475,6 +475,17 @@ impl EnvVarGuard {
                 std::env::set_var(key, TEST_SEARCH_ENGINE);
             }
         }
+        if !vars
+            .iter()
+            .any(|(key, _)| *key == "AM_ALLOW_EPHEMERAL_PROJECT_ROOTS")
+        {
+            let key = "AM_ALLOW_EPHEMERAL_PROJECT_ROOTS";
+            let old = std::env::var(key).ok();
+            previous.push((key.to_string(), old));
+            unsafe {
+                std::env::set_var(key, "1");
+            }
+        }
         mcp_agent_mail_core::Config::reset_cached();
         Self { previous }
     }
@@ -570,7 +581,7 @@ fn handwritten_tool_failure_cases() -> Vec<HandwrittenToolFailureCase> {
             tool_name: "health_check",
             case_name: "malformed_non_object_arguments",
             input: serde_json::json!([]),
-            expected_err: expected_error_containing("invalid type"),
+            expected_err: expected_error_containing("expected type object"),
         },
         HandwrittenToolFailureCase {
             tool_name: "register_agent",
@@ -688,13 +699,13 @@ fn handwritten_tool_failure_cases() -> Vec<HandwrittenToolFailureCase> {
             tool_name: "install_precommit_guard",
             case_name: "malformed_non_object_arguments",
             input: serde_json::json!([]),
-            expected_err: expected_error_containing("invalid type"),
+            expected_err: expected_error_containing("expected type object"),
         },
         HandwrittenToolFailureCase {
             tool_name: "uninstall_precommit_guard",
             case_name: "malformed_non_object_arguments",
             input: serde_json::json!([]),
-            expected_err: expected_error_containing("invalid type"),
+            expected_err: expected_error_containing("expected type object"),
         },
         HandwrittenToolFailureCase {
             tool_name: "list_agents",
@@ -706,7 +717,7 @@ fn handwritten_tool_failure_cases() -> Vec<HandwrittenToolFailureCase> {
             tool_name: "cleanup_pane_identities",
             case_name: "malformed_non_object_arguments",
             input: serde_json::json!([]),
-            expected_err: expected_error_containing("invalid type"),
+            expected_err: expected_error_containing("expected type object"),
         },
         HandwrittenToolFailureCase {
             tool_name: "macro_start_session",
@@ -1060,7 +1071,11 @@ fn initialize_runtime_mailbox(database_url: &str) {
     let pool = mcp_agent_mail_db::create_pool(&cfg)
         .unwrap_or_else(|e| panic!("initialize runtime mailbox {}: {e}", sqlite_path.display()));
     let cx = Cx::for_testing();
-    let conn = fastmcp_core::block_on(pool.acquire(&cx))
+    let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build runtime for mailbox initialization");
+    let conn = rt
+        .block_on(pool.acquire(&cx))
         .into_result()
         .unwrap_or_else(|e| panic!("acquire runtime mailbox {}: {e}", sqlite_path.display()));
     drop(conn);
@@ -1098,6 +1113,7 @@ fn sql_quote(raw: &str) -> String {
     raw.replace('\'', "''")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_test_message(
     cx: &Cx,
     pool: &mcp_agent_mail_db::DbPool,

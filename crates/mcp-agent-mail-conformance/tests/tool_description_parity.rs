@@ -40,6 +40,13 @@ const PYTHON_ONLY_TOOLS: &[&str] = &[
     "summarize_recent",
 ];
 
+/// Rust-native tools that do not have Python reference descriptions.
+const RUST_NATIVE_TOOLS: &[&str] = &[
+    "cleanup_pane_identities",
+    "list_agents",
+    "resolve_pane_identity",
+];
+
 /// Load the Python reference fixture.
 fn load_fixture() -> ToolDescriptionsFixture {
     let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -317,9 +324,14 @@ fn tool_descriptions_match_python_fixture() {
     let python_names: BTreeSet<&str> = python_by_name.keys().copied().collect();
     for rust_name in rust_by_name.keys() {
         if !python_names.contains(rust_name.as_str()) {
-            eprintln!("EXTRA: {} (Rust-only, not in Python fixture)", rust_name);
+            if RUST_NATIVE_TOOLS.contains(&rust_name.as_str()) {
+                eprintln!("RUST-NATIVE: {} (not in Python fixture)", rust_name);
+                passed += 1;
+                continue;
+            }
+            eprintln!("EXTRA: {} (unexpected Rust-only tool)", rust_name);
             failures.push(format!(
-                "[{rust_name}] EXTRA: registered in Rust but not in Python fixture"
+                "[{rust_name}] EXTRA: registered in Rust but not declared Rust-native"
             ));
             failed += 1;
         }
@@ -431,17 +443,29 @@ fn rust_tool_count_matches_expected() {
         .filter(|t| !PYTHON_ONLY_TOOLS.contains(&t.name.as_str()))
         .count();
 
-    // Rust should have exactly the shared tools (no more, no less)
+    let expected_rust_count = shared_python_count + RUST_NATIVE_TOOLS.len();
+
+    // Rust should have the shared Python-parity tools plus declared Rust-native tools.
     assert_eq!(
         rust_tools.len(),
-        shared_python_count,
-        "Rust has {} tools, Python has {} shared tools (excluding {} Python-only). \
+        expected_rust_count,
+        "Rust has {} tools, expected {} ({} shared Python tools + {} Rust-native tools, excluding {} Python-only). \
          Rust tools: {:?}",
         rust_tools.len(),
+        expected_rust_count,
         shared_python_count,
+        RUST_NATIVE_TOOLS.len(),
         PYTHON_ONLY_TOOLS.len(),
         rust_tools.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
+
+    let rust_names: BTreeSet<&str> = rust_tools.iter().map(|tool| tool.name.as_str()).collect();
+    for rust_native_tool in RUST_NATIVE_TOOLS {
+        assert!(
+            rust_names.contains(rust_native_tool),
+            "declared Rust-native tool is not registered: {rust_native_tool}"
+        );
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
