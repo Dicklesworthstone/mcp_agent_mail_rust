@@ -30,7 +30,7 @@ mcp-agent-mail-guard = { workspace = true }
 mcp-agent-mail-server = { workspace = true, default-features = false }
 mcp-agent-mail-tools = { workspace = true, default-features = false }
 mcp-agent-mail-storage = { workspace = true, default-features = false }
-beads_rust.workspace = true
+beads_rust = { version = "0.1.42", default-features = false }
 sha2.workspace = true
 hex.workspace = true
 asupersync.workspace = true
