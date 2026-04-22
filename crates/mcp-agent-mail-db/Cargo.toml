@@ -107,5 +107,9 @@ name = "two_tier_bench"
 harness = false
 required-features = ["hybrid"]
 
+[[bench]]
+name = "inbox_bench"
+harness = false
+
 [lints]
 workspace = true
