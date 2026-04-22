@@ -1,7 +1,7 @@
 # Archive Batch 100 Profile
 
 ## Reproduction
-- warm profile: `rch exec -- env CARGO_TARGET_DIR=/data/tmp/cargo-target MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch`
+- warm profile: `rch exec -- env MCP_AGENT_MAIL_ARCHIVE_PROFILE=1 cargo bench -p mcp-agent-mail --bench benchmarks -- archive_write_batch`
 - flamegraph: `env CARGO_TARGET_DIR=/data/tmp/cargo-target cargo flamegraph -p mcp-agent-mail --bench benchmarks --root -- archive_write_batch`
 - dry-run validated: yes
 - cross-engineer target: Reproduce within 10% on similar CPU/storage/filesystem/kernel hardware within 30 days
