@@ -88,6 +88,7 @@ fn seed_fixtures(fixtures: &Fixtures) {
                         SessionState::new(),
                         None,
                         None,
+                        None,
                     )
                     .expect("tool call should succeed during seeding");
                 req_id += 1;
@@ -176,6 +177,7 @@ fn bench_tools(c: &mut Criterion) {
                             params.clone(),
                             &budget,
                             SessionState::new(),
+                            None,
                             None,
                             None,
                         )

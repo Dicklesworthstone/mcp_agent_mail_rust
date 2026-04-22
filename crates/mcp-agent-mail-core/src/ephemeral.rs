@@ -547,7 +547,7 @@ fn looks_like_mkdtemp_segment(segment: &str) -> bool {
     };
     let alnum_run: String = rest
         .chars()
-        .take_while(|c| c.is_ascii_alphanumeric())
+        .take_while(char::is_ascii_alphanumeric)
         .collect();
     let len = alnum_run.len();
     if !(6..=10).contains(&len) {
@@ -583,19 +583,17 @@ fn looks_like_go_test_segment(segment: &str) -> bool {
         return false;
     }
     // Trailing digit run ≥ 6 is the timestamp signature.
-    let digit_suffix_len = rest
-        .chars()
-        .rev()
-        .take_while(|c| c.is_ascii_digit())
-        .count();
+    let digit_suffix_len = rest.chars().rev().take_while(char::is_ascii_digit).count();
     digit_suffix_len >= 6
 }
 
 /// Returns `true` if `human_key` contains a path segment that matches a
 /// known test-fixture naming pattern (`tempfile.mkdtemp`, `t.TempDir()`,
-/// `.tmpXXXXXX`). Narrower than `classify_ephemeral`: this is specifically
-/// the "refuse to write into the real archive" check, not the
-/// "reroute to isolated storage" check.
+/// `.tmpXXXXXX`).
+///
+/// Narrower than `classify_ephemeral`: this is specifically the "refuse to
+/// write into the real archive" check, not the "reroute to isolated storage"
+/// check.
 ///
 /// Does not canonicalize; operates on the given string so `/tmp/foo` is
 /// **not** rejected (that's a valid ephemeral project that should be
@@ -625,17 +623,17 @@ pub fn is_ephemeral_project_path(human_key: &str) -> bool {
 }
 
 /// Returns `true` when the operator has opted in to allow ephemeral
-/// project roots to be registered into the archive. Honors the standard
-/// `process_env_value` harness so tests and integration harnesses can
-/// override it without touching the real process env.
+/// project roots to be registered into the archive.
+///
+/// Honors the standard `process_env_value` harness so tests and integration
+/// harnesses can override it without touching the real process env.
 ///
 /// Accepts the same truthy vocabulary as [`crate::config::parse_bool`]
 /// (`1`/`true`/`t`/`yes`/`y`, case-insensitive) for consistency.
 #[must_use]
 pub fn ephemeral_project_roots_allowed() -> bool {
     crate::config::process_env_value("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS")
-        .map(|v| crate::config::parse_bool(&v, false))
-        .unwrap_or(false)
+        .is_some_and(|v| crate::config::parse_bool(&v, false))
 }
 
 // ============================================================================

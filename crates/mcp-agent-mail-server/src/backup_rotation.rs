@@ -152,8 +152,11 @@ pub fn resolved_keep_per_kind() -> usize {
 }
 
 /// Rotate backup files in `storage_root`, keeping `keep_per_kind` newest of
-/// each kind and deleting the rest. Non-backup files (live DB, Codex DB,
-/// projects/, search_index/, .git/, etc.) are never touched.
+/// each kind and deleting the rest.
+///
+/// Non-backup files (live DB, Codex DB, projects/, search_index/, .git/,
+/// etc.) are never touched. Rotation only applies to files classified as
+/// backups.
 ///
 /// Returns a `RotateReport` with per-kind counts. Errors on individual
 /// deletes are logged and counted as `kept` so partial failures don't mask
@@ -193,7 +196,7 @@ pub fn rotate_storage_backups(
 
     for (kind, mut files) in by_kind {
         // Sort descending by mtime — oldest tail will be deleted.
-        files.sort_by(|a, b| b.1.cmp(&a.1));
+        files.sort_by_key(|file| std::cmp::Reverse(file.1));
         let (to_keep, to_delete) = if files.len() > keep {
             files.split_at(keep)
         } else {

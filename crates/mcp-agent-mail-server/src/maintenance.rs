@@ -338,9 +338,8 @@ fn dir_size_recursive(path: &Path) -> u64 {
         return 0;
     };
     for entry in entries.flatten() {
-        let ft = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
+        let Ok(ft) = entry.file_type() else {
+            continue;
         };
         if ft.is_file() {
             total += entry.metadata().map(|m| m.len()).unwrap_or(0);

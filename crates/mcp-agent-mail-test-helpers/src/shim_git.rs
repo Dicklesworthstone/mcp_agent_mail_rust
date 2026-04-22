@@ -22,6 +22,9 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 /// Controlled behaviors for a shim git binary.
 #[derive(Debug, Clone)]
 pub struct ShimBehavior {
@@ -77,6 +80,8 @@ pub enum ShimExit {
 ///
 /// Panics if file creation, permission setting, or the environment
 /// lookup fails — this is test code and should surface failure loudly.
+#[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn build_shim_git(dir: &Path, name: &str, behavior: &ShimBehavior) -> PathBuf {
     let path = dir.join(name);
     let counter_path = dir.join(format!("{name}.counter"));
@@ -113,8 +118,13 @@ pub fn build_shim_git(dir: &Path, name: &str, behavior: &ShimBehavior) -> PathBu
 
     #[cfg(unix)]
     {
+        let delay_s = format!(
+            "{}.{:03}",
+            behavior.delay_ms / 1000,
+            behavior.delay_ms % 1000
+        );
         let script = format!(
-            r##"#!/usr/bin/env bash
+            r#"#!/usr/bin/env bash
 # mcp-agent-mail-test-helpers: shim git binary
 # Built at test time; behavior is governed by the exit sequence below.
 
@@ -179,19 +189,18 @@ case "$action" in
         exit 2
         ;;
 esac
-"##,
+"#,
             real_git = real_git.display(),
             counter_path = counter_path.display(),
             exits_bash = exits_bash,
             marker_line = marker_line,
             delay_ms = behavior.delay_ms,
-            delay_s = (behavior.delay_ms as f64) / 1000.0,
+            delay_s = delay_s,
             version_output = behavior.version_output,
         );
         let mut f = File::create(&path).expect("create shim");
         f.write_all(script.as_bytes()).expect("write shim");
         drop(f);
-        use std::os::unix::fs::PermissionsExt;
         let mut perm = fs::metadata(&path).unwrap().permissions();
         perm.set_mode(0o755);
         fs::set_permissions(&path, perm).expect("chmod shim");
@@ -343,7 +352,7 @@ mod tests {
         // signal; accept either.
         let saw_segv = signal == Some(11) || {
             let out = Command::new(&shim).args(["status"]).output();
-            out.as_ref().map_or(false, |o| o.status.code() == Some(139))
+            out.as_ref().is_ok_and(|o| o.status.code() == Some(139))
         };
         assert!(saw_segv, "expected SIGSEGV or exit 139");
     }

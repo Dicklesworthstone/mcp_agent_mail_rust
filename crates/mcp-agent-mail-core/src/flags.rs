@@ -616,9 +616,11 @@ mod tests {
         )
         .expect("write env");
 
-        let mut config = Config::default();
-        config.console_persist_path = path;
-        config.atc_write_mode = AtcWriteMode::Off;
+        let config = Config {
+            console_persist_path: path,
+            atc_write_mode: AtcWriteMode::Off,
+            ..Config::default()
+        };
 
         let flag = find_flag("ATC_WRITE_MODE").expect("flag");
         assert_eq!(flag.current_source(&config), FlagSource::ConfigFile);
@@ -630,9 +632,11 @@ mod tests {
         let path = dir.path().join("config.env");
         std::fs::write(&path, "GIT_IDENTITY_ENABLED=true\n").expect("write env");
 
-        let mut config = Config::default();
-        config.console_persist_path = path;
-        config.worktrees_enabled = true;
+        let config = Config {
+            console_persist_path: path,
+            worktrees_enabled: true,
+            ..Config::default()
+        };
 
         let flag = find_flag("WORKTREES_ENABLED").expect("flag");
         assert_eq!(flag.current_source(&config), FlagSource::ConfigFile);
@@ -643,8 +647,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.env");
 
-        let mut config = Config::default();
-        config.console_persist_path = path.clone();
+        let config = Config {
+            console_persist_path: path.clone(),
+            ..Config::default()
+        };
 
         let snapshot = toggle_bool_flag(&config, "ATC_LEARNING_DISABLED", true).expect("toggle");
         assert_eq!(snapshot.current_value, "true");

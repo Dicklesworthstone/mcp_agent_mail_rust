@@ -1490,6 +1490,7 @@ mod tests {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[allow(clippy::struct_field_names)]
     struct ExpectedCounts {
         total_count: i64,
         resolved_count: i64,
@@ -1536,13 +1537,12 @@ mod tests {
             warmup_connections: 0,
             ..Default::default()
         })
-        .map(|pool| {
+        .inspect(|_pool| {
             TEST_POOL_DIRS
                 .get_or_init(|| Mutex::new(Vec::new()))
                 .lock()
                 .expect("lock test tempdir registry")
                 .push(dir);
-            pool
         })
         .expect("create file-backed ATC test pool")
     }
@@ -1755,14 +1755,15 @@ mod tests {
                     .into_iter()
                     .enumerate()
                     .map(|(idx, (effect_kind, state, flag))| {
-                        let created_ts_micros = 1_000_000 + (idx as i64 * 10_000);
+                        let idx_i64 = i64::try_from(idx).expect("test index fits i64");
+                        let created_ts_micros = 1_000_000 + (idx_i64 * 10_000);
                         let resolved_ts_micros = match state.as_str() {
                             "open" => None,
                             _ => Some(created_ts_micros + 5_000),
                         };
                         let resolved = state == "resolved";
                         TestExperienceSpec {
-                            experience_id: (idx as i64) + 1,
+                            experience_id: idx_i64 + 1,
                             subsystem: if idx % 2 == 0 {
                                 "liveness".to_string()
                             } else {
@@ -2147,8 +2148,8 @@ mod tests {
         );
         assert_eq!(probe.correct_count, 1);
         assert_eq!(probe.incorrect_count, 1);
-        assert_eq!(probe.total_loss, 1.0);
-        assert_eq!(probe.total_regret, 0.25);
+        assert!((probe.total_loss - 1.0).abs() < f64::EPSILON);
+        assert!((probe.total_regret - 0.25).abs() < f64::EPSILON);
 
         run_refresh(
             &pool,

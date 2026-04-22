@@ -3797,23 +3797,23 @@ fn reservation_pathspec_ls_files_libgit2(
     };
 
     // First: tracked files that match. Use the index directly.
-    if let Ok(index) = repo.index() {
-        if let Ok(ps) = git2::Pathspec::new(std::iter::once(pathspec)) {
-            for entry in index.iter() {
-                let Ok(rel_str) = std::str::from_utf8(&entry.path) else {
-                    continue;
-                };
-                if ps.matches_path(
-                    std::path::Path::new(rel_str),
-                    git2::PathspecFlags::NO_MATCH_ERROR,
-                ) {
-                    let candidate = repo_root.join(rel_str);
-                    let modified_us = std::fs::metadata(&candidate)
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .and_then(reservation_system_time_to_micros);
-                    out.push((candidate, modified_us));
-                }
+    if let Ok(index) = repo.index()
+        && let Ok(ps) = git2::Pathspec::new(std::iter::once(pathspec))
+    {
+        for entry in index.iter() {
+            let Ok(rel_str) = std::str::from_utf8(&entry.path) else {
+                continue;
+            };
+            if ps.matches_path(
+                std::path::Path::new(rel_str),
+                git2::PathspecFlags::NO_MATCH_ERROR,
+            ) {
+                let candidate = repo_root.join(rel_str);
+                let modified_us = std::fs::metadata(&candidate)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(reservation_system_time_to_micros);
+                out.push((candidate, modified_us));
             }
         }
     }
@@ -3845,7 +3845,7 @@ fn reservation_pathspec_ls_files_libgit2(
     out
 }
 
-/// CLI fallback for the pathspec walk, gated by AM_GIT_LS_FILES_SHELL=1.
+/// CLI fallback for the pathspec walk, gated by `AM_GIT_LS_FILES_SHELL=1`.
 fn reservation_pathspec_ls_files_cli_fallback(
     repo_root: &Path,
     git_glob: &str,
@@ -3923,7 +3923,7 @@ fn reservation_git_latest_activity_micros(repo_root: &Path, pathspecs: &[String]
         target: "mcp_agent_mail::tools::reservations::activity",
         repo = %repo_root.display(),
         patterns = pathspecs.len(),
-        duration_ms = start.elapsed().as_millis() as u64,
+        duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
         found = result.is_some(),
         via = "libgit2",
         "reservation_activity_result"
@@ -3975,9 +3975,8 @@ fn reservation_git_latest_activity_micros_libgit2(
         }
     };
 
-    let mut revwalk = match repo.revwalk() {
-        Ok(w) => w,
-        Err(_) => return None,
+    let Ok(mut revwalk) = repo.revwalk() else {
+        return None;
     };
     if revwalk.push_head().is_err() {
         // Unborn HEAD — nothing to walk.
@@ -4035,7 +4034,7 @@ fn reservation_git_latest_activity_micros_libgit2(
 }
 
 /// Legacy CLI path, kept for the one-release feature-flag escape hatch
-/// (AM_GIT_RESERVATION_ACTIVITY_SHELL=1). Removed in a follow-up bead.
+/// (`AM_GIT_RESERVATION_ACTIVITY_SHELL=1`). Removed in a follow-up bead.
 fn reservation_git_latest_activity_micros_cli_fallback(
     repo_root: &Path,
     pathspecs: &[String],

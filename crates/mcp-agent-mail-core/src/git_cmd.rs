@@ -33,7 +33,7 @@
 //! - Do NOT call `GitCmd::new` from inside `mcp-agent-mail-guard`
 //!   pre-commit code: the guard runs inside the user's git process and
 //!   wrapping with flock would deadlock. See B1 design note §3.
-//! - Do NOT call from inside the CommitCoalescer's per-repo worker:
+//! - Do NOT call from inside the `CommitCoalescer`'s per-repo worker:
 //!   the coalescer has its own CAS lock; mutexing twice wastes time
 //!   (but won't deadlock). Use direct `git2::` calls there.
 
@@ -132,7 +132,7 @@ impl<'a> GitCmd<'a> {
     }
 
     #[must_use]
-    pub fn timeout(mut self, t: Duration) -> Self {
+    pub const fn timeout(mut self, t: Duration) -> Self {
         self.timeout = t;
         self
     }
@@ -170,6 +170,7 @@ impl<'a> GitCmd<'a> {
     }
 
     /// Run once with the given borrowed repo. Internal.
+    #[allow(clippy::too_many_arguments)]
     fn run_once_inner(
         repo: &Path,
         cwd: Option<&Path>,
@@ -199,14 +200,14 @@ impl<'a> GitCmd<'a> {
         let _reent = canonical.as_ref().map(|c| ReentrancyGuard::enter(c));
 
         // Mutex layer.
-        let _mtx = if skip_mutex {
+        let mtx = if skip_mutex {
             None
         } else {
             canonical
                 .as_ref()
                 .map(|c| GitRepoLocks::global().lock_for(c))
         };
-        let _mtx_guard = _mtx.as_ref().map(|arc| {
+        let _mtx_guard = mtx.as_ref().map(|arc| {
             arc.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
@@ -235,6 +236,7 @@ impl<'a> GitCmd<'a> {
     }
 
     /// Run once, returning classified outcome.
+    #[must_use]
     pub fn run_once(self) -> GitRunOutcome {
         Self::run_once_inner(
             self.repo,
@@ -251,6 +253,9 @@ impl<'a> GitCmd<'a> {
     /// Run with retry on `SegfaultLike`. Retry policy per bead E2
     /// (3 retries, 100/400/1600ms jittered, 10s wall-clock cap).
     pub fn run(self) -> io::Result<Output> {
+        const MAX_RETRIES: u32 = 3;
+        const BACKOFFS_MS: [u64; 3] = [100, 400, 1600];
+
         // Capture owned state so we can re-attempt without re-borrowing
         // the original `&Path` beyond this function's lifetime.
         let repo = self.repo.to_path_buf();
@@ -261,9 +266,6 @@ impl<'a> GitCmd<'a> {
         let timeout = self.timeout;
         let skip_flock = self.skip_flock;
         let skip_mutex = self.skip_mutex;
-
-        const MAX_RETRIES: u32 = 3;
-        const BACKOFFS_MS: [u64; 3] = [100, 400, 1600];
 
         let attempt_limit = MAX_RETRIES + 1;
         let overall_start = Instant::now();
@@ -353,12 +355,15 @@ fn jitter_ms(base: u64) -> u64 {
     // Deterministic-ish jitter in [0.75x, 1.25x] using process nanos.
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
-        .unwrap_or(0);
+        .map_or(0, |d| u64::from(d.subsec_nanos()));
     let span = base / 2; // 0.5 * base
     let low = base - span / 2; // 0.75x
     let offset = n % span.max(1);
     low + offset
+}
+
+fn duration_ms_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(unix)]
@@ -463,7 +468,7 @@ fn run_child(
         GitRunOutcome::Finished(_) => {
             tracing::debug!(
                 target: "mcp_agent_mail::git_locked",
-                duration_ms = duration.as_millis() as u64,
+                duration_ms = duration_ms_u64(duration),
                 binary_version = %binary.version,
                 "git_locked_exit_ok"
             );
@@ -537,8 +542,8 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> GitRunOutcome {
                     let _ = child.wait();
                     // Still join readers so their thread/resource don't
                     // leak; buffers may be partial but that's OK.
-                    let _ = stdout_handle.map(|h| h.join());
-                    let _ = stderr_handle.map(|h| h.join());
+                    let _ = stdout_handle.map(std::thread::JoinHandle::join);
+                    let _ = stderr_handle.map(std::thread::JoinHandle::join);
                     return GitRunOutcome::Timeout { after: timeout };
                 }
                 std::thread::sleep(Duration::from_millis(25));
@@ -549,8 +554,8 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> GitRunOutcome {
                 // of the server's lifetime.
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = stdout_handle.map(|h| h.join());
-                let _ = stderr_handle.map(|h| h.join());
+                let _ = stdout_handle.map(std::thread::JoinHandle::join);
+                let _ = stderr_handle.map(std::thread::JoinHandle::join);
                 return GitRunOutcome::Error(e);
             }
         }

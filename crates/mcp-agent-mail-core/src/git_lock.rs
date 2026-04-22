@@ -24,7 +24,7 @@
 //! # Non-goals
 //!
 //! - Not reentrant. Same thread + same canonical path = panic.
-//! - Not coordinating with the CommitCoalescer's per-repo CAS
+//! - Not coordinating with the `CommitCoalescer`'s per-repo CAS
 //!   (that's a separate layer inside the archive's own write path;
 //!   they don't overlap because the coalescer does libgit2 writes
 //!   internally, not git shell-outs).
@@ -175,7 +175,7 @@ pub fn sentinel_path(repo_canonical: &Path) -> Option<PathBuf> {
 /// Acquired via `fcntl F_SETLK LOCK_EX` (fs2 crate). Released on drop.
 ///
 /// If the sentinel can't be created (read-only `.git`, permissions,
-/// network FS refusal), this returns a "phantom" RepoFlock that holds
+/// network FS refusal), this returns a "phantom" `RepoFlock` that holds
 /// no file and does nothing on drop. Callers are notified via
 /// [`RepoFlock::is_real`].
 #[derive(Debug)]
@@ -194,7 +194,7 @@ impl RepoFlock {
     ///   getting the lock. Caller should abort its git op rather than
     ///   retry forever.
     /// - `io::ErrorKind::PermissionDenied`: sentinel file cannot be
-    ///   created; returns a phantom RepoFlock instead of an error
+    ///   created; returns a phantom `RepoFlock` instead of an error
     ///   (see [`Self::try_acquire_phantom_on_failure`]).
     /// - Other IO errors propagate.
     ///
@@ -206,6 +206,7 @@ impl RepoFlock {
         Self::acquire_with_timeout(repo_canonical, timeout)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn acquire_with_timeout(repo_canonical: &Path, timeout: Duration) -> io::Result<Self> {
         let Some(path) = sentinel_path(repo_canonical) else {
             tracing::debug!(
@@ -291,7 +292,7 @@ impl RepoFlock {
                     tracing::info!(
                         target: "mcp_agent_mail::git_lock",
                         sentinel = %path.display(),
-                        wait_ms = start.elapsed().as_millis() as u64,
+                        wait_ms = duration_ms_u64(start.elapsed()),
                         "flock_acquired_after_wait"
                     );
                     return Ok(Self {
@@ -387,23 +388,27 @@ pub struct ReentrancyGuard {
 }
 
 impl ReentrancyGuard {
+    #[must_use]
     pub fn enter(repo_canonical: &Path) -> Self {
         HELD_LOCKS.with(|h| {
             let mut set = h.borrow_mut();
-            if set.contains(repo_canonical) {
-                panic!(
-                    "run_git_locked reentrant call on {} from thread {:?}. \
-                     This would deadlock. See docs/DESIGN_git_lock.md §6.1.",
-                    repo_canonical.display(),
-                    std::thread::current().id()
-                );
-            }
+            assert!(
+                !set.contains(repo_canonical),
+                "run_git_locked reentrant call on {} from thread {:?}. \
+                 This would deadlock. See docs/DESIGN_git_lock.md §6.1.",
+                repo_canonical.display(),
+                std::thread::current().id()
+            );
             set.insert(repo_canonical.to_path_buf());
         });
         Self {
             path: repo_canonical.to_path_buf(),
         }
     }
+}
+
+fn duration_ms_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 impl Drop for ReentrancyGuard {
@@ -432,6 +437,9 @@ mod tests {
 
     #[test]
     fn same_repo_two_threads_serialize() {
+        const THREADS: u64 = 8;
+        const PER_THREAD: u64 = 250;
+
         GitRepoLocks::global().reset_for_test();
         let tmp = TempDir::new().unwrap();
         let repo = init_repo(tmp.path());
@@ -440,8 +448,6 @@ mod tests {
         // Each thread increments N times inside the lock; if the lock
         // were broken we'd see lost-update races. We assert strict
         // equality which only holds with serialization.
-        const THREADS: u64 = 8;
-        const PER_THREAD: u64 = 250;
         let counter = Arc::new(AtomicU64::new(0));
 
         let handles: Vec<_> = (0..THREADS)
@@ -604,7 +610,7 @@ mod tests {
         let _g1 = ReentrancyGuard::enter(&canonical);
         // Second thread acquiring the SAME path must not panic —
         // reentrancy is per-thread.
-        let cc = canonical.clone();
+        let cc = canonical;
         thread::spawn(move || {
             let _g2 = ReentrancyGuard::enter(&cc);
         })

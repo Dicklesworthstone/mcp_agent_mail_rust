@@ -3,7 +3,7 @@
 //! Tests for ATC rollup snapshot / restore lifecycle.
 //!
 //! Exercises snapshot capture, JSON round-trip, restore upsert, and
-//! idempotent restore semantics with REAL SQLite — no mocks.
+//! idempotent restore semantics with REAL `SQLite` — no mocks.
 
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;

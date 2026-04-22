@@ -170,7 +170,7 @@ fn resolve_path(human_key: &str) -> PathBuf {
 /// br-8ujfs.3.4 (C4): this originally shelled out via
 /// `Command::new("git").arg("-C")...`. It now routes through
 /// [`crate::git_cmd::GitCmd`] which picks up:
-///   - AM_GIT_BINARY resolution (bead A5),
+///   - `AM_GIT_BINARY` resolution (bead A5),
 ///   - per-repo in-process mutex (bead B2),
 ///   - per-repo OS flock on `.git/am.git-serialize.lock` (bead B3),
 ///   - SIGSEGV detection + 3-retry loop (beads E1/E2),

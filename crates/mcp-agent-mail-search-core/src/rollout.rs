@@ -230,17 +230,14 @@ impl ShadowMetrics {
             0.0
         };
 
-        let avg_latency_delta = if total > 0 {
+        let avg_latency_delta = latency_sum.checked_div(total).map_or(0, |avg_offset| {
             // Compute the average in u64 first (no wrap), then peel back the
             // offset using checked math so a saturated accumulator can't
             // underflow into a bogus negative average.
-            let avg_offset = latency_sum / total;
             i64::try_from(avg_offset)
                 .unwrap_or(i64::MAX)
                 .saturating_sub(1_000_000)
-        } else {
-            0
-        };
+        });
 
         ShadowMetricsSnapshot {
             total_comparisons: total,

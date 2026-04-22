@@ -361,10 +361,7 @@ fn format_duration(duration_micros: u64) -> String {
 mod tests {
     use super::*;
 
-    fn metric<'a>(
-        scorecard: &'a AgentHealthScorecard,
-        kind: AgentHealthMetricKind,
-    ) -> &'a AgentHealthMetric {
+    fn metric(scorecard: &AgentHealthScorecard, kind: AgentHealthMetricKind) -> &AgentHealthMetric {
         scorecard
             .metrics
             .iter()

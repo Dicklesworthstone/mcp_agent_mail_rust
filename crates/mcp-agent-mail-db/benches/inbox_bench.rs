@@ -6,9 +6,9 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::schema;
 use mcp_agent_mail_db::sync::fetch_inbox_rows_from_conn;
-use mcp_agent_mail_db::DbConn;
 use sqlmodel_core::Value;
 
 fn block_on<F, Fut, T>(f: F) -> T
@@ -62,9 +62,10 @@ fn seeded_conn(n_messages: usize) -> (DbConn, i64, Vec<i64>) {
     let base_ts: i64 = 1_700_000_000_000_000;
     for i in 0..n_messages {
         let sender_idx = i % n_agents;
-        let ts = base_ts + i as i64 * 1_000_000;
+        let i_i64 = i64::try_from(i).expect("benchmark message index fits i64");
+        let ts = base_ts + i_i64 * 1_000_000;
         let importance = if i % 20 == 0 { "urgent" } else { "normal" };
-        let ack_req: i64 = if i % 10 == 0 { 1 } else { 0 };
+        let ack_req = i64::from(i % 10 == 0);
         conn.execute_sync(
             "INSERT INTO messages (project_id, sender_id, subject, body_md, importance, \
              ack_required, thread_id, created_ts, recipients_json, attachments) \
@@ -73,7 +74,9 @@ fn seeded_conn(n_messages: usize) -> (DbConn, i64, Vec<i64>) {
                 Value::BigInt(project_id),
                 Value::BigInt(agent_ids[sender_idx]),
                 Value::Text(format!("Subject {i}")),
-                Value::Text(format!("Body of message {i} with some realistic length content.")),
+                Value::Text(format!(
+                    "Body of message {i} with some realistic length content."
+                )),
                 Value::Text(importance.to_string()),
                 Value::BigInt(ack_req),
                 Value::Text(format!("thread-{}", i / 5)),
@@ -97,10 +100,7 @@ fn seeded_conn(n_messages: usize) -> (DbConn, i64, Vec<i64>) {
             let cc_idx = (i + 2) % n_agents;
             conn.execute_sync(
                 "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?1, ?2, 'cc')",
-                &[
-                    Value::BigInt(msg_id),
-                    Value::BigInt(agent_ids[cc_idx]),
-                ],
+                &[Value::BigInt(msg_id), Value::BigInt(agent_ids[cc_idx])],
             )
             .expect("insert cc recipient");
         }
@@ -126,27 +126,23 @@ fn bench_inbox_fetch(c: &mut Criterion) {
     group.sample_size(100);
 
     for limit in [50, 200, 1000] {
-        group.bench_with_input(
-            BenchmarkId::new("limit", limit),
-            &limit,
-            |b, &lim| {
-                b.iter(|| {
-                    black_box(
-                        fetch_inbox_rows_from_conn(
-                            &conn,
-                            project_id,
-                            target_agent,
-                            false,
-                            false,
-                            false,
-                            None,
-                            lim,
-                        )
-                        .expect("inbox fetch"),
+        group.bench_with_input(BenchmarkId::new("limit", limit), &limit, |b, &lim| {
+            b.iter(|| {
+                black_box(
+                    fetch_inbox_rows_from_conn(
+                        &conn,
+                        project_id,
+                        target_agent,
+                        false,
+                        false,
+                        false,
+                        None,
+                        lim,
                     )
-                });
-            },
-        );
+                    .expect("inbox fetch"),
+                )
+            });
+        });
     }
 
     group.bench_function("urgent_only", |b| {

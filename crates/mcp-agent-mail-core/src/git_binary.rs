@@ -102,7 +102,7 @@ impl GitVersion {
     }
 
     /// Lex-ordered tuple for range comparisons.
-    fn as_tuple(self) -> (u32, u32, u32) {
+    const fn as_tuple(self) -> (u32, u32, u32) {
         (self.major, self.minor, self.patch)
     }
 
@@ -110,6 +110,7 @@ impl GitVersion {
     /// suffixes) into a [`GitVersion`]. Returns `None` if the string
     /// has fewer than two dot-separated segments or they don't parse
     /// as integers.
+    #[must_use]
     pub fn parse_lax(s: &str) -> Option<Self> {
         let head = s.split_terminator(['-', '+']).next().unwrap_or(s);
         let mut it = head.split('.');
@@ -241,6 +242,7 @@ where
         );
     }
     *guard = Some(resolved.clone());
+    drop(guard);
     Ok(resolved)
 }
 
@@ -304,9 +306,7 @@ where
 }
 
 fn expand(raw: &str) -> String {
-    shellexpand::full(raw)
-        .map(|c| c.into_owned())
-        .unwrap_or_else(|_| raw.to_string())
+    shellexpand::full(raw).map_or_else(|_| raw.to_string(), std::borrow::Cow::into_owned)
 }
 
 /// Minimal `which` implementation — avoids adding the `which` crate to

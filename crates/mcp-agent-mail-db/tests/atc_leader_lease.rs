@@ -3,7 +3,7 @@
 //! Tests for the ATC leader lease (multi-server concurrency safety).
 //!
 //! Exercises acquire / renew / release / steal-on-expiry / conflict semantics
-//! with REAL SQLite — no mocks.
+//! with REAL `SQLite` — no mocks.
 
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;

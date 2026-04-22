@@ -16,7 +16,7 @@ use tempfile::TempDir;
 
 /// A tempdir-backed git repo in a specific shape.
 ///
-/// Keeping `_guard` private ensures the TempDir outlives the PathBuf.
+/// Keeping `_guard` private ensures the `TempDir` outlives the `PathBuf`.
 pub struct RepoFixture {
     pub path: PathBuf,
     _guard: TempDir,
@@ -68,6 +68,7 @@ impl RepoBuilder {
 
     /// Create a new branch called `main` with a single commit containing
     /// a README so HEAD is born.
+    #[must_use]
     pub fn commit_initial(mut self, content: &str) -> Self {
         let readme = self.path.join("README.md");
         fs::write(&readme, content).unwrap();
@@ -87,6 +88,7 @@ impl RepoBuilder {
     }
 
     /// Add a named file and commit it on top of current HEAD.
+    #[must_use]
     pub fn add_file_and_commit(mut self, name: &str, content: &str) -> Self {
         let p = self.path.join(name);
         if let Some(parent) = p.parent() {
@@ -125,7 +127,7 @@ impl RepoBuilder {
     #[must_use]
     pub fn build(self) -> RepoFixture {
         // Drop the repo handle so the caller can open a fresh one.
-        let RepoBuilder { guard, path, .. } = self;
+        let Self { guard, path, .. } = self;
         RepoFixture {
             path,
             _guard: guard,
@@ -173,9 +175,10 @@ pub fn unborn_head() -> RepoFixture {
 }
 
 /// Repo with a dangling `refs/heads/crash-recovery` pointing at a SHA
-/// that doesn't exist in the object database. Emulates the damage
-/// pattern seen on 2.51.0 boxes after a segfault interrupts a stash
-/// or branch write.
+/// that doesn't exist in the object database.
+///
+/// Emulates the damage pattern seen on 2.51.0 boxes after a segfault
+/// interrupts a stash or branch write.
 ///
 /// Used by Track F tests (F2/F3/F6) as the ground-truth damage fixture.
 #[must_use]

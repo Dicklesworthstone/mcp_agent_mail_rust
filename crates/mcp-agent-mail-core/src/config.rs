@@ -837,7 +837,7 @@ pub fn is_running_under_cargo_test_harness() -> bool {
 
 /// When this process is running under a test harness and `storage_root`
 /// is the real user default, flag the likely leak. This closes the common
-/// bug where a subprocess-spawning test fails to pass STORAGE_ROOT through
+/// bug where a subprocess-spawning test fails to pass `STORAGE_ROOT` through
 /// to the `am` binary and the binary silently starts writing to the real
 /// user archive.
 ///
@@ -847,7 +847,7 @@ pub fn is_running_under_cargo_test_harness() -> bool {
 ///   avoids breaking the many existing tests that call `Config::from_env`
 ///   purely to inspect config defaults without ever touching storage.
 /// - **Strict mode** (`AM_STRICT_HOME_STORAGE_GUARD=1`): panics instead
-///   of warning. Useful in CI to force test suites to set STORAGE_ROOT
+///   of warning. Useful in CI to force test suites to set `STORAGE_ROOT`
 ///   explicitly, and in production if operators want to ensure no stray
 ///   test invocation can write to the real archive.
 ///
@@ -874,9 +874,7 @@ fn guard_against_default_storage_root_in_test_mode(storage_root: &Path) {
         storage_root.display()
     );
 
-    if env_truthy("AM_STRICT_HOME_STORAGE_GUARD") {
-        panic!("{}", message);
-    }
+    assert!(!env_truthy("AM_STRICT_HOME_STORAGE_GUARD"), "{}", message);
     tracing::warn!(
         storage_root = %storage_root.display(),
         "{}",
@@ -890,9 +888,7 @@ fn guard_against_default_storage_root_in_test_mode(storage_root: &Path) {
 /// Uses the same truthy/falsy vocabulary as [`parse_bool`] so operators get
 /// a consistent experience across all AM env vars.
 fn env_truthy(key: &str) -> bool {
-    process_env_value(key)
-        .map(|v| parse_bool(&v, false))
-        .unwrap_or(false)
+    process_env_value(key).is_some_and(|v| parse_bool(&v, false))
 }
 
 /// Symlink-resolving variant of [`is_default_storage_root`] for the test-mode
@@ -901,7 +897,7 @@ fn env_truthy(key: &str) -> bool {
 /// make the two differ and the raw equality check would miss the match.
 ///
 /// Uses the same `canonicalize_storage_root` helper that `Config::from_env`
-/// applied to the live storage_root, so symlinks are resolved consistently
+/// applied to the live `storage_root`, so symlinks are resolved consistently
 /// even when the target path doesn't exist yet (fresh install). Comparing
 /// canonicalized paths this way closes the hole without disturbing callers
 /// of `is_default_storage_root` that rely on exact path equality.
@@ -1573,7 +1569,7 @@ impl Config {
                 "AM_ARCHIVE_MAINTENANCE_INTERVAL_SECS",
                 config.archive_maintenance_interval_secs,
             );
-            if raw < MIN_MAINTENANCE_INTERVAL_SECS || raw > MAX_MAINTENANCE_INTERVAL_SECS {
+            if !(MIN_MAINTENANCE_INTERVAL_SECS..=MAX_MAINTENANCE_INTERVAL_SECS).contains(&raw) {
                 tracing::warn!(
                     raw,
                     min = MIN_MAINTENANCE_INTERVAL_SECS,
@@ -3143,6 +3139,13 @@ fn env_f64(key: &str, default: f64) -> f64 {
 mod tests {
     use super::*;
 
+    fn assert_f64_eq(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() <= f64::EPSILON,
+            "expected {expected}, got {actual}"
+        );
+    }
+
     struct TestEnvOverrideGuard {
         previous: Vec<(String, Option<String>)>,
     }
@@ -3264,25 +3267,25 @@ mod tests {
             config.atc_safe_mode_recovery_count,
             crate::atc_baseline::BASELINE_CALIBRATION.safe_mode_recovery_count
         );
-        assert_eq!(
+        assert_f64_eq(
             config.atc_eprocess_threshold,
-            crate::atc_baseline::BASELINE_CALIBRATION.eprocess_alert_threshold
+            crate::atc_baseline::BASELINE_CALIBRATION.eprocess_alert_threshold,
         );
-        assert_eq!(
+        assert_f64_eq(
             config.atc_cusum_threshold,
-            crate::atc_baseline::BASELINE_CALIBRATION.cusum_threshold
+            crate::atc_baseline::BASELINE_CALIBRATION.cusum_threshold,
         );
-        assert_eq!(
+        assert_f64_eq(
             config.atc_cusum_delta,
-            crate::atc_baseline::BASELINE_CALIBRATION.cusum_delta
+            crate::atc_baseline::BASELINE_CALIBRATION.cusum_delta,
         );
         assert_eq!(
             config.atc_ledger_capacity,
             crate::atc_baseline::BASELINE_CALIBRATION.ledger_capacity
         );
-        assert_eq!(
+        assert_f64_eq(
             config.atc_suspicion_k,
-            crate::atc_baseline::BASELINE_SUSPICION_K
+            crate::atc_baseline::BASELINE_SUSPICION_K,
         );
     }
 
@@ -3307,11 +3310,11 @@ mod tests {
         assert_eq!(config.atc_advisory_cooldown_secs, 10);
         assert_eq!(config.atc_summary_interval_secs, 10);
         assert_eq!(config.atc_safe_mode_recovery_count, 1);
-        assert_eq!(config.atc_eprocess_threshold, 21.5);
-        assert_eq!(config.atc_cusum_threshold, 7.25);
-        assert_eq!(config.atc_cusum_delta, 0.3);
+        assert_f64_eq(config.atc_eprocess_threshold, 21.5);
+        assert_f64_eq(config.atc_cusum_threshold, 7.25);
+        assert_f64_eq(config.atc_cusum_delta, 0.3);
         assert_eq!(config.atc_ledger_capacity, 10);
-        assert_eq!(config.atc_suspicion_k, 4.5);
+        assert_f64_eq(config.atc_suspicion_k, 4.5);
     }
 
     #[test]

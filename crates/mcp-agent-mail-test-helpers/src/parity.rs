@@ -64,7 +64,6 @@ pub fn run_cli_git(repo: &Path, args: &[&str]) -> String {
 /// Returns `Ok(())` if we should; `Err(reason)` with a human-readable
 /// explanation otherwise. Caller prints the SKIP reason and treats the
 /// test as PASS.
-#[must_use]
 pub fn cli_half_available() -> Result<(), String> {
     let out = match Command::new("git").arg("--version").output() {
         Ok(o) => o,
@@ -108,12 +107,12 @@ where
     match cli_half_available() {
         Ok(()) => {
             let cli_result = cli(repo);
-            if cli_result != libgit2_result {
-                panic!(
-                    "parity FAIL [{case_name}]:\n  repo    : {}\n  cli     : {cli_result:?}\n  libgit2 : {libgit2_result:?}",
-                    repo.display()
-                );
-            }
+            assert_eq!(
+                cli_result,
+                libgit2_result,
+                "parity FAIL [{case_name}]:\n  repo    : {}",
+                repo.display()
+            );
             if std::env::var("AM_TEST_PARITY_VERBOSE").ok().as_deref() == Some("1") {
                 eprintln!(
                     "[parity PASS {case_name}] cli={cli_result:?} libgit2={libgit2_result:?}"
@@ -167,11 +166,10 @@ mod tests {
     fn assert_parity_fails_loudly_on_mismatch() {
         // Only run the panic-case when CLI is available; otherwise the
         // test would SKIP (never panic).
-        if cli_half_available().is_err() {
-            // Force the panic so the #[should_panic] assertion is
-            // satisfied even in SKIP environments.
-            panic!("parity FAIL cli=\"a\" libgit2=\"b\" (SKIP path fallback)");
-        }
+        assert!(
+            cli_half_available().is_ok(),
+            "parity FAIL cli=\"a\" libgit2=\"b\" (SKIP path fallback)"
+        );
         let fix = RepoBuilder::new().commit_initial("x\n").build();
         assert_parity(
             fix.path(),
