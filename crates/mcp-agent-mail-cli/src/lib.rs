@@ -4655,8 +4655,8 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
 
 fn handle_doctor_pack_archive(json: bool) -> CliResult<()> {
     let config = mcp_agent_mail_core::Config::from_env();
-    let git_dir = mcp_agent_mail_server::maintenance::resolve_archive_git_dir(&config)
-        .ok_or_else(|| {
+    let git_dir =
+        mcp_agent_mail_server::maintenance::resolve_archive_git_dir(&config).ok_or_else(|| {
             CliError::Other(format!(
                 "could not locate archive .git directory under {}",
                 config.storage_root.display()
@@ -4682,27 +4682,37 @@ fn handle_doctor_pack_archive(json: bool) -> CliResult<()> {
         if let Some(err) = &report.error {
             eprintln!("ERROR: {err}");
         }
-        println!("Archive maintenance: {}", if report.success { "OK" } else { "FAILED" });
-        println!();
         println!(
-            "  {:>20}  {:>10}  {:>10}",
-            "", "Before", "After"
+            "Archive maintenance: {}",
+            if report.success { "OK" } else { "FAILED" }
         );
+        println!();
+        println!("  {:>20}  {:>10}  {:>10}", "", "Before", "After");
         println!(
             "  {:>20}  {:>10}  {:>10}",
             "Loose objects",
-            report.loose_before.map_or("-".to_string(), |v| v.to_string()),
-            report.loose_after.map_or("-".to_string(), |v| v.to_string()),
+            report
+                .loose_before
+                .map_or("-".to_string(), |v| v.to_string()),
+            report
+                .loose_after
+                .map_or("-".to_string(), |v| v.to_string()),
         );
         println!(
             "  {:>20}  {:>10}  {:>10}",
             "Pack files",
-            report.pack_count_before.map_or("-".to_string(), |v| v.to_string()),
-            report.pack_count_after.map_or("-".to_string(), |v| v.to_string()),
+            report
+                .pack_count_before
+                .map_or("-".to_string(), |v| v.to_string()),
+            report
+                .pack_count_after
+                .map_or("-".to_string(), |v| v.to_string()),
         );
         let fmt_bytes = |b: Option<u64>| -> String {
             match b {
-                Some(bytes) if bytes >= 1024 * 1024 => format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0)),
+                Some(bytes) if bytes >= 1024 * 1024 => {
+                    format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+                }
                 Some(bytes) if bytes >= 1024 => format!("{:.1} KB", bytes as f64 / 1024.0),
                 Some(bytes) => format!("{bytes} B"),
                 None => "-".to_string(),
@@ -4723,7 +4733,11 @@ fn handle_doctor_pack_archive(json: bool) -> CliResult<()> {
         }
     }
 
-    if report.success { Ok(()) } else { Err(CliError::Other("maintenance failed".into())) }
+    if report.success {
+        Ok(())
+    } else {
+        Err(CliError::Other("maintenance failed".into()))
+    }
 }
 
 fn handle_guard(action: GuardCommand) -> CliResult<()> {
@@ -12394,8 +12408,8 @@ fn download_archive_memory_sync(url: &str) -> Result<Vec<u8>, String> {
 /// release tarball to keep `am self-update` lightweight even on memory-
 /// constrained hosts.
 fn download_file_to_path(url: &str, dest: &Path) -> Result<(), String> {
-    let file = std::fs::File::create(dest)
-        .map_err(|e| format!("create {}: {e}", dest.display()))?;
+    let file =
+        std::fs::File::create(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
     let mut sink = StreamingSink::File(file);
     let result = download_streaming(url, &mut sink, true);
     // Drop the sink so the File handle is closed before we hash it.
@@ -12426,7 +12440,9 @@ fn verify_sha256_file(path: &Path, expected_hex: &str) -> Result<bool, String> {
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = file.read(&mut buf).map_err(|e| format!("read for hashing: {e}"))?;
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("read for hashing: {e}"))?;
         if n == 0 {
             break;
         }

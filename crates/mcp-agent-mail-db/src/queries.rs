@@ -22729,16 +22729,16 @@ mod tests {
             let inputs: Vec<&[u8]> = vec![
                 b"hello\x00world",
                 b"test\x01\x02\x03",
-                b"query\x1b[31mred",     // ANSI escape
+                b"query\x1b[31mred", // ANSI escape
                 b"line\r\nbreak",
                 b"tab\there",
                 b"null\x00",
                 b"\x00\x00\x00",
                 b"mixed\x00\x0a\x0d\x1b\x7fend",
                 b"valid prefix\x00hidden suffix",
-                b"\xc0\xaf",             // overlong UTF-8
-                b"\xfe\xff",             // invalid UTF-8 BOM
-                b"ok\xe2\x80\x8b\x00z",  // zero-width space + null
+                b"\xc0\xaf",            // overlong UTF-8
+                b"\xfe\xff",            // invalid UTF-8 BOM
+                b"ok\xe2\x80\x8b\x00z", // zero-width space + null
             ];
             for raw in &inputs {
                 let query = String::from_utf8_lossy(raw);
@@ -22748,7 +22748,8 @@ mod tests {
                     let escaped = like_escape(term);
                     assert!(
                         !escaped.contains('\x00'),
-                        "NULL byte survived pipeline for input {:?}", raw
+                        "NULL byte survived pipeline for input {:?}",
+                        raw
                     );
                 }
             }
@@ -22785,8 +22786,14 @@ mod tests {
                 (&nested_parens, "500 nested parens"),
                 (&tabs_1k, "1K tabs"),
                 (&wildcards_100, "100 leading wildcards"),
-                ("col1:injection col2:attack {col3}:payload", "FTS5 column filters"),
-                ("NEAR(attack payload, 1) AND ^prefix", "FTS5 proximity + prefix"),
+                (
+                    "col1:injection col2:attack {col3}:payload",
+                    "FTS5 column filters",
+                ),
+                (
+                    "NEAR(attack payload, 1) AND ^prefix",
+                    "FTS5 proximity + prefix",
+                ),
             ];
 
             for (input, label) in &cases {
