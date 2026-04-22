@@ -596,20 +596,23 @@ impl ReadCache {
     }
 
     /// Cache an agent (write-through after DB mutation) in a specific DB scope.
+    ///
+    /// Holds the `agents_by_key` write lock for the entire operation so that
+    /// a concurrent `invalidate_agent_scoped` cannot remove the by-key entry
+    /// and skip the by-id cleanup between the two insertions.
+    /// Lock ordering (rank 22 → 23) is respected.
     pub fn put_agent_scoped(&self, scope: &str, agent: &AgentRow) {
         let scope_fp = scope_fingerprint(scope);
         let shared = Arc::new(agent.clone());
-        {
-            let mut cache = self.agents_by_key.write();
-            let name_lower = agent.name.to_ascii_lowercase();
-            cache.insert(
-                (scope_fp, agent.project_id, InternedStr::new(&name_lower)),
-                CacheEntry::new(Arc::clone(&shared)),
-            );
-        }
+        let mut by_key = self.agents_by_key.write();
+        let name_lower = agent.name.to_ascii_lowercase();
+        by_key.insert(
+            (scope_fp, agent.project_id, InternedStr::new(&name_lower)),
+            CacheEntry::new(Arc::clone(&shared)),
+        );
         if let Some(id) = agent.id {
-            let mut cache = self.agents_by_id.write();
-            cache.insert((scope_fp, id), CacheEntry::new(shared));
+            let mut by_id = self.agents_by_id.write();
+            by_id.insert((scope_fp, id), CacheEntry::new(shared));
         }
     }
 
@@ -621,12 +624,14 @@ impl ReadCache {
     }
 
     /// Bulk-insert agents into the cache (cache warming on startup) in a DB scope.
+    ///
+    /// Holds the `agents_by_key` write lock for the entire operation (same
+    /// rationale as `put_agent_scoped`). Lock ordering (rank 22 → 23).
     pub fn warm_agents_scoped(&self, scope: &str, agents: &[AgentRow]) {
         let scope_fp = scope_fingerprint(scope);
         let prepared: Vec<_> = agents
             .iter()
             .map(|agent| {
-                // Lowercase to match get_agent_scoped key construction.
                 let name_lower = agent.name.to_ascii_lowercase();
                 (
                     agent.project_id,
@@ -636,20 +641,18 @@ impl ReadCache {
                 )
             })
             .collect();
-        {
-            let mut cache = self.agents_by_key.write();
-            for (project_id, name, _id, shared) in &prepared {
-                cache.insert(
-                    (scope_fp, *project_id, name.clone()),
-                    CacheEntry::new(Arc::clone(shared)),
-                );
-            }
+        let mut by_key = self.agents_by_key.write();
+        for (project_id, name, _id, shared) in &prepared {
+            by_key.insert(
+                (scope_fp, *project_id, name.clone()),
+                CacheEntry::new(Arc::clone(shared)),
+            );
         }
         {
-            let mut cache = self.agents_by_id.write();
+            let mut by_id = self.agents_by_id.write();
             for (_project_id, _name, id, shared) in &prepared {
                 if let Some(id) = id {
-                    cache.insert((scope_fp, *id), CacheEntry::new(Arc::clone(shared)));
+                    by_id.insert((scope_fp, *id), CacheEntry::new(Arc::clone(shared)));
                 }
             }
         }
