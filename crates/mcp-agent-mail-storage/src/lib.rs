@@ -2931,7 +2931,16 @@ fn coalescer_commit_batch(
     }
 
     // Keep batch commits bounded to avoid enormous commits under load.
-    let commit_result = if can_merge && requests.len() <= configured_coalescer_batch_size() {
+    let commit_result = if requests.len() == 1 {
+        // Single request - commit directly.
+        coalescer_commit_with_retry(
+            repo_root,
+            &config,
+            &requests[0].message,
+            &requests[0].rel_paths,
+        )
+        .map(|()| (1, 1))
+    } else if can_merge && requests.len() <= configured_coalescer_batch_size() {
         // Merge all into a single commit
         let merged_paths: Vec<String> = requests
             .iter()
@@ -2954,15 +2963,6 @@ fn coalescer_commit_batch(
 
         coalescer_commit_with_retry(repo_root, &config, &combined_msg, &merged_paths)
             .map(|()| (1, requests.len()))
-    } else if requests.len() == 1 {
-        // Single request — commit directly
-        coalescer_commit_with_retry(
-            repo_root,
-            &config,
-            &requests[0].message,
-            &requests[0].rel_paths,
-        )
-        .map(|()| (1, 1))
     } else {
         // Path conflicts — commit sequentially
         let mut total = 0;
@@ -3029,13 +3029,8 @@ fn coalescer_commit_batch(
             let mut sizes = batch_sizes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if num_commits > 0 {
-                record_batch_size_samples(
-                    &mut s,
-                    &mut sizes,
-                    batched_items / num_commits,
-                    num_commits,
-                );
+            if let Some(mean_batch_size) = batched_items.checked_div(num_commits) {
+                record_batch_size_samples(&mut s, &mut sizes, mean_batch_size, num_commits);
             }
             CoalescerCommitOutcome {
                 committed_requests: u64::try_from(batched_items).unwrap_or(u64::MAX),

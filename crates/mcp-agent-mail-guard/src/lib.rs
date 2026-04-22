@@ -1646,7 +1646,12 @@ fn is_expired(ts_str: &str, now: &chrono::DateTime<chrono::Utc>) -> bool {
 fn guard_run_git_with_retry(mut cmd: Command) -> std::io::Result<std::process::Output> {
     const BACKOFFS_MS: [u64; 3] = [100, 400, 1600];
     let mut last_output: Option<std::process::Output> = None;
-    for attempt in 0..=BACKOFFS_MS.len() {
+    for (attempt, maybe_base) in BACKOFFS_MS
+        .into_iter()
+        .map(Some)
+        .chain(std::iter::once(None))
+        .enumerate()
+    {
         let output = cmd.output()?;
         let signal_segfault = {
             #[cfg(unix)]
@@ -1661,7 +1666,7 @@ fn guard_run_git_with_retry(mut cmd: Command) -> std::io::Result<std::process::O
         if !signal_segfault && !code_segfault {
             return Ok(output);
         }
-        if attempt >= BACKOFFS_MS.len() {
+        let Some(base) = maybe_base else {
             tracing::warn!(
                 target: "mcp_agent_mail::guard::segfault_retry",
                 attempt = attempt,
@@ -1669,13 +1674,12 @@ fn guard_run_git_with_retry(mut cmd: Command) -> std::io::Result<std::process::O
             );
             last_output = Some(output);
             break;
-        }
+        };
         tracing::warn!(
             target: "mcp_agent_mail::guard::segfault_retry",
             attempt = attempt,
             "guard_git_segfault_retry"
         );
-        let base = BACKOFFS_MS[attempt];
         // Jitter formula MUST match mcp_agent_mail_core::git_cmd::jitter_ms
         // so the guard's retry cadence is identical to the server's.
         //   span = base / 2           (half the base)
@@ -1686,8 +1690,7 @@ fn guard_run_git_with_retry(mut cmd: Command) -> std::io::Result<std::process::O
         let low = base - span / 2;
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos() as u64)
-            .unwrap_or(0);
+            .map_or(0, |d| u64::from(d.subsec_nanos()));
         let offset = nanos % span.max(1);
         let jitter = low + offset;
         std::thread::sleep(std::time::Duration::from_millis(jitter));
