@@ -42,10 +42,10 @@ fn router_with_fuzzed_tools() -> fastmcp::Router {
 fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
     match payload.downcast::<String>() {
         Ok(message) => *message,
-        Err(payload) => match payload.downcast::<&'static str>() {
-            Ok(message) => (*message).to_string(),
-            Err(_) => "non-string panic payload".to_string(),
-        },
+        Err(payload) => payload.downcast::<&'static str>().map_or_else(
+            |_| "non-string panic payload".to_string(),
+            |message| (*message).to_string(),
+        ),
     }
 }
 
