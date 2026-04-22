@@ -1770,6 +1770,171 @@ mod tests {
                 "hits({delta_hits}) + misses({delta_misses}) < ops({ops_count})"
             );
         }
+
+        /// Operation enum for interleaved dual-index coherency proptest.
+        #[derive(Debug, Clone)]
+        enum CacheOp {
+            Put { name_idx: usize, project_id: i64, agent_id: i64 },
+            Invalidate { name_idx: usize, project_id: i64, with_id: Option<i64> },
+            Touch { agent_id: i64, ts: i64 },
+            GetByKey { name_idx: usize, project_id: i64 },
+            GetById { agent_id: i64 },
+        }
+
+        fn arb_cache_op() -> impl Strategy<Value = CacheOp> {
+            prop_oneof![
+                (0..8usize, 1..=4i64, 1..=200i64).prop_map(|(n, p, id)| CacheOp::Put {
+                    name_idx: n,
+                    project_id: p,
+                    agent_id: id,
+                }),
+                (0..8usize, 1..=4i64, proptest::option::of(1..=200i64)).prop_map(
+                    |(n, p, id)| CacheOp::Invalidate {
+                        name_idx: n,
+                        project_id: p,
+                        with_id: id,
+                    }
+                ),
+                (1..=200i64, 0..=1_000_000i64)
+                    .prop_map(|(id, ts)| CacheOp::Touch { agent_id: id, ts }),
+                (0..8usize, 1..=4i64)
+                    .prop_map(|(n, p)| CacheOp::GetByKey { name_idx: n, project_id: p }),
+                (1..=200i64).prop_map(|id| CacheOp::GetById { agent_id: id }),
+            ]
+        }
+
+        const AGENT_NAMES: [&str; 8] = [
+            "Alpha", "Bravo", "Charlie", "Delta",
+            "Echo", "Foxtrot", "Golf", "Hotel",
+        ];
+
+        fn assert_dual_index_coherent(cache: &ReadCache) {
+            let by_key = cache.agents_by_key.read();
+            let by_id = cache.agents_by_id.read();
+
+            let scope_fp = scope_fingerprint("");
+
+            let key_entries: Vec<_> = by_key
+                .keys()
+                .filter(|(s, _, _)| *s == scope_fp)
+                .cloned()
+                .collect();
+            for key in &key_entries {
+                if let Some(entry) = by_key.peek(key) {
+                    if let Some(agent_id) = entry.value.id {
+                        let id_key = (scope_fp, agent_id);
+                        assert!(
+                            by_id.peek(&id_key).is_some(),
+                            "by_key has agent id={agent_id} name={} but by_id missing",
+                            entry.value.name,
+                        );
+                    }
+                }
+            }
+
+            let id_entries: Vec<_> = by_id
+                .keys()
+                .filter(|(s, _)| *s == scope_fp)
+                .cloned()
+                .collect();
+            for id_key in &id_entries {
+                if let Some(entry) = by_id.peek(id_key) {
+                    let name_lower = entry.value.name.to_ascii_lowercase();
+                    let key = (scope_fp, entry.value.project_id, InternedStr::new(&name_lower));
+                    assert!(
+                        by_key.peek(&key).is_some(),
+                        "by_id has agent id={} name={} but by_key missing",
+                        id_key.1,
+                        entry.value.name,
+                    );
+                }
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig { cases: 500, max_shrink_iters: 2000, ..ProptestConfig::default() })]
+
+            #[test]
+            fn prop_interleaved_ops_dual_index_coherent(
+                ops in proptest::collection::vec(arb_cache_op(), 1..=300)
+            ) {
+                let cache = ReadCache::with_capacity(64);
+
+                for op in &ops {
+                    match op {
+                        CacheOp::Put { name_idx, project_id, agent_id } => {
+                            let agent = make_agent_with_id(
+                                AGENT_NAMES[*name_idx],
+                                *project_id,
+                                *agent_id,
+                            );
+                            cache.put_agent(&agent);
+                        }
+                        CacheOp::Invalidate { name_idx, project_id, with_id } => {
+                            cache.invalidate_agent(
+                                *project_id,
+                                AGENT_NAMES[*name_idx],
+                                *with_id,
+                            );
+                        }
+                        CacheOp::Touch { agent_id, ts } => {
+                            let _ = cache.enqueue_touch(*agent_id, *ts);
+                        }
+                        CacheOp::GetByKey { name_idx, project_id } => {
+                            let _ = cache.get_agent(*project_id, AGENT_NAMES[*name_idx]);
+                        }
+                        CacheOp::GetById { agent_id } => {
+                            let _ = cache.get_agent_by_id(*agent_id);
+                        }
+                    }
+                }
+
+                assert_dual_index_coherent(&cache);
+            }
+
+            #[test]
+            fn prop_interleaved_ops_no_panic_under_eviction(
+                ops in proptest::collection::vec(arb_cache_op(), 1..=500)
+            ) {
+                let cache = ReadCache::with_capacity(8);
+
+                for op in &ops {
+                    match op {
+                        CacheOp::Put { name_idx, project_id, agent_id } => {
+                            let agent = make_agent_with_id(
+                                AGENT_NAMES[*name_idx],
+                                *project_id,
+                                *agent_id,
+                            );
+                            cache.put_agent(&agent);
+                        }
+                        CacheOp::Invalidate { name_idx, project_id, with_id } => {
+                            cache.invalidate_agent(
+                                *project_id,
+                                AGENT_NAMES[*name_idx],
+                                *with_id,
+                            );
+                        }
+                        CacheOp::Touch { agent_id, ts } => {
+                            let _ = cache.enqueue_touch(*agent_id, *ts);
+                        }
+                        CacheOp::GetByKey { name_idx, project_id } => {
+                            let _ = cache.get_agent(*project_id, AGENT_NAMES[*name_idx]);
+                        }
+                        CacheOp::GetById { agent_id } => {
+                            let _ = cache.get_agent_by_id(*agent_id);
+                        }
+                    }
+                }
+
+                let counts = cache.entry_counts();
+                prop_assert!(
+                    counts.agents_by_key <= 8,
+                    "by_key {} exceeded capacity 8",
+                    counts.agents_by_key
+                );
+            }
+        }
     }
 
     #[test]
