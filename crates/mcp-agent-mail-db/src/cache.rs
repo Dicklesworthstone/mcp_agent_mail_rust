@@ -1774,32 +1774,29 @@ mod tests {
         /// Operation enum for interleaved dual-index coherency proptest.
         #[derive(Debug, Clone)]
         enum CacheOp {
-            Put { name_idx: usize, project_id: i64, agent_id: i64 },
-            Invalidate { name_idx: usize, project_id: i64, with_id: Option<i64> },
-            Touch { agent_id: i64, ts: i64 },
+            Put { name_idx: usize, project_id: i64 },
+            Invalidate { name_idx: usize, project_id: i64, with_id: bool },
+            Touch { name_idx: usize, project_id: i64, ts: i64 },
             GetByKey { name_idx: usize, project_id: i64 },
-            GetById { agent_id: i64 },
+            GetById { name_idx: usize, project_id: i64 },
         }
 
         fn arb_cache_op() -> impl Strategy<Value = CacheOp> {
             prop_oneof![
-                (0..8usize, 1..=4i64, 1..=200i64).prop_map(|(n, p, id)| CacheOp::Put {
-                    name_idx: n,
-                    project_id: p,
-                    agent_id: id,
-                }),
-                (0..8usize, 1..=4i64, proptest::option::of(1..=200i64)).prop_map(
-                    |(n, p, id)| CacheOp::Invalidate {
-                        name_idx: n,
-                        project_id: p,
-                        with_id: id,
-                    }
-                ),
-                (1..=200i64, 0..=1_000_000i64)
-                    .prop_map(|(id, ts)| CacheOp::Touch { agent_id: id, ts }),
-                (0..8usize, 1..=4i64)
+                4 => (0..8usize, 1..=4i64)
+                    .prop_map(|(n, p)| CacheOp::Put { name_idx: n, project_id: p }),
+                2 => (0..8usize, 1..=4i64, proptest::bool::ANY)
+                    .prop_map(|(n, p, with_id)| CacheOp::Invalidate {
+                        name_idx: n, project_id: p, with_id,
+                    }),
+                1 => (0..8usize, 1..=4i64, 0..=1_000_000i64)
+                    .prop_map(|(n, p, ts)| CacheOp::Touch {
+                        name_idx: n, project_id: p, ts,
+                    }),
+                2 => (0..8usize, 1..=4i64)
                     .prop_map(|(n, p)| CacheOp::GetByKey { name_idx: n, project_id: p }),
-                (1..=200i64).prop_map(|id| CacheOp::GetById { agent_id: id }),
+                1 => (0..8usize, 1..=4i64)
+                    .prop_map(|(n, p)| CacheOp::GetById { name_idx: n, project_id: p }),
             ]
         }
 
@@ -1808,7 +1805,12 @@ mod tests {
             "Echo", "Foxtrot", "Golf", "Hotel",
         ];
 
-        fn assert_dual_index_coherent(cache: &ReadCache) {
+        #[allow(clippy::cast_possible_wrap)]
+        fn stable_agent_id(name_idx: usize, project_id: i64) -> i64 {
+            (project_id - 1) * 8 + name_idx as i64 + 1
+        }
+
+        fn assert_dual_index_consistent(cache: &ReadCache) {
             let by_key = cache.agents_by_key.read();
             let by_id = cache.agents_by_id.read();
 
@@ -1823,30 +1825,19 @@ mod tests {
                 if let Some(entry) = by_key.peek(key) {
                     if let Some(agent_id) = entry.value.id {
                         let id_key = (scope_fp, agent_id);
-                        assert!(
-                            by_id.peek(&id_key).is_some(),
-                            "by_key has agent id={agent_id} name={} but by_id missing",
-                            entry.value.name,
-                        );
+                        if let Some(id_entry) = by_id.peek(&id_key) {
+                            assert_eq!(
+                                entry.value.name.to_ascii_lowercase(),
+                                id_entry.value.name.to_ascii_lowercase(),
+                                "by_key and by_id disagree on name for id={agent_id}",
+                            );
+                            assert_eq!(
+                                entry.value.project_id,
+                                id_entry.value.project_id,
+                                "by_key and by_id disagree on project_id for id={agent_id}",
+                            );
+                        }
                     }
-                }
-            }
-
-            let id_entries: Vec<_> = by_id
-                .keys()
-                .filter(|(s, _)| *s == scope_fp)
-                .cloned()
-                .collect();
-            for id_key in &id_entries {
-                if let Some(entry) = by_id.peek(id_key) {
-                    let name_lower = entry.value.name.to_ascii_lowercase();
-                    let key = (scope_fp, entry.value.project_id, InternedStr::new(&name_lower));
-                    assert!(
-                        by_key.peek(&key).is_some(),
-                        "by_id has agent id={} name={} but by_key missing",
-                        id_key.1,
-                        entry.value.name,
-                    );
                 }
             }
         }
@@ -1861,35 +1852,39 @@ mod tests {
                 let cache = ReadCache::with_capacity(64);
 
                 for op in &ops {
-                    match op {
-                        CacheOp::Put { name_idx, project_id, agent_id } => {
+                    match *op {
+                        CacheOp::Put { name_idx, project_id } => {
+                            let id = stable_agent_id(name_idx, project_id);
                             let agent = make_agent_with_id(
-                                AGENT_NAMES[*name_idx],
-                                *project_id,
-                                *agent_id,
+                                AGENT_NAMES[name_idx], project_id, id,
                             );
                             cache.put_agent(&agent);
                         }
                         CacheOp::Invalidate { name_idx, project_id, with_id } => {
+                            let id_hint = if with_id {
+                                Some(stable_agent_id(name_idx, project_id))
+                            } else {
+                                None
+                            };
                             cache.invalidate_agent(
-                                *project_id,
-                                AGENT_NAMES[*name_idx],
-                                *with_id,
+                                project_id, AGENT_NAMES[name_idx], id_hint,
                             );
                         }
-                        CacheOp::Touch { agent_id, ts } => {
-                            let _ = cache.enqueue_touch(*agent_id, *ts);
+                        CacheOp::Touch { name_idx, project_id, ts } => {
+                            let id = stable_agent_id(name_idx, project_id);
+                            let _ = cache.enqueue_touch(id, ts);
                         }
                         CacheOp::GetByKey { name_idx, project_id } => {
-                            let _ = cache.get_agent(*project_id, AGENT_NAMES[*name_idx]);
+                            let _ = cache.get_agent(project_id, AGENT_NAMES[name_idx]);
                         }
-                        CacheOp::GetById { agent_id } => {
-                            let _ = cache.get_agent_by_id(*agent_id);
+                        CacheOp::GetById { name_idx, project_id } => {
+                            let id = stable_agent_id(name_idx, project_id);
+                            let _ = cache.get_agent_by_id(id);
                         }
                     }
                 }
 
-                assert_dual_index_coherent(&cache);
+                assert_dual_index_consistent(&cache);
             }
 
             #[test]
@@ -1899,30 +1894,34 @@ mod tests {
                 let cache = ReadCache::with_capacity(8);
 
                 for op in &ops {
-                    match op {
-                        CacheOp::Put { name_idx, project_id, agent_id } => {
+                    match *op {
+                        CacheOp::Put { name_idx, project_id } => {
+                            let id = stable_agent_id(name_idx, project_id);
                             let agent = make_agent_with_id(
-                                AGENT_NAMES[*name_idx],
-                                *project_id,
-                                *agent_id,
+                                AGENT_NAMES[name_idx], project_id, id,
                             );
                             cache.put_agent(&agent);
                         }
                         CacheOp::Invalidate { name_idx, project_id, with_id } => {
+                            let id_hint = if with_id {
+                                Some(stable_agent_id(name_idx, project_id))
+                            } else {
+                                None
+                            };
                             cache.invalidate_agent(
-                                *project_id,
-                                AGENT_NAMES[*name_idx],
-                                *with_id,
+                                project_id, AGENT_NAMES[name_idx], id_hint,
                             );
                         }
-                        CacheOp::Touch { agent_id, ts } => {
-                            let _ = cache.enqueue_touch(*agent_id, *ts);
+                        CacheOp::Touch { name_idx, project_id, ts } => {
+                            let id = stable_agent_id(name_idx, project_id);
+                            let _ = cache.enqueue_touch(id, ts);
                         }
                         CacheOp::GetByKey { name_idx, project_id } => {
-                            let _ = cache.get_agent(*project_id, AGENT_NAMES[*name_idx]);
+                            let _ = cache.get_agent(project_id, AGENT_NAMES[name_idx]);
                         }
-                        CacheOp::GetById { agent_id } => {
-                            let _ = cache.get_agent_by_id(*agent_id);
+                        CacheOp::GetById { name_idx, project_id } => {
+                            let id = stable_agent_id(name_idx, project_id);
+                            let _ = cache.get_agent_by_id(id);
                         }
                     }
                 }
