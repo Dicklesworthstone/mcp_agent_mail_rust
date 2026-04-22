@@ -77,8 +77,8 @@ mod cleanup;
 pub mod console;
 mod disk_monitor;
 mod integrity_guard;
-pub mod maintenance;
 mod mail_ui;
+pub mod maintenance;
 mod markdown;
 mod retention;
 pub mod startup_checks;
@@ -3875,6 +3875,9 @@ fn dispatch_compose_envelope(
 ) {
     let Some(conn) = tui_poller::open_sync_connection_pub(database_url) else {
         tracing::warn!("compose: cannot open DB for send");
+        tui_state.push_console_log(
+            "\u{274c} Compose: could not open database — message not sent".to_string(),
+        );
         return;
     };
 
@@ -3927,6 +3930,7 @@ fn dispatch_compose_envelope(
         }
         Err(e) => {
             tracing::error!("compose: failed to dispatch message: {e}");
+            tui_state.push_console_log(format!("\u{274c} Compose: failed to send message — {e}"));
         }
     }
 }
@@ -4143,11 +4147,10 @@ where
 {
     let worker_cancel = cancel.clone();
     let closure_permit = Arc::clone(&shared_permit);
-    let spawn_future =
-        asupersync::runtime::spawn_blocking(move || {
-            let _permit_guard = SharedPermitGuard(closure_permit);
-            work(worker_cancel)
-        });
+    let spawn_future = asupersync::runtime::spawn_blocking(move || {
+        let _permit_guard = SharedPermitGuard(closure_permit);
+        work(worker_cancel)
+    });
 
     if dispatch_timeout_secs == 0 {
         return spawn_future.await;
@@ -10167,9 +10170,7 @@ to skip auth for local requests.</p>
             dispatch_cx,
             DispatchCancel::new(),
             Arc::new(Mutex::new(Some(permit))),
-            move |cancel| {
-                arc_self.dispatch_inner_with_cx(request, &worker_cx, &cancel)
-            },
+            move |cancel| arc_self.dispatch_inner_with_cx(request, &worker_cx, &cancel),
         )
         .await;
 
@@ -27250,6 +27251,68 @@ first body
         assert!(
             thread_id.is_none(),
             "thread_id should be NULL when compose envelope omits it"
+        );
+    }
+
+    #[test]
+    fn dispatch_compose_envelope_db_open_failure_pushes_console_log() {
+        let config = mcp_agent_mail_core::Config::default();
+        let tui_state = tui_bridge::TuiSharedState::new(&config);
+        let envelope = tui_compose::ComposeEnvelope {
+            sender_name: tui_compose::OVERSEER_AGENT_NAME.to_string(),
+            to: vec!["BlueLake".to_string()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "should fail".to_string(),
+            body_md: "body".to_string(),
+            importance: "normal".to_string(),
+            thread_id: None,
+        };
+        dispatch_compose_envelope(
+            "sqlite:///nonexistent/path/compose_fail.sqlite3",
+            &tui_state,
+            &envelope,
+        );
+        let logs = tui_state.console_log_since(0);
+        assert!(
+            logs.iter()
+                .any(|(_, msg)| msg.contains("could not open database")),
+            "DB-open failure must surface to console log, got: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn dispatch_compose_envelope_send_failure_pushes_console_log() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("compose_fail_send.sqlite3");
+        setup_compose_dispatch_test_db(&db_path);
+
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        conn.execute_sync("DROP TABLE message_recipients", &[])
+            .expect("drop table to force send failure");
+        drop(conn);
+
+        let config = mcp_agent_mail_core::Config::default();
+        let tui_state = tui_bridge::TuiSharedState::new(&config);
+        let envelope = tui_compose::ComposeEnvelope {
+            sender_name: tui_compose::OVERSEER_AGENT_NAME.to_string(),
+            to: vec!["BlueLake".to_string()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "should fail on send".to_string(),
+            body_md: "body".to_string(),
+            importance: "normal".to_string(),
+            thread_id: None,
+        };
+        let database_url = format!("sqlite://{}", db_path.display());
+        dispatch_compose_envelope(&database_url, &tui_state, &envelope);
+
+        let logs = tui_state.console_log_since(0);
+        assert!(
+            logs.iter()
+                .any(|(_, msg)| msg.contains("failed to send message")),
+            "dispatch failure must surface to console log, got: {logs:?}"
         );
     }
 
