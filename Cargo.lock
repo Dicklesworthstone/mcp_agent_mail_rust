@@ -5071,6 +5071,7 @@ dependencies = [
 name = "mcp-agent-mail-tools"
 version = "0.2.46"
 dependencies = [
+ "arbitrary",
  "asupersync",
  "chrono",
  "fastmcp-core",
@@ -5084,6 +5085,7 @@ dependencies = [
  "mcp-agent-mail-db",
  "mcp-agent-mail-guard",
  "mcp-agent-mail-storage",
+ "proptest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
