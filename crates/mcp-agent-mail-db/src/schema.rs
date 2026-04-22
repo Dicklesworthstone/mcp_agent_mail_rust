@@ -1471,7 +1471,7 @@ pub fn schema_migrations() -> Vec<Migration> {
         "v16_idx_atc_experiences_open".to_string(),
         "index for open experience lookup (resolution candidates)".to_string(),
         "CREATE INDEX IF NOT EXISTS idx_atc_exp_open \
-         ON atc_experiences(state) WHERE state = 'open'"
+         ON atc_experiences(state)"
             .to_string(),
         String::new(),
     ));
@@ -3292,6 +3292,52 @@ mod tests {
         assert!(ids.contains("v18_rollup_ewma_loss"));
         assert!(ids.contains("v21_atc_experiences_add_feature_schema_version"));
         assert!(!ids.contains("v19_agents_reaper_exempt"));
+    }
+
+    #[test]
+    fn runtime_canonical_followup_keeps_franken_runtime_openable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime_followup_openable.sqlite3");
+        let path = db_path.to_string_lossy().to_string();
+
+        {
+            let conn = DbConn::open_file(&path).expect("open base sqlite connection");
+            block_on({
+                let conn = &conn;
+                move |cx| async move {
+                    migrate_to_latest_base(&cx, conn)
+                        .await
+                        .into_result()
+                        .expect("base migrations");
+                }
+            });
+        }
+
+        for migration in schema_migrations_runtime_canonical_followup() {
+            let migration_id = migration.id.clone();
+            {
+                let conn =
+                    crate::CanonicalDbConn::open_file(&path).expect("open canonical connection");
+                let apply_migration_id = migration_id.clone();
+                block_on({
+                    let conn = &conn;
+                    move |cx| async move {
+                        run_specific_migrations(&cx, conn, vec![migration])
+                            .await
+                            .into_result()
+                            .unwrap_or_else(|err| {
+                                panic!(
+                                    "apply runtime follow-up migration {apply_migration_id}: {err}"
+                                )
+                            });
+                    }
+                });
+            }
+
+            DbConn::open_file(&path).unwrap_or_else(|err| {
+                panic!("franken runtime open after migration {migration_id}: {err}")
+            });
+        }
     }
 
     #[test]

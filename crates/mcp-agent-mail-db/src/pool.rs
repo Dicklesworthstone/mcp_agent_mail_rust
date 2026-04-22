@@ -4485,11 +4485,8 @@ pub fn wal_checkpoint_truncate_path(db_path: &Path) -> DbResult<u64> {
         return Ok(0);
     }
     let path_str = db_path.to_string_lossy();
-    let conn = crate::guard_db_conn(
-        open_sqlite_file_with_lock_retry(path_str.as_ref())
-            .map_err(|e| DbError::Sqlite(format!("checkpoint: open failed: {e}")))?,
-        "wal checkpoint connection",
-    );
+    let conn = open_sqlite_file_with_lock_retry_canonical(path_str.as_ref())
+        .map_err(|e| DbError::Sqlite(format!("checkpoint: open failed: {e}")))?;
 
     conn.execute_raw("PRAGMA busy_timeout = 60000;")
         .map_err(|e| DbError::Sqlite(format!("checkpoint: busy_timeout: {e}")))?;
