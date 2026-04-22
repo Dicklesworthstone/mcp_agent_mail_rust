@@ -225,7 +225,6 @@ fn assert_atc_feature_schema_version_column(conn: &SqliteConnection) {
 
 fn seed_schema_without_migrations(conn: &SqliteConnection, skipped_ids: &[&str]) {
     block_on({
-        let conn = conn;
         move |cx| async move {
             init_migrations_table(&cx, conn)
                 .await

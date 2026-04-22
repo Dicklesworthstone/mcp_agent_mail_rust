@@ -3040,10 +3040,10 @@ async fn run_sqlite_init_once(
         if followup_applied
             .iter()
             .any(|id| schema::is_atc_runtime_canonical_migration(id))
-            && let Err(err) = compact_sqlite_path(Path::new(sqlite_path))
+            && let Err(err) = wal_checkpoint_truncate_path(Path::new(sqlite_path))
         {
             return Outcome::Err(SqlError::Custom(format!(
-                "sqlite init stage=compact_after_atc_followup failed: {err}"
+                "sqlite init stage=checkpoint_after_atc_followup failed: {err}"
             )));
         }
     }
@@ -4495,21 +4495,6 @@ pub fn wal_checkpoint_truncate_path(db_path: &Path) -> DbResult<u64> {
         .query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[])
         .map_err(|e| DbError::Sqlite(format!("checkpoint: {e}")))?;
     parse_wal_checkpoint_rows(&rows, "checkpoint", true)
-}
-
-fn compact_sqlite_path(db_path: &Path) -> DbResult<()> {
-    if db_path.as_os_str() == ":memory:" {
-        return Ok(());
-    }
-    wal_checkpoint_truncate_path(db_path)?;
-    let path_str = db_path.to_string_lossy();
-    let conn = open_sqlite_file_with_lock_retry_canonical(path_str.as_ref())
-        .map_err(|e| DbError::Sqlite(format!("compact: open failed: {e}")))?;
-    conn.execute_raw(schema::PRAGMA_DB_INIT_BASE_SQL)
-        .map_err(|e| DbError::Sqlite(format!("compact: init pragmas failed: {e}")))?;
-    conn.execute_raw("VACUUM")
-        .map_err(|e| DbError::Sqlite(format!("compact: vacuum failed: {e}")))?;
-    Ok(())
 }
 
 fn is_real_directory(path: &Path) -> bool {
@@ -10933,7 +10918,7 @@ mod tests {
             .expect("build runtime");
         let cx = asupersync::Cx::for_testing();
 
-        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let tmp = tempfile::TempDir::new_in("/tmp").expect("tempdir");
         let db_path = tmp.path().join("fresh_bootstrap.sqlite3");
         let db_path_str = db_path.to_str().expect("utf8 db path");
 
@@ -11002,6 +10987,47 @@ mod tests {
                 .count(),
             1,
             "fresh bootstrap should not duplicate agents.registration_token"
+        );
+    }
+
+    #[test]
+    fn sqlite_pool_acquire_bootstraps_fresh_file_with_storage_root_env() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("pool_bootstrap.sqlite3");
+        let db_url = format!("sqlite://{}", db_path.display());
+        let storage_root = tmp.path().join("archive");
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &db_url),
+                (
+                    "STORAGE_ROOT",
+                    storage_root.to_str().expect("utf8 storage root"),
+                ),
+            ],
+            || {
+                let config = DbPoolConfig {
+                    database_url: db_url.clone(),
+                    min_connections: 1,
+                    max_connections: 1,
+                    warmup_connections: 0,
+                    ..Default::default()
+                };
+                let pool = create_pool(&config).expect("create pool");
+                let conn = rt
+                    .block_on(pool.acquire(&cx))
+                    .into_result()
+                    .expect("acquire initialized pool connection");
+                conn.query_sync("SELECT 1 FROM projects LIMIT 0", &[])
+                    .expect("projects table should exist after acquire");
+            },
         );
     }
 

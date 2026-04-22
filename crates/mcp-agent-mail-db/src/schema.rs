@@ -1867,11 +1867,34 @@ fn is_fts_migration(id: &str) -> bool {
     id_lower.contains("fts")
 }
 
+fn is_analyze_migration(id: &str) -> bool {
+    matches!(
+        id,
+        "v4_analyze_after_indexes"
+            | "v13_analyze_after_poller_indexes"
+            | "v16_analyze_atc_experiences"
+    )
+}
+
+fn is_obsolete_message_fts_trigger_migration(id: &str) -> bool {
+    matches!(
+        id,
+        "v1_create_trigger_messages_ai"
+            | "v1_create_trigger_messages_ad"
+            | "v1_create_trigger_messages_au"
+    )
+}
+
 /// Migrations that use SQL features unsupported by `FrankenConnection`.
 ///
 /// Includes FTS5 virtual tables, queries with aggregate functions over JOINs,
 /// CREATE INDEX with expressions (COLLATE NOCASE), and message triggers that
-/// depend on `fts_messages`.
+/// depend on `fts_messages`. The obsolete message FTS triggers are skipped in
+/// both startup lanes; Search V3 decommissions FTS, and reintroducing those
+/// triggers before later table migrations makes SQLite reparse trigger bodies
+/// that reference missing `fts_messages`. ANALYZE migrations are also excluded
+/// because their `sqlite_stat1` table can make FrankenSQLite reenter schema
+/// refresh while query planning.
 ///
 /// `v15_add_recipients_json_to_messages` is also excluded from base mode.
 /// The base-mode startup path and compatibility probes do not require the
@@ -1879,7 +1902,10 @@ fn is_fts_migration(id: &str) -> bool {
 /// `ALTER TABLE ... ADD COLUMN` reparsing under the base engine even though the
 /// rest of the schema is readable and migratable.
 fn is_unsupported_by_franken(id: &str) -> bool {
-    is_fts_migration(id) || is_runtime_canonical_followup_migration(id)
+    is_fts_migration(id)
+        || is_obsolete_message_fts_trigger_migration(id)
+        || is_analyze_migration(id)
+        || is_runtime_canonical_followup_migration(id)
 }
 
 #[must_use]
@@ -1889,7 +1915,6 @@ pub(crate) fn is_atc_runtime_canonical_migration(id: &str) -> bool {
         "v16_create_atc_experiences"
             | "v16a_atc_experiences_backfill_effect_id_from_pk"
             | "v16_create_atc_experience_rollups"
-            | "v16_analyze_atc_experiences"
             | "v17_idx_atc_experiences_decision_effect_unique"
             | "v17_create_atc_leader_lease"
             | "v17_create_atc_rollup_snapshots"
@@ -1908,10 +1933,7 @@ fn is_runtime_canonical_followup_migration(id: &str) -> bool {
     is_atc_runtime_canonical_migration(id)
         || matches!(
             id,
-            "v1_create_trigger_messages_ai"
-                | "v1_create_trigger_messages_ad"
-                | "v1_create_trigger_messages_au"
-                | "v6_backfill_inbox_stats"
+            "v6_backfill_inbox_stats"
                 | "v6_trg_inbox_stats_insert"
                 | "v6_trg_inbox_stats_mark_read"
                 | "v6_trg_inbox_stats_ack"
@@ -2114,10 +2136,25 @@ pub fn migration_runner_base() -> MigrationRunner {
 
 #[must_use]
 pub fn schema_migrations_runtime_canonical_followup() -> Vec<Migration> {
-    schema_migrations()
+    let mut migrations: Vec<_> = schema_migrations()
         .into_iter()
         .filter(|migration| is_runtime_canonical_followup_migration(migration.id.as_str()))
-        .collect()
+        .collect();
+    migrations.sort_by_key(|migration| runtime_canonical_followup_order(migration.id.as_str()));
+    migrations
+}
+
+#[must_use]
+fn runtime_canonical_followup_order(id: &str) -> u8 {
+    if matches!(
+        id,
+        "v15_add_recipients_json_to_messages"
+            | "v15b_backfill_recipients_json"
+            | "v15c_trg_messages_default_recipients_json"
+    ) {
+        return 0;
+    }
+    1
 }
 
 #[must_use]
@@ -2427,6 +2464,70 @@ async fn migration_preflight_already_satisfied<C: Connection>(
     }
 }
 
+async fn execute_v15_add_recipients_json_to_messages<C: Connection>(
+    cx: &Cx,
+    conn: &C,
+) -> Outcome<(), SqlError> {
+    const REBUILD_SQL: [&str; 24] = [
+        "DROP TRIGGER IF EXISTS fts_messages_ai",
+        "DROP TRIGGER IF EXISTS fts_messages_ad",
+        "DROP TRIGGER IF EXISTS fts_messages_au",
+        "DROP TRIGGER IF EXISTS messages_ai",
+        "DROP TRIGGER IF EXISTS messages_ad",
+        "DROP TRIGGER IF EXISTS messages_au",
+        "DROP TRIGGER IF EXISTS trg_inbox_stats_insert",
+        "DROP TRIGGER IF EXISTS trg_inbox_stats_mark_read",
+        "DROP TRIGGER IF EXISTS trg_inbox_stats_ack",
+        "DROP TRIGGER IF EXISTS trg_messages_default_recipients_json",
+        "DROP TABLE IF EXISTS messages_v15_rebuild",
+        "CREATE TABLE messages_v15_rebuild (\
+            id INTEGER PRIMARY KEY AUTOINCREMENT,\
+            project_id INTEGER NOT NULL REFERENCES projects(id),\
+            sender_id INTEGER NOT NULL REFERENCES agents(id),\
+            thread_id TEXT,\
+            subject TEXT NOT NULL,\
+            body_md TEXT NOT NULL,\
+            importance TEXT NOT NULL DEFAULT 'normal',\
+            ack_required INTEGER NOT NULL DEFAULT 0,\
+            created_ts INTEGER NOT NULL,\
+            recipients_json TEXT NOT NULL DEFAULT '{}',\
+            attachments TEXT NOT NULL DEFAULT '[]'\
+        )",
+        "INSERT INTO messages_v15_rebuild \
+            (id, project_id, sender_id, thread_id, subject, body_md, importance, \
+             ack_required, created_ts, recipients_json, attachments) \
+         SELECT id, project_id, sender_id, thread_id, subject, body_md, \
+                COALESCE(NULLIF(importance, ''), 'normal'), \
+                COALESCE(ack_required, 0), \
+                created_ts, \
+                '{}', \
+                COALESCE(NULLIF(attachments, ''), '[]') \
+         FROM messages",
+        "DROP TABLE messages",
+        "ALTER TABLE messages_v15_rebuild RENAME TO messages",
+        "CREATE INDEX IF NOT EXISTS idx_messages_project_created ON messages(project_id, created_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_messages_project_sender_created ON messages(project_id, sender_id, created_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_messages_thread_id ON messages(thread_id)",
+        "CREATE INDEX IF NOT EXISTS idx_messages_importance ON messages(importance)",
+        "CREATE INDEX IF NOT EXISTS idx_messages_created_ts ON messages(created_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_msg_thread_created ON messages(thread_id, created_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_msg_project_importance_created ON messages(project_id, importance, created_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_messages_ack_required_id ON messages(ack_required, id)",
+        "DROP TABLE IF EXISTS messages_v15_rebuild",
+    ];
+
+    for sql in REBUILD_SQL {
+        match conn.execute(cx, sql, &[]).await {
+            Outcome::Ok(_) => {}
+            Outcome::Err(err) => return Outcome::Err(err),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+
+    Outcome::Ok(())
+}
+
 async fn cleanup_legacy_message_fts_artifacts<C: Connection>(
     cx: &Cx,
     conn: &C,
@@ -2523,8 +2624,19 @@ async fn run_single_migration_with_lock_retry<C: Connection>(
                 "migration preflight found schema already satisfies migration; recording migration without executing DDL"
             );
         } else {
-            match conn.execute(cx, &migration.up, &[]).await {
-                Outcome::Ok(_) => {}
+            let statement_result = if migration.id == "v15_add_recipients_json_to_messages" {
+                execute_v15_add_recipients_json_to_messages(cx, conn).await
+            } else {
+                match conn.execute(cx, &migration.up, &[]).await {
+                    Outcome::Ok(_) => Outcome::Ok(()),
+                    Outcome::Err(err) => Outcome::Err(err),
+                    Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+                    Outcome::Panicked(payload) => Outcome::Panicked(payload),
+                }
+            };
+
+            match statement_result {
+                Outcome::Ok(()) => {}
                 Outcome::Err(err) => {
                     if migration.id == "v15b_backfill_recipients_json"
                         && is_missing_fts_messages_error(&err)
@@ -3109,6 +3221,105 @@ mod tests {
     }
 
     #[test]
+    fn recipients_column_rebuild_drops_stale_inbox_triggers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join("migrations_rebuild_stale_inbox_triggers.db");
+        let conn =
+            DbConn::open_file(db_path.display().to_string()).expect("open sqlite connection");
+
+        conn.execute_raw(
+            "CREATE TABLE messages (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                project_id INTEGER NOT NULL,\
+                sender_id INTEGER NOT NULL,\
+                thread_id TEXT,\
+                subject TEXT NOT NULL,\
+                body_md TEXT NOT NULL,\
+                importance TEXT NOT NULL,\
+                ack_required INTEGER NOT NULL,\
+                created_ts INTEGER NOT NULL,\
+                attachments TEXT NOT NULL DEFAULT '[]'\
+            )",
+        )
+        .expect("create legacy messages table");
+        conn.execute_raw(
+            "CREATE TABLE message_recipients (\
+                message_id INTEGER NOT NULL,\
+                agent_id INTEGER NOT NULL,\
+                kind TEXT NOT NULL DEFAULT 'to',\
+                read_ts INTEGER,\
+                ack_ts INTEGER,\
+                PRIMARY KEY(message_id, agent_id)\
+            )",
+        )
+        .expect("create message_recipients table");
+        conn.execute_raw(
+            "CREATE TABLE inbox_stats (\
+                agent_id INTEGER PRIMARY KEY,\
+                total_count INTEGER NOT NULL DEFAULT 0,\
+                unread_count INTEGER NOT NULL DEFAULT 0,\
+                ack_pending_count INTEGER NOT NULL DEFAULT 0,\
+                last_message_ts INTEGER\
+            )",
+        )
+        .expect("create inbox_stats table");
+        conn.execute_raw(
+            "INSERT INTO messages \
+                (project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments) \
+             VALUES (1, 1, 'thread', 'subject', 'body', 'normal', 0, 123, '[]')",
+        )
+        .expect("insert legacy message row");
+        conn.execute_raw(TRG_INBOX_STATS_INSERT_COMPAT_SQL)
+            .expect("create stale inbox trigger");
+
+        block_on({
+            let conn = &conn;
+            move |cx| async move {
+                init_migrations_table(&cx, conn)
+                    .await
+                    .into_result()
+                    .expect("init migrations table");
+                run_single_migration_with_lock_retry(
+                    &cx,
+                    conn,
+                    &Migration::new(
+                        "v15_add_recipients_json_to_messages".to_string(),
+                        "add recipients_json column to messages table".to_string(),
+                        "ALTER TABLE messages ADD COLUMN recipients_json TEXT".to_string(),
+                        String::new(),
+                    ),
+                )
+                .await
+                .into_result()
+                .expect("rebuild messages table with stale inbox trigger present");
+            }
+        });
+
+        let rows = conn
+            .query_sync("SELECT recipients_json FROM messages WHERE id = 1", &[])
+            .expect("query messages");
+        assert_eq!(
+            rows[0]
+                .get_named::<String>("recipients_json")
+                .expect("recipients_json value"),
+            "{}"
+        );
+
+        let trigger_rows = conn
+            .query_sync(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name = 'trg_inbox_stats_insert'",
+                &[],
+            )
+            .expect("query trigger existence");
+        assert!(
+            trigger_rows.is_empty(),
+            "expected stale inbox trigger to be removed"
+        );
+    }
+
+    #[test]
     fn recipients_backfill_recovers_from_stale_fts_triggers() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir
@@ -3252,9 +3463,17 @@ mod tests {
         assert!(ids.contains("base_v2_drop_fts_projects_table"));
 
         // FTS table creation must still be excluded from base migrations.
+        assert!(!ids.contains("v1_create_trigger_messages_ai"));
+        assert!(!ids.contains("v1_create_trigger_messages_ad"));
+        assert!(!ids.contains("v1_create_trigger_messages_au"));
         assert!(!ids.contains("v5_create_fts_with_porter"));
         assert!(!ids.contains("v7_create_fts_agents"));
         assert!(!ids.contains("v7_create_fts_projects"));
+        // ANALYZE creates sqlite_stat1, which currently trips FrankenSQLite's
+        // planner/schema-refresh path after startup.
+        assert!(!ids.contains("v4_analyze_after_indexes"));
+        assert!(!ids.contains("v13_analyze_after_poller_indexes"));
+        assert!(!ids.contains("v16_analyze_atc_experiences"));
         // Inbox trigger DDL is skipped in base mode (runtime tries best-effort compat creation).
         assert!(!ids.contains("v6_trg_inbox_stats_insert"));
         assert!(!ids.contains("v6_trg_inbox_stats_mark_read"));
@@ -3280,18 +3499,36 @@ mod tests {
     fn runtime_canonical_followup_includes_atc_schema_family() {
         use std::collections::HashSet;
 
-        let ids: HashSet<String> = schema_migrations_runtime_canonical_followup()
+        let ordered_ids: Vec<String> = schema_migrations_runtime_canonical_followup()
             .into_iter()
             .map(|m| m.id)
             .collect();
+        let ids: HashSet<String> = ordered_ids.iter().cloned().collect();
 
         assert!(ids.contains("v10a_dedup_agents_case_insensitive"));
         assert!(ids.contains("v15_add_recipients_json_to_messages"));
+        assert!(!ids.contains("v1_create_trigger_messages_ai"));
+        assert!(!ids.contains("v1_create_trigger_messages_ad"));
+        assert!(!ids.contains("v1_create_trigger_messages_au"));
         assert!(ids.contains("v16_create_atc_experiences"));
         assert!(ids.contains("v17_create_atc_leader_lease"));
         assert!(ids.contains("v18_rollup_ewma_loss"));
         assert!(ids.contains("v21_atc_experiences_add_feature_schema_version"));
+        assert!(!ids.contains("v16_analyze_atc_experiences"));
         assert!(!ids.contains("v19_agents_reaper_exempt"));
+
+        let v15_pos = ordered_ids
+            .iter()
+            .position(|id| id == "v15_add_recipients_json_to_messages")
+            .expect("v15 migration is present");
+        let trigger_pos = ordered_ids
+            .iter()
+            .position(|id| id == "v6_trg_inbox_stats_insert")
+            .expect("runtime trigger migration is present");
+        assert!(
+            v15_pos < trigger_pos,
+            "table-shape migrations must run before trigger DDL"
+        );
     }
 
     #[test]
