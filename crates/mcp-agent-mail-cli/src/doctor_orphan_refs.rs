@@ -211,7 +211,7 @@ fn scan_one_project(
 
     // Count total refs via libgit2 so the report shows the true
     // denominator (findings / scanned) rather than just findings.
-    let scanned_refs = count_refs(project_path).unwrap_or_else(|| findings.len());
+    let scanned_refs = count_refs(project_path).unwrap_or(findings.len());
     let summary = DetectionSummary::from_findings(scanned_refs, &findings);
 
     let mut actions = Vec::<ActionRecord>::new();

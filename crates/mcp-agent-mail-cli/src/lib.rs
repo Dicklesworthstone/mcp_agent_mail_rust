@@ -54331,7 +54331,9 @@ fn self_update_metadata_sink_rejects_oversize_before_extending_vec() {
         memory_sink_bytes(sink).is_empty(),
         "chunk must not be appended after the metadata cap is exceeded"
     );
-    assert!(MAX_METADATA_BYTES <= 16 * 1024 * 1024);
+    const {
+        assert!(MAX_METADATA_BYTES <= 16 * 1024 * 1024);
+    }
 }
 
 #[test]
