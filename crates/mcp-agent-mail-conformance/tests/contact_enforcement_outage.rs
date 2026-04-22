@@ -72,8 +72,16 @@ fn call_tool(
         meta: None,
     };
     *req_id += 1;
-    let result =
-        router.handle_tools_call(cx, *req_id, params, budget, SessionState::new(), None, None);
+    let result = router.handle_tools_call(
+        cx,
+        *req_id,
+        params,
+        budget,
+        SessionState::new(),
+        None,
+        None,
+        None,
+    );
     match result {
         Ok(resp) => {
             if resp.is_error {

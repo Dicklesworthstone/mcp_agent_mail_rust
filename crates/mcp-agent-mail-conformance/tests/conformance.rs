@@ -4,8 +4,11 @@
 use fastmcp::{Budget, CallToolParams, Content, Cx, ListToolsParams, ReadResourceParams};
 use fastmcp_core::SessionState;
 use mcp_agent_mail_conformance::{Case, ExpectedError, Fixtures, Normalize};
+use proptest::prelude::*;
+use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestRunner};
 use serde::Deserialize;
 use serde_json::Value;
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -546,6 +549,313 @@ fn rust_native_tool_names() -> BTreeSet<String> {
         .collect()
 }
 
+#[derive(Debug)]
+struct HandwrittenToolFailureCase {
+    tool_name: &'static str,
+    case_name: &'static str,
+    input: Value,
+    expected_err: ExpectedError,
+}
+
+fn expected_error_containing(needle: &str) -> ExpectedError {
+    ExpectedError {
+        message_contains: Some(needle.to_string()),
+        ..ExpectedError::default()
+    }
+}
+
+fn handwritten_tool_failure_cases() -> Vec<HandwrittenToolFailureCase> {
+    vec![
+        HandwrittenToolFailureCase {
+            tool_name: "health_check",
+            case_name: "malformed_non_object_arguments",
+            input: serde_json::json!([]),
+            expected_err: expected_error_containing("invalid type"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "register_agent",
+            case_name: "empty_program_error",
+            input: serde_json::json!({
+                "project_key": "abs-path-backend",
+                "program": "",
+                "model": "gpt-5"
+            }),
+            expected_err: expected_error_containing("program cannot be empty"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "create_agent_identity",
+            case_name: "empty_model_error",
+            input: serde_json::json!({
+                "project_key": "abs-path-backend",
+                "program": "codex-cli",
+                "model": ""
+            }),
+            expected_err: expected_error_containing("model cannot be empty"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "request_contact",
+            case_name: "project_not_found_error",
+            input: serde_json::json!({
+                "project_key": "missing-project",
+                "from_agent": "BlueLake",
+                "to_agent": "GreenCastle",
+                "register_if_missing": false
+            }),
+            expected_err: expected_error_containing("not found"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "respond_contact",
+            case_name: "project_not_found_error",
+            input: serde_json::json!({
+                "project_key": "missing-project",
+                "to_agent": "BlueLake",
+                "from_agent": "GreenCastle",
+                "accept": true
+            }),
+            expected_err: expected_error_containing("not found"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "list_contacts",
+            case_name: "project_not_found_error",
+            input: serde_json::json!({
+                "project_key": "missing-project",
+                "agent_name": "BlueLake"
+            }),
+            expected_err: expected_error_containing("not found"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "set_contact_policy",
+            case_name: "project_not_found_error",
+            input: serde_json::json!({
+                "project_key": "missing-project",
+                "agent_name": "BlueLake",
+                "policy": "open"
+            }),
+            expected_err: expected_error_containing("not found"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "reply_message",
+            case_name: "project_not_found_error",
+            input: serde_json::json!({
+                "project_key": "missing-project",
+                "message_id": 999999,
+                "sender_name": "BlueLake",
+                "body_md": "Reply"
+            }),
+            expected_err: expected_error_containing("not found"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "fetch_inbox",
+            case_name: "invalid_limit_error",
+            input: serde_json::json!({
+                "project_key": "abs-path-backend",
+                "agent_name": "BlueLake",
+                "limit": 0
+            }),
+            expected_err: expected_error_containing("limit must be at least 1"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "mark_message_read",
+            case_name: "project_not_found_error",
+            input: serde_json::json!({
+                "project_key": "missing-project",
+                "agent_name": "BlueLake",
+                "message_id": 999999
+            }),
+            expected_err: expected_error_containing("not found"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "acknowledge_message",
+            case_name: "project_not_found_error",
+            input: serde_json::json!({
+                "project_key": "missing-project",
+                "agent_name": "BlueLake",
+                "message_id": 999999
+            }),
+            expected_err: expected_error_containing("not found"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "release_file_reservations",
+            case_name: "project_not_found_error",
+            input: serde_json::json!({
+                "project_key": "missing-project",
+                "agent_name": "BlueLake",
+                "paths": ["src/**"]
+            }),
+            expected_err: expected_error_containing("not found"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "install_precommit_guard",
+            case_name: "malformed_non_object_arguments",
+            input: serde_json::json!([]),
+            expected_err: expected_error_containing("invalid type"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "uninstall_precommit_guard",
+            case_name: "malformed_non_object_arguments",
+            input: serde_json::json!([]),
+            expected_err: expected_error_containing("invalid type"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "list_agents",
+            case_name: "project_not_found_error",
+            input: serde_json::json!({ "project_key": "missing-project" }),
+            expected_err: expected_error_containing("not found"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "cleanup_pane_identities",
+            case_name: "malformed_non_object_arguments",
+            input: serde_json::json!([]),
+            expected_err: expected_error_containing("invalid type"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "macro_start_session",
+            case_name: "relative_human_key_error",
+            input: serde_json::json!({
+                "human_key": "relative-project",
+                "program": "codex-cli",
+                "model": "gpt-5"
+            }),
+            expected_err: expected_error_containing("human_key must be an absolute path"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "macro_prepare_thread",
+            case_name: "empty_thread_id_error",
+            input: serde_json::json!({
+                "project_key": "abs-path-backend",
+                "thread_id": "   ",
+                "program": "codex-cli",
+                "model": "gpt-5"
+            }),
+            expected_err: expected_error_containing("thread_id must not be empty"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "macro_file_reservation_cycle",
+            case_name: "empty_paths_error",
+            input: serde_json::json!({
+                "project_key": "abs-path-backend",
+                "agent_name": "BlueLake",
+                "paths": []
+            }),
+            expected_err: expected_error_containing("paths must not be empty"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "macro_contact_handshake",
+            case_name: "missing_requester_error",
+            input: serde_json::json!({
+                "project_key": "abs-path-backend",
+                "to_agent": "GreenCastle"
+            }),
+            expected_err: expected_error_containing("requester or agent_name is required"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "ensure_product",
+            case_name: "missing_product_key_error",
+            input: serde_json::json!({}),
+            expected_err: expected_error_containing("Provide product_key or name"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "products_link",
+            case_name: "product_not_found_error",
+            input: serde_json::json!({
+                "product_key": "missing-product",
+                "project_key": "abs-path-backend"
+            }),
+            expected_err: expected_error_containing("Product not found"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "search_messages_product",
+            case_name: "product_not_found_error",
+            input: serde_json::json!({
+                "product_key": "missing-product",
+                "query": "hello"
+            }),
+            expected_err: expected_error_containing("Product not found"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "fetch_inbox_product",
+            case_name: "product_not_found_error",
+            input: serde_json::json!({
+                "product_key": "missing-product",
+                "agent_name": "BlueLake"
+            }),
+            expected_err: expected_error_containing("Product not found"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "summarize_thread_product",
+            case_name: "product_not_found_error",
+            input: serde_json::json!({
+                "product_key": "missing-product",
+                "thread_id": "T-404"
+            }),
+            expected_err: expected_error_containing("Product not found"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "acquire_build_slot",
+            case_name: "project_not_found_error",
+            input: serde_json::json!({
+                "project_key": "missing-project",
+                "agent_name": "BlueLake",
+                "slot": "build"
+            }),
+            expected_err: expected_error_containing("not found"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "renew_build_slot",
+            case_name: "project_not_found_error",
+            input: serde_json::json!({
+                "project_key": "missing-project",
+                "agent_name": "BlueLake",
+                "slot": "build"
+            }),
+            expected_err: expected_error_containing("not found"),
+        },
+        HandwrittenToolFailureCase {
+            tool_name: "release_build_slot",
+            case_name: "project_not_found_error",
+            input: serde_json::json!({
+                "project_key": "missing-project",
+                "agent_name": "BlueLake",
+                "slot": "build"
+            }),
+            expected_err: expected_error_containing("not found"),
+        },
+    ]
+}
+
+fn handwritten_tool_happy_case_tools() -> BTreeSet<&'static str> {
+    BTreeSet::from(["force_release_file_reservation"])
+}
+
+fn rust_native_tool_case_shapes() -> BTreeMap<String, (bool, bool)> {
+    let mut shapes = BTreeMap::new();
+    for fixture in load_rust_native_tool_fixtures() {
+        let entry = shapes.entry(fixture.tool).or_insert((false, false));
+        for case in fixture.cases {
+            entry.0 |= case.expect.ok_golden_output_path.is_some();
+            entry.1 |= case.expect.err.is_some();
+        }
+    }
+    shapes
+}
+
+fn generated_malformed_argument_strategy() -> impl Strategy<Value = Value> {
+    prop_oneof![
+        any::<bool>().prop_map(Value::Bool),
+        any::<i64>().prop_map(|n| Value::Number(n.into())),
+        ".{0,32}".prop_map(Value::String),
+        prop::collection::vec(any::<i64>(), 0..4).prop_map(|items| serde_json::json!(items)),
+    ]
+}
+
+fn looks_like_argument_deserialization_error(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("invalid type")
+        || lower.contains("tool arguments must be a json object")
+        || (lower.contains("expected") && lower.contains("object"))
+        || (lower.contains("expected") && lower.contains("struct"))
+}
+
 fn extract_tool_names_from_directory(value: &Value) -> Vec<String> {
     let mut names = Vec::new();
     let Some(clusters) = value.get("clusters").and_then(|v| v.as_array()) else {
@@ -641,7 +951,16 @@ fn execute_tool(
         meta: None,
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        router.handle_tools_call(cx, *req_id, params, budget, SessionState::new(), None, None)
+        router.handle_tools_call(
+            cx,
+            *req_id,
+            params,
+            budget,
+            SessionState::new(),
+            None,
+            None,
+            None,
+        )
     }))
     .map_err(|payload| {
         format!(
@@ -1016,6 +1335,7 @@ fn run_fixtures_against_rust_server_router() {
                     SessionState::new(),
                     None,
                     None,
+                    None,
                 )
             }))
             .unwrap_or_else(|payload| {
@@ -1098,6 +1418,7 @@ fn run_fixtures_against_rust_server_router() {
                 &params,
                 &budget,
                 SessionState::new(),
+                None,
                 None,
                 None,
             );
@@ -1651,6 +1972,7 @@ fn run_fixtures_against_rust_server_router() {
             SessionState::new(),
             None,
             None,
+            None,
         )
         .unwrap_or_else(|e| panic!("ensure_project failed: {e}"));
     req_id += 1;
@@ -1674,6 +1996,7 @@ fn run_fixtures_against_rust_server_router() {
                 register_params,
                 &budget,
                 SessionState::new(),
+                None,
                 None,
                 None,
             )
@@ -1707,6 +2030,7 @@ fn run_fixtures_against_rust_server_router() {
             send_params,
             &budget,
             SessionState::new(),
+            None,
             None,
             None,
         )
@@ -1771,6 +2095,7 @@ fn run_fixtures_against_rust_server_router() {
             SessionState::new(),
             None,
             None,
+            None,
         )
         .unwrap_or_else(|e| panic!("fetch_inbox failed: {e}"));
     assert!(!fetch_result.is_error, "fetch_inbox returned error");
@@ -1818,7 +2143,16 @@ fn tool_filter_profiles_match_fixtures() {
             meta: None,
         };
         let result = router
-            .handle_resources_read(&cx, 1, &params, &budget, SessionState::new(), None, None)
+            .handle_resources_read(
+                &cx,
+                1,
+                &params,
+                &budget,
+                SessionState::new(),
+                None,
+                None,
+                None,
+            )
             .expect("tooling directory read failed");
         let dir_json = decode_json_from_resource_contents(&params.uri, &result.contents)
             .expect("tooling directory JSON decode failed");
@@ -2125,6 +2459,7 @@ fn backpressure_shedding_rejects_only_shedable_tools_when_enabled() {
         SessionState::new(),
         None,
         None,
+        None,
     );
     req_id += 1;
     match shedable_result {
@@ -2165,6 +2500,7 @@ fn backpressure_shedding_rejects_only_shedable_tools_when_enabled() {
             critical_params,
             &budget,
             SessionState::new(),
+            None,
             None,
             None,
         )
@@ -2224,6 +2560,7 @@ fn product_bus_tools_end_to_end_across_linked_projects() {
                 params,
                 &budget,
                 SessionState::new(),
+                None,
                 None,
                 None,
             )
@@ -2581,6 +2918,226 @@ fn fixture_tool_error_case_coverage() {
 }
 
 #[test]
+fn fixture_tool_happy_and_failure_shape_coverage() {
+    let fixtures = Fixtures::load_default().expect("failed to load fixtures");
+    let rust_native_shapes = rust_native_tool_case_shapes();
+    let handwritten_failure_tools: BTreeSet<&str> = handwritten_tool_failure_cases()
+        .into_iter()
+        .map(|case| case.tool_name)
+        .collect();
+    let handwritten_happy_tools = handwritten_tool_happy_case_tools();
+
+    for &(tool_name, _) in mcp_agent_mail_tools::TOOL_CLUSTER_MAP {
+        let python_fixture = fixtures.tools.get(tool_name);
+        let python_has_ok = python_fixture
+            .is_some_and(|fixture| fixture.cases.iter().any(|case| case.expect.ok.is_some()));
+        let python_has_err = python_fixture
+            .is_some_and(|fixture| fixture.cases.iter().any(|case| case.expect.err.is_some()));
+        let (rust_has_ok, rust_has_err) = rust_native_shapes
+            .get(tool_name)
+            .copied()
+            .unwrap_or((false, false));
+        let handwritten_has_ok = handwritten_happy_tools.contains(tool_name);
+        let handwritten_has_err = handwritten_failure_tools.contains(tool_name);
+
+        assert!(
+            python_has_ok || rust_has_ok || handwritten_has_ok,
+            "tool {tool_name} must have at least one happy-path conformance case"
+        );
+        assert!(
+            python_has_err || rust_has_err || handwritten_has_err,
+            "tool {tool_name} must have at least one failure-shape conformance case"
+        );
+    }
+}
+
+#[test]
+fn handwritten_tool_failure_cases_match_rust_router() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let env = setup_fixture_env();
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+    let mut req_id: u64 = 1;
+
+    for case in handwritten_tool_failure_cases() {
+        match execute_tool(
+            &env.router,
+            &cx,
+            &budget,
+            &mut req_id,
+            case.tool_name,
+            Some(case.input),
+        ) {
+            Ok(Ok(value)) => panic!(
+                "tool {} case {} expected error, got ok: {value}",
+                case.tool_name, case.case_name
+            ),
+            Ok(Err(err_text)) | Err(err_text) => {
+                assert_expected_error(&err_text, &case.expected_err);
+            }
+        }
+    }
+}
+
+#[test]
+fn force_release_file_reservation_happy_path_is_covered() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("force-release-happy.sqlite3");
+    let db_url = format!("sqlite://{}", db_path.display());
+    let storage = tmp.path().join("archive");
+    let project_key = tmp
+        .path()
+        .join("force-release-project")
+        .to_string_lossy()
+        .to_string();
+    let _env_guard = EnvVarGuard::set(&[
+        ("DATABASE_URL", &db_url),
+        ("STORAGE_ROOT", storage.to_str().unwrap_or_default()),
+        ("TOOLS_FILTER_ENABLED", "0"),
+        ("AGENT_NAME_ENFORCEMENT_MODE", "coerce"),
+        ("FILE_RESERVATION_INACTIVITY_SECONDS", "0"),
+        ("FILE_RESERVATION_ACTIVITY_GRACE_SECONDS", "0"),
+    ]);
+    initialize_runtime_mailbox(&db_url);
+
+    let config = mcp_agent_mail_core::Config::from_env();
+    let router = mcp_agent_mail_server::build_server(&config).into_router();
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+    let mut req_id: u64 = 1;
+
+    execute_tool(
+        &router,
+        &cx,
+        &budget,
+        &mut req_id,
+        "ensure_project",
+        Some(serde_json::json!({ "human_key": project_key.as_str() })),
+    )
+    .expect("ensure_project router")
+    .expect("ensure_project ok");
+
+    for name in ["BlueLake", "GreenCastle"] {
+        execute_tool(
+            &router,
+            &cx,
+            &budget,
+            &mut req_id,
+            "register_agent",
+            Some(serde_json::json!({
+                "project_key": project_key.as_str(),
+                "program": "codex-cli",
+                "model": "gpt-5",
+                "name": name
+            })),
+        )
+        .unwrap_or_else(|err| panic!("register_agent router error for {name}: {err}"))
+        .unwrap_or_else(|err| panic!("register_agent tool error for {name}: {err}"));
+    }
+
+    let reservation = execute_tool(
+        &router,
+        &cx,
+        &budget,
+        &mut req_id,
+        "file_reservation_paths",
+        Some(serde_json::json!({
+            "project_key": project_key.as_str(),
+            "agent_name": "BlueLake",
+            "paths": ["nonexistent-force-release-path.rs"],
+            "ttl_seconds": 60,
+            "exclusive": true,
+            "reason": "conformance-force-release"
+        })),
+    )
+    .expect("file_reservation_paths router")
+    .expect("file_reservation_paths ok");
+    let reservation_id = reservation
+        .pointer("/granted/0/id")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| panic!("reservation response missing granted[0].id: {reservation}"));
+
+    let released = execute_tool(
+        &router,
+        &cx,
+        &budget,
+        &mut req_id,
+        "force_release_file_reservation",
+        Some(serde_json::json!({
+            "project_key": project_key.as_str(),
+            "agent_name": "GreenCastle",
+            "file_reservation_id": reservation_id,
+            "note": "conformance happy path",
+            "notify_previous": false
+        })),
+    )
+    .expect("force_release_file_reservation router")
+    .expect("force_release_file_reservation ok");
+
+    assert_eq!(released["released"], 1);
+    assert_eq!(released["reservation"]["id"], reservation_id);
+    assert_eq!(released["reservation"]["agent"], "BlueLake");
+    assert_eq!(
+        released["reservation"]["path_pattern"],
+        "nonexistent-force-release-path.rs"
+    );
+    assert_eq!(released["reservation"]["notified"], false);
+}
+
+#[test]
+fn generated_non_object_arguments_are_rejected_for_every_tool() {
+    let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let env = setup_fixture_env();
+    let cx = Cx::for_testing();
+    let budget = Budget::INFINITE;
+    let req_id = Cell::new(1_u64);
+    let tool_names: Vec<&'static str> = mcp_agent_mail_tools::TOOL_CLUSTER_MAP
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    let mut runner = TestRunner::new(ProptestConfig {
+        cases: 16,
+        ..ProptestConfig::default()
+    });
+
+    runner
+        .run(&generated_malformed_argument_strategy(), |input| {
+            for tool_name in &tool_names {
+                let mut next_req_id = req_id.get();
+                let result = execute_tool(
+                    &env.router,
+                    &cx,
+                    &budget,
+                    &mut next_req_id,
+                    tool_name,
+                    Some(input.clone()),
+                );
+                req_id.set(next_req_id);
+
+                let err_text = match result {
+                    Ok(Ok(value)) => {
+                        return Err(TestCaseError::fail(format!(
+                            "tool {tool_name} accepted malformed non-object arguments {input}: {value}"
+                        )));
+                    }
+                    Ok(Err(err_text)) | Err(err_text) => err_text,
+                };
+                prop_assert!(
+                    looks_like_argument_deserialization_error(&err_text),
+                    "tool {} returned non-parser error for malformed non-object arguments {}: {}",
+                    tool_name,
+                    input,
+                    err_text
+                );
+            }
+            Ok(())
+        })
+        .expect("non-object argument parser property should hold for every tool");
+}
+
+#[test]
 fn fixture_resource_identity_coverage() {
     let fixtures = Fixtures::load_default().expect("failed to load fixtures");
 
@@ -2640,6 +3197,7 @@ fn resource_query_router_projects_limit_and_contains_are_honored() {
             SessionState::new(),
             None,
             None,
+            None,
         );
         req_id += 1;
         let call_result = result.unwrap_or_else(|e| panic!("ensure_project failed: {e}"));
@@ -2657,6 +3215,7 @@ fn resource_query_router_projects_limit_and_contains_are_honored() {
         &params,
         &budget,
         SessionState::new(),
+        None,
         None,
         None,
     );
@@ -2697,6 +3256,7 @@ fn resource_query_router_projects_limit_and_contains_are_honored() {
             &zero_params,
             &budget,
             SessionState::new(),
+            None,
             None,
             None,
         )
@@ -2751,6 +3311,7 @@ fn resource_query_router_projects_invalid_query_values_surface_errors() {
             &params,
             &budget,
             SessionState::new(),
+            None,
             None,
             None,
         );
@@ -2835,6 +3396,7 @@ fn resource_router_error_cases_missing_projects_invalid_uris_and_bad_params() {
             SessionState::new(),
             None,
             None,
+            None,
         );
 
         let contains_any = |text: &str| -> bool {
@@ -2913,7 +3475,16 @@ fn toon_format_resolution_json_fallback() {
         arguments: None,
         meta: None,
     };
-    let result = router.handle_tools_call(&cx, 1, params, &budget, SessionState::new(), None, None);
+    let result = router.handle_tools_call(
+        &cx,
+        1,
+        params,
+        &budget,
+        SessionState::new(),
+        None,
+        None,
+        None,
+    );
     let call_result = result.expect("health_check should not fail");
     assert!(!call_result.is_error, "health_check should succeed");
 
@@ -2980,6 +3551,7 @@ fn llm_mode_parameter_accepted_by_tools() {
         SessionState::new(),
         None,
         None,
+        None,
     );
     req_id += 1;
     let call_result = result.unwrap_or_else(|e| panic!("ensure_project setup failed: {e}"));
@@ -3034,6 +3606,7 @@ fn llm_mode_parameter_accepted_by_tools() {
         SessionState::new(),
         None,
         None,
+        None,
     );
     req_id += 1;
     let call_result = result.expect("summarize_thread should not fail with llm_mode=false");
@@ -3069,6 +3642,7 @@ fn llm_mode_parameter_accepted_by_tools() {
         params,
         &budget,
         SessionState::new(),
+        None,
         None,
         None,
     );
