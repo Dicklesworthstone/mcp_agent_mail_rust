@@ -3314,6 +3314,96 @@ pub fn commit_lock_path(repo_root: &Path, rel_paths: &[&str]) -> PathBuf {
     }
 }
 
+#[cfg(fuzzing)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FuzzWbqEnqueueOutcome {
+    pub result: WbqEnqueueResult,
+    pub depth: u64,
+    pub remaining_messages: usize,
+}
+
+#[cfg(fuzzing)]
+pub fn fuzz_wbq_enqueue_scenario(
+    capacity: u8,
+    prefill: u8,
+    drop_receiver: bool,
+    disk_pressure_level: u64,
+) -> FuzzWbqEnqueueOutcome {
+    let capacity = usize::from(capacity.clamp(1, 8));
+    let prefill = usize::from(prefill).min(capacity.saturating_sub(1));
+    let (tx, rx) = std::sync::mpsc::sync_channel(capacity);
+
+    for index in 0..prefill {
+        let _ = tx.try_send(WbqMsg::Op(WbqOpEnvelope {
+            enqueued_at: Instant::now(),
+            op: Box::new(WriteOp::ClearSignal {
+                config: Config::default(),
+                project_slug: format!("fuzz-prefill-{index}"),
+                agent_name: "FuzzAgent".to_string(),
+            }),
+        }));
+    }
+
+    let op_depth = AtomicU64::new(0);
+    if drop_receiver {
+        drop(rx);
+        let result = wbq_enqueue_with_sender_and_pressure(
+            &tx,
+            &op_depth,
+            WriteOp::ClearSignal {
+                config: Config::default(),
+                project_slug: "fuzz-disconnected".to_string(),
+                agent_name: "FuzzAgent".to_string(),
+            },
+            disk_pressure_level,
+        );
+        return FuzzWbqEnqueueOutcome {
+            result,
+            depth: op_depth.load(Ordering::Relaxed),
+            remaining_messages: 0,
+        };
+    }
+
+    let result = wbq_enqueue_with_sender_and_pressure(
+        &tx,
+        &op_depth,
+        WriteOp::ClearSignal {
+            config: Config::default(),
+            project_slug: "fuzz-live".to_string(),
+            agent_name: "FuzzAgent".to_string(),
+        },
+        disk_pressure_level,
+    );
+    drop(tx);
+    let remaining_messages = rx.try_iter().count();
+
+    FuzzWbqEnqueueOutcome {
+        result,
+        depth: op_depth.load(Ordering::Relaxed),
+        remaining_messages,
+    }
+}
+
+#[cfg(fuzzing)]
+pub fn fuzz_coalescer_batch_summary(wall_offsets_seconds: &[i64]) -> String {
+    let base = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap_or_else(Utc::now);
+    let requests: Vec<CoalescerCommitFields> = wall_offsets_seconds
+        .iter()
+        .take(128)
+        .enumerate()
+        .map(|(index, offset)| CoalescerCommitFields {
+            enqueued_at: Instant::now(),
+            enqueued_wall: base + chrono::Duration::seconds(offset.rem_euclid(86_400)),
+            git_author_name: "Fuzz".to_string(),
+            git_author_email: "fuzz@example.invalid".to_string(),
+            message: format!("fuzz commit {index}"),
+            rel_paths: vec![format!("projects/fuzz/file-{index}.json")],
+        })
+        .collect();
+
+    coalescer_batch_commit_message(&requests)
+}
+
 /// Check if an error is a git index.lock contention error.
 fn is_git_index_lock_error(err: &git2::Error) -> bool {
     let msg = err.message().to_lowercase();

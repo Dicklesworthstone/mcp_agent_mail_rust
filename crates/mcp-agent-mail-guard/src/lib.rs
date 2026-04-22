@@ -1870,6 +1870,33 @@ fn parse_name_status_z(raw: &[u8]) -> GuardResult<Vec<String>> {
     Ok(paths)
 }
 
+#[cfg(fuzzing)]
+#[must_use]
+pub fn fuzz_normalize_path(path: &str, ignorecase: bool) -> String {
+    normalize_path(path, ignorecase)
+}
+
+#[cfg(fuzzing)]
+#[must_use]
+pub fn fuzz_contains_glob(pattern: &str) -> bool {
+    contains_glob(pattern)
+}
+
+#[cfg(fuzzing)]
+pub fn fuzz_parse_name_status_z(raw: &[u8]) -> GuardResult<Vec<String>> {
+    parse_name_status_z(raw)
+}
+
+#[cfg(fuzzing)]
+pub fn fuzz_check_path_conflicts(
+    paths: &[String],
+    reservations: &[FileReservationRecord],
+    self_agent: &str,
+    ignorecase: bool,
+) -> GuardResult<Vec<GuardConflict>> {
+    check_path_conflicts(paths, reservations, self_agent, ignorecase)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,0 +1,59 @@
+[package]
+name = "mcp-agent-mail-storage-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1.4.2", features = ["derive"] }
+libfuzzer-sys = "0.4.12"
+mcp-agent-mail-storage = { path = ".." }
+
+[patch.crates-io]
+fastmcp-rust = { path = "../../../../fastmcp_rust/crates/fastmcp" }
+fastmcp-core = { path = "../../../../fastmcp_rust/crates/fastmcp-core" }
+fastmcp-server = { path = "../../../../fastmcp_rust/crates/fastmcp-server" }
+fastmcp-transport = { path = "../../../../fastmcp_rust/crates/fastmcp-transport" }
+fastmcp-protocol = { path = "../../../../fastmcp_rust/crates/fastmcp-protocol" }
+sqlmodel = { path = "../../../../sqlmodel_rust/crates/sqlmodel" }
+sqlmodel-core = { path = "../../../../sqlmodel_rust/crates/sqlmodel-core" }
+sqlmodel-macros = { path = "../../../../sqlmodel_rust/crates/sqlmodel-macros" }
+sqlmodel-query = { path = "../../../../sqlmodel_rust/crates/sqlmodel-query" }
+sqlmodel-schema = { path = "../../../../sqlmodel_rust/crates/sqlmodel-schema" }
+sqlmodel-session = { path = "../../../../sqlmodel_rust/crates/sqlmodel-session" }
+sqlmodel-pool = { path = "../../../../sqlmodel_rust/crates/sqlmodel-pool" }
+sqlmodel-frankensqlite = { path = "../../../../sqlmodel_rust/crates/sqlmodel-frankensqlite" }
+sqlmodel-sqlite = { path = "../../../../sqlmodel_rust/crates/sqlmodel-sqlite" }
+fsqlite = { path = "../../../../frankensqlite/crates/fsqlite" }
+fsqlite-core = { path = "../../../../frankensqlite/crates/fsqlite-core" }
+fsqlite-types = { path = "../../../../frankensqlite/crates/fsqlite-types" }
+fsqlite-error = { path = "../../../../frankensqlite/crates/fsqlite-error" }
+fsqlite-vfs = { path = "../../../../frankensqlite/crates/fsqlite-vfs" }
+fsqlite-wal = { path = "../../../../frankensqlite/crates/fsqlite-wal" }
+fsqlite-pager = { path = "../../../../frankensqlite/crates/fsqlite-pager" }
+fsqlite-mvcc = { path = "../../../../frankensqlite/crates/fsqlite-mvcc" }
+fsqlite-btree = { path = "../../../../frankensqlite/crates/fsqlite-btree" }
+fsqlite-ast = { path = "../../../../frankensqlite/crates/fsqlite-ast" }
+fsqlite-parser = { path = "../../../../frankensqlite/crates/fsqlite-parser" }
+fsqlite-planner = { path = "../../../../frankensqlite/crates/fsqlite-planner" }
+fsqlite-vdbe = { path = "../../../../frankensqlite/crates/fsqlite-vdbe" }
+fsqlite-func = { path = "../../../../frankensqlite/crates/fsqlite-func" }
+
+[[bin]]
+name = "storage_wbq_enqueue"
+path = "fuzz_targets/storage_wbq_enqueue.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "storage_commit_coalescer"
+path = "fuzz_targets/storage_commit_coalescer.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
