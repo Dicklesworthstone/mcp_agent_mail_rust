@@ -360,6 +360,17 @@ impl ReconstructStats {
             sample_ids
         ));
     }
+
+    fn finalize_cross_project_canonical_collision_warnings(&mut self) {
+        if self.cross_project_canonical_collisions <= DUPLICATE_CANONICAL_WARNING_SAMPLE_LIMIT {
+            return;
+        }
+        self.warnings.push(format!(
+            "Preserved {} cross-project canonical id collision(s) under generated DB ids; only the first {} were itemized in warnings above",
+            self.cross_project_canonical_collisions,
+            DUPLICATE_CANONICAL_WARNING_SAMPLE_LIMIT
+        ));
+    }
 }
 
 impl std::fmt::Display for ReconstructStats {
@@ -1294,6 +1305,7 @@ pub fn reconstruct_from_archive(db_path: &Path, storage_root: &Path) -> DbResult
         .map_err(|e| DbError::Sqlite(format!("reconstruct: checkpoint: {e}")))?;
 
     stats.finalize_duplicate_warnings();
+    stats.finalize_cross_project_canonical_collision_warnings();
     tracing::info!(%stats, "database reconstruction from archive complete");
     Ok(stats)
 }
@@ -5864,9 +5876,9 @@ second body
         let db_path = tmp.path().join("test.db");
         let storage_root = tmp.path().join("storage");
 
-        for (slug, subject_body, sender, recipient) in [
-            ("project-a", "Alice A", "Alice", "Bob"),
-            ("project-b", "Alice B", "Alice", "Carol"),
+        for (slug, file_slug, subject_body, sender, recipient) in [
+            ("project-a", "alice-a", "Alice A", "Alice", "Bob"),
+            ("project-b", "alice-b", "Alice B", "Alice", "Carol"),
         ] {
             let project_dir = storage_root.join("projects").join(slug);
             let agent_dir = project_dir.join("agents").join(sender);
@@ -5889,7 +5901,7 @@ second body
             .unwrap();
             std::fs::write(
                 messages_dir.join(format!(
-                    "2026-02-22T12-00-00Z__{subject_body}__7.md"
+                    "2026-02-22T12-00-00Z__{file_slug}__7.md"
                 )),
                 format!(
                     r#"---json
@@ -5948,6 +5960,47 @@ body for {slug}
             .query_sync("SELECT id FROM messages WHERE id = 7", &[])
             .unwrap();
         assert_eq!(canonical_rows.len(), 1);
+    }
+
+    #[test]
+    fn finalize_cross_project_canonical_collision_warnings_emits_summary_above_sample_limit() {
+        // Below or at the sample limit: no summary line — the per-collision
+        // warnings already itemize everything.
+        let mut at_limit = ReconstructStats {
+            cross_project_canonical_collisions: DUPLICATE_CANONICAL_WARNING_SAMPLE_LIMIT,
+            ..ReconstructStats::default()
+        };
+        at_limit.finalize_cross_project_canonical_collision_warnings();
+        assert!(
+            at_limit.warnings.is_empty(),
+            "no summary expected at the sample limit, got {:?}",
+            at_limit.warnings
+        );
+
+        // Above the sample limit: emit a single summary so the diagnostic
+        // count survives even when the per-occurrence warning loop stopped.
+        let mut over_limit = ReconstructStats {
+            cross_project_canonical_collisions: DUPLICATE_CANONICAL_WARNING_SAMPLE_LIMIT + 7,
+            ..ReconstructStats::default()
+        };
+        over_limit.finalize_cross_project_canonical_collision_warnings();
+        assert_eq!(
+            over_limit.warnings.len(),
+            1,
+            "exactly one summary line expected above the sample limit"
+        );
+        let summary = &over_limit.warnings[0];
+        assert!(
+            summary.contains(&format!(
+                "{}",
+                DUPLICATE_CANONICAL_WARNING_SAMPLE_LIMIT + 7
+            )),
+            "summary must report the total collision count, got: {summary}"
+        );
+        assert!(
+            summary.contains("cross-project"),
+            "summary must mention cross-project, got: {summary}"
+        );
     }
 
     #[test]
