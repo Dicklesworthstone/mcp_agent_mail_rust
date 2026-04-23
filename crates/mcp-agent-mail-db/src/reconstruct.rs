@@ -188,11 +188,17 @@ pub struct ReconstructStats {
     /// Number of message-recipient rows inserted.
     pub recipients: usize,
     /// Number of duplicate canonical archive files skipped because their
-    /// positive frontmatter `id` had already been recovered.
+    /// positive frontmatter `id` had already been recovered within the same
+    /// project.
     pub duplicate_canonical_message_files: usize,
     /// Number of distinct logical message ids represented by the skipped
     /// duplicate canonical archive files.
     pub duplicate_canonical_message_ids: usize,
+    /// Number of messages re-inserted under a generated DB id because their
+    /// canonical frontmatter id collided with a message from a *different*
+    /// project. These are preserved (not skipped) to avoid cross-project
+    /// data loss.
+    pub cross_project_canonical_collisions: usize,
     /// Number of projects recovered only from a salvaged database.
     pub salvaged_projects: usize,
     /// Number of agents recovered only from a salvaged database.
@@ -316,6 +322,25 @@ impl ReconstructStats {
         }
     }
 
+    fn record_cross_project_canonical_collision(
+        &mut self,
+        message_id: i64,
+        existing_project_id: i64,
+        new_project_id: i64,
+        file_path: &Path,
+    ) {
+        self.cross_project_canonical_collisions += 1;
+        if self.cross_project_canonical_collisions <= DUPLICATE_CANONICAL_WARNING_SAMPLE_LIMIT {
+            self.warnings.push(format!(
+                "Cross-project canonical message id {message_id} collision in {}: \
+                 existing message belongs to project_id {existing_project_id}, \
+                 new archive artifact belongs to project_id {new_project_id}; \
+                 inserting under a generated DB id to avoid data loss",
+                file_path.display()
+            ));
+        }
+    }
+
     fn finalize_duplicate_warnings(&mut self) {
         if self.duplicate_canonical_message_files <= DUPLICATE_CANONICAL_WARNING_SAMPLE_LIMIT {
             return;
@@ -349,6 +374,13 @@ impl std::fmt::Display for ReconstructStats {
                 f,
                 "; skipped {} duplicate canonical file(s) across {} message id(s)",
                 self.duplicate_canonical_message_files, self.duplicate_canonical_message_ids
+            )?;
+        }
+        if self.cross_project_canonical_collisions > 0 {
+            write!(
+                f,
+                "; preserved {} cross-project canonical id collision(s) under generated DB ids",
+                self.cross_project_canonical_collisions
             )?;
         }
         if self.salvaged_projects > 0
@@ -1613,12 +1645,41 @@ fn parse_and_insert_message(
         .and_then(serde_json::Value::as_i64)
         .filter(|&id| id > 0);
 
-    if let Some(cid) = canonical_id
-        && message_id_exists(conn, cid)?
-    {
-        stats.record_duplicate_canonical_message(cid, file_path);
-        return Ok(());
-    }
+    // Canonical-id collision handling:
+    //
+    //   Same-project collision:  almost certainly a duplicate archive artifact
+    //                            (two files for the same logical message).
+    //                            Keep the first, skip the second.
+    //
+    //   Cross-project collision: two *different* messages in two separate
+    //                            project archives happen to share the same
+    //                            frontmatter `id` (e.g. because the archives
+    //                            were originally produced by separate storage
+    //                            roots). Both are real messages; skipping one
+    //                            would drop legitimate data. Insert the
+    //                            second under an auto-generated DB id and
+    //                            record a warning so operators can audit.
+    //
+    // See: https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/104
+    let canonical_id = if let Some(cid) = canonical_id {
+        if let Some(existing_project_id) = message_project_id(conn, cid)? {
+            if existing_project_id == project_id {
+                stats.record_duplicate_canonical_message(cid, file_path);
+                return Ok(());
+            }
+            stats.record_cross_project_canonical_collision(
+                cid,
+                existing_project_id,
+                project_id,
+                file_path,
+            );
+            None
+        } else {
+            Some(cid)
+        }
+    } else {
+        None
+    };
 
     let thread_id = raw_thread_id.and_then(|raw| {
         let normalized = sanitize_reconstructed_thread_id(raw);
@@ -2164,6 +2225,28 @@ fn message_id_exists(conn: &DbConn, message_id: i64) -> DbResult<bool> {
         )
         .map_err(|e| DbError::Sqlite(format!("check message {message_id} existence: {e}")))?;
     Ok(!rows.is_empty())
+}
+
+/// Return the `project_id` of a message row with the given canonical id, or
+/// `None` if no such row exists. Used during reconstruction to distinguish
+/// same-project duplicates from cross-project canonical-id collisions.
+fn message_project_id(conn: &DbConn, message_id: i64) -> DbResult<Option<i64>> {
+    let rows = conn
+        .query_sync(
+            "SELECT project_id FROM messages WHERE id = ? LIMIT 1",
+            &[Value::BigInt(message_id)],
+        )
+        .map_err(|e| DbError::Sqlite(format!("check message {message_id} project: {e}")))?;
+    if let Some(row) = rows.first() {
+        let pid = row.get_named::<i64>("project_id").map_err(|e| {
+            DbError::Sqlite(format!(
+                "decode project_id for message {message_id}: {e}"
+            ))
+        })?;
+        Ok(Some(pid))
+    } else {
+        Ok(None)
+    }
 }
 
 fn table_exists(conn: &DbConn, table: &str) -> DbResult<bool> {
@@ -4444,6 +4527,7 @@ mod tests {
             recipients: 200,
             duplicate_canonical_message_files: 0,
             duplicate_canonical_message_ids: 0,
+            cross_project_canonical_collisions: 0,
             salvaged_projects: 0,
             salvaged_agents: 0,
             salvaged_messages: 0,
@@ -5768,6 +5852,102 @@ second body
                 .expect("recipient name"),
             "Bob"
         );
+    }
+
+    #[test]
+    fn reconstruct_preserves_cross_project_canonical_id_collision_under_generated_db_id() {
+        // Two separate project archives both contain a message with frontmatter
+        // id 7. Prior behavior dropped the second as a duplicate. Expected
+        // behavior: both messages are preserved, the second inserted under an
+        // auto-generated DB id, with a cross-project collision warning.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("test.db");
+        let storage_root = tmp.path().join("storage");
+
+        for (slug, subject_body, sender, recipient) in [
+            ("project-a", "Alice A", "Alice", "Bob"),
+            ("project-b", "Alice B", "Alice", "Carol"),
+        ] {
+            let project_dir = storage_root.join("projects").join(slug);
+            let agent_dir = project_dir.join("agents").join(sender);
+            let messages_dir = project_dir.join("messages").join("2026").join("02");
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            std::fs::create_dir_all(&messages_dir).unwrap();
+            std::fs::write(
+                project_dir.join("project.json"),
+                format!(
+                    r#"{{"slug":"{slug}","human_key":"/{slug}","created_at":0}}"#,
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                agent_dir.join("profile.json"),
+                format!(
+                    r#"{{"agent_name":"{sender}","program":"coder","model":"test","registered_ts":"2026-02-22T00:00:00Z"}}"#,
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                messages_dir.join(format!(
+                    "2026-02-22T12-00-00Z__{subject_body}__7.md"
+                )),
+                format!(
+                    r#"---json
+{{
+  "id": 7,
+  "from": "{sender}",
+  "to": ["{recipient}"],
+  "subject": "{subject_body}",
+  "importance": "normal",
+  "created_ts": "2026-02-22T12:00:00Z"
+}}
+---
+
+body for {slug}
+"#
+                ),
+            )
+            .unwrap();
+        }
+
+        let stats = reconstruct_from_archive(&db_path, &storage_root).expect("should succeed");
+        assert_eq!(
+            stats.messages, 2,
+            "both messages must be preserved across projects"
+        );
+        assert_eq!(
+            stats.duplicate_canonical_message_files, 0,
+            "cross-project collisions must not count as duplicates"
+        );
+        assert_eq!(stats.cross_project_canonical_collisions, 1);
+        assert!(
+            stats
+                .warnings
+                .iter()
+                .any(|w| w.contains("Cross-project canonical message id 7")),
+            "expected cross-project warning, got {:?}",
+            stats.warnings
+        );
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let subject_rows = conn
+            .query_sync(
+                "SELECT subject FROM messages ORDER BY subject",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(subject_rows.len(), 2, "both messages must exist in DB");
+        let subjects: Vec<String> = subject_rows
+            .iter()
+            .map(|r| r.get_named::<String>("subject").expect("subject"))
+            .collect();
+        assert_eq!(subjects, vec!["Alice A".to_string(), "Alice B".to_string()]);
+
+        // Exactly one message keeps canonical id 7; the other is re-keyed.
+        let canonical_rows = conn
+            .query_sync("SELECT id FROM messages WHERE id = 7", &[])
+            .unwrap();
+        assert_eq!(canonical_rows.len(), 1);
     }
 
     #[test]

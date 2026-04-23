@@ -3177,6 +3177,49 @@ fn select_killable_agent_mail_pids(
     agent_mail_pids
 }
 
+/// Choose listener PIDs that doctor diagnostics may sample (read-only).
+///
+/// Sampling is read-only and need not satisfy the kill-safe identity contract.
+/// We can sample any listener PID once `check_port_status` has confirmed the
+/// listener belongs to an Agent Mail server.
+fn doctor_listener_sample_pids(
+    status: &mcp_agent_mail_server::startup_checks::PortStatus,
+    verified_agent_mail_pids: Vec<u32>,
+    listener_pids: Vec<u32>,
+) -> Vec<u32> {
+    use mcp_agent_mail_server::startup_checks::PortStatus;
+
+    if !verified_agent_mail_pids.is_empty() {
+        return verified_agent_mail_pids;
+    }
+    match status {
+        PortStatus::AgentMailServer => listener_pids,
+        PortStatus::Free | PortStatus::OtherProcess { .. } | PortStatus::Error { .. } => Vec::new(),
+    }
+}
+
+/// Resolve listener PIDs that doctor diagnostics may sample.
+///
+/// Distinct from `resolved_agent_mail_listener_pids`, which is kill-safe.
+/// Sampling only reads `/proc` stats, so the trust requirement is weaker:
+/// a verified `PortStatus::AgentMailServer` is enough to authorize sampling.
+fn resolved_doctor_sample_pids(host: &str, port: u16) -> Vec<u32> {
+    use mcp_agent_mail_server::startup_checks::{
+        agent_mail_port_holder_pids_with_hint, check_port_status,
+        listener_port_holder_pids_with_hint,
+    };
+
+    let agent_mail_pids = agent_mail_port_holder_pids_with_hint(host, port);
+    if !agent_mail_pids.is_empty() {
+        return agent_mail_pids;
+    }
+    doctor_listener_sample_pids(
+        &check_port_status(host, port),
+        agent_mail_pids,
+        listener_port_holder_pids_with_hint(host, port),
+    )
+}
+
 fn select_remaining_kill_pids(
     initial_pids: &[u32],
     refreshed_pids: Vec<u32>,
@@ -3349,6 +3392,65 @@ mod port_kill_tests {
             select_killable_agent_mail_pids(
                 &PortStatus::OtherProcess {
                     description: "foreign listener".to_string(),
+                },
+                vec![],
+                vec![22],
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn doctor_listener_sample_pids_prefers_verified_agent_mail_pids() {
+        assert_eq!(
+            doctor_listener_sample_pids(&PortStatus::AgentMailServer, vec![11], vec![22]),
+            vec![11]
+        );
+    }
+
+    #[test]
+    fn doctor_listener_sample_pids_falls_back_to_listener_when_port_status_verifies_server() {
+        assert_eq!(
+            doctor_listener_sample_pids(&PortStatus::AgentMailServer, vec![], vec![22]),
+            vec![22]
+        );
+    }
+
+    #[test]
+    fn doctor_listener_sample_pids_samples_ambiguous_listener_set_when_port_status_verifies_server()
+    {
+        assert_eq!(
+            doctor_listener_sample_pids(&PortStatus::AgentMailServer, vec![], vec![22, 33]),
+            vec![22, 33]
+        );
+    }
+
+    #[test]
+    fn doctor_listener_sample_pids_rejects_other_process() {
+        assert!(
+            doctor_listener_sample_pids(
+                &PortStatus::OtherProcess {
+                    description: "foreign listener".to_string(),
+                },
+                vec![],
+                vec![22],
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn doctor_listener_sample_pids_rejects_free_port() {
+        assert!(doctor_listener_sample_pids(&PortStatus::Free, vec![], vec![22]).is_empty());
+    }
+
+    #[test]
+    fn doctor_listener_sample_pids_rejects_port_check_error() {
+        assert!(
+            doctor_listener_sample_pids(
+                &PortStatus::Error {
+                    kind: std::io::ErrorKind::PermissionDenied,
+                    message: "no perm".to_string(),
                 },
                 vec![],
                 vec![22],
@@ -16420,7 +16522,7 @@ fn collect_doctor_server_runtime_diagnostics(config: &Config) -> DoctorServerRun
     let port_status = check_port_status(&config.http_host, config.http_port);
     let http_health = probe_local_http_health(config, &port_status);
     let jsonrpc_health = probe_local_jsonrpc_health(config, &port_status);
-    let listener_pids = resolved_agent_mail_listener_pids(&config.http_host, config.http_port);
+    let listener_pids = resolved_doctor_sample_pids(&config.http_host, config.http_port);
     let (process_samples, process_error) = sample_agent_mail_process_cpu(&listener_pids);
 
     DoctorServerRuntimeDiagnostics {
