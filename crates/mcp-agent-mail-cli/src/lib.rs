@@ -12931,6 +12931,7 @@ fn handle_self_update_full(force: bool, target_version: Option<String>) -> CliRe
         Ok(r) => r,
         Err(e) => {
             ftui_runtime::ftui_eprintln!("Download failed: {e}");
+            ftui_runtime::ftui_eprintln!("{}", self_update_installer_fallback_hint(&version_to_install));
             return Err(CliError::Other(format!("self-update download failed: {e}")));
         }
     };
@@ -12957,11 +12958,27 @@ fn handle_self_update_full(force: bool, target_version: Option<String>) -> CliRe
                 "New binaries are staged at: {}",
                 release.extract_dir.display()
             );
+            ftui_runtime::ftui_eprintln!(
+                "{}",
+                self_update_installer_fallback_hint(&release.version)
+            );
             Err(CliError::Other(format!(
                 "self-update replacement failed: {e}"
             )))
         }
     }
+}
+
+/// Render a one-line installer fallback hint that always works, including for
+/// callers stuck on a pre-v0.2.47 binary whose original updater can't bootstrap
+/// the fixed updater (see GH#102). The installer downloads and verifies the
+/// release artifacts directly, bypassing the in-binary self-update entirely.
+fn self_update_installer_fallback_hint(version: &str) -> String {
+    let normalized = version.trim_start_matches('v');
+    format!(
+        "Fallback: install via the official installer (always works, including from older binaries):\n  \
+         curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/v{normalized}/install.sh | bash -s -- --version v{normalized} --verify"
+    )
 }
 
 // ── End self-update ──────────────────────────────────────────────────────
@@ -54394,6 +54411,25 @@ fn handle_self_update_check_result_returns_error_on_failed_check() {
     })
     .expect_err("failed update checks should return an error");
     assert!(format!("{err}").contains("update check failed"));
+}
+
+#[test]
+fn self_update_installer_fallback_hint_strips_v_prefix_and_pins_version() {
+    let hint = self_update_installer_fallback_hint("v0.2.50");
+    assert!(hint.contains("install.sh"));
+    assert!(hint.contains("/v0.2.50/"));
+    assert!(hint.contains("--version v0.2.50"));
+    assert!(hint.contains("--verify"));
+    // No double-v after stripping the prefix.
+    assert!(!hint.contains("/vv0.2.50/"));
+    assert!(!hint.contains("--version vv0.2.50"));
+}
+
+#[test]
+fn self_update_installer_fallback_hint_accepts_unprefixed_version() {
+    let hint = self_update_installer_fallback_hint("0.2.50");
+    assert!(hint.contains("/v0.2.50/"));
+    assert!(hint.contains("--version v0.2.50"));
 }
 
 #[test]
