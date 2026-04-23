@@ -333,8 +333,13 @@ detect_platform() {
   esac
 
   TARGET=""
+  # For linux x86_64 we prefer the statically-linked musl artifact so the
+  # binary runs on every modern Linux regardless of host glibc (Debian 12,
+  # Ubuntu 22.04, RHEL 9, Amazon Linux 2023, Alpine). If the musl asset is
+  # missing (e.g., installing an older release that only shipped gnu), the
+  # download step falls back to the gnu artifact automatically.
   case "${OS}-${ARCH}" in
-    linux-x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
+    linux-x86_64) TARGET="x86_64-unknown-linux-musl" ;;
     linux-aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
     darwin-x86_64) TARGET="x86_64-apple-darwin" ;;
     darwin-aarch64) TARGET="aarch64-apple-darwin" ;;
@@ -4749,10 +4754,28 @@ trap cleanup EXIT
 if [ "$FROM_SOURCE" -eq 0 ]; then
   info "Downloading $URL"
   if ! download_to_file "$URL" "$TMP/$TAR" "binary-download"; then
-    warn "Binary download failed (release may not exist for $VERSION)"
-    warn "Attempting build from source as fallback..."
-    verbose "binary-download:fallback_to_source version=${VERSION} url=${URL}"
-    FROM_SOURCE=1
+    # If we preferred a musl artifact that isn't published for this release
+    # (older tags only shipped gnu), fall back to the gnu artifact before
+    # giving up and attempting a source build.
+    if [ "$TARGET" = "x86_64-unknown-linux-musl" ] && [ -z "${ARTIFACT_URL:-}" ]; then
+      warn "musl artifact not available for $VERSION; falling back to gnu artifact"
+      verbose "binary-download:musl_fallback_to_gnu version=${VERSION} url=${URL}"
+      TARGET="x86_64-unknown-linux-gnu"
+      TAR="mcp-agent-mail-${TARGET}.tar.xz"
+      URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${TAR}"
+      info "Downloading $URL"
+      if ! download_to_file "$URL" "$TMP/$TAR" "binary-download"; then
+        warn "Binary download failed (release may not exist for $VERSION)"
+        warn "Attempting build from source as fallback..."
+        verbose "binary-download:fallback_to_source version=${VERSION} url=${URL}"
+        FROM_SOURCE=1
+      fi
+    else
+      warn "Binary download failed (release may not exist for $VERSION)"
+      warn "Attempting build from source as fallback..."
+      verbose "binary-download:fallback_to_source version=${VERSION} url=${URL}"
+      FROM_SOURCE=1
+    fi
   fi
 fi
 
