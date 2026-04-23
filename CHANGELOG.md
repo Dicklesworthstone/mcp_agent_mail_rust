@@ -10,7 +10,43 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
 
 ## Unreleased
 
-(no in-flight changes)
+### Bug fixes
+
+- **`am doctor` reports listener CPU samples for verified Agent Mail servers
+  whose process identity is not kill-safe**
+  ([#103](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/103)).
+  `collect_doctor_server_runtime_diagnostics` previously reused the kill-safe
+  listener PID resolver for read-only CPU sampling. That resolver intentionally
+  refuses listener PIDs unless they carry an explicit Agent Mail signature or a
+  current PID hint. Doctor diagnostics now use a separate
+  `doctor_listener_sample_pids` helper that samples any listener PID once
+  `check_port_status` has confirmed the listener belongs to an Agent Mail
+  server, and rejects `Free` / `OtherProcess` / `Error`. Kill semantics are
+  unchanged. Six new unit tests cover the selection matrix.
+- **`am doctor reconstruct` preserves cross-project canonical id collisions
+  instead of silently dropping them**
+  ([#104](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/104)).
+  Reconstruct previously dedup'd canonical message ids globally, so two project
+  archives that independently coined frontmatter `id=N` would lose the second
+  message. Now distinguishes same-project duplicates (skip, unchanged) from
+  cross-project canonical-id collisions (preserve under a generated DB id and
+  record a warning naming both `project_id`s). New
+  `cross_project_canonical_collisions` counter on `ReconstructStats`,
+  `finalize_cross_project_canonical_collision_warnings` to summarize when
+  collisions exceed the per-occurrence sample limit, and an integration test
+  driving the full reconstruct pipeline with two project archives sharing
+  `id=7`.
+- **`am self-update` now prints the official installer one-liner on every
+  download or replacement failure**
+  ([#102](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/issues/102)).
+  Pre-`v0.2.47` binaries on macOS arm64 cannot reliably bootstrap to the fixed
+  updater because their baked-in updater hits HTTP 400 / stalls on the
+  checksum fetch. Those binaries cannot be patched retroactively, but every
+  future self-update failure now surfaces a copy-pasteable
+  `curl … install.sh | bash -s -- --version vX.Y.Z --verify` command pinned
+  to the requested version, with a v-prefix-stripping helper to avoid
+  `vv0.2.50` foot-guns. Two regression tests pin the prefix-stripping
+  behavior.
 
 ---
 
