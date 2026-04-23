@@ -215,7 +215,11 @@ jobs:
         run: ls -laR dist
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v4.0.0
+        # SHA-pinned to the v4.0.0 commit so a tag re-push (malicious or
+        # accidental) cannot substitute a compromised action into the
+        # signing step — the entire sigstore integrity chain hinges on this
+        # action's code being the one we audited.
+        uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad # v4.0.0
 
       - name: Sign release artifacts (sigstore bundle)
         run: |
