@@ -5960,6 +5960,21 @@ body for {slug}
             .query_sync("SELECT id FROM messages WHERE id = 7", &[])
             .unwrap();
         assert_eq!(canonical_rows.len(), 1);
+
+        // Both messages must keep their original project association — the
+        // collision recovery must not collapse them into a single project.
+        let project_pair_rows = conn
+            .query_sync(
+                "SELECT COUNT(DISTINCT project_id) AS n FROM messages",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(project_pair_rows.len(), 1);
+        assert_eq!(
+            project_pair_rows[0].get_named::<i64>("n").unwrap(),
+            2,
+            "messages must remain attached to their original distinct projects"
+        );
     }
 
     #[test]
