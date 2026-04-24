@@ -307,12 +307,20 @@ fn handle_integrity_error(
     *last_recovery_attempt = Some(now);
 
     let storage_root_present = storage_root.is_dir();
+    // #105 flagged this line as confusing — "recovery is disabled" reads as
+    // "nothing will happen" but in fact the query path triggers
+    // `reconstruct_sqlite_file_with_archive_salvage` on its own when a
+    // tool reads against a broken verdict (see
+    // `mcp-agent-mail-tools::tool_util::live_db_is_suspect`). What this
+    // branch actually does is *surface* the detection and leave the
+    // mutation to the query path's admission-controlled reconstruct, so
+    // say that plainly.
     tracing::warn!(
         phase,
         path = %sqlite_path.display(),
         error = %error_message,
         storage_root_present,
-        "integrity guard detected recoverable sqlite corruption, but automatic server-side recovery is disabled"
+        "integrity guard detected recoverable sqlite corruption; background guard does not mutate the live db — the query-path recovery flow will trigger an admission-controlled reconstruct on the next corrupt-verdict read"
     );
 }
 
