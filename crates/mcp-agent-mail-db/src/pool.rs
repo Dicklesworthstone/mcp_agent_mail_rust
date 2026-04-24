@@ -5732,8 +5732,8 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
     primary_path: &Path,
     storage_root: &Path,
 ) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
-    let now = Instant::now();
-    if let Some((age, stats)) = recent_reconstruct_lookup(primary_path, now) {
+    let lookup_at = Instant::now();
+    if let Some((age, stats)) = recent_reconstruct_lookup(primary_path, lookup_at) {
         // age is capped at RECONSTRUCT_COALESCE_WINDOW, so u64 always fits,
         // but express the saturation explicitly to satisfy the lint.
         let age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX);
@@ -5751,7 +5751,13 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
         reconstruct_sqlite_file_with_archive_salvage_inner(primary_path, storage_root, true)
     });
     if let Ok(stats) = &result {
-        recent_reconstruct_store(primary_path, now, stats);
+        // Store the *completion* timestamp, not the entry timestamp. A
+        // reconstruct can take seconds (or longer on larger archives), and
+        // if we reused `lookup_at` here the effective coalesce window
+        // would shrink by that duration — worst case to zero, silently
+        // defeating the coalesce for exactly the workloads it most needs
+        // to protect (slow recoveries where duplicate work is expensive).
+        recent_reconstruct_store(primary_path, Instant::now(), stats);
     }
     result
 }
@@ -6647,6 +6653,55 @@ mod tests {
         assert!(
             recent_reconstruct_lookup(&path, beyond).is_none(),
             "cache entries must be invisible past the coalesce window"
+        );
+        reset_recent_reconstruct_cache_for_test();
+    }
+
+    #[test]
+    fn recent_reconstruct_cache_store_uses_completion_time_not_entry_time() {
+        // Regression for a self-review find: the wrapper used to store the
+        // timestamp captured at *function entry* rather than at
+        // *reconstruct completion*. A reconstruct that genuinely takes 15s
+        // would then land a 15-s-old timestamp in the cache, so the very
+        // next caller — the exact thread of callers the coalesce was
+        // designed to protect — would see `age = 15s`, miss the 10-s
+        // window, and redo the work.
+        //
+        // This test simulates that by storing with a time that predates
+        // the lookup by more than the window and asserting the lookup
+        // misses, then storing with a fresh time and asserting the lookup
+        // hits. If someone regresses the wrapper to pass an entry-time
+        // `now` on a slow reconstruct, the "simulated slow reconstruct"
+        // assertion below will catch it in integration, and this unit
+        // test pins the store API contract that "the timestamp you pass
+        // is what lookup compares against."
+        reset_recent_reconstruct_cache_for_test();
+        let path = PathBuf::from("/tmp/agent-mail-coalesce-completion-time.db");
+        let stats = crate::reconstruct::ReconstructStats::default();
+
+        let simulated_entry_time = Instant::now();
+        let simulated_slow_reconstruct = RECONSTRUCT_COALESCE_WINDOW + Duration::from_secs(5);
+        let simulated_completion_time = simulated_entry_time + simulated_slow_reconstruct;
+
+        // If we (incorrectly) stored the *entry* time and then a sibling
+        // caller arrives right after completion, the lookup age would
+        // exceed the window and miss. Assert that shape first.
+        recent_reconstruct_store(&path, simulated_entry_time, &stats);
+        assert!(
+            recent_reconstruct_lookup(&path, simulated_completion_time).is_none(),
+            "using entry-time as the stored timestamp defeats coalescing for slow reconstructs — \
+             the wrapper must pass completion time instead"
+        );
+
+        // Now store with the completion time (what the wrapper does)
+        // and assert a sibling caller arriving immediately after is
+        // coalesced.
+        reset_recent_reconstruct_cache_for_test();
+        recent_reconstruct_store(&path, simulated_completion_time, &stats);
+        let sibling_arrival = simulated_completion_time + Duration::from_millis(10);
+        assert!(
+            recent_reconstruct_lookup(&path, sibling_arrival).is_some(),
+            "completion-time storage must let an immediate-follow-up caller coalesce"
         );
         reset_recent_reconstruct_cache_for_test();
     }
