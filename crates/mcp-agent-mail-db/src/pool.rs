@@ -5734,9 +5734,12 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
 ) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
     let now = Instant::now();
     if let Some((age, stats)) = recent_reconstruct_lookup(primary_path, now) {
+        // age is capped at RECONSTRUCT_COALESCE_WINDOW, so u64 always fits,
+        // but express the saturation explicitly to satisfy the lint.
+        let age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX);
         tracing::info!(
             path = %primary_path.display(),
-            age_ms = age.as_millis() as u64,
+            age_ms,
             %stats,
             "archive salvage reconstruction coalesced with recent successful run (within {}s window); returning cached stats",
             RECONSTRUCT_COALESCE_WINDOW.as_secs()
