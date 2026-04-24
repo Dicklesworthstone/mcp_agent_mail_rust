@@ -786,15 +786,12 @@ impl ReadCache {
         }
 
         let mut cache = self.inbox_stats.write();
-        let expired = if let Some(entry) = cache.get_mut(&key) {
-            if entry.is_expired(INBOX_STATS_TTL) {
-                true
-            } else {
-                entry.touch();
-                false
-            }
+        let entry = cache.get_mut(&key)?;
+        let expired = if entry.is_expired(INBOX_STATS_TTL) {
+            true
         } else {
-            return None;
+            entry.touch();
+            false
         };
         if expired {
             cache.remove(&key);

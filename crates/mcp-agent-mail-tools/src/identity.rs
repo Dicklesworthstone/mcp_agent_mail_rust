@@ -103,8 +103,7 @@ async fn persist_agent_registration_token_with_retry(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0u64, |d| u64::from(d.subsec_nanos()));
         let sleep_ms = register_agent_retry_sleep_ms(attempt, now_ns);
-        asupersync::time::sleep(ctx.cx().now(), std::time::Duration::from_millis(sleep_ms))
-            .await;
+        asupersync::time::sleep(ctx.cx().now(), std::time::Duration::from_millis(sleep_ms)).await;
         attempt = attempt.saturating_add(1);
     }
 }
