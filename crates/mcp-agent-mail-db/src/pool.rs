@@ -5668,14 +5668,89 @@ fn reconstruct_sqlite_file_with_archive_salvage_inner(
     }
 }
 
+/// Coalescing window for back-to-back archive-salvage reconstructions.
+///
+/// #105 reported two `database reconstruction from archive complete` log
+/// lines 10 ms apart with identical counters — both query-path requests
+/// detected the corrupt verdict in the same millisecond, both took the
+/// recovery path, and both rebuilt the live file in sequence. With a real
+/// reconstruct that costs O(100 ms) per MB of archive this is mostly
+/// wasted work: the second caller's inputs are identical to the first
+/// caller's and the first has already delivered a healthy primary. Within
+/// this window, a successful prior reconstruct is returned verbatim.
+const RECONSTRUCT_COALESCE_WINDOW: Duration = Duration::from_secs(10);
+
+static RECENT_RECONSTRUCT_CACHE: OnceLock<
+    Mutex<HashMap<PathBuf, (Instant, crate::reconstruct::ReconstructStats)>>,
+> = OnceLock::new();
+
+fn recent_reconstruct_cache()
+-> &'static Mutex<HashMap<PathBuf, (Instant, crate::reconstruct::ReconstructStats)>> {
+    RECENT_RECONSTRUCT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn recent_reconstruct_lookup(
+    primary_path: &Path,
+    now: Instant,
+) -> Option<(Duration, crate::reconstruct::ReconstructStats)> {
+    let mut cache = recent_reconstruct_cache()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    cache.retain(|_, (t, _)| now.saturating_duration_since(*t) <= RECONSTRUCT_COALESCE_WINDOW);
+    cache
+        .get(primary_path)
+        .map(|(t, stats)| (now.saturating_duration_since(*t), stats.clone()))
+}
+
+fn recent_reconstruct_store(
+    primary_path: &Path,
+    now: Instant,
+    stats: &crate::reconstruct::ReconstructStats,
+) {
+    let mut cache = recent_reconstruct_cache()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    cache.retain(|_, (t, _)| now.saturating_duration_since(*t) <= RECONSTRUCT_COALESCE_WINDOW);
+    cache.insert(primary_path.to_path_buf(), (now, stats.clone()));
+}
+
+/// Clear the coalescing cache. Intended for tests only — production code
+/// should never need to invalidate, because re-corruption after a
+/// successful reconstruct sets the verdict back to `broken` via a
+/// normally-occurring integrity check failure, and the next reconstruct
+/// call will land after the window expires naturally.
+#[cfg(test)]
+pub(crate) fn reset_recent_reconstruct_cache_for_test() {
+    recent_reconstruct_cache()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+}
+
 #[allow(clippy::result_large_err)]
 pub fn reconstruct_sqlite_file_with_archive_salvage(
     primary_path: &Path,
     storage_root: &Path,
 ) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
-    with_recovery_admission(primary_path, "archive salvage reconstruction", || {
+    let now = Instant::now();
+    if let Some((age, stats)) = recent_reconstruct_lookup(primary_path, now) {
+        tracing::info!(
+            path = %primary_path.display(),
+            age_ms = age.as_millis() as u64,
+            %stats,
+            "archive salvage reconstruction coalesced with recent successful run (within {}s window); returning cached stats",
+            RECONSTRUCT_COALESCE_WINDOW.as_secs()
+        );
+        return Ok(stats);
+    }
+
+    let result = with_recovery_admission(primary_path, "archive salvage reconstruction", || {
         reconstruct_sqlite_file_with_archive_salvage_inner(primary_path, storage_root, true)
-    })
+    });
+    if let Ok(stats) = &result {
+        recent_reconstruct_store(primary_path, now, stats);
+    }
+    result
 }
 
 #[allow(clippy::result_large_err)]
@@ -6528,6 +6603,67 @@ mod tests {
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn recent_reconstruct_cache_returns_fresh_entry_within_window() {
+        // Regression for #105: back-to-back reconstructs with identical
+        // counters within a 10s window must coalesce — the second caller
+        // reads the first caller's stats instead of rebuilding the DB.
+        reset_recent_reconstruct_cache_for_test();
+        let path = PathBuf::from("/tmp/agent-mail-coalesce-window-1.db");
+        let mut stats = crate::reconstruct::ReconstructStats::default();
+        stats.projects = 10;
+        stats.messages = 342;
+
+        let stored_at = Instant::now();
+        recent_reconstruct_store(&path, stored_at, &stats);
+
+        // Lookup 10ms later — within the coalesce window.
+        let lookup_at = stored_at + Duration::from_millis(10);
+        let hit = recent_reconstruct_lookup(&path, lookup_at)
+            .expect("reconstruct cache must return the stored entry within the window");
+        assert_eq!(hit.1.projects, 10);
+        assert_eq!(hit.1.messages, 342);
+        assert!(hit.0 <= Duration::from_millis(10));
+        reset_recent_reconstruct_cache_for_test();
+    }
+
+    #[test]
+    fn recent_reconstruct_cache_evicts_past_window() {
+        // After RECONSTRUCT_COALESCE_WINDOW, a lookup must miss so a fresh
+        // corrupt verdict can actually rebuild rather than silently reuse
+        // stats from a too-old prior success.
+        reset_recent_reconstruct_cache_for_test();
+        let path = PathBuf::from("/tmp/agent-mail-coalesce-window-2.db");
+        let stats = crate::reconstruct::ReconstructStats::default();
+
+        let stored_at = Instant::now();
+        recent_reconstruct_store(&path, stored_at, &stats);
+
+        let beyond = stored_at + RECONSTRUCT_COALESCE_WINDOW + Duration::from_millis(1);
+        assert!(
+            recent_reconstruct_lookup(&path, beyond).is_none(),
+            "cache entries must be invisible past the coalesce window"
+        );
+        reset_recent_reconstruct_cache_for_test();
+    }
+
+    #[test]
+    fn recent_reconstruct_cache_is_keyed_per_path() {
+        reset_recent_reconstruct_cache_for_test();
+        let path_a = PathBuf::from("/tmp/agent-mail-coalesce-path-a.db");
+        let path_b = PathBuf::from("/tmp/agent-mail-coalesce-path-b.db");
+        let stats_a = crate::reconstruct::ReconstructStats::default();
+        let now = Instant::now();
+        recent_reconstruct_store(&path_a, now, &stats_a);
+
+        assert!(recent_reconstruct_lookup(&path_a, now).is_some());
+        assert!(
+            recent_reconstruct_lookup(&path_b, now).is_none(),
+            "cache must not coalesce across distinct primary paths — each DB is independent"
+        );
+        reset_recent_reconstruct_cache_for_test();
+    }
 
     #[test]
     fn normalize_sqlite_identity_path_caches_recent_entries() {
