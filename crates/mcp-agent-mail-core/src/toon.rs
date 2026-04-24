@@ -497,10 +497,9 @@ fn parse_token_line(line: &str) -> Option<(u64, u64)> {
     // Find arrow (-> or →) and extract second ~N
     let after_arrow = if let Some(pos) = trimmed.find("->") {
         &trimmed[pos + 2..]
-    } else if let Some(pos) = trimmed.find('\u{2192}') {
-        &trimmed[pos + '\u{2192}'.len_utf8()..]
     } else {
-        return None;
+        let pos = trimmed.find('\u{2192}')?;
+        &trimmed[pos + '\u{2192}'.len_utf8()..]
     };
 
     let toon_start = after_arrow.find('~')? + 1;

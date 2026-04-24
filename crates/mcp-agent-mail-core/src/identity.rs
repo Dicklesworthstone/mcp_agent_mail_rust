@@ -546,7 +546,7 @@ pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {
     let branch = repo_root
         .as_ref()
         .and_then(|root| git_cmd(Path::new(root), &["rev-parse", "--abbrev-ref", "HEAD"]))
-        .and_then(|b| if b == "HEAD" { None } else { Some(b) });
+        .filter(|b| b != "HEAD");
 
     let worktree_name = repo_root.as_ref().and_then(|root| {
         Path::new(root)
@@ -608,13 +608,7 @@ pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {
                 None
             }
         })
-        .and_then(|info| {
-            if info.project_uid.is_some() || info.product_uid.is_some() {
-                Some(info)
-            } else {
-                None
-            }
-        });
+        .filter(|info| info.project_uid.is_some() || info.product_uid.is_some());
 
     let mut project_uid: Option<String> = None;
     let marker_committed = repo_root_path

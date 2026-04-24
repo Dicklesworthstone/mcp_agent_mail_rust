@@ -1406,10 +1406,9 @@ fn parse_http_url_for_status(url: &str) -> Option<StatusUrlParts> {
     let trimmed = url.trim();
     let (scheme, remainder, default_port) = if let Some(rest) = trimmed.strip_prefix("http://") {
         ("http", rest, 80_u16)
-    } else if let Some(rest) = trimmed.strip_prefix("https://") {
-        ("https", rest, 443_u16)
     } else {
-        return None;
+        let rest = trimmed.strip_prefix("https://")?;
+        ("https", rest, 443_u16)
     };
 
     let (authority, raw_path) = if let Some((auth, tail)) = remainder.split_once('/') {
