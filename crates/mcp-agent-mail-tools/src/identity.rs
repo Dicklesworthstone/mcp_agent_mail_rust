@@ -58,6 +58,57 @@ fn register_agent_retry_sleep_ms(attempt: u32, now_ns: u64) -> u64 {
     }
 }
 
+/// Persist a freshly-generated registration token for `agent_id` with a
+/// tool-layer retry ladder.
+///
+/// #105 documented a caller-visible write failure where the single UPDATE
+/// that stamps a new registration token raced with a transient degraded
+/// storage window and immediately surfaced `RESOURCE_BUSY` to the MCP
+/// client (which then had to retry the whole `register_agent` call, losing
+/// the freshly-generated token on the first attempt). The inner DB layer
+/// already has its own MVCC retry budget; this wrapper mirrors the coarse
+/// 4-attempt / 500/1000/1500/2000 ms ladder that `register_agent` uses so
+/// the burst settles inside the server process. Retry is gated on the
+/// same lock/busy classifier — we never retry on a hard error.
+async fn persist_agent_registration_token_with_retry(
+    ctx: &McpContext,
+    pool: &mcp_agent_mail_db::DbPool,
+    agent_id: i64,
+    agent_name: &str,
+    registration_token: &str,
+) -> Outcome<(), mcp_agent_mail_db::DbError> {
+    const UPDATE_TOKEN_TOOL_RETRIES: u32 = 4;
+    let mut attempt: u32 = 0;
+    loop {
+        let out = mcp_agent_mail_db::queries::update_agent_registration_token(
+            ctx.cx(),
+            pool,
+            agent_id,
+            registration_token,
+        )
+        .await;
+
+        let should_retry = matches!(&out, Outcome::Err(err) if is_register_retryable(err));
+        if !should_retry || attempt >= UPDATE_TOKEN_TOOL_RETRIES {
+            return out;
+        }
+
+        tracing::warn!(
+            attempt,
+            max = UPDATE_TOKEN_TOOL_RETRIES,
+            agent = %agent_name,
+            "update_agent_registration_token: tool-layer retry on RESOURCE_BUSY"
+        );
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0u64, |d| u64::from(d.subsec_nanos()));
+        let sleep_ms = register_agent_retry_sleep_ms(attempt, now_ns);
+        asupersync::time::sleep(ctx.cx().now(), std::time::Duration::from_millis(sleep_ms))
+            .await;
+        attempt = attempt.saturating_add(1);
+    }
+}
+
 /// Build recovery status for the `health_check` response.
 ///
 /// Returns `Some(RecoveryStatusResponse)` when the mailbox is not fully healthy,
@@ -1193,10 +1244,11 @@ Check that all parameters have valid values."
     if !registration_token.is_empty()
         && let Some(agent_id) = row.id
     {
-        let token_update = mcp_agent_mail_db::queries::update_agent_registration_token(
-            ctx.cx(),
+        let token_update = persist_agent_registration_token_with_retry(
+            ctx,
             &pool,
             agent_id,
+            &row.name,
             &registration_token,
         )
         .await;
@@ -1435,10 +1487,11 @@ Choose a different name (or omit the name to auto-generate one)."
     if !registration_token.is_empty()
         && let Some(agent_id) = row.id
     {
-        let token_update = mcp_agent_mail_db::queries::update_agent_registration_token(
-            ctx.cx(),
+        let token_update = persist_agent_registration_token_with_retry(
+            ctx,
             &pool,
             agent_id,
+            &row.name,
             &registration_token,
         )
         .await;
