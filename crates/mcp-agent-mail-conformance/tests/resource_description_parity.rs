@@ -85,92 +85,52 @@ fn collect_all_resources() -> Vec<ResourceEntry> {
 
 /// Expected description prefixes for key Python-matching resources.
 fn expected_description_prefixes() -> HashMap<&'static str, &'static str> {
-    let mut m = HashMap::new();
-    m.insert(
-        "resource://config/environment",
-        "Inspect the server's current environment and HTTP settings.",
-    );
-    m.insert(
-        "resource://identity/{project}",
-        "Inspect identity resolution for a given project path.",
-    );
-    m.insert(
-        "resource://tooling/directory",
-        "Provide a clustered view of exposed MCP tools to combat option overload.",
-    );
-    m.insert(
-        "resource://tooling/schemas",
-        "Expose JSON-like parameter schemas for tools/macros to prevent drift.",
-    );
-    m.insert(
-        "resource://tooling/metrics",
-        "Expose aggregated tool call/error counts for analysis.",
-    );
-    m.insert(
-        "resource://tooling/locks",
-        "Return lock metadata from the shared archive storage.",
-    );
-    m.insert(
-        "resource://projects",
-        "List all projects known to the server in creation order.",
-    );
-    m.insert(
-        "resource://project/{slug}",
-        "Fetch a project and its agents by project slug or human key.",
-    );
-    m.insert(
-        "resource://agents/{project_key}",
-        "List all registered agents in a project for easy agent discovery.",
-    );
-    m.insert(
-        "resource://file_reservations/{slug}",
-        "List file_reservations for a project, optionally filtering to active-only.",
-    );
-    m.insert(
-        "resource://message/{message_id}",
-        "Read a single message by id within a project.",
-    );
-    m.insert(
-        "resource://thread/{thread_id}",
-        "List messages for a thread within a project.",
-    );
-    m.insert(
-        "resource://inbox/{agent}",
-        "Read an agent's inbox for a project.",
-    );
-    m.insert(
-        "resource://views/urgent-unread/{agent}",
-        "Convenience view listing urgent and high-importance messages that are unread",
-    );
-    m.insert(
-        "resource://views/ack-required/{agent}",
-        "Convenience view listing messages requiring acknowledgement",
-    );
-    m.insert(
-        "resource://views/acks-stale/{agent}",
-        "List ack-required messages older than a TTL",
-    );
-    m.insert(
-        "resource://views/ack-overdue/{agent}",
-        "List messages requiring acknowledgement older than ttl_minutes",
-    );
-    m.insert(
-        "resource://mailbox/{agent}",
-        "List recent messages in an agent's mailbox with commit metadata fields.",
-    );
-    m.insert(
-        "resource://mailbox-with-commits/{agent}",
-        "List recent messages in an agent's mailbox with commit metadata fields, including explicit unavailable markers",
-    );
-    m.insert(
-        "resource://outbox/{agent}",
-        "List messages sent by the agent with commit metadata fields.",
-    );
-    m.insert(
-        "resource://product/{key}",
-        "Inspect product and list linked projects.",
-    );
-    m
+    [
+        ("resource://config/environment", "Inspect the server's current environment and HTTP settings."),
+        ("resource://identity/{project}", "Inspect identity resolution for a given project path."),
+        (
+            "resource://tooling/directory",
+            "Provide a clustered view of exposed MCP tools to combat option overload.",
+        ),
+        (
+            "resource://tooling/schemas",
+            "Expose JSON-like parameter schemas for tools/macros to prevent drift.",
+        ),
+        ("resource://tooling/metrics", "Expose aggregated tool call/error counts for analysis."),
+        ("resource://tooling/locks", "Return lock metadata from the shared archive storage."),
+        ("resource://projects", "List all projects known to the server in creation order."),
+        ("resource://project/{slug}", "Fetch a project and its agents by project slug or human key."),
+        ("resource://agents/{project_key}", "List all registered agents in a project for easy agent discovery."),
+        (
+            "resource://file_reservations/{slug}",
+            "List file_reservations for a project, optionally filtering to active-only.",
+        ),
+        ("resource://message/{message_id}", "Read a single message by id within a project."),
+        ("resource://thread/{thread_id}", "List messages for a thread within a project."),
+        ("resource://inbox/{agent}", "Read an agent's inbox for a project."),
+        (
+            "resource://views/urgent-unread/{agent}",
+            "Convenience view listing urgent and high-importance messages that are unread",
+        ),
+        (
+            "resource://views/ack-required/{agent}",
+            "Convenience view listing messages requiring acknowledgement",
+        ),
+        ("resource://views/acks-stale/{agent}", "List ack-required messages older than a TTL"),
+        (
+            "resource://views/ack-overdue/{agent}",
+            "List messages requiring acknowledgement older than ttl_minutes",
+        ),
+        ("resource://mailbox/{agent}", "List recent messages in an agent's mailbox with commit metadata fields."),
+        (
+            "resource://mailbox-with-commits/{agent}",
+            "List recent messages in an agent's mailbox with commit metadata fields, including explicit unavailable markers",
+        ),
+        ("resource://outbox/{agent}", "List messages sent by the agent with commit metadata fields."),
+        ("resource://product/{key}", "Inspect product and list linked projects."),
+    ]
+    .into_iter()
+    .collect()
 }
 
 #[test]
