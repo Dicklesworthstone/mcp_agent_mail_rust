@@ -4733,31 +4733,16 @@ pub fn message_paths(
     } else {
         format!("{iso}__{slug}.md")
     };
+    let dated_file = |base: PathBuf| base.join(&y).join(&m).join(&filename);
 
-    let canonical = project_root
-        .join("messages")
-        .join(&y)
-        .join(&m)
-        .join(&filename);
-    let outbox = project_root
-        .join("agents")
-        .join(sender)
-        .join("outbox")
-        .join(&y)
-        .join(&m)
-        .join(&filename);
+    let canonical = dated_file(project_root.join("messages"));
+    let outbox = dated_file(project_root.join("agents").join(sender).join("outbox"));
     let mut inbox: Vec<PathBuf> = Vec::with_capacity(recipients.len());
     for r in recipients {
         let r = validate_archive_component("recipient", r)?;
-        inbox.push(
-            project_root
-                .join("agents")
-                .join(r)
-                .join("inbox")
-                .join(&y)
-                .join(&m)
-                .join(&filename),
-        );
+        inbox.push(dated_file(
+            project_root.join("agents").join(r).join("inbox"),
+        ));
     }
 
     Ok(MessageArchivePaths {
