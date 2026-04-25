@@ -87,62 +87,59 @@ fn normalize_runtime_resource_uri(uri: &str) -> String {
 }
 
 fn normalize_fixture_resource_uri(uri: &str) -> String {
-    if uri.starts_with("resource://config/environment") {
-        return "resource://config/environment".to_string();
-    }
-    if uri.starts_with("resource://projects") {
-        return "resource://projects".to_string();
-    }
-    if uri.starts_with("resource://project/") {
-        return "resource://project/{slug}".to_string();
-    }
-    if uri.starts_with("resource://identity/") {
-        return "resource://identity/{project}".to_string();
-    }
-    if uri.starts_with("resource://agents/") {
-        return "resource://agents/{project_key}".to_string();
-    }
-    if uri.starts_with("resource://product/") {
-        return "resource://product/{key}".to_string();
-    }
-    if uri.starts_with("resource://inbox/") {
-        return "resource://inbox/{agent}".to_string();
-    }
-    if uri.starts_with("resource://message/") {
-        return "resource://message/{message_id}".to_string();
-    }
-    if uri.starts_with("resource://thread/") {
-        return "resource://thread/{thread_id}".to_string();
-    }
-    if uri.starts_with("resource://file_reservations/") {
-        return "resource://file_reservations/{slug}".to_string();
-    }
-    if uri.starts_with("resource://tooling/capabilities/") {
-        return "resource://tooling/capabilities/{agent}".to_string();
-    }
-    if uri.starts_with("resource://tooling/recent/") {
-        return "resource://tooling/recent/{window_seconds}".to_string();
-    }
-    if uri.starts_with("resource://views/urgent-unread/") {
-        return "resource://views/urgent-unread/{agent}".to_string();
-    }
-    if uri.starts_with("resource://views/ack-required/") {
-        return "resource://views/ack-required/{agent}".to_string();
-    }
-    if uri.starts_with("resource://views/acks-stale/") {
-        return "resource://views/acks-stale/{agent}".to_string();
-    }
-    if uri.starts_with("resource://views/ack-overdue/") {
-        return "resource://views/ack-overdue/{agent}".to_string();
-    }
-    if uri.starts_with("resource://mailbox-with-commits/") {
-        return "resource://mailbox-with-commits/{agent}".to_string();
-    }
-    if uri.starts_with("resource://mailbox/") {
-        return "resource://mailbox/{agent}".to_string();
-    }
-    if uri.starts_with("resource://outbox/") {
-        return "resource://outbox/{agent}".to_string();
+    const PREFIX_NORMALIZATIONS: &[(&str, &str)] = &[
+        (
+            "resource://config/environment",
+            "resource://config/environment",
+        ),
+        ("resource://projects", "resource://projects"),
+        ("resource://project/", "resource://project/{slug}"),
+        ("resource://identity/", "resource://identity/{project}"),
+        ("resource://agents/", "resource://agents/{project_key}"),
+        ("resource://product/", "resource://product/{key}"),
+        ("resource://inbox/", "resource://inbox/{agent}"),
+        ("resource://message/", "resource://message/{message_id}"),
+        ("resource://thread/", "resource://thread/{thread_id}"),
+        (
+            "resource://file_reservations/",
+            "resource://file_reservations/{slug}",
+        ),
+        (
+            "resource://tooling/capabilities/",
+            "resource://tooling/capabilities/{agent}",
+        ),
+        (
+            "resource://tooling/recent/",
+            "resource://tooling/recent/{window_seconds}",
+        ),
+        (
+            "resource://views/urgent-unread/",
+            "resource://views/urgent-unread/{agent}",
+        ),
+        (
+            "resource://views/ack-required/",
+            "resource://views/ack-required/{agent}",
+        ),
+        (
+            "resource://views/acks-stale/",
+            "resource://views/acks-stale/{agent}",
+        ),
+        (
+            "resource://views/ack-overdue/",
+            "resource://views/ack-overdue/{agent}",
+        ),
+        (
+            "resource://mailbox-with-commits/",
+            "resource://mailbox-with-commits/{agent}",
+        ),
+        ("resource://mailbox/", "resource://mailbox/{agent}"),
+        ("resource://outbox/", "resource://outbox/{agent}"),
+    ];
+
+    for (prefix, normalized) in PREFIX_NORMALIZATIONS {
+        if uri.starts_with(prefix) {
+            return (*normalized).to_string();
+        }
     }
     uri.split('?').next().unwrap_or(uri).to_string()
 }
