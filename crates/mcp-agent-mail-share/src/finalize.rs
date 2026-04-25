@@ -264,8 +264,35 @@ fn build_materialized_views_with_conn(
              ELSE 0 \
          END AS attachment_count";
 
+    // frankensqlite has a quirk where CREATE TABLE ... AS SELECT with complex
+    // sources (correlated subqueries + nested derived tables in the FROM
+    // clause) returns Ok but does NOT register the table in sqlite_master,
+    // which then blows up when later DDL (CREATE INDEX, etc.) tries to use
+    // the table. Sidestep it by creating the table with explicit columns and
+    // then INSERTing the SELECT result — the INSERT path doesn't depend on
+    // schema inference from the SELECT and works reliably.
+    let create_table_sql = "\
+        CREATE TABLE message_overview_mv (\
+             id INTEGER, \
+             project_id INTEGER, \
+             thread_id TEXT, \
+             subject TEXT, \
+             importance TEXT, \
+             ack_required INTEGER, \
+             created_ts INTEGER, \
+             sender_name TEXT, \
+             body_length INTEGER, \
+             attachment_count INTEGER, \
+             latest_snippet TEXT, \
+             recipients TEXT\
+         )";
+    conn.execute_raw(create_table_sql)
+        .map_err(|e| ShareError::Sqlite {
+            message: format!("message_overview_mv create failed: {e}"),
+        })?;
+
     let overview_sql = format!(
-        "CREATE TABLE message_overview_mv AS \
+        "INSERT INTO message_overview_mv \
          SELECT \
              m.id, \
              m.project_id, \
@@ -285,7 +312,7 @@ fn build_materialized_views_with_conn(
     );
     conn.execute_raw(&overview_sql)
         .map_err(|e| ShareError::Sqlite {
-            message: format!("message_overview_mv create failed: {e}"),
+            message: format!("message_overview_mv populate failed: {e}\nSQL: {overview_sql}"),
         })?;
 
     for idx in [
@@ -342,10 +369,22 @@ fn build_materialized_views_with_conn(
         conn.execute_raw("DROP TABLE IF EXISTS fts_search_overview_mv")
             .map_err(sql_err)?;
 
-        // Use m.id for the rowid column since id INTEGER PRIMARY KEY aliases rowid.
+        // Same frankensqlite CTA quirk as message_overview_mv: split the
+        // CREATE TABLE AS SELECT into an explicit CREATE TABLE + INSERT INTO
+        // ... SELECT so the new table actually lands in sqlite_master.
+        let create_fts_table_sql = "\
+            CREATE TABLE fts_search_overview_mv (\
+                 rowid INTEGER, \
+                 id INTEGER, \
+                 subject TEXT, \
+                 created_ts INTEGER, \
+                 importance TEXT, \
+                 sender_name TEXT, \
+                 snippet TEXT\
+             )";
         let fts_overview_sql = if has_sender_id {
             format!(
-                "CREATE TABLE fts_search_overview_mv AS \
+                "INSERT INTO fts_search_overview_mv \
              SELECT \
                  m.id AS rowid, \
                  m.id, \
@@ -359,7 +398,7 @@ fn build_materialized_views_with_conn(
             )
         } else {
             format!(
-                "CREATE TABLE fts_search_overview_mv AS \
+                "INSERT INTO fts_search_overview_mv \
              SELECT \
                  m.id AS rowid, \
                  m.id, \
@@ -371,23 +410,20 @@ fn build_materialized_views_with_conn(
              FROM messages m \
              ORDER BY m.created_ts DESC"
             )
-            .to_string()
         };
 
-        match conn.execute_raw(&fts_overview_sql) {
-            Ok(_) => {
-                for idx in [
-                    "CREATE INDEX idx_fts_overview_rowid ON fts_search_overview_mv(rowid)",
-                    "CREATE INDEX idx_fts_overview_created ON fts_search_overview_mv(created_ts DESC)",
-                ] {
-                    conn.execute_raw(idx).map_err(sql_err)?;
-                }
-                created.push("fts_search_overview_mv".to_string());
+        if conn.execute_raw(create_fts_table_sql).is_ok()
+            && conn.execute_raw(&fts_overview_sql).is_ok()
+        {
+            for idx in [
+                "CREATE INDEX idx_fts_overview_rowid ON fts_search_overview_mv(rowid)",
+                "CREATE INDEX idx_fts_overview_created ON fts_search_overview_mv(created_ts DESC)",
+            ] {
+                conn.execute_raw(idx).map_err(sql_err)?;
             }
-            Err(_) => {
-                // FTS5 not available at view creation time — skip gracefully
-            }
+            created.push("fts_search_overview_mv".to_string());
         }
+        // else: FTS5 not available at view creation time — skip gracefully
     }
 
     Ok(created)
