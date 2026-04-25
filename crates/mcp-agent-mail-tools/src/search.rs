@@ -582,15 +582,11 @@ fn resolve_time_bound_alias(
 ) -> Result<Option<i64>, McpError> {
     let mut chosen: Option<(&'static str, String, i64)> = None;
 
-    let mut candidates = Vec::with_capacity(alias_values.len() + 1);
-    candidates.push((canonical_field, canonical_value));
-    candidates.extend(
+    for (name, raw_value) in std::iter::once((canonical_field, canonical_value)).chain(
         alias_values
             .iter()
             .map(|(name, value)| (*name, value.clone())),
-    );
-
-    for (name, raw_value) in candidates {
+    ) {
         let Some(value) = non_empty_trimmed(raw_value) else {
             continue;
         };
