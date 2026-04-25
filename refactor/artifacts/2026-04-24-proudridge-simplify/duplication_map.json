@@ -1,0 +1,24 @@
+{
+  "run_id": "2026-04-24-proudridge-simplify",
+  "generated_at": "2026-04-24T22:21:10Z",
+  "tools_run": ["manual_diff_review", "heuristic_slop_scan"],
+  "candidates": [
+    {
+      "id": "D1",
+      "kind": "Repeated lossy agent-name normalization",
+      "locations": ["crates/mcp-agent-mail-tools/src/messaging.rs"],
+      "score": 10.0,
+      "status": "implemented"
+    },
+    {
+      "id": "R1",
+      "kind": "Baseline formatting drift",
+      "locations": [
+        "crates/mcp-agent-mail-cli/src/lib.rs",
+        "crates/mcp-agent-mail-db/src/reconstruct.rs"
+      ],
+      "score": null,
+      "status": "implemented"
+    }
+  ]
+}
