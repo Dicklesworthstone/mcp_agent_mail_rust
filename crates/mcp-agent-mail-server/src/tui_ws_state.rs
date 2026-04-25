@@ -1,6 +1,6 @@
 #![allow(clippy::module_name_repetitions)]
 
-use crate::tui_bridge::TuiSharedState;
+use crate::tui_bridge::{RequestCounters, TuiSharedState};
 use crate::tui_events::MailEvent;
 use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -66,19 +66,19 @@ fn config_json(state: &TuiSharedState) -> Value {
     })
 }
 
-fn request_counters_json(state: &TuiSharedState) -> Value {
-    let counters = state.request_counters();
+fn request_counters_json(counters: RequestCounters, avg_latency_ms: u64) -> Value {
     json!({
         "total": counters.total,
         "status_2xx": counters.status_2xx,
         "status_4xx": counters.status_4xx,
         "status_5xx": counters.status_5xx,
         "latency_total_ms": counters.latency_total_ms,
-        "avg_latency_ms": state.avg_latency_ms(),
+        "avg_latency_ms": avg_latency_ms,
     })
 }
 
 fn snapshot_payload(state: &TuiSharedState, limit: usize) -> Value {
+    let counters = state.request_counters();
     let ring = state.event_ring_stats();
     let next_seq = ring.next_seq;
     let events = state.recent_events(limit);
@@ -90,7 +90,7 @@ fn snapshot_payload(state: &TuiSharedState, limit: usize) -> Value {
         "generated_at_us": now_micros(),
         "next_seq": next_seq,
         "event_count": events.len(),
-        "request_counters": request_counters_json(state),
+        "request_counters": request_counters_json(counters, state.avg_latency_ms()),
         "event_ring_stats": ring,
         "config": config_json(state),
         "db_stats": state.db_stats_snapshot(),
@@ -101,6 +101,7 @@ fn snapshot_payload(state: &TuiSharedState, limit: usize) -> Value {
 }
 
 fn delta_payload(state: &TuiSharedState, since: u64, limit: usize) -> Value {
+    let counters = state.request_counters();
     let ring = state.event_ring_stats();
     let events = state.events_since_limited(since, limit);
     let to_seq = events.last().map_or(since, MailEvent::seq);
@@ -113,7 +114,7 @@ fn delta_payload(state: &TuiSharedState, since: u64, limit: usize) -> Value {
         "since_seq": since,
         "to_seq": to_seq,
         "event_count": events.len(),
-        "request_counters": request_counters_json(state),
+        "request_counters": request_counters_json(counters, state.avg_latency_ms()),
         "event_ring_stats": ring,
         "db_stats": state.db_stats_snapshot(),
         "atc": crate::atc_operator_snapshot(),
