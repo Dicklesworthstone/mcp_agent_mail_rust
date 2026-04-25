@@ -1976,13 +1976,13 @@ fn parse_salvaged_recipients_json(
 fn sync_reconstructed_message_recipients_json(conn: &DbConn, message_id: i64) -> DbResult<()> {
     let rows = conn
         .query_sync(
-            "SELECT COALESCE(NULLIF(TRIM(a.name), ''), '[unknown-agent-' || mr.agent_id || ']') AS name, \
+            "SELECT CASE WHEN a.id IS NULL THEN '[unknown-agent-' || mr.agent_id || ']' ELSE TRIM(a.name) END AS name, \
                     mr.kind AS kind \
              FROM message_recipients mr \
              LEFT JOIN agents a ON a.id = mr.agent_id \
              WHERE mr.message_id = ? \
              ORDER BY CASE mr.kind WHEN 'to' THEN 0 WHEN 'cc' THEN 1 WHEN 'bcc' THEN 2 ELSE 3 END, \
-                     COALESCE(NULLIF(TRIM(a.name), ''), '[unknown-agent-' || mr.agent_id || ']') COLLATE NOCASE",
+                     CASE WHEN a.id IS NULL THEN '[unknown-agent-' || mr.agent_id || ']' ELSE TRIM(a.name) END COLLATE NOCASE",
             &[Value::BigInt(message_id)],
         )
         .map_err(|e| {
@@ -4119,6 +4119,13 @@ fn extract_id_from_rows(rows: &[sqlmodel_core::Row]) -> Option<i64> {
 mod tests {
     use super::*;
 
+    fn message_one_recipients_json(conn: &DbConn) -> serde_json::Value {
+        let rows = conn
+            .query_sync("SELECT recipients_json FROM messages WHERE id = 1", &[])
+            .unwrap();
+        serde_json::from_str(&rows[0].get_named::<String>("recipients_json").unwrap()).unwrap()
+    }
+
     #[test]
     fn reconstruct_benign_migration_error_detection() {
         assert!(is_reconstruct_benign_migration_error(
@@ -4451,12 +4458,8 @@ mod tests {
 
         sync_reconstructed_message_recipients_json(&conn, 1).expect("sync recipients_json");
 
-        let rows = conn
-            .query_sync("SELECT recipients_json FROM messages WHERE id = 1", &[])
-            .unwrap();
-        let recipients_json: String = rows[0].get_named("recipients_json").unwrap();
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&recipients_json).unwrap(),
+            message_one_recipients_json(&conn),
             serde_json::json!({
                 "to": ["Bob"],
                 "cc": [],
@@ -4493,12 +4496,8 @@ mod tests {
 
         sync_reconstructed_message_recipients_json(&conn, 1).expect("sync recipients_json");
 
-        let rows = conn
-            .query_sync("SELECT recipients_json FROM messages WHERE id = 1", &[])
-            .unwrap();
-        let recipients_json: String = rows[0].get_named("recipients_json").unwrap();
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&recipients_json).unwrap(),
+            message_one_recipients_json(&conn),
             serde_json::json!({
                 "to": ["[unknown-agent-7]"],
                 "cc": [],
