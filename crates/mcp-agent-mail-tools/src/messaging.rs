@@ -114,6 +114,21 @@ pub(crate) fn enqueue_agent_semantic_index(agent: &mcp_agent_mail_db::AgentRow) 
     );
 }
 
+fn normalize_agent_name_or_original(name: String) -> String {
+    mcp_agent_mail_core::models::normalize_agent_name(&name).unwrap_or(name)
+}
+
+fn normalize_agent_names_or_original(names: Vec<String>) -> Vec<String> {
+    names
+        .into_iter()
+        .map(normalize_agent_name_or_original)
+        .collect()
+}
+
+fn normalize_optional_agent_names(names: Option<Vec<String>>) -> Option<Vec<String>> {
+    names.map(normalize_agent_names_or_original)
+}
+
 fn is_agent_unique_constraint_error(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
     let Some((prefix, columns)) = normalized.split_once(':') else {
@@ -1421,22 +1436,10 @@ pub async fn send_message(
     sender_token: Option<String>,
 ) -> McpResult<String> {
     // Normalize names
-    let sender_name =
-        mcp_agent_mail_core::models::normalize_agent_name(&sender_name).unwrap_or(sender_name);
-    let to: Vec<String> = to
-        .into_iter()
-        .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
-        .collect();
-    let cc: Option<Vec<String>> = cc.map(|v| {
-        v.into_iter()
-            .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
-            .collect()
-    });
-    let bcc: Option<Vec<String>> = bcc.map(|v| {
-        v.into_iter()
-            .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
-            .collect()
-    });
+    let sender_name = normalize_agent_name_or_original(sender_name);
+    let to = normalize_agent_names_or_original(to);
+    let cc = normalize_optional_agent_names(cc);
+    let bcc = normalize_optional_agent_names(bcc);
 
     // Truncate subject at 200 chars (parity with Python legacy).
     // Use char_indices to avoid panicking on multi-byte UTF-8 boundaries.
@@ -2262,23 +2265,10 @@ pub async fn reply_message(
     sender_token: Option<String>,
 ) -> McpResult<String> {
     // Normalize names
-    let sender_name =
-        mcp_agent_mail_core::models::normalize_agent_name(&sender_name).unwrap_or(sender_name);
-    let to: Option<Vec<String>> = to.map(|v| {
-        v.into_iter()
-            .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
-            .collect()
-    });
-    let cc: Option<Vec<String>> = cc.map(|v| {
-        v.into_iter()
-            .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
-            .collect()
-    });
-    let bcc: Option<Vec<String>> = bcc.map(|v| {
-        v.into_iter()
-            .map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n))
-            .collect()
-    });
+    let sender_name = normalize_agent_name_or_original(sender_name);
+    let to = normalize_optional_agent_names(to);
+    let cc = normalize_optional_agent_names(cc);
+    let bcc = normalize_optional_agent_names(bcc);
 
     let prefix = subject_prefix.unwrap_or_else(|| "Re:".to_string());
     let config = &Config::get();
@@ -3045,8 +3035,7 @@ pub async fn fetch_inbox(
     include_bodies: Option<bool>,
     topic: Option<String>,
 ) -> McpResult<String> {
-    let agent_name =
-        mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
+    let agent_name = normalize_agent_name_or_original(agent_name);
     let mut msg_limit = limit.unwrap_or(20);
     if msg_limit < 1 {
         return Err(legacy_tool_error(
@@ -3258,8 +3247,7 @@ pub async fn mark_message_read(
     agent_name: String,
     message_id: i64,
 ) -> McpResult<String> {
-    let agent_name =
-        mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
+    let agent_name = normalize_agent_name_or_original(agent_name);
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
@@ -3322,8 +3310,7 @@ pub async fn acknowledge_message(
     agent_name: String,
     message_id: i64,
 ) -> McpResult<String> {
-    let agent_name =
-        mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
+    let agent_name = normalize_agent_name_or_original(agent_name);
 
     let pool = get_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;

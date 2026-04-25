@@ -10388,7 +10388,9 @@ fn saturating_minutes_to_micros(minutes: i64) -> i64 {
 }
 
 fn saturating_age_minutes_since(now_us: i64, created_ts: i64) -> i64 {
-    now_us.saturating_sub(created_ts) / CLI_MICROS_PER_MINUTE
+    // Created-in-the-future is reported as 0 minutes overdue, not a negative
+    // age; downstream UIs render age as an unsigned magnitude.
+    now_us.saturating_sub(created_ts).max(0) / CLI_MICROS_PER_MINUTE
 }
 
 fn handle_acks_with_conn(conn: &mcp_agent_mail_db::DbConn, action: AcksCommand) -> CliResult<()> {
@@ -12931,7 +12933,10 @@ fn handle_self_update_full(force: bool, target_version: Option<String>) -> CliRe
         Ok(r) => r,
         Err(e) => {
             ftui_runtime::ftui_eprintln!("Download failed: {e}");
-            ftui_runtime::ftui_eprintln!("{}", self_update_installer_fallback_hint(&version_to_install));
+            ftui_runtime::ftui_eprintln!(
+                "{}",
+                self_update_installer_fallback_hint(&version_to_install)
+            );
             return Err(CliError::Other(format!("self-update download failed: {e}")));
         }
     };
@@ -18058,10 +18063,9 @@ fn parse_mcp_config_status_url(url: &str) -> Option<McpAgentMailStatusUrlParts> 
     let trimmed = url.trim();
     let (scheme, remainder, default_port) = if let Some(rest) = trimmed.strip_prefix("http://") {
         ("http", rest, 80_u16)
-    } else if let Some(rest) = trimmed.strip_prefix("https://") {
-        ("https", rest, 443_u16)
     } else {
-        return None;
+        let rest = trimmed.strip_prefix("https://")?;
+        ("https", rest, 443_u16)
     };
 
     let (authority, raw_path) = if let Some((auth, tail)) = remainder.split_once('/') {

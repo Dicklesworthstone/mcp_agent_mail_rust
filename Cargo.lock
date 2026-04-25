@@ -458,6 +458,8 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 [[package]]
 name = "beads_rust"
 version = "0.1.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6648b5c59a608032c8fc76b38cc643f64d0108f55f28d16b76be1914fbfa2474"
 dependencies = [
  "anyhow",
  "chrono",
@@ -489,9 +491,8 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yml",
- "sha2 0.11.0",
+ "sha2 0.10.9",
  "shell-words",
- "similar 3.1.0",
  "tempfile",
  "thiserror",
  "tracing",
@@ -1735,7 +1736,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2515,6 +2516,8 @@ dependencies = [
 [[package]]
 name = "ftui"
 version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "900bf8d3d1a7c167a07cce908118d1adecf777451200d34f54a25d84906350a3"
 dependencies = [
  "ftui-core",
  "ftui-extras",
@@ -2529,6 +2532,8 @@ dependencies = [
 [[package]]
 name = "ftui-a11y"
 version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "105dc9742b4b7d46f94a276b3b3d95eb33b248944619c8365b79eff1571cc817"
 dependencies = [
  "ahash",
  "ftui-core",
@@ -2537,6 +2542,8 @@ dependencies = [
 [[package]]
 name = "ftui-backend"
 version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7f2599c0890f529da66184d4f70a0f755340694e1910243ebc47b6686e795db"
 dependencies = [
  "ftui-core",
  "ftui-render",
@@ -2545,6 +2552,8 @@ dependencies = [
 [[package]]
 name = "ftui-core"
 version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fac919691de3e2752ea689d3665a142d6885f67f859d3a8fa754f22faaf99b82"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2562,6 +2571,8 @@ dependencies = [
 [[package]]
 name = "ftui-extras"
 version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f202a80aa8bad926daff7501a8a7d7da4dc01c776ca983a0a93f000ab3af645e"
 dependencies = [
  "base64 0.22.1",
  "ftui-core",
@@ -2582,6 +2593,8 @@ dependencies = [
 [[package]]
 name = "ftui-harness"
 version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ca266c201b694b4b7d1228848c73649e3c93972ff72ff8b7e89b2bbbeab09c3"
 dependencies = [
  "blake3",
  "ftui-core",
@@ -2600,10 +2613,14 @@ dependencies = [
 [[package]]
 name = "ftui-i18n"
 version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8511cfff5709b203550a764ec261ca28d8fe75c103d1ab5bc3ebd830eb8a85c"
 
 [[package]]
 name = "ftui-layout"
 version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3691b957ebba9bea9ce86b74dc28368ca21018f614ec671840644c506d2e6430"
 dependencies = [
  "ftui-core",
  "rustc-hash",
@@ -2614,6 +2631,8 @@ dependencies = [
 [[package]]
 name = "ftui-render"
 version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e05eafaeb0b449cf7f18141cbe1fee78bba723d93d6ffe50e92c52da8a5823ad"
 dependencies = [
  "ahash",
  "bitflags",
@@ -2629,6 +2648,8 @@ dependencies = [
 [[package]]
 name = "ftui-runtime"
 version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d70020c8019013da3314e12d554f405a8ea8246fd7a74bf1edf0c508508323f9"
 dependencies = [
  "arc-swap",
  "ftui-backend",
@@ -2648,6 +2669,8 @@ dependencies = [
 [[package]]
 name = "ftui-style"
 version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dcd2f8ee8eeffd651b40e1c81a8be9ed400550b0926631198744ed80f1174943"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -2658,12 +2681,14 @@ dependencies = [
 [[package]]
 name = "ftui-text"
 version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a20ca45ebbc7db9940ec028d607c4a260bdb1fbb9591697bd88bbcf41dfa1cfc"
 dependencies = [
  "ftui-core",
  "ftui-layout",
  "ftui-render",
  "ftui-style",
- "lru 0.17.0",
+ "lru 0.16.4",
  "ropey",
  "rustc-hash",
  "smallvec",
@@ -2675,6 +2700,8 @@ dependencies = [
 [[package]]
 name = "ftui-tty"
 version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b8ca5ba718a588aaa9006a5e7fc4172c6dd078833501da5a368bdfc59789ca"
 dependencies = [
  "ftui-backend",
  "ftui-core",
@@ -2687,6 +2714,8 @@ dependencies = [
 [[package]]
 name = "ftui-widgets"
 version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "383129a44d20f2684b69f05d16b6ba794e85883978548c038dbed6ddee1af2d6"
 dependencies = [
  "ahash",
  "bitflags",
@@ -4238,7 +4267,7 @@ dependencies = [
  "console",
  "once_cell",
  "serde",
- "similar 2.7.0",
+ "similar",
  "tempfile",
 ]
 
@@ -4337,7 +4366,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4647,15 +4676,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lru"
-version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e0b564323a0fb6d54b864f625ae139de9612e27edb944dda37c109f05aac531"
-dependencies = [
- "hashbrown 0.17.0",
-]
-
-[[package]]
 name = "lz4_flex"
 version = "0.11.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4765,7 +4785,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail"
-version = "0.2.47"
+version = "0.2.48"
 dependencies = [
  "clap",
  "criterion",
@@ -4791,7 +4811,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-cli"
-version = "0.2.47"
+version = "0.2.48"
 dependencies = [
  "asupersync",
  "beads_rust",
@@ -4819,7 +4839,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "similar 2.7.0",
+ "similar",
  "sqlmodel-core",
  "tempfile",
  "thiserror",
@@ -4833,7 +4853,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-conformance"
-version = "0.2.47"
+version = "0.2.48"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4858,7 +4878,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-core"
-version = "0.2.47"
+version = "0.2.48"
 dependencies = [
  "chrono",
  "criterion",
@@ -4884,7 +4904,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-db"
-version = "0.2.47"
+version = "0.2.48"
 dependencies = [
  "asupersync",
  "chrono",
@@ -4927,7 +4947,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-guard"
-version = "0.2.47"
+version = "0.2.48"
 dependencies = [
  "chrono",
  "git2",
@@ -4943,7 +4963,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-search-core"
-version = "0.2.47"
+version = "0.2.48"
 dependencies = [
  "chrono",
  "criterion",
@@ -4973,7 +4993,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-server"
-version = "0.2.47"
+version = "0.2.48"
 dependencies = [
  "ammonia",
  "asupersync",
@@ -5016,7 +5036,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-share"
-version = "0.2.47"
+version = "0.2.48"
 dependencies = [
  "atty",
  "base64 0.22.1",
@@ -5038,7 +5058,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-storage"
-version = "0.2.47"
+version = "0.2.48"
 dependencies = [
  "asupersync",
  "base64 0.22.1",
@@ -5063,7 +5083,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-test-helpers"
-version = "0.2.47"
+version = "0.2.48"
 dependencies = [
  "git2",
  "tempfile",
@@ -5072,7 +5092,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-agent-mail-tools"
-version = "0.2.47"
+version = "0.2.48"
 dependencies = [
  "arbitrary",
  "asupersync",
@@ -5605,7 +5625,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6678,7 +6698,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7124,15 +7144,6 @@ name = "similar"
 version = "2.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
-
-[[package]]
-name = "similar"
-version = "3.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04d93e861ede2e497b47833469b8ec9d5c07fa4c78ce7a00f6eb7dd8168b4b3f"
-dependencies = [
- "bstr",
-]
 
 [[package]]
 name = "siphasher"
@@ -7619,7 +7630,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8581,7 +8592,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9176,3 +9187,59 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
+
+[[patch.unused]]
+name = "beads_rust"
+version = "0.2.1"
+
+[[patch.unused]]
+name = "ftui"
+version = "0.4.0"
+
+[[patch.unused]]
+name = "ftui-backend"
+version = "0.4.0"
+
+[[patch.unused]]
+name = "ftui-core"
+version = "0.4.0"
+
+[[patch.unused]]
+name = "ftui-extras"
+version = "0.4.0"
+
+[[patch.unused]]
+name = "ftui-harness"
+version = "0.4.0"
+
+[[patch.unused]]
+name = "ftui-i18n"
+version = "0.4.0"
+
+[[patch.unused]]
+name = "ftui-layout"
+version = "0.4.0"
+
+[[patch.unused]]
+name = "ftui-render"
+version = "0.4.0"
+
+[[patch.unused]]
+name = "ftui-runtime"
+version = "0.4.0"
+
+[[patch.unused]]
+name = "ftui-style"
+version = "0.4.0"
+
+[[patch.unused]]
+name = "ftui-text"
+version = "0.4.0"
+
+[[patch.unused]]
+name = "ftui-tty"
+version = "0.4.0"
+
+[[patch.unused]]
+name = "ftui-widgets"
+version = "0.4.0"

@@ -2251,9 +2251,7 @@ fn message_project_id(conn: &DbConn, message_id: i64) -> DbResult<Option<i64>> {
         .map_err(|e| DbError::Sqlite(format!("check message {message_id} project: {e}")))?;
     if let Some(row) = rows.first() {
         let pid = row.get_named::<i64>("project_id").map_err(|e| {
-            DbError::Sqlite(format!(
-                "decode project_id for message {message_id}: {e}"
-            ))
+            DbError::Sqlite(format!("decode project_id for message {message_id}: {e}"))
         })?;
         Ok(Some(pid))
     } else {
@@ -5887,9 +5885,7 @@ second body
             std::fs::create_dir_all(&messages_dir).unwrap();
             std::fs::write(
                 project_dir.join("project.json"),
-                format!(
-                    r#"{{"slug":"{slug}","human_key":"/{slug}","created_at":0}}"#,
-                ),
+                format!(r#"{{"slug":"{slug}","human_key":"/{slug}","created_at":0}}"#),
             )
             .unwrap();
             std::fs::write(
@@ -5900,9 +5896,7 @@ second body
             )
             .unwrap();
             std::fs::write(
-                messages_dir.join(format!(
-                    "2026-02-22T12-00-00Z__{file_slug}__7.md"
-                )),
+                messages_dir.join(format!("2026-02-22T12-00-00Z__{file_slug}__7.md")),
                 format!(
                     r#"---json
 {{
@@ -5943,10 +5937,7 @@ body for {slug}
 
         let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
         let subject_rows = conn
-            .query_sync(
-                "SELECT subject FROM messages ORDER BY subject",
-                &[],
-            )
+            .query_sync("SELECT subject FROM messages ORDER BY subject", &[])
             .unwrap();
         assert_eq!(subject_rows.len(), 2, "both messages must exist in DB");
         let subjects: Vec<String> = subject_rows
@@ -5964,10 +5955,7 @@ body for {slug}
         // Both messages must keep their original project association — the
         // collision recovery must not collapse them into a single project.
         let project_pair_rows = conn
-            .query_sync(
-                "SELECT COUNT(DISTINCT project_id) AS n FROM messages",
-                &[],
-            )
+            .query_sync("SELECT COUNT(DISTINCT project_id) AS n FROM messages", &[])
             .unwrap();
         assert_eq!(project_pair_rows.len(), 1);
         assert_eq!(
@@ -6005,11 +5993,9 @@ body for {slug}
             "exactly one summary line expected above the sample limit"
         );
         let summary = &over_limit.warnings[0];
+        let expected_collision_count = (DUPLICATE_CANONICAL_WARNING_SAMPLE_LIMIT + 7).to_string();
         assert!(
-            summary.contains(&format!(
-                "{}",
-                DUPLICATE_CANONICAL_WARNING_SAMPLE_LIMIT + 7
-            )),
+            summary.contains(&expected_collision_count),
             "summary must report the total collision count, got: {summary}"
         );
         assert!(
