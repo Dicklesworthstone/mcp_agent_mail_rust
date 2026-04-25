@@ -66,8 +66,19 @@ fn config_json(state: &TuiSharedState) -> Value {
     })
 }
 
-fn snapshot_payload(state: &TuiSharedState, limit: usize) -> Value {
+fn request_counters_json(state: &TuiSharedState) -> Value {
     let counters = state.request_counters();
+    json!({
+        "total": counters.total,
+        "status_2xx": counters.status_2xx,
+        "status_4xx": counters.status_4xx,
+        "status_5xx": counters.status_5xx,
+        "latency_total_ms": counters.latency_total_ms,
+        "avg_latency_ms": state.avg_latency_ms(),
+    })
+}
+
+fn snapshot_payload(state: &TuiSharedState, limit: usize) -> Value {
     let ring = state.event_ring_stats();
     let next_seq = ring.next_seq;
     let events = state.recent_events(limit);
@@ -79,14 +90,7 @@ fn snapshot_payload(state: &TuiSharedState, limit: usize) -> Value {
         "generated_at_us": now_micros(),
         "next_seq": next_seq,
         "event_count": events.len(),
-        "request_counters": {
-            "total": counters.total,
-            "status_2xx": counters.status_2xx,
-            "status_4xx": counters.status_4xx,
-            "status_5xx": counters.status_5xx,
-            "latency_total_ms": counters.latency_total_ms,
-            "avg_latency_ms": state.avg_latency_ms(),
-        },
+        "request_counters": request_counters_json(state),
         "event_ring_stats": ring,
         "config": config_json(state),
         "db_stats": state.db_stats_snapshot(),
@@ -97,7 +101,6 @@ fn snapshot_payload(state: &TuiSharedState, limit: usize) -> Value {
 }
 
 fn delta_payload(state: &TuiSharedState, since: u64, limit: usize) -> Value {
-    let counters = state.request_counters();
     let ring = state.event_ring_stats();
     let events = state.events_since_limited(since, limit);
     let to_seq = events.last().map_or(since, MailEvent::seq);
@@ -110,14 +113,7 @@ fn delta_payload(state: &TuiSharedState, since: u64, limit: usize) -> Value {
         "since_seq": since,
         "to_seq": to_seq,
         "event_count": events.len(),
-        "request_counters": {
-            "total": counters.total,
-            "status_2xx": counters.status_2xx,
-            "status_4xx": counters.status_4xx,
-            "status_5xx": counters.status_5xx,
-            "latency_total_ms": counters.latency_total_ms,
-            "avg_latency_ms": state.avg_latency_ms(),
-        },
+        "request_counters": request_counters_json(state),
         "event_ring_stats": ring,
         "db_stats": state.db_stats_snapshot(),
         "atc": crate::atc_operator_snapshot(),
