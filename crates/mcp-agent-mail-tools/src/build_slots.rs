@@ -264,12 +264,7 @@ fn collect_slot_conflicts(
         }
         // Exclusive request conflicts with any active holder.
         // Shared request conflicts only with existing exclusive holders.
-        let conflicts_with_entry = if request_exclusive {
-            true
-        } else {
-            entry.exclusive
-        };
-        if conflicts_with_entry {
+        if request_exclusive || entry.exclusive {
             conflicts.push(entry);
         }
     }
