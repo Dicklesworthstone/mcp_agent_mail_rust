@@ -3059,28 +3059,26 @@ fn env_bool(key: &str, default: bool) -> bool {
     env_value(key).map_or(default, |v| parse_bool(&v, default))
 }
 
-fn env_u16(key: &str, default: u16) -> u16 {
+fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
     env_value(key)
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+fn env_u16(key: &str, default: u16) -> u16 {
+    env_parse(key, default)
 }
 
 fn env_u32(key: &str, default: u32) -> u32 {
-    env_value(key)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    env_parse(key, default)
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    env_value(key)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    env_parse(key, default)
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
-    env_value(key)
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    env_parse(key, default)
 }
 
 fn env_u64_opt(key: &str) -> Option<u64> {
