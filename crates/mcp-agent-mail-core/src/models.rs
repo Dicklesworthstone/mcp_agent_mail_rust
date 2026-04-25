@@ -699,25 +699,26 @@ pub const DESCRIPTIVE_NAME_KEYWORDS: &[&str] = &[
     "engineer",
 ];
 
+fn lowercase_non_empty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_ascii_lowercase())
+}
+
 /// Check if a value looks like a known program name.
 #[must_use]
 pub fn looks_like_program_name(value: &str) -> bool {
-    let value = value.trim();
-    if value.is_empty() {
+    let Some(lower) = lowercase_non_empty(value) else {
         return false;
-    }
-    let lower = value.to_ascii_lowercase();
+    };
     KNOWN_PROGRAM_NAMES.contains(&lower.as_str())
 }
 
 /// Check if a value looks like a model name.
 #[must_use]
 pub fn looks_like_model_name(value: &str) -> bool {
-    let value = value.trim();
-    if value.is_empty() {
+    let Some(lower) = lowercase_non_empty(value) else {
         return false;
-    }
-    let lower = value.to_ascii_lowercase();
+    };
     MODEL_NAME_PATTERNS
         .iter()
         .any(|pattern| lower.contains(pattern))
@@ -743,22 +744,18 @@ pub fn looks_like_email(value: &str) -> bool {
 /// Check if a value looks like an attempt to broadcast to all agents.
 #[must_use]
 pub fn looks_like_broadcast(value: &str) -> bool {
-    let value = value.trim();
-    if value.is_empty() {
+    let Some(lower) = lowercase_non_empty(value) else {
         return false;
-    }
-    let lower = value.to_ascii_lowercase();
+    };
     BROADCAST_TOKENS.contains(&lower.as_str())
 }
 
 /// Check if a value looks like a descriptive role name.
 #[must_use]
 pub fn looks_like_descriptive_name(value: &str) -> bool {
-    let value = value.trim();
-    if value.is_empty() {
+    let Some(lower) = lowercase_non_empty(value) else {
         return false;
-    }
-    let lower = value.to_ascii_lowercase();
+    };
     DESCRIPTIVE_NAME_KEYWORDS
         .iter()
         .any(|keyword| lower.contains(keyword))
