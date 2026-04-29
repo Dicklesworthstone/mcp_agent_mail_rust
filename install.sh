@@ -599,6 +599,17 @@ CAPTURED_CMD_OUTPUT=""
 CAPTURED_CMD_STATUS=0
 PYTHON_MIGRATION_MARKER="${PYTHON_MIGRATION_MARKER:-$HOME/.config/mcp-agent-mail/.python-migration-complete}"
 
+path_resolves_to_installed_am() {
+  local candidate="$1"
+  [ -n "$candidate" ] || return 1
+
+  local dest_real candidate_real
+  dest_real=$(readlink -f "$DEST/$BIN_CLI" 2>/dev/null || printf '%s\n' "$DEST/$BIN_CLI")
+  candidate_real=$(readlink -f "$candidate" 2>/dev/null || printf '%s\n' "$candidate")
+
+  [ "$candidate_real" = "$dest_real" ]
+}
+
 # T1.1: Detect Python am alias in shell rc files
 detect_python_alias() {
   PYTHON_ALIAS_FOUND=0
@@ -790,8 +801,6 @@ detect_python_binary() {
   local all_am
   all_am=$(which -a am 2>/dev/null || true)
   [ -z "$all_am" ] && return 0
-  local dest_cli_real
-  dest_cli_real=$(readlink -f "$DEST/$BIN_CLI" 2>/dev/null || printf '%s\n' "$DEST/$BIN_CLI")
 
   while IFS= read -r am_path; do
     [ -z "$am_path" ] && continue
@@ -803,7 +812,7 @@ detect_python_binary() {
     if [ -L "$am_path" ]; then
       local link_target
       link_target=$(readlink -f "$am_path" 2>/dev/null || readlink "$am_path" 2>/dev/null || true)
-      if [ -n "$link_target" ] && [ "$link_target" = "$dest_cli_real" ]; then
+      if path_resolves_to_installed_am "$link_target"; then
         verbose "detect_python_binary:skip_rust_symlink path=${am_path} target=${link_target}"
         continue
       fi
@@ -4384,6 +4393,57 @@ interactive_shell_am_descriptor() {
   esac
 }
 
+python_alias_points_to_installed_am() {
+  [ "$PYTHON_ALIAS_FOUND" -eq 1 ] || return 1
+
+  local alias_body candidate
+  alias_body="$(python_alias_entry_body 2>/dev/null || true)"
+  [ -z "$alias_body" ] && alias_body="${PYTHON_ALIAS_CONTENT:-}"
+  [ -n "$alias_body" ] || return 1
+
+  candidate=$(printf '%s\n' "$alias_body" | sed -n -E \
+    -e "s/^[[:space:]]*alias[[:space:]]+am=['\"]?([^'\"[:space:];]+).*/\1/p" \
+    -e "s/^[[:space:]]*alias[[:space:]]+am[[:space:]]+['\"]?([^'\"[:space:];]+).*/\1/p" \
+    | head -1)
+  [ -n "$candidate" ] || return 1
+
+  path_resolves_to_installed_am "$candidate"
+}
+
+interactive_shell_descriptor_matches_installed_am() {
+  local descriptor="$1"
+  [ -n "$descriptor" ] || return 1
+
+  if printf '%s\n' "$descriptor" | grep -Fq "$DEST/$BIN_CLI"; then
+    return 0
+  fi
+
+  local line candidate
+  while IFS= read -r line; do
+    candidate=""
+    case "$line" in
+      "am is an alias for "*) candidate="${line#am is an alias for }" ;;
+      "am is aliased to "*) candidate="${line#am is aliased to }" ;;
+      "am is "*) candidate="${line#am is }" ;;
+    esac
+    [ -n "$candidate" ] || continue
+
+    candidate="${candidate#\'}"
+    candidate="${candidate%\'}"
+    candidate="${candidate#\"}"
+    candidate="${candidate%\"}"
+    case "$candidate" in
+      /*)
+        if path_resolves_to_installed_am "$candidate"; then
+          return 0
+        fi
+        ;;
+    esac
+  done <<< "$descriptor"
+
+  return 1
+}
+
 existing_rust_binaries_are_skip_safe() {
   EXISTING_INSTALL_REPAIR_REASON=""
 
@@ -4433,12 +4493,12 @@ existing_rust_binaries_are_skip_safe() {
     EXISTING_INSTALL_REPAIR_REASON="interactive shell cannot resolve 'am'"
     return 1
   fi
-  if printf '%s\n' "$actual_resolution" | grep -qiE 'alias|function'; then
-    EXISTING_INSTALL_REPAIR_REASON="interactive shell still resolves 'am' via ${actual_resolution}"
-    return 1
-  fi
-  if ! printf '%s\n' "$actual_resolution" | grep -Fq "$DEST/$BIN_CLI"; then
-    EXISTING_INSTALL_REPAIR_REASON="interactive shell resolves 'am' to ${actual_resolution}"
+  if ! interactive_shell_descriptor_matches_installed_am "$actual_resolution"; then
+    if printf '%s\n' "$actual_resolution" | grep -qiE 'alias|function'; then
+      EXISTING_INSTALL_REPAIR_REASON="interactive shell still resolves 'am' via ${actual_resolution}"
+    else
+      EXISTING_INSTALL_REPAIR_REASON="interactive shell resolves 'am' to ${actual_resolution}"
+    fi
     return 1
   fi
 
@@ -4450,7 +4510,9 @@ existing_install_can_skip() {
 
   if [ "$PYTHON_DETECTED" -eq 1 ] && [ "$FORCE_NO_MIGRATE" -eq 0 ]; then
     local python_shadow_active=0
-    [ "$PYTHON_ALIAS_FOUND" -eq 1 ] && python_shadow_active=1
+    if [ "$PYTHON_ALIAS_FOUND" -eq 1 ] && ! python_alias_points_to_installed_am; then
+      python_shadow_active=1
+    fi
     [ -n "${PYTHON_PID:-}" ] && python_shadow_active=1
     if [ "$PYTHON_BINARY_FOUND" -eq 1 ]; then
       case "${PYTHON_BINARY_PATH:-}" in

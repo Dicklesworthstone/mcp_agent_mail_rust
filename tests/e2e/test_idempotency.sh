@@ -363,6 +363,12 @@ chmod +x "${LEGACY_LINK_DEST}/.venv/bin/am"
 printf 'migrated_at=2026-01-01T00:00:00Z\nnote=test fixture\n' \
     > "${LEGACY_LINK_HOME}/.config/mcp-agent-mail/.python-migration-complete"
 ln -s "${LEGACY_LINK_DEST}/am" "${LEGACY_LINK_BIN}/am"
+cat > "${LEGACY_LINK_HOME}/.zshrc" <<EOF
+alias am='${LEGACY_LINK_BIN}/am'
+EOF
+cat > "${LEGACY_LINK_HOME}/.bashrc" <<EOF
+alias am='${LEGACY_LINK_BIN}/am'
+EOF
 
 LEGACY_LINK_BACKUPS_BEFORE="$(count_glob_matches "${LEGACY_LINK_BIN}/am.bak.mcp-agent-mail-*")"
 
