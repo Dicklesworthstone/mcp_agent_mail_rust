@@ -2394,6 +2394,37 @@ maybe_add_path() {
   verbose "maybe_add_path:done"
 }
 
+install_local_bin_link() {
+  local binary_name="$1"
+  local source_path="$DEST/$binary_name"
+  local link_dir="${AM_LINK_DIR:-$HOME/.local/bin}"
+  local link_path="$link_dir/$binary_name"
+
+  [ -x "$source_path" ] || return 1
+  [ "$source_path" = "$link_path" ] && return 0
+
+  if ! mkdir -p "$link_dir"; then
+    warn "Unable to create local bin directory for $binary_name: $link_dir"
+    return 1
+  fi
+  if [ -e "$link_path" ] && [ ! -w "$link_path" ]; then
+    warn "Unable to update PATH shim for $binary_name (not writable): $link_path"
+    return 1
+  fi
+  if ! ln -sfn "$source_path" "$link_path"; then
+    warn "Unable to link $link_path -> $source_path"
+    return 1
+  fi
+  ok "Linked $link_path -> $source_path"
+}
+
+install_local_bin_links() {
+  local issues=0
+  install_local_bin_link "$BIN_CLI" || issues=$((issues + 1))
+  install_local_bin_link "$BIN_SERVER" || issues=$((issues + 1))
+  return "$issues"
+}
+
 detect_mac_direct_exec_compat_mode() {
   MAC_DIRECT_EXEC_COMPAT_MODE=0
   MAC_DIRECT_EXEC_COMPAT_REASON=""
@@ -2722,13 +2753,13 @@ probe_remote_http_endpoint() {
   base_url="$(desired_mcp_http_base_url)"
   local bearer_token
   bearer_token="$(resolve_setup_http_bearer_token)"
-  local curl_args=(--silent --show-error --fail --connect-timeout 1 --max-time 4)
+  local curl_args=(--silent --show-error --connect-timeout 1 --max-time 4)
   if [ -n "$bearer_token" ]; then
     curl_args+=(-H "Authorization: Bearer ${bearer_token}")
   fi
 
   local health_url
-  for health_url in "${base_url}/health" "${base_url}/healthz"; do
+  for health_url in "${base_url}/health/readiness" "${base_url}/health"; do
     local health_body=""
     if health_body=$(curl "${curl_args[@]}" "$health_url" 2>/dev/null); then
       if printf '%s' "$health_body" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"(ok|ready)"'; then
@@ -2740,6 +2771,10 @@ probe_remote_http_endpoint() {
       REMOTE_HTTP_PROBE_DETAIL="could not reach ${health_url}"
     fi
   done
+
+  if curl "${curl_args[@]}" "${base_url}/healthz" >/dev/null 2>&1; then
+    REMOTE_HTTP_PROBE_DETAIL="${REMOTE_HTTP_PROBE_DETAIL}; liveness endpoint responds but readiness is not healthy"
+  fi
 
   return 1
 }
@@ -2856,15 +2891,15 @@ ensure_remote_http_client_readiness() {
   [ -n "${REMOTE_HTTP_PROBE_DETAIL:-}" ] && warn "  Probe detail: ${REMOTE_HTTP_PROBE_DETAIL}"
 
   if ! platform_supports_user_service_management; then
-    warn "Automatic background service setup is not supported on this platform."
-    warn "Start a local HTTP server with: ${DEST}/${BIN_CLI} serve-http --no-tui"
-    return 0
+    err "Automatic background service setup is not supported on this platform."
+    err "Start a local HTTP server with: ${DEST}/${BIN_CLI} serve-http --no-tui"
+    return 1
   fi
 
   if ! "$DEST/$BIN_CLI" service install --help >/dev/null 2>&1; then
-    warn "This build does not expose 'am service install'; skipping automatic background startup."
-    warn "Start a local HTTP server with: ${DEST}/${BIN_CLI} serve-http --no-tui"
-    return 0
+    err "This build does not expose 'am service install'; cannot start the required background service."
+    err "Start a local HTTP server with: ${DEST}/${BIN_CLI} serve-http --no-tui"
+    return 1
   fi
 
   info "Installing or restarting the background Agent Mail HTTP service"
@@ -2875,14 +2910,14 @@ ensure_remote_http_client_readiness() {
     done <<< "$service_output"
     repair_launchd_service_env_from_rust_config
   else
-    warn "Automatic background service setup failed."
+    err "Automatic background service setup failed."
     if [ -n "$service_output" ]; then
       while IFS= read -r line; do
-        [ -n "$line" ] && warn "  ${line}"
+        [ -n "$line" ] && err "  ${line}"
       done <<< "$service_output"
     fi
-    warn "You can still start a local HTTP server manually with: ${DEST}/${BIN_CLI} serve-http --no-tui"
-    return 0
+    err "You can still start a local HTTP server manually with: ${DEST}/${BIN_CLI} serve-http --no-tui"
+    return 1
   fi
 
   if wait_for_remote_http_endpoint 20; then
@@ -2894,10 +2929,8 @@ ensure_remote_http_client_readiness() {
   # The service install returned 0 but the endpoint never came up. This was
   # the exact failure mode in #96 (systemd CHDIR crash-loop) where the
   # installer said "ok" while every MCP client saw zero tools. Surface it as
-  # an ERR so it cannot be missed in install output — we still don't
-  # hard-fail the install (users running in non-systemd environments may
-  # want to start the server manually), but echo the service status
-  # verbatim so the failure mode is obvious.
+  # an ERR and fail the installer so orchestrators such as ACFS cannot mark a
+  # broken remote-MCP setup as successful.
   err "Background service was installed, but the MCP HTTP endpoint is still not healthy."
   # `service status` returns non-zero when the service is failing (which is
   # exactly the case that lands us here), so capture its output
@@ -2916,7 +2949,7 @@ ensure_remote_http_client_readiness() {
   err "Diagnose with:  ${DEST}/${BIN_CLI} service status"
   err "Or start a foreground server manually with:  ${DEST}/${BIN_CLI} serve-http --no-tui"
   err "MCP clients (Claude Code, Cursor, Codex, …) will see zero tools until this is resolved."
-  return 0
+  return 1
 }
 
 resolve_setup_http_bearer_token() {
@@ -4822,6 +4855,7 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   ok "  $DEST/$BIN_SERVER"
   ok "  $DEST/$BIN_CLI"
   maybe_add_path
+  install_local_bin_links
   if [ "$VERIFY" -eq 1 ]; then
     "$DEST/$BIN_CLI" --version || true
     ok "Self-test complete"
@@ -4964,6 +4998,7 @@ ok "Installed to $DEST"
 ok "  $DEST/$BIN_SERVER"
 ok "  $DEST/$BIN_CLI"
 maybe_add_path
+install_local_bin_links
 
 if detect_mac_direct_exec_compat_mode; then
   warn "macOS direct execution compatibility mode enabled"
@@ -6182,10 +6217,12 @@ verify_installation() {
   # 7. Summary
   if [ "$issues" -gt 0 ]; then
     warn "Verification found $issues issue(s). See warnings above."
+    return 1
   else
     ok "All verification checks passed"
   fi
   verbose "verify_installation:done issues=${issues}"
+  return 0
 }
 
 if [ "$VERIFY" -eq 1 ]; then
