@@ -5223,6 +5223,41 @@ fn sqlite_conn_check_ok_canonical(
     Ok(sqlite_pragma_check_rows_ok(&rows, kind))
 }
 
+fn sqlite_file_check_ok_canonical(
+    db_path: &Path,
+    kind: mcp_agent_mail_db::CheckKind,
+) -> CliResult<bool> {
+    let path_string = db_path.to_string_lossy().into_owned();
+    let conn = mcp_agent_mail_db::CanonicalDbConn::open_file(&path_string).map_err(|e| {
+        CliError::Other(format!(
+            "cannot open sqlite file {} for canonical {kind}: {e}",
+            db_path.display()
+        ))
+    })?;
+    sqlite_conn_check_ok_canonical(&conn, kind)
+}
+
+fn sqlite_conn_check_ok_with_canonical_file_fallback(
+    conn: &mcp_agent_mail_db::DbConn,
+    db_path: &Path,
+    kind: mcp_agent_mail_db::CheckKind,
+) -> CliResult<bool> {
+    let primary_result = sqlite_conn_check_ok(conn, kind);
+    if primary_result.as_ref().is_ok_and(|ok| *ok) || db_path.as_os_str() == ":memory:" {
+        return primary_result;
+    }
+
+    match sqlite_file_check_ok_canonical(db_path, kind) {
+        Ok(true) => Ok(true),
+        Ok(false) => Ok(false),
+        Err(_) => match primary_result {
+            Ok(false) => Ok(false),
+            Ok(true) => Ok(true),
+            Err(primary_error) => Err(primary_error),
+        },
+    }
+}
+
 fn sqlite_conn_quick_check_ok(conn: &mcp_agent_mail_db::DbConn) -> CliResult<bool> {
     sqlite_conn_check_ok(conn, mcp_agent_mail_db::CheckKind::Quick)
 }
@@ -17825,8 +17860,12 @@ fn doctor_database_fix_strategy(
         }
     }
 
-    let integrity_ok = match sqlite_conn_check_ok(&opened.conn, mcp_agent_mail_db::CheckKind::Full)
-    {
+    let opened_path = Path::new(&opened.opened_path);
+    let integrity_ok = match sqlite_conn_check_ok_with_canonical_file_fallback(
+        &opened.conn,
+        opened_path,
+        mcp_agent_mail_db::CheckKind::Full,
+    ) {
         Ok(ok) => ok,
         Err(error) => {
             let detail = format!(
@@ -48689,24 +48728,12 @@ fn handle_doctor_repair_with(
     // do NOT bail to reconstruction — the REINDEX step below will fix index
     // corruption in-place.
     {
-        let full_rows = conn
-            .query_sync("PRAGMA integrity_check", &[])
-            .unwrap_or_default();
-        let full_ok = full_rows.len() == 1
-            && full_rows
-                .first()
-                .and_then(|r| {
-                    use sqlmodel_core::Value;
-                    if let Some(Value::Text(s)) = r.get_by_name("integrity_check") {
-                        Some(s.clone())
-                    } else if let Some(Value::Text(s)) = r.values().next() {
-                        Some(s.clone())
-                    } else {
-                        None
-                    }
-                })
-                .as_deref()
-                == Some("ok");
+        let full_ok = sqlite_conn_check_ok_with_canonical_file_fallback(
+            &conn,
+            &reconstruct_db_path,
+            mcp_agent_mail_db::CheckKind::Full,
+        )
+        .unwrap_or(false);
         if !full_ok {
             ftui_runtime::ftui_println!(
                 "  Full integrity_check: FAILED (index corruption detected; REINDEX will repair)"

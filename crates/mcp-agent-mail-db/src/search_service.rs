@@ -2462,6 +2462,7 @@ fn env_bool(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+#[cfg(feature = "hybrid")]
 fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -3001,7 +3002,7 @@ async fn orchestrate_hybrid_results_with_optional_rerank(
     lexical_results: Vec<SearchResult>,
     semantic_results: Vec<SearchResult>,
 ) -> (Vec<SearchResult>, Option<HybridRerankAudit>) {
-    let mut merged = orchestrate_hybrid_results(
+    let merged = orchestrate_hybrid_results(
         query,
         &plan.derivation,
         plan.governor,
@@ -3010,13 +3011,20 @@ async fn orchestrate_hybrid_results_with_optional_rerank(
     );
 
     #[cfg(feature = "hybrid")]
-    let rerank_audit = Some(if plan.governor.rerank_enabled {
-        maybe_apply_hybrid_rerank(cx, query, merged.as_mut_slice()).await
-    } else {
-        rerank_skip_audit_for_governor(plan.governor, merged.len())
-    });
+    let (merged, rerank_audit) = {
+        let mut merged = merged;
+        let rerank_audit = Some(if plan.governor.rerank_enabled {
+            maybe_apply_hybrid_rerank(cx, query, merged.as_mut_slice()).await
+        } else {
+            rerank_skip_audit_for_governor(plan.governor, merged.len())
+        });
+        (merged, rerank_audit)
+    };
     #[cfg(not(feature = "hybrid"))]
-    let rerank_audit = None;
+    let rerank_audit = {
+        let _ = cx;
+        None
+    };
 
     (merged, rerank_audit)
 }
@@ -3768,15 +3776,16 @@ pub async fn execute_search(
         let semantic_results: Vec<SearchResult> = Vec::new();
 
         if let Some(lexical_results) = lexical_results {
-            let (mut raw_results, mut rerank_audit) =
-                orchestrate_hybrid_results_with_optional_rerank(
-                    cx,
-                    &candidate_query,
-                    &plan,
-                    lexical_results,
-                    semantic_results,
-                )
-                .await;
+            let (mut raw_results, rerank_audit) = orchestrate_hybrid_results_with_optional_rerank(
+                cx,
+                &candidate_query,
+                &plan,
+                lexical_results,
+                semantic_results,
+            )
+            .await;
+            #[cfg(feature = "hybrid")]
+            let mut rerank_audit = rerank_audit;
             #[cfg(feature = "hybrid")]
             if let (Some(audit), Some(telemetry)) =
                 (rerank_audit.as_mut(), two_tier_telemetry.as_ref())

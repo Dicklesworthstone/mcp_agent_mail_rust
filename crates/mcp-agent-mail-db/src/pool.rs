@@ -3878,16 +3878,6 @@ fn sqlite_pragma_check_is_ok(conn: &DbConn, kind: integrity::CheckKind) -> Resul
 }
 
 #[allow(clippy::result_large_err)]
-fn sqlite_quick_check_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
-    sqlite_pragma_check_is_ok(conn, integrity::CheckKind::Quick)
-}
-
-#[allow(clippy::result_large_err)]
-fn sqlite_incremental_check_is_ok(conn: &DbConn) -> Result<bool, SqlError> {
-    sqlite_pragma_check_is_ok(conn, integrity::CheckKind::Incremental)
-}
-
-#[allow(clippy::result_large_err)]
 fn sqlite_pragma_check_details_canonical(
     conn: &crate::CanonicalDbConn,
     kind: integrity::CheckKind,
@@ -3904,6 +3894,54 @@ fn sqlite_pragma_check_is_ok_canonical(
     let details = sqlite_pragma_check_details_canonical(conn, kind)?;
     Ok(integrity::details_indicate_ok(&details)
         || integrity::integrity_details_are_suspect(&details))
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_canonical_file_check_is_ok(
+    path: &Path,
+    kind: integrity::CheckKind,
+) -> Result<bool, SqlError> {
+    let path_str = path.to_string_lossy();
+    let conn = crate::CanonicalDbConn::open_file(path_str.as_ref())?;
+    sqlite_pragma_check_is_ok_canonical(&conn, kind)
+}
+
+#[allow(clippy::result_large_err)]
+fn sqlite_primary_check_is_ok_with_canonical_fallback(
+    path: &Path,
+    conn: &DbConn,
+    kind: integrity::CheckKind,
+) -> Result<bool, SqlError> {
+    let primary_result = sqlite_pragma_check_is_ok(conn, kind);
+    if matches!(primary_result, Ok(true)) {
+        return Ok(true);
+    }
+
+    match sqlite_canonical_file_check_is_ok(path, kind) {
+        Ok(true) => {
+            tracing::warn!(
+                path = %path.display(),
+                check = %kind,
+                primary_error = primary_result.as_ref().err().map(ToString::to_string).as_deref(),
+                "primary sqlite integrity probe did not accept the file but canonical SQLite did; treating as healthy"
+            );
+            Ok(true)
+        }
+        Ok(false) => Ok(false),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                check = %kind,
+                error = %error,
+                "primary sqlite integrity probe failed and canonical fallback could not prove the file healthy"
+            );
+            match primary_result {
+                Ok(false) => Ok(false),
+                Ok(true) => Ok(true),
+                Err(primary_error) => Err(primary_error),
+            }
+        }
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -4132,7 +4170,11 @@ pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError
         }
     };
 
-    match sqlite_quick_check_is_ok(&conn) {
+    match sqlite_primary_check_is_ok_with_canonical_fallback(
+        path,
+        &conn,
+        integrity::CheckKind::Quick,
+    ) {
         Ok(false) => return Ok(false),
         Ok(true) => {}
         Err(e) => {
@@ -4151,7 +4193,11 @@ pub fn sqlite_primary_read_path_is_healthy(path: &Path) -> Result<bool, SqlError
         }
     }
 
-    match sqlite_incremental_check_is_ok(&conn) {
+    match sqlite_primary_check_is_ok_with_canonical_fallback(
+        path,
+        &conn,
+        integrity::CheckKind::Incremental,
+    ) {
         Ok(false) => return Ok(false),
         Ok(true) => {}
         Err(e) => {
