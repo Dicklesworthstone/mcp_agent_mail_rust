@@ -597,6 +597,7 @@ MAC_DIRECT_EXEC_COMPAT_REASON=""
 MAC_DIRECT_EXEC_COMPAT_LAUNCHER=""
 CAPTURED_CMD_OUTPUT=""
 CAPTURED_CMD_STATUS=0
+PYTHON_MIGRATION_MARKER="${PYTHON_MIGRATION_MARKER:-$HOME/.config/mcp-agent-mail/.python-migration-complete}"
 
 # T1.1: Detect Python am alias in shell rc files
 detect_python_alias() {
@@ -789,6 +790,8 @@ detect_python_binary() {
   local all_am
   all_am=$(which -a am 2>/dev/null || true)
   [ -z "$all_am" ] && return 0
+  local dest_cli_real
+  dest_cli_real=$(readlink -f "$DEST/$BIN_CLI" 2>/dev/null || printf '%s\n' "$DEST/$BIN_CLI")
 
   while IFS= read -r am_path; do
     [ -z "$am_path" ] && continue
@@ -800,7 +803,11 @@ detect_python_binary() {
     if [ -L "$am_path" ]; then
       local link_target
       link_target=$(readlink -f "$am_path" 2>/dev/null || readlink "$am_path" 2>/dev/null || true)
-      if echo "$link_target" | grep -qiE "python|venv|site-packages|mcp.agent.mail"; then
+      if [ -n "$link_target" ] && [ "$link_target" = "$dest_cli_real" ]; then
+        verbose "detect_python_binary:skip_rust_symlink path=${am_path} target=${link_target}"
+        continue
+      fi
+      if echo "$link_target" | grep -qiE '(^|/)(python[0-9.]*|venv|\.venv|virtualenv|site-packages)(/|$)|/\.local/lib/python'; then
         PYTHON_BINARY_FOUND=1
         PYTHON_BINARY_PATH="$am_path"
         verbose "detect_python_binary:found symlink_path=${PYTHON_BINARY_PATH}"
@@ -4442,8 +4449,21 @@ existing_install_can_skip() {
   EXISTING_INSTALL_REPAIR_REASON=""
 
   if [ "$PYTHON_DETECTED" -eq 1 ] && [ "$FORCE_NO_MIGRATE" -eq 0 ]; then
-    EXISTING_INSTALL_REPAIR_REASON="legacy Python installation is still present and takeover/displacement has not been re-run"
-    return 1
+    local python_shadow_active=0
+    [ "$PYTHON_ALIAS_FOUND" -eq 1 ] && python_shadow_active=1
+    [ -n "${PYTHON_PID:-}" ] && python_shadow_active=1
+    if [ "$PYTHON_BINARY_FOUND" -eq 1 ]; then
+      case "${PYTHON_BINARY_PATH:-}" in
+        python\ *|python3\ *|*"-m mcp_agent_mail"*) ;;
+        *) python_shadow_active=1 ;;
+      esac
+    fi
+
+    if [ "$python_shadow_active" -eq 1 ] || [ ! -f "$PYTHON_MIGRATION_MARKER" ]; then
+      EXISTING_INSTALL_REPAIR_REASON="legacy Python installation is still present and takeover/displacement has not been re-run"
+      return 1
+    fi
+    verbose "existing_install_can_skip:legacy clone remains but migration marker is present and no active Python launcher shadows Rust"
   fi
 
   existing_rust_binaries_are_skip_safe
@@ -5015,7 +5035,6 @@ fi
 # T5.0: Check if Python→Rust migration was already completed on a previous run.
 # A marker file records that the database was successfully migrated, so we never
 # attempt to overwrite the live Rust database with the old Python snapshot again.
-PYTHON_MIGRATION_MARKER="$HOME/.config/mcp-agent-mail/.python-migration-complete"
 PYTHON_MIGRATION_ALREADY_DONE=0
 if [ -f "$PYTHON_MIGRATION_MARKER" ]; then
   PYTHON_MIGRATION_ALREADY_DONE=1

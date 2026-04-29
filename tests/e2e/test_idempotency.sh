@@ -53,6 +53,17 @@ count_literal_in_file() {
     grep -F -c "$literal" "$file" 2>/dev/null || true
 }
 
+count_glob_matches() {
+    local pattern="$1"
+    local matches
+    matches="$(compgen -G "$pattern" || true)"
+    if [ -z "$matches" ]; then
+        printf '0\n'
+    else
+        printf '%s\n' "$matches" | wc -l | tr -d ' '
+    fi
+}
+
 build_mock_release_artifact() {
     local version="$1"
     local artifact_path="$2"
@@ -145,6 +156,37 @@ run_installer() {
             --version "v${version}" \
             --artifact-url "file://${artifact_path}" \
             --dest "$DEST" \
+            --offline \
+            --no-verify \
+            --no-gum
+    ) >"$stdout_file" 2>"$stderr_file"
+    LAST_INSTALL_RC=$?
+    set -e
+
+    LAST_INSTALL_STDOUT="$(cat "$stdout_file" 2>/dev/null || true)"
+    LAST_INSTALL_STDERR="$(cat "$stderr_file" 2>/dev/null || true)"
+    e2e_save_artifact "${case_name}_stdout.txt" "$LAST_INSTALL_STDOUT"
+    e2e_save_artifact "${case_name}_stderr.txt" "$LAST_INSTALL_STDERR"
+}
+
+run_legacy_link_installer() {
+    local case_name="$1"
+    local path_value="$2"
+
+    local stdout_file="${WORK}/${case_name}_stdout.txt"
+    local stderr_file="${WORK}/${case_name}_stderr.txt"
+
+    set +e
+    (
+        cd "$LEGACY_LINK_RUN_DIR"
+        HOME="$LEGACY_LINK_HOME" \
+        SHELL="$TEST_SHELL" \
+        STORAGE_ROOT="$LEGACY_LINK_STORAGE" \
+        PATH="$path_value" \
+        bash "$INSTALL_SH" \
+            --version "v0.1.0" \
+            --artifact-url "file://${ARTIFACT_V010}" \
+            --dest "$LEGACY_LINK_DEST" \
             --offline \
             --no-verify \
             --no-gum
@@ -292,6 +334,48 @@ git -C "${STORAGE_ROOT}" fsck --no-progress >/dev/null 2>&1
 GIT_FSCK_RC_SECOND=$?
 set -e
 e2e_assert_exit_code "storage root git repo integrity preserved (second install)" "0" "$GIT_FSCK_RC_SECOND"
+
+# ===========================================================================
+# Case 2b: Same-version install skips legacy clone residue after completed migration
+# ===========================================================================
+e2e_case_banner "Same-version install skips inert legacy clone residue"
+
+LEGACY_LINK_HOME="${WORK}/legacy_link_home"
+LEGACY_LINK_RUN_DIR="${WORK}/legacy_link_project"
+LEGACY_LINK_DEST="${LEGACY_LINK_HOME}/mcp_agent_mail"
+LEGACY_LINK_BIN="${LEGACY_LINK_HOME}/.local/bin"
+LEGACY_LINK_STORAGE="${LEGACY_LINK_HOME}/storage_root"
+mkdir -p "$LEGACY_LINK_RUN_DIR" "$LEGACY_LINK_DEST" "$LEGACY_LINK_BIN" "$LEGACY_LINK_STORAGE"
+
+run_legacy_link_installer "case_02b_first_install" "$PATH_BASE"
+e2e_assert_exit_code "legacy-link first install exits 0" "0" "$LAST_INSTALL_RC"
+
+cat > "${LEGACY_LINK_DEST}/pyproject.toml" <<'EOF'
+[project]
+name = "mcp-agent-mail"
+EOF
+mkdir -p "${LEGACY_LINK_DEST}/.venv/bin" "${LEGACY_LINK_HOME}/.config/mcp-agent-mail"
+cat > "${LEGACY_LINK_DEST}/.venv/bin/am" <<'EOF'
+#!/usr/bin/env python3
+print("legacy python am")
+EOF
+chmod +x "${LEGACY_LINK_DEST}/.venv/bin/am"
+printf 'migrated_at=2026-01-01T00:00:00Z\nnote=test fixture\n' \
+    > "${LEGACY_LINK_HOME}/.config/mcp-agent-mail/.python-migration-complete"
+ln -s "${LEGACY_LINK_DEST}/am" "${LEGACY_LINK_BIN}/am"
+
+LEGACY_LINK_BACKUPS_BEFORE="$(count_glob_matches "${LEGACY_LINK_BIN}/am.bak.mcp-agent-mail-*")"
+
+run_legacy_link_installer "case_02b_second_install_legacy_clone_residue" "${LEGACY_LINK_BIN}:${PATH_BASE}"
+e2e_assert_exit_code "legacy-link second install exits 0" "0" "$LAST_INSTALL_RC"
+e2e_assert_contains "legacy-link second install reports already installed" "$LAST_INSTALL_STDOUT" "already installed"
+e2e_assert_not_contains "legacy-link second install does not force repair" "$LAST_INSTALL_STDOUT" "still needs repair"
+e2e_assert_not_contains "legacy-link second install does not displace rust symlink" "$LAST_INSTALL_STDOUT" "Legacy am launcher displaced"
+
+LEGACY_LINK_TARGET="$(readlink "${LEGACY_LINK_BIN}/am")"
+e2e_assert_eq "legacy-link shim still targets installed Rust am" "${LEGACY_LINK_DEST}/am" "$LEGACY_LINK_TARGET"
+LEGACY_LINK_BACKUPS_AFTER="$(count_glob_matches "${LEGACY_LINK_BIN}/am.bak.mcp-agent-mail-*")"
+e2e_assert_eq "legacy-link second install creates no am shim backup" "$LEGACY_LINK_BACKUPS_BEFORE" "$LEGACY_LINK_BACKUPS_AFTER"
 
 # ===========================================================================
 # Case 3: Same-version reinstall repairs active Python alias shadow
