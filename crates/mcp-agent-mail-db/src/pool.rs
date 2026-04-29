@@ -4926,6 +4926,13 @@ fn command_line_has_agent_mail_signature(command: &str) -> bool {
     executable_name_has_agent_mail_signature(basename)
 }
 
+fn command_line_is_agent_mail_server(command: &str) -> bool {
+    command_line_has_agent_mail_signature(command)
+        && command
+            .split_whitespace()
+            .any(|arg| matches!(arg, "serve-http" | "serve-stdio"))
+}
+
 #[cfg(target_os = "linux")]
 fn pid_command_line(pid: u32) -> Option<String> {
     let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
@@ -5077,6 +5084,21 @@ fn classify_mailbox_ownership(
             && !process.holds_sqlite_lock
             && process.holds_database_file
         {
+            if process
+                .command
+                .as_deref()
+                .is_some_and(command_line_is_agent_mail_server)
+            {
+                return (
+                    MailboxOwnershipDisposition::ActiveOtherOwner,
+                    competing_pids,
+                    false,
+                    format!(
+                        "another Agent Mail server owns the mailbox database: {}",
+                        describe_mailbox_process(process)
+                    ),
+                );
+            }
             return (
                 MailboxOwnershipDisposition::StaleLiveProcess,
                 competing_pids,
@@ -10161,6 +10183,27 @@ mod tests {
         assert_eq!(competing_pids, vec![4343]);
         assert!(supervised_restart_required);
         assert!(detail.contains("without mailbox activity locks"));
+    }
+
+    #[test]
+    fn classify_mailbox_ownership_accepts_active_http_server_without_activity_locks() {
+        let processes = vec![MailboxOwnershipProcess {
+            pid: 4344,
+            command: Some("am serve-http --host 127.0.0.1 --port 8765".to_string()),
+            executable_path: Some("/home/ubuntu/mcp_agent_mail/am".to_string()),
+            executable_deleted: false,
+            holds_storage_root_lock: false,
+            holds_sqlite_lock: false,
+            holds_database_file: true,
+        }];
+
+        let (disposition, competing_pids, supervised_restart_required, detail) =
+            classify_mailbox_ownership(&processes, std::process::id());
+
+        assert_eq!(disposition, MailboxOwnershipDisposition::ActiveOtherOwner);
+        assert_eq!(competing_pids, vec![4344]);
+        assert!(!supervised_restart_required);
+        assert!(detail.contains("server owns the mailbox database"));
     }
 
     #[test]
