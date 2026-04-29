@@ -331,6 +331,11 @@ pub struct ProductSearchItem {
     pub thread_id: Option<String>,
     pub from: String,
     pub project_id: i64,
+    /// Message body (Markdown). Populated only when the caller passes
+    /// `include_body_md=true`; otherwise omitted from the JSON envelope so
+    /// FTS5 result lists stay cheap by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_md: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -350,7 +355,7 @@ pub struct ProductSearchResponse {
 /// Python-parity.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 #[tool(
-    description = "Search across all projects linked to a product using the unified Search V3 service.\n\nParameters\n----------\nproduct_key : str\n    Product identifier.\nquery : str\n    Search query string.\nlimit : int\n    Max results to return (default 20, max 1000).\ncursor : str\n    Stable pagination cursor for large result sets.\nproject : str\n    Optional project filter inside the product scope.\n    Aliases: `project_key_filter`, `project_slug`, `proj`.\nsender : str\n    Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.\nimportance : str\n    Filter by importance level(s). Comma-separated: \"low\", \"normal\", \"high\", \"urgent\".\nthread_id : str\n    Filter by thread ID (exact match).\ndate_start : str\n    Inclusive lower bound for created timestamp.\ndate_end : str\n    Inclusive upper bound for created timestamp.\n    Aliases for start: `date_from`, `after`, `since`.\n    Aliases for end: `date_to`, `before`, `until`.\n\nReturns\n-------\ndict\n    { result: [{ id, subject, importance, ack_required, created_ts, thread_id, from, project_id }], assistance?, next_cursor?, diagnostics? }"
+    description = "Search across all projects linked to a product using the unified Search V3 service.\n\nParameters\n----------\nproduct_key : str\n    Product identifier.\nquery : str\n    Search query string.\nlimit : int\n    Max results to return (default 20, max 1000).\ncursor : str\n    Stable pagination cursor for large result sets.\nproject : str\n    Optional project filter inside the product scope.\n    Aliases: `project_key_filter`, `project_slug`, `proj`.\nsender : str\n    Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.\nimportance : str\n    Filter by importance level(s). Comma-separated: \"low\", \"normal\", \"high\", \"urgent\".\nthread_id : str\n    Filter by thread ID (exact match).\ndate_start : str\n    Inclusive lower bound for created timestamp.\ndate_end : str\n    Inclusive upper bound for created timestamp.\n    Aliases for start: `date_from`, `after`, `since`.\n    Aliases for end: `date_to`, `before`, `until`.\ninclude_body_md : bool\n    If true, include the full `body_md` field on each result (default false). Use this\n    when the caller intends to read message contents directly from search output rather\n    than via `fetch_inbox_product` or `resource://thread/...`.\n\nReturns\n-------\ndict\n    { result: [{ id, subject, importance, ack_required, created_ts, thread_id, from, project_id, body_md? }], assistance?, next_cursor?, diagnostics? }\n\n`body_md` is only present when `include_body_md=true`."
 )]
 pub async fn search_messages_product(
     ctx: &McpContext,
@@ -376,7 +381,9 @@ pub async fn search_messages_product(
     before: Option<String>,
     since: Option<String>,
     until: Option<String>,
+    include_body_md: Option<bool>,
 ) -> McpResult<String> {
+    let include_body_md = include_body_md.unwrap_or(false);
     let config = &Config::get();
     if !config.worktrees_enabled {
         return Err(worktrees_required());
@@ -486,6 +493,7 @@ pub async fn search_messages_product(
             thread_id: r.thread_id,
             from: r.from_agent.unwrap_or_default(),
             project_id: r.project_id.unwrap_or(0),
+            body_md: if include_body_md { Some(r.body) } else { None },
         })
         .collect();
 
@@ -1032,6 +1040,7 @@ mod tests {
             thread_id: Some("br-123".to_string()),
             from: "GoldFox".to_string(),
             project_id: 5,
+            body_md: None,
         };
         let json = serde_json::to_string(&item).unwrap();
         let parsed: ProductSearchItem = serde_json::from_str(&json).unwrap();
@@ -1042,6 +1051,9 @@ mod tests {
         assert_eq!(parsed.thread_id, Some("br-123".to_string()));
         assert_eq!(parsed.from, "GoldFox");
         assert_eq!(parsed.project_id, 5);
+        assert!(parsed.body_md.is_none());
+        // Default serialization MUST omit body_md to keep result lists cheap.
+        assert!(!json.contains("body_md"));
     }
 
     #[test]
@@ -1055,11 +1067,31 @@ mod tests {
             thread_id: None,
             from: "Agent".to_string(),
             project_id: 1,
+            body_md: None,
         };
         let json = serde_json::to_string(&item).unwrap();
         let parsed: ProductSearchItem = serde_json::from_str(&json).unwrap();
         assert!(parsed.created_ts.is_none());
         assert!(parsed.thread_id.is_none());
+    }
+
+    #[test]
+    fn product_search_item_includes_body_md_when_populated() {
+        let item = ProductSearchItem {
+            id: 7,
+            subject: "Body test".to_string(),
+            importance: "normal".to_string(),
+            ack_required: 0,
+            created_ts: None,
+            thread_id: None,
+            from: "Agent".to_string(),
+            project_id: 1,
+            body_md: Some("body contents".to_string()),
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(json.contains("\"body_md\":\"body contents\""));
+        let parsed: ProductSearchItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.body_md.as_deref(), Some("body contents"));
     }
 
     #[test]
@@ -1088,6 +1120,7 @@ mod tests {
                     thread_id: None,
                     from: "A".to_string(),
                     project_id: 1,
+                    body_md: None,
                 },
                 ProductSearchItem {
                     id: 2,
@@ -1098,6 +1131,7 @@ mod tests {
                     thread_id: None,
                     from: "B".to_string(),
                     project_id: 2,
+                    body_md: None,
                 },
             ],
             assistance: None,

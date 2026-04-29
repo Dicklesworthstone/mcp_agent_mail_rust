@@ -32,6 +32,11 @@ pub struct SearchResult {
     pub cc: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub bcc: Vec<String>,
+    /// Message body (Markdown). Populated only when the caller passes
+    /// `include_body_md=true`; otherwise omitted from the JSON envelope so
+    /// FTS5 result lists stay cheap by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_md: Option<String>,
     /// Concise reason codes explaining why this result ranked here.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reason_codes: Vec<String>,
@@ -664,6 +669,10 @@ pub(crate) fn parse_time_range_with_aliases(
 /// - `date_from`, `after`, `since`: Aliases of `date_start`
 /// - `date_to`, `before`, `until`: Aliases of `date_end`
 /// - `explain`: Include query plan explain metadata (default: false)
+/// - `include_body_md`: Include the full `body_md` field on each result (default: false).
+///   Default `false` preserves the lightweight FTS5 result-list cost; set `true` when the
+///   caller intends to read the message contents directly from search output (e.g. when
+///   `fetch_inbox` or `ReadMcpResourceTool` is unavailable from a spawned pane).
 /// - `diagnostics`: Optional degraded-mode metadata for budget/timeout signals
 ///
 /// # Returns
@@ -677,7 +686,7 @@ pub(crate) fn parse_time_range_with_aliases(
     clippy::too_many_lines
 )]
 #[tool(
-    description = "Search over subject and body for a project using the unified Search V3 service.\n\nTips\n----\n- Query parser supports phrases (\"build plan\"), prefix (mig*), and boolean operators (plan AND users)\n- Results default to relevance ranking; set `ranking=\"recency\"` for newest-first\n- Limit defaults to 20; raise for broad queries\n- All filter parameters are optional; omit to search without filtering\n\nQuery examples\n---------------\n- Phrase search: `\"build plan\"`\n- Prefix: `migrat*`\n- Boolean: `plan AND users`\n- Require urgent: `urgent AND deployment`\n\nParameters\n----------\nproject_key : str\n    Project identifier.\nquery : str\n    Search query string.\nlimit : int\n    Max results to return (default 20, max 1000).\noffset : int\n    Pagination offset (default 0).\nranking : str\n    Ranking mode: \"relevance\" (default) or \"recency\" (newest first).\nsender : str\n    Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.\nimportance : str\n    Filter by importance level(s). Comma-separated: \"low\", \"normal\", \"high\", \"urgent\".\nthread_id : str\n    Filter by thread ID (exact match).\ndate_start : str\n    Inclusive lower bound for created timestamp.\ndate_end : str\n    Inclusive upper bound for created timestamp.\n    Aliases for start: `date_from`, `after`, `since`.\n    Aliases for end: `date_to`, `before`, `until`.\n    Date-only values are normalized in UTC (`date_end` includes the full day).\nexplain : bool\n    If true, include query explain metadata in the response (default false).\n\nReturns\n-------\ndict\n    { result: [{ id, subject, importance, ack_required, created_ts, thread_id, from }], assistance?, guidance?, explain?, next_cursor?, diagnostics? }\n\n`diagnostics` is present when degraded-mode signals are detected (budget governor pressure, stage timeout).\n\nExamples\n--------\nBasic search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"build plan\",\"limit\":50}\n```\n\nFiltered search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"migration\",\"sender\":\"BlueLake\",\"importance\":\"high,urgent\",\"ranking\":\"recency\"}\n```"
+    description = "Search over subject and body for a project using the unified Search V3 service.\n\nTips\n----\n- Query parser supports phrases (\"build plan\"), prefix (mig*), and boolean operators (plan AND users)\n- Results default to relevance ranking; set `ranking=\"recency\"` for newest-first\n- Limit defaults to 20; raise for broad queries\n- All filter parameters are optional; omit to search without filtering\n- Set `include_body_md=true` to receive the full message body inline; default `false` keeps result lists token-cheap\n\nQuery examples\n---------------\n- Phrase search: `\"build plan\"`\n- Prefix: `migrat*`\n- Boolean: `plan AND users`\n- Require urgent: `urgent AND deployment`\n\nParameters\n----------\nproject_key : str\n    Project identifier.\nquery : str\n    Search query string.\nlimit : int\n    Max results to return (default 20, max 1000).\noffset : int\n    Pagination offset (default 0).\nranking : str\n    Ranking mode: \"relevance\" (default) or \"recency\" (newest first).\nsender : str\n    Filter by sender agent name (exact match). Aliases: `from_agent`, `sender_name`.\nimportance : str\n    Filter by importance level(s). Comma-separated: \"low\", \"normal\", \"high\", \"urgent\".\nthread_id : str\n    Filter by thread ID (exact match).\ndate_start : str\n    Inclusive lower bound for created timestamp.\ndate_end : str\n    Inclusive upper bound for created timestamp.\n    Aliases for start: `date_from`, `after`, `since`.\n    Aliases for end: `date_to`, `before`, `until`.\n    Date-only values are normalized in UTC (`date_end` includes the full day).\nexplain : bool\n    If true, include query explain metadata in the response (default false).\ninclude_body_md : bool\n    If true, include the full `body_md` field on each result (default false). Use this\n    when the caller intends to read message contents directly from search output rather\n    than via `fetch_inbox` or `resource://thread/...`.\n\nReturns\n-------\ndict\n    { result: [{ id, subject, importance, ack_required, created_ts, thread_id, from, body_md? }], assistance?, guidance?, explain?, next_cursor?, diagnostics? }\n\n`body_md` is only present when `include_body_md=true`. `diagnostics` is present when degraded-mode signals are detected (budget governor pressure, stage timeout).\n\nExamples\n--------\nBasic search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"build plan\",\"limit\":50}\n```\n\nFiltered search:\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"migration\",\"sender\":\"BlueLake\",\"importance\":\"high,urgent\",\"ranking\":\"recency\"}\n```\n\nWith bodies inline (when fetch_inbox / ReadMcpResourceTool are unavailable):\n```json\n{\"project_key\":\"/abs/path/backend\",\"query\":\"deployment plan\",\"include_body_md\":true,\"limit\":10}\n```"
 )]
 pub async fn search_messages(
     ctx: &McpContext,
@@ -701,7 +710,9 @@ pub async fn search_messages(
     since: Option<String>,
     until: Option<String>,
     explain: Option<bool>,
+    include_body_md: Option<bool>,
 ) -> McpResult<String> {
+    let include_body_md = include_body_md.unwrap_or(false);
     let max_results_raw = match limit {
         Some(l) if l > 0 => l.clamp(1, 1000),
         _ => 20,
@@ -815,6 +826,7 @@ pub async fn search_messages(
                 to: r.to.unwrap_or_default(),
                 cc: r.cc.unwrap_or_default(),
                 bcc: r.bcc.unwrap_or_default(),
+                body_md: if include_body_md { Some(r.body) } else { None },
                 reason_codes: r.reason_codes,
                 score_factors: r.score_factors,
             }
@@ -1712,6 +1724,7 @@ mod tests {
             to: vec![],
             cc: vec![],
             bcc: vec![],
+            body_md: None,
             reason_codes: Vec::new(),
             score_factors: Vec::new(),
         };
@@ -1722,6 +1735,8 @@ mod tests {
         assert!(json.contains("\"ack_required\":1"));
         assert!(json.contains("\"thread_id\":\"thread-123\""));
         assert!(json.contains("\"from\":\"Alice\""));
+        // body_md is opt-in; absent by default to keep result lists cheap.
+        assert!(!json.contains("body_md"));
     }
 
     #[test]
@@ -1737,6 +1752,7 @@ mod tests {
             to: vec![],
             cc: vec![],
             bcc: vec![],
+            body_md: None,
             reason_codes: Vec::new(),
             score_factors: Vec::new(),
         };
@@ -1746,6 +1762,8 @@ mod tests {
         // Empty vecs should be omitted via skip_serializing_if
         assert!(!json.contains("reason_codes"));
         assert!(!json.contains("score_factors"));
+        // body_md=None must be omitted from the envelope.
+        assert!(!json.contains("body_md"));
     }
 
     #[test]
@@ -1762,6 +1780,7 @@ mod tests {
             to: vec![],
             cc: vec![],
             bcc: vec![],
+            body_md: None,
             reason_codes: vec!["LexicalBm25".to_string(), "FusionWeightedBlend".to_string()],
             score_factors: vec![ScoreFactorSummary {
                 key: "bm25".to_string(),
@@ -1774,6 +1793,27 @@ mod tests {
         assert!(json.contains("\"score_factors\":[{"));
         assert!(json.contains("\"key\":\"bm25\""));
         assert!(json.contains("\"contribution\":0.72"));
+    }
+
+    #[test]
+    fn search_result_includes_body_md_when_requested() {
+        let result = SearchResult {
+            id: 99,
+            subject: "Body test".to_string(),
+            importance: "normal".to_string(),
+            ack_required: 0,
+            created_ts: None,
+            thread_id: None,
+            from: "Carol".to_string(),
+            to: vec![],
+            cc: vec![],
+            bcc: vec![],
+            body_md: Some("# Hello\n\nthis is the body".to_string()),
+            reason_codes: Vec::new(),
+            score_factors: Vec::new(),
+        };
+        let json = serde_json::to_string(&result).expect("serialize");
+        assert!(json.contains("\"body_md\":\"# Hello"));
     }
 
     // -----------------------------------------------------------------------

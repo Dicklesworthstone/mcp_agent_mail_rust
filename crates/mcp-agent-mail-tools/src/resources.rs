@@ -1182,6 +1182,10 @@ fn build_tool_directory() -> ToolDirectory {
                             hint: "Explain + diagnostics".to_string(),
                             sample: "search_messages(project_key='backend', query='\"build plan\" AND users', explain=true, limit=20)".to_string(),
                         },
+                        ToolUsageExample {
+                            hint: "Inline bodies (when fetch_inbox / ReadMcpResourceTool unavailable)".to_string(),
+                            sample: "search_messages(project_key='backend', query='deployment plan', include_body_md=true, limit=10)".to_string(),
+                        },
                     ],
                     capabilities: vec!["search".to_string()],
                     complexity: "medium".to_string(),
@@ -1332,6 +1336,10 @@ fn build_tool_directory() -> ToolDirectory {
                         ToolUsageExample {
                             hint: "Scoped inside product".to_string(),
                             sample: "search_messages_product(product_key='prod-123', query='rollback', project_slug='backend', date_from='2026-02-01', date_to='2026-02-15')".to_string(),
+                        },
+                        ToolUsageExample {
+                            hint: "Inline bodies (when fetch_inbox_product / ReadMcpResourceTool unavailable)".to_string(),
+                            sample: "search_messages_product(product_key='prod-123', query='deployment plan', include_body_md=true, limit=10)".to_string(),
                         },
                     ],
                     capabilities: vec!["product".to_string(), "search".to_string()],
