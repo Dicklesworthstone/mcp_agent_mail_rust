@@ -234,6 +234,16 @@ run_with_spinner() {
   fi
 }
 
+path_in_list() {
+  local needle="$1"
+  shift
+  local item
+  for item in "$@"; do
+    [ "$item" = "$needle" ] && return 0
+  done
+  return 1
+}
+
 # Draw a box around text with automatic width calculation
 draw_box() {
   local color="$1"
@@ -323,7 +333,7 @@ resolve_version() {
 }
 
 detect_platform() {
-  OS=$(uname -s | tr 'A-Z' 'a-z')
+  OS=$(uname -s | tr '[:upper:]' '[:lower:]')
   ARCH=$(uname -m)
   verbose "detect_platform:raw os=${OS} arch=${ARCH}"
   case "$ARCH" in
@@ -427,7 +437,7 @@ check_disk_space() {
       if [ -n "$storage_avail_kb" ] && [ "$storage_avail_kb" -lt 102400 ]; then
         warn "Low disk space in $storage_dir ($(( storage_avail_kb / 1024 ))MB free)."
         warn "Database migration requires ~200-500MB of free space."
-        warn "Consider cleaning old backups: rm ${storage_dir}/storage.sqlite3.bak.* ${storage_dir}/storage.sqlite3.pre-python-import-* ${storage_dir}/storage.sqlite3.corrupt-*"
+        warn "Old backup files may be using space under ${storage_dir}; review database backup patterns before removing anything manually."
       fi
     fi
   else
@@ -597,7 +607,7 @@ check_network() {
     return 0
   fi
   if select_linux_x86_64_gnu_artifact_if_available; then
-    info "musl artifact unavailable for $VERSION; using gnu artifact"
+    info "Selected gnu artifact for $VERSION (preferred musl build is not published)"
     verbose "network:musl_fallback_to_gnu version=${VERSION} url=${URL}"
     return 0
   fi
@@ -625,7 +635,6 @@ PYTHON_DB_FOUND=0
 PYTHON_DB_PATH=""
 PYTHON_DB_MIGRATED_PATH=""
 PYTHON_DB_FORMAT=""
-PYTHON_DB_PROBE_OUTPUT=""
 MIGRATED_BEARER_TOKEN=""
 RUST_DB_PATH=""
 PYTHON_ALIAS_DISPLACED_COUNT=0
@@ -696,7 +705,7 @@ detect_python_alias() {
       sourced="${sourced%\"}"
       sourced="${sourced#\'}"
       sourced="${sourced%\'}"
-      if [ -f "$sourced" ] && [[ ! " ${rc_files[*]} " =~ " ${sourced} " ]]; then
+      if [ -f "$sourced" ] && ! path_in_list "$sourced" "${rc_files[@]}"; then
         sourced_files+=("$sourced")
       fi
     done < <(grep -oE '^\s*(source|\.)\s+"?[^"#]+"?' "$rc" 2>/dev/null | sed -E 's/^\s*(source|\.)\s+//' | sed 's/#.*//' | sed 's/[[:space:]]*$//' || true)
@@ -705,11 +714,11 @@ detect_python_alias() {
 
   # Also directly check ACFS paths (common agent framework that defines am alias)
   local acfs_zshrc="$HOME/.acfs/zsh/acfs.zshrc"
-  if [ -f "$acfs_zshrc" ] && [[ ! " ${rc_files[*]} " =~ " ${acfs_zshrc} " ]]; then
+  if [ -f "$acfs_zshrc" ] && ! path_in_list "$acfs_zshrc" "${rc_files[@]}"; then
     rc_files+=("$acfs_zshrc")
   fi
   local acfs_bashrc="$HOME/.acfs/bash/acfs.bashrc"
-  if [ -f "$acfs_bashrc" ] && [[ ! " ${rc_files[*]} " =~ " ${acfs_bashrc} " ]]; then
+  if [ -f "$acfs_bashrc" ] && ! path_in_list "$acfs_bashrc" "${rc_files[@]}"; then
     rc_files+=("$acfs_bashrc")
   fi
 
@@ -1128,7 +1137,6 @@ probe_database_format_with_installed_am() {
   local cli_bin="${DEST}/${BIN_CLI}"
   local output="" fallback_output="" cli_format=""
   PYTHON_DB_FORMAT=""
-  PYTHON_DB_PROBE_OUTPUT=""
 
   [ -x "$cli_bin" ] || return 1
 
@@ -1163,7 +1171,6 @@ probe_database_format_with_installed_am() {
     PYTHON_DB_FORMAT=$(extract_migrate_check_format "$fallback_output")
   fi
 
-  PYTHON_DB_PROBE_OUTPUT="$output"
   cli_format="$PYTHON_DB_FORMAT"
 
   if [ -n "$cli_format" ] && [ "${cli_format#empty database (}" = "$cli_format" ]; then
@@ -1800,7 +1807,6 @@ resolve_database_path() {
   PYTHON_DB_FOUND=0
   PYTHON_DB_PATH=""
   PYTHON_DB_FORMAT=""
-  PYTHON_DB_PROBE_OUTPUT=""
   RUST_STORAGE_ROOT="${STORAGE_ROOT:-$HOME/.mcp_agent_mail_git_mailbox_repo}"
   RUST_DB_PATH=""
 
@@ -2027,7 +2033,7 @@ resolve_database_path() {
     existing_import_backups=$(count_matching_backup_files "${rust_db}.pre-python-import-")
     if [ "$existing_import_backups" -ge 3 ]; then
       warn "Already ${existing_import_backups} pre-python-import backups exist. Skipping backup creation."
-      warn "Clean old backups with: rm ${rust_db}.pre-python-import-*"
+      warn "Old backup files match ${rust_db}.pre-python-import-*; review them before removing anything manually."
     else
       local rust_backup_ts rust_backup
       rust_backup_ts=$(date -u +%Y%m%dT%H%M%SZ)
@@ -2149,9 +2155,8 @@ migrate_env_config() {
     info "Writing Rust config at $rust_env with adopted legacy data paths"
   fi
 
-  # Vars that are compatible between Python and Rust
-  local compat_vars="HTTP_HOST HTTP_PORT HTTP_PATH HTTP_BEARER_TOKEN STORAGE_ROOT DATABASE_URL TUI_ENABLED LLM_ENABLED LLM_DEFAULT_MODEL WORKTREES_ENABLED"
-  # Python-only vars to skip
+  # Python-only vars are skipped; non-Python settings are preserved so operator
+  # additions survive the migration.
   local skip_pattern="^(SQLALCHEMY_|ALEMBIC_|UVICORN_|ASYNC_)"
   local seen_database_url=0
   local seen_storage_root=0
@@ -2374,7 +2379,10 @@ maybe_add_path() {
   # Helper: idempotently add a PATH guard to a file (creates it if needed)
   _ensure_path_in_file() {
     local target="$1"
-    local guard_line='[ -d "'"$DEST"'" ] && case ":$PATH:" in *:"'"$DEST"'":*) ;; *) export PATH="'"$DEST"':$PATH" ;; esac'
+    local escaped_dest="${DEST//\"/\\\"}"
+    local guard_line
+    printf -v guard_line "[ -d \"%s\" ] && case \":\$PATH:\" in *:\"%s\":*) ;; *) export PATH=\"%s:\$PATH\" ;; esac" \
+      "$escaped_dest" "$escaped_dest" "$escaped_dest"
     # Check for the expanded path, $HOME form, and ~ form
     if [ -e "$target" ]; then
       local dest_home_form="${DEST/#$HOME/\$HOME}"
@@ -2398,7 +2406,9 @@ maybe_add_path() {
       return 0
     fi
     # Append with a blank line separator
-    { [ ! -s "$target" ] || echo ""; echo "# Ensure $DEST is in PATH"; echo "$guard_line"; } >> "$target"
+    local needs_separator=0
+    [ -s "$target" ] && needs_separator=1
+    { [ "$needs_separator" -eq 0 ] || echo ""; echo "# Ensure $DEST is in PATH"; echo "$guard_line"; } >> "$target"
     verbose "maybe_add_path:appended guard to ${target}"
     return 1  # signal that we made a change
   }
@@ -2547,7 +2557,7 @@ install_mac_python_cli_shell_alias() {
   [ -n "${MAC_DIRECT_EXEC_COMPAT_LAUNCHER:-}" ] || return 1
 
   local rc_files=("$HOME/.zshrc" "$HOME/.bashrc")
-  local rc marker_start marker_end block timestamp backup
+  local rc marker_start marker_end block timestamp backup needs_separator
   marker_start="# >>> mcp-agent-mail mac exec compat >>>"
   marker_end="# <<< mcp-agent-mail mac exec compat <<<"
   block="${marker_start}
@@ -2566,10 +2576,9 @@ ${marker_end}"
       verbose "mac_exec_compat:rc_backup rc=${rc} backup=${backup}"
     fi
 
-    {
-      [ ! -f "$rc" ] || [ ! -s "$rc" ] || echo ""
-      printf '%s\n' "$block"
-    } >> "$rc"
+    needs_separator=0
+    [ -s "$rc" ] && needs_separator=1
+    { [ "$needs_separator" -eq 0 ] || echo ""; printf '%s\n' "$block"; } >> "$rc"
     MAC_DIRECT_EXEC_COMPAT_REASON="${MAC_DIRECT_EXEC_COMPAT_REASON}; shell alias installed in ${rc}"
   done
 }
@@ -2774,7 +2783,7 @@ desired_service_bind_port() {
 }
 
 platform_supports_user_service_management() {
-  case "${OS:-$(uname -s | tr 'A-Z' 'a-z')}" in
+  case "${OS:-$(uname -s | tr '[:upper:]' '[:lower:]')}" in
     linux|darwin) return 0 ;;
     *) return 1 ;;
   esac
@@ -2850,7 +2859,7 @@ wait_for_remote_http_endpoint() {
 }
 
 repair_launchd_service_env_from_rust_config() {
-  [ "${OS:-$(uname -s | tr 'A-Z' 'a-z')}" = "darwin" ] || return 0
+  [ "${OS:-$(uname -s | tr '[:upper:]' '[:lower:]')}" = "darwin" ] || return 0
 
   local plist_path="$HOME/Library/LaunchAgents/com.agent-mail.plist"
   [ -f "$plist_path" ] || return 0
@@ -4135,6 +4144,9 @@ purge_data_paths() {
 
 find_latest_python_alias_backup() {
   local rc="$1"
+  # Backups are timestamped by this installer; ls -t is the most portable
+  # cross-platform way to choose the newest one here.
+  # shellcheck disable=SC2012
   ls -1t "${rc}.bak.mcp-agent-mail-"* 2>/dev/null | head -1 || true
 }
 
@@ -4345,7 +4357,8 @@ verify_sigstore_bundle() {
     bundle_url="${artifact_url}.sigstore.json"
   fi
 
-  local bundle_file="$TMP/$(basename "$bundle_url")"
+  local bundle_file
+  bundle_file="$TMP/$(basename "$bundle_url")"
   info "Fetching sigstore bundle from ${bundle_url}"
   if ! download_to_file "$bundle_url" "$bundle_file" "sigstore-bundle"; then
     warn "Sigstore bundle not found; skipping signature verification"
@@ -5716,7 +5729,7 @@ sqlite_timestamp_fallback_migration() {
 
   # Cap backup count to prevent disk fill-up during cascading recovery.
   local existing_bak_count=0
-  existing_bak_count=$(ls -1 "${db_path}.bak."* 2>/dev/null | wc -l | tr -d ' ')
+  existing_bak_count=$(find "$(dirname "$db_path")" -maxdepth 1 -type f -name "$(basename "$db_path").bak.*" 2>/dev/null | wc -l | tr -d ' ')
   if [ "$existing_bak_count" -ge 3 ]; then
     verbose "sqlite_timestamp_fallback_migration:backup_skipped existing_count=${existing_bak_count}"
     warn "Skipping fallback backup (${existing_bak_count} backups already exist). Clean old backups to reclaim space."
@@ -5858,7 +5871,7 @@ if [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 0 ] && [ -n "$PYTHON_DB_MIGRATED_PATH" ]
   if [ "$_pre_migrate_count" -ge 3 ]; then
     migration_pristine_backup=""
     warn "Skipping pristine backup (${_pre_migrate_count} pre-migrate backups already exist)."
-    warn "Clean old backups: rm ${PYTHON_DB_MIGRATED_PATH}.pre-migrate.*"
+    warn "Old backup files match ${PYTHON_DB_MIGRATED_PATH}.pre-migrate.*; review them before removing anything manually."
   elif ! check_copy_disk_space "$PYTHON_DB_MIGRATED_PATH" "$(dirname "$PYTHON_DB_MIGRATED_PATH")" 2; then
     migration_pristine_backup=""
     warn "Insufficient disk space for pristine migration snapshot. Skipping backup."
@@ -6381,9 +6394,9 @@ if [ "$QUIET" -eq 0 ]; then
 
   echo ""
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 245 --italic "To uninstall: ./install.sh --uninstall --dest $DEST"
+    gum style --foreground 245 --italic "Managed removal: ./install.sh --uninstall --dest $DEST"
   else
-    echo -e "\033[0;90mTo uninstall: ./install.sh --uninstall --dest $DEST\033[0m"
+    echo -e "\033[0;90mManaged removal: ./install.sh --uninstall --dest $DEST\033[0m"
   fi
 fi
 
