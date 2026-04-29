@@ -372,6 +372,39 @@ set_artifact_url() {
   verbose "set_artifact_url:done tar=${TAR:-<none>} url=${URL:-<none>} from_source=${FROM_SOURCE}"
 }
 
+artifact_url_for_target() {
+  local target="$1"
+  printf 'https://github.com/%s/%s/releases/download/%s/mcp-agent-mail-%s.tar.xz' \
+    "$OWNER" "$REPO" "$VERSION" "$target"
+}
+
+set_target_artifact() {
+  TARGET="$1"
+  TAR="mcp-agent-mail-${TARGET}.tar.xz"
+  URL="$(artifact_url_for_target "$TARGET")"
+}
+
+linux_x86_64_gnu_fallback_allowed() {
+  [ "$TARGET" = "x86_64-unknown-linux-musl" ] && [ -z "${ARTIFACT_URL:-}" ]
+}
+
+artifact_url_reachable() {
+  local url="$1"
+  curl -fsSI --connect-timeout 3 --max-time 5 -o /dev/null "$url" 2>/dev/null
+}
+
+select_linux_x86_64_gnu_artifact() {
+  set_target_artifact "x86_64-unknown-linux-gnu"
+}
+
+select_linux_x86_64_gnu_artifact_if_available() {
+  linux_x86_64_gnu_fallback_allowed || return 1
+  local fallback_url
+  fallback_url="$(artifact_url_for_target "x86_64-unknown-linux-gnu")"
+  artifact_url_reachable "$fallback_url" || return 1
+  select_linux_x86_64_gnu_artifact
+}
+
 check_disk_space() {
   local min_kb=20480  # 20MB minimum for binaries alone
   local path="$DEST"
@@ -560,10 +593,16 @@ check_network() {
     warn "curl not found; skipping network check"
     return 0
   fi
-  if ! curl -fsSI --connect-timeout 3 --max-time 5 -o /dev/null "$URL" 2>/dev/null; then
-    warn "Network check failed for $URL"
-    warn "Continuing; download may fail"
+  if artifact_url_reachable "$URL"; then
+    return 0
   fi
+  if select_linux_x86_64_gnu_artifact_if_available; then
+    info "musl artifact unavailable for $VERSION; using gnu artifact"
+    verbose "network:musl_fallback_to_gnu version=${VERSION} url=${URL}"
+    return 0
+  fi
+  warn "Network check failed for $URL"
+  warn "Continuing; download may fail"
 }
 
 # ── Python installation detection (T1.1, T1.2, T1.3) ──────────────────────
@@ -4872,12 +4911,10 @@ if [ "$FROM_SOURCE" -eq 0 ]; then
     # If we preferred a musl artifact that isn't published for this release
     # (older tags only shipped gnu), fall back to the gnu artifact before
     # giving up and attempting a source build.
-    if [ "$TARGET" = "x86_64-unknown-linux-musl" ] && [ -z "${ARTIFACT_URL:-}" ]; then
+    if linux_x86_64_gnu_fallback_allowed; then
       warn "musl artifact not available for $VERSION; falling back to gnu artifact"
       verbose "binary-download:musl_fallback_to_gnu version=${VERSION} url=${URL}"
-      TARGET="x86_64-unknown-linux-gnu"
-      TAR="mcp-agent-mail-${TARGET}.tar.xz"
-      URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${TAR}"
+      select_linux_x86_64_gnu_artifact
       info "Downloading $URL"
       if ! download_to_file "$URL" "$TMP/$TAR" "binary-download"; then
         warn "Binary download failed (release may not exist for $VERSION)"
