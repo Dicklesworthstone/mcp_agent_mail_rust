@@ -9283,7 +9283,7 @@ impl HttpState {
                         &serde_json::json!({"status":"warming_up"}),
                     ));
                 }
-                if let Err(_err) = readiness_check_quick(&self.config) {
+                if let Err(_err) = readiness_check_with_archive_reconcile(&self.config) {
                     tracing::warn!(error = %_err, "readiness check failed");
                     return Some(self.error_response(req, 503, "service unavailable"));
                 }
@@ -13498,6 +13498,40 @@ fn readiness_check_quick(config: &mcp_agent_mail_core::Config) -> Result<(), Str
     readiness_check_cached_semantic_status(config, &conn)
 }
 
+fn readiness_check_with_archive_reconcile(
+    config: &mcp_agent_mail_core::Config,
+) -> Result<(), String> {
+    match readiness_check_quick(config) {
+        Ok(()) => Ok(()),
+        Err(error) if error.contains("archive inventory is ahead of the sqlite index") => {
+            let sqlite_path = resolve_server_database_url_sqlite_path(&config.database_url)
+                .ok_or_else(|| {
+                    format!("{error}; cannot resolve sqlite path for archive reconcile")
+                })?;
+            tracing::warn!(
+                error = %error,
+                sqlite_path = %sqlite_path.display(),
+                storage_root = %config.storage_root.display(),
+                "readiness archive drift detected; attempting archive-backed SQLite reconcile"
+            );
+            mcp_agent_mail_db::ensure_sqlite_file_healthy_with_archive(
+                &sqlite_path,
+                config.storage_root.as_path(),
+            )
+            .map_err(|reconcile_error| {
+                format!("{error}; automatic archive-backed reconcile failed: {reconcile_error}")
+            })?;
+            *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
+            readiness_check_quick(config).map_err(|post_error| {
+                format!(
+                    "{error}; automatic archive-backed reconcile completed but readiness still failed: {post_error}"
+                )
+            })
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn readiness_check_cached_semantic_status(
     config: &mcp_agent_mail_core::Config,
     conn: &DbConn,
@@ -14648,6 +14682,7 @@ mod tests {
     static STDIO_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
     static TUI_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static TOOL_DISPATCH_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static HEALTH_ROUTE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static HEALTH_COUNT_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static REDIS_RATE_LIMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -15534,30 +15569,31 @@ first body
     }
 
     #[test]
-    fn health_readiness_returns_503_when_archive_is_ahead_of_db() {
-        *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
+    fn health_readiness_reconciles_archive_ahead_db() {
+        with_serialized_health_route(|| {
+            *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
 
-        let temp = tempfile::tempdir().expect("tempdir");
-        let storage_root = temp.path().join("storage");
-        let db_path = temp.path().join("stale-health.sqlite3");
-        let project_dir = storage_root.join("projects").join("ahead-project");
-        let agent_dir = project_dir.join("agents").join("Alice");
-        let messages_dir = project_dir.join("messages").join("2026").join("03");
-        std::fs::create_dir_all(&agent_dir).expect("create agent dir");
-        std::fs::create_dir_all(&messages_dir).expect("create messages dir");
-        std::fs::write(
-            project_dir.join("project.json"),
-            r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
-        )
-        .expect("write project metadata");
-        std::fs::write(
-            agent_dir.join("profile.json"),
-            r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
-        )
-        .expect("write agent profile");
-        std::fs::write(
-            messages_dir.join("2026-03-22T12-00-00Z__first__1.md"),
-            r#"---json
+            let temp = tempfile::tempdir().expect("tempdir");
+            let storage_root = temp.path().join("storage");
+            let db_path = temp.path().join("stale-health.sqlite3");
+            let project_dir = storage_root.join("projects").join("ahead-project");
+            let agent_dir = project_dir.join("agents").join("Alice");
+            let messages_dir = project_dir.join("messages").join("2026").join("03");
+            std::fs::create_dir_all(&agent_dir).expect("create agent dir");
+            std::fs::create_dir_all(&messages_dir).expect("create messages dir");
+            std::fs::write(
+                project_dir.join("project.json"),
+                r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
+            )
+            .expect("write project metadata");
+            std::fs::write(
+                agent_dir.join("profile.json"),
+                r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
+            )
+            .expect("write agent profile");
+            std::fs::write(
+                messages_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+                r#"---json
 {
   "id": 1,
   "from": "Alice",
@@ -15570,25 +15606,42 @@ first body
 
 first body
 "#,
-        )
-        .expect("write canonical message");
+            )
+            .expect("write canonical message");
 
-        let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
-        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
-            .expect("init schema");
-        drop(conn);
+            let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
+            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                .expect("init schema");
+            drop(conn);
 
-        let mut config = mcp_agent_mail_core::Config::default();
-        config.database_url = format!("sqlite:///{}", db_path.display());
-        config.storage_root = storage_root;
-        config.integrity_check_on_startup = false;
+            let mut config = mcp_agent_mail_core::Config::default();
+            config.database_url = format!("sqlite:///{}", db_path.display());
+            config.storage_root = storage_root;
+            config.integrity_check_on_startup = false;
 
-        let state = build_state(config);
-        let req = make_request(Http1Method::Get, "/health/readiness", &[]);
-        let resp = block_on(state.handle(req));
-        assert_eq!(resp.status, 503);
-        let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-        assert_eq!(body["detail"], "service unavailable");
+            let state = build_state(config);
+            let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+            let resp = block_on(state.handle(req));
+            assert_eq!(resp.status, 200);
+            let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+            assert_eq!(body["status"], "ready");
+
+            let conn =
+                DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open reconciled db");
+            let rows = conn
+                .query_sync(
+                    "SELECT \
+                    (SELECT COUNT(*) FROM projects) AS project_count, \
+                    (SELECT COUNT(*) FROM agents) AS agent_count, \
+                    (SELECT COUNT(*) FROM messages) AS message_count",
+                    &[],
+                )
+                .expect("query reconciled inventory");
+            let row = rows.first().expect("inventory row");
+            assert_eq!(row.get_named::<i64>("project_count").unwrap_or(0), 1);
+            assert_eq!(row.get_named::<i64>("agent_count").unwrap_or(0), 2);
+            assert_eq!(row.get_named::<i64>("message_count").unwrap_or(0), 1);
+        });
     }
 
     #[test]
@@ -16151,6 +16204,31 @@ first body
         )
     }
 
+    fn isolated_health_config() -> mcp_agent_mail_core::Config {
+        clear_startup_readiness_fast_path();
+        mcp_agent_mail_core::Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn with_serialized_health_route<F, T>(f: F) -> T
+    where
+        F: FnOnce() -> T,
+    {
+        let _lock = HEALTH_ROUTE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_startup_readiness_fast_path();
+        *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
+        *lock_mutex(&HEALTH_COUNT_CACHE) = (Instant::now(), None);
+        let result = f();
+        clear_startup_readiness_fast_path();
+        *lock_mutex(&READINESS_SEMANTIC_CACHE) = (Instant::now(), None);
+        *lock_mutex(&HEALTH_COUNT_CACHE) = (Instant::now(), None);
+        result
+    }
+
     fn test_http_server_instance(
         join: AsyncJoinHandle<std::io::Result<()>>,
         shutdown: asupersync::server::shutdown::ShutdownSignal,
@@ -16204,6 +16282,9 @@ first body
     where
         F: FnOnce() -> T,
     {
+        let _route_lock = HEALTH_ROUTE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _lock = HEALTH_COUNT_CACHE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -22654,34 +22735,33 @@ first body
 
     #[test]
     fn health_readiness_returns_ready_json() {
-        let config = mcp_agent_mail_core::Config {
-            database_url: "sqlite:///:memory:".to_string(),
-            ..Default::default()
-        };
-        let state = build_state(config);
-        let req = make_request(Http1Method::Get, "/health/readiness", &[]);
-        let resp = block_on(state.handle(req));
-        assert_eq!(resp.status, 200);
-        let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-        assert_eq!(body["status"], "ready");
-        // Enriched identity fields are present.
-        assert!(
-            body.get("version").is_some(),
-            "version field must be present"
-        );
-        assert!(
-            body.get("database_path").is_some(),
-            "database_path field must be present"
-        );
-        assert!(
-            body.get("project_count").is_some(),
-            "project_count field must be present"
-        );
-        assert!(
-            body.get("message_count").is_some(),
-            "message_count field must be present"
-        );
-        assert_eq!(body["database_path"], ":memory:");
+        with_serialized_health_route(|| {
+            let config = isolated_health_config();
+            let state = build_state(config);
+            let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+            let resp = block_on(state.handle(req));
+            assert_eq!(resp.status, 200);
+            let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+            assert_eq!(body["status"], "ready");
+            // Enriched identity fields are present.
+            assert!(
+                body.get("version").is_some(),
+                "version field must be present"
+            );
+            assert!(
+                body.get("database_path").is_some(),
+                "database_path field must be present"
+            );
+            assert!(
+                body.get("project_count").is_some(),
+                "project_count field must be present"
+            );
+            assert!(
+                body.get("message_count").is_some(),
+                "message_count field must be present"
+            );
+            assert_eq!(body["database_path"], ":memory:");
+        });
     }
 
     #[test]
@@ -22717,46 +22797,7 @@ first body
         with_serialized_health_count_cache(|| {
             let dir = tempfile::tempdir().expect("tempdir");
             let storage_root = dir.path().join("storage");
-            let db_path = dir.path().join("health-count-stale.sqlite3");
-            let project_dir = storage_root.join("projects").join("ahead-project");
-            let agent_dir = project_dir.join("agents").join("Alice");
-            let messages_dir = project_dir.join("messages").join("2026").join("03");
-            std::fs::create_dir_all(&agent_dir).expect("create agent dir");
-            std::fs::create_dir_all(&messages_dir).expect("create messages dir");
-            std::fs::write(
-                project_dir.join("project.json"),
-                r#"{"slug":"ahead-project","human_key":"/ahead-project","created_at":0}"#,
-            )
-            .expect("write project metadata");
-            std::fs::write(
-                agent_dir.join("profile.json"),
-                r#"{"agent_name":"Alice","program":"coder","model":"test","registered_ts":"2026-03-22T00:00:00Z"}"#,
-            )
-            .expect("write agent profile");
-            std::fs::write(
-                messages_dir.join("2026-03-22T12-00-00Z__first__1.md"),
-                r#"---json
-{
-  "id": 1,
-  "from": "Alice",
-  "to": ["Bob"],
-  "subject": "First copy",
-  "importance": "normal",
-  "created_ts": "2026-03-22T12:00:00Z"
-}
----
-
-first body
-"#,
-            )
-            .expect("write canonical message");
-
-            let conn = DbConn::open_file(db_path.to_string_lossy().as_ref()).expect("open db");
-            conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
-                .expect("init schema");
-            drop(conn);
-
-            let database_url = format!("sqlite:///{}", db_path.display());
+            let database_url = "postgres://localhost/db".to_string();
             let expected_counts = Some((11, 13));
             *lock_mutex(&HEALTH_COUNT_CACHE) = (
                 Instant::now(),
@@ -22767,18 +22808,8 @@ first body
                 }),
             );
 
-            let tmpdir_file = dir.path().join("tmpdir-file");
-            std::fs::write(&tmpdir_file, "not a directory").expect("write tmpdir file");
-            let tmpdir = tmpdir_file
-                .to_str()
-                .expect("tmpdir override utf-8")
-                .to_string();
-
             let mut body = serde_json::json!({});
-            mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-                &[("TMPDIR", tmpdir.as_str())],
-                || enrich_readiness_response(&database_url, &storage_root, &mut body),
-            );
+            enrich_readiness_response(&database_url, &storage_root, &mut body);
 
             assert_eq!(body["project_count"], serde_json::json!(11));
             assert_eq!(body["message_count"], serde_json::json!(13));
@@ -22794,71 +22825,78 @@ first body
 
     #[test]
     fn health_root_alias_returns_ready_json() {
-        let config = mcp_agent_mail_core::Config {
-            database_url: "sqlite:///:memory:".to_string(),
-            ..Default::default()
-        };
-        let state = build_state(config);
-        let req = make_request(Http1Method::Get, "/health", &[]);
-        let resp = block_on(state.handle(req));
-        assert_eq!(resp.status, 200);
-        let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-        assert_eq!(body["status"], "ready");
-        // Enriched identity fields are present.
-        assert!(
-            body.get("version").is_some(),
-            "version field must be present"
-        );
-        assert!(
-            body.get("database_path").is_some(),
-            "database_path field must be present"
-        );
-        assert_eq!(body["database_path"], ":memory:");
+        with_serialized_health_route(|| {
+            let config = isolated_health_config();
+            let state = build_state(config);
+            let req = make_request(Http1Method::Get, "/health", &[]);
+            let resp = block_on(state.handle(req));
+            assert_eq!(resp.status, 200);
+            let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+            assert_eq!(body["status"], "ready");
+            // Enriched identity fields are present.
+            assert!(
+                body.get("version").is_some(),
+                "version field must be present"
+            );
+            assert!(
+                body.get("database_path").is_some(),
+                "database_path field must be present"
+            );
+            assert_eq!(body["database_path"], ":memory:");
+        });
     }
 
     #[test]
     fn health_readiness_has_json_content_type() {
-        let config = mcp_agent_mail_core::Config::default();
-        let state = build_state(config);
-        let req = make_request(Http1Method::Get, "/health/readiness", &[]);
-        let resp = block_on(state.handle(req));
-        assert_eq!(
-            response_header(&resp, "content-type"),
-            Some("application/json")
-        );
+        with_serialized_health_route(|| {
+            let config = isolated_health_config();
+            let state = build_state(config);
+            let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+            let resp = block_on(state.handle(req));
+            assert_eq!(
+                response_header(&resp, "content-type"),
+                Some("application/json")
+            );
+        });
     }
 
     #[test]
     fn health_root_alias_has_json_content_type() {
-        let config = mcp_agent_mail_core::Config::default();
-        let state = build_state(config);
-        let req = make_request(Http1Method::Get, "/health", &[]);
-        let resp = block_on(state.handle(req));
-        assert_eq!(
-            response_header(&resp, "content-type"),
-            Some("application/json")
-        );
+        with_serialized_health_route(|| {
+            let config = isolated_health_config();
+            let state = build_state(config);
+            let req = make_request(Http1Method::Get, "/health", &[]);
+            let resp = block_on(state.handle(req));
+            assert_eq!(
+                response_header(&resp, "content-type"),
+                Some("application/json")
+            );
+        });
     }
 
     #[test]
     fn health_readiness_emits_agent_mail_signature_header() {
-        let config = mcp_agent_mail_core::Config::default();
-        let state = build_state(config);
-        let req = make_request(Http1Method::Get, "/health/readiness", &[]);
-        let resp = block_on(state.handle(req));
-        assert_eq!(
-            response_header(&resp, startup_checks::HEALTH_SIGNATURE_HEADER_NAME),
-            Some(startup_checks::HEALTH_SIGNATURE_HEADER_VALUE)
-        );
+        with_serialized_health_route(|| {
+            let config = isolated_health_config();
+            let state = build_state(config);
+            let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+            let resp = block_on(state.handle(req));
+            assert_eq!(
+                response_header(&resp, startup_checks::HEALTH_SIGNATURE_HEADER_NAME),
+                Some(startup_checks::HEALTH_SIGNATURE_HEADER_VALUE)
+            );
+        });
     }
 
     #[test]
     fn health_readiness_rejects_post_with_405() {
-        let config = mcp_agent_mail_core::Config::default();
-        let state = build_state(config);
-        let req = make_request(Http1Method::Post, "/health/readiness", &[]);
-        let resp = block_on(state.handle(req));
-        assert_eq!(resp.status, 405);
+        with_serialized_health_route(|| {
+            let config = isolated_health_config();
+            let state = build_state(config);
+            let req = make_request(Http1Method::Post, "/health/readiness", &[]);
+            let resp = block_on(state.handle(req));
+            assert_eq!(resp.status, 405);
+        });
     }
 
     #[test]
@@ -23041,32 +23079,34 @@ first body
 
     #[test]
     fn health_readiness_bypasses_bearer_auth() {
-        let config = mcp_agent_mail_core::Config {
-            http_bearer_token: Some("secret-token".to_string()),
-            database_url: "sqlite:///:memory:".to_string(),
-            ..Default::default()
-        };
-        let state = build_state(config);
-        let req = make_request(Http1Method::Get, "/health/readiness", &[]);
-        let resp = block_on(state.handle(req));
-        assert_eq!(resp.status, 200);
-        let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-        assert_eq!(body["status"], "ready");
+        with_serialized_health_route(|| {
+            let config = mcp_agent_mail_core::Config {
+                http_bearer_token: Some("secret-token".to_string()),
+                ..isolated_health_config()
+            };
+            let state = build_state(config);
+            let req = make_request(Http1Method::Get, "/health/readiness", &[]);
+            let resp = block_on(state.handle(req));
+            assert_eq!(resp.status, 200);
+            let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+            assert_eq!(body["status"], "ready");
+        });
     }
 
     #[test]
     fn health_root_alias_bypasses_bearer_auth() {
-        let config = mcp_agent_mail_core::Config {
-            http_bearer_token: Some("secret-token".to_string()),
-            database_url: "sqlite:///:memory:".to_string(),
-            ..Default::default()
-        };
-        let state = build_state(config);
-        let req = make_request(Http1Method::Get, "/health", &[]);
-        let resp = block_on(state.handle(req));
-        assert_eq!(resp.status, 200);
-        let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-        assert_eq!(body["status"], "ready");
+        with_serialized_health_route(|| {
+            let config = mcp_agent_mail_core::Config {
+                http_bearer_token: Some("secret-token".to_string()),
+                ..isolated_health_config()
+            };
+            let state = build_state(config);
+            let req = make_request(Http1Method::Get, "/health", &[]);
+            let resp = block_on(state.handle(req));
+            assert_eq!(resp.status, 200);
+            let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+            assert_eq!(body["status"], "ready");
+        });
     }
 
     #[test]
