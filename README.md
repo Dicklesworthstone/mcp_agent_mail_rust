@@ -321,7 +321,7 @@ installed binary always matches the freshly-built artifact regardless of
 `CARGO_TARGET_DIR` overrides or workspace settings. Do **not** manually copy from
 `target/release/am` -- if `CARGO_TARGET_DIR` is set, that path may be stale.
 
-Requires Rust nightly (see `rust-toolchain.toml`). Source builds also expect the locally patched sibling projects used by the workspace: `../asupersync`, `../sqlmodel_rust`, `../frankensqlite`, `../frankentui`, and `../frankensearch`. `fastmcp-rust`, `beads_rust`, and `toon` are normal Cargo dependencies, not local path requirements.
+Requires Rust nightly (see `rust-toolchain.toml`). Source builds also expect locally patched sibling checkouts in the parent directory for **six** repos: `../fastmcp_rust`, `../beads_rust`, `../sqlmodel_rust`, `../frankensqlite`, `../frankentui`, and `../frankensearch`. (`asupersync` was previously a sibling requirement but is now pulled from crates.io.)
 
 ### Platforms
 
@@ -1397,7 +1397,7 @@ need to do anything.
 ## Limitations
 
 - **Rust nightly required.** Uses Rust 2024 edition features that require the nightly compiler.
-- **Local patched dependencies.** Building from source expects local sibling checkouts for `asupersync`, `sqlmodel_rust`, `frankensqlite`, `frankentui`, and `frankensearch`.
+- **Local patched dependencies.** Building from source expects local sibling checkouts in the parent directory for **six** repos: `fastmcp_rust`, `beads_rust`, `sqlmodel_rust`, `frankensqlite`, `frankentui`, and `frankensearch`. (`asupersync` is no longer required as a sibling — it is pulled from crates.io.)
 - **Single-machine coordination.** Designed for agents running on the same machine or accessing the same filesystem. Not a distributed system.
 - **Advisory, not enforced.** File reservations are advisory. Agents can bypass the pre-commit guard with `--no-verify`.
 - **No built-in authentication federation.** JWT support exists, but there's no centralized auth service. Each server manages its own tokens.
