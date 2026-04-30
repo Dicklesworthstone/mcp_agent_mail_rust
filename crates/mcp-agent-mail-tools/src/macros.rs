@@ -124,12 +124,28 @@ pub async fn macro_start_session(
     let project_json = crate::identity::ensure_project(ctx, human_key.clone(), None).await?;
     let project: ProjectResponse = parse_json(project_json, "project")?;
 
+    // Dedup against pre-existing pane identities (mcp_agent_mail#110).
+    //
+    // Orchestrators like NTM pre-register an agent for each tmux pane and
+    // write the canonical pane-identity file before booting the agent. When
+    // the agent then calls `macro_start_session` without an explicit
+    // `agent_name`, register_agent would mint a fresh random name and we'd
+    // end up with two identities pointing at the same logical pane. Look up
+    // the pane identity first and reuse the pre-registered name when one is
+    // available, so the macro is idempotent against the boot path.
+    let resolved_name = agent_name.or_else(|| {
+        mcp_agent_mail_core::pane_identity::resolve_identity_current_pane(&project.human_key)
+            .and_then(|name| {
+                mcp_agent_mail_core::models::normalize_agent_name(&name).or(Some(name))
+            })
+    });
+
     let agent_json = crate::identity::register_agent(
         ctx,
         project.human_key.clone(),
         program,
         model,
-        agent_name,
+        resolved_name,
         task_description,
         None,
         reaper_exempt,
