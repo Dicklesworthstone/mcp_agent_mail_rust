@@ -4476,6 +4476,7 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
         let agent_last_active = agent_by_id
             .get(&row.agent_id)
             .map(|agent| agent.last_active_ts);
+        let agent_missing = agent_last_active.is_none();
         let agent_inactive =
             agent_last_active.is_none_or(|ts| now_micros.saturating_sub(ts) > inactivity_micros);
 
@@ -4496,6 +4497,28 @@ pub async fn file_reservations(ctx: &McpContext, slug: String) -> McpResult<Stri
         };
         let recent_mail =
             mail_activity.is_some_and(|ts| now_micros.saturating_sub(ts) <= grace_micros);
+
+        // When the holder agent's row is gone (DB pruned, never registered, etc.) the
+        // reservation is orphaned: there is no live owner to coordinate with. We must
+        // release the row regardless of workspace availability, since fs/git signals
+        // cannot tell us anything useful about a non-existent owner. Without this
+        // path, orphaned reservations become permanent phantoms that block other
+        // agents until expires_ts elapses.
+        if agent_missing && !recent_mail {
+            let updated = db_outcome_to_mcp_result(
+                mcp_agent_mail_db::queries::force_release_reservation(
+                    ctx.cx(),
+                    &pool,
+                    id,
+                    Some(row.expires_ts),
+                )
+                .await,
+            )?;
+            if updated > 0 {
+                released_ids.push(id);
+            }
+            continue;
+        }
 
         if !workspace_available {
             continue;
@@ -6783,8 +6806,7 @@ mod resource_shape_tests {
         with_serialized_resources(|| {
             run_async(|cx| async move {
                 let pool = get_db_pool().expect("db pool");
-                let workspace = tempfile::tempdir().expect("workspace tempdir");
-                let project_key = workspace.path().to_string_lossy().to_string();
+                let project_key = format!("/tmp/resources-orphaned-holder-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
                 let holder = register_agent(&cx, &pool, project_id, "AmberRiver").await;

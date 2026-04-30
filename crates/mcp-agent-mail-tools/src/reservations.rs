@@ -2385,8 +2385,7 @@ mod tests {
         with_serialized_reservations(|| {
             run_async(|cx| async move {
                 let pool = get_db_pool().expect("db pool");
-                let workspace = tempfile::tempdir().expect("workspace tempdir");
-                let project_key = workspace.path().to_string_lossy().to_string();
+                let project_key = format!("/tmp/force-release-stale-holder-{}", unique_suffix());
                 let project = ensure_project(&cx, &pool, &project_key).await;
                 let project_id = project.id.unwrap_or(0);
                 let holder = register_agent(&cx, &pool, project_id, "AmberRiver").await;
