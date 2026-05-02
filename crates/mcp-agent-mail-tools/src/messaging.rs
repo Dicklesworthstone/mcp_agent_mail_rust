@@ -904,6 +904,19 @@ fn normalize_send_message_aliases(arguments: &mut Value) {
     }
 }
 
+fn broadcast_disabled_error(recipients_supplied: Option<bool>) -> McpError {
+    let data = recipients_supplied.map_or_else(
+        || json!({ "argument": "broadcast" }),
+        |supplied| json!({ "argument": "broadcast", "recipients_supplied": supplied }),
+    );
+    legacy_tool_error(
+        "BROADCAST_DISABLED",
+        "broadcast=true is intentionally unsupported to prevent agent spam. Address agents explicitly and omit the broadcast flag.",
+        true,
+        data,
+    )
+}
+
 /// Normalize raw `send_message` / `reply_message` arguments for parity with the
 /// Python reference:
 /// - accepts common project/sender/message aliases used in messaging flows
@@ -927,12 +940,7 @@ pub fn normalize_send_message_arguments(arguments: &mut Value) -> McpResult<()> 
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        return Err(legacy_tool_error(
-            "INVALID_ARGUMENT",
-            "broadcast=true is intentionally unsupported to prevent agent spam. Address agents explicitly and omit the broadcast flag.",
-            true,
-            json!({ "argument": "broadcast" }),
-        ));
+        return Err(broadcast_disabled_error(None));
     }
 
     normalize_send_message_to_argument(args)?;
@@ -1580,21 +1588,8 @@ effective_free_bytes={free}"
         || bcc.as_ref().is_some_and(|v| !v.is_empty());
 
     let broadcast = broadcast.unwrap_or(false);
-    if broadcast && explicitly_targeted {
-        return Err(legacy_tool_error(
-            "INVALID_ARGUMENT",
-            "broadcast=true and explicit 'to' recipients are mutually exclusive. Set broadcast=true with an empty 'to' list, or provide explicit recipients without broadcast.",
-            true,
-            serde_json::json!({ "argument": "broadcast" }),
-        ));
-    }
     if broadcast {
-        return Err(legacy_tool_error(
-            "BROADCAST_DISABLED",
-            "Broadcast messaging is intentionally not supported to prevent agent spam. Address agents specifically.",
-            true,
-            serde_json::json!({ "argument": "broadcast" }),
-        ));
+        return Err(broadcast_disabled_error(Some(explicitly_targeted)));
     }
 
     // Self-send detection: warn if sender is sending to themselves (Python parity)
@@ -3860,7 +3855,25 @@ mod tests {
             "broadcast=true is intentionally unsupported to prevent agent spam. Address agents explicitly and omit the broadcast flag."
         );
         let data = err.data.expect("error payload");
-        assert_eq!(data["error"]["type"], "INVALID_ARGUMENT");
+        assert_eq!(data["error"]["type"], "BROADCAST_DISABLED");
+        assert_eq!(data["error"]["data"]["argument"], "broadcast");
+    }
+
+    #[test]
+    fn normalize_send_message_arguments_rejects_broadcast_without_recipients() {
+        let mut args = json!({
+            "broadcast": true,
+            "to": [],
+        });
+        let err = normalize_send_message_arguments(&mut args)
+            .expect_err("broadcast without explicit recipients should fail");
+        assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+        assert_eq!(
+            err.message,
+            "broadcast=true is intentionally unsupported to prevent agent spam. Address agents explicitly and omit the broadcast flag."
+        );
+        let data = err.data.expect("error payload");
+        assert_eq!(data["error"]["type"], "BROADCAST_DISABLED");
         assert_eq!(data["error"]["data"]["argument"], "broadcast");
     }
 
