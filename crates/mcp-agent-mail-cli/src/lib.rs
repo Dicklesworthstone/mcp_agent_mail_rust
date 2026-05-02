@@ -43379,7 +43379,15 @@ startup_timeout_sec = 42
         ));
         assert!(migrate_format_needs_conversion_attempt(
             &TimestampFormat::Mixed {
-                text_tables: vec!["messages".to_string()]
+                text_tables: vec!["messages".to_string()],
+                real_tables: vec![],
+            }
+        ));
+        // Pre-fix this case classified REAL-only as RustMicros and short-circuited
+        // migration entirely. See GH#115.
+        assert!(migrate_format_needs_conversion_attempt(
+            &TimestampFormat::LegacyReal {
+                tables: vec!["projects".to_string()],
             }
         ));
         assert!(migrate_format_needs_conversion_attempt(
@@ -43402,8 +43410,14 @@ startup_timeout_sec = 42
         )));
         assert!(!migrate_format_requires_force(&TimestampFormat::PythonText));
         assert!(!migrate_format_requires_force(&TimestampFormat::Mixed {
-            text_tables: vec!["messages".to_string()]
+            text_tables: vec!["messages".to_string()],
+            real_tables: vec![],
         }));
+        assert!(!migrate_format_requires_force(
+            &TimestampFormat::LegacyReal {
+                tables: vec!["projects".to_string()],
+            }
+        ));
         assert!(!migrate_format_requires_force(&TimestampFormat::RustMicros));
         assert!(!migrate_format_requires_force(&TimestampFormat::Empty));
     }

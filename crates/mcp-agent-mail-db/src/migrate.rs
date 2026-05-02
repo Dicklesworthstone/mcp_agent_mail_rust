@@ -13,7 +13,8 @@
 //! let format = detect_timestamp_format(&conn)?;
 //! match format {
 //!     TimestampFormat::RustMicros => println!("Already migrated"),
-//!     TimestampFormat::PythonText => println!("Needs migration"),
+//!     TimestampFormat::PythonText => println!("Needs migration (TEXT timestamps)"),
+//!     TimestampFormat::LegacyReal { .. } => println!("Needs migration (REAL timestamps)"),
 //!     TimestampFormat::Empty => println!("No data to migrate"),
 //!     TimestampFormat::Mixed { .. } => println!("Partially migrated"),
 //!     TimestampFormat::Unknown(s) => eprintln!("Unknown format: {s}"),
@@ -67,12 +68,28 @@ pub enum TimestampFormat {
     /// All timestamps are TEXT strings (Python format, needs migration).
     PythonText,
 
+    /// All timestamps are REAL/DOUBLE values (legacy float format, needs
+    /// migration to i64 microseconds). Surfaces in databases written by a
+    /// path that bypassed SQLite INTEGER affinity coercion (Python
+    /// `sqlite3` REAL adapter, FreeBSD-libsqlite3 portable build, ad-hoc
+    /// `CAST(... AS REAL)` inserts). Unfixed, these rows trip
+    /// `Type error in column ...: expected i64, found DOUBLE` at row
+    /// decode time — see GH#115. Contains the names of tables holding
+    /// at least one REAL row.
+    LegacyReal { tables: Vec<String> },
+
     /// Database has no data — no migration needed.
     Empty,
 
-    /// Some tables have TEXT, some have INTEGER — partially migrated.
-    /// Contains the names of tables still in TEXT format.
-    Mixed { text_tables: Vec<String> },
+    /// Database has a mix of timestamp formats — at least two of {TEXT,
+    /// REAL, INTEGER} present in different rows or different tables.
+    /// `text_tables` and `real_tables` list the tables still holding
+    /// non-INTEGER rows. Either list may be empty when the other is
+    /// non-empty alongside INTEGER rows.
+    Mixed {
+        text_tables: Vec<String>,
+        real_tables: Vec<String>,
+    },
 
     /// Unrecognized format (stores the `typeof()` result).
     Unknown(String),
@@ -82,7 +99,10 @@ impl TimestampFormat {
     /// Whether migration is needed.
     #[must_use]
     pub const fn needs_migration(&self) -> bool {
-        matches!(self, Self::PythonText | Self::Mixed { .. })
+        matches!(
+            self,
+            Self::PythonText | Self::LegacyReal { .. } | Self::Mixed { .. }
+        )
     }
 }
 
@@ -91,9 +111,28 @@ impl std::fmt::Display for TimestampFormat {
         match self {
             Self::RustMicros => write!(f, "i64 microseconds (Rust native)"),
             Self::PythonText => write!(f, "TEXT timestamps (Python format, needs migration)"),
+            Self::LegacyReal { tables } => write!(
+                f,
+                "REAL/DOUBLE timestamps (legacy float format, needs migration; in: {})",
+                tables.join(", ")
+            ),
             Self::Empty => write!(f, "empty database (no migration needed)"),
-            Self::Mixed { text_tables } => {
-                write!(f, "mixed format (TEXT in: {})", text_tables.join(", "))
+            Self::Mixed {
+                text_tables,
+                real_tables,
+            } => {
+                let mut parts: Vec<String> = Vec::new();
+                if !text_tables.is_empty() {
+                    parts.push(format!("TEXT in: {}", text_tables.join(", ")));
+                }
+                if !real_tables.is_empty() {
+                    parts.push(format!("REAL in: {}", real_tables.join(", ")));
+                }
+                if parts.is_empty() {
+                    write!(f, "mixed format")
+                } else {
+                    write!(f, "mixed format ({})", parts.join("; "))
+                }
             }
             Self::Unknown(s) => write!(f, "unknown format: {s}"),
         }
@@ -126,15 +165,28 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
 #[derive(Debug, Default)]
 struct ColumnTypeScan {
     has_non_null: bool,
-    has_text: bool,
-    has_integer: bool,
-    has_real: bool,
+    storage_classes: TimestampStorageClasses,
     other_types: BTreeSet<String>,
 }
 
+#[derive(Debug, Default)]
+struct TimestampStorageClasses {
+    has_text: bool,
+    has_integer: bool,
+    has_real: bool,
+}
+
 impl ColumnTypeScan {
-    fn has_integer_like(&self) -> bool {
-        self.has_integer || self.has_real
+    fn has_text(&self) -> bool {
+        self.storage_classes.has_text
+    }
+
+    fn has_integer(&self) -> bool {
+        self.storage_classes.has_integer
+    }
+
+    fn has_real(&self) -> bool {
+        self.storage_classes.has_real
     }
 }
 
@@ -166,9 +218,9 @@ fn scan_column_types(
         }
         scan.has_non_null = true;
         match type_str.as_str() {
-            "text" => scan.has_text = true,
-            "integer" => scan.has_integer = true,
-            "real" => scan.has_real = true,
+            "text" => scan.storage_classes.has_text = true,
+            "integer" => scan.storage_classes.has_integer = true,
+            "real" => scan.storage_classes.has_real = true,
             other => {
                 scan.other_types.insert(other.to_string());
             }
@@ -190,9 +242,11 @@ fn scan_column_types(
 pub fn detect_timestamp_format(conn: &DbConn) -> Result<TimestampFormat, MigrationError> {
     let mut saw_integer = false;
     let mut saw_text = false;
+    let mut saw_real = false;
     let mut saw_nonempty_table = false;
     let mut saw_incompatible_timestamp_schema = false;
     let mut text_tables = BTreeSet::new();
+    let mut real_tables = BTreeSet::new();
     let mut table_has_rows_cache: HashMap<&'static str, Option<bool>> = HashMap::new();
 
     for &(table, column, nullable) in TIMESTAMP_COLUMNS {
@@ -225,16 +279,24 @@ pub fn detect_timestamp_format(conn: &DbConn) -> Result<TimestampFormat, Migrati
             }
             continue;
         }
-        if scan.has_integer_like() {
+        // INTEGER is the only "already migrated" state. REAL needs migration
+        // (see GH#115) — pre-fix this branch took has_integer_like() which
+        // grouped REAL with INTEGER and silently classified REAL-only DBs as
+        // RustMicros, causing `am migrate --check` to lie.
+        if scan.has_integer() {
             saw_integer = true;
         }
-        if scan.has_text {
+        if scan.has_text() {
             saw_text = true;
             text_tables.insert(table.to_string());
         }
+        if scan.has_real() {
+            saw_real = true;
+            real_tables.insert(table.to_string());
+        }
     }
 
-    if !saw_integer && !saw_text {
+    if !saw_integer && !saw_text && !saw_real {
         if saw_nonempty_table || saw_incompatible_timestamp_schema {
             return Ok(TimestampFormat::Unknown(
                 "existing rows use an unsupported or unreadable timestamp schema".to_string(),
@@ -242,25 +304,34 @@ pub fn detect_timestamp_format(conn: &DbConn) -> Result<TimestampFormat, Migrati
         }
         return Ok(TimestampFormat::Empty);
     }
-    if saw_text && !saw_integer {
+    if saw_text && !saw_integer && !saw_real {
         return Ok(TimestampFormat::PythonText);
     }
-    if saw_integer && !saw_text {
+    if saw_real && !saw_integer && !saw_text {
+        return Ok(TimestampFormat::LegacyReal {
+            tables: real_tables.into_iter().collect(),
+        });
+    }
+    if saw_integer && !saw_text && !saw_real {
         return Ok(TimestampFormat::RustMicros);
     }
-    // Both TEXT and INTEGER found — partially migrated
+    // Some combination of {TEXT, REAL, INTEGER} all present — partially migrated.
     Ok(TimestampFormat::Mixed {
         text_tables: text_tables.into_iter().collect(),
+        real_tables: real_tables.into_iter().collect(),
     })
 }
 
 /// Detect format for a specific table and column.
 ///
 /// Returns `Some("text")` if any row in the column still stores a TEXT
-/// timestamp, even when other rows are already INTEGER. Returns `Some("integer")`
-/// once the column is fully integer-like, or `None` if the table is empty,
-/// unreadable, or the column has no non-NULL values. Unsupported storage
-/// classes are returned as an error so migration cannot silently skip them.
+/// timestamp (even when other rows are already INTEGER); `Some("real")` if any
+/// row stores a REAL/DOUBLE value (REAL needs migration to INTEGER per GH#115);
+/// `Some("integer")` once the column is fully integer-backed; or `None` if the
+/// table is empty, unreadable, or the column has no non-NULL values.
+/// Priority order is TEXT → REAL → INTEGER, matching the migration loop's
+/// dispatch in `convert_all_timestamps`. Unsupported storage classes are
+/// returned as an error so migration cannot silently skip them.
 pub fn detect_column_format(
     conn: &DbConn,
     table: &str,
@@ -276,9 +347,9 @@ pub fn detect_column_format(
         // (also needs conversion to INTEGER — see #115), then INTEGER as the
         // terminal already-migrated state. A column with mixed REAL+INTEGER
         // surfaces as "real" so the convert path picks up the REAL rows.
-        Ok(scan) if scan.has_text => Ok(Some("text".to_string())),
-        Ok(scan) if scan.has_real => Ok(Some("real".to_string())),
-        Ok(scan) if scan.has_integer => Ok(Some("integer".to_string())),
+        Ok(scan) if scan.has_text() => Ok(Some("text".to_string())),
+        Ok(scan) if scan.has_real() => Ok(Some("real".to_string())),
+        Ok(scan) if scan.has_integer() => Ok(Some("integer".to_string())),
         Ok(_) => Ok(None),
         Err(_) => Ok(None),
     }
@@ -348,6 +419,18 @@ pub fn text_to_micros(
         row_id,
         value: text.to_string(),
     })
+}
+
+fn real_timestamp_to_micros(real_val: f64) -> Option<i64> {
+    if !real_val.is_finite() || real_val < (i64::MIN as f64) || real_val >= (i64::MAX as f64) {
+        return None;
+    }
+    Some(truncate_checked_real_to_i64(real_val))
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn truncate_checked_real_to_i64(real_val: f64) -> i64 {
+    real_val.trunc() as i64
 }
 
 /// Strip common timezone suffixes from a timestamp string.
@@ -567,17 +650,14 @@ pub fn convert_real_column(
 
         let real_val: f64 = row.get_named(column).unwrap_or(f64::NAN);
 
-        // Reject values that can't be safely truncated to i64. real_val.is_nan(),
-        // ±Inf, or out-of-i64-range fall through to the error branch.
-        if !real_val.is_finite() || real_val < (i64::MIN as f64) || real_val >= (i64::MAX as f64) {
+        let Some(micros) = real_timestamp_to_micros(real_val) else {
             result.skipped += 1;
             result.errors.push(format!(
                 "{table}.{column} id={row_id}: REAL value {real_val} not representable as i64; skipping"
             ));
             continue;
-        }
+        };
 
-        let micros = real_val.trunc() as i64;
         let update_sql = if is_composite_pk {
             format!(
                 "UPDATE {table} SET {column} = ? \
@@ -638,6 +718,43 @@ fn load_completed_tables(conn: &DbConn) -> Result<HashSet<String>, MigrationErro
         }
     }
     Ok(out)
+}
+
+/// Record the result of one `convert_column` / `convert_real_column` call into
+/// the running per-table result list. Returns `true` when the conversion
+/// succeeded (or was a no-op), `false` when the conversion errored. Either way
+/// the failure is captured in `table_results` so the eventual rollback path can
+/// surface it; the bool is just so the caller can decide whether to attempt the
+/// follow-up pass on the same column. Today we run the second pass even on a
+/// first-pass error — the rollback below makes any partial work moot anyway.
+fn record_column_conversion(
+    res: Result<ColumnConversionResult, MigrationError>,
+    table: &str,
+    column: &str,
+    table_results: &mut Vec<ColumnConversionResult>,
+    table_failed: &mut bool,
+) -> bool {
+    match res {
+        Ok(result) => {
+            if result.skipped > 0 {
+                *table_failed = true;
+            }
+            table_results.push(result);
+            true
+        }
+        Err(e) => {
+            *table_failed = true;
+            table_results.push(ColumnConversionResult {
+                table: table.to_string(),
+                column: column.to_string(),
+                converted: 0,
+                skipped: 0,
+                nulls: 0,
+                errors: vec![e.to_string()],
+            });
+            false
+        }
+    }
 }
 
 fn mark_table_completed(conn: &DbConn, table: &str) -> Result<(), MigrationError> {
@@ -760,42 +877,53 @@ pub fn convert_all_timestamps(conn: &DbConn) -> Result<MigrationSummary, Migrati
         let mut table_results: Vec<ColumnConversionResult> = Vec::new();
 
         for column in columns {
-            let fmt_result = detect_column_format(conn, table, column);
-            let fmt = match fmt_result {
+            // Probe once to short-circuit empty / already-INTEGER columns,
+            // and to surface a hard error if `detect_column_format` itself
+            // fails (which would indicate a corrupt schema or a query failure
+            // we can't recover from inside this transaction).
+            let initial_fmt = match detect_column_format(conn, table, column) {
                 Err(e) => {
-                    // Rollback the open transaction before propagating.
                     let _ = conn.execute_raw("ROLLBACK");
                     return Err(e);
                 }
-                Ok(Some(f)) if f == "text" || f == "real" => f,
-                Ok(Some(_)) => continue, // already-INTEGER, nothing to do
-                Ok(None) => continue,
+                Ok(fmt) => fmt,
             };
+            let needs_text_pass = matches!(initial_fmt.as_deref(), Some("text"));
+            let needs_real_pass_now = matches!(initial_fmt.as_deref(), Some("real"));
+            if !needs_text_pass && !needs_real_pass_now {
+                continue; // already-INTEGER, empty, or unreadable
+            }
 
-            let column_result = if fmt == "real" {
-                convert_real_column(conn, table, column)
-            } else {
-                convert_column(conn, table, column)
-            };
-
-            match column_result {
-                Ok(result) => {
-                    if result.skipped > 0 {
-                        table_failed = true;
-                    }
-                    table_results.push(result);
+            // Run the TEXT → INTEGER pass first if any TEXT rows exist.
+            // After this, any rows that were TEXT are now INTEGER. REAL rows
+            // (if any in the same column) survive untouched and are picked
+            // up by the second pass below — this handles the rare legacy
+            // case where one column carries both TEXT and REAL writers.
+            if needs_text_pass {
+                let res = convert_column(conn, table, column);
+                if !record_column_conversion(res, table, column, &mut table_results, &mut table_failed) {
+                    // record_column_conversion returns false if a hard error
+                    // happened. The error is already captured in
+                    // table_results; the table will roll back below.
                 }
+            }
+
+            // Re-detect after the TEXT pass: detect_column_format gives "real"
+            // priority below "text", so the first probe couldn't distinguish
+            // text-only vs text-and-real. After convert_column the column is
+            // either INTEGER (TEXT-only originally) or REAL+INTEGER (was
+            // TEXT+REAL originally). The "real" branch fires only for the
+            // latter case.
+            let post_text_fmt = match detect_column_format(conn, table, column) {
                 Err(e) => {
-                    table_failed = true;
-                    table_results.push(ColumnConversionResult {
-                        table: table.to_string(),
-                        column: column.to_string(),
-                        converted: 0,
-                        skipped: 0,
-                        nulls: 0,
-                        errors: vec![e.to_string()],
-                    });
+                    let _ = conn.execute_raw("ROLLBACK");
+                    return Err(e);
                 }
+                Ok(fmt) => fmt,
+            };
+            if matches!(post_text_fmt.as_deref(), Some("real")) {
+                let res = convert_real_column(conn, table, column);
+                let _ = record_column_conversion(res, table, column, &mut table_results, &mut table_failed);
             }
         }
 
@@ -1230,7 +1358,7 @@ mod tests {
         .expect("insert product");
         let format = detect_timestamp_format(&conn).expect("detect format");
         match format {
-            TimestampFormat::Mixed { text_tables } => {
+            TimestampFormat::Mixed { text_tables, .. } => {
                 assert!(text_tables.contains(&"products".to_string()));
             }
             other => panic!("expected Mixed, got {other:?}"),
@@ -1255,7 +1383,7 @@ mod tests {
 
         let format = detect_timestamp_format(&conn).expect("detect format");
         match format {
-            TimestampFormat::Mixed { text_tables } => {
+            TimestampFormat::Mixed { text_tables, .. } => {
                 assert!(text_tables.contains(&"agents".to_string()));
             }
             other => panic!("expected Mixed, got {other:?}"),
@@ -1317,8 +1445,25 @@ mod tests {
         assert!(
             TimestampFormat::Mixed {
                 text_tables: vec!["test".to_string()],
+                real_tables: vec![],
             }
             .needs_migration()
+        );
+        assert!(
+            TimestampFormat::Mixed {
+                text_tables: vec![],
+                real_tables: vec!["test".to_string()],
+            }
+            .needs_migration()
+        );
+        assert!(
+            TimestampFormat::LegacyReal {
+                tables: vec!["projects".to_string()],
+            }
+            .needs_migration(),
+            "LegacyReal must signal needs-migration; pre-fix this case was \
+             classified as RustMicros and `am migrate --check` lied about \
+             REAL-only DBs (see GH#115)"
         );
         assert!(!TimestampFormat::Unknown("blob".to_string()).needs_migration());
     }
@@ -1539,6 +1684,7 @@ mod tests {
             format,
             TimestampFormat::Mixed {
                 text_tables: vec!["message_recipients".to_string()],
+                real_tables: vec![],
             }
         );
     }
@@ -1649,8 +1795,15 @@ mod tests {
         let _ = format!("{}", TimestampFormat::Empty);
         let _ = format!(
             "{}",
+            TimestampFormat::LegacyReal {
+                tables: vec!["projects".to_string()],
+            }
+        );
+        let _ = format!(
+            "{}",
             TimestampFormat::Mixed {
                 text_tables: vec!["projects".to_string()],
+                real_tables: vec!["agents".to_string()],
             }
         );
         let _ = format!("{}", TimestampFormat::Unknown("blob".to_string()));
@@ -2080,5 +2233,118 @@ mod tests {
             Some("integer"),
             "after migration the REAL row must be gone; otherwise GH#115 still reproduces"
         );
+    }
+
+    /// `detect_timestamp_format` must classify a REAL-only DB as needing
+    /// migration. Pre-fix it returned `RustMicros` (because
+    /// `has_integer_like()` grouped REAL with INTEGER), which made
+    /// `am migrate --check` lie about REAL-only DBs and made the
+    /// `format.needs_migration()` gate at
+    /// crates/mcp-agent-mail-cli/src/lib.rs:11417 silently skip the
+    /// migration entirely. This is the latent half of GH#115 — the
+    /// per-column `convert_real_column` machinery would never get
+    /// called.
+    #[test]
+    fn detect_timestamp_format_classifies_real_only_db_as_needing_migration() {
+        let conn = DbConn::open_memory().expect("open in-memory DB");
+        // The actual production schema is needed here so detect_timestamp_format
+        // walks TIMESTAMP_COLUMNS against real tables. We can't use a tiny
+        // schema because the function iterates a hardcoded TIMESTAMP_COLUMNS
+        // list; only the production tables it knows about will be probed.
+        // The FTS5 prefix='2,3' issue means we have to build a custom
+        // schema string rather than execute CREATE_TABLES_SQL directly.
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE, human_key TEXT NOT NULL, created_at NUMERIC NOT NULL)",
+        )
+        .expect("create table");
+
+        // Insert a REAL row — fractional value keeps NUMERIC affinity
+        // storing it as REAL.
+        conn.execute_raw(
+            "INSERT INTO projects (slug, human_key, created_at) \
+             VALUES ('real-only', '/tmp/real-only', 1700000000999999.5)",
+        )
+        .expect("insert real");
+
+        let format = detect_timestamp_format(&conn).expect("detect format");
+
+        assert!(
+            format.needs_migration(),
+            "REAL-only DB must report needs_migration=true; got format={format:?}. \
+             Pre-fix this returned RustMicros and `am migrate --check` reported \
+             'No migration needed' for a DB that absolutely needed migration."
+        );
+
+        match format {
+            TimestampFormat::LegacyReal { tables } => {
+                assert!(
+                    tables.iter().any(|t| t == "projects"),
+                    "LegacyReal must list projects as a needing-migration table; got {tables:?}"
+                );
+            }
+            other => {
+                panic!("expected TimestampFormat::LegacyReal for a REAL-only DB; got {other:?}")
+            }
+        }
+    }
+
+    /// `detect_timestamp_format` must surface a TEXT+REAL+INTEGER mix as
+    /// `Mixed` with both `text_tables` and `real_tables` populated, so
+    /// `am migrate --check` can tell the operator the full picture.
+    #[test]
+    fn detect_timestamp_format_classifies_text_and_real_mix_as_mixed_with_both_lists() {
+        let conn = DbConn::open_memory().expect("open in-memory DB");
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             slug TEXT NOT NULL UNIQUE, human_key TEXT NOT NULL, \
+             created_at NUMERIC NOT NULL)",
+        )
+        .expect("create projects");
+        conn.execute_raw(
+            "CREATE TABLE products (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             product_uid TEXT NOT NULL UNIQUE, name TEXT NOT NULL UNIQUE, \
+             created_at NUMERIC NOT NULL)",
+        )
+        .expect("create products");
+
+        // projects has a REAL row, products has a TEXT row, and we add an
+        // INTEGER row to one of them so the Mixed branch is triggered.
+        conn.execute_raw(
+            "INSERT INTO projects (slug, human_key, created_at) \
+             VALUES ('real-row', '/tmp/r', 1700000000123.5)",
+        )
+        .expect("insert real");
+        conn.execute_raw(
+            "INSERT INTO projects (slug, human_key, created_at) \
+             VALUES ('int-row', '/tmp/i', 1700000000123)",
+        )
+        .expect("insert integer");
+        conn.execute_raw(
+            "INSERT INTO products (product_uid, name, created_at) \
+             VALUES ('uid', 'name', '2026-04-01 12:00:00')",
+        )
+        .expect("insert text");
+
+        let format = detect_timestamp_format(&conn).expect("detect format");
+        assert!(
+            format.needs_migration(),
+            "TEXT+REAL+INTEGER mix must signal needs-migration; got {format:?}"
+        );
+        match format {
+            TimestampFormat::Mixed {
+                text_tables,
+                real_tables,
+            } => {
+                assert!(
+                    text_tables.iter().any(|t| t == "products"),
+                    "products has the TEXT row; expected in text_tables, got {text_tables:?}"
+                );
+                assert!(
+                    real_tables.iter().any(|t| t == "projects"),
+                    "projects has the REAL row; expected in real_tables, got {real_tables:?}"
+                );
+            }
+            other => panic!("expected Mixed with both text and real tables; got {other:?}"),
+        }
     }
 }
