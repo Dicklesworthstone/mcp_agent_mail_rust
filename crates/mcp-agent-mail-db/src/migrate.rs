@@ -127,8 +127,15 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
 struct ColumnTypeScan {
     has_non_null: bool,
     has_text: bool,
-    has_integer_like: bool,
+    has_integer: bool,
+    has_real: bool,
     other_types: BTreeSet<String>,
+}
+
+impl ColumnTypeScan {
+    fn has_integer_like(&self) -> bool {
+        self.has_integer || self.has_real
+    }
 }
 
 fn unsupported_storage_class_error(
@@ -160,7 +167,8 @@ fn scan_column_types(
         scan.has_non_null = true;
         match type_str.as_str() {
             "text" => scan.has_text = true,
-            "integer" | "real" => scan.has_integer_like = true,
+            "integer" => scan.has_integer = true,
+            "real" => scan.has_real = true,
             other => {
                 scan.other_types.insert(other.to_string());
             }
@@ -217,7 +225,7 @@ pub fn detect_timestamp_format(conn: &DbConn) -> Result<TimestampFormat, Migrati
             }
             continue;
         }
-        if scan.has_integer_like {
+        if scan.has_integer_like() {
             saw_integer = true;
         }
         if scan.has_text {
@@ -264,8 +272,13 @@ pub fn detect_column_format(
             column,
             &scan.other_types,
         )),
+        // Order matters: TEXT first (always needs conversion), then REAL
+        // (also needs conversion to INTEGER — see #115), then INTEGER as the
+        // terminal already-migrated state. A column with mixed REAL+INTEGER
+        // surfaces as "real" so the convert path picks up the REAL rows.
         Ok(scan) if scan.has_text => Ok(Some("text".to_string())),
-        Ok(scan) if scan.has_integer_like => Ok(Some("integer".to_string())),
+        Ok(scan) if scan.has_real => Ok(Some("real".to_string())),
+        Ok(scan) if scan.has_integer => Ok(Some("integer".to_string())),
         Ok(_) => Ok(None),
         Err(_) => Ok(None),
     }
@@ -484,6 +497,113 @@ pub fn convert_column(
     Ok(result)
 }
 
+/// Convert all REAL/DOUBLE values in a single timestamp column to i64
+/// microseconds.
+///
+/// SQLite's dynamic typing lets a row land in an INTEGER-declared column with
+/// REAL affinity (typically because the original writer was a Python or pre-Rust
+/// codepath that handed the driver an `f64`). `convert_column` only handles
+/// TEXT, so those REAL rows survive migration unchanged and trip
+/// `Type error: expected i64, found DOUBLE` when the row is later decoded
+/// through `sqlmodel::Model::from_row` (see GH#115).
+///
+/// Conversion strategy: the schema says microseconds, so we treat the REAL
+/// value as already-microseconds and truncate to i64. This is lossless for
+/// real-world timestamps (microseconds since 1970 fit in 53 bits of mantissa
+/// for any year before AD ~287396) and matches what `now_micros()` would have
+/// produced at write time. Values that don't round-trip safely (NaN, Inf,
+/// > i64::MAX, < i64::MIN) are reported as skipped errors.
+///
+/// Uses explicit column names (not `SELECT *`) for `FrankenSQLite` compatibility.
+///
+/// # Errors
+///
+/// Returns `MigrationError` if the query or update fails critically.
+/// Individual row parse errors are collected in the result and do NOT abort
+/// the conversion — we skip and continue.
+pub fn convert_real_column(
+    conn: &DbConn,
+    table: &str,
+    column: &str,
+) -> Result<ColumnConversionResult, MigrationError> {
+    use sqlmodel_core::Value;
+
+    let mut result = ColumnConversionResult {
+        table: table.to_string(),
+        column: column.to_string(),
+        converted: 0,
+        skipped: 0,
+        nulls: 0,
+        errors: Vec::new(),
+    };
+
+    let is_composite_pk = table == "message_recipients";
+
+    let select_sql = if is_composite_pk {
+        format!(
+            "SELECT message_id, agent_id, {column} FROM {table} \
+             WHERE typeof({column}) = 'real'"
+        )
+    } else {
+        format!(
+            "SELECT id, {column} FROM {table} \
+             WHERE typeof({column}) = 'real'"
+        )
+    };
+
+    let rows = conn
+        .query_sync(&select_sql, &[])
+        .map_err(|e| MigrationError::Query(format!("failed to read {table}.{column}: {e}")))?;
+
+    for row in &rows {
+        let (row_id, pk_values): (i64, Vec<Value>) = if is_composite_pk {
+            let msg_id: i64 = row.get_named("message_id").unwrap_or(0);
+            let agent_id: i64 = row.get_named("agent_id").unwrap_or(0);
+            (msg_id, vec![Value::BigInt(msg_id), Value::BigInt(agent_id)])
+        } else {
+            let id: i64 = row.get_named("id").unwrap_or(0);
+            (id, vec![Value::BigInt(id)])
+        };
+
+        let real_val: f64 = row.get_named(column).unwrap_or(f64::NAN);
+
+        // Reject values that can't be safely truncated to i64. real_val.is_nan(),
+        // ±Inf, or out-of-i64-range fall through to the error branch.
+        if !real_val.is_finite()
+            || real_val < (i64::MIN as f64)
+            || real_val >= (i64::MAX as f64)
+        {
+            result.skipped += 1;
+            result.errors.push(format!(
+                "{table}.{column} id={row_id}: REAL value {real_val} not representable as i64; skipping"
+            ));
+            continue;
+        }
+
+        let micros = real_val.trunc() as i64;
+        let update_sql = if is_composite_pk {
+            format!(
+                "UPDATE {table} SET {column} = ? \
+                 WHERE message_id = ? AND agent_id = ?"
+            )
+        } else {
+            format!("UPDATE {table} SET {column} = ? WHERE id = ?")
+        };
+        let mut params = vec![Value::BigInt(micros)];
+        params.extend(pk_values);
+        if let Err(e) = conn.query_sync(&update_sql, &params) {
+            result.skipped += 1;
+            result
+                .errors
+                .push(format!("{table}.{column} id={row_id}: update failed: {e}"));
+        } else {
+            result.converted += 1;
+        }
+    }
+
+    Ok(result)
+}
+
 /// Summary of a full database migration.
 #[derive(Debug, Clone)]
 pub struct MigrationSummary {
@@ -574,6 +694,26 @@ fn table_has_text_timestamps(
     Ok(false)
 }
 
+/// Returns true when at least one of the given columns has at least one row
+/// stored with REAL/DOUBLE affinity. REAL rows survive `convert_column`
+/// (which only handles TEXT) and trip a runtime "expected i64, found DOUBLE"
+/// at row decode time — see GH#115. The migration loop uses this to decide
+/// whether a table needs the additional REAL-to-INTEGER pass.
+fn table_has_real_timestamps(
+    conn: &DbConn,
+    table: &str,
+    columns: &[&str],
+) -> Result<bool, MigrationError> {
+    for &column in columns {
+        if let Some(fmt) = detect_column_format(conn, table, column)?
+            && fmt == "real"
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Convert all TEXT timestamp columns in the database to i64 microseconds.
 ///
 /// Iterates over all known timestamp columns and converts each one.
@@ -597,10 +737,13 @@ pub fn convert_all_timestamps(conn: &DbConn) -> Result<MigrationSummary, Migrati
 
     for (table, columns) in timestamp_columns_by_table() {
         let has_text = table_has_text_timestamps(conn, table, &columns)?;
+        let has_real = table_has_real_timestamps(conn, table, &columns)?;
 
         // Keep migration_state synced with what we observe, but do not blindly
-        // trust it when TEXT values still exist.
-        if !has_text {
+        // trust it when TEXT or REAL values still exist (REAL is treated the
+        // same way as TEXT here because both decode-fail at row read time —
+        // see GH#115).
+        if !has_text && !has_real {
             if !completed_tables.contains(table) {
                 mark_table_completed(conn, table)?;
                 completed_tables.insert(table.to_string());
@@ -621,18 +764,24 @@ pub fn convert_all_timestamps(conn: &DbConn) -> Result<MigrationSummary, Migrati
 
         for column in columns {
             let fmt_result = detect_column_format(conn, table, column);
-            match fmt_result {
+            let fmt = match fmt_result {
                 Err(e) => {
                     // Rollback the open transaction before propagating.
                     let _ = conn.execute_raw("ROLLBACK");
                     return Err(e);
                 }
-                Ok(Some(fmt)) if fmt != "text" => continue,
-                Ok(Some(_)) => {} // text format — proceed to convert
+                Ok(Some(f)) if f == "text" || f == "real" => f,
+                Ok(Some(_)) => continue, // already-INTEGER, nothing to do
                 Ok(None) => continue,
-            }
+            };
 
-            match convert_column(conn, table, column) {
+            let column_result = if fmt == "real" {
+                convert_real_column(conn, table, column)
+            } else {
+                convert_column(conn, table, column)
+            };
+
+            match column_result {
                 Ok(result) => {
                     if result.skipped > 0 {
                         table_failed = true;
@@ -1744,5 +1893,195 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── convert_real_column tests (GH#115) ───────────────────────────────
+
+    /// Direct repro for GH#115: a row with REAL `created_at` survives
+    /// `convert_column`'s text-only pass and trips `Type error: expected i64,
+    /// found DOUBLE` when later decoded through `Model::from_row`. After the
+    /// fix, `convert_real_column` truncates the REAL value to i64 microseconds
+    /// and the row reads back cleanly.
+    #[test]
+    fn convert_real_column_normalizes_double_timestamp_to_integer() {
+        let conn = DbConn::open_memory().expect("open in-memory DB");
+        // Use a NUMERIC-affinity column rather than INTEGER. Why: SQLite's
+        // type-affinity rules coerce a fractional REAL into the column's
+        // declared affinity at insert time — a literal like `1700000000123456.0`
+        // bound against an INTEGER-affinity column gets stored as INTEGER,
+        // not REAL, even though the bug we're exercising involves rows
+        // *already in the DB* with REAL affinity. NUMERIC affinity preserves
+        // REAL when the value has no integer-equivalent, which is what we
+        // need to construct the bug shape from #115. The schema in production
+        // declares INTEGER, but the bug's source rows came from a writer
+        // that bypassed affinity (Python `sqlite3` REAL adapter, FreeBSD
+        // portable build, ad-hoc INSERT with explicit REAL cast, etc.) —
+        // all of which leave the column with `typeof() = 'real'` regardless
+        // of what the schema *declared*.
+        conn.execute_raw(
+            "CREATE TABLE projects (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                slug TEXT NOT NULL, \
+                human_key TEXT NOT NULL, \
+                created_at NUMERIC NOT NULL\
+             )",
+        )
+        .expect("create projects table");
+
+        // Insert one row whose created_at is REAL (bug shape from GH#115).
+        // The fractional `.5` is what keeps it REAL even under NUMERIC
+        // affinity — try `.0` and SQLite stores it as INTEGER, defeating
+        // the test.
+        conn.execute_raw(
+            "INSERT INTO projects (slug, human_key, created_at) \
+             VALUES ('real-row', '/tmp/real-row', 1700000000123456.5)",
+        )
+        .expect("insert real");
+        // Control row: integer-typed. Should be untouched by convert_real_column.
+        conn.execute_raw(
+            "INSERT INTO projects (slug, human_key, created_at) \
+             VALUES ('int-row', '/tmp/int-row', 1700000000654321)",
+        )
+        .expect("insert integer");
+
+        // Sanity check: detect_column_format reports "real" (which the migrate
+        // loop now picks up — pre-fix it was returning "integer" and the
+        // migration silently skipped the REAL row).
+        let fmt = detect_column_format(&conn, "projects", "created_at")
+            .expect("detect")
+            .expect("Some format");
+        assert_eq!(
+            fmt, "real",
+            "pre-fix scan classified REAL as 'integer' and skipped conversion"
+        );
+
+        let result = convert_real_column(&conn, "projects", "created_at").expect("convert");
+        assert_eq!(
+            result.converted, 1,
+            "exactly the one REAL row should have been converted; integer row left alone"
+        );
+        assert_eq!(result.skipped, 0);
+        assert!(result.errors.is_empty(), "no error rows expected");
+
+        // Post-conversion the column is fully integer-backed, which is what
+        // `Model::from_row` expects.
+        let fmt_after = detect_column_format(&conn, "projects", "created_at")
+            .expect("detect after")
+            .expect("Some format after");
+        assert_eq!(fmt_after, "integer");
+
+        // The row value round-trips losslessly when we truncate the REAL
+        // representation of a microsecond timestamp. We truncate, so .5 is
+        // dropped — for microsecond-precision timestamps this loses at most
+        // a sub-microsecond fragment that wasn't representable in i64 anyway.
+        let rows = conn
+            .query_sync(
+                "SELECT created_at FROM projects WHERE slug = 'real-row'",
+                &[],
+            )
+            .expect("query");
+        let micros: i64 = rows
+            .first()
+            .expect("one row")
+            .get_named("created_at")
+            .expect("read i64 after conversion");
+        assert_eq!(micros, 1_700_000_000_123_456);
+    }
+
+    /// Mixed REAL + INTEGER must still be picked up: the migration loop
+    /// previously treated any non-text column as already-migrated, so a
+    /// partially-corrupted column would silently bypass conversion.
+    #[test]
+    fn convert_real_column_handles_mixed_real_and_integer() {
+        let conn = DbConn::open_memory().expect("open in-memory DB");
+        // NUMERIC affinity (not INTEGER) so fractional REAL literals stay REAL.
+        // See convert_real_column_normalizes_double_timestamp_to_integer for
+        // the full rationale.
+        conn.execute_raw(
+            "CREATE TABLE projects (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                slug TEXT NOT NULL, \
+                human_key TEXT NOT NULL, \
+                created_at NUMERIC NOT NULL\
+             )",
+        )
+        .expect("create projects table");
+
+        // 3 REAL rows (fractional values keep them REAL under affinity rules)
+        // + 2 INTEGER rows. Only the REAL ones should be converted.
+        for i in 1..=3 {
+            conn.execute_raw(&format!(
+                "INSERT INTO projects (slug, human_key, created_at) \
+                 VALUES ('real-{i}', '/tmp/real-{i}', {i}.5)"
+            ))
+            .expect("insert real");
+        }
+        for i in 4..=5 {
+            conn.execute_raw(&format!(
+                "INSERT INTO projects (slug, human_key, created_at) \
+                 VALUES ('int-{i}', '/tmp/int-{i}', {i})"
+            ))
+            .expect("insert integer");
+        }
+
+        // detect_column_format must report the mixed column as "real" so the
+        // migration loop calls convert_real_column instead of skipping.
+        let fmt = detect_column_format(&conn, "projects", "created_at")
+            .expect("detect")
+            .expect("Some format");
+        assert_eq!(fmt, "real");
+
+        let result = convert_real_column(&conn, "projects", "created_at").expect("convert");
+        assert_eq!(result.converted, 3, "only the 3 REAL rows should convert");
+        assert_eq!(result.skipped, 0);
+    }
+
+    /// convert_all_timestamps must descend into REAL columns. This is the
+    /// end-to-end repro for GH#115: a fresh DB where someone (legacy code,
+    /// FreeBSD portable build, ad-hoc INSERT) wrote a REAL-typed timestamp
+    /// must end the migration with all rows decodable as i64.
+    #[test]
+    fn convert_all_timestamps_includes_real_pass() {
+        let conn = DbConn::open_memory().expect("open in-memory DB");
+        conn.execute_raw(
+            "CREATE TABLE projects (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                slug TEXT NOT NULL, \
+                human_key TEXT NOT NULL, \
+                created_at NUMERIC NOT NULL\
+             )",
+        )
+        .expect("create projects table");
+
+        conn.execute_raw(
+            "INSERT INTO projects (slug, human_key, created_at) \
+             VALUES ('real-only', '/tmp/real-only', 1700000000999999.5)",
+        )
+        .expect("insert real");
+
+        // Sanity: pre-migration the column is REAL.
+        assert_eq!(
+            detect_column_format(&conn, "projects", "created_at")
+                .expect("detect pre")
+                .as_deref(),
+            Some("real")
+        );
+
+        let summary = convert_all_timestamps(&conn).expect("migrate");
+        assert!(summary.success, "migration should succeed: {summary:?}");
+        assert!(
+            summary.total_converted >= 1,
+            "at least the REAL projects row should have been converted; got {}",
+            summary.total_converted
+        );
+
+        // Post-migration the column is INTEGER.
+        assert_eq!(
+            detect_column_format(&conn, "projects", "created_at")
+                .expect("detect post")
+                .as_deref(),
+            Some("integer"),
+            "after migration the REAL row must be gone; otherwise GH#115 still reproduces"
+        );
     }
 }
