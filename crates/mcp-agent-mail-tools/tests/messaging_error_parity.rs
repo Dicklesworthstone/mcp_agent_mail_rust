@@ -442,7 +442,7 @@ fn test_broadcast_with_explicit_to_error() {
         let payload = error_object(&err);
         assert_eq!(
             payload.get("type").and_then(Value::as_str),
-            Some("INVALID_ARGUMENT"),
+            Some("BROADCAST_DISABLED"),
         );
         let msg = payload
             .get("message")
@@ -450,7 +450,7 @@ fn test_broadcast_with_explicit_to_error() {
             .expect("message");
         assert_eq!(
             msg,
-            "broadcast=true and explicit 'to' recipients are mutually exclusive. Set broadcast=true with an empty 'to' list, or provide explicit recipients without broadcast."
+            "broadcast=true is intentionally unsupported to prevent agent spam. Address agents explicitly and omit the broadcast flag."
         );
         assert_eq!(
             payload
@@ -458,6 +458,13 @@ fn test_broadcast_with_explicit_to_error() {
                 .and_then(|d| d.get("argument"))
                 .and_then(Value::as_str),
             Some("broadcast"),
+        );
+        assert_eq!(
+            payload
+                .get("data")
+                .and_then(|d| d.get("recipients_supplied"))
+                .and_then(Value::as_bool),
+            Some(true),
         );
     });
 }
