@@ -901,7 +901,13 @@ pub fn convert_all_timestamps(conn: &DbConn) -> Result<MigrationSummary, Migrati
             // case where one column carries both TEXT and REAL writers.
             if needs_text_pass {
                 let res = convert_column(conn, table, column);
-                if !record_column_conversion(res, table, column, &mut table_results, &mut table_failed) {
+                if !record_column_conversion(
+                    res,
+                    table,
+                    column,
+                    &mut table_results,
+                    &mut table_failed,
+                ) {
                     // record_column_conversion returns false if a hard error
                     // happened. The error is already captured in
                     // table_results; the table will roll back below.
@@ -923,7 +929,13 @@ pub fn convert_all_timestamps(conn: &DbConn) -> Result<MigrationSummary, Migrati
             };
             if matches!(post_text_fmt.as_deref(), Some("real")) {
                 let res = convert_real_column(conn, table, column);
-                let _ = record_column_conversion(res, table, column, &mut table_results, &mut table_failed);
+                let _ = record_column_conversion(
+                    res,
+                    table,
+                    column,
+                    &mut table_results,
+                    &mut table_failed,
+                );
             }
         }
 
@@ -1160,6 +1172,105 @@ mod tests {
         text_to_micros(s, "test", "col", 0).is_err()
     }
 
+    fn create_migration_test_tables(conn: &DbConn) {
+        conn.execute_raw(
+            "\
+            CREATE TABLE IF NOT EXISTS projects (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                slug TEXT NOT NULL UNIQUE,\
+                human_key TEXT NOT NULL,\
+                created_at NUMERIC NOT NULL\
+            );\
+            CREATE TABLE IF NOT EXISTS products (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                product_uid TEXT NOT NULL UNIQUE,\
+                name TEXT NOT NULL UNIQUE,\
+                created_at NUMERIC NOT NULL\
+            );\
+            CREATE TABLE IF NOT EXISTS product_project_links (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                product_id INTEGER NOT NULL,\
+                project_id INTEGER NOT NULL,\
+                created_at NUMERIC NOT NULL,\
+                UNIQUE(product_id, project_id)\
+            );\
+            CREATE TABLE IF NOT EXISTS agents (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                project_id INTEGER NOT NULL,\
+                name TEXT NOT NULL,\
+                program TEXT NOT NULL,\
+                model TEXT NOT NULL,\
+                task_description TEXT NOT NULL DEFAULT '',\
+                inception_ts NUMERIC NOT NULL,\
+                last_active_ts NUMERIC NOT NULL,\
+                attachments_policy TEXT NOT NULL DEFAULT 'auto',\
+                contact_policy TEXT NOT NULL DEFAULT 'auto',\
+                reaper_exempt INTEGER NOT NULL DEFAULT 0,\
+                registration_token TEXT,\
+                UNIQUE(project_id, name)\
+            );\
+            CREATE TABLE IF NOT EXISTS messages (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                project_id INTEGER NOT NULL,\
+                sender_id INTEGER NOT NULL,\
+                thread_id TEXT,\
+                subject TEXT NOT NULL,\
+                body_md TEXT NOT NULL,\
+                importance TEXT NOT NULL DEFAULT 'normal',\
+                ack_required INTEGER NOT NULL DEFAULT 0,\
+                created_ts NUMERIC NOT NULL,\
+                recipients_json TEXT NOT NULL DEFAULT '{}',\
+                attachments TEXT NOT NULL DEFAULT '[]'\
+            );\
+            CREATE TABLE IF NOT EXISTS message_recipients (\
+                message_id INTEGER NOT NULL,\
+                agent_id INTEGER NOT NULL,\
+                kind TEXT NOT NULL DEFAULT 'to',\
+                read_ts NUMERIC,\
+                ack_ts NUMERIC,\
+                PRIMARY KEY(message_id, agent_id)\
+            );\
+            CREATE TABLE IF NOT EXISTS file_reservations (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                project_id INTEGER NOT NULL,\
+                agent_id INTEGER NOT NULL,\
+                path_pattern TEXT NOT NULL,\
+                exclusive INTEGER NOT NULL DEFAULT 1,\
+                reason TEXT NOT NULL DEFAULT '',\
+                created_ts NUMERIC NOT NULL,\
+                expires_ts NUMERIC NOT NULL,\
+                released_ts NUMERIC\
+            );\
+            CREATE TABLE IF NOT EXISTS agent_links (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                a_project_id INTEGER NOT NULL,\
+                a_agent_id INTEGER NOT NULL,\
+                b_project_id INTEGER NOT NULL,\
+                b_agent_id INTEGER NOT NULL,\
+                status TEXT NOT NULL DEFAULT 'pending',\
+                reason TEXT NOT NULL DEFAULT '',\
+                created_ts NUMERIC NOT NULL,\
+                updated_ts NUMERIC NOT NULL,\
+                expires_ts NUMERIC,\
+                UNIQUE(a_project_id, a_agent_id, b_project_id, b_agent_id)\
+            );\
+            CREATE TABLE IF NOT EXISTS project_sibling_suggestions (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                project_a_id INTEGER NOT NULL,\
+                project_b_id INTEGER NOT NULL,\
+                score REAL NOT NULL,\
+                status TEXT NOT NULL DEFAULT 'suggested',\
+                rationale TEXT NOT NULL DEFAULT '',\
+                created_ts NUMERIC NOT NULL,\
+                evaluated_ts NUMERIC NOT NULL,\
+                confirmed_ts NUMERIC,\
+                dismissed_ts NUMERIC,\
+                UNIQUE(project_a_id, project_b_id)\
+            );",
+        )
+        .expect("create migration test tables");
+    }
+
     #[test]
     fn space_separator_with_microseconds() {
         let micros = parse("2026-02-24 15:30:00.123456").unwrap();
@@ -1302,8 +1413,7 @@ mod tests {
     #[test]
     fn detect_empty_database() {
         let conn = DbConn::open_memory().expect("open in-memory DB");
-        conn.execute_raw(crate::schema::CREATE_TABLES_SQL)
-            .expect("create tables");
+        create_migration_test_tables(&conn);
         let format = detect_timestamp_format(&conn).expect("detect format");
         assert_eq!(format, TimestampFormat::Empty);
     }
@@ -1311,8 +1421,7 @@ mod tests {
     #[test]
     fn detect_rust_format() {
         let conn = DbConn::open_memory().expect("open in-memory DB");
-        conn.execute_raw(crate::schema::CREATE_TABLES_SQL)
-            .expect("create tables");
+        create_migration_test_tables(&conn);
         // Insert a project with integer timestamp
         conn.query_sync(
             "INSERT INTO projects (slug, human_key, created_at) VALUES ('test', '/tmp/test', 1740000000000000)",
@@ -1326,8 +1435,7 @@ mod tests {
     #[test]
     fn detect_python_format() {
         let conn = DbConn::open_memory().expect("open in-memory DB");
-        conn.execute_raw(crate::schema::CREATE_TABLES_SQL)
-            .expect("create tables");
+        create_migration_test_tables(&conn);
         // Insert a project with TEXT timestamp (Python style)
         conn.query_sync(
             "INSERT INTO projects (slug, human_key, created_at) VALUES ('test', '/tmp/test', '2026-02-24 15:30:00.123456')",
@@ -1342,8 +1450,7 @@ mod tests {
     #[test]
     fn detect_mixed_format() {
         let conn = DbConn::open_memory().expect("open in-memory DB");
-        conn.execute_raw(crate::schema::CREATE_TABLES_SQL)
-            .expect("create tables");
+        create_migration_test_tables(&conn);
         // Insert a project with INTEGER timestamp
         conn.query_sync(
             "INSERT INTO projects (slug, human_key, created_at) VALUES ('test', '/tmp/test', 1740000000000000)",
@@ -1368,8 +1475,7 @@ mod tests {
     #[test]
     fn detect_mixed_format_within_single_table() {
         let conn = DbConn::open_memory().expect("open in-memory DB");
-        conn.execute_raw(crate::schema::CREATE_TABLES_SQL)
-            .expect("create tables");
+        create_migration_test_tables(&conn);
         conn.query_sync(
             "INSERT INTO projects (slug, human_key, created_at) VALUES ('test', '/tmp', 1740000000000000)",
             &[],
@@ -1473,8 +1579,7 @@ mod tests {
     #[test]
     fn convert_column_text_to_integer() {
         let conn = DbConn::open_memory().expect("open in-memory DB");
-        conn.execute_raw(crate::schema::CREATE_TABLES_SQL)
-            .expect("create tables");
+        create_migration_test_tables(&conn);
 
         // Insert projects with TEXT timestamps
         for i in 1..=5 {
@@ -1501,8 +1606,7 @@ mod tests {
     #[test]
     fn convert_column_preserves_nulls() {
         let conn = DbConn::open_memory().expect("open in-memory DB");
-        conn.execute_raw(crate::schema::CREATE_TABLES_SQL)
-            .expect("create tables");
+        create_migration_test_tables(&conn);
 
         // Insert project and agent
         conn.query_sync(
@@ -1535,8 +1639,7 @@ mod tests {
     #[test]
     fn convert_all_timestamps_full_migration() {
         let conn = DbConn::open_memory().expect("open in-memory DB");
-        conn.execute_raw(crate::schema::CREATE_TABLES_SQL)
-            .expect("create tables");
+        create_migration_test_tables(&conn);
 
         // Insert Python-format data across multiple tables
         conn.query_sync(
@@ -1573,8 +1676,7 @@ mod tests {
     #[test]
     fn convert_is_idempotent() {
         let conn = DbConn::open_memory().expect("open in-memory DB");
-        conn.execute_raw(crate::schema::CREATE_TABLES_SQL)
-            .expect("create tables");
+        create_migration_test_tables(&conn);
         conn.query_sync(
             "INSERT INTO projects (slug, human_key, created_at) VALUES ('test', '/tmp', '2026-02-24 15:30:00.123456')",
             &[],
@@ -1594,8 +1696,7 @@ mod tests {
     #[test]
     fn convert_rebuilds_stale_migration_state() {
         let conn = DbConn::open_memory().expect("open in-memory DB");
-        conn.execute_raw(crate::schema::CREATE_TABLES_SQL)
-            .expect("create tables");
+        create_migration_test_tables(&conn);
         conn.query_sync(
             "INSERT INTO projects (slug, human_key, created_at) VALUES ('test', '/tmp', '2026-02-24 15:30:00.123456')",
             &[],
@@ -1632,8 +1733,7 @@ mod tests {
     #[test]
     fn detect_column_format_prefers_text_when_column_is_mixed() {
         let conn = DbConn::open_memory().expect("open in-memory DB");
-        conn.execute_raw(crate::schema::CREATE_TABLES_SQL)
-            .expect("create tables");
+        create_migration_test_tables(&conn);
 
         conn.query_sync(
             "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'test', '/tmp', 1740000000000000)",
@@ -1692,8 +1792,7 @@ mod tests {
     #[test]
     fn convert_all_timestamps_converts_mixed_message_recipient_columns() {
         let conn = DbConn::open_memory().expect("open in-memory DB");
-        conn.execute_raw(crate::schema::CREATE_TABLES_SQL)
-            .expect("create tables");
+        create_migration_test_tables(&conn);
 
         conn.query_sync(
             "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'test', '/tmp', 1740000000000000)",
@@ -1763,8 +1862,7 @@ mod tests {
     #[test]
     fn detect_column_format_rejects_unsupported_storage_classes() {
         let conn = DbConn::open_memory().expect("open in-memory DB");
-        conn.execute_raw(crate::schema::CREATE_TABLES_SQL)
-            .expect("create tables");
+        create_migration_test_tables(&conn);
 
         conn.query_sync(
             "INSERT INTO projects (slug, human_key, created_at) VALUES ('blob-project', '/tmp/blob', X'0102')",
