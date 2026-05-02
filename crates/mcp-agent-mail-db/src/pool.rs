@@ -2352,11 +2352,59 @@ impl DbPool {
 
         match integrity::quick_check(&conn) {
             Ok(res) => Ok(res),
-            Err(DbError::IntegrityCorruption { .. }) => {
-                tracing::warn!(
-                    path = %self.sqlite_path,
-                    "startup integrity check failed; attempting auto-recovery from backup"
-                );
+            Err(DbError::IntegrityCorruption { message, details }) => {
+                // GH#114: before triggering disruptive recovery (which keeps
+                // recovery.mode=degraded_read_only on every quick-cycle tick),
+                // give canonical SQLite a chance to overrule the bespoke probe.
+                // The canonical fallback is already used by the runtime
+                // health-verdict path (sqlite_primary_check_is_ok_with_canonical_fallback);
+                // wiring it through the startup probe ensures both paths reach
+                // the same verdict.
+                match sqlite_canonical_file_check_is_ok(
+                    Path::new(&self.sqlite_path),
+                    integrity::CheckKind::Quick,
+                ) {
+                    Ok(true) => {
+                        tracing::warn!(
+                            path = %self.sqlite_path,
+                            primary_error = %message,
+                            "startup integrity probe rejected the file but canonical SQLite accepted it; treating as healthy (skipping recovery)"
+                        );
+                        return Ok(integrity::IntegrityCheckResult {
+                            ok: true,
+                            details: vec!["ok (canonical fallback)".to_string()],
+                            duration_us: 0,
+                            kind: integrity::CheckKind::Quick,
+                        });
+                    }
+                    Ok(false) => {
+                        tracing::warn!(
+                            path = %self.sqlite_path,
+                            primary_error = %message,
+                            "startup integrity probe and canonical SQLite both rejected the file; attempting auto-recovery from backup"
+                        );
+                    }
+                    Err(canonical_error) => {
+                        tracing::warn!(
+                            path = %self.sqlite_path,
+                            primary_error = %message,
+                            canonical_error = %canonical_error,
+                            "startup integrity probe rejected the file and canonical fallback failed; attempting auto-recovery from backup"
+                        );
+                    }
+                }
+
+                // Re-emit the original details into the trace to preserve
+                // forensics from the primary probe before recovery clobbers
+                // the file.
+                if !details.is_empty() {
+                    tracing::debug!(
+                        path = %self.sqlite_path,
+                        primary_details = ?details,
+                        "primary probe details prior to recovery"
+                    );
+                }
+
                 // Close connection before attempting restore (Windows/locking safety)
                 drop(conn);
 
