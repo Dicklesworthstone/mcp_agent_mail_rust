@@ -2350,60 +2350,23 @@ impl DbPool {
             "startup integrity check connection",
         );
 
-        match integrity::quick_check(&conn) {
+        // GH#114: route through the canonical-fallback helper instead of
+        // calling `integrity::quick_check` directly. If the bespoke probe
+        // false-positives (e.g. on a NOCASE-collation index it dislikes) but
+        // canonical SQLite accepts the file, we return Ok and skip recovery
+        // entirely — preventing the runtime verdict pipeline from wedging
+        // `recovery.mode = degraded_read_only` on every 5-min quick-cycle.
+        match self.quick_check_with_canonical_fallback(&conn, "initial") {
             Ok(res) => Ok(res),
-            Err(DbError::IntegrityCorruption { message, details }) => {
-                // GH#114: before triggering disruptive recovery (which keeps
-                // recovery.mode=degraded_read_only on every quick-cycle tick),
-                // give canonical SQLite a chance to overrule the bespoke probe.
-                // The canonical fallback is already used by the runtime
-                // health-verdict path (sqlite_primary_check_is_ok_with_canonical_fallback);
-                // wiring it through the startup probe ensures both paths reach
-                // the same verdict.
-                match sqlite_canonical_file_check_is_ok(
-                    Path::new(&self.sqlite_path),
-                    integrity::CheckKind::Quick,
-                ) {
-                    Ok(true) => {
-                        tracing::warn!(
-                            path = %self.sqlite_path,
-                            primary_error = %message,
-                            "startup integrity probe rejected the file but canonical SQLite accepted it; treating as healthy (skipping recovery)"
-                        );
-                        return Ok(integrity::IntegrityCheckResult {
-                            ok: true,
-                            details: vec!["ok (canonical fallback)".to_string()],
-                            duration_us: 0,
-                            kind: integrity::CheckKind::Quick,
-                        });
-                    }
-                    Ok(false) => {
-                        tracing::warn!(
-                            path = %self.sqlite_path,
-                            primary_error = %message,
-                            "startup integrity probe and canonical SQLite both rejected the file; attempting auto-recovery from backup"
-                        );
-                    }
-                    Err(canonical_error) => {
-                        tracing::warn!(
-                            path = %self.sqlite_path,
-                            primary_error = %message,
-                            canonical_error = %canonical_error,
-                            "startup integrity probe rejected the file and canonical fallback failed; attempting auto-recovery from backup"
-                        );
-                    }
-                }
-
-                // Re-emit the original details into the trace to preserve
-                // forensics from the primary probe before recovery clobbers
-                // the file.
-                if !details.is_empty() {
-                    tracing::debug!(
-                        path = %self.sqlite_path,
-                        primary_details = ?details,
-                        "primary probe details prior to recovery"
-                    );
-                }
+            Err(DbError::IntegrityCorruption { .. }) => {
+                // The helper already logged the rejection verdict (primary +
+                // canonical). This warn marks the recovery action taken in
+                // response, so an operator following the log can correlate
+                // verdict → action without scanning code.
+                tracing::warn!(
+                    path = %self.sqlite_path,
+                    "attempting auto-recovery from backup"
+                );
 
                 // Close connection before attempting restore (Windows/locking safety)
                 drop(conn);
@@ -2412,7 +2375,13 @@ impl DbPool {
                     return Err(DbError::Sqlite(format!("startup recovery failed: {e}")));
                 }
 
-                // Re-open and re-verify
+                // Re-open and re-verify. Route post-recovery through the same
+                // canonical fallback: if the bespoke probe's false-positive was
+                // index-shape-related (e.g. GH#114's NOCASE-collation idx_agents
+                // entries-out-of-order verdict on a perfectly valid index), the
+                // restored file will reproduce the same schema and trip the same
+                // false positive. Without the fallback we'd return Err here and
+                // re-wedge recovery.mode despite canonical accepting the file.
                 let conn = crate::guard_db_conn(
                     open_sqlite_file_with_lock_retry(&self.sqlite_path).map_err(|e| {
                         DbError::Sqlite(format!(
@@ -2421,7 +2390,75 @@ impl DbPool {
                     })?,
                     "startup integrity check post-recovery connection",
                 );
-                integrity::quick_check(&conn)
+                self.quick_check_with_canonical_fallback(&conn, "post-recovery")
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Run `integrity::quick_check` on `conn` and, on `IntegrityCorruption`,
+    /// consult canonical SQLite as a second opinion (mirroring
+    /// `sqlite_primary_check_is_ok_with_canonical_fallback` from the runtime
+    /// health-verdict path). Used by `run_startup_integrity_check` for both
+    /// the initial probe and the post-recovery re-verification so a
+    /// bespoke-only false positive does not wedge `recovery.mode` (GH#114).
+    ///
+    /// `phase` is folded into log lines so the operator can tell whether a
+    /// canonical-overrule fired during the initial probe or after recovery.
+    fn quick_check_with_canonical_fallback(
+        &self,
+        conn: &DbConn,
+        phase: &str,
+    ) -> DbResult<integrity::IntegrityCheckResult> {
+        match integrity::quick_check(conn) {
+            Ok(res) => Ok(res),
+            Err(DbError::IntegrityCorruption { message, details }) => {
+                match sqlite_canonical_file_check_is_ok(
+                    Path::new(&self.sqlite_path),
+                    integrity::CheckKind::Quick,
+                ) {
+                    Ok(true) => {
+                        tracing::warn!(
+                            phase,
+                            path = %self.sqlite_path,
+                            primary_error = %message,
+                            "integrity probe rejected the file but canonical SQLite accepted it; treating as healthy"
+                        );
+                        Ok(integrity::IntegrityCheckResult {
+                            ok: true,
+                            details: vec!["ok (canonical fallback)".to_string()],
+                            duration_us: 0,
+                            kind: integrity::CheckKind::Quick,
+                        })
+                    }
+                    Ok(false) => {
+                        tracing::warn!(
+                            phase,
+                            path = %self.sqlite_path,
+                            primary_error = %message,
+                            "integrity probe and canonical SQLite both rejected the file"
+                        );
+                        if !details.is_empty() {
+                            tracing::debug!(
+                                phase,
+                                path = %self.sqlite_path,
+                                primary_details = ?details,
+                                "primary probe details (canonical also rejected)"
+                            );
+                        }
+                        Err(DbError::IntegrityCorruption { message, details })
+                    }
+                    Err(canonical_error) => {
+                        tracing::warn!(
+                            phase,
+                            path = %self.sqlite_path,
+                            primary_error = %message,
+                            canonical_error = %canonical_error,
+                            "integrity probe rejected the file and canonical fallback could not run"
+                        );
+                        Err(DbError::IntegrityCorruption { message, details })
+                    }
+                }
             }
             Err(e) => Err(e),
         }
