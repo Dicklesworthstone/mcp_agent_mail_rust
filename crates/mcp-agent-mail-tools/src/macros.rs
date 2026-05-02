@@ -76,6 +76,18 @@ fn parse_json<T: DeserializeOwned>(payload: String, label: &str) -> McpResult<T>
         .map_err(|e| McpError::internal_error(format!("{label} JSON parse error: {e}")))
 }
 
+fn normalize_resolved_pane_agent_name(name: &str) -> Option<String> {
+    if let Some(normalized) = mcp_agent_mail_core::models::normalize_agent_name(name) {
+        return Some(normalized);
+    }
+
+    tracing::warn!(
+        pane_agent_name = %name.trim(),
+        "ignoring invalid pane identity name during macro_start_session"
+    );
+    None
+}
+
 /// Boot a project session: ensure project + register agent + reserve files + fetch inbox.
 ///
 /// # Parameters
@@ -135,9 +147,7 @@ pub async fn macro_start_session(
     // available, so the macro is idempotent against the boot path.
     let resolved_name = agent_name.or_else(|| {
         mcp_agent_mail_core::pane_identity::resolve_identity_current_pane(&project.human_key)
-            .and_then(|name| {
-                mcp_agent_mail_core::models::normalize_agent_name(&name).or(Some(name))
-            })
+            .and_then(|name| normalize_resolved_pane_agent_name(&name))
     });
 
     let agent_json = crate::identity::register_agent(
@@ -812,6 +822,22 @@ mod tests {
         assert!(!Path::new("data/projects/test").is_absolute());
         assert!(!Path::new("./test").is_absolute());
         assert!(!Path::new("").is_absolute());
+    }
+
+    #[test]
+    fn resolved_pane_agent_name_normalizes_valid_identity() {
+        assert_eq!(
+            normalize_resolved_pane_agent_name("bluelake"),
+            Some("BlueLake".to_string())
+        );
+    }
+
+    #[test]
+    fn resolved_pane_agent_name_ignores_invalid_identity() {
+        assert_eq!(
+            normalize_resolved_pane_agent_name("BackendHarmonizer"),
+            None
+        );
     }
 
     // -----------------------------------------------------------------------
