@@ -25,7 +25,7 @@ pub mod output;
 pub mod robot;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -10113,6 +10113,7 @@ fn handle_file_reservations_with_conn(
                 )
                 .map_err(|e| CliError::Other(format!("query failed: {e}")))?;
             let mut conflicts: Vec<serde_json::Value> = Vec::new();
+            let mut conflicted_paths: BTreeSet<String> = BTreeSet::new();
             for path in &paths {
                 for r in &active_rows {
                     let holder_is_exclusive: bool = r.get_named("exclusive").unwrap_or(true);
@@ -10124,6 +10125,7 @@ fn handle_file_reservations_with_conn(
                     if !reservation_patterns_overlap(path, &pattern) {
                         continue;
                     }
+                    conflicted_paths.insert(path.clone());
                     let rid: i64 = r.get_named("id").unwrap_or(0);
                     conflicts.push(serde_json::json!({
                         "path": path,
@@ -10138,6 +10140,9 @@ fn handle_file_reservations_with_conn(
             let expires_us = now_us.saturating_add(saturating_seconds_to_micros(ttl));
             let mut granted: Vec<serde_json::Value> = Vec::new();
             for path in &paths {
+                if conflicted_paths.contains(path) {
+                    continue;
+                }
                 conn.query_sync(
                     "INSERT INTO file_reservations \
                      (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts) \
@@ -10183,7 +10188,7 @@ fn handle_file_reservations_with_conn(
             );
             if !conflicts.is_empty() {
                 output::warn(&format!(
-                    "{} conflict(s) detected — reservations created but may overlap.",
+                    "{} conflict(s) detected — conflicting reservations were not created.",
                     conflicts.len()
                 ));
             }
@@ -11541,7 +11546,9 @@ fn handle_migrate_cmd(
 
     if after.needs_migration() {
         ftui_runtime::ftui_eprintln!(
-            "Warning: database still contains TEXT timestamps after migration."
+            "Warning: database still contains non-INTEGER timestamps after migration \
+             (TEXT, REAL, or a mixed-format leftover that the migration could not fully \
+             convert in this run)."
         );
         ftui_runtime::ftui_eprintln!("  Post-migration format: {after}");
     }
@@ -38491,6 +38498,71 @@ startup_timeout_sec = 42
         assert!(
             output.contains("\"conflicts\"") && output.contains("BlueLake"),
             "expected conflict with BlueLake, got: {output}"
+        );
+        let redfox_rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS n FROM file_reservations \
+                 WHERE project_id = 1 AND agent_id = 2 AND path_pattern = ? AND released_ts IS NULL",
+                &[sqlmodel_core::Value::Text("src/api/*.rs".to_string())],
+            )
+            .unwrap();
+        let redfox_count: i64 = redfox_rows
+            .first()
+            .and_then(|row| row.get_named("n").ok())
+            .unwrap_or_default();
+        assert_eq!(
+            redfox_count, 0,
+            "conflicting CLI reservations must be reported without being inserted"
+        );
+    }
+
+    #[test]
+    fn integration_file_reservations_reserve_grants_only_non_conflicting_paths() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.sqlite3");
+        let conn = seed_acks_and_reservations_db(&db_path);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        let result = handle_file_reservations_with_conn(
+            &conn,
+            FileReservationsCommand::Reserve {
+                project: "test-proj".to_string(),
+                agent: "RedFox".to_string(),
+                paths: vec!["src/api/*.rs".to_string(), "docs/guide.md".to_string()],
+                ttl: 3600,
+                exclusive: true,
+                shared: false,
+                reason: "mixed overlap test".to_string(),
+            },
+        );
+        let output = capture.drain_to_string();
+        assert!(result.is_ok(), "mixed reserve failed: {result:?}");
+        assert!(
+            output.contains("\"conflicts\"")
+                && output.contains("src/api/*.rs")
+                && output.contains("docs/guide.md"),
+            "expected conflict plus non-conflicting grant, got: {output}"
+        );
+
+        let rows = conn
+            .query_sync(
+                "SELECT path_pattern FROM file_reservations \
+                 WHERE project_id = 1 AND agent_id = 2 AND released_ts IS NULL \
+                 ORDER BY path_pattern",
+                &[],
+            )
+            .unwrap();
+        let paths: Vec<String> = rows
+            .iter()
+            .filter_map(|row| row.get_named("path_pattern").ok())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["docs/guide.md".to_string()],
+            "only the non-conflicting CLI reservation should be inserted"
         );
     }
 
