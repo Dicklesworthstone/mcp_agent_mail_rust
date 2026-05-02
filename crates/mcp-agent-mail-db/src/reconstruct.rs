@@ -2878,6 +2878,7 @@ fn merge_salvaged_database(
         .execute_raw("BEGIN IMMEDIATE;")
         .map_err(|e| DbError::Sqlite(format!("reconstruct salvage: begin transaction: {e}")))?;
 
+    let pre_merge_stats = stats.clone();
     let merge_result: DbResult<()> = (|| {
         let mut project_id_map: HashMap<i64, i64> = HashMap::new();
         let mut agent_id_map: HashMap<i64, i64> = HashMap::new();
@@ -3788,14 +3789,23 @@ fn merge_salvaged_database(
 
     if let Err(err) = merge_result {
         let _ = target_conn.execute_raw("ROLLBACK;");
+        *stats = pre_merge_stats;
         return Err(err);
     }
-    target_conn
-        .execute_raw("COMMIT;")
-        .map_err(|e| DbError::Sqlite(format!("reconstruct salvage: commit transaction: {e}")))?;
+    if let Err(e) = target_conn.execute_raw("COMMIT;") {
+        let _ = target_conn.execute_raw("ROLLBACK;");
+        *stats = pre_merge_stats;
+        return Err(DbError::Sqlite(format!(
+            "reconstruct salvage: commit transaction: {e}"
+        )));
+    }
     drop(target_conn);
-    crate::pool::wal_checkpoint_truncate_path(target_db_path)
-        .map_err(|e| DbError::Sqlite(format!("reconstruct salvage: checkpoint: {e}")))?;
+    if let Err(e) = crate::pool::wal_checkpoint_truncate_path(target_db_path) {
+        stats.warnings.push(format!(
+            "Salvage merge committed, but WAL checkpoint failed for {}: {e}",
+            target_db_path.display()
+        ));
+    }
 
     Ok(())
 }
@@ -6620,6 +6630,14 @@ archive body
             agent_count, 0,
             "failed salvage merge should not leak partially inserted agents"
         );
+        assert_eq!(
+            stats.salvaged_projects, 0,
+            "rolled-back salvage merge should not report salvaged projects"
+        );
+        assert_eq!(
+            stats.salvaged_agents, 0,
+            "rolled-back salvage merge should not report salvaged agents"
+        );
     }
 
     #[test]
@@ -6707,6 +6725,18 @@ archive body
         assert_eq!(
             message_count, 0,
             "corrupt salvage source should not leak DB-only messages"
+        );
+        assert_eq!(
+            stats.salvaged_projects, 0,
+            "failed salvage attempt should not report rolled-back projects"
+        );
+        assert_eq!(
+            stats.salvaged_agents, 0,
+            "failed salvage attempt should not report rolled-back agents"
+        );
+        assert_eq!(
+            stats.salvaged_messages, 0,
+            "failed salvage attempt should not report rolled-back messages"
         );
     }
 

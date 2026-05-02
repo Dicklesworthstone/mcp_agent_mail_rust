@@ -569,10 +569,7 @@ pub fn convert_real_column(
 
         // Reject values that can't be safely truncated to i64. real_val.is_nan(),
         // ±Inf, or out-of-i64-range fall through to the error branch.
-        if !real_val.is_finite()
-            || real_val < (i64::MIN as f64)
-            || real_val >= (i64::MAX as f64)
-        {
+        if !real_val.is_finite() || real_val < (i64::MIN as f64) || real_val >= (i64::MAX as f64) {
             result.skipped += 1;
             result.errors.push(format!(
                 "{table}.{column} id={row_id}: REAL value {real_val} not representable as i64; skipping"
