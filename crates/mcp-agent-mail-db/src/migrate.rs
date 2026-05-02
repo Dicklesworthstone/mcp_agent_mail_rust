@@ -721,26 +721,22 @@ fn load_completed_tables(conn: &DbConn) -> Result<HashSet<String>, MigrationErro
 }
 
 /// Record the result of one `convert_column` / `convert_real_column` call into
-/// the running per-table result list. Returns `true` when the conversion
-/// succeeded (or was a no-op), `false` when the conversion errored. Either way
-/// the failure is captured in `table_results` so the eventual rollback path can
-/// surface it; the bool is just so the caller can decide whether to attempt the
-/// follow-up pass on the same column. Today we run the second pass even on a
-/// first-pass error — the rollback below makes any partial work moot anyway.
+/// the running per-table result list. Any hard error or skipped row flips
+/// `table_failed`; the eventual rollback path then surfaces the captured
+/// per-column detail without leaking partial conversions.
 fn record_column_conversion(
     res: Result<ColumnConversionResult, MigrationError>,
     table: &str,
     column: &str,
     table_results: &mut Vec<ColumnConversionResult>,
     table_failed: &mut bool,
-) -> bool {
+) {
     match res {
         Ok(result) => {
             if result.skipped > 0 {
                 *table_failed = true;
             }
             table_results.push(result);
-            true
         }
         Err(e) => {
             *table_failed = true;
@@ -752,7 +748,6 @@ fn record_column_conversion(
                 nulls: 0,
                 errors: vec![e.to_string()],
             });
-            false
         }
     }
 }
@@ -819,10 +814,16 @@ fn table_has_real_timestamps(
     columns: &[&str],
 ) -> Result<bool, MigrationError> {
     for &column in columns {
-        if let Some(fmt) = detect_column_format(conn, table, column)?
-            && fmt == "real"
-        {
-            return Ok(true);
+        match scan_column_types(conn, table, column) {
+            Ok(scan) if !scan.other_types.is_empty() => {
+                return Err(unsupported_storage_class_error(
+                    table,
+                    column,
+                    &scan.other_types,
+                ));
+            }
+            Ok(scan) if scan.has_real() => return Ok(true),
+            Ok(_) | Err(_) => {}
         }
     }
     Ok(false)
@@ -896,7 +897,7 @@ pub fn convert_all_timestamps(conn: &DbConn) -> Result<MigrationSummary, Migrati
                     // second probe below — this handles the rare legacy case
                     // where one column carries both TEXT and REAL writers.
                     let res = convert_column(conn, table, column);
-                    let _ = record_column_conversion(
+                    record_column_conversion(
                         res,
                         table,
                         column,
@@ -919,7 +920,7 @@ pub fn convert_all_timestamps(conn: &DbConn) -> Result<MigrationSummary, Migrati
                     };
                     if matches!(post_text_fmt.as_deref(), Some("real")) {
                         let res = convert_real_column(conn, table, column);
-                        let _ = record_column_conversion(
+                        record_column_conversion(
                             res,
                             table,
                             column,
@@ -932,7 +933,7 @@ pub fn convert_all_timestamps(conn: &DbConn) -> Result<MigrationSummary, Migrati
                     // No TEXT rows; just the REAL pass. Skip the post-TEXT
                     // re-detect since nothing changed before it could detect.
                     let res = convert_real_column(conn, table, column);
-                    let _ = record_column_conversion(
+                    record_column_conversion(
                         res,
                         table,
                         column,
@@ -941,8 +942,7 @@ pub fn convert_all_timestamps(conn: &DbConn) -> Result<MigrationSummary, Migrati
                     );
                 }
                 _ => {
-                    // already-INTEGER, empty, or unreadable — nothing to do.
-                    continue;
+                    // already-INTEGER, empty, or unreadable: nothing to do.
                 }
             }
         }
@@ -2380,6 +2380,11 @@ mod tests {
                 .as_deref(),
             Some("text"),
             "detect_column_format should give TEXT priority over REAL when both exist"
+        );
+        assert!(
+            table_has_real_timestamps(&conn, "projects", &["created_at"])
+                .expect("detect table real state"),
+            "table-level REAL detection must still see REAL rows hidden behind TEXT priority"
         );
 
         let summary = convert_all_timestamps(&conn).expect("migrate");
