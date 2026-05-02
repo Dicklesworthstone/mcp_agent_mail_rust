@@ -888,54 +888,62 @@ pub fn convert_all_timestamps(conn: &DbConn) -> Result<MigrationSummary, Migrati
                 }
                 Ok(fmt) => fmt,
             };
-            let needs_text_pass = matches!(initial_fmt.as_deref(), Some("text"));
-            let needs_real_pass_now = matches!(initial_fmt.as_deref(), Some("real"));
-            if !needs_text_pass && !needs_real_pass_now {
-                continue; // already-INTEGER, empty, or unreadable
-            }
+            match initial_fmt.as_deref() {
+                Some("text") => {
+                    // Run the TEXT → INTEGER pass first. After this, any rows
+                    // that were TEXT are now INTEGER. REAL rows (if any in the
+                    // same column) survive untouched and are picked up by the
+                    // second probe below — this handles the rare legacy case
+                    // where one column carries both TEXT and REAL writers.
+                    let res = convert_column(conn, table, column);
+                    let _ = record_column_conversion(
+                        res,
+                        table,
+                        column,
+                        &mut table_results,
+                        &mut table_failed,
+                    );
 
-            // Run the TEXT → INTEGER pass first if any TEXT rows exist.
-            // After this, any rows that were TEXT are now INTEGER. REAL rows
-            // (if any in the same column) survive untouched and are picked
-            // up by the second pass below — this handles the rare legacy
-            // case where one column carries both TEXT and REAL writers.
-            if needs_text_pass {
-                let res = convert_column(conn, table, column);
-                if !record_column_conversion(
-                    res,
-                    table,
-                    column,
-                    &mut table_results,
-                    &mut table_failed,
-                ) {
-                    // record_column_conversion returns false if a hard error
-                    // happened. The error is already captured in
-                    // table_results; the table will roll back below.
+                    // Re-detect after the TEXT pass. detect_column_format gives
+                    // "real" priority below "text", so the first probe couldn't
+                    // distinguish text-only vs text-and-real. After convert_column
+                    // the column is either INTEGER (TEXT-only originally) or
+                    // REAL+INTEGER (was TEXT+REAL originally). The "real" branch
+                    // fires only for the latter case.
+                    let post_text_fmt = match detect_column_format(conn, table, column) {
+                        Err(e) => {
+                            let _ = conn.execute_raw("ROLLBACK");
+                            return Err(e);
+                        }
+                        Ok(fmt) => fmt,
+                    };
+                    if matches!(post_text_fmt.as_deref(), Some("real")) {
+                        let res = convert_real_column(conn, table, column);
+                        let _ = record_column_conversion(
+                            res,
+                            table,
+                            column,
+                            &mut table_results,
+                            &mut table_failed,
+                        );
+                    }
                 }
-            }
-
-            // Re-detect after the TEXT pass: detect_column_format gives "real"
-            // priority below "text", so the first probe couldn't distinguish
-            // text-only vs text-and-real. After convert_column the column is
-            // either INTEGER (TEXT-only originally) or REAL+INTEGER (was
-            // TEXT+REAL originally). The "real" branch fires only for the
-            // latter case.
-            let post_text_fmt = match detect_column_format(conn, table, column) {
-                Err(e) => {
-                    let _ = conn.execute_raw("ROLLBACK");
-                    return Err(e);
+                Some("real") => {
+                    // No TEXT rows; just the REAL pass. Skip the post-TEXT
+                    // re-detect since nothing changed before it could detect.
+                    let res = convert_real_column(conn, table, column);
+                    let _ = record_column_conversion(
+                        res,
+                        table,
+                        column,
+                        &mut table_results,
+                        &mut table_failed,
+                    );
                 }
-                Ok(fmt) => fmt,
-            };
-            if matches!(post_text_fmt.as_deref(), Some("real")) {
-                let res = convert_real_column(conn, table, column);
-                let _ = record_column_conversion(
-                    res,
-                    table,
-                    column,
-                    &mut table_results,
-                    &mut table_failed,
-                );
+                _ => {
+                    // already-INTEGER, empty, or unreadable — nothing to do.
+                    continue;
+                }
             }
         }
 
@@ -2331,6 +2339,74 @@ mod tests {
             Some("integer"),
             "after migration the REAL row must be gone; otherwise GH#115 still reproduces"
         );
+    }
+
+    /// `convert_all_timestamps` must convert BOTH TEXT and REAL rows
+    /// when a single column carries both writers (e.g. an old DB written
+    /// by mixed Python-string and float-binding code paths). Pre-refactor
+    /// the per-column loop was single-pass and `detect_column_format` gives
+    /// "text" priority over "real" — so a TEXT+REAL column would have its
+    /// TEXT rows converted to INTEGER and the REAL rows would silently
+    /// survive, still tripping the i64-vs-DOUBLE error at row decode.
+    #[test]
+    fn convert_all_timestamps_handles_text_and_real_in_same_column() {
+        let conn = DbConn::open_memory().expect("open in-memory DB");
+        conn.execute_raw(
+            "CREATE TABLE projects (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             slug TEXT NOT NULL UNIQUE, human_key TEXT NOT NULL, \
+             created_at NUMERIC NOT NULL)",
+        )
+        .expect("create projects");
+
+        // Row 1: TEXT (Python string format)
+        conn.execute_raw(
+            "INSERT INTO projects (slug, human_key, created_at) \
+             VALUES ('text-row', '/tmp/text', '2026-02-24 15:30:00.123456')",
+        )
+        .expect("insert text");
+        // Row 2: REAL (the bug shape from GH#115)
+        conn.execute_raw(
+            "INSERT INTO projects (slug, human_key, created_at) \
+             VALUES ('real-row', '/tmp/real', 1700000000123.5)",
+        )
+        .expect("insert real");
+
+        // Sanity: pre-migration, detect_column_format reports "text" because
+        // TEXT has priority over REAL — without two-pass migration, the REAL
+        // row would survive.
+        assert_eq!(
+            detect_column_format(&conn, "projects", "created_at")
+                .expect("pre-detect")
+                .as_deref(),
+            Some("text"),
+            "detect_column_format should give TEXT priority over REAL when both exist"
+        );
+
+        let summary = convert_all_timestamps(&conn).expect("migrate");
+        assert!(summary.success, "migration should succeed: {summary:?}");
+
+        // Post-migration: column must be fully INTEGER. If the REAL row
+        // survived (because we only ran one pass), this would still report
+        // "real" and the original GH#115 error would re-trigger at runtime.
+        assert_eq!(
+            detect_column_format(&conn, "projects", "created_at")
+                .expect("post-detect")
+                .as_deref(),
+            Some("integer"),
+            "after migration both TEXT and REAL rows must be INTEGER; \
+             a 'real' result here means the second pass didn't run and GH#115 \
+             still reproduces for TEXT+REAL columns"
+        );
+
+        // And both rows are still queryable as i64 (no decode error).
+        let rows = conn
+            .query_sync("SELECT id, created_at FROM projects ORDER BY id", &[])
+            .expect("query");
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            // get_named::<i64> would error if the row was REAL/DOUBLE
+            let _: i64 = row.get_named("created_at").expect("read as i64");
+        }
     }
 
     /// `detect_timestamp_format` must classify a REAL-only DB as needing
