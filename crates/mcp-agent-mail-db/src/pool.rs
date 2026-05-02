@@ -2303,6 +2303,14 @@ impl DbPool {
     /// integrity at startup. Returns `Ok(result)` if healthy, or
     /// `Err(IntegrityCorruption)` if corruption is detected.
     ///
+    /// "Healthy" includes the GH#114 case where the bespoke probe rejects
+    /// the file but canonical SQLite accepts it; in that case the returned
+    /// `IntegrityCheckResult` has `details = ["ok (canonical fallback)"]`
+    /// (see [`Self::quick_check_with_canonical_fallback`]). This is also
+    /// invoked by the periodic 5-minute `run_quick_cycle` in the integrity
+    /// guard, so the canonical fallback applies to both startup and steady
+    /// state.
+    ///
     /// This opens a dedicated connection (outside the pool) so the check
     /// doesn't consume a pooled slot.
     pub fn run_startup_integrity_check(&self) -> DbResult<integrity::IntegrityCheckResult> {
@@ -2405,6 +2413,14 @@ impl DbPool {
     ///
     /// `phase` is folded into log lines so the operator can tell whether a
     /// canonical-overrule fired during the initial probe or after recovery.
+    ///
+    /// Caller invariant: `conn` MUST be a connection opened from
+    /// `self.sqlite_path` — the canonical fallback opens a fresh canonical
+    /// connection against `self.sqlite_path` and the two probes only agree
+    /// when they're inspecting the same file. The function is private and
+    /// has exactly two call sites in `run_startup_integrity_check`, both of
+    /// which open `conn` from `self.sqlite_path` immediately before passing
+    /// it in; do not call from anywhere that violates this.
     fn quick_check_with_canonical_fallback(
         &self,
         conn: &DbConn,

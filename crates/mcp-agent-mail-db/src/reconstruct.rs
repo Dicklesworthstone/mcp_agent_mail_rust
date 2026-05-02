@@ -36,6 +36,10 @@ type SqliteDbConn = crate::CanonicalDbConn;
 static FAIL_SALVAGE_MERGE_AFTER_PROJECTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(test)]
+static FAIL_SALVAGE_QUERY_MESSAGES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn is_real_directory(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
 }
@@ -1324,8 +1328,10 @@ pub fn reconstruct_from_archive_with_salvage(
 ) -> DbResult<ReconstructStats> {
     let mut stats = reconstruct_from_archive(db_path, storage_root)?;
     if let Some(salvage_db_path) = salvage_db_path.filter(|path| is_real_file(path)) {
-        match probe_salvage_database_for_merge(salvage_db_path) {
-            Ok(()) => merge_salvaged_database(db_path, salvage_db_path, &mut stats)?,
+        match probe_salvage_database_for_merge(salvage_db_path)
+            .and_then(|()| merge_salvaged_database(db_path, salvage_db_path, &mut stats))
+        {
+            Ok(()) => {}
             Err(error) => stats.warnings.push(format!(
                 "Skipping best-effort salvage from {}: {error}",
                 salvage_db_path.display()
@@ -3437,6 +3443,14 @@ fn merge_salvaged_database(
                 stats,
                 salvage_db_path,
             ) {
+                #[cfg(test)]
+                if FAIL_SALVAGE_QUERY_MESSAGES.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    return Err(DbError::Sqlite(
+                        "reconstruct salvage: query messages: Query error: database disk image is malformed"
+                            .to_owned(),
+                    ));
+                }
+
                 let message_rows = salvage_conn
                     .query_sync(
                         &format!("SELECT {message_select} FROM messages ORDER BY id"),
@@ -6575,13 +6589,17 @@ archive body
             .expect("insert salvage agent");
 
         FAIL_SALVAGE_MERGE_AFTER_PROJECTS.store(true, std::sync::atomic::Ordering::SeqCst);
-        let err =
+        let stats =
             reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
-                .expect_err("forced late salvage failure should bubble up");
+                .expect("forced late salvage failure should not abort archive reconstruction");
         assert!(
-            err.to_string()
-                .contains("reconstruct salvage: forced failure after projects"),
-            "unexpected error: {err}"
+            stats
+                .warnings
+                .iter()
+                .any(|warning| warning
+                    .contains("reconstruct salvage: forced failure after projects")),
+            "warnings should include forced salvage failure: {:?}",
+            stats.warnings
         );
 
         let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
@@ -6601,6 +6619,94 @@ archive body
         assert_eq!(
             agent_count, 0,
             "failed salvage merge should not leak partially inserted agents"
+        );
+    }
+
+    #[test]
+    fn reconstruct_with_salvage_skips_corrupt_source_when_message_query_fails() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("reconstructed_corrupt_salvage.db");
+        let salvage_db_path = tmp.path().join("salvage_corrupt_message_scan.db");
+        let storage_root = tmp.path().join("storage");
+
+        std::fs::create_dir_all(storage_root.join("projects")).unwrap();
+
+        let salvage_conn = SqliteDbConn::open_file(salvage_db_path.to_str().unwrap()).unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE projects (
+                    id INTEGER PRIMARY KEY,
+                    slug TEXT NOT NULL,
+                    human_key TEXT,
+                    created_at INTEGER
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE agents (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    name TEXT NOT NULL
+                )",
+            )
+            .unwrap();
+        salvage_conn
+            .execute_raw(
+                "CREATE TABLE messages (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    sender_id INTEGER NOT NULL,
+                    subject TEXT,
+                    body_md TEXT,
+                    created_ts INTEGER
+                )",
+            )
+            .unwrap();
+
+        salvage_conn
+            .query_sync(
+                "INSERT INTO projects (id, slug, human_key, created_at)
+                 VALUES (100, 'corrupt-source-project', '/corrupt-source-project', 1)",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO agents (id, project_id, name)
+                 VALUES (10, 100, 'Alice')",
+                &[],
+            )
+            .unwrap();
+        salvage_conn
+            .query_sync(
+                "INSERT INTO messages (id, project_id, sender_id, subject, body_md, created_ts)
+                 VALUES (2, 100, 10, 'DB-only', 'db body', 2)",
+                &[],
+            )
+            .unwrap();
+
+        FAIL_SALVAGE_QUERY_MESSAGES.store(true, std::sync::atomic::Ordering::SeqCst);
+        let stats =
+            reconstruct_from_archive_with_salvage(&db_path, &storage_root, Some(&salvage_db_path))
+                .expect("corrupt salvage source should not abort archive reconstruction");
+
+        assert!(
+            stats.warnings.iter().any(|warning| warning.contains(
+                "reconstruct salvage: query messages: Query error: database disk image is malformed"
+            )),
+            "warnings should include corrupt message query failure: {:?}",
+            stats.warnings
+        );
+
+        let conn = SqliteDbConn::open_file(db_path.to_str().unwrap()).unwrap();
+        let message_rows = conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM messages", &[])
+            .expect("query message count");
+        let message_count: i64 = message_rows[0].get_named("cnt").expect("message count");
+        assert_eq!(
+            message_count, 0,
+            "corrupt salvage source should not leak DB-only messages"
         );
     }
 
