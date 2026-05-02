@@ -1448,6 +1448,12 @@ pub async fn send_message(
     let to = normalize_agent_names_or_original(to);
     let cc = normalize_optional_agent_names(cc);
     let bcc = normalize_optional_agent_names(bcc);
+    let explicitly_targeted = !to.is_empty()
+        || cc.as_ref().is_some_and(|v| !v.is_empty())
+        || bcc.as_ref().is_some_and(|v| !v.is_empty());
+    if broadcast.unwrap_or(false) {
+        return Err(broadcast_disabled_error(Some(explicitly_targeted)));
+    }
 
     // Truncate subject at 200 chars (parity with Python legacy).
     // Use char_indices to avoid panicking on multi-byte UTF-8 boundaries.
@@ -1582,15 +1588,6 @@ effective_free_bytes={free}"
         }
         None => false,
     };
-
-    let explicitly_targeted = !to.is_empty()
-        || cc.as_ref().is_some_and(|v| !v.is_empty())
-        || bcc.as_ref().is_some_and(|v| !v.is_empty());
-
-    let broadcast = broadcast.unwrap_or(false);
-    if broadcast {
-        return Err(broadcast_disabled_error(Some(explicitly_targeted)));
-    }
 
     // Self-send detection: warn if sender is sending to themselves (Python parity)
     {
@@ -3875,6 +3872,20 @@ mod tests {
         let data = err.data.expect("error payload");
         assert_eq!(data["error"]["type"], "BROADCAST_DISABLED");
         assert_eq!(data["error"]["data"]["argument"], "broadcast");
+    }
+
+    #[test]
+    fn broadcast_disabled_error_records_recipient_context() {
+        let err = broadcast_disabled_error(Some(true));
+        assert_eq!(err.code, McpErrorCode::ToolExecutionError);
+        assert_eq!(
+            err.message,
+            "broadcast=true is intentionally unsupported to prevent agent spam. Address agents explicitly and omit the broadcast flag."
+        );
+        let data = err.data.expect("error payload");
+        assert_eq!(data["error"]["type"], "BROADCAST_DISABLED");
+        assert_eq!(data["error"]["data"]["argument"], "broadcast");
+        assert_eq!(data["error"]["data"]["recipients_supplied"], true);
     }
 
     #[test]
