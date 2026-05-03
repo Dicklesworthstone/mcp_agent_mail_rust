@@ -433,6 +433,24 @@ fn truncate_checked_real_to_i64(real_val: f64) -> i64 {
     real_val.trunc() as i64
 }
 
+fn update_timestamp_column_to_null(
+    conn: &DbConn,
+    table: &str,
+    column: &str,
+    is_composite_pk: bool,
+    pk_values: &[sqlmodel_core::Value],
+) -> Result<(), sqlmodel_core::Error> {
+    let update_sql = if is_composite_pk {
+        format!(
+            "UPDATE {table} SET {column} = NULL \
+             WHERE message_id = ? AND agent_id = ?"
+        )
+    } else {
+        format!("UPDATE {table} SET {column} = NULL WHERE id = ?")
+    };
+    conn.query_sync(&update_sql, pk_values).map(|_| ())
+}
+
 /// Strip common timezone suffixes from a timestamp string.
 fn strip_timezone_suffix(s: &str) -> &str {
     // Strip trailing "Z"
@@ -464,7 +482,7 @@ pub struct ColumnConversionResult {
     pub converted: u64,
     /// Number of rows skipped due to parse errors.
     pub skipped: u64,
-    /// Number of NULL values left as-is.
+    /// Number of blank TEXT values converted to NULL.
     pub nulls: u64,
     /// Parse error details for skipped rows (table, column, `row_id`, value).
     pub errors: Vec<String>,
@@ -531,21 +549,6 @@ pub fn convert_column(
 
         let text_val: String = row.get_named(column).unwrap_or_default();
 
-        if text_val.is_empty() {
-            result.nulls += 1;
-            // Update empty string to NULL
-            let update_sql = if is_composite_pk {
-                format!(
-                    "UPDATE {table} SET {column} = NULL \
-                     WHERE message_id = ? AND agent_id = ?"
-                )
-            } else {
-                format!("UPDATE {table} SET {column} = NULL WHERE id = ?")
-            };
-            let _ = conn.query_sync(&update_sql, &pk_values);
-            continue;
-        }
-
         match text_to_micros(&text_val, table, column, row_id) {
             Ok(Some(micros)) => {
                 let update_sql = if is_composite_pk {
@@ -568,7 +571,20 @@ pub fn convert_column(
                 }
             }
             Ok(None) => {
-                result.nulls += 1;
+                if let Err(e) = update_timestamp_column_to_null(
+                    conn,
+                    table,
+                    column,
+                    is_composite_pk,
+                    &pk_values,
+                ) {
+                    result.skipped += 1;
+                    result.errors.push(format!(
+                        "{table}.{column} id={row_id}: empty timestamp could not be set to NULL: {e}"
+                    ));
+                } else {
+                    result.nulls += 1;
+                }
             }
             Err(e) => {
                 result.skipped += 1;
@@ -690,7 +706,7 @@ pub struct MigrationSummary {
     pub total_converted: u64,
     /// Total rows skipped across all tables.
     pub total_skipped: u64,
-    /// Total NULL values across all tables.
+    /// Total blank TEXT values converted to NULL across all tables.
     pub total_nulls: u64,
     /// Whether migration completed successfully (no critical errors).
     pub success: bool,
@@ -1638,10 +1654,88 @@ mod tests {
         let result = convert_column(&conn, "file_reservations", "released_ts").expect("convert");
         // released_ts is NULL, so no TEXT rows to convert
         assert_eq!(result.converted, 0);
+        assert_eq!(result.nulls, 0);
 
         // But created_ts should convert
         let result2 = convert_column(&conn, "file_reservations", "created_ts").expect("convert");
         assert_eq!(result2.converted, 1);
+    }
+
+    #[test]
+    fn convert_column_converts_whitespace_text_to_null() {
+        let conn = DbConn::open_memory().expect("open in-memory DB");
+        create_migration_test_tables(&conn);
+
+        conn.query_sync(
+            "INSERT INTO file_reservations \
+             (project_id, agent_id, path_pattern, created_ts, expires_ts, released_ts) \
+             VALUES (1, 1, '*.rs', 1740000000000000, 1740000000000001, '   ')",
+            &[],
+        )
+        .expect("insert reservation with blank released_ts");
+
+        let result = convert_column(&conn, "file_reservations", "released_ts").expect("convert");
+        assert_eq!(result.converted, 0);
+        assert_eq!(result.nulls, 1);
+        assert_eq!(result.skipped, 0);
+
+        let rows = conn
+            .query_sync(
+                "SELECT released_ts IS NULL AS is_null FROM file_reservations WHERE id = 1",
+                &[],
+            )
+            .expect("query converted reservation");
+        let is_null: i64 = rows
+            .first()
+            .and_then(|row| row.get_named("is_null").ok())
+            .unwrap_or_default();
+        assert_eq!(
+            is_null, 1,
+            "whitespace-only TEXT timestamps must be written back as NULL"
+        );
+    }
+
+    #[test]
+    fn convert_column_reports_non_nullable_empty_text_without_claiming_null() {
+        let conn = DbConn::open_memory().expect("open in-memory DB");
+        create_migration_test_tables(&conn);
+
+        conn.query_sync(
+            "INSERT INTO projects (slug, human_key, created_at) VALUES ('blank', '/tmp/blank', '')",
+            &[],
+        )
+        .expect("insert project with empty created_at");
+
+        let result = convert_column(&conn, "projects", "created_at").expect("convert");
+        assert_eq!(result.converted, 0);
+        assert_eq!(
+            result.nulls, 0,
+            "failed NULL writes to NOT NULL columns must not be counted as null conversions"
+        );
+        assert_eq!(result.skipped, 1);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.contains("could not be set to NULL")),
+            "expected failed NULL write error, got {:?}",
+            result.errors
+        );
+
+        let rows = conn
+            .query_sync(
+                "SELECT typeof(created_at) AS t FROM projects WHERE slug = 'blank'",
+                &[],
+            )
+            .expect("query project");
+        let storage_type: String = rows
+            .first()
+            .and_then(|row| row.get_named("t").ok())
+            .unwrap_or_default();
+        assert_eq!(
+            storage_type, "text",
+            "the unconverted bad row remains TEXT for the caller to report or roll back"
+        );
     }
 
     #[test]
@@ -2430,8 +2524,6 @@ mod tests {
         // walks TIMESTAMP_COLUMNS against real tables. We can't use a tiny
         // schema because the function iterates a hardcoded TIMESTAMP_COLUMNS
         // list; only the production tables it knows about will be probed.
-        // The FTS5 prefix='2,3' issue means we have to build a custom
-        // schema string rather than execute CREATE_TABLES_SQL directly.
         conn.execute_raw(
             "CREATE TABLE projects (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE, human_key TEXT NOT NULL, created_at NUMERIC NOT NULL)",
         )
