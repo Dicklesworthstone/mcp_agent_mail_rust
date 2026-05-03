@@ -200,7 +200,7 @@ fn assert_migrated_fixture_state(conn: &DbConn) {
 
     let fts_rows = conn
         .query_sync(
-            "SELECT rowid FROM fts_messages WHERE fts_messages MATCH 'sentinel'",
+            "SELECT rowid FROM fts_messages WHERE subject MATCH 'sentinel'",
             &[],
         )
         .expect("query fts table after migration");

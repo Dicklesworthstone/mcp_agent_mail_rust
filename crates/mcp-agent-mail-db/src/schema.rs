@@ -160,13 +160,13 @@ CREATE TABLE IF NOT EXISTS project_sibling_suggestions (
 
 -- FTS5 virtual table for message search
 -- Porter stemmer: run/running/runs → run. Unicode61: Unicode-aware tokenization.
--- remove_diacritics 2: normalize accented characters. prefix='2,3': fast prefix queries.
+-- remove_diacritics 2: normalize accented characters. prefix='2 3': fast prefix queries.
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
     message_id UNINDEXED,
     subject,
     body,
     tokenize='porter unicode61 remove_diacritics 2',
-    prefix='2,3'
+    prefix='2 3'
 );
 ";
 
@@ -722,7 +722,7 @@ pub fn schema_migrations() -> Vec<Migration> {
              subject, \
              body, \
              tokenize='porter unicode61 remove_diacritics 2', \
-             prefix='2,3'\
+             prefix='2 3'\
          )"
         .to_string(),
         String::new(),
@@ -851,7 +851,7 @@ pub fn schema_migrations() -> Vec<Migration> {
              program UNINDEXED, \
              model UNINDEXED, \
              tokenize='porter unicode61 remove_diacritics 2', \
-             prefix='2,3'\
+             prefix='2 3'\
          )"
         .to_string(),
         String::new(),
@@ -865,7 +865,7 @@ pub fn schema_migrations() -> Vec<Migration> {
              slug, \
              human_key, \
              tokenize='porter unicode61 remove_diacritics 2', \
-             prefix='2,3'\
+             prefix='2 3'\
          )"
         .to_string(),
         String::new(),

@@ -24,12 +24,12 @@ And it informs:
 
 - `br-3vwi.2.4` (permission-aware visibility + redaction guardrails)
 
-## Current State (2026-02-10)
+## Runtime State (post `br-2tnl.8.4` decommission)
 
 ### Messages
 
 - `messages(project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, ...)`
-- `fts_messages(message_id, subject, body, tokenize='porter unicode61 remove_diacritics 2', prefix='2,3')`
+- `fts_messages(message_id, subject, body, tokenize='porter unicode61 remove_diacritics 2', prefix='2 3')`
 - Triggers: `messages_ai/ad/au` keep `fts_messages` in sync.
 
 Refs:
@@ -39,9 +39,9 @@ Refs:
 ### Message Search API
 
 - DB query: `queries::search_messages(project_id, query, limit)`
-  - Uses `fts_messages MATCH ?`
-  - Orders by `bm25(fts_messages, 10.0, 1.0)` then `m.id`
-  - On FTS error, falls back to LIKE on extracted terms
+  - FTS5-backed runtime search was decommissioned in `br-2tnl.8.4`.
+  - Current runtime path sanitizes the query, extracts LIKE terms, and searches `messages.subject` / `messages.body_md`.
+  - `fts_messages` is still maintained for export indexes, compatibility probes, and historical benchmark coverage.
 - MCP tool: `crates/mcp-agent-mail-tools/src/search.rs` resolves `project_key -> project_id` and calls DB search.
 - TUI currently has its own search sanitization/fallback path (needs convergence later).
 
@@ -125,7 +125,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_agents USING fts5(
   program UNINDEXED,
   model UNINDEXED,
   tokenize='porter unicode61 remove_diacritics 2',
-  prefix='2,3'
+  prefix='2 3'
 );
 ```
 
@@ -157,7 +157,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_projects USING fts5(
   slug,
   human_key,
   tokenize='porter unicode61 remove_diacritics 2',
-  prefix='2,3'
+  prefix='2 3'
 );
 ```
 
@@ -262,7 +262,7 @@ Measure on representative dataset sizes:
 - SQLite: `3.46.1`
 - Dataset: single project, single sender agent, bodies of the form `"hello world ..."` with token `needle` in 1% of messages.
 - Ingest path: direct `INSERT INTO messages` with `messages_ai` FTS triggers enabled (no `message_recipients`, no archive writes).
-- Query: `SELECT message_id FROM fts_messages WHERE fts_messages MATCH 'needle' LIMIT 50` (500 samples; warmed).
+- Query: `SELECT message_id FROM fts_messages WHERE subject MATCH 'needle' OR body MATCH 'needle' LIMIT 50` (500 samples; warmed).
 
 **Results**
 

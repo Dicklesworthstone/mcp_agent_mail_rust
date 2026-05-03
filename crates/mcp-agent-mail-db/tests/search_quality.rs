@@ -482,7 +482,7 @@ fn corpus_v1() -> Vec<CorpusMessage> {
         },
         CorpusMessage {
             subject: "FTS5 tokenizer configuration for multilingual support",
-            body: "Current FTS5 config uses porter unicode61 with remove_diacritics=2 and prefix='2,3'. This handles English stemming and accented characters well. For CJK support we'd need the ICU tokenizer, but that requires linking libicu. Deferring CJK to a future bead.",
+            body: "Current FTS5 config uses porter unicode61 with remove_diacritics=2 and prefix='2 3'. This handles English stemming and accented characters well. For CJK support we'd need the ICU tokenizer, but that requires linking libicu. Deferring CJK to a future bead.",
             thread_id: None,
             importance: "normal",
             ack_required: false,
