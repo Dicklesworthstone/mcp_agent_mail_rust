@@ -421,6 +421,19 @@ pub async fn search_messages_product(
         return Err(worktrees_required());
     }
 
+    let pool = get_read_db_pool()?;
+    let product = get_product_by_key(ctx.cx(), &pool, product_key.trim())
+        .await?
+        .ok_or_else(|| {
+            legacy_tool_error(
+                "NOT_FOUND",
+                format!("Product not found: {product_key}"),
+                true,
+                serde_json::json!({ "entity": "Product", "identifier": product_key }),
+            )
+        })?;
+    let product_id = product.id.unwrap_or(0);
+
     let trimmed = query.trim();
     if trimmed.is_empty() {
         let response = ProductSearchResponse {
@@ -433,7 +446,6 @@ pub async fn search_messages_product(
             .map_err(|e| McpError::internal_error(format!("JSON error: {e}")));
     }
 
-    let pool = get_read_db_pool()?;
     let max_results = parse_product_search_limit(limit);
 
     // Parse optional ranking mode
@@ -441,18 +453,6 @@ pub async fn search_messages_product(
         Some(r) => crate::search::parse_search_mode(r)?,
         None => mcp_agent_mail_db::search_planner::RankingMode::default(),
     };
-
-    let product = get_product_by_key(ctx.cx(), &pool, product_key.trim())
-        .await?
-        .ok_or_else(|| {
-            legacy_tool_error(
-                "NOT_FOUND",
-                format!("Product not found: {product_key}"),
-                true,
-                serde_json::json!({ "entity": "Product", "identifier": product_key }),
-            )
-        })?;
-    let product_id = product.id.unwrap_or(0);
 
     // Parse optional filters (reuse helpers from search module)
     let importance_filter = match &importance {
@@ -1197,6 +1197,65 @@ mod tests {
     #[test]
     fn product_search_limit_caps_large_values() {
         assert_eq!(parse_product_search_limit(Some(5_000)), 1000);
+    }
+
+    #[test]
+    fn search_messages_product_blank_query_still_validates_product_key() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("product-search-missing.sqlite3");
+
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", db_path.display())),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+                ("WORKTREES_ENABLED", "1"),
+            ],
+            || {
+                Config::reset_cached();
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                rt.block_on(async {
+                    let cx = Cx::for_testing();
+                    let ctx = McpContext::new(cx, 1);
+                    let err = search_messages_product(
+                        &ctx,
+                        "missing-product".to_string(),
+                        "   ".to_string(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect_err("missing product should be reported before empty query");
+                    let message = format!("{err:?}");
+                    assert!(
+                        message.contains("Product not found: missing-product")
+                            || message.contains("NOT_FOUND"),
+                        "expected missing-product error, got: {message}"
+                    );
+                });
+            },
+        );
     }
 
     #[test]
