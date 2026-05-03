@@ -700,6 +700,10 @@ pub async fn summarize_thread_product(
             .cmp(&b.created_ts)
             .then_with(|| a.id.cmp(&b.id))
     });
+    let start_idx = rows.len().saturating_sub(msg_limit);
+    if start_idx > 0 {
+        rows.drain(..start_idx);
+    }
     let use_llm = llm_mode.unwrap_or(true);
     let mut summary = crate::search::summarize_messages(&rows);
 
@@ -1285,6 +1289,247 @@ mod tests {
         assert_eq!(
             parse_product_thread_limit(Some(7)).expect("positive limit should pass"),
             7
+        );
+    }
+
+    #[test]
+    fn summarize_thread_product_applies_limit_after_merging_projects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let db_path = temp.path().join("product-thread-limit.sqlite3");
+
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", db_path.display())),
+                ("STORAGE_ROOT", &storage_root.display().to_string()),
+                ("WORKTREES_ENABLED", "1"),
+            ],
+            || {
+                Config::reset_cached();
+                let rt = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build runtime");
+                rt.block_on(async {
+                    let cx = Cx::for_testing();
+                    let pool = get_db_pool().expect("db pool");
+
+                    let first_project = match mcp_agent_mail_db::queries::ensure_project(
+                        &cx,
+                        &pool,
+                        "/product-thread-limit-first",
+                    )
+                    .await
+                    {
+                        Outcome::Ok(project) => project,
+                        other => panic!("ensure first project failed: {other:?}"),
+                    };
+                    let second_project = match mcp_agent_mail_db::queries::ensure_project(
+                        &cx,
+                        &pool,
+                        "/product-thread-limit-second",
+                    )
+                    .await
+                    {
+                        Outcome::Ok(project) => project,
+                        other => panic!("ensure second project failed: {other:?}"),
+                    };
+
+                    let first_sender = match mcp_agent_mail_db::queries::register_agent(
+                        &cx,
+                        &pool,
+                        first_project.id.unwrap_or(0),
+                        "BlueLake",
+                        "coder",
+                        "test",
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        Outcome::Ok(agent) => agent,
+                        other => panic!("register first sender failed: {other:?}"),
+                    };
+                    let first_recipient = match mcp_agent_mail_db::queries::register_agent(
+                        &cx,
+                        &pool,
+                        first_project.id.unwrap_or(0),
+                        "RedPeak",
+                        "coder",
+                        "test",
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        Outcome::Ok(agent) => agent,
+                        other => panic!("register first recipient failed: {other:?}"),
+                    };
+                    let second_sender = match mcp_agent_mail_db::queries::register_agent(
+                        &cx,
+                        &pool,
+                        second_project.id.unwrap_or(0),
+                        "GoldRiver",
+                        "coder",
+                        "test",
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        Outcome::Ok(agent) => agent,
+                        other => panic!("register second sender failed: {other:?}"),
+                    };
+                    let second_recipient = match mcp_agent_mail_db::queries::register_agent(
+                        &cx,
+                        &pool,
+                        second_project.id.unwrap_or(0),
+                        "SilverStone",
+                        "coder",
+                        "test",
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    {
+                        Outcome::Ok(agent) => agent,
+                        other => panic!("register second recipient failed: {other:?}"),
+                    };
+
+                    let product = match mcp_agent_mail_db::queries::ensure_product(
+                        &cx,
+                        &pool,
+                        None,
+                        Some("prod-thread-limit"),
+                    )
+                    .await
+                    {
+                        Outcome::Ok(product) => product,
+                        other => panic!("ensure product failed: {other:?}"),
+                    };
+                    match mcp_agent_mail_db::queries::link_product_to_projects(
+                        &cx,
+                        &pool,
+                        product.id.unwrap_or(0),
+                        &[
+                            first_project.id.unwrap_or(0),
+                            second_project.id.unwrap_or(0),
+                        ],
+                    )
+                    .await
+                    {
+                        Outcome::Ok(_) => {}
+                        other => panic!("link_product_to_projects failed: {other:?}"),
+                    }
+
+                    let mut created_messages = Vec::new();
+                    for (project_id, sender_id, recipient_id, subject, body, created_ts) in [
+                        (
+                            first_project.id.unwrap_or(0),
+                            first_sender.id.unwrap_or(0),
+                            first_recipient.id.unwrap_or(0),
+                            "first old",
+                            "- first old point",
+                            1_000_i64,
+                        ),
+                        (
+                            second_project.id.unwrap_or(0),
+                            second_sender.id.unwrap_or(0),
+                            second_recipient.id.unwrap_or(0),
+                            "second middle",
+                            "- second middle point",
+                            2_000_i64,
+                        ),
+                        (
+                            second_project.id.unwrap_or(0),
+                            second_sender.id.unwrap_or(0),
+                            second_recipient.id.unwrap_or(0),
+                            "second latest",
+                            "- second latest point",
+                            3_000_i64,
+                        ),
+                        (
+                            first_project.id.unwrap_or(0),
+                            first_sender.id.unwrap_or(0),
+                            first_recipient.id.unwrap_or(0),
+                            "first latest",
+                            "- first latest point",
+                            4_000_i64,
+                        ),
+                    ] {
+                        let message =
+                            match mcp_agent_mail_db::queries::create_message_with_recipients(
+                                &cx,
+                                &pool,
+                                project_id,
+                                sender_id,
+                                subject,
+                                body,
+                                Some("PRODUCT-LIMIT-1"),
+                                "normal",
+                                false,
+                                "[]",
+                                &[(recipient_id, "to")],
+                            )
+                            .await
+                            {
+                                Outcome::Ok(message) => message,
+                                other => panic!("create message failed: {other:?}"),
+                            };
+                        created_messages.push((message.id.unwrap_or(0), created_ts));
+                    }
+
+                    let conn = match pool.acquire(&cx).await {
+                        Outcome::Ok(conn) => conn,
+                        Outcome::Err(err) => panic!("acquire failed: {err}"),
+                        Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                        Outcome::Panicked(panic) => {
+                            panic!("acquire panicked: {}", panic.message())
+                        }
+                    };
+                    for (message_id, created_ts) in created_messages {
+                        conn.execute_sync(
+                            "UPDATE messages SET created_ts = ? WHERE id = ?",
+                            &[
+                                mcp_agent_mail_db::sqlmodel::Value::BigInt(created_ts),
+                                mcp_agent_mail_db::sqlmodel::Value::BigInt(message_id),
+                            ],
+                        )
+                        .expect("set message created_ts");
+                    }
+                    drop(conn);
+
+                    let ctx = McpContext::new(cx.clone(), 1);
+                    let response = summarize_thread_product(
+                        &ctx,
+                        "prod-thread-limit".to_string(),
+                        "PRODUCT-LIMIT-1".to_string(),
+                        Some(true),
+                        Some(false),
+                        None,
+                        Some(2),
+                    )
+                    .await
+                    .expect("summarize_thread_product should succeed");
+                    let parsed: SingleThreadResponse =
+                        serde_json::from_str(&response).expect("parse product summary");
+
+                    assert_eq!(parsed.summary.total_messages, 2);
+                    assert_eq!(
+                        parsed.summary.key_points,
+                        vec![
+                            "second latest point".to_string(),
+                            "first latest point".to_string()
+                        ]
+                    );
+                    assert_eq!(parsed.examples.len(), 2);
+                    assert_eq!(parsed.examples[0].subject, "second latest");
+                    assert_eq!(parsed.examples[1].subject, "first latest");
+                });
+            },
         );
     }
 
