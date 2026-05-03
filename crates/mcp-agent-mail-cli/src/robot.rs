@@ -3184,6 +3184,11 @@ fn build_inbox(
         "AND priority_bucket <= 5" // include read but un-acked messages
     };
 
+    let body_select = if include_bodies {
+        "m.body_md"
+    } else {
+        "'' AS body_md"
+    };
     let sql = format!(
         "SELECT sub.id, sub.subject, sub.thread_id, sub.importance, sub.ack_required,
                 sub.created_ts, sub.sender_id, sub.read_ts, sub.ack_ts, sub.body_md,
@@ -3191,7 +3196,7 @@ fn build_inbox(
                 COALESCE(a_sender.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name
          FROM (
              SELECT m.id, m.subject, m.thread_id, m.importance, m.ack_required,
-                    m.created_ts, m.sender_id, mr.read_ts, mr.ack_ts, m.body_md,
+                    m.created_ts, m.sender_id, mr.read_ts, mr.ack_ts, {body_select},
                     CASE
                         WHEN m.importance IN ('urgent','high') AND mr.read_ts IS NULL THEN 1
                         WHEN m.ack_required = 1 AND mr.ack_ts IS NULL AND m.created_ts < ? THEN 2
@@ -3474,17 +3479,25 @@ fn build_outbox_entries(
     include_bodies: bool,
 ) -> Result<Vec<InboxEntry>, CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
+    let body_select = if include_bodies {
+        "m.body_md"
+    } else {
+        "'' AS body_md"
+    };
+    let sql = format!(
+        "SELECT m.id, m.subject, m.thread_id, m.importance, m.ack_required, m.created_ts, {body_select},
+                COUNT(mr.agent_id) AS recipient_count,
+                SUM(CASE WHEN mr.ack_ts IS NOT NULL THEN 1 ELSE 0 END) AS acked_count
+         FROM messages m
+         LEFT JOIN message_recipients mr ON mr.message_id = m.id
+         WHERE m.sender_id = ? AND m.project_id = ?
+         GROUP BY m.id
+         ORDER BY m.created_ts DESC
+         LIMIT ?"
+    );
     let rows = conn
         .query_sync(
-            "SELECT m.id, m.subject, m.thread_id, m.importance, m.ack_required, m.created_ts, m.body_md,
-                    COUNT(mr.agent_id) AS recipient_count,
-                    SUM(CASE WHEN mr.ack_ts IS NOT NULL THEN 1 ELSE 0 END) AS acked_count
-             FROM messages m
-             LEFT JOIN message_recipients mr ON mr.message_id = m.id
-             WHERE m.sender_id = ? AND m.project_id = ?
-             GROUP BY m.id
-             ORDER BY m.created_ts DESC
-             LIMIT ?",
+            &sql,
             &[
                 Value::BigInt(agent_id),
                 Value::BigInt(project_id),
@@ -3620,8 +3633,13 @@ fn build_thread(
     params.push(Value::BigInt(
         effective_limit.try_into().unwrap_or(i64::MAX),
     ));
+    let body_select = if include_bodies {
+        "m.body_md"
+    } else {
+        "'' AS body_md"
+    };
     let sql = format!(
-        "SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
+        "SELECT m.id, m.subject, {body_select}, m.importance, m.ack_required, m.created_ts,
                 m.sender_id,
                 COALESCE(a_sender.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name,
                 COUNT(mr.agent_id) AS recipient_count,
@@ -14057,6 +14075,31 @@ mod tests {
     }
 
     #[test]
+    fn test_build_thread_respects_include_bodies_flag() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (102, 1, 1, 'Body flag', 'BODY-FLAG', 'normal', 0, 10, 'thread body', '[]')",
+            &[],
+        )
+        .expect("insert message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (102, 102, 2, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert recipient");
+
+        let metadata =
+            build_thread(&conn, 1, "BODY-FLAG", Some(10), None, false).expect("metadata thread");
+        assert_eq!(metadata.messages[0].body, None);
+
+        let full = build_thread(&conn, 1, "BODY-FLAG", Some(10), None, true).expect("full thread");
+        assert_eq!(full.messages[0].body.as_deref(), Some("thread body"));
+    }
+
+    #[test]
     fn test_build_thread_collects_sender_and_recipient_participants() {
         let (_temp_dir, conn) = setup_robot_thread_message_test_db();
         let created_ts = mcp_agent_mail_db::now_micros();
@@ -14219,6 +14262,36 @@ mod tests {
 
         assert_eq!(result.entries.len(), 1);
         assert_eq!(result.entries[0].from, UNKNOWN_SENDER_DISPLAY);
+    }
+
+    #[test]
+    fn test_build_inbox_respects_include_bodies_flag() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (123, 1, 1, 'Inbox body flag', 'INBOX-BODY', 'normal', 0, 10, 'inbox body', '[]')",
+            &[],
+        )
+        .expect("insert inbox message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (123, 123, 2, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert inbox recipient");
+
+        let metadata = build_inbox(
+            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, false,
+        )
+        .expect("build metadata inbox");
+        assert_eq!(metadata.entries[0].body_md, None);
+
+        let full = build_inbox(
+            &conn, 1, "proj", 2, "Bob", false, false, true, false, 20, true,
+        )
+        .expect("build full inbox");
+        assert_eq!(full.entries[0].body_md.as_deref(), Some("inbox body"));
     }
 
     #[test]
@@ -14852,6 +14925,30 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].thread, "121");
+    }
+
+    #[test]
+    fn test_build_outbox_respects_include_bodies_flag() {
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (124, 1, 1, 'Outbox body flag', 'OUTBOX-BODY', 'normal', 0, 10, 'outbox body', '[]')",
+            &[],
+        )
+        .expect("insert outbox message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (124, 124, 2, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert outbox recipient");
+
+        let metadata = build_outbox_entries(&conn, 1, 1, 20, false).expect("build metadata outbox");
+        assert_eq!(metadata[0].body_md, None);
+
+        let full = build_outbox_entries(&conn, 1, 1, 20, true).expect("build full outbox");
+        assert_eq!(full[0].body_md.as_deref(), Some("outbox body"));
     }
 
     #[test]
