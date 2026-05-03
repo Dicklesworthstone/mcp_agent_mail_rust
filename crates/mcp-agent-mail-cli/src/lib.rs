@@ -49602,7 +49602,7 @@ fn probe_doctor_salvage_tables(
             ));
         }
 
-        let scan_sql = format!("SELECT * FROM {table}");
+        let scan_sql = format!("SELECT COUNT(*) AS row_count FROM {table}");
         conn.query_sync(&scan_sql, &[])
             .map_err(|error| format!("scan {table}: {error}"))?;
     }
