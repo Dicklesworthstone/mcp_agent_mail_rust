@@ -18,8 +18,7 @@ use crate::messaging::InboxMessage;
 use crate::search::{ExampleMessage, SingleThreadResponse};
 use crate::tool_util::{
     db_error_to_mcp_error, db_outcome_to_mcp_result, get_db_pool, get_read_db_pool,
-    legacy_tool_error, parse_attachment_metadata_json, parse_recipients_lists, resolve_agent,
-    resolve_project,
+    legacy_tool_error, parse_attachment_metadata_json, parse_recipients_lists, resolve_project,
 };
 
 static PRODUCT_UID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -104,6 +103,48 @@ fn parse_product_since_ts(since_ts: Option<&str>) -> Option<i64> {
     })
 }
 
+fn validate_product_inbox_agent_name(agent_name: &str) -> McpResult<()> {
+    if agent_name.trim().is_empty() {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "Agent name cannot be empty. Provide a valid agent name.",
+            true,
+            serde_json::json!({"parameter":"agent_name","provided":agent_name}),
+        ));
+    }
+
+    const AGENT_PLACEHOLDER_PATTERNS: &[&str] = &[
+        "YOUR_AGENT",
+        "YOUR_AGENT_NAME",
+        "AGENT_NAME",
+        "PLACEHOLDER",
+        "<AGENT>",
+        "{AGENT}",
+        "$AGENT",
+    ];
+    let name_upper = agent_name.trim().to_ascii_uppercase();
+    for pattern in AGENT_PLACEHOLDER_PATTERNS {
+        if name_upper.contains(pattern) || name_upper == *pattern {
+            return Err(legacy_tool_error(
+                "CONFIGURATION_ERROR",
+                format!(
+                    "Detected placeholder value '{agent_name}' instead of a real agent name. \
+                     Replace placeholder values with your actual agent name."
+                ),
+                true,
+                serde_json::json!({
+                    "parameter": "agent_name",
+                    "provided": agent_name,
+                    "detected_placeholder": pattern,
+                    "fix_hint": "Update AGENT_MAIL_AGENT or agent_name in your configuration",
+                }),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn parse_product_thread_limit(per_thread_limit: Option<i32>) -> McpResult<usize> {
     let msg_limit_raw = per_thread_limit.unwrap_or(50);
     if msg_limit_raw < 1 {
@@ -130,15 +171,6 @@ fn parse_product_search_limit(limit: Option<i32>) -> usize {
         _ => 20,
     };
     max_results_raw.unsigned_abs() as usize
-}
-
-fn is_not_found_tool_error(err: &McpError) -> bool {
-    err.data
-        .as_ref()
-        .and_then(|data| data.get("error"))
-        .and_then(|error| error.get("type"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|ty| ty == "NOT_FOUND")
 }
 
 async fn get_product_by_key(cx: &Cx, pool: &DbPool, key: &str) -> McpResult<Option<ProductRow>> {
@@ -525,8 +557,8 @@ pub async fn fetch_inbox_product(
     include_bodies: Option<bool>,
     since_ts: Option<String>,
 ) -> McpResult<String> {
-    let agent_name =
-        mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
+    let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
+        .unwrap_or_else(|| agent_name.trim().to_string());
 
     let config = &Config::get();
     if !config.worktrees_enabled {
@@ -546,94 +578,61 @@ pub async fn fetch_inbox_product(
         })?;
     let product_id = product.id.unwrap_or(0);
 
-    let projects = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::list_product_projects(ctx.cx(), &pool, product_id).await,
-    )?;
-
     let max_messages = parse_fetch_inbox_product_limit(limit)?;
     let urgent = urgent_only.unwrap_or(false);
     let with_bodies = include_bodies.unwrap_or(false);
     let since_micros = parse_product_since_ts(since_ts.as_deref());
+    validate_product_inbox_agent_name(&agent_name)?;
 
-    let mut items: Vec<(i64, i64, InboxMessage)> = Vec::with_capacity(max_messages); // (created_ts, id, msg)
-    for p in projects {
-        let project_id = p.id.unwrap_or(0);
-        let agent =
-            match resolve_agent(ctx, &pool, project_id, &agent_name, &p.slug, &p.human_key).await {
-                Ok(agent) => agent,
-                Err(err) if is_not_found_tool_error(&err) => {
-                    // Product inbox spans linked projects, so absence in one project is fine.
-                    continue;
-                }
-                Err(err) => return Err(err),
-            };
-        let rows = db_outcome_to_mcp_result(if with_bodies {
-            mcp_agent_mail_db::queries::fetch_inbox(
-                ctx.cx(),
-                &pool,
-                project_id,
-                agent.id.unwrap_or(0),
-                urgent,
-                since_micros,
-                max_messages,
-            )
-            .await
-        } else {
-            mcp_agent_mail_db::queries::fetch_inbox_metadata(
-                ctx.cx(),
-                &pool,
-                project_id,
-                agent.id.unwrap_or(0),
-                urgent,
-                since_micros,
-                max_messages,
-            )
-            .await
-        })?;
-        for row in rows {
+    let rows = db_outcome_to_mcp_result(if with_bodies {
+        mcp_agent_mail_db::queries::fetch_inbox_for_product_agent(
+            ctx.cx(),
+            &pool,
+            product_id,
+            &agent_name,
+            urgent,
+            since_micros,
+            max_messages,
+        )
+        .await
+    } else {
+        mcp_agent_mail_db::queries::fetch_inbox_for_product_agent_metadata(
+            ctx.cx(),
+            &pool,
+            product_id,
+            &agent_name,
+            urgent,
+            since_micros,
+            max_messages,
+        )
+        .await
+    })?;
+
+    let out: Vec<InboxMessage> = rows
+        .into_iter()
+        .map(|row| {
             let msg = row.message;
             let created_ts = msg.created_ts;
             let id = msg.id.unwrap_or(0);
-
             let recipients = parse_recipients_lists(&msg.recipients_json);
-
-            let to = recipients.to;
-            let cc = recipients.cc;
-            let bcc = if msg.sender_id == agent.id.unwrap_or(0) {
-                recipients.bcc
-            } else {
-                Vec::new()
-            };
-
-            items.push((
-                created_ts,
+            InboxMessage {
                 id,
-                InboxMessage {
-                    id,
-                    project_id: msg.project_id,
-                    sender_id: msg.sender_id,
-                    thread_id: msg.thread_id,
-                    subject: msg.subject,
-                    importance: msg.importance,
-                    ack_required: msg.ack_required != 0,
-                    from: row.sender_name,
-                    to,
-                    cc,
-                    bcc,
-                    created_ts: Some(micros_to_iso(created_ts)),
-                    kind: row.kind,
-                    attachments: parse_attachment_metadata_json(&msg.attachments),
-                    body_md: if with_bodies { Some(msg.body_md) } else { None },
-                },
-            ));
-        }
-    }
-
-    items.sort_by(|(a_ts, a_id, _), (b_ts, b_id, _)| b_ts.cmp(a_ts).then_with(|| b_id.cmp(a_id)));
-    let out: Vec<InboxMessage> = items
-        .into_iter()
-        .take(max_messages)
-        .map(|(_, _, m)| m)
+                project_id: msg.project_id,
+                sender_id: msg.sender_id,
+                thread_id: msg.thread_id,
+                subject: msg.subject,
+                importance: msg.importance,
+                ack_required: msg.ack_required != 0,
+                from: row.sender_name,
+                to: recipients.to,
+                cc: recipients.cc,
+                bcc: Vec::new(),
+                created_ts: Some(micros_to_iso(created_ts)),
+                kind: row.kind,
+                attachments: parse_attachment_metadata_json(&msg.attachments),
+                body_md: if with_bodies { Some(msg.body_md) } else { None },
+            }
+        })
         .collect();
 
     serde_json::to_string(&out).map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
@@ -1471,25 +1470,6 @@ archive body
                 });
             },
         );
-    }
-
-    #[test]
-    fn not_found_tool_error_helper_matches_only_not_found() {
-        let not_found = legacy_tool_error(
-            "NOT_FOUND",
-            "missing agent",
-            true,
-            serde_json::json!({"agent_name":"GreenPlateau"}),
-        );
-        assert!(is_not_found_tool_error(&not_found));
-
-        let resource_busy = legacy_tool_error(
-            "RESOURCE_BUSY",
-            "database is locked",
-            true,
-            serde_json::json!({"resource":"sqlite"}),
-        );
-        assert!(!is_not_found_tool_error(&resource_busy));
     }
 
     #[test]
