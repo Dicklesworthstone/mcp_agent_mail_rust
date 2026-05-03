@@ -2895,20 +2895,40 @@ body
 
     #[test]
     fn resolve_identity_from_project_keys_falls_back_to_human_key() {
-        let raw_project_key = "test-project".to_string();
-        let human_key = format!("/tmp/test-pane-identity-human-key-{}", std::process::id());
-        let pane = "%17";
-        let written_path =
-            mcp_agent_mail_core::write_identity(&human_key, pane, "BlueLake").expect("write");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let xdg_config_home = temp.path().join("xdg-config");
+        let xdg_config_home_text = xdg_config_home.to_string_lossy().into_owned();
+        let home = temp.path().join("home");
+        let home_text = home.to_string_lossy().into_owned();
 
-        let resolved = resolve_identity_from_project_keys(&[raw_project_key, human_key], pane)
-            .expect("resolve identity across project keys");
-        assert_eq!(resolved.0, "BlueLake");
-        assert_eq!(resolved.1, written_path);
+        with_process_env_overrides_for_test(
+            &[
+                ("XDG_CONFIG_HOME", xdg_config_home_text.as_str()),
+                ("HOME", home_text.as_str()),
+            ],
+            || {
+                let raw_project_key = "test-project".to_string();
+                let human_key = temp
+                    .path()
+                    .join("pane-identity-human-key")
+                    .to_string_lossy()
+                    .into_owned();
+                let pane = "%17";
+                let written_path =
+                    mcp_agent_mail_core::write_identity(&human_key, pane, "BlueLake")
+                        .expect("write");
 
-        let _ = std::fs::remove_file(&written_path);
-        if let Some(parent) = written_path.parent() {
-            let _ = std::fs::remove_dir(parent);
-        }
+                assert!(
+                    written_path.starts_with(&xdg_config_home),
+                    "identity test wrote outside temp config home: {written_path:?}"
+                );
+
+                let resolved =
+                    resolve_identity_from_project_keys(&[raw_project_key, human_key], pane)
+                        .expect("resolve identity across project keys");
+                assert_eq!(resolved.0, "BlueLake");
+                assert_eq!(resolved.1, written_path);
+            },
+        );
     }
 }

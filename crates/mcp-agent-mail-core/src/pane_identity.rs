@@ -31,6 +31,10 @@ const IDENTITY_DIR_NAME: &str = "agent-mail/identity";
 /// How many hex chars of the project hash to use in the directory name.
 const PROJECT_HASH_LEN: usize = 12;
 
+#[cfg(test)]
+static TEST_CONFIG_BASE_DIR: std::sync::LazyLock<std::sync::Mutex<Option<PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -107,7 +111,7 @@ pub fn resolve_identity_with_path(project_key: &str, pane_id: &str) -> Option<(S
     //     is something like `%3`. We check the env so we can find files written
     //     before the composite key migration.
     if pane_id.contains(':')
-        && let Ok(bare) = std::env::var("TMUX_PANE")
+        && let Some(bare) = tmux_pane_env()
     {
         let bare = bare.trim().to_string();
         if !bare.is_empty() {
@@ -119,7 +123,7 @@ pub fn resolve_identity_with_path(project_key: &str, pane_id: &str) -> Option<(S
     }
 
     // 2. Legacy Claude Code path: ~/.claude/agent-mail/identity.$TMUX_PANE
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = home_dir() {
         let sanitized = sanitize_pane_id(pane_id);
         let legacy_claude = home
             .join(".claude")
@@ -131,7 +135,7 @@ pub fn resolve_identity_with_path(project_key: &str, pane_id: &str) -> Option<(S
 
         // 2b. If composite key, also try bare pane ID for legacy Claude Code path
         if pane_id.contains(':')
-            && let Ok(bare) = std::env::var("TMUX_PANE")
+            && let Some(bare) = tmux_pane_env()
         {
             let bare_sanitized = sanitize_pane_id(bare.trim());
             if bare_sanitized != sanitized {
@@ -156,7 +160,7 @@ pub fn resolve_identity_with_path(project_key: &str, pane_id: &str) -> Option<(S
 
     // 3b. If composite key, also try bare pane ID for legacy NTM path
     if pane_id.contains(':')
-        && let Ok(bare) = std::env::var("TMUX_PANE")
+        && let Some(bare) = tmux_pane_env()
     {
         let bare_sanitized = sanitize_pane_id(bare.trim());
         if bare_sanitized != sanitized {
@@ -198,9 +202,9 @@ pub fn write_identity_current_pane(
 
 /// Remove stale identity files for panes that no longer exist.
 ///
-/// Queries `tmux list-panes -a -F '#{pane_id}'` to get active pane IDs,
-/// then removes any identity files under the given project hash directory
-/// whose names do not correspond to a live pane.
+/// Queries tmux for active composite pane keys and bare pane IDs, then removes
+/// any identity files under the given project hash directory whose names do
+/// not correspond to a live pane.
 ///
 /// Returns the list of removed file paths.
 #[must_use]
@@ -393,11 +397,53 @@ fn write_identity_for_pane(
 
 /// Get the XDG-compatible config base directory (`~/.config`).
 fn config_base_dir() -> PathBuf {
-    dirs::config_dir().unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join(".config")
+    #[cfg(test)]
+    if let Some(path) = test_config_base_dir() {
+        return path;
+    }
+
+    if let Some(path) = env_path("XDG_CONFIG_HOME") {
+        return path;
+    }
+
+    home_dir()
+        .map(|home| home.join(".config"))
+        .or_else(dirs::config_dir)
+        .unwrap_or_else(|| PathBuf::from("/tmp").join(".config"))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    env_path("HOME").or_else(dirs::home_dir)
+}
+
+fn env_path(key: &str) -> Option<PathBuf> {
+    crate::config::process_env_value(key).and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(shellexpand::tilde(trimmed).into_owned()))
+        }
     })
+}
+
+fn tmux_pane_env() -> Option<String> {
+    crate::config::process_env_value("TMUX_PANE").filter(|value| !value.trim().is_empty())
+}
+
+#[cfg(test)]
+fn test_config_base_dir() -> Option<PathBuf> {
+    TEST_CONFIG_BASE_DIR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+#[cfg(test)]
+fn set_test_config_base_dir(path: Option<PathBuf>) {
+    *TEST_CONFIG_BASE_DIR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = path;
 }
 
 /// Query tmux for all live pane IDs (sanitized).
@@ -473,9 +519,7 @@ pub fn get_composite_tmux_pane_id() -> Option<String> {
     }
 
     // Fallback to bare $TMUX_PANE
-    std::env::var("TMUX_PANE")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
+    tmux_pane_env()
 }
 
 // ---------------------------------------------------------------------------
@@ -485,6 +529,42 @@ pub fn get_composite_tmux_pane_id() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex, MutexGuard};
+
+    static TEST_CONFIG_BASE_DIR_SERIAL: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct IsolatedConfigBaseDir {
+        _guard: MutexGuard<'static, ()>,
+        tempdir: tempfile::TempDir,
+    }
+
+    impl IsolatedConfigBaseDir {
+        fn new() -> Self {
+            let guard = TEST_CONFIG_BASE_DIR_SERIAL
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let tempdir = tempfile::tempdir().expect("temp config dir");
+            set_test_config_base_dir(Some(tempdir.path().to_path_buf()));
+            Self {
+                _guard: guard,
+                tempdir,
+            }
+        }
+
+        fn project_key(&self, suffix: &str) -> String {
+            self.tempdir
+                .path()
+                .join(suffix)
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+
+    impl Drop for IsolatedConfigBaseDir {
+        fn drop(&mut self) {
+            set_test_config_base_dir(None);
+        }
+    }
 
     // -- project_hash --------------------------------------------------------
 
@@ -586,6 +666,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canonical_path_honors_virtual_xdg_config_home() {
+        let _guard = TEST_CONFIG_BASE_DIR_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_test_config_base_dir(None);
+
+        let tmp = tempfile::tempdir().expect("temp config home");
+        let xdg_config_home = tmp.path().join("xdg-config");
+        let xdg_config_home_text = xdg_config_home.to_string_lossy().into_owned();
+
+        crate::config::with_process_env_overrides_for_test(
+            &[("XDG_CONFIG_HOME", xdg_config_home_text.as_str())],
+            || {
+                let path = canonical_identity_path("/data/projects/backend", "%3");
+                assert!(
+                    path.starts_with(&xdg_config_home),
+                    "canonical pane identity path ignored virtual XDG_CONFIG_HOME: {path:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn canonical_path_honors_virtual_home_fallback() {
+        let _guard = TEST_CONFIG_BASE_DIR_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_test_config_base_dir(None);
+
+        let tmp = tempfile::tempdir().expect("temp home");
+        let home = tmp.path().join("home");
+        let home_text = home.to_string_lossy().into_owned();
+        let expected_config_home = home.join(".config");
+
+        crate::config::with_process_env_overrides_for_test(
+            &[("XDG_CONFIG_HOME", ""), ("HOME", home_text.as_str())],
+            || {
+                let path = canonical_identity_path("/data/projects/backend", "%3");
+                assert!(
+                    path.starts_with(&expected_config_home),
+                    "canonical pane identity path ignored virtual HOME fallback: {path:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn legacy_claude_identity_honors_virtual_home() {
+        let _guard = TEST_CONFIG_BASE_DIR_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_test_config_base_dir(None);
+
+        let tmp = tempfile::tempdir().expect("temp home");
+        let home = tmp.path().join("home");
+        let home_text = home.to_string_lossy().into_owned();
+        let identity_dir = home.join(".claude").join("agent-mail");
+        std::fs::create_dir_all(&identity_dir).expect("create legacy identity dir");
+        let identity_path = identity_dir.join("identity.18");
+        std::fs::write(&identity_path, "BlueLake\n").expect("write legacy identity");
+
+        crate::config::with_process_env_overrides_for_test(
+            &[("XDG_CONFIG_HOME", ""), ("HOME", home_text.as_str())],
+            || {
+                let resolved =
+                    resolve_identity_with_path("/data/projects/backend", "%18").expect("resolve");
+                assert_eq!(resolved.0, "BlueLake");
+                assert_eq!(resolved.1, identity_path);
+            },
+        );
+    }
+
     // -- write / resolve roundtrip -------------------------------------------
 
     #[test]
@@ -618,45 +771,51 @@ mod tests {
         assert!(read_identity_file(&path).is_none());
     }
 
-    // -- list_identities (with real filesystem) ------------------------------
+    // -- list_identities (with isolated config dir) --------------------------
 
     #[test]
     fn write_then_resolve_roundtrip_composite_key() {
-        let unique_key = format!("/tmp/test-pane-identity-composite-{}", std::process::id());
+        let config = IsolatedConfigBaseDir::new();
+        let unique_key = config.project_key("composite-project");
         let composite_pane = "test_session:0:1";
-        let _ = write_identity(&unique_key, composite_pane, "GreenOwl");
+        write_identity(&unique_key, composite_pane, "GreenOwl").expect("write identity");
 
         let resolved = resolve_identity(&unique_key, composite_pane);
         assert_eq!(resolved.as_deref(), Some("GreenOwl"));
+        drop(config);
+    }
 
-        // Cleanup
-        let path = canonical_identity_path(&unique_key, composite_pane);
-        let _ = std::fs::remove_file(&path);
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::remove_dir(parent);
-        }
+    #[test]
+    fn composite_resolution_honors_virtual_bare_tmux_pane_fallback() {
+        let config = IsolatedConfigBaseDir::new();
+        let unique_key = config.project_key("bare-fallback-project");
+        let bare_pane = "%23";
+        let written_path =
+            write_identity(&unique_key, bare_pane, "BlueLake").expect("write bare pane identity");
+
+        crate::config::with_process_env_overrides_for_test(&[("TMUX_PANE", bare_pane)], || {
+            let resolved =
+                resolve_identity_with_path(&unique_key, "session:0:1").expect("resolve identity");
+            assert_eq!(resolved.0, "BlueLake");
+            assert_eq!(resolved.1, written_path);
+        });
+
+        drop(config);
     }
 
     #[test]
     fn list_identities_returns_entries() {
-        // This test uses the real filesystem via write_identity, so we need
-        // to use a unique project key to avoid collision.
-        let unique_key = format!("/tmp/test-pane-identity-{}", std::process::id());
+        let config = IsolatedConfigBaseDir::new();
+        let unique_key = config.project_key("list-project");
         let pane = "%99";
-        let _ = write_identity(&unique_key, pane, "RedFox");
+        write_identity(&unique_key, pane, "RedFox").expect("write identity");
 
         let entries = list_identities(&unique_key);
         assert!(
             entries.iter().any(|(p, n)| p == "99" && n == "RedFox"),
             "expected RedFox entry: {entries:?}"
         );
-
-        // Cleanup: remove the file we created
-        let path = canonical_identity_path(&unique_key, pane);
-        let _ = std::fs::remove_file(&path);
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::remove_dir(parent);
-        }
+        drop(config);
     }
 
     // -- write_identity_current_pane -----------------------------------------
@@ -670,7 +829,12 @@ mod tests {
 
     #[test]
     fn resolve_identity_with_path_reports_legacy_ntm_path() {
-        let unique_key = format!("/tmp/test-pane-identity-legacy-{}", std::process::id());
+        let tmp = tempfile::tempdir().expect("temp project key");
+        let unique_key = tmp
+            .path()
+            .join("legacy-project")
+            .to_string_lossy()
+            .into_owned();
         let pane = "%42";
         let hash = project_hash(&unique_key);
         let sanitized = sanitize_pane_id(pane);
