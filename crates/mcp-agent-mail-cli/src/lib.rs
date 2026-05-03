@@ -21709,7 +21709,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
 
             let mut search_query =
                 mcp_agent_mail_db::search_planner::SearchQuery::messages(&query, pid);
-            search_query.limit = Some(limit.max(0) as usize);
+            search_query.limit = Some(parse_cli_search_limit("mail search", limit)?);
 
             let response = outcome_to_result(
                 mcp_agent_mail_db::search_service::execute_search_simple(
@@ -21848,6 +21848,21 @@ fn parse_cli_fetch_inbox_product_limit(limit: i64) -> CliResult<usize> {
         CliError::InvalidArgument(format!("limit exceeds supported range: {limit}"))
     })?;
     Ok(limit.min(FETCH_INBOX_PRODUCT_LIMIT_MAX))
+}
+
+const CLI_SEARCH_LIMIT_MAX: usize = 1000;
+
+fn parse_cli_search_limit(command: &str, limit: i64) -> CliResult<usize> {
+    if limit < 1 {
+        return Err(CliError::InvalidArgument(format!(
+            "{command} limit must be at least 1, got {limit}. Use a positive integer."
+        )));
+    }
+
+    let limit = usize::try_from(limit).map_err(|_| {
+        CliError::InvalidArgument(format!("{command} limit exceeds supported range: {limit}"))
+    })?;
+    Ok(limit.min(CLI_SEARCH_LIMIT_MAX))
 }
 
 fn normalize_cli_product_inbox_agent_name(agent_name: &str) -> CliResult<String> {
@@ -23061,7 +23076,7 @@ mod mail_server_cli_bridge_tests {
         coerce_tool_result_json_or_error, ensure_message_in_project,
         fetch_inbox_server_rejection_allows_local_fallback, is_resource_busy_cli_error,
         mail_server_rejection_allows_local_fallback, normalize_cli_product_inbox_agent_name,
-        parse_cli_fetch_inbox_product_limit, product_inbox_row_to_json,
+        parse_cli_fetch_inbox_product_limit, parse_cli_search_limit, product_inbox_row_to_json,
         server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
         sort_product_inbox_items_desc, sqlite_doctor_sanity_with_health_probe,
     };
@@ -23276,6 +23291,31 @@ mod mail_server_cli_bridge_tests {
     fn fetch_inbox_product_cli_limit_caps_large_values() {
         assert_eq!(
             parse_cli_fetch_inbox_product_limit(5_000).expect("large limit should cap"),
+            1000
+        );
+    }
+
+    #[test]
+    fn search_cli_limit_must_be_positive() {
+        let err = parse_cli_search_limit("products search", 0)
+            .expect_err("zero search limit should fail");
+        assert!(
+            err.to_string()
+                .contains("products search limit must be at least 1")
+        );
+
+        let err = parse_cli_search_limit("mail search", -5)
+            .expect_err("negative search limit should fail");
+        assert!(
+            err.to_string()
+                .contains("mail search limit must be at least 1")
+        );
+    }
+
+    #[test]
+    fn search_cli_limit_caps_large_values() {
+        assert_eq!(
+            parse_cli_search_limit("products search", 5_000).expect("large limit should cap"),
             1000
         );
     }
@@ -52586,7 +52626,7 @@ async fn handle_products_with(
             let prod_id = prod.id.unwrap_or(0);
             let mut search_query =
                 mcp_agent_mail_db::search_planner::SearchQuery::product_messages(&query, prod_id);
-            search_query.limit = Some(limit.max(0) as usize);
+            search_query.limit = Some(parse_cli_search_limit("products search", limit)?);
 
             let response = outcome_to_result(
                 mcp_agent_mail_db::search_service::execute_search_simple(cx, pool, &search_query)
