@@ -75,7 +75,7 @@ pub fn fetch_inbox_rows_from_conn(
             urgent_only,
             unread_only,
             ack_required_only,
-            include_bodies: true,
+            body_policy: InboxBodyPolicy::Full,
         },
     )
 }
@@ -101,9 +101,15 @@ pub fn fetch_inbox_metadata_rows_from_conn(
             urgent_only,
             unread_only,
             ack_required_only,
-            include_bodies: false,
+            body_policy: InboxBodyPolicy::MetadataOnly,
         },
     )
+}
+
+#[derive(Clone, Copy)]
+enum InboxBodyPolicy {
+    Full,
+    MetadataOnly,
 }
 
 #[derive(Clone, Copy)]
@@ -111,7 +117,7 @@ struct InboxFetchOptions {
     urgent_only: bool,
     unread_only: bool,
     ack_required_only: bool,
-    include_bodies: bool,
+    body_policy: InboxBodyPolicy,
 }
 
 fn fetch_inbox_rows_from_conn_impl(
@@ -123,10 +129,9 @@ fn fetch_inbox_rows_from_conn_impl(
     options: InboxFetchOptions,
 ) -> Result<Vec<InboxRow>, DbError> {
     let _ = conn.execute_raw("PRAGMA busy_timeout = 250");
-    let body_select = if options.include_bodies {
-        "m.body_md"
-    } else {
-        "'' AS body_md"
+    let body_select = match options.body_policy {
+        InboxBodyPolicy::Full => "m.body_md",
+        InboxBodyPolicy::MetadataOnly => "'' AS body_md",
     };
 
     let mut sql = format!(

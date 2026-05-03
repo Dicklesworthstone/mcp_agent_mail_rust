@@ -6378,7 +6378,7 @@ pub async fn fetch_inbox(
             urgent_only,
             unread_only: false,
             ack_required_only: false,
-            include_bodies: true,
+            body_policy: InboxBodyPolicy::Full,
         },
     )
     .await
@@ -6404,7 +6404,7 @@ pub async fn fetch_inbox_metadata(
             urgent_only,
             unread_only: false,
             ack_required_only: false,
-            include_bodies: false,
+            body_policy: InboxBodyPolicy::MetadataOnly,
         },
     )
     .await
@@ -6430,7 +6430,7 @@ pub async fn fetch_inbox_unread(
             urgent_only,
             unread_only: true,
             ack_required_only: false,
-            include_bodies: true,
+            body_policy: InboxBodyPolicy::Full,
         },
     )
     .await
@@ -6456,7 +6456,7 @@ pub async fn fetch_inbox_unread_metadata(
             urgent_only,
             unread_only: true,
             ack_required_only: false,
-            include_bodies: false,
+            body_policy: InboxBodyPolicy::MetadataOnly,
         },
     )
     .await
@@ -6480,7 +6480,7 @@ pub async fn fetch_inbox_ack_required(
             urgent_only: false,
             unread_only: false,
             ack_required_only: true,
-            include_bodies: true,
+            body_policy: InboxBodyPolicy::Full,
         },
     )
     .await
@@ -6504,10 +6504,16 @@ pub async fn fetch_inbox_ack_required_metadata(
             urgent_only: false,
             unread_only: false,
             ack_required_only: true,
-            include_bodies: false,
+            body_policy: InboxBodyPolicy::MetadataOnly,
         },
     )
     .await
+}
+
+#[derive(Clone, Copy)]
+enum InboxBodyPolicy {
+    Full,
+    MetadataOnly,
 }
 
 #[derive(Clone, Copy)]
@@ -6515,7 +6521,7 @@ struct InboxQueryOptions {
     urgent_only: bool,
     unread_only: bool,
     ack_required_only: bool,
-    include_bodies: bool,
+    body_policy: InboxBodyPolicy,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6539,7 +6545,7 @@ async fn fetch_inbox_impl(
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
 
-    let result = if options.include_bodies {
+    let result = if matches!(options.body_policy, InboxBodyPolicy::Full) {
         crate::sync::fetch_inbox_rows_from_conn(
             &conn,
             project_id,
@@ -6566,6 +6572,167 @@ async fn fetch_inbox_impl(
     match result {
         Ok(rows) => Outcome::Ok(rows),
         Err(error) => Outcome::Err(error),
+    }
+}
+
+fn decode_inbox_row_indexed(row: &SqlRow) -> std::result::Result<InboxRow, DbError> {
+    let id: i64 = row.get_as(0).map_err(|e| map_sql_error(&e))?;
+    let project_id: i64 = row.get_as(1).map_err(|e| map_sql_error(&e))?;
+    let sender_id: i64 = row.get_as(2).map_err(|e| map_sql_error(&e))?;
+    let thread_id: Option<String> = row.get_as(3).map_err(|e| map_sql_error(&e))?;
+    let subject: String = row.get_as(4).map_err(|e| map_sql_error(&e))?;
+    let body_md: String = row.get_as(5).map_err(|e| map_sql_error(&e))?;
+    let importance: String = row.get_as(6).map_err(|e| map_sql_error(&e))?;
+    let ack_required: i64 = row.get_as(7).map_err(|e| map_sql_error(&e))?;
+    let created_ts: i64 = row.get_as(8).map_err(|e| map_sql_error(&e))?;
+    let recipients_json: String = row.get_as(9).map_err(|e| map_sql_error(&e))?;
+    let attachments: String = row.get_as(10).map_err(|e| map_sql_error(&e))?;
+    let kind: String = row.get_as(11).map_err(|e| map_sql_error(&e))?;
+    let sender_name: String = row.get_as(12).map_err(|e| map_sql_error(&e))?;
+    let read_ts: Option<i64> = row.get_as(13).map_err(|e| map_sql_error(&e))?;
+    let ack_ts: Option<i64> = row.get_as(14).map_err(|e| map_sql_error(&e))?;
+
+    Ok(InboxRow {
+        message: MessageRow {
+            id: Some(id),
+            project_id,
+            sender_id,
+            thread_id,
+            subject,
+            body_md,
+            importance,
+            ack_required,
+            created_ts,
+            recipients_json,
+            attachments,
+        },
+        kind,
+        sender_name,
+        read_ts,
+        ack_ts,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct ProductInboxQueryOptions {
+    urgent_only: bool,
+    body_policy: InboxBodyPolicy,
+}
+
+pub async fn fetch_inbox_for_product_agent(
+    cx: &Cx,
+    pool: &DbPool,
+    product_id: i64,
+    agent_name: &str,
+    urgent_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+) -> Outcome<Vec<InboxRow>, DbError> {
+    fetch_inbox_for_product_agent_impl(
+        cx,
+        pool,
+        product_id,
+        agent_name,
+        since_ts,
+        limit,
+        ProductInboxQueryOptions {
+            urgent_only,
+            body_policy: InboxBodyPolicy::Full,
+        },
+    )
+    .await
+}
+
+pub async fn fetch_inbox_for_product_agent_metadata(
+    cx: &Cx,
+    pool: &DbPool,
+    product_id: i64,
+    agent_name: &str,
+    urgent_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+) -> Outcome<Vec<InboxRow>, DbError> {
+    fetch_inbox_for_product_agent_impl(
+        cx,
+        pool,
+        product_id,
+        agent_name,
+        since_ts,
+        limit,
+        ProductInboxQueryOptions {
+            urgent_only,
+            body_policy: InboxBodyPolicy::MetadataOnly,
+        },
+    )
+    .await
+}
+
+async fn fetch_inbox_for_product_agent_impl(
+    cx: &Cx,
+    pool: &DbPool,
+    product_id: i64,
+    agent_name: &str,
+    since_ts: Option<i64>,
+    limit: usize,
+    options: ProductInboxQueryOptions,
+) -> Outcome<Vec<InboxRow>, DbError> {
+    let Ok(limit_i64) = i64::try_from(limit) else {
+        return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
+    };
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+
+    let body_select = match options.body_policy {
+        InboxBodyPolicy::Full => "m.body_md",
+        InboxBodyPolicy::MetadataOnly => "'' AS body_md",
+    };
+    let mut sql = format!(
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, {body_select}, \
+                m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
+                r.kind, COALESCE(s.name, ?) AS sender_name, r.read_ts, r.ack_ts \
+         FROM product_project_links ppl \
+         JOIN agents recipient ON recipient.project_id = ppl.project_id AND recipient.name = ? COLLATE NOCASE \
+         JOIN message_recipients r ON r.agent_id = recipient.id \
+         JOIN messages m ON m.id = r.message_id AND m.project_id = ppl.project_id \
+         LEFT JOIN agents s ON s.id = m.sender_id \
+         WHERE ppl.product_id = ?"
+    );
+
+    let mut params = vec![
+        Value::Text(UNKNOWN_SENDER_DISPLAY.to_string()),
+        Value::Text(agent_name.to_string()),
+        Value::BigInt(product_id),
+    ];
+    if options.urgent_only {
+        sql.push_str(" AND m.importance IN ('high', 'urgent')");
+    }
+    if let Some(ts) = since_ts {
+        sql.push_str(" AND m.created_ts > ?");
+        params.push(Value::BigInt(ts));
+    }
+    sql.push_str(" ORDER BY m.created_ts DESC, m.id DESC LIMIT ?");
+    params.push(Value::BigInt(limit_i64));
+
+    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                match decode_inbox_row_indexed(&row) {
+                    Ok(decoded) => out.push(decoded),
+                    Err(error) => return Outcome::Err(error),
+                }
+            }
+            Outcome::Ok(out)
+        }
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
     }
 }
 
@@ -20593,6 +20760,242 @@ mod tests {
             );
             assert_eq!(lookup.name, format!("[unknown-product-{product_id}]"));
             assert!(lookup.created_at > 0);
+        });
+    }
+
+    #[test]
+    #[allow(clippy::similar_names)]
+    #[allow(clippy::too_many_lines)]
+    fn fetch_inbox_for_product_agent_uses_single_global_fan_in() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("product_inbox_global_fan_in.db");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project_a = ensure_project(&cx, &pool, &format!("/tmp/am-product-inbox-a-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project a");
+            let project_b = ensure_project(&cx, &pool, &format!("/tmp/am-product-inbox-b-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project b");
+            let project_c = ensure_project(&cx, &pool, &format!("/tmp/am-product-inbox-c-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project c");
+            let project_a_id = project_a.id.expect("project a id");
+            let project_b_id = project_b.id.expect("project b id");
+            let project_c_id = project_c.id.expect("project c id");
+
+            let product_uid = format!("prod_product_inbox_{base}");
+            let product = ensure_product(&cx, &pool, Some(&product_uid), Some(&product_uid))
+                .await
+                .into_result()
+                .expect("ensure product");
+            let product_id = product.id.expect("product id");
+            link_product_to_projects(
+                &cx,
+                &pool,
+                product_id,
+                &[project_a_id, project_b_id, project_c_id],
+            )
+            .await
+            .into_result()
+            .expect("link product projects");
+
+            let recipient_a = create_agent(
+                &cx,
+                &pool,
+                project_a_id,
+                "BlueLake",
+                "test",
+                "model",
+                Some("recipient a"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create recipient a");
+            let recipient_b = create_agent(
+                &cx,
+                &pool,
+                project_b_id,
+                "BlueLake",
+                "test",
+                "model",
+                Some("recipient b"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create recipient b");
+            let sender_a = create_agent(
+                &cx,
+                &pool,
+                project_a_id,
+                "RedStone",
+                "test",
+                "model",
+                Some("sender a"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create sender a");
+            let sender_b = create_agent(
+                &cx,
+                &pool,
+                project_b_id,
+                "GreenCastle",
+                "test",
+                "model",
+                Some("sender b"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create sender b");
+            let sender_c = create_agent(
+                &cx,
+                &pool,
+                project_c_id,
+                "PurpleHarbor",
+                "test",
+                "model",
+                Some("sender c"),
+                Some("auto"),
+            )
+            .await
+            .into_result()
+            .expect("create sender c");
+
+            let older = create_message_with_recipients(
+                &cx,
+                &pool,
+                project_a_id,
+                sender_a.id.expect("sender a id"),
+                "older normal",
+                "older body",
+                Some("prod-inbox"),
+                "normal",
+                false,
+                "[]",
+                &[(recipient_a.id.expect("recipient a id"), "to")],
+            )
+            .await
+            .into_result()
+            .expect("create older message");
+            let newer = create_message_with_recipients(
+                &cx,
+                &pool,
+                project_b_id,
+                sender_b.id.expect("sender b id"),
+                "newer urgent",
+                "newer body",
+                Some("prod-inbox"),
+                "urgent",
+                true,
+                "[]",
+                &[(recipient_b.id.expect("recipient b id"), "to")],
+            )
+            .await
+            .into_result()
+            .expect("create newer message");
+            let skipped = create_message_with_recipients(
+                &cx,
+                &pool,
+                project_c_id,
+                sender_c.id.expect("sender c id"),
+                "should skip",
+                "skip body",
+                Some("prod-inbox"),
+                "urgent",
+                false,
+                "[]",
+                &[(sender_c.id.expect("sender c id"), "to")],
+            )
+            .await
+            .into_result()
+            .expect("create skipped message");
+
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire conn");
+            let base_ts = 1_800_000_000_000_000_i64;
+            for (id, ts, body) in [
+                (older.id.expect("older id"), base_ts, "older body hydrated"),
+                (
+                    newer.id.expect("newer id"),
+                    base_ts + 1_000_000,
+                    "newer body hydrated",
+                ),
+                (
+                    skipped.id.expect("skipped id"),
+                    base_ts + 2_000_000,
+                    "skipped body",
+                ),
+            ] {
+                conn.execute_sync(
+                    "UPDATE messages SET created_ts = ?, body_md = ? WHERE id = ?",
+                    &[
+                        Value::BigInt(ts),
+                        Value::Text(body.to_string()),
+                        Value::BigInt(id),
+                    ],
+                )
+                .expect("stabilize message timestamp");
+            }
+            drop(conn);
+
+            let metadata_rows = fetch_inbox_for_product_agent_metadata(
+                &cx, &pool, product_id, "BlueLake", false, None, 10,
+            )
+            .await
+            .into_result()
+            .expect("fetch product metadata inbox");
+            assert_eq!(metadata_rows.len(), 2);
+            assert_eq!(metadata_rows[0].message.subject, "newer urgent");
+            assert_eq!(metadata_rows[1].message.subject, "older normal");
+            assert!(
+                metadata_rows
+                    .iter()
+                    .all(|row| row.message.body_md.is_empty()),
+                "metadata product inbox must not hydrate message bodies"
+            );
+
+            let since_rows = fetch_inbox_for_product_agent_metadata(
+                &cx,
+                &pool,
+                product_id,
+                "bluelake",
+                false,
+                Some(base_ts),
+                10,
+            )
+            .await
+            .into_result()
+            .expect("fetch product metadata inbox since timestamp");
+            assert_eq!(since_rows.len(), 1);
+            assert_eq!(since_rows[0].message.subject, "newer urgent");
+            assert!(
+                since_rows.iter().all(|row| row.message.body_md.is_empty()),
+                "metadata product inbox must not hydrate message bodies"
+            );
+
+            let urgent_rows =
+                fetch_inbox_for_product_agent(&cx, &pool, product_id, "BlueLake", true, None, 10)
+                    .await
+                    .into_result()
+                    .expect("fetch urgent product inbox");
+            assert_eq!(urgent_rows.len(), 1);
+            assert_eq!(urgent_rows[0].message.subject, "newer urgent");
+            assert_eq!(urgent_rows[0].message.body_md, "newer body hydrated");
         });
     }
 
