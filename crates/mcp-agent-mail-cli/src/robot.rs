@@ -7200,6 +7200,16 @@ fn atc_open_strata_data(
     rows
 }
 
+fn atc_open_total_for_filter(snapshot: &AtcRobotSnapshot, stratum_filter: Option<&str>) -> u64 {
+    snapshot
+        .observability
+        .experiences_open_by_stratum
+        .iter()
+        .filter(|(stratum, _)| atc_stratum_matches(stratum, stratum_filter))
+        .map(|(_, count)| *count)
+        .sum()
+}
+
 fn atc_summary_data(
     snapshot: &AtcRobotSnapshot,
     stratum_filter: Option<&str>,
@@ -7207,16 +7217,11 @@ fn atc_summary_data(
 ) -> AtcSummaryData {
     let open_strata = atc_open_strata_data(snapshot, stratum_filter, limit);
     let open_total = if stratum_filter.is_some() {
-        open_strata.iter().map(|entry| entry.open_experiences).sum()
+        atc_open_total_for_filter(snapshot, stratum_filter)
     } else if snapshot.experiences_open > 0 {
         snapshot.experiences_open as u64
     } else {
-        snapshot
-            .observability
-            .experiences_open_by_stratum
-            .values()
-            .copied()
-            .sum()
+        atc_open_total_for_filter(snapshot, None)
     };
     let resolved_total = if snapshot.experiences_resolved > 0 {
         snapshot.experiences_resolved
@@ -9564,6 +9569,31 @@ mod tests {
                 .and_then(|summary| summary.resolved_outcomes.get("expired"))
                 .copied(),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn build_atc_data_stratum_total_is_not_capped_by_display_limit() {
+        let mut snapshot = sample_atc_snapshot();
+        snapshot.experiences_open = 0;
+        snapshot.observability.experiences_open_by_stratum = std::collections::BTreeMap::from([
+            ("liveness:probe:0".to_string(), 3),
+            ("liveness:probe:1".to_string(), 4),
+            ("liveness:watch:0".to_string(), 5),
+            ("conflict:release:2".to_string(), 6),
+        ]);
+
+        let data = build_atc_data(snapshot, Vec::new(), None, None, Some("liveness"), true, 1);
+        let summary = data.summary.expect("summary");
+
+        assert_eq!(
+            summary.open_strata.len(),
+            1,
+            "display rows should still honor --limit"
+        );
+        assert_eq!(
+            summary.experiences_open, 12,
+            "aggregate should include all matching strata, not only displayed rows"
         );
     }
 
