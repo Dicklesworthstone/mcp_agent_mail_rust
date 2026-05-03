@@ -3,6 +3,7 @@
 //! Seeds an in-memory DB with 10K messages distributed across agents,
 //! then measures `fetch_inbox_rows_from_conn` at various limits.
 
+use std::cell::OnceCell;
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -41,26 +42,31 @@ fn seeded_conn_with_body_bytes(n_messages: usize, body_bytes: usize) -> (DbConn,
         }
     });
 
+    conn.execute_raw("BEGIN IMMEDIATE")
+        .expect("begin benchmark seed transaction");
+
     conn.execute_sync(
-        "INSERT INTO projects (slug, human_key, created_at) VALUES ('bench', '/tmp/bench', 1000000)",
+        "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'bench', '/tmp/bench', 1000000)",
         &[],
     )
     .expect("insert project");
-    let project_id = last_id(&conn);
+    let project_id = 1;
 
     let n_agents: usize = 20;
     let mut agent_ids = Vec::with_capacity(n_agents);
     for i in 0..n_agents {
+        let agent_id = i64::try_from(i + 1).expect("benchmark agent id fits i64");
         conn.execute_sync(
-            "INSERT INTO agents (project_id, name, program, model, task_description, \
-             inception_ts, last_active_ts) VALUES (?1, ?2, 'bench', 'bench', 'bench', 1000000, 1000000)",
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, \
+             inception_ts, last_active_ts) VALUES (?1, ?2, ?3, 'bench', 'bench', 'bench', 1000000, 1000000)",
             &[
+                Value::BigInt(agent_id),
                 Value::BigInt(project_id),
                 Value::Text(format!("Agent{i}")),
             ],
         )
         .expect("insert agent");
-        agent_ids.push(last_id(&conn));
+        agent_ids.push(agent_id);
     }
 
     let base_ts: i64 = 1_700_000_000_000_000;
@@ -68,14 +74,16 @@ fn seeded_conn_with_body_bytes(n_messages: usize, body_bytes: usize) -> (DbConn,
     for i in 0..n_messages {
         let sender_idx = i % n_agents;
         let i_i64 = i64::try_from(i).expect("benchmark message index fits i64");
+        let msg_id = i_i64 + 1;
         let ts = base_ts + i_i64 * 1_000_000;
         let importance = if i % 20 == 0 { "urgent" } else { "normal" };
         let ack_req = i64::from(i % 10 == 0);
         conn.execute_sync(
-            "INSERT INTO messages (project_id, sender_id, subject, body_md, importance, \
+            "INSERT INTO messages (id, project_id, sender_id, subject, body_md, importance, \
              ack_required, thread_id, created_ts, recipients_json, attachments) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '[]', '[]')",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, '[]', '[]')",
             &[
+                Value::BigInt(msg_id),
                 Value::BigInt(project_id),
                 Value::BigInt(agent_ids[sender_idx]),
                 Value::Text(format!("Subject {i}")),
@@ -89,7 +97,6 @@ fn seeded_conn_with_body_bytes(n_messages: usize, body_bytes: usize) -> (DbConn,
             ],
         )
         .expect("insert message");
-        let msg_id = last_id(&conn);
 
         let recipient_idx = (i + 1) % n_agents;
         conn.execute_sync(
@@ -111,33 +118,27 @@ fn seeded_conn_with_body_bytes(n_messages: usize, body_bytes: usize) -> (DbConn,
         }
     }
 
+    conn.execute_raw("COMMIT")
+        .expect("commit benchmark seed transaction");
+
     (conn, project_id, agent_ids)
 }
 
-fn last_id(conn: &DbConn) -> i64 {
-    conn.query_sync("SELECT last_insert_rowid() AS id", &[])
-        .expect("query last id")
-        .into_iter()
-        .next()
-        .and_then(|r| r.get_named::<i64>("id").ok())
-        .expect("get last id")
-}
-
 fn bench_inbox_fetch(c: &mut Criterion) {
-    let (conn, project_id, agent_ids) = seeded_conn(10_000);
-    let target_agent = agent_ids[1];
+    let state = OnceCell::new();
 
     let mut group = c.benchmark_group("inbox_fetch_10k");
     group.sample_size(100);
 
     for limit in [50, 200, 1000] {
         group.bench_with_input(BenchmarkId::new("limit", limit), &limit, |b, &lim| {
+            let (conn, project_id, agent_ids) = state.get_or_init(|| seeded_conn(10_000));
             b.iter(|| {
                 black_box(
                     fetch_inbox_rows_from_conn(
-                        &conn,
-                        project_id,
-                        target_agent,
+                        conn,
+                        *project_id,
+                        agent_ids[1],
                         false,
                         false,
                         false,
@@ -151,12 +152,13 @@ fn bench_inbox_fetch(c: &mut Criterion) {
     }
 
     group.bench_function("urgent_only", |b| {
+        let (conn, project_id, agent_ids) = state.get_or_init(|| seeded_conn(10_000));
         b.iter(|| {
             black_box(
                 fetch_inbox_rows_from_conn(
-                    &conn,
-                    project_id,
-                    target_agent,
+                    conn,
+                    *project_id,
+                    agent_ids[1],
                     true,
                     false,
                     false,
@@ -169,12 +171,13 @@ fn bench_inbox_fetch(c: &mut Criterion) {
     });
 
     group.bench_function("unread_only", |b| {
+        let (conn, project_id, agent_ids) = state.get_or_init(|| seeded_conn(10_000));
         b.iter(|| {
             black_box(
                 fetch_inbox_rows_from_conn(
-                    &conn,
-                    project_id,
-                    target_agent,
+                    conn,
+                    *project_id,
+                    agent_ids[1],
                     false,
                     true,
                     false,
@@ -190,17 +193,17 @@ fn bench_inbox_fetch(c: &mut Criterion) {
 }
 
 fn bench_inbox_fetch_since(c: &mut Criterion) {
-    let (conn, project_id, agent_ids) = seeded_conn(10_000);
-    let target_agent = agent_ids[1];
+    let state = OnceCell::new();
     let midpoint_ts: i64 = 1_700_000_000_000_000 + 5000 * 1_000_000;
 
     c.bench_function("inbox_fetch_10k_since_midpoint", |b| {
+        let (conn, project_id, agent_ids) = state.get_or_init(|| seeded_conn(10_000));
         b.iter(|| {
             black_box(
                 fetch_inbox_rows_from_conn(
-                    &conn,
-                    project_id,
-                    target_agent,
+                    conn,
+                    *project_id,
+                    agent_ids[1],
                     false,
                     false,
                     false,
@@ -214,42 +217,45 @@ fn bench_inbox_fetch_since(c: &mut Criterion) {
 }
 
 fn bench_inbox_fetch_body_policy(c: &mut Criterion) {
-    let (conn, project_id, agent_ids) = seeded_conn_with_body_bytes(10_000, 4096);
-    let target_agent = agent_ids[1];
+    let state = OnceCell::new();
 
-    let mut group = c.benchmark_group("inbox_fetch_10k_body_policy");
-    group.sample_size(50);
+    let mut group = c.benchmark_group("inbox_fetch_body_policy");
+    group.sample_size(20);
 
-    group.bench_function("full_bodies_limit_200", |b| {
+    group.bench_function("full_bodies_limit_50", |b| {
+        let (conn, project_id, agent_ids) =
+            state.get_or_init(|| seeded_conn_with_body_bytes(500, 512));
         b.iter(|| {
             black_box(
                 fetch_inbox_rows_from_conn(
-                    &conn,
-                    project_id,
-                    target_agent,
+                    conn,
+                    *project_id,
+                    agent_ids[1],
                     false,
                     false,
                     false,
                     None,
-                    200,
+                    50,
                 )
                 .expect("full inbox fetch"),
             )
         });
     });
 
-    group.bench_function("metadata_only_limit_200", |b| {
+    group.bench_function("metadata_only_limit_50", |b| {
+        let (conn, project_id, agent_ids) =
+            state.get_or_init(|| seeded_conn_with_body_bytes(500, 512));
         b.iter(|| {
             black_box(
                 fetch_inbox_metadata_rows_from_conn(
-                    &conn,
-                    project_id,
-                    target_agent,
+                    conn,
+                    *project_id,
+                    agent_ids[1],
                     false,
                     false,
                     false,
                     None,
-                    200,
+                    50,
                 )
                 .expect("metadata inbox fetch"),
             )
@@ -260,17 +266,17 @@ fn bench_inbox_fetch_body_policy(c: &mut Criterion) {
 }
 
 fn bench_inbox_stats_query(c: &mut Criterion) {
-    let (conn, project_id, agent_ids) = seeded_conn(10_000);
-    let target_agent = agent_ids[1];
+    let state = OnceCell::new();
 
     c.bench_function("inbox_count_query_10k", |b| {
+        let (conn, project_id, agent_ids) = state.get_or_init(|| seeded_conn(10_000));
         b.iter(|| {
             let rows = conn
                 .query_sync(
                     "SELECT COUNT(*) AS cnt FROM message_recipients r \
                      JOIN messages m ON m.id = r.message_id \
                      WHERE r.agent_id = ? AND m.project_id = ?",
-                    &[Value::BigInt(target_agent), Value::BigInt(project_id)],
+                    &[Value::BigInt(agent_ids[1]), Value::BigInt(*project_id)],
                 )
                 .expect("count query");
             black_box(rows);
