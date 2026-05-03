@@ -69,12 +69,14 @@ pub fn fetch_inbox_rows_from_conn(
         conn,
         project_id,
         agent_id,
-        urgent_only,
-        unread_only,
-        ack_required_only,
         since_ts,
         limit,
-        true,
+        InboxFetchOptions {
+            urgent_only,
+            unread_only,
+            ack_required_only,
+            include_bodies: true,
+        },
     )
 }
 
@@ -93,29 +95,35 @@ pub fn fetch_inbox_metadata_rows_from_conn(
         conn,
         project_id,
         agent_id,
-        urgent_only,
-        unread_only,
-        ack_required_only,
         since_ts,
         limit,
-        false,
+        InboxFetchOptions {
+            urgent_only,
+            unread_only,
+            ack_required_only,
+            include_bodies: false,
+        },
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy)]
+struct InboxFetchOptions {
+    urgent_only: bool,
+    unread_only: bool,
+    ack_required_only: bool,
+    include_bodies: bool,
+}
+
 fn fetch_inbox_rows_from_conn_impl(
     conn: &DbConn,
     project_id: i64,
     agent_id: i64,
-    urgent_only: bool,
-    unread_only: bool,
-    ack_required_only: bool,
     since_ts: Option<i64>,
     limit: usize,
-    include_bodies: bool,
+    options: InboxFetchOptions,
 ) -> Result<Vec<InboxRow>, DbError> {
     let _ = conn.execute_raw("PRAGMA busy_timeout = 250");
-    let body_select = if include_bodies {
+    let body_select = if options.include_bodies {
         "m.body_md"
     } else {
         "'' AS body_md"
@@ -132,13 +140,13 @@ fn fetch_inbox_rows_from_conn_impl(
     );
 
     let mut params = vec![Value::BigInt(agent_id), Value::BigInt(project_id)];
-    if urgent_only {
+    if options.urgent_only {
         sql.push_str(" AND m.importance IN ('high', 'urgent')");
     }
-    if unread_only {
+    if options.unread_only {
         sql.push_str(" AND r.read_ts IS NULL");
     }
-    if ack_required_only {
+    if options.ack_required_only {
         sql.push_str(" AND m.ack_required = 1 AND r.ack_ts IS NULL");
     }
     if let Some(ts) = since_ts {

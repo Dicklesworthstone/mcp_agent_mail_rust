@@ -6372,12 +6372,14 @@ pub async fn fetch_inbox(
         pool,
         project_id,
         agent_id,
-        urgent_only,
-        false,
-        false,
         since_ts,
         limit,
-        true,
+        InboxQueryOptions {
+            urgent_only,
+            unread_only: false,
+            ack_required_only: false,
+            include_bodies: true,
+        },
     )
     .await
 }
@@ -6396,12 +6398,14 @@ pub async fn fetch_inbox_metadata(
         pool,
         project_id,
         agent_id,
-        urgent_only,
-        false,
-        false,
         since_ts,
         limit,
-        false,
+        InboxQueryOptions {
+            urgent_only,
+            unread_only: false,
+            ack_required_only: false,
+            include_bodies: false,
+        },
     )
     .await
 }
@@ -6420,12 +6424,14 @@ pub async fn fetch_inbox_unread(
         pool,
         project_id,
         agent_id,
-        urgent_only,
-        true,
-        false,
         since_ts,
         limit,
-        true,
+        InboxQueryOptions {
+            urgent_only,
+            unread_only: true,
+            ack_required_only: false,
+            include_bodies: true,
+        },
     )
     .await
 }
@@ -6444,12 +6450,14 @@ pub async fn fetch_inbox_unread_metadata(
         pool,
         project_id,
         agent_id,
-        urgent_only,
-        true,
-        false,
         since_ts,
         limit,
-        false,
+        InboxQueryOptions {
+            urgent_only,
+            unread_only: true,
+            ack_required_only: false,
+            include_bodies: false,
+        },
     )
     .await
 }
@@ -6462,7 +6470,18 @@ pub async fn fetch_inbox_ack_required(
     limit: usize,
 ) -> Outcome<Vec<InboxRow>, DbError> {
     fetch_inbox_impl(
-        cx, pool, project_id, agent_id, false, false, true, None, limit, true,
+        cx,
+        pool,
+        project_id,
+        agent_id,
+        None,
+        limit,
+        InboxQueryOptions {
+            urgent_only: false,
+            unread_only: false,
+            ack_required_only: true,
+            include_bodies: true,
+        },
     )
     .await
 }
@@ -6475,23 +6494,39 @@ pub async fn fetch_inbox_ack_required_metadata(
     limit: usize,
 ) -> Outcome<Vec<InboxRow>, DbError> {
     fetch_inbox_impl(
-        cx, pool, project_id, agent_id, false, false, true, None, limit, false,
+        cx,
+        pool,
+        project_id,
+        agent_id,
+        None,
+        limit,
+        InboxQueryOptions {
+            urgent_only: false,
+            unread_only: false,
+            ack_required_only: true,
+            include_bodies: false,
+        },
     )
     .await
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[derive(Clone, Copy)]
+struct InboxQueryOptions {
+    urgent_only: bool,
+    unread_only: bool,
+    ack_required_only: bool,
+    include_bodies: bool,
+}
+
+#[allow(clippy::too_many_lines)]
 async fn fetch_inbox_impl(
     cx: &Cx,
     pool: &DbPool,
     project_id: i64,
     agent_id: i64,
-    urgent_only: bool,
-    unread_only: bool,
-    ack_required_only: bool,
     since_ts: Option<i64>,
     limit: usize,
-    include_bodies: bool,
+    options: InboxQueryOptions,
 ) -> Outcome<Vec<InboxRow>, DbError> {
     let Ok(_limit_i64) = i64::try_from(limit) else {
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
@@ -6504,14 +6539,14 @@ async fn fetch_inbox_impl(
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
 
-    let result = if include_bodies {
+    let result = if options.include_bodies {
         crate::sync::fetch_inbox_rows_from_conn(
             &conn,
             project_id,
             agent_id,
-            urgent_only,
-            unread_only,
-            ack_required_only,
+            options.urgent_only,
+            options.unread_only,
+            options.ack_required_only,
             since_ts,
             limit,
         )
@@ -6520,9 +6555,9 @@ async fn fetch_inbox_impl(
             &conn,
             project_id,
             agent_id,
-            urgent_only,
-            unread_only,
-            ack_required_only,
+            options.urgent_only,
+            options.unread_only,
+            options.ack_required_only,
             since_ts,
             limit,
         )
