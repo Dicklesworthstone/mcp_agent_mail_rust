@@ -1269,9 +1269,21 @@ Check that all parameters have valid values."
         row.registration_token = Some(registration_token.clone());
     }
 
-    // Invalidate + repopulate read cache after mutation
-    mcp_agent_mail_db::read_cache().invalidate_agent(project_id, &row.name, row.id);
-    mcp_agent_mail_db::read_cache().put_agent(&row);
+    // Invalidate + repopulate read cache after mutation. Scope to the live
+    // pool's identity key so subsequent reads against the same pool
+    // (resolve_agent → queries::get_agent) see the freshly persisted row
+    // instead of the pre-update entry. Other pools (archive snapshots) keep
+    // their own scoped caches and will refresh on their next miss; we
+    // intentionally do not invalidate them here because their agent IDs may
+    // legitimately differ from the live pool's. See mcp_agent_mail_rust#106.
+    let pool_scope = pool.sqlite_identity_key();
+    mcp_agent_mail_db::read_cache().invalidate_agent_scoped(
+        &pool_scope,
+        project_id,
+        &row.name,
+        row.id,
+    );
+    mcp_agent_mail_db::read_cache().put_agent_scoped(&pool_scope, &row);
 
     // Write agent profile to git archive (best-effort)
     let config = &Config::get();
@@ -1512,9 +1524,21 @@ Choose a different name (or omit the name to auto-generate one)."
         row.registration_token = Some(registration_token.clone());
     }
 
-    // Invalidate + repopulate read cache after mutation
-    mcp_agent_mail_db::read_cache().invalidate_agent(project_id, &row.name, row.id);
-    mcp_agent_mail_db::read_cache().put_agent(&row);
+    // Invalidate + repopulate read cache after mutation. Scope to the live
+    // pool's identity key so subsequent reads against the same pool
+    // (resolve_agent → queries::get_agent) see the freshly persisted row
+    // instead of the pre-update entry. Other pools (archive snapshots) keep
+    // their own scoped caches and will refresh on their next miss; we
+    // intentionally do not invalidate them here because their agent IDs may
+    // legitimately differ from the live pool's. See mcp_agent_mail_rust#106.
+    let pool_scope = pool.sqlite_identity_key();
+    mcp_agent_mail_db::read_cache().invalidate_agent_scoped(
+        &pool_scope,
+        project_id,
+        &row.name,
+        row.id,
+    );
+    mcp_agent_mail_db::read_cache().put_agent_scoped(&pool_scope, &row);
 
     // Write agent profile to git archive (best-effort)
     let config = &Config::get();
