@@ -11512,7 +11512,7 @@ fn handle_migrate_cmd(
         ftui_runtime::ftui_println!("  Skipped:   {} rows (parse errors)", summary.total_skipped);
     }
     if summary.total_nulls > 0 {
-        ftui_runtime::ftui_println!("  NULLs:     {} (left as-is)", summary.total_nulls);
+        ftui_runtime::ftui_println!("  Blank TEXT -> NULL: {} rows", summary.total_nulls);
     }
     ftui_runtime::ftui_println!("  Backup:    {}", backup_path.display());
     ftui_runtime::ftui_println!("  Format:    {after}");
@@ -21421,7 +21421,7 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                 let proj = resolve_project_async(&cx, read_pool.pool(), &project_key).await?;
                 let pid = proj.id.unwrap_or(0);
                 let agent = resolve_agent_async(&cx, read_pool.pool(), pid, &agent_name).await?;
-                let rows = outcome_to_result(
+                let rows = outcome_to_result(if include_bodies {
                     mcp_agent_mail_db::queries::fetch_inbox(
                         &cx,
                         read_pool.pool(),
@@ -21431,8 +21431,19 @@ async fn handle_mail_async(action: MailCommand) -> CliResult<()> {
                         since_ts,
                         validated_limit,
                     )
-                    .await,
-                )?;
+                    .await
+                } else {
+                    mcp_agent_mail_db::queries::fetch_inbox_metadata(
+                        &cx,
+                        read_pool.pool(),
+                        pid,
+                        agent.id.unwrap_or(0),
+                        urgent_only,
+                        since_ts,
+                        validated_limit,
+                    )
+                    .await
+                })?;
                 Ok::<Vec<serde_json::Value>, CliError>(
                     rows.iter()
                         .map(|row| inbox_row_to_json(row, include_bodies))
@@ -22313,7 +22324,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
 
             // 4. Fetch inbox
             let inbox = outcome_to_result(
-                mcp_agent_mail_db::queries::fetch_inbox(
+                mcp_agent_mail_db::queries::fetch_inbox_metadata(
                     &cx,
                     &ctx.pool,
                     pid,
@@ -22449,7 +22460,8 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             };
 
             // Fetch inbox
-            let inbox = outcome_to_result(
+            let inbox_limit = inbox_limit.max(0) as usize;
+            let inbox = outcome_to_result(if inbox_bodies {
                 mcp_agent_mail_db::queries::fetch_inbox(
                     &cx,
                     &ctx.pool,
@@ -22457,10 +22469,21 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                     agent.id.unwrap_or(0),
                     false,
                     None,
-                    inbox_limit.max(0) as usize,
+                    inbox_limit,
                 )
-                .await,
-            )?;
+                .await
+            } else {
+                mcp_agent_mail_db::queries::fetch_inbox_metadata(
+                    &cx,
+                    &ctx.pool,
+                    pid,
+                    agent.id.unwrap_or(0),
+                    false,
+                    None,
+                    inbox_limit,
+                )
+                .await
+            })?;
 
             let resp = serde_json::json!({
                 "project": {
@@ -34178,6 +34201,25 @@ startup_timeout_sec = 42
         }
     }
 
+    struct DoctorSalvageTableScanFailureGuard;
+
+    impl DoctorSalvageTableScanFailureGuard {
+        fn new(path: &Path) -> Self {
+            *doctor_salvage_table_scan_failure_path()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path.to_path_buf());
+            Self
+        }
+    }
+
+    impl Drop for DoctorSalvageTableScanFailureGuard {
+        fn drop(&mut self) {
+            *doctor_salvage_table_scan_failure_path()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+    }
+
     #[test]
     fn attempt_best_doctor_salvage_artifact_falls_back_to_readable_backup_candidate() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -34193,6 +34235,51 @@ startup_timeout_sec = 42
             .expect("insert marker");
         drop(conn);
 
+        let salvage = attempt_best_doctor_salvage_artifact(&db_path);
+        match salvage {
+            DoctorSalvageAttempt::Succeeded(artifact) => {
+                assert_eq!(artifact.db_path, backup_path);
+                assert!(
+                    artifact.detail.contains("backup candidate"),
+                    "unexpected salvage detail: {}",
+                    artifact.detail
+                );
+            }
+            DoctorSalvageAttempt::Failed(detail) => {
+                panic!("expected backup salvage fallback, got failure: {detail}");
+            }
+        }
+    }
+
+    #[test]
+    fn attempt_best_doctor_salvage_artifact_falls_back_when_current_table_scan_fails() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        let live_conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open live sqlite db");
+        live_conn
+            .execute_raw("CREATE TABLE messages(id INTEGER PRIMARY KEY)")
+            .expect("create messages table");
+        live_conn
+            .execute_raw("INSERT INTO messages(id) VALUES(1)")
+            .expect("insert live message");
+        drop(live_conn);
+
+        let backup_path = dir.path().join("storage.sqlite3.bak");
+        let backup_conn = mcp_agent_mail_db::DbConn::open_file(backup_path.display().to_string())
+            .expect("open backup sqlite db");
+        backup_conn
+            .execute_raw("CREATE TABLE messages(id INTEGER PRIMARY KEY)")
+            .expect("create backup messages table");
+        backup_conn
+            .execute_raw("INSERT INTO messages(id) VALUES(2)")
+            .expect("insert backup message");
+        drop(backup_conn);
+
+        let _scan_failure = DoctorSalvageTableScanFailureGuard::new(&db_path);
         let salvage = attempt_best_doctor_salvage_artifact(&db_path);
         match salvage {
             DoctorSalvageAttempt::Succeeded(artifact) => {
@@ -49381,6 +49468,16 @@ enum DoctorSalvageAttempt {
     Succeeded(DoctorSalvageArtifact),
 }
 
+const DOCTOR_SALVAGE_PROBE_TABLES: &[&str] = &[
+    "projects",
+    "agents",
+    "messages",
+    "message_recipients",
+    "agent_links",
+    "products",
+    "product_project_links",
+];
+
 fn next_doctor_artifact_path_with_timestamp(
     base_path: &Path,
     label: &str,
@@ -49463,6 +49560,12 @@ fn attempt_readable_sqlite_salvage_source(sqlite_path: &Path, label: &str) -> Do
             sqlite_path.display()
         ));
     }
+    if let Err(error) = probe_doctor_salvage_tables(&conn, sqlite_path) {
+        return DoctorSalvageAttempt::Failed(format!(
+            "{label} {} failed a canonical salvage table scan: {error}",
+            sqlite_path.display()
+        ));
+    }
 
     DoctorSalvageAttempt::Succeeded(DoctorSalvageArtifact {
         db_path: sqlite_path.to_path_buf(),
@@ -49471,6 +49574,62 @@ fn attempt_readable_sqlite_salvage_source(sqlite_path: &Path, label: &str) -> Do
             sqlite_path.display()
         ),
     })
+}
+
+fn probe_doctor_salvage_tables(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
+    sqlite_path: &Path,
+) -> Result<(), String> {
+    #[cfg(not(test))]
+    let _ = sqlite_path;
+
+    for table in DOCTOR_SALVAGE_PROBE_TABLES {
+        let exists_sql = format!(
+            "SELECT 1 AS exists_flag FROM sqlite_master \
+             WHERE type = 'table' AND name = '{table}' LIMIT 1"
+        );
+        let exists = conn
+            .query_sync(&exists_sql, &[])
+            .map_err(|error| format!("check {table} existence: {error}"))?;
+        if exists.is_empty() {
+            continue;
+        }
+
+        #[cfg(test)]
+        if should_fail_doctor_salvage_table_scan(sqlite_path, table) {
+            return Err(format!(
+                "scan {table}: Query error: database disk image is malformed"
+            ));
+        }
+
+        let scan_sql = format!("SELECT * FROM {table}");
+        conn.query_sync(&scan_sql, &[])
+            .map_err(|error| format!("scan {table}: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn doctor_salvage_table_scan_failure_path() -> &'static std::sync::Mutex<Option<PathBuf>> {
+    static PATH: std::sync::OnceLock<std::sync::Mutex<Option<PathBuf>>> =
+        std::sync::OnceLock::new();
+    PATH.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn should_fail_doctor_salvage_table_scan(sqlite_path: &Path, table: &str) -> bool {
+    if table != "messages" {
+        return false;
+    }
+    let mut guard = doctor_salvage_table_scan_failure_path()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.as_deref() == Some(sqlite_path) {
+        *guard = None;
+        true
+    } else {
+        false
+    }
 }
 
 fn attempt_readable_current_db_salvage(current_db: &Path) -> DoctorSalvageAttempt {
@@ -51103,7 +51262,7 @@ pub fn check_inbox_direct(config: &CheckInboxDirectConfig) -> CliResult<CheckInb
     let project_id = crate::context::resolve_project(read_db.conn(), &config.project_key)?.id;
     let agent_id =
         resolve_agent_id_for_inbox_check(read_db.conn(), project_id, &config.agent_name)?;
-    let rows = mcp_agent_mail_db::sync::fetch_inbox_rows_from_conn(
+    let rows = mcp_agent_mail_db::sync::fetch_inbox_metadata_rows_from_conn(
         read_db.conn(),
         project_id,
         agent_id,
@@ -51169,16 +51328,29 @@ fn fetch_mail_inbox_direct_with_database_url(
     let read_db = open_db_sync_mail_inbox_with_database_url_and_path(database_url)?;
     let project = crate::context::resolve_project(read_db.conn(), project_key)?;
     let agent = crate::context::resolve_agent(read_db.conn(), project.id, agent_name)?;
-    let rows = mcp_agent_mail_db::sync::fetch_inbox_rows_from_conn(
-        read_db.conn(),
-        project.id,
-        agent.id,
-        urgent_only,
-        false,
-        false,
-        since_ts,
-        validated_limit,
-    )
+    let rows = if include_bodies {
+        mcp_agent_mail_db::sync::fetch_inbox_rows_from_conn(
+            read_db.conn(),
+            project.id,
+            agent.id,
+            urgent_only,
+            false,
+            false,
+            since_ts,
+            validated_limit,
+        )
+    } else {
+        mcp_agent_mail_db::sync::fetch_inbox_metadata_rows_from_conn(
+            read_db.conn(),
+            project.id,
+            agent.id,
+            urgent_only,
+            false,
+            false,
+            since_ts,
+            validated_limit,
+        )
+    }
     .map_err(|e| CliError::Other(format!("inbox query failed: {e}")))?;
 
     let mut data = Vec::with_capacity(rows.len());
@@ -52347,17 +52519,29 @@ async fn handle_products_with(
                             asupersync::Outcome::Ok(a) => a,
                             _ => continue, // legacy: skip missing agent in project
                         };
-                        let rows = match mcp_agent_mail_db::queries::fetch_inbox(
-                            cx,
-                            pool,
-                            project_id,
-                            agent_row.id.unwrap_or(0),
-                            urgent_only,
-                            since_micros,
-                            max_messages,
-                        )
-                        .await
-                        {
+                        let rows = match if include_bodies {
+                            mcp_agent_mail_db::queries::fetch_inbox(
+                                cx,
+                                pool,
+                                project_id,
+                                agent_row.id.unwrap_or(0),
+                                urgent_only,
+                                since_micros,
+                                max_messages,
+                            )
+                            .await
+                        } else {
+                            mcp_agent_mail_db::queries::fetch_inbox_metadata(
+                                cx,
+                                pool,
+                                project_id,
+                                agent_row.id.unwrap_or(0),
+                                urgent_only,
+                                since_micros,
+                                max_messages,
+                            )
+                            .await
+                        } {
                             asupersync::Outcome::Ok(v) => v,
                             _ => continue,
                         };
