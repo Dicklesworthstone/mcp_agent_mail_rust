@@ -1027,18 +1027,21 @@ pub mod tool_util {
             }
         }
 
-        // Check read cache first
-        if let Some(cached) = mcp_agent_mail_db::read_cache().get_agent(project_id, name) {
-            return Ok(cached);
-        }
+        // Delegate to queries::get_agent, which is itself cache-first against
+        // the *pool-scoped* cache. The previous code path also consulted the
+        // unscoped (`scope = ""`) cache here as a pre-check, but the unscoped
+        // entries are populated by `register_agent` / `create_agent_identity`
+        // against the live write pool, while `fetch_inbox` (and similar reads)
+        // run against an archive-aware read pool whose `sqlite_identity_key`
+        // can differ. That split-brain caused agent IDs from the live pool to
+        // be served for archive-pool reads, returning rows for the wrong
+        // recipient (mcp_agent_mail_rust#106). Always go through the scoped
+        // path so the cache key matches the pool the SQL will actually run
+        // against.
         let out = mcp_agent_mail_db::queries::get_agent(ctx.cx(), pool, project_id, name).await;
 
         match db_outcome_to_mcp_result(out) {
-            Ok(agent) => {
-                // Populate cache on miss
-                mcp_agent_mail_db::read_cache().put_agent(&agent);
-                Ok(agent)
-            }
+            Ok(agent) => Ok(agent),
             Err(e) => {
                 // Only enhance NOT_FOUND errors with suggestions
                 let is_not_found = e
