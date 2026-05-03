@@ -55,11 +55,12 @@ pub fn doc_id_to_string(id: i64) -> String {
 
 /// Parse a frankensearch `String` doc ID back to the domain-specific `i64`.
 ///
-/// Returns `None` if the string is not a valid `i64`.
+/// Returns `None` if the string is not a valid non-negative `i64`.
 #[inline]
 #[must_use]
 pub fn doc_id_from_string(id: &str) -> Option<i64> {
-    id.parse().ok()
+    let parsed = id.parse().ok()?;
+    (parsed >= 0).then_some(parsed)
 }
 
 // ─── Config Conversion ──────────────────────────────────────────────────────
@@ -94,12 +95,12 @@ pub fn from_fs_config(config: &FsTwoTierConfig) -> crate::two_tier::TwoTierConfi
 
 /// Convert a frankensearch `ScoredResult` to a search-core `ScoredResult`.
 ///
-/// Returns `None` if the `doc_id` cannot be parsed as `i64`.
+/// Returns `None` if the `doc_id` cannot be parsed as a non-negative `i64`.
 /// Domain-specific fields (`doc_kind`, `project_id`) are set to defaults;
 /// callers should enrich them from the document store.
 #[must_use]
 pub fn from_fs_scored_result(result: &FsScoredResult) -> Option<crate::two_tier::ScoredResult> {
-    let doc_id: i64 = result.doc_id.parse().ok()?;
+    let doc_id = doc_id_from_string(&result.doc_id)?;
     Some(crate::two_tier::ScoredResult {
         idx: 0,
         doc_id,
@@ -439,14 +440,33 @@ mod tests {
     }
 
     #[test]
-    fn doc_id_negative_string_returns_value() {
-        assert_eq!(doc_id_from_string("-1"), Some(-1));
+    fn doc_id_negative_string_returns_none() {
+        assert_eq!(doc_id_from_string("-1"), None);
     }
 
     #[test]
     fn doc_id_overflow_string_returns_none() {
         // i64::MAX + 1
         assert_eq!(doc_id_from_string("9223372036854775808"), None);
+    }
+
+    #[test]
+    fn scored_result_negative_id_returns_none() {
+        use frankensearch::core::types::ScoreSource;
+
+        let fs_result = FsScoredResult {
+            doc_id: "-1".to_string(),
+            score: 0.5,
+            source: ScoreSource::Hybrid,
+            index: None,
+            fast_score: None,
+            quality_score: None,
+            lexical_score: None,
+            rerank_score: None,
+            explanation: None,
+            metadata: None,
+        };
+        assert!(from_fs_scored_result(&fs_result).is_none());
     }
 
     // ── Config edge cases ─────────────────────────────────────────────

@@ -40,7 +40,7 @@ fn make_f32_query(dim: usize, seed: usize) -> Vec<f32> {
 fn make_test_entries(count: usize, config: &TwoTierConfig) -> Vec<TwoTierEntry> {
     (0..count)
         .map(|i| TwoTierEntry {
-            doc_id: i as i64,
+            doc_id: i64::try_from(i).expect("benchmark entry count fits i64"),
             doc_kind: DocKind::Message,
             project_id: Some(1),
             fast_embedding: make_f16_embedding(config.fast_dimension, i),

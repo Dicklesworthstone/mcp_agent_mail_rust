@@ -981,7 +981,7 @@ impl<'a> TwoTierSearchIter<'a> {
 
         // If no fast candidates are available OR they are empty, fall back to full quality search.
         // This ensures that even if lexical search misses everything, semantic search has a chance.
-        if fast_results.is_none() || fast_results.is_some_and(std::vec::Vec::is_empty) {
+        if fast_results.is_none_or(std::vec::Vec::is_empty) {
             let _score_span =
                 tracing::debug_span!("two_tier.score_quality", candidates = 0).entered();
             let score_start = Instant::now();
@@ -1256,7 +1256,7 @@ mod tests {
     fn make_test_entries(count: usize, config: &TwoTierConfig) -> Vec<TwoTierEntry> {
         (0..count)
             .map(|i| TwoTierEntry {
-                doc_id: i as i64,
+                doc_id: i64::try_from(i).expect("test entry count fits i64"),
                 doc_kind: crate::document::DocKind::Message,
                 project_id: Some(1),
                 fast_embedding: (0..config.fast_dimension)
@@ -2543,8 +2543,9 @@ mod tests {
             handles.push(thread::spawn(move || {
                 bar.wait();
                 let mut count = 0_u32;
+                let writer_id = i64::try_from(w).expect("writer index fits i64");
                 for i in 0..20_i64 {
-                    let doc_id = (w as i64) * 100 + i;
+                    let doc_id = writer_id * 100 + i;
                     let value = 0.01 * (doc_id + 1) as f32;
                     let entry = TwoTierEntry {
                         doc_id,
