@@ -31711,6 +31711,54 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
+    fn products_inbox_unknown_product_errors_in_local_fallback() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let root = tempfile::tempdir().unwrap();
+        let (db_path, _proj_alpha_key, _proj_beta_key, _created_at_us) =
+            seed_products_cli_db(&root);
+        let pool = mcp_agent_mail_db::DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            storage_root: Some(root.path().to_path_buf()),
+            min_connections: 1,
+            max_connections: 1,
+            acquire_timeout_ms: 5_000,
+            max_lifetime_ms: 60_000,
+            run_migrations: false,
+            warmup_connections: 0,
+            cache_budget_kb: mcp_agent_mail_db::schema::DEFAULT_CACHE_BUDGET_KB,
+        })
+        .unwrap();
+        let cx = asupersync::Cx::for_request();
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+
+        let (res, out) = run_products_cmd_capture(
+            &runtime,
+            &cx,
+            &pool,
+            ProductsCommand::Inbox {
+                product_key: "missing-product".to_string(),
+                agent: "GreenCastle".to_string(),
+                limit: 20,
+                urgent_only: false,
+                all: false,
+                include_bodies: false,
+                no_bodies: false,
+                since_ts: None,
+                format: None,
+                json: false,
+            },
+        );
+
+        let err = res.unwrap_err();
+        assert!(matches!(err, CliError::ExitCode(2)));
+        assert!(
+            out.contains("Product 'missing-product' not found."),
+            "expected missing-product guidance, got: {out}"
+        );
+    }
+
+    #[test]
     fn products_status_accepts_orphaned_product_placeholder() {
         use asupersync::runtime::RuntimeBuilder;
         use mcp_agent_mail_db::sqlmodel::Value;
@@ -52676,83 +52724,84 @@ async fn handle_products_with(
 
             if items.is_empty() && !server_answered {
                 // Local fallback.
-                if let Some(prod) = get_product_by_key(cx, pool, product_key.trim()).await? {
-                    let prod_id = prod.id.unwrap_or(0);
-                    let projects =
-                        match mcp_agent_mail_db::queries::list_product_projects(cx, pool, prod_id)
+                let prod = get_product_by_key(cx, pool, product_key.trim())
+                    .await?
+                    .ok_or_else(|| {
+                        ftui_runtime::ftui_eprintln!("Product '{product_key}' not found.");
+                        CliError::ExitCode(2)
+                    })?;
+                let prod_id = prod.id.unwrap_or(0);
+                let projects = match mcp_agent_mail_db::queries::list_product_projects(
+                    cx, pool, prod_id,
+                )
+                .await
+                {
+                    asupersync::Outcome::Ok(v) => v,
+                    asupersync::Outcome::Err(e) => {
+                        return Err(CliError::Other(format!("project list failed: {e}")));
+                    }
+                    asupersync::Outcome::Cancelled(_) => {
+                        return Err(CliError::Other("request cancelled".to_string()));
+                    }
+                    asupersync::Outcome::Panicked(p) => {
+                        return Err(CliError::Other(format!("internal panic: {}", p.message())));
+                    }
+                };
+
+                let since_micros = since_ts
+                    .as_deref()
+                    .and_then(mcp_agent_mail_db::iso_to_micros);
+
+                let mut merged: Vec<(i64, i64, serde_json::Value)> = Vec::new();
+                for p in projects {
+                    let project_id = p.id.unwrap_or(0);
+                    let agent_row =
+                        match mcp_agent_mail_db::queries::get_agent(cx, pool, project_id, &agent)
                             .await
-                        {
-                            asupersync::Outcome::Ok(v) => v,
-                            asupersync::Outcome::Err(e) => {
-                                return Err(CliError::Other(format!("project list failed: {e}")));
-                            }
-                            asupersync::Outcome::Cancelled(_) => {
-                                return Err(CliError::Other("request cancelled".to_string()));
-                            }
-                            asupersync::Outcome::Panicked(p) => {
-                                return Err(CliError::Other(format!(
-                                    "internal panic: {}",
-                                    p.message()
-                                )));
-                            }
-                        };
-
-                    let since_micros = since_ts
-                        .as_deref()
-                        .and_then(mcp_agent_mail_db::iso_to_micros);
-
-                    let mut merged: Vec<(i64, i64, serde_json::Value)> = Vec::new();
-                    for p in projects {
-                        let project_id = p.id.unwrap_or(0);
-                        let agent_row = match mcp_agent_mail_db::queries::get_agent(
-                            cx, pool, project_id, &agent,
-                        )
-                        .await
                         {
                             asupersync::Outcome::Ok(a) => a,
                             _ => continue, // legacy: skip missing agent in project
                         };
-                        let rows = match if include_bodies {
-                            mcp_agent_mail_db::queries::fetch_inbox(
-                                cx,
-                                pool,
-                                project_id,
-                                agent_row.id.unwrap_or(0),
-                                urgent_only,
-                                since_micros,
-                                max_messages,
-                            )
-                            .await
-                        } else {
-                            mcp_agent_mail_db::queries::fetch_inbox_metadata(
-                                cx,
-                                pool,
-                                project_id,
-                                agent_row.id.unwrap_or(0),
-                                urgent_only,
-                                since_micros,
-                                max_messages,
-                            )
-                            .await
-                        } {
-                            asupersync::Outcome::Ok(v) => v,
-                            _ => continue,
-                        };
-                        for row in rows {
-                            let id = row.message.id.unwrap_or(0);
-                            let created_ts = row.message.created_ts;
-                            let obj = product_inbox_row_to_json(&row, include_bodies);
-                            merged.push((created_ts, id, obj));
-                        }
+                    let rows = match if include_bodies {
+                        mcp_agent_mail_db::queries::fetch_inbox(
+                            cx,
+                            pool,
+                            project_id,
+                            agent_row.id.unwrap_or(0),
+                            urgent_only,
+                            since_micros,
+                            max_messages,
+                        )
+                        .await
+                    } else {
+                        mcp_agent_mail_db::queries::fetch_inbox_metadata(
+                            cx,
+                            pool,
+                            project_id,
+                            agent_row.id.unwrap_or(0),
+                            urgent_only,
+                            since_micros,
+                            max_messages,
+                        )
+                        .await
+                    } {
+                        asupersync::Outcome::Ok(v) => v,
+                        _ => continue,
+                    };
+                    for row in rows {
+                        let id = row.message.id.unwrap_or(0);
+                        let created_ts = row.message.created_ts;
+                        let obj = product_inbox_row_to_json(&row, include_bodies);
+                        merged.push((created_ts, id, obj));
                     }
-
-                    sort_product_inbox_items_desc(&mut merged);
-                    items = merged
-                        .into_iter()
-                        .take(max_messages)
-                        .map(|(_, _, v)| v)
-                        .collect();
                 }
+
+                sort_product_inbox_items_desc(&mut merged);
+                items = merged
+                    .into_iter()
+                    .take(max_messages)
+                    .map(|(_, _, v)| v)
+                    .collect();
             }
 
             if items.is_empty() {
