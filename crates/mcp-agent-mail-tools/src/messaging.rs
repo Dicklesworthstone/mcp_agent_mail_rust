@@ -3095,7 +3095,7 @@ pub async fn fetch_inbox(
         None
     };
 
-    let inbox_rows = db_outcome_to_mcp_result(
+    let inbox_rows = db_outcome_to_mcp_result(if include_body {
         mcp_agent_mail_db::queries::fetch_inbox(
             ctx.cx(),
             &read_pool,
@@ -3105,8 +3105,19 @@ pub async fn fetch_inbox(
             since_micros,
             msg_limit,
         )
-        .await,
-    )?;
+        .await
+    } else {
+        mcp_agent_mail_db::queries::fetch_inbox_metadata(
+            ctx.cx(),
+            &read_pool,
+            project_id,
+            agent_id,
+            urgent,
+            since_micros,
+            msg_limit,
+        )
+        .await
+    })?;
 
     let messages: Vec<InboxMessage> = inbox_rows
         .into_iter()

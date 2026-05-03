@@ -2595,7 +2595,7 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
     let agent_name = agent.name;
 
     // Fetch inbox messages
-    let inbox_rows = db_outcome_to_mcp_result(
+    let inbox_rows = db_outcome_to_mcp_result(if include_bodies {
         mcp_agent_mail_db::queries::fetch_inbox(
             ctx.cx(),
             &pool,
@@ -2605,8 +2605,19 @@ pub async fn inbox(ctx: &McpContext, agent: String) -> McpResult<String> {
             since_ts,
             limit,
         )
-        .await,
-    )?;
+        .await
+    } else {
+        mcp_agent_mail_db::queries::fetch_inbox_metadata(
+            ctx.cx(),
+            &pool,
+            project_id,
+            agent_id,
+            urgent_only,
+            since_ts,
+            limit,
+        )
+        .await
+    })?;
 
     let messages: Vec<InboxResourceMessage> = inbox_rows
         .into_iter()
@@ -2854,16 +2865,22 @@ fn outbox_query(
     limit_i64: i64,
 ) -> (String, Vec<mcp_agent_mail_db::sqlmodel::Value>) {
     use mcp_agent_mail_db::sqlmodel::Value;
+    let body_select = if options.include_bodies {
+        "body_md"
+    } else {
+        "'' AS body_md"
+    };
 
     options.since_ts.map_or_else(
         || {
             (
-                "SELECT id, project_id, sender_id, thread_id, subject, body_md, \
+                format!(
+                    "SELECT id, project_id, sender_id, thread_id, subject, {body_select}, \
                  importance, ack_required, created_ts, attachments \
                  FROM messages \
                  WHERE project_id = ? AND sender_id = ? \
                  ORDER BY created_ts + 0 DESC LIMIT ?"
-                    .to_string(),
+                ),
                 vec![
                     Value::BigInt(options.project_id),
                     Value::BigInt(options.agent_id),
@@ -2873,12 +2890,13 @@ fn outbox_query(
         },
         |ts| {
             (
-                "SELECT id, project_id, sender_id, thread_id, subject, body_md, \
+                format!(
+                    "SELECT id, project_id, sender_id, thread_id, subject, {body_select}, \
                  importance, ack_required, created_ts, attachments \
                  FROM messages \
                  WHERE project_id = ? AND sender_id = ? AND created_ts > ? \
                  ORDER BY created_ts + 0 DESC LIMIT ?"
-                    .to_string(),
+                ),
                 vec![
                     Value::BigInt(options.project_id),
                     Value::BigInt(options.agent_id),
@@ -3004,7 +3022,7 @@ async fn load_mailbox_messages(
     Vec<OutboxMessageEntry>,
 )> {
     let inbox_rows = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::fetch_inbox(
+        mcp_agent_mail_db::queries::fetch_inbox_metadata(
             ctx.cx(),
             pool,
             request.project_id,
@@ -3374,7 +3392,7 @@ pub async fn views_urgent_unread(ctx: &McpContext, agent: String) -> McpResult<S
 
     // Fetch inbox and filter for urgent unread
     let inbox_rows = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::fetch_inbox_unread(
+        mcp_agent_mail_db::queries::fetch_inbox_unread_metadata(
             ctx.cx(),
             &pool,
             project_id,
@@ -3448,7 +3466,7 @@ pub async fn views_ack_required(ctx: &McpContext, agent: String) -> McpResult<St
         .unwrap_or(0);
 
     let inbox_rows = db_outcome_to_mcp_result(
-        mcp_agent_mail_db::queries::fetch_inbox_ack_required(
+        mcp_agent_mail_db::queries::fetch_inbox_ack_required_metadata(
             ctx.cx(),
             &pool,
             project_id,

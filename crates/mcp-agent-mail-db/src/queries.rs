@@ -6377,6 +6377,31 @@ pub async fn fetch_inbox(
         false,
         since_ts,
         limit,
+        true,
+    )
+    .await
+}
+
+pub async fn fetch_inbox_metadata(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    urgent_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+) -> Outcome<Vec<InboxRow>, DbError> {
+    fetch_inbox_impl(
+        cx,
+        pool,
+        project_id,
+        agent_id,
+        urgent_only,
+        false,
+        false,
+        since_ts,
+        limit,
+        false,
     )
     .await
 }
@@ -6400,6 +6425,31 @@ pub async fn fetch_inbox_unread(
         false,
         since_ts,
         limit,
+        true,
+    )
+    .await
+}
+
+pub async fn fetch_inbox_unread_metadata(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    urgent_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+) -> Outcome<Vec<InboxRow>, DbError> {
+    fetch_inbox_impl(
+        cx,
+        pool,
+        project_id,
+        agent_id,
+        urgent_only,
+        true,
+        false,
+        since_ts,
+        limit,
+        false,
     )
     .await
 }
@@ -6412,7 +6462,20 @@ pub async fn fetch_inbox_ack_required(
     limit: usize,
 ) -> Outcome<Vec<InboxRow>, DbError> {
     fetch_inbox_impl(
-        cx, pool, project_id, agent_id, false, false, true, None, limit,
+        cx, pool, project_id, agent_id, false, false, true, None, limit, true,
+    )
+    .await
+}
+
+pub async fn fetch_inbox_ack_required_metadata(
+    cx: &Cx,
+    pool: &DbPool,
+    project_id: i64,
+    agent_id: i64,
+    limit: usize,
+) -> Outcome<Vec<InboxRow>, DbError> {
+    fetch_inbox_impl(
+        cx, pool, project_id, agent_id, false, false, true, None, limit, false,
     )
     .await
 }
@@ -6428,6 +6491,7 @@ async fn fetch_inbox_impl(
     ack_required_only: bool,
     since_ts: Option<i64>,
     limit: usize,
+    include_bodies: bool,
 ) -> Outcome<Vec<InboxRow>, DbError> {
     let Ok(_limit_i64) = i64::try_from(limit) else {
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
@@ -6440,16 +6504,31 @@ async fn fetch_inbox_impl(
         Outcome::Panicked(payload) => return Outcome::Panicked(payload),
     };
 
-    match crate::sync::fetch_inbox_rows_from_conn(
-        &conn,
-        project_id,
-        agent_id,
-        urgent_only,
-        unread_only,
-        ack_required_only,
-        since_ts,
-        limit,
-    ) {
+    let result = if include_bodies {
+        crate::sync::fetch_inbox_rows_from_conn(
+            &conn,
+            project_id,
+            agent_id,
+            urgent_only,
+            unread_only,
+            ack_required_only,
+            since_ts,
+            limit,
+        )
+    } else {
+        crate::sync::fetch_inbox_metadata_rows_from_conn(
+            &conn,
+            project_id,
+            agent_id,
+            urgent_only,
+            unread_only,
+            ack_required_only,
+            since_ts,
+            limit,
+        )
+    };
+
+    match result {
         Ok(rows) => Outcome::Ok(rows),
         Err(error) => Outcome::Err(error),
     }

@@ -65,10 +65,64 @@ pub fn fetch_inbox_rows_from_conn(
     since_ts: Option<i64>,
     limit: usize,
 ) -> Result<Vec<InboxRow>, DbError> {
+    fetch_inbox_rows_from_conn_impl(
+        conn,
+        project_id,
+        agent_id,
+        urgent_only,
+        unread_only,
+        ack_required_only,
+        since_ts,
+        limit,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn fetch_inbox_metadata_rows_from_conn(
+    conn: &DbConn,
+    project_id: i64,
+    agent_id: i64,
+    urgent_only: bool,
+    unread_only: bool,
+    ack_required_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+) -> Result<Vec<InboxRow>, DbError> {
+    fetch_inbox_rows_from_conn_impl(
+        conn,
+        project_id,
+        agent_id,
+        urgent_only,
+        unread_only,
+        ack_required_only,
+        since_ts,
+        limit,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fetch_inbox_rows_from_conn_impl(
+    conn: &DbConn,
+    project_id: i64,
+    agent_id: i64,
+    urgent_only: bool,
+    unread_only: bool,
+    ack_required_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+    include_bodies: bool,
+) -> Result<Vec<InboxRow>, DbError> {
     let _ = conn.execute_raw("PRAGMA busy_timeout = 250");
+    let body_select = if include_bodies {
+        "m.body_md"
+    } else {
+        "'' AS body_md"
+    };
 
     let mut sql = format!(
-        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, m.body_md, \
+        "SELECT m.id, m.project_id, m.sender_id, m.thread_id, m.subject, {body_select}, \
                 m.importance, m.ack_required, m.created_ts, m.recipients_json, m.attachments, \
                 r.kind, COALESCE(s.name, '{UNKNOWN_SENDER_DISPLAY}') AS sender_name, r.read_ts, r.ack_ts \
          FROM message_recipients r \
@@ -699,6 +753,58 @@ mod tests {
             .next()
             .and_then(|r| r.get_named::<i64>("id").ok())
             .expect("get message id")
+    }
+
+    #[test]
+    fn fetch_inbox_metadata_rows_omit_body_payload() {
+        let conn = test_conn();
+        let pid = insert_project(&conn);
+        let sender_id = insert_agent(&conn, pid, "Sender");
+        let recipient_id = insert_agent(&conn, pid, "Recipient");
+        let msg_id = insert_message(&conn, pid, sender_id, "thread-1");
+        conn.execute_sync(
+            "UPDATE messages SET body_md = ? WHERE id = ?",
+            &[
+                Value::Text("large body payload that metadata reads should not load".repeat(8)),
+                Value::BigInt(msg_id),
+            ],
+        )
+        .expect("update message body");
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (?1, ?2, 'to')",
+            &[Value::BigInt(msg_id), Value::BigInt(recipient_id)],
+        )
+        .expect("insert recipient");
+
+        let full_rows =
+            fetch_inbox_rows_from_conn(&conn, pid, recipient_id, false, false, false, None, 10)
+                .expect("full inbox fetch");
+        assert_eq!(full_rows.len(), 1);
+        assert!(
+            full_rows[0]
+                .message
+                .body_md
+                .starts_with("large body payload")
+        );
+
+        let metadata_rows = fetch_inbox_metadata_rows_from_conn(
+            &conn,
+            pid,
+            recipient_id,
+            false,
+            false,
+            false,
+            None,
+            10,
+        )
+        .expect("metadata inbox fetch");
+        assert_eq!(metadata_rows.len(), 1);
+        assert_eq!(metadata_rows[0].message.id, Some(msg_id));
+        assert_eq!(metadata_rows[0].message.subject, "test subject");
+        assert!(
+            metadata_rows[0].message.body_md.is_empty(),
+            "metadata-only inbox reads should not materialize message bodies"
+        );
     }
 
     // ── update_message_thread_id tests ───────────────────────────────

@@ -567,7 +567,7 @@ pub async fn fetch_inbox_product(
                 }
                 Err(err) => return Err(err),
             };
-        let rows = db_outcome_to_mcp_result(
+        let rows = db_outcome_to_mcp_result(if with_bodies {
             mcp_agent_mail_db::queries::fetch_inbox(
                 ctx.cx(),
                 &pool,
@@ -577,8 +577,19 @@ pub async fn fetch_inbox_product(
                 since_micros,
                 max_messages,
             )
-            .await,
-        )?;
+            .await
+        } else {
+            mcp_agent_mail_db::queries::fetch_inbox_metadata(
+                ctx.cx(),
+                &pool,
+                project_id,
+                agent.id.unwrap_or(0),
+                urgent,
+                since_micros,
+                max_messages,
+            )
+            .await
+        })?;
         for row in rows {
             let msg = row.message;
             let created_ts = msg.created_ts;

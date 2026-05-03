@@ -8,7 +8,7 @@ use std::hint::black_box;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use mcp_agent_mail_db::DbConn;
 use mcp_agent_mail_db::schema;
-use mcp_agent_mail_db::sync::fetch_inbox_rows_from_conn;
+use mcp_agent_mail_db::sync::{fetch_inbox_metadata_rows_from_conn, fetch_inbox_rows_from_conn};
 use sqlmodel_core::Value;
 
 fn block_on<F, Fut, T>(f: F) -> T
@@ -24,6 +24,10 @@ where
 }
 
 fn seeded_conn(n_messages: usize) -> (DbConn, i64, Vec<i64>) {
+    seeded_conn_with_body_bytes(n_messages, 0)
+}
+
+fn seeded_conn_with_body_bytes(n_messages: usize, body_bytes: usize) -> (DbConn, i64, Vec<i64>) {
     let conn = DbConn::open_memory().expect("open in-memory db");
     conn.execute_raw(schema::PRAGMA_DB_INIT_SQL)
         .expect("apply PRAGMAs");
@@ -60,6 +64,7 @@ fn seeded_conn(n_messages: usize) -> (DbConn, i64, Vec<i64>) {
     }
 
     let base_ts: i64 = 1_700_000_000_000_000;
+    let body_padding = "x".repeat(body_bytes);
     for i in 0..n_messages {
         let sender_idx = i % n_agents;
         let i_i64 = i64::try_from(i).expect("benchmark message index fits i64");
@@ -75,7 +80,7 @@ fn seeded_conn(n_messages: usize) -> (DbConn, i64, Vec<i64>) {
                 Value::BigInt(agent_ids[sender_idx]),
                 Value::Text(format!("Subject {i}")),
                 Value::Text(format!(
-                    "Body of message {i} with some realistic length content."
+                    "Body of message {i} with some realistic length content. {body_padding}"
                 )),
                 Value::Text(importance.to_string()),
                 Value::BigInt(ack_req),
@@ -208,6 +213,52 @@ fn bench_inbox_fetch_since(c: &mut Criterion) {
     });
 }
 
+fn bench_inbox_fetch_body_policy(c: &mut Criterion) {
+    let (conn, project_id, agent_ids) = seeded_conn_with_body_bytes(10_000, 4096);
+    let target_agent = agent_ids[1];
+
+    let mut group = c.benchmark_group("inbox_fetch_10k_body_policy");
+    group.sample_size(50);
+
+    group.bench_function("full_bodies_limit_200", |b| {
+        b.iter(|| {
+            black_box(
+                fetch_inbox_rows_from_conn(
+                    &conn,
+                    project_id,
+                    target_agent,
+                    false,
+                    false,
+                    false,
+                    None,
+                    200,
+                )
+                .expect("full inbox fetch"),
+            )
+        });
+    });
+
+    group.bench_function("metadata_only_limit_200", |b| {
+        b.iter(|| {
+            black_box(
+                fetch_inbox_metadata_rows_from_conn(
+                    &conn,
+                    project_id,
+                    target_agent,
+                    false,
+                    false,
+                    false,
+                    None,
+                    200,
+                )
+                .expect("metadata inbox fetch"),
+            )
+        });
+    });
+
+    group.finish();
+}
+
 fn bench_inbox_stats_query(c: &mut Criterion) {
     let (conn, project_id, agent_ids) = seeded_conn(10_000);
     let target_agent = agent_ids[1];
@@ -231,6 +282,7 @@ criterion_group!(
     benches,
     bench_inbox_fetch,
     bench_inbox_fetch_since,
+    bench_inbox_fetch_body_policy,
     bench_inbox_stats_query,
 );
 criterion_main!(benches);
