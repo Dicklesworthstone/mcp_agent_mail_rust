@@ -21814,7 +21814,7 @@ fn build_server_reply_message_arguments(
 fn build_server_fetch_inbox_product_arguments(
     product_key: &str,
     agent_name: &str,
-    limit: i64,
+    limit: usize,
     urgent_only: bool,
     include_bodies: bool,
     since_ts: Option<&str>,
@@ -21833,6 +21833,53 @@ fn build_server_fetch_inbox_product_arguments(
         arguments.insert("since_ts".to_string(), serde_json::json!(since_ts));
     }
     serde_json::Value::Object(arguments)
+}
+
+const FETCH_INBOX_PRODUCT_LIMIT_MAX: usize = 1000;
+
+fn parse_cli_fetch_inbox_product_limit(limit: i64) -> CliResult<usize> {
+    if limit < 1 {
+        return Err(CliError::InvalidArgument(format!(
+            "limit must be at least 1, got {limit}. Use a positive integer."
+        )));
+    }
+
+    let limit = usize::try_from(limit).map_err(|_| {
+        CliError::InvalidArgument(format!("limit exceeds supported range: {limit}"))
+    })?;
+    Ok(limit.min(FETCH_INBOX_PRODUCT_LIMIT_MAX))
+}
+
+fn normalize_cli_product_inbox_agent_name(agent_name: &str) -> CliResult<String> {
+    let trimmed = agent_name.trim();
+    if trimmed.is_empty() {
+        return Err(CliError::InvalidArgument(
+            "agent name cannot be empty. Provide a valid agent name.".to_string(),
+        ));
+    }
+
+    let normalized = mcp_agent_mail_core::models::normalize_agent_name(trimmed)
+        .unwrap_or_else(|| trimmed.to_string());
+    const AGENT_PLACEHOLDER_PATTERNS: &[&str] = &[
+        "YOUR_AGENT",
+        "YOUR_AGENT_NAME",
+        "AGENT_NAME",
+        "PLACEHOLDER",
+        "<AGENT>",
+        "{AGENT}",
+        "$AGENT",
+    ];
+    let name_upper = normalized.to_ascii_uppercase();
+    for pattern in AGENT_PLACEHOLDER_PATTERNS {
+        if name_upper.contains(pattern) {
+            return Err(CliError::InvalidArgument(format!(
+                "detected placeholder value '{agent_name}' instead of a real agent name. \
+                 Replace placeholder values with your actual agent name."
+            )));
+        }
+    }
+
+    Ok(normalized)
 }
 
 fn sort_product_inbox_items_desc(items: &mut [(i64, i64, serde_json::Value)]) {
@@ -23013,7 +23060,8 @@ mod mail_server_cli_bridge_tests {
         build_server_send_message_arguments, classify_server_tool_call, coerce_tool_result_json,
         coerce_tool_result_json_or_error, ensure_message_in_project,
         fetch_inbox_server_rejection_allows_local_fallback, is_resource_busy_cli_error,
-        mail_server_rejection_allows_local_fallback, product_inbox_row_to_json,
+        mail_server_rejection_allows_local_fallback, normalize_cli_product_inbox_agent_name,
+        parse_cli_fetch_inbox_product_limit, product_inbox_row_to_json,
         server_inbox_payload_to_cli_json, server_message_payload_to_cli_json,
         sort_product_inbox_items_desc, sqlite_doctor_sanity_with_health_probe,
     };
@@ -23212,6 +23260,45 @@ mod mail_server_cli_bridge_tests {
         assert_eq!(
             object.get("since_ts").and_then(serde_json::Value::as_str),
             Some("2026-03-18T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn fetch_inbox_product_cli_limit_must_be_positive() {
+        let err = parse_cli_fetch_inbox_product_limit(0).expect_err("zero limit should fail");
+        assert!(err.to_string().contains("limit must be at least 1"));
+
+        let err = parse_cli_fetch_inbox_product_limit(-5).expect_err("negative limit should fail");
+        assert!(err.to_string().contains("limit must be at least 1"));
+    }
+
+    #[test]
+    fn fetch_inbox_product_cli_limit_caps_large_values() {
+        assert_eq!(
+            parse_cli_fetch_inbox_product_limit(5_000).expect("large limit should cap"),
+            1000
+        );
+    }
+
+    #[test]
+    fn fetch_inbox_product_cli_agent_name_rejects_placeholders() {
+        let err = normalize_cli_product_inbox_agent_name("YOUR_AGENT_NAME")
+            .expect_err("placeholder agent name should fail");
+        assert!(err.to_string().contains("placeholder value"));
+
+        assert_eq!(
+            normalize_cli_product_inbox_agent_name("PinkStone")
+                .expect("real agent name should be accepted"),
+            "PinkStone"
+        );
+    }
+
+    #[test]
+    fn fetch_inbox_product_cli_agent_name_normalizes_valid_agent_names() {
+        assert_eq!(
+            normalize_cli_product_inbox_agent_name("  pinkstone  ")
+                .expect("valid agent name should normalize"),
+            "PinkStone"
         );
     }
 
@@ -52527,6 +52614,8 @@ async fn handle_products_with(
             let fmt = output::CliOutputFormat::resolve(format, json);
             let urgent_only = resolve_bool(urgent_only, all, false);
             let include_bodies = resolve_bool(include_bodies, no_bodies, false);
+            let max_messages = parse_cli_fetch_inbox_product_limit(limit)?;
+            let agent = normalize_cli_product_inbox_agent_name(&agent)?;
             let pool = require_products_pool(pool, "products inbox")?;
 
             let mut server_answered = false;
@@ -52538,7 +52627,7 @@ async fn handle_products_with(
                     build_server_fetch_inbox_product_arguments(
                         &product_key,
                         &agent,
-                        limit,
+                        max_messages,
                         urgent_only,
                         include_bodies,
                         since_ts.as_deref(),
@@ -52611,7 +52700,6 @@ async fn handle_products_with(
                     let since_micros = since_ts
                         .as_deref()
                         .and_then(mcp_agent_mail_db::iso_to_micros);
-                    let max_messages = usize::try_from(limit.max(0)).unwrap_or(0);
 
                     let mut merged: Vec<(i64, i64, serde_json::Value)> = Vec::new();
                     for p in projects {
