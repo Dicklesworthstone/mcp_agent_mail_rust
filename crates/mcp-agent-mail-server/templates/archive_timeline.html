@@ -90,7 +90,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   const container = document.getElementById('timeline-container');
-  container.innerHTML = `<pre class="mermaid">${mermaidCode}</pre>`;
+  const pre = document.createElement('pre');
+  pre.className = 'mermaid';
+  pre.textContent = mermaidCode;
+  container.replaceChildren(pre);
 
   try {
     await window.mermaid.run();

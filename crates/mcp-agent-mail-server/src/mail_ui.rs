@@ -2249,6 +2249,20 @@ mod auth_route_hardening_regression_suite {
         );
     }
 
+    #[test]
+    fn archive_timeline_mermaid_payload_is_inserted_as_text() {
+        let template = include_str!("../templates/archive_timeline.html");
+        assert!(
+            template.contains("pre.textContent = mermaidCode"),
+            "Mermaid payload must be assigned as text, not HTML"
+        );
+        assert!(
+            !template
+                .contains("container.innerHTML = `<pre class=\"mermaid\">${mermaidCode}</pre>`"),
+            "Git-controlled author/sender labels must not be interpolated through innerHTML"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn resolve_archive_project_ignores_symlinked_project_metadata() {
