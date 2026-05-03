@@ -34194,7 +34194,8 @@ startup_timeout_sec = 42
                     detail.contains("could not be opened directly")
                         || detail.contains("failed a direct sqlite probe")
                         || detail.contains("could not be opened for canonical salvage read")
-                        || detail.contains("failed a canonical salvage probe"),
+                        || detail.contains("failed a canonical salvage probe")
+                        || detail.contains("failed a canonical salvage quick_check"),
                     "unexpected salvage failure detail: {detail}"
                 );
             }
@@ -34215,6 +34216,25 @@ startup_timeout_sec = 42
     impl Drop for DoctorSalvageTableScanFailureGuard {
         fn drop(&mut self) {
             *doctor_salvage_table_scan_failure_path()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+    }
+
+    struct DoctorSalvageQuickCheckFailureGuard;
+
+    impl DoctorSalvageQuickCheckFailureGuard {
+        fn new(path: &Path) -> Self {
+            *doctor_salvage_quick_check_failure_path()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path.to_path_buf());
+            Self
+        }
+    }
+
+    impl Drop for DoctorSalvageQuickCheckFailureGuard {
+        fn drop(&mut self) {
+            *doctor_salvage_quick_check_failure_path()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
@@ -34280,6 +34300,51 @@ startup_timeout_sec = 42
         drop(backup_conn);
 
         let _scan_failure = DoctorSalvageTableScanFailureGuard::new(&db_path);
+        let salvage = attempt_best_doctor_salvage_artifact(&db_path);
+        match salvage {
+            DoctorSalvageAttempt::Succeeded(artifact) => {
+                assert_eq!(artifact.db_path, backup_path);
+                assert!(
+                    artifact.detail.contains("backup candidate"),
+                    "unexpected salvage detail: {}",
+                    artifact.detail
+                );
+            }
+            DoctorSalvageAttempt::Failed(detail) => {
+                panic!("expected backup salvage fallback, got failure: {detail}");
+            }
+        }
+    }
+
+    #[test]
+    fn attempt_best_doctor_salvage_artifact_falls_back_when_current_quick_check_fails() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        let live_conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open live sqlite db");
+        live_conn
+            .execute_raw("CREATE TABLE messages(id INTEGER PRIMARY KEY)")
+            .expect("create messages table");
+        live_conn
+            .execute_raw("INSERT INTO messages(id) VALUES(1)")
+            .expect("insert live message");
+        drop(live_conn);
+
+        let backup_path = dir.path().join("storage.sqlite3.bak");
+        let backup_conn = mcp_agent_mail_db::DbConn::open_file(backup_path.display().to_string())
+            .expect("open backup sqlite db");
+        backup_conn
+            .execute_raw("CREATE TABLE messages(id INTEGER PRIMARY KEY)")
+            .expect("create backup messages table");
+        backup_conn
+            .execute_raw("INSERT INTO messages(id) VALUES(2)")
+            .expect("insert backup message");
+        drop(backup_conn);
+
+        let _quick_check_failure = DoctorSalvageQuickCheckFailureGuard::new(&db_path);
         let salvage = attempt_best_doctor_salvage_artifact(&db_path);
         match salvage {
             DoctorSalvageAttempt::Succeeded(artifact) => {
@@ -49560,6 +49625,12 @@ fn attempt_readable_sqlite_salvage_source(sqlite_path: &Path, label: &str) -> Do
             sqlite_path.display()
         ));
     }
+    if let Err(error) = probe_doctor_salvage_quick_check(&conn, sqlite_path) {
+        return DoctorSalvageAttempt::Failed(format!(
+            "{label} {} failed a canonical salvage quick_check: {error}",
+            sqlite_path.display()
+        ));
+    }
     if let Err(error) = probe_doctor_salvage_tables(&conn, sqlite_path) {
         return DoctorSalvageAttempt::Failed(format!(
             "{label} {} failed a canonical salvage table scan: {error}",
@@ -49574,6 +49645,25 @@ fn attempt_readable_sqlite_salvage_source(sqlite_path: &Path, label: &str) -> Do
             sqlite_path.display()
         ),
     })
+}
+
+fn probe_doctor_salvage_quick_check(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
+    sqlite_path: &Path,
+) -> Result<(), String> {
+    #[cfg(not(test))]
+    let _ = sqlite_path;
+
+    #[cfg(test)]
+    if should_fail_doctor_salvage_quick_check(sqlite_path) {
+        return Err("simulated quick_check corruption".to_string());
+    }
+
+    match sqlite_conn_quick_check_ok_canonical(conn) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("PRAGMA quick_check did not return ok".to_string()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn probe_doctor_salvage_tables(
@@ -49614,6 +49704,21 @@ fn doctor_salvage_table_scan_failure_path() -> &'static std::sync::Mutex<Option<
     static PATH: std::sync::OnceLock<std::sync::Mutex<Option<PathBuf>>> =
         std::sync::OnceLock::new();
     PATH.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn doctor_salvage_quick_check_failure_path() -> &'static std::sync::Mutex<Option<PathBuf>> {
+    static PATH: std::sync::OnceLock<std::sync::Mutex<Option<PathBuf>>> =
+        std::sync::OnceLock::new();
+    PATH.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn should_fail_doctor_salvage_quick_check(sqlite_path: &Path) -> bool {
+    let guard = doctor_salvage_quick_check_failure_path()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.as_deref() == Some(sqlite_path)
 }
 
 #[cfg(test)]
