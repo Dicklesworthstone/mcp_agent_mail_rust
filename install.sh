@@ -23,7 +23,7 @@
 #   --offline          Skip network preflight checks
 #   --force            Force reinstall even if already at version
 #   --migrate          Force Python->Rust migration/displacement when Python install detected
-#   --no-migrate       Skip Python->Rust migration/displacement even when detected
+#   --no-migrate       Skip and remember Python->Rust migration/displacement
 #   --uninstall        Remove installed binaries/configuration helpers
 #   --yes              Non-interactive mode (skip all confirmations)
 #   --purge            With --uninstall, also delete data directories/database
@@ -646,6 +646,22 @@ MAC_DIRECT_EXEC_COMPAT_LAUNCHER=""
 CAPTURED_CMD_OUTPUT=""
 CAPTURED_CMD_STATUS=0
 PYTHON_MIGRATION_MARKER="${PYTHON_MIGRATION_MARKER:-$HOME/.config/mcp-agent-mail/.python-migration-complete}"
+PYTHON_MIGRATION_SKIP_MARKER="${PYTHON_MIGRATION_SKIP_MARKER:-$HOME/.config/mcp-agent-mail/.python-migration-skipped}"
+
+write_python_migration_skip_marker() {
+  local reason="${1:-unspecified}"
+  if mkdir -p "$(dirname "$PYTHON_MIGRATION_SKIP_MARKER")" 2>/dev/null && \
+     printf 'skipped_at=%s\nreason=%s\ninstaller_version=%s\n' \
+       "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+       "$reason" \
+       "${VERSION:-unknown}" \
+       > "$PYTHON_MIGRATION_SKIP_MARKER" 2>/dev/null; then
+    verbose "python_migration_skip_marker:written path=${PYTHON_MIGRATION_SKIP_MARKER} reason=${reason}"
+  else
+    warn "Could not save Python→Rust migration skip marker at: $PYTHON_MIGRATION_SKIP_MARKER"
+    warn "Future installer runs may ask about the migration again."
+  fi
+}
 
 path_resolves_to_installed_am() {
   local candidate="$1"
@@ -4497,6 +4513,7 @@ interactive_shell_descriptor_matches_installed_am() {
 }
 
 existing_rust_binaries_are_skip_safe() {
+  local allow_intentional_python_shadow="${1:-0}"
   EXISTING_INSTALL_REPAIR_REASON=""
 
   if [ ! -x "$DEST/$BIN_CLI" ]; then
@@ -4546,6 +4563,10 @@ existing_rust_binaries_are_skip_safe() {
     return 1
   fi
   if ! interactive_shell_descriptor_matches_installed_am "$actual_resolution"; then
+    if [ "$allow_intentional_python_shadow" -eq 1 ] && [ "$PYTHON_DETECTED" -eq 1 ]; then
+      verbose "existing_install_can_skip:interactive shell intentionally remains on legacy Python am due to skip marker: ${actual_resolution}"
+      return 0
+    fi
     if printf '%s\n' "$actual_resolution" | grep -qiE 'alias|function'; then
       EXISTING_INSTALL_REPAIR_REASON="interactive shell still resolves 'am' via ${actual_resolution}"
     else
@@ -4560,7 +4581,12 @@ existing_rust_binaries_are_skip_safe() {
 existing_install_can_skip() {
   EXISTING_INSTALL_REPAIR_REASON=""
 
-  if [ "$PYTHON_DETECTED" -eq 1 ] && [ "$FORCE_NO_MIGRATE" -eq 0 ]; then
+  local python_migration_skip_chosen=0
+  if [ "$PYTHON_DETECTED" -eq 1 ] && [ -f "$PYTHON_MIGRATION_SKIP_MARKER" ] && [ "$FORCE_MIGRATE" -ne 1 ]; then
+    python_migration_skip_chosen=1
+  fi
+
+  if [ "$PYTHON_DETECTED" -eq 1 ] && [ "$FORCE_NO_MIGRATE" -eq 0 ] && [ "$python_migration_skip_chosen" -eq 0 ]; then
     local python_shadow_active=0
     if [ "$PYTHON_ALIAS_FOUND" -eq 1 ] && ! python_alias_points_to_installed_am; then
       python_shadow_active=1
@@ -4578,9 +4604,11 @@ existing_install_can_skip() {
       return 1
     fi
     verbose "existing_install_can_skip:legacy clone remains but migration marker is present and no active Python launcher shadows Rust"
+  elif [ "$python_migration_skip_chosen" -eq 1 ]; then
+    verbose "existing_install_can_skip:legacy Python installation intentionally retained by skip marker ${PYTHON_MIGRATION_SKIP_MARKER}"
   fi
 
-  existing_rust_binaries_are_skip_safe
+  existing_rust_binaries_are_skip_safe "$python_migration_skip_chosen"
 }
 
 usage() {
@@ -4607,7 +4635,7 @@ Options:
   --no-verify        Skip checksum + signature verification (for testing only)
   --force            Force reinstall even if same version is installed
   --migrate          Force Python->Rust migration/displacement when Python install is detected
-  --no-migrate       Skip Python->Rust migration/displacement even if Python install is detected
+  --no-migrate       Skip and remember Python->Rust migration/displacement
   --uninstall        Remove installed binaries/configuration helpers
   --yes              Non-interactive mode (skip all confirmations)
   --purge            With --uninstall, also delete storage/database data
@@ -4796,10 +4824,16 @@ print_install_plan() {
 
   # Section 3: Python migration
   if [ "$PYTHON_DETECTED" -eq 1 ]; then
-    local _plan_marker="$HOME/.config/mcp-agent-mail/.python-migration-complete"
+    local _plan_marker="$PYTHON_MIGRATION_MARKER"
+    local _plan_skip_marker="$PYTHON_MIGRATION_SKIP_MARKER"
     if [ -f "$_plan_marker" ] && [ "$FORCE_MIGRATE" -ne 1 ]; then
       echo -e "\033[${section_color}m[Python Migration]\033[0m"
       echo "  Already migrated — skipping (marker: $_plan_marker)"
+      echo ""
+    elif [ -f "$_plan_skip_marker" ] && [ "$FORCE_MIGRATE" -ne 1 ]; then
+      echo -e "\033[${section_color}m[Python Migration]\033[0m"
+      echo "  Previously skipped — keeping legacy Python active (marker: $_plan_skip_marker)"
+      echo "  To migrate now, rerun with --migrate"
       echo ""
     else
       echo -e "\033[${section_color}m[Python Migration]\033[0m"
@@ -5153,6 +5187,12 @@ if [ -f "$PYTHON_MIGRATION_MARKER" ]; then
   verbose "python_migration_marker:found path=${PYTHON_MIGRATION_MARKER}"
 fi
 
+PYTHON_MIGRATION_SKIP_ALREADY_CHOSEN=0
+if [ -f "$PYTHON_MIGRATION_SKIP_MARKER" ]; then
+  PYTHON_MIGRATION_SKIP_ALREADY_CHOSEN=1
+  verbose "python_migration_skip_marker:found path=${PYTHON_MIGRATION_SKIP_MARKER}"
+fi
+
 # Displace Python installation if detected (T2.2)
 if [ "$PYTHON_DETECTED" -eq 1 ]; then
   if [ "$PYTHON_MIGRATION_ALREADY_DONE" -eq 1 ] && [ "$FORCE_MIGRATE" -ne 1 ]; then
@@ -5167,6 +5207,11 @@ if [ "$PYTHON_DETECTED" -eq 1 ]; then
       displace_python_alias 2>/dev/null || true
       displace_python_binary 2>/dev/null || true
     fi
+  elif [ "$PYTHON_MIGRATION_SKIP_ALREADY_CHOSEN" -eq 1 ] && [ "$FORCE_MIGRATE" -ne 1 ]; then
+    MIGRATE_PYTHON=0
+    info "Python installation detected but Python→Rust migration was previously skipped."
+    info "  Marker: $PYTHON_MIGRATION_SKIP_MARKER"
+    info "  To migrate now: re-run with --migrate"
   elif [ "$MAC_DIRECT_EXEC_COMPAT_MODE" -eq 1 ]; then
     MIGRATE_PYTHON=0
     warn "Keeping the existing Python installation active because this macOS host blocks direct execution of the newly installed Rust binaries."
@@ -5175,6 +5220,7 @@ if [ "$PYTHON_DETECTED" -eq 1 ]; then
     if [ "$FORCE_NO_MIGRATE" -eq 1 ]; then
       MIGRATE_PYTHON=0
       warn "Skipping Python displacement due to --no-migrate."
+      write_python_migration_skip_marker "explicit --no-migrate"
     elif [ "$FORCE_MIGRATE" -eq 1 ]; then
       MIGRATE_PYTHON=1
       info "Forcing Python displacement due to --migrate."
@@ -5194,6 +5240,7 @@ if [ "$PYTHON_DETECTED" -eq 1 ]; then
         [nN]*)
           MIGRATE_PYTHON=0
           warn "Skipping Python displacement."
+          write_python_migration_skip_marker "interactive decline"
           if [ "$PYTHON_ALIAS_FOUND" -eq 1 ]; then
             warn "The shell alias 'am' still points to the Python version."
             warn "The Rust binary is available as: $DEST/$BIN_CLI"

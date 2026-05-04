@@ -445,9 +445,7 @@ pub async fn macro_prepare_thread(
     if let Some(bodies) = include_inbox_bodies {
         tracing::debug!("Include inbox bodies: {}", bodies);
     }
-    if let Some(limit) = inbox_limit {
-        tracing::debug!("Inbox limit: {}", limit);
-    }
+    tracing::debug!("Inbox limit: {}", inbox_limit);
 
     serde_json::to_string(&response)
         .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")))
