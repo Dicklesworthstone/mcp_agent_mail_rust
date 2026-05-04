@@ -88,6 +88,19 @@ fn normalize_resolved_pane_agent_name(name: &str) -> Option<String> {
     None
 }
 
+fn parse_macro_inbox_limit(inbox_limit: Option<i32>) -> McpResult<i32> {
+    let msg_limit = inbox_limit.unwrap_or(10);
+    if msg_limit < 1 {
+        return Err(legacy_tool_error(
+            "INVALID_LIMIT",
+            format!("inbox_limit must be at least 1, got {msg_limit}. Use a positive integer."),
+            true,
+            serde_json::json!({ "provided": msg_limit, "min": 1, "max": 1000 }),
+        ));
+    }
+    Ok(msg_limit)
+}
+
 /// Boot a project session: ensure project + register agent + reserve files + fetch inbox.
 ///
 /// # Parameters
@@ -122,6 +135,7 @@ pub async fn macro_start_session(
 ) -> McpResult<String> {
     let agent_name =
         agent_name.map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n));
+    let inbox_limit = parse_macro_inbox_limit(inbox_limit)?;
 
     // Validate human_key is absolute
     if !std::path::Path::new(&human_key).is_absolute() {
@@ -206,10 +220,7 @@ pub async fn macro_start_session(
         agent.name.clone(),
         Some(false),
         None,
-        Some(match inbox_limit {
-            Some(l) if l > 0 => l,
-            _ => 10,
-        }),
+        Some(inbox_limit),
         Some(false),
         None,
     )
@@ -283,6 +294,7 @@ pub async fn macro_prepare_thread(
 
     let agent_name =
         agent_name.map(|n| mcp_agent_mail_core::models::normalize_agent_name(&n).unwrap_or(n));
+    let inbox_limit = parse_macro_inbox_limit(inbox_limit)?;
 
     let pool = get_db_pool()?;
     let project_row = resolve_project(ctx, &pool, &project_key).await?;
@@ -404,10 +416,7 @@ pub async fn macro_prepare_thread(
         agent.name.clone(),
         Some(false),
         None,
-        Some(match inbox_limit {
-            Some(l) if l > 0 => l,
-            _ => 10,
-        }),
+        Some(inbox_limit),
         Some(include_inbox_bodies.unwrap_or(false)),
         None,
     )
@@ -838,6 +847,21 @@ mod tests {
             normalize_resolved_pane_agent_name("BackendHarmonizer"),
             None
         );
+    }
+
+    #[test]
+    fn macro_inbox_limit_defaults_only_when_absent() {
+        assert_eq!(parse_macro_inbox_limit(None).unwrap(), 10);
+        assert_eq!(parse_macro_inbox_limit(Some(25)).unwrap(), 25);
+    }
+
+    #[test]
+    fn macro_inbox_limit_must_be_positive() {
+        let err = parse_macro_inbox_limit(Some(0)).expect_err("zero inbox_limit should fail");
+        assert!(err.to_string().contains("inbox_limit must be at least 1"));
+
+        let err = parse_macro_inbox_limit(Some(-5)).expect_err("negative inbox_limit should fail");
+        assert!(err.to_string().contains("inbox_limit must be at least 1"));
     }
 
     // -----------------------------------------------------------------------

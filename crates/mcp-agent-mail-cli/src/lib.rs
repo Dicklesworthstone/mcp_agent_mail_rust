@@ -21865,6 +21865,23 @@ fn parse_cli_search_limit(command: &str, limit: i64) -> CliResult<usize> {
     Ok(limit.min(CLI_SEARCH_LIMIT_MAX))
 }
 
+const CLI_MACRO_INBOX_LIMIT_MAX: usize = 1000;
+
+fn parse_cli_macro_inbox_limit(command: &str, limit: i32) -> CliResult<usize> {
+    if limit < 1 {
+        return Err(CliError::InvalidArgument(format!(
+            "{command} inbox limit must be at least 1, got {limit}. Use a positive integer."
+        )));
+    }
+
+    let limit = usize::try_from(limit).map_err(|_| {
+        CliError::InvalidArgument(format!(
+            "{command} inbox limit exceeds supported range: {limit}"
+        ))
+    })?;
+    Ok(limit.min(CLI_MACRO_INBOX_LIMIT_MAX))
+}
+
 fn normalize_cli_product_inbox_agent_name(agent_name: &str) -> CliResult<String> {
     let trimmed = agent_name.trim();
     if trimmed.is_empty() {
@@ -22340,6 +22357,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             if !reserve_paths.is_empty() {
                 validate_reservation_ttl_seconds(reserve_ttl)?;
             }
+            let inbox_limit = parse_cli_macro_inbox_limit("macros start-session", inbox_limit)?;
 
             // 1. Ensure project
             let proj = resolve_project_async(&cx, &ctx.pool, &human_key).await?;
@@ -22393,7 +22411,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                     agent.id.unwrap_or(0),
                     false,
                     None,
-                    inbox_limit.max(0) as usize,
+                    inbox_limit,
                 )
                 .await,
             )?;
@@ -22454,6 +22472,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             let fmt = output::CliOutputFormat::resolve(format, json);
             let should_register = context::resolve_bool(register, no_register, true);
             let include_examples = context::resolve_bool(examples, no_examples, true);
+            let inbox_limit = parse_cli_macro_inbox_limit("macros prepare-thread", inbox_limit)?;
 
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
             let pid = proj.id.unwrap_or(0);
@@ -22522,7 +22541,6 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             };
 
             // Fetch inbox
-            let inbox_limit = inbox_limit.max(0) as usize;
             let inbox = outcome_to_result(if inbox_bodies {
                 mcp_agent_mail_db::queries::fetch_inbox(
                     &cx,
@@ -23316,6 +23334,32 @@ mod mail_server_cli_bridge_tests {
     fn search_cli_limit_caps_large_values() {
         assert_eq!(
             parse_cli_search_limit("products search", 5_000).expect("large limit should cap"),
+            1000
+        );
+    }
+
+    #[test]
+    fn macro_inbox_cli_limit_must_be_positive() {
+        let err = parse_cli_macro_inbox_limit("macros start-session", 0)
+            .expect_err("zero macro inbox limit should fail");
+        assert!(
+            err.to_string()
+                .contains("macros start-session inbox limit must be at least 1")
+        );
+
+        let err = parse_cli_macro_inbox_limit("macros prepare-thread", -5)
+            .expect_err("negative macro inbox limit should fail");
+        assert!(
+            err.to_string()
+                .contains("macros prepare-thread inbox limit must be at least 1")
+        );
+    }
+
+    #[test]
+    fn macro_inbox_cli_limit_caps_large_values() {
+        assert_eq!(
+            parse_cli_macro_inbox_limit("macros start-session", 5_000)
+                .expect("large macro inbox limit should cap"),
             1000
         );
     }
