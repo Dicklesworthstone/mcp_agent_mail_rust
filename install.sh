@@ -3290,7 +3290,7 @@ import os
 import re
 import shutil
 import sys
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 config_path, desired_url, desired_auth_header = sys.argv[1:4]
 
@@ -3381,7 +3381,7 @@ parent_dir = os.path.dirname(config_path)
 if parent_dir:
     os.makedirs(parent_dir, exist_ok=True)
 if os.path.exists(config_path):
-    stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     backup = f"{config_path}.{stamp}.bak"
     shutil.copy2(config_path, backup)
 else:
