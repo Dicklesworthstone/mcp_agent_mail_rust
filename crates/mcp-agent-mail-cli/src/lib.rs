@@ -23340,14 +23340,14 @@ mod mail_server_cli_bridge_tests {
 
     #[test]
     fn macro_inbox_cli_limit_must_be_positive() {
-        let err = parse_cli_macro_inbox_limit("macros start-session", 0)
+        let err = crate::parse_cli_macro_inbox_limit("macros start-session", 0)
             .expect_err("zero macro inbox limit should fail");
         assert!(
             err.to_string()
                 .contains("macros start-session inbox limit must be at least 1")
         );
 
-        let err = parse_cli_macro_inbox_limit("macros prepare-thread", -5)
+        let err = crate::parse_cli_macro_inbox_limit("macros prepare-thread", -5)
             .expect_err("negative macro inbox limit should fail");
         assert!(
             err.to_string()
@@ -23358,7 +23358,7 @@ mod mail_server_cli_bridge_tests {
     #[test]
     fn macro_inbox_cli_limit_caps_large_values() {
         assert_eq!(
-            parse_cli_macro_inbox_limit("macros start-session", 5_000)
+            crate::parse_cli_macro_inbox_limit("macros start-session", 5_000)
                 .expect("large macro inbox limit should cap"),
             1000
         );

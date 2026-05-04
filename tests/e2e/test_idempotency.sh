@@ -172,6 +172,10 @@ run_installer() {
 run_legacy_link_installer() {
     local case_name="$1"
     local path_value="$2"
+    shift 2
+    local -a extra_args=( "$@" )
+    local install_version="${LEGACY_LINK_VERSION:-0.1.0}"
+    local install_artifact="${LEGACY_LINK_ARTIFACT:-$ARTIFACT_V010}"
 
     local stdout_file="${WORK}/${case_name}_stdout.txt"
     local stderr_file="${WORK}/${case_name}_stderr.txt"
@@ -184,12 +188,13 @@ run_legacy_link_installer() {
         STORAGE_ROOT="$LEGACY_LINK_STORAGE" \
         PATH="$path_value" \
         bash "$INSTALL_SH" \
-            --version "v0.1.0" \
-            --artifact-url "file://${ARTIFACT_V010}" \
+            --version "v${install_version}" \
+            --artifact-url "file://${install_artifact}" \
             --dest "$LEGACY_LINK_DEST" \
             --offline \
             --no-verify \
-            --no-gum
+            --no-gum \
+            "${extra_args[@]}"
     ) >"$stdout_file" 2>"$stderr_file"
     LAST_INSTALL_RC=$?
     set -e
@@ -382,6 +387,80 @@ LEGACY_LINK_TARGET="$(readlink "${LEGACY_LINK_BIN}/am")"
 e2e_assert_eq "legacy-link shim still targets installed Rust am" "${LEGACY_LINK_DEST}/am" "$LEGACY_LINK_TARGET"
 LEGACY_LINK_BACKUPS_AFTER="$(count_glob_matches "${LEGACY_LINK_BIN}/am.bak.mcp-agent-mail-*")"
 e2e_assert_eq "legacy-link second install creates no am shim backup" "$LEGACY_LINK_BACKUPS_BEFORE" "$LEGACY_LINK_BACKUPS_AFTER"
+
+# ===========================================================================
+# Case 2c: Same-version install remembers an explicit migration skip
+# ===========================================================================
+e2e_case_banner "Same-version install honors skipped Python migration choice"
+
+LEGACY_SKIP_HOME="${WORK}/legacy_skip_home"
+LEGACY_SKIP_RUN_DIR="${WORK}/legacy_skip_project"
+LEGACY_SKIP_DEST="${LEGACY_SKIP_HOME}/rust-bin"
+LEGACY_SKIP_BIN="${LEGACY_SKIP_HOME}/.local/bin"
+LEGACY_SKIP_STORAGE="${LEGACY_SKIP_HOME}/storage_root"
+LEGACY_SKIP_CLONE="${LEGACY_SKIP_HOME}/mcp_agent_mail"
+LEGACY_SKIP_MARKER="${LEGACY_SKIP_HOME}/.config/mcp-agent-mail/.python-migration-skipped"
+mkdir -p "$LEGACY_SKIP_RUN_DIR" "$LEGACY_SKIP_DEST" "$LEGACY_SKIP_BIN" "$LEGACY_SKIP_STORAGE"
+
+LEGACY_LINK_HOME="$LEGACY_SKIP_HOME"
+LEGACY_LINK_RUN_DIR="$LEGACY_SKIP_RUN_DIR"
+LEGACY_LINK_DEST="$LEGACY_SKIP_DEST"
+LEGACY_LINK_BIN="$LEGACY_SKIP_BIN"
+LEGACY_LINK_STORAGE="$LEGACY_SKIP_STORAGE"
+
+run_legacy_link_installer "case_02c_first_install" "${LEGACY_SKIP_BIN}:${PATH_BASE}"
+e2e_assert_exit_code "skip-choice first install exits 0" "0" "$LAST_INSTALL_RC"
+
+mkdir -p "${LEGACY_SKIP_CLONE}/src/mcp_agent_mail" "${LEGACY_SKIP_CLONE}/scripts" "$(dirname "$LEGACY_SKIP_MARKER")"
+cat > "${LEGACY_SKIP_CLONE}/pyproject.toml" <<'EOF'
+[project]
+name = "mcp_agent_mail"
+EOF
+cat > "${LEGACY_SKIP_CLONE}/scripts/run_server_with_token.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "legacy python am"
+EOF
+chmod +x "${LEGACY_SKIP_CLONE}/scripts/run_server_with_token.sh"
+cat > "${LEGACY_SKIP_HOME}/.zshrc" <<EOF
+alias am='cd "${LEGACY_SKIP_CLONE}" && scripts/run_server_with_token.sh'
+EOF
+cat > "${LEGACY_SKIP_HOME}/.bashrc" <<EOF
+alias am='cd "${LEGACY_SKIP_CLONE}" && scripts/run_server_with_token.sh'
+EOF
+
+run_legacy_link_installer "case_02c_no_migrate_records_choice" "${LEGACY_SKIP_BIN}:${PATH_BASE}" --no-migrate
+e2e_assert_exit_code "skip-choice --no-migrate install exits 0" "0" "$LAST_INSTALL_RC"
+e2e_assert_contains "skip-choice --no-migrate records skip message" "$LAST_INSTALL_STDOUT" "Skipping Python displacement due to --no-migrate."
+e2e_assert_file_exists "skip-choice marker written" "$LEGACY_SKIP_MARKER"
+e2e_assert_contains "skip-choice marker records explicit reason" "$(cat "$LEGACY_SKIP_MARKER" 2>/dev/null || true)" "reason=explicit --no-migrate"
+
+run_legacy_link_installer "case_02c_yes_respects_skip_choice" "${LEGACY_SKIP_BIN}:${PATH_BASE}" --yes
+e2e_assert_exit_code "skip-choice --yes reinstall exits 0" "0" "$LAST_INSTALL_RC"
+e2e_assert_contains "skip-choice --yes reports already installed" "$LAST_INSTALL_STDOUT" "already installed"
+e2e_assert_not_contains "skip-choice --yes does not auto-accept migration" "$LAST_INSTALL_STDOUT" "Auto-accepting Python"
+e2e_assert_not_contains "skip-choice --yes does not displace Python alias" "$LAST_INSTALL_STDOUT" "Python alias disabled in"
+if grep -Eq '^[[:space:]]*alias am=' "${LEGACY_SKIP_HOME}/.zshrc"; then
+    e2e_pass "skip-choice legacy zsh alias remains active after --yes"
+else
+    e2e_fail "skip-choice legacy zsh alias remains active after --yes"
+fi
+
+LEGACY_LINK_VERSION="0.1.1"
+LEGACY_LINK_ARTIFACT="$ARTIFACT_V011"
+run_legacy_link_installer "case_02c_upgrade_respects_skip_choice" "${LEGACY_SKIP_BIN}:${PATH_BASE}" --yes
+LEGACY_LINK_VERSION="0.1.0"
+LEGACY_LINK_ARTIFACT="$ARTIFACT_V010"
+e2e_assert_exit_code "skip-choice upgrade reinstall exits 0" "0" "$LAST_INSTALL_RC"
+e2e_assert_contains "skip-choice upgrade reports previous skip" "$LAST_INSTALL_STDOUT" "migration was previously skipped"
+e2e_assert_not_contains "skip-choice upgrade does not auto-accept migration" "$LAST_INSTALL_STDOUT" "Auto-accepting Python"
+e2e_assert_not_contains "skip-choice upgrade does not displace Python alias" "$LAST_INSTALL_STDOUT" "Python alias disabled in"
+LEGACY_SKIP_VERSION="$("${LEGACY_SKIP_DEST}/am" --version 2>&1 || true)"
+e2e_assert_contains "skip-choice Rust binary still upgrades" "$LEGACY_SKIP_VERSION" "0.1.1"
+if grep -Eq '^[[:space:]]*alias am=' "${LEGACY_SKIP_HOME}/.zshrc"; then
+    e2e_pass "skip-choice legacy zsh alias remains active after upgrade"
+else
+    e2e_fail "skip-choice legacy zsh alias remains active after upgrade"
+fi
 
 # ===========================================================================
 # Case 3: Same-version reinstall repairs active Python alias shadow
