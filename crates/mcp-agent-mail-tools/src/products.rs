@@ -9,6 +9,7 @@
 use asupersync::Cx;
 use fastmcp::prelude::*;
 use mcp_agent_mail_core::Config;
+use mcp_agent_mail_db::queries::ThreadMessageRow;
 use mcp_agent_mail_db::{DbError, DbPool, ProductRow, micros_to_iso};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -166,6 +167,24 @@ fn parse_product_thread_limit(per_thread_limit: Option<i32>) -> McpResult<usize>
         )
     })?;
     Ok(msg_limit.min(PRODUCT_TOOL_LIMIT_MAX))
+}
+
+fn sort_product_thread_rows(rows: &mut [ThreadMessageRow]) {
+    rows.sort_by(|a, b| {
+        a.created_ts
+            .cmp(&b.created_ts)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+fn prune_product_thread_rows_to_limit(rows: &mut Vec<ThreadMessageRow>, msg_limit: usize) {
+    if rows.len() <= msg_limit {
+        return;
+    }
+
+    sort_product_thread_rows(rows);
+    let start_idx = rows.len() - msg_limit;
+    rows.drain(..start_idx);
 }
 
 fn parse_product_search_limit(limit: Option<i32>) -> usize {
@@ -681,8 +700,7 @@ pub async fn summarize_thread_product(
     )?;
 
     let msg_limit = parse_product_thread_limit(per_thread_limit)?;
-    let mut rows: Vec<mcp_agent_mail_db::queries::ThreadMessageRow> =
-        Vec::with_capacity(msg_limit.saturating_mul(projects.len()));
+    let mut rows: Vec<ThreadMessageRow> = Vec::with_capacity(msg_limit);
     for p in projects {
         let project_id = p.id.unwrap_or(0);
         let msgs = db_outcome_to_mcp_result(
@@ -696,17 +714,10 @@ pub async fn summarize_thread_product(
             .await,
         )?;
         rows.extend(msgs);
+        prune_product_thread_rows_to_limit(&mut rows, msg_limit);
     }
 
-    rows.sort_by(|a, b| {
-        a.created_ts
-            .cmp(&b.created_ts)
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    let start_idx = rows.len().saturating_sub(msg_limit);
-    if start_idx > 0 {
-        rows.drain(..start_idx);
-    }
+    sort_product_thread_rows(&mut rows);
     let use_llm = llm_mode.unwrap_or(true);
     let mut summary = crate::search::summarize_messages(&rows);
 
@@ -1300,6 +1311,41 @@ mod tests {
         assert_eq!(
             parse_product_thread_limit(Some(5_000)).expect("large limit should cap"),
             1000
+        );
+    }
+
+    fn make_thread_row(id: i64, created_ts: i64, subject: &str) -> ThreadMessageRow {
+        ThreadMessageRow {
+            id,
+            project_id: 1,
+            sender_id: 1,
+            thread_id: Some("PRODUCT-LIMIT-1".to_string()),
+            subject: subject.to_string(),
+            body_md: format!("- {subject} point"),
+            importance: "normal".to_string(),
+            ack_required: 0,
+            created_ts,
+            recipients: "[]".to_string(),
+            attachments: "[]".to_string(),
+            from: "BlueLake".to_string(),
+        }
+    }
+
+    #[test]
+    fn product_thread_row_pruning_keeps_latest_messages_chronologically() {
+        let mut rows = vec![
+            make_thread_row(1, 1_000, "oldest"),
+            make_thread_row(2, 4_000, "latest"),
+            make_thread_row(3, 2_000, "middle"),
+        ];
+
+        prune_product_thread_rows_to_limit(&mut rows, 2);
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.subject.as_str())
+                .collect::<Vec<_>>(),
+            vec!["middle", "latest"]
         );
     }
 
