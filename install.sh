@@ -2800,15 +2800,23 @@ desired_service_bind_port() {
 
 platform_supports_user_service_management() {
   case "${OS:-$(uname -s | tr '[:upper:]' '[:lower:]')}" in
-    linux) command -v systemctl >/dev/null 2>&1 ;;
-    darwin) command -v launchctl >/dev/null 2>&1 ;;
+    linux)
+      command -v systemctl >/dev/null 2>&1 || return 1
+      systemctl --user show-environment >/dev/null 2>&1
+      ;;
+    darwin)
+      command -v launchctl >/dev/null 2>&1 || return 1
+      local uid
+      uid="$(id -u 2>/dev/null)" || return 1
+      launchctl print "gui/${uid}" >/dev/null 2>&1
+      ;;
     *) return 1 ;;
   esac
 }
 
 service_setup_unavailable_failure() {
   local output="$1"
-  printf '%s\n' "$output" | grep -qiE 'failed to run systemctl|systemctl: command not found|failed to connect (to )?(user scope )?bus|no such file or directory \(os error 2\)'
+  printf '%s\n' "$output" | grep -qiE 'failed to run (systemctl|launchctl)|systemctl: command not found|launchctl: command not found|failed to connect (to )?(user scope )?bus|system has not been booted with systemd|could not find domain for'
 }
 
 has_remote_http_client_targets() {
