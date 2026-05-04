@@ -4512,6 +4512,31 @@ interactive_shell_descriptor_matches_installed_am() {
   return 1
 }
 
+interactive_shell_descriptor_looks_like_legacy_python_am() {
+  local descriptor="$1"
+  [ -n "$descriptor" ] || return 1
+
+  if [ "$PYTHON_ALIAS_FOUND" -eq 1 ] && \
+     printf '%s\n' "$descriptor" | grep -qiE 'alias|function'; then
+    return 0
+  fi
+
+  if [ "$PYTHON_BINARY_FOUND" -eq 1 ] && [ -n "${PYTHON_BINARY_PATH:-}" ]; then
+    case "${PYTHON_BINARY_PATH:-}" in
+      python\ *|python3\ *)
+        printf '%s\n' "$descriptor" | grep -qiE 'python|mcp_agent_mail' && return 0
+        ;;
+      *)
+        if printf '%s\n' "$descriptor" | grep -F -- "$PYTHON_BINARY_PATH" >/dev/null 2>&1; then
+          return 0
+        fi
+        ;;
+    esac
+  fi
+
+  printf '%s\n' "$descriptor" | grep -qiE 'python|mcp_agent_mail|venv|virtualenv|site-packages|/\.local/lib/python'
+}
+
 existing_rust_binaries_are_skip_safe() {
   local allow_intentional_python_shadow="${1:-0}"
   EXISTING_INSTALL_REPAIR_REASON=""
@@ -4563,7 +4588,8 @@ existing_rust_binaries_are_skip_safe() {
     return 1
   fi
   if ! interactive_shell_descriptor_matches_installed_am "$actual_resolution"; then
-    if [ "$allow_intentional_python_shadow" -eq 1 ] && [ "$PYTHON_DETECTED" -eq 1 ]; then
+    if [ "$allow_intentional_python_shadow" -eq 1 ] && \
+       interactive_shell_descriptor_looks_like_legacy_python_am "$actual_resolution"; then
       verbose "existing_install_can_skip:interactive shell intentionally remains on legacy Python am due to skip marker: ${actual_resolution}"
       return 0
     fi
