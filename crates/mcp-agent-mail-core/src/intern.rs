@@ -487,20 +487,20 @@ mod tests {
     fn eq_with_owned_string() {
         let s = intern("eq_owned");
         let owned = "eq_owned".to_string();
-        assert!(s == owned);
+        assert_eq!(s, owned);
     }
 
     #[test]
     fn eq_with_str_ref() {
         let s = intern("eq_ref");
-        assert!(s == "eq_ref");
+        assert_eq!(s, "eq_ref");
     }
 
     #[test]
     fn eq_with_double_ref() {
         let s = intern("eq_double");
         let r: &str = "eq_double";
-        assert!(s == r);
+        assert_eq!(s, r);
     }
 
     #[test]

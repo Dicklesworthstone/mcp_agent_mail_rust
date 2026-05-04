@@ -7686,7 +7686,7 @@ archive body
             "mcp-agent-mail-archive-drift-report"
         );
         assert_eq!(json["schema"]["major"], 1);
-        assert!(json["archive_only_ids"].as_array().unwrap().len() == 1);
+        assert_eq!(json["archive_only_ids"].as_array().unwrap().len(), 1);
         assert!(json["db_only_ids"].as_array().unwrap().is_empty());
     }
 
