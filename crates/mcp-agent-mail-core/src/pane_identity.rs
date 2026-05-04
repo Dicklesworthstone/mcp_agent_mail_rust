@@ -19,6 +19,7 @@
 //! [`write_identity`] and [`resolve_identity`] as the single source of truth.
 
 use sha1::{Digest, Sha1};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -33,6 +34,10 @@ const PROJECT_HASH_LEN: usize = 12;
 
 #[cfg(test)]
 static TEST_CONFIG_BASE_DIR: std::sync::LazyLock<std::sync::Mutex<Option<PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[cfg(test)]
+static TEST_LIVE_TMUX_PANES: std::sync::LazyLock<std::sync::Mutex<Option<Vec<String>>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 // ---------------------------------------------------------------------------
@@ -214,7 +219,7 @@ pub fn cleanup_stale_identities(project_key: &str) -> Vec<PathBuf> {
     let hash = project_hash(project_key);
     let project_dir = base.join(IDENTITY_DIR_NAME).join(&hash);
 
-    if !project_dir.is_dir() {
+    if !path_is_real_directory(&project_dir) {
         return removed;
     }
 
@@ -226,7 +231,6 @@ pub fn cleanup_stale_identities(project_key: &str) -> Vec<PathBuf> {
 
     for entry in entries.flatten() {
         let file_name = entry.file_name();
-        let name_str = file_name.to_string_lossy();
 
         // If tmux is not running (empty live_panes list), skip cleanup
         // to avoid accidentally removing everything.
@@ -234,9 +238,9 @@ pub fn cleanup_stale_identities(project_key: &str) -> Vec<PathBuf> {
             break;
         }
 
-        if !live_panes.contains(&name_str.to_string()) {
+        if !file_name_matches_live_pane(&file_name, &live_panes) {
             let path = entry.path();
-            if path.is_file() && std::fs::remove_file(&path).is_ok() {
+            if dir_entry_is_real_file(&entry) && std::fs::remove_file(&path).is_ok() {
                 removed.push(path);
             }
         }
@@ -255,7 +259,7 @@ pub fn cleanup_all_stale_identities() -> Vec<PathBuf> {
     let base = config_base_dir();
     let identity_root = base.join(IDENTITY_DIR_NAME);
 
-    if !identity_root.is_dir() {
+    if !path_is_real_directory(&identity_root) {
         return removed;
     }
 
@@ -271,7 +275,7 @@ pub fn cleanup_all_stale_identities() -> Vec<PathBuf> {
 
     for dir_entry in entries.flatten() {
         let project_dir = dir_entry.path();
-        if !project_dir.is_dir() {
+        if !dir_entry_is_real_directory(&dir_entry) {
             continue;
         }
         let Ok(files) = std::fs::read_dir(&project_dir) else {
@@ -279,10 +283,9 @@ pub fn cleanup_all_stale_identities() -> Vec<PathBuf> {
         };
         for file_entry in files.flatten() {
             let file_name = file_entry.file_name();
-            let name_str = file_name.to_string_lossy();
-            if !live_panes.contains(&name_str.to_string()) {
+            if !file_name_matches_live_pane(&file_name, &live_panes) {
                 let path = file_entry.path();
-                if path.is_file() && std::fs::remove_file(&path).is_ok() {
+                if dir_entry_is_real_file(&file_entry) && std::fs::remove_file(&path).is_ok() {
                     removed.push(path);
                 }
             }
@@ -301,7 +304,7 @@ pub fn list_identities(project_key: &str) -> Vec<(String, String)> {
     let hash = project_hash(project_key);
     let project_dir = base.join(IDENTITY_DIR_NAME).join(hash);
 
-    if !project_dir.is_dir() {
+    if !path_is_real_directory(&project_dir) {
         return Vec::new();
     }
 
@@ -324,6 +327,23 @@ pub fn list_identities(project_key: &str) -> Vec<(String, String)> {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+fn path_is_real_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+fn dir_entry_is_real_directory(entry: &std::fs::DirEntry) -> bool {
+    entry.file_type().is_ok_and(|file_type| file_type.is_dir())
+}
+
+fn dir_entry_is_real_file(entry: &std::fs::DirEntry) -> bool {
+    entry.file_type().is_ok_and(|file_type| file_type.is_file())
+}
+
+fn file_name_matches_live_pane(file_name: &OsStr, live_panes: &[String]) -> bool {
+    let name = file_name.to_string_lossy();
+    live_panes.iter().any(|pane| pane.as_str() == name.as_ref())
+}
 
 /// Compute a truncated SHA-1 hex hash of the project key.
 fn project_hash(project_key: &str) -> String {
@@ -446,6 +466,21 @@ fn set_test_config_base_dir(path: Option<PathBuf>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = path;
 }
 
+#[cfg(test)]
+fn test_live_tmux_panes() -> Option<Vec<String>> {
+    TEST_LIVE_TMUX_PANES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+#[cfg(test)]
+fn set_test_live_tmux_panes(panes: Option<Vec<String>>) {
+    *TEST_LIVE_TMUX_PANES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = panes;
+}
+
 /// Query tmux for all live pane IDs (sanitized).
 ///
 /// Returns composite keys (`session_name:window_index:pane_index`) for each
@@ -453,6 +488,11 @@ fn set_test_config_base_dir(path: Option<PathBuf>) {
 /// compatibility during cleanup. Returns an empty vec if tmux is not running
 /// or the command fails.
 fn list_live_tmux_panes() -> Vec<String> {
+    #[cfg(test)]
+    if let Some(panes) = test_live_tmux_panes() {
+        return panes;
+    }
+
     let output = std::process::Command::new("tmux")
         .args([
             "list-panes",
@@ -563,6 +603,21 @@ mod tests {
     impl Drop for IsolatedConfigBaseDir {
         fn drop(&mut self) {
             set_test_config_base_dir(None);
+        }
+    }
+
+    struct LiveTmuxPanesGuard;
+
+    impl LiveTmuxPanesGuard {
+        fn new(panes: Vec<String>) -> Self {
+            set_test_live_tmux_panes(Some(panes));
+            Self
+        }
+    }
+
+    impl Drop for LiveTmuxPanesGuard {
+        fn drop(&mut self) {
+            set_test_live_tmux_panes(None);
         }
     }
 
@@ -815,6 +870,47 @@ mod tests {
             entries.iter().any(|(p, n)| p == "99" && n == "RedFox"),
             "expected RedFox entry: {entries:?}"
         );
+        drop(config);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_identities_skips_symlinked_project_directories() {
+        use std::os::unix::fs::symlink;
+
+        let config = IsolatedConfigBaseDir::new();
+        let tmux = LiveTmuxPanesGuard::new(vec!["live-pane".to_string()]);
+        let unique_key = config.project_key("symlink-cleanup-project");
+        let identity_root = config.tempdir.path().join(IDENTITY_DIR_NAME);
+        let project_dir = identity_root.join(project_hash(&unique_key));
+        let outside_dir = config.tempdir.path().join("outside-identities");
+        let outside_stale = outside_dir.join("stale-pane");
+
+        std::fs::create_dir_all(&identity_root).expect("create identity root");
+        std::fs::create_dir_all(&outside_dir).expect("create outside dir");
+        std::fs::write(&outside_stale, "OtherAgent\n").expect("write outside identity");
+        symlink(&outside_dir, &project_dir).expect("symlink project identity dir");
+
+        let scoped_removed = cleanup_stale_identities(&unique_key);
+        assert!(
+            scoped_removed.is_empty(),
+            "scoped cleanup must not walk a symlinked project dir: {scoped_removed:?}"
+        );
+        assert!(
+            outside_stale.exists(),
+            "scoped cleanup must not remove files behind symlinked project dirs"
+        );
+
+        let global_removed = cleanup_all_stale_identities();
+        assert!(
+            global_removed.is_empty(),
+            "global cleanup must not walk symlinked project dirs: {global_removed:?}"
+        );
+        assert!(
+            outside_stale.exists(),
+            "global cleanup must not remove files behind symlinked project dirs"
+        );
+        drop(tmux);
         drop(config);
     }
 
