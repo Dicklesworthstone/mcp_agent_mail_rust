@@ -463,6 +463,43 @@ else
 fi
 
 # ===========================================================================
+# Case 2d: Same-version --no-migrate records skip before early idempotent exit
+# ===========================================================================
+e2e_case_banner "Same-version --no-migrate records skip before idempotent exit"
+
+LEGACY_EARLY_SKIP_HOME="${WORK}/legacy_early_skip_home"
+LEGACY_EARLY_SKIP_RUN_DIR="${WORK}/legacy_early_skip_project"
+LEGACY_EARLY_SKIP_DEST="${LEGACY_EARLY_SKIP_HOME}/rust-bin"
+LEGACY_EARLY_SKIP_BIN="${LEGACY_EARLY_SKIP_HOME}/.local/bin"
+LEGACY_EARLY_SKIP_STORAGE="${LEGACY_EARLY_SKIP_HOME}/storage_root"
+LEGACY_EARLY_SKIP_CLONE="${LEGACY_EARLY_SKIP_HOME}/mcp_agent_mail"
+LEGACY_EARLY_SKIP_MARKER="${LEGACY_EARLY_SKIP_HOME}/.config/mcp-agent-mail/.python-migration-skipped"
+mkdir -p "$LEGACY_EARLY_SKIP_RUN_DIR" "$LEGACY_EARLY_SKIP_DEST" "$LEGACY_EARLY_SKIP_BIN" "$LEGACY_EARLY_SKIP_STORAGE"
+
+LEGACY_LINK_HOME="$LEGACY_EARLY_SKIP_HOME"
+LEGACY_LINK_RUN_DIR="$LEGACY_EARLY_SKIP_RUN_DIR"
+LEGACY_LINK_DEST="$LEGACY_EARLY_SKIP_DEST"
+LEGACY_LINK_BIN="$LEGACY_EARLY_SKIP_BIN"
+LEGACY_LINK_STORAGE="$LEGACY_EARLY_SKIP_STORAGE"
+LEGACY_LINK_VERSION="0.1.0"
+LEGACY_LINK_ARTIFACT="$ARTIFACT_V010"
+
+run_legacy_link_installer "case_02d_first_install" "${LEGACY_EARLY_SKIP_BIN}:${PATH_BASE}"
+e2e_assert_exit_code "early-skip first install exits 0" "0" "$LAST_INSTALL_RC"
+
+mkdir -p "${LEGACY_EARLY_SKIP_CLONE}/src/mcp_agent_mail" "$(dirname "$LEGACY_EARLY_SKIP_MARKER")"
+cat > "${LEGACY_EARLY_SKIP_CLONE}/pyproject.toml" <<'EOF'
+[project]
+name = "mcp_agent_mail"
+EOF
+
+run_legacy_link_installer "case_02d_no_migrate_same_version_records_choice" "${LEGACY_EARLY_SKIP_BIN}:${PATH_BASE}" --no-migrate
+e2e_assert_exit_code "early-skip --no-migrate install exits 0" "0" "$LAST_INSTALL_RC"
+e2e_assert_contains "early-skip --no-migrate exits through idempotent path" "$LAST_INSTALL_STDOUT" "already installed"
+e2e_assert_file_exists "early-skip marker written before idempotent exit" "$LEGACY_EARLY_SKIP_MARKER"
+e2e_assert_contains "early-skip marker records explicit reason" "$(cat "$LEGACY_EARLY_SKIP_MARKER" 2>/dev/null || true)" "reason=explicit --no-migrate"
+
+# ===========================================================================
 # Case 3: Same-version reinstall repairs active Python alias shadow
 # ===========================================================================
 e2e_case_banner "Same-version reinstall repairs active Python am shadow"

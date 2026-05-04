@@ -4790,6 +4790,10 @@ detect_python
 # Check if already at target version (skip download if so, unless --force)
 if [ "$FORCE_INSTALL" -eq 0 ] && check_installed_version "$VERSION"; then
   if existing_install_can_skip; then
+    if [ "$PYTHON_DETECTED" -eq 1 ] && [ "$FORCE_NO_MIGRATE" -eq 1 ] && \
+       [ "$FORCE_MIGRATE" -ne 1 ] && [ ! -f "$PYTHON_MIGRATION_SKIP_MARKER" ]; then
+      write_python_migration_skip_marker "explicit --no-migrate"
+    fi
     ok "mcp-agent-mail $VERSION is already installed at $DEST"
     info "Use --force to reinstall"
     exit 0
