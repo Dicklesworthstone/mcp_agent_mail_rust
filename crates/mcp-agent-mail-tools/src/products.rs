@@ -22,6 +22,8 @@ use crate::tool_util::{
 };
 
 static PRODUCT_UID_COUNTER: AtomicU64 = AtomicU64::new(0);
+const PRODUCT_TOOL_LIMIT_MAX_I32: i32 = 1000;
+const PRODUCT_TOOL_LIMIT_MAX: usize = 1000;
 
 fn worktrees_required() -> McpError {
     legacy_tool_error(
@@ -70,22 +72,22 @@ fn parse_fetch_inbox_product_limit(limit: Option<i32>) -> McpResult<usize> {
             "INVALID_LIMIT",
             format!("limit must be at least 1, got {msg_limit}. Use a positive integer."),
             true,
-            serde_json::json!({ "provided": msg_limit, "min": 1, "max": 1000 }),
+            serde_json::json!({ "provided": msg_limit, "min": 1, "max": PRODUCT_TOOL_LIMIT_MAX }),
         ));
     }
-    if msg_limit > 1000 {
+    if msg_limit > PRODUCT_TOOL_LIMIT_MAX_I32 {
         tracing::info!(
             "fetch_inbox_product limit {} is very large; capping at 1000",
             msg_limit
         );
-        msg_limit = 1000;
+        msg_limit = PRODUCT_TOOL_LIMIT_MAX_I32;
     }
     usize::try_from(msg_limit).map_err(|_| {
         legacy_tool_error(
             "INVALID_LIMIT",
             format!("limit exceeds supported range: {msg_limit}"),
             true,
-            serde_json::json!({ "provided": msg_limit, "min": 1, "max": 1000 }),
+            serde_json::json!({ "provided": msg_limit, "min": 1, "max": PRODUCT_TOOL_LIMIT_MAX }),
         )
     })
 }
@@ -155,19 +157,20 @@ fn parse_product_thread_limit(per_thread_limit: Option<i32>) -> McpResult<usize>
             serde_json::json!({"field":"per_thread_limit","error_detail":msg_limit_raw}),
         ));
     }
-    usize::try_from(msg_limit_raw).map_err(|_| {
+    let msg_limit = usize::try_from(msg_limit_raw).map_err(|_| {
         legacy_tool_error(
             "INVALID_ARGUMENT",
             "Invalid argument value: per_thread_limit exceeds supported range. Check that all parameters have valid values.",
             true,
             serde_json::json!({"field":"per_thread_limit","error_detail":msg_limit_raw}),
         )
-    })
+    })?;
+    Ok(msg_limit.min(PRODUCT_TOOL_LIMIT_MAX))
 }
 
 fn parse_product_search_limit(limit: Option<i32>) -> usize {
     let max_results_raw = match limit {
-        Some(value) if value > 0 => value.clamp(1, 1000),
+        Some(value) if value > 0 => value.clamp(1, PRODUCT_TOOL_LIMIT_MAX_I32),
         _ => 20,
     };
     max_results_raw.unsigned_abs() as usize
@@ -1289,6 +1292,14 @@ mod tests {
         assert_eq!(
             parse_product_thread_limit(Some(7)).expect("positive limit should pass"),
             7
+        );
+    }
+
+    #[test]
+    fn summarize_thread_product_limit_caps_large_values() {
+        assert_eq!(
+            parse_product_thread_limit(Some(5_000)).expect("large limit should cap"),
+            1000
         );
     }
 
