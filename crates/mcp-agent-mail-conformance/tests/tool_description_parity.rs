@@ -115,6 +115,13 @@ fn diff_position(expected: &str, actual: &str) -> Option<(usize, String)> {
     None
 }
 
+fn description_matches_fixture(expected: &str, actual: &str) -> bool {
+    actual == expected
+        || actual
+            .strip_prefix(expected)
+            .is_some_and(|suffix| suffix.starts_with("\n\n"))
+}
+
 fn normalized_required(schema: &Value) -> BTreeSet<String> {
     schema
         .get("required")
@@ -287,15 +294,10 @@ fn tool_descriptions_match_python_fixture() {
         let rust_desc = rust_tool.description.as_deref().unwrap_or("");
         let py_desc = &py_tool.description;
 
-        // Allow Rust descriptions to extend the Python baseline (Search V3
-        // added parameter docs, ranking options, examples, etc.).
-        let is_extended = rust_desc.starts_with(py_desc)
-            || (rust_desc.len() > py_desc.len()
-                && rust_desc.starts_with(&py_desc[..py_desc.len().min(200)]));
         if rust_desc == py_desc {
             eprintln!("PASS");
             passed += 1;
-        } else if is_extended {
+        } else if description_matches_fixture(py_desc, rust_desc) {
             eprintln!("PASS (extended)");
             passed += 1;
         } else {
@@ -427,6 +429,22 @@ fn fixture_is_valid() {
         fixture.tools.len(),
         "Fixture contains duplicate tool names"
     );
+}
+
+#[test]
+fn description_matching_rejects_same_prefix_with_midstream_drift() {
+    let fixture = "alpha beta gamma";
+
+    assert!(description_matches_fixture(fixture, fixture));
+    assert!(description_matches_fixture(
+        fixture,
+        "alpha beta gamma\n\nRust-only extension"
+    ));
+    assert!(!description_matches_fixture(fixture, "alpha beta delta"));
+    assert!(!description_matches_fixture(
+        fixture,
+        "alpha beta gamma Rust-only extension"
+    ));
 }
 
 /// Verify the Rust tool count matches expected shared tool count.
@@ -594,14 +612,8 @@ fn check_cluster_descriptions(tool_names: &[&str]) {
         };
 
         let rust_desc = rust_tool.description.as_deref().unwrap_or("");
-        // Allow Rust descriptions to extend the Python baseline (Search V3
-        // added parameter docs, ranking options, examples, etc.).
-        let is_extended = rust_desc.starts_with(&py_tool.description)
-            || (rust_desc.len() > py_tool.description.len()
-                && rust_desc
-                    .starts_with(&py_tool.description[..py_tool.description.len().min(200)]));
         if rust_desc != py_tool.description
-            && !is_extended
+            && !description_matches_fixture(&py_tool.description, rust_desc)
             && let Some((_pos, detail)) = diff_position(&py_tool.description, rust_desc)
         {
             failures.push(format!(
