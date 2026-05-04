@@ -2800,9 +2800,15 @@ desired_service_bind_port() {
 
 platform_supports_user_service_management() {
   case "${OS:-$(uname -s | tr '[:upper:]' '[:lower:]')}" in
-    linux|darwin) return 0 ;;
+    linux) command -v systemctl >/dev/null 2>&1 ;;
+    darwin) command -v launchctl >/dev/null 2>&1 ;;
     *) return 1 ;;
   esac
+}
+
+service_setup_unavailable_failure() {
+  local output="$1"
+  printf '%s\n' "$output" | grep -qiE 'failed to run systemctl|systemctl: command not found|failed to connect (to )?(user scope )?bus|no such file or directory \(os error 2\)'
 }
 
 has_remote_http_client_targets() {
@@ -2971,9 +2977,9 @@ ensure_remote_http_client_readiness() {
   [ -n "${REMOTE_HTTP_PROBE_DETAIL:-}" ] && warn "  Probe detail: ${REMOTE_HTTP_PROBE_DETAIL}"
 
   if ! platform_supports_user_service_management; then
-    err "Automatic background service setup is not supported on this platform."
-    err "Start a local HTTP server with: ${DEST}/${BIN_CLI} serve-http --no-tui"
-    return 1
+    warn "Automatic background service setup is not supported in this environment."
+    warn "Start a local HTTP server with: ${DEST}/${BIN_CLI} serve-http --no-tui"
+    return 0
   fi
 
   if ! "$DEST/$BIN_CLI" service install --help >/dev/null 2>&1; then
@@ -2990,6 +2996,17 @@ ensure_remote_http_client_readiness() {
     done <<< "$service_output"
     repair_launchd_service_env_from_rust_config
   else
+    if service_setup_unavailable_failure "$service_output"; then
+      warn "Automatic background service setup is not available in this environment."
+      if [ -n "$service_output" ]; then
+        while IFS= read -r line; do
+          [ -n "$line" ] && warn "  ${line}"
+        done <<< "$service_output"
+      fi
+      warn "Start a local HTTP server manually with: ${DEST}/${BIN_CLI} serve-http --no-tui"
+      return 0
+    fi
+
     err "Automatic background service setup failed."
     if [ -n "$service_output" ]; then
       while IFS= read -r line; do
