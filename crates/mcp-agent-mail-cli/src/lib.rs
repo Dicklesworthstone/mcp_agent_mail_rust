@@ -6115,10 +6115,12 @@ fn recover_sqlite_file_with_storage_root(
                 "No backup found. Reconstructing database from archive at {}...",
                 storage_root.display()
             );
-            // Attempt best-effort salvage from the original DB while it is still
-            // in place. If the file remains readable enough to inspect through
-            // FrankenSQLite, merge any DB-only rows during archive reconstruction.
-            let salvage_attempt = attempt_readable_current_db_salvage(path);
+            // Attempt best-effort salvage from the original DB and nearby
+            // doctor artifacts while the live file is still in place. A prior
+            // quarantine can contain cleaner DB-only state than the current
+            // malformed file, so keep startup recovery aligned with the manual
+            // `am doctor reconstruct` salvage candidate order.
+            let salvage_attempt = attempt_best_doctor_salvage_artifact(path);
             let salvage_db_path = match &salvage_attempt {
                 DoctorSalvageAttempt::Succeeded(artifact) => Some(artifact.db_path.as_path()),
                 DoctorSalvageAttempt::Failed(detail) => {
@@ -44842,6 +44844,59 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn recover_sqlite_file_salvages_clean_quarantined_artifact_when_primary_is_corrupt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage_root = dir.path().join("storage");
+        let db_path = dir.path().join("storage.sqlite3");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+
+        let message_dir = seed_archive_mailbox_project(&storage_root);
+        write_archive_mailbox_message(
+            &message_dir,
+            "2026-03-22T12-00-00Z__first__1.md",
+            1,
+            "Bob",
+            "First",
+            "normal",
+            "2026-03-22T12:00:00Z",
+            "first body",
+        );
+
+        let quarantined_path = dir
+            .path()
+            .join("storage.sqlite3.corrupt-20260324_120000_000");
+        seed_project_only_db(
+            &quarantined_path,
+            "salvage-only-project",
+            "/salvage-only-project",
+        );
+        std::fs::write(&db_path, b"THIS FILE IS CORRUPT").expect("corrupt primary");
+
+        recover_sqlite_file_with_storage_root(&db_path, Some(&storage_root))
+            .expect("recover from archive with clean quarantined salvage artifact");
+
+        let reopened =
+            mcp_agent_mail_db::DbConn::open_file(&db_path_str).expect("open recovered db");
+        let rows = reopened
+            .query_sync("SELECT slug FROM projects ORDER BY slug", &[])
+            .expect("query projects");
+        let projects = rows
+            .iter()
+            .map(|row| row.get_named::<String>("slug").expect("slug"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            projects,
+            vec![
+                "ahead-project".to_string(),
+                "salvage-only-project".to_string()
+            ]
+        );
+        let (message_count, max_message_id) = sqlite_message_stats(&db_path);
+        assert_eq!(message_count, 1);
+        assert_eq!(max_message_id, 1);
+    }
+
+    #[test]
     fn recover_sqlite_file_fails_closed_without_backup_or_archive() {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage_root = dir.path().join("storage");
@@ -50093,10 +50148,6 @@ fn should_fail_doctor_salvage_table_scan(sqlite_path: &Path, table: &str) -> boo
     } else {
         false
     }
-}
-
-fn attempt_readable_current_db_salvage(current_db: &Path) -> DoctorSalvageAttempt {
-    attempt_readable_sqlite_salvage_source(current_db, "current database")
 }
 
 fn doctor_salvage_artifact_candidates(current_db: &Path) -> Vec<(String, PathBuf)> {
