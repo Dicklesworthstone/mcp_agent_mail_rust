@@ -17,6 +17,7 @@ use crate::tool_util::{
 };
 
 const MAX_SUMMARIZE_THREAD_IDS: usize = 128;
+const MAX_MESSAGES_PER_SUMMARIZED_THREAD: usize = 1000;
 
 /// Search result entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +204,27 @@ fn parse_thread_ids(thread_id: &str) -> Vec<String> {
         }
     }
     parsed
+}
+
+fn parse_summarize_thread_limit(per_thread_limit: Option<i32>) -> McpResult<usize> {
+    let msg_limit_raw = per_thread_limit.unwrap_or(50);
+    if msg_limit_raw < 1 {
+        return Err(legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "Invalid argument value: per_thread_limit must be at least 1. Check that all parameters have valid values.",
+            true,
+            json!({"field":"per_thread_limit","error_detail":msg_limit_raw}),
+        ));
+    }
+    let msg_limit = usize::try_from(msg_limit_raw).map_err(|_| {
+        legacy_tool_error(
+            "INVALID_ARGUMENT",
+            "Invalid argument value: per_thread_limit exceeds supported range. Check that all parameters have valid values.",
+            true,
+            json!({"field":"per_thread_limit","error_detail":msg_limit_raw}),
+        )
+    })?;
+    Ok(msg_limit.min(MAX_MESSAGES_PER_SUMMARIZED_THREAD))
 }
 
 fn explain_facet_value<'a>(
@@ -971,13 +993,13 @@ fn parse_iso_to_micros_with_boundary(
 /// - `include_examples`: Include up to 3 sample messages (single-thread mode only)
 /// - `llm_mode`: Refine summary with AI (if enabled)
 /// - `llm_model`: Override model for AI refinement
-/// - `per_thread_limit`: Max messages per thread (multi-thread mode)
+/// - `per_thread_limit`: Max messages per thread (default 50, max 1000)
 ///
 /// # Conformance
 /// Python-parity.
 #[allow(clippy::too_many_lines)]
 #[tool(
-    description = "Extract participants, key points, and action items for one or more threads.\n\nSingle-thread mode (thread_id is a single ID):\n- Returns detailed summary with optional example messages\n- Response: { thread_id, summary: {participants[], key_points[], action_items[]}, examples[] }\n\nMulti-thread mode (thread_id is comma-separated IDs like \"TKT-1,TKT-2,TKT-3\"):\n- Returns aggregate digest across all threads\n- Response: { threads: [{thread_id, summary}], aggregate: {top_mentions[], key_points[], action_items[]} }\n\nParameters\n----------\nproject_key : str\n    Project identifier.\nthread_id : str\n    Single thread ID for detailed summary, OR comma-separated IDs for aggregate digest.\ninclude_examples : bool\n    If true (single-thread mode only), include up to 3 sample messages.\nllm_mode : bool\n    If true and LLM is enabled, refine the summary with AI.\nllm_model : Optional[str]\n    Override model name for the LLM call.\nper_thread_limit : int\n    Max messages to consider per thread (multi-thread mode).\n\nExamples\n--------\nSingle thread:\n```json\n{\"thread_id\": \"TKT-123\", \"include_examples\": true}\n```\n\nMultiple threads:\n```json\n{\"thread_id\": \"TKT-1,TKT-2,TKT-3\"}\n```"
+    description = "Extract participants, key points, and action items for one or more threads.\n\nSingle-thread mode (thread_id is a single ID):\n- Returns detailed summary with optional example messages\n- Response: { thread_id, summary: {participants[], key_points[], action_items[]}, examples[] }\n\nMulti-thread mode (thread_id is comma-separated IDs like \"TKT-1,TKT-2,TKT-3\"):\n- Returns aggregate digest across all threads\n- Response: { threads: [{thread_id, summary}], aggregate: {top_mentions[], key_points[], action_items[]} }\n\nParameters\n----------\nproject_key : str\n    Project identifier.\nthread_id : str\n    Single thread ID for detailed summary, OR comma-separated IDs for aggregate digest.\ninclude_examples : bool\n    If true (single-thread mode only), include up to 3 sample messages.\nllm_mode : bool\n    If true and LLM is enabled, refine the summary with AI.\nllm_model : Optional[str]\n    Override model name for the LLM call.\nper_thread_limit : int\n    Max messages to consider per thread (default 50, max 1000).\n\nExamples\n--------\nSingle thread:\n```json\n{\"thread_id\": \"TKT-123\", \"include_examples\": true}\n```\n\nMultiple threads:\n```json\n{\"thread_id\": \"TKT-1,TKT-2,TKT-3\"}\n```"
 )]
 pub async fn summarize_thread(
     ctx: &McpContext,
@@ -990,23 +1012,7 @@ pub async fn summarize_thread(
 ) -> McpResult<String> {
     let with_examples = include_examples.unwrap_or(false);
     let use_llm = llm_mode.unwrap_or(true);
-    let msg_limit_raw = per_thread_limit.unwrap_or(50);
-    if msg_limit_raw < 1 {
-        return Err(legacy_tool_error(
-            "INVALID_ARGUMENT",
-            "Invalid argument value: per_thread_limit must be at least 1. Check that all parameters have valid values.",
-            true,
-            json!({"field":"per_thread_limit","error_detail":msg_limit_raw}),
-        ));
-    }
-    let msg_limit = usize::try_from(msg_limit_raw).map_err(|_| {
-        legacy_tool_error(
-            "INVALID_ARGUMENT",
-            "Invalid argument value: per_thread_limit exceeds supported range. Check that all parameters have valid values.",
-            true,
-            json!({"field":"per_thread_limit","error_detail":msg_limit_raw}),
-        )
-    })?;
+    let msg_limit = parse_summarize_thread_limit(per_thread_limit)?;
 
     let pool = get_read_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
@@ -1266,6 +1272,32 @@ mod tests {
     fn parse_thread_ids_deduplicates_preserving_order() {
         let parsed = parse_thread_ids("br-2, br-1, br-2, br-3, br-1");
         assert_eq!(parsed, vec!["br-2", "br-1", "br-3"]);
+    }
+
+    #[test]
+    fn summarize_thread_limit_defaults_and_accepts_positive_values() {
+        assert_eq!(
+            parse_summarize_thread_limit(None).expect("default limit should pass"),
+            50
+        );
+        assert_eq!(
+            parse_summarize_thread_limit(Some(7)).expect("positive limit should pass"),
+            7
+        );
+    }
+
+    #[test]
+    fn summarize_thread_limit_rejects_non_positive_values() {
+        assert!(parse_summarize_thread_limit(Some(0)).is_err());
+        assert!(parse_summarize_thread_limit(Some(-5)).is_err());
+    }
+
+    #[test]
+    fn summarize_thread_limit_caps_large_values() {
+        assert_eq!(
+            parse_summarize_thread_limit(Some(5_000)).expect("large limit should cap"),
+            MAX_MESSAGES_PER_SUMMARIZED_THREAD
+        );
     }
 
     fn make_msg(from: &str, body: &str) -> ThreadMessageRow {
