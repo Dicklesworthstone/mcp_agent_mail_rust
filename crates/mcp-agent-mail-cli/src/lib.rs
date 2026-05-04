@@ -35533,6 +35533,35 @@ startup_timeout_sec = 42
         )));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn doctor_backups_inventory_skips_symlinked_backup_names() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let backup_dir = tmp.path().join("backups");
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::write(
+            backup_dir.join("pre_repair_20260101_120000.sqlite3"),
+            b"real-backup",
+        )
+        .unwrap();
+        let outside = tmp.path().join("outside.sqlite3");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(
+            &outside,
+            backup_dir.join("storage.sqlite3.bak.20260102_120000"),
+        )
+        .unwrap();
+
+        let backups = doctor_backup_inventory_backups(&backup_dir).unwrap();
+        let names = backups
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["pre_repair_20260101_120000.sqlite3"]);
+    }
+
     #[test]
     fn doctor_restore_rejects_missing_backup() {
         let result =
@@ -49631,17 +49660,7 @@ fn handle_doctor_backups_with_storage_root(
         return Ok(());
     }
 
-    let mut backups: Vec<(String, u64, std::time::SystemTime)> = Vec::new();
-    for entry in std::fs::read_dir(&backup_dir)?.flatten() {
-        let path = entry.path();
-        if let Some(name) = doctor_backup_inventory_file_name(&path)
-            && let Ok(meta) = path.metadata()
-        {
-            let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-            backups.push((name, meta.len(), modified));
-        }
-    }
-    backups.sort_by_key(|x| std::cmp::Reverse(x.2));
+    let backups = doctor_backup_inventory_backups(&backup_dir)?;
 
     let arr: Vec<serde_json::Value> = backups
         .iter()
@@ -49660,6 +49679,30 @@ fn handle_doctor_backups_with_storage_root(
         table.render();
     });
     Ok(())
+}
+
+fn doctor_backup_inventory_backups(
+    backup_dir: &Path,
+) -> CliResult<Vec<(String, u64, std::time::SystemTime)>> {
+    let mut backups = Vec::new();
+    for entry in std::fs::read_dir(backup_dir)?.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() || file_type.is_symlink() {
+            continue;
+        }
+
+        let path = entry.path();
+        if let Some(name) = doctor_backup_inventory_file_name(&path)
+            && let Ok(meta) = path.metadata()
+        {
+            let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            backups.push((name, meta.len(), modified));
+        }
+    }
+    backups.sort_by_key(|x| std::cmp::Reverse(x.2));
+    Ok(backups)
 }
 
 fn doctor_backup_inventory_file_name(path: &Path) -> Option<String> {
