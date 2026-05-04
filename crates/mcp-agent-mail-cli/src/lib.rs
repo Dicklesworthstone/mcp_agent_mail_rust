@@ -5984,6 +5984,37 @@ fn os_str_ends_with(value: &OsStr, suffix: &OsStr) -> bool {
     }
 }
 
+fn os_str_contains(value: &OsStr, needle: &OsStr) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let value_bytes = value.as_bytes();
+        let needle_bytes = needle.as_bytes();
+        needle_bytes.is_empty()
+            || value_bytes
+                .windows(needle_bytes.len())
+                .any(|window| window == needle_bytes)
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        let value_units = value.encode_wide().collect::<Vec<_>>();
+        let needle_units = needle.encode_wide().collect::<Vec<_>>();
+        needle_units.is_empty()
+            || value_units
+                .windows(needle_units.len())
+                .any(|window| window == needle_units)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        value
+            .to_string_lossy()
+            .contains(needle.to_string_lossy().as_ref())
+    }
+}
+
 fn sqlite_backup_candidates(path: &Path) -> Vec<PathBuf> {
     let mut candidates: Vec<(std::time::SystemTime, bool, u8, PathBuf)> = Vec::new();
     let Some(file_name) = path.file_name() else {
@@ -35480,29 +35511,26 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn doctor_backups_lists_sqlite3_files_only() {
-        let tmp = tempfile::tempdir().unwrap();
-        let backup_dir = tmp.path().join("backups");
-        std::fs::create_dir_all(&backup_dir).unwrap();
-        std::fs::write(
-            backup_dir.join("pre_repair_20260101_120000.sqlite3"),
-            b"data1",
-        )
-        .unwrap();
-        std::fs::write(
-            backup_dir.join("pre_repair_20260102_120000.sqlite3"),
-            b"data22",
-        )
-        .unwrap();
-        std::fs::write(backup_dir.join("notes.txt"), b"not a backup").unwrap();
+    fn doctor_backups_inventory_accepts_legacy_and_created_backup_names() {
+        assert!(is_doctor_backup_inventory_file_name(OsStr::new(
+            "pre_repair_20260101_120000.sqlite3"
+        )));
+        assert!(is_doctor_backup_inventory_file_name(OsStr::new(
+            "storage.sqlite3.bak.20260102_120000"
+        )));
 
-        let mut count = 0u32;
-        for entry in std::fs::read_dir(&backup_dir).unwrap().flatten() {
-            if entry.path().extension().and_then(|s| s.to_str()) == Some("sqlite3") {
-                count += 1;
-            }
-        }
-        assert_eq!(count, 2, "should find exactly 2 .sqlite3 files");
+        assert!(!is_doctor_backup_inventory_file_name(OsStr::new(
+            "storage.sqlite3.bak.20260102_120000-wal"
+        )));
+        assert!(!is_doctor_backup_inventory_file_name(OsStr::new(
+            "storage.sqlite3.bak.20260102_120000-shm"
+        )));
+        assert!(!is_doctor_backup_inventory_file_name(OsStr::new(
+            "notes.bak.20260102_120000"
+        )));
+        assert!(!is_doctor_backup_inventory_file_name(OsStr::new(
+            "notes.txt"
+        )));
     }
 
     #[test]
@@ -49606,14 +49634,9 @@ fn handle_doctor_backups_with_storage_root(
     let mut backups: Vec<(String, u64, std::time::SystemTime)> = Vec::new();
     for entry in std::fs::read_dir(&backup_dir)?.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("sqlite3")
+        if let Some(name) = doctor_backup_inventory_file_name(&path)
             && let Ok(meta) = path.metadata()
         {
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("?")
-                .to_string();
             let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
             backups.push((name, meta.len(), modified));
         }
@@ -49637,6 +49660,27 @@ fn handle_doctor_backups_with_storage_root(
         table.render();
     });
     Ok(())
+}
+
+fn doctor_backup_inventory_file_name(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?;
+    is_doctor_backup_inventory_file_name(file_name)
+        .then(|| file_name.to_string_lossy().into_owned())
+}
+
+fn is_doctor_backup_inventory_file_name(file_name: &OsStr) -> bool {
+    if SQLITE_RECOVERY_SIDECAR_SUFFIXES
+        .iter()
+        .any(|suffix| os_str_ends_with(file_name, OsStr::new(suffix)))
+    {
+        return false;
+    }
+
+    Path::new(file_name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        == Some("sqlite3")
+        || os_str_contains(file_name, OsStr::new(".sqlite3.bak."))
 }
 
 fn handle_doctor_restore(backup_path: PathBuf, dry_run: bool, yes: bool) -> CliResult<()> {
