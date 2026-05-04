@@ -3230,7 +3230,7 @@ mod tests {
         let screen = AnalyticsScreen::new();
         let (c, h, m, l) = screen.severity_counts();
         // May have cards from quick_insight_feed
-        assert!(c + h + m + l == screen.feed.cards.len() as u64);
+        assert_eq!(c + h + m + l, screen.feed.cards.len() as u64);
     }
 
     #[test]

@@ -5737,7 +5737,7 @@ mod tests {
         let widget = HeatmapGrid::new(&data);
         let out = render_widget(&widget, 20, 5);
         // All spaces — nothing rendered.
-        assert!(out.chars().filter(|&c| c != ' ' && c != '\n').count() == 0);
+        assert_eq!(out.chars().filter(|&c| c != ' ' && c != '\n').count(), 0);
     }
 
     #[test]
@@ -5816,7 +5816,7 @@ mod tests {
         let samples: Vec<PercentileSample> = vec![];
         let widget = PercentileRibbon::new(&samples);
         let out = render_widget(&widget, 20, 10);
-        assert!(out.chars().filter(|&c| c != ' ' && c != '\n').count() == 0);
+        assert_eq!(out.chars().filter(|&c| c != ' ' && c != '\n').count(), 0);
     }
 
     #[test]
@@ -5890,7 +5890,7 @@ mod tests {
         let entries: Vec<LeaderboardEntry<'_>> = vec![];
         let widget = Leaderboard::new(&entries);
         let out = render_widget(&widget, 40, 10);
-        assert!(out.chars().filter(|&c| c != ' ' && c != '\n').count() == 0);
+        assert_eq!(out.chars().filter(|&c| c != ' ' && c != '\n').count(), 0);
     }
 
     #[test]
@@ -5975,7 +5975,7 @@ mod tests {
         let widget = Leaderboard::new(&entries);
         // Width < 10 — should render nothing gracefully.
         let out = render_widget(&widget, 8, 5);
-        assert!(out.chars().filter(|&c| c != ' ' && c != '\n').count() == 0);
+        assert_eq!(out.chars().filter(|&c| c != ' ' && c != '\n').count(), 0);
     }
 
     // ─── AnomalyCard tests ──────────────────────────────────────────────
@@ -6306,7 +6306,7 @@ mod tests {
         let matrix: Vec<Vec<f64>> = vec![];
         let widget = AgentHeatmap::new(agents, &matrix);
         let out = render_widget(&widget, 30, 5);
-        assert!(out.chars().filter(|&c| c != ' ' && c != '\n').count() == 0);
+        assert_eq!(out.chars().filter(|&c| c != ' ' && c != '\n').count(), 0);
     }
 
     #[test]

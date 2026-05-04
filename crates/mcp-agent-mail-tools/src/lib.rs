@@ -1440,12 +1440,12 @@ pub mod tool_util {
             let data = err.data.expect("expected data payload");
             assert_eq!(data["error"]["type"], "DATABASE_CORRUPTION");
             assert_eq!(data["error"]["recoverable"], false);
-            assert!(
+            assert_eq!(
                 data["error"]["data"]["corruption_details"]
                     .as_array()
                     .unwrap()
-                    .len()
-                    == 2
+                    .len(),
+                2
             );
         }
 
