@@ -21902,14 +21902,17 @@ fn parse_cli_macro_thread_id(thread_id: String) -> CliResult<String> {
     Ok(thread_id.to_string())
 }
 
-fn normalize_cli_macro_agent_name_value(name: &str) -> CliResult<Option<String>> {
+fn normalize_cli_macro_agent_name_value(name: &str) -> CliResult<String> {
     let name = name.trim();
     if name.is_empty() {
-        return Ok(None);
+        return Err(CliError::InvalidArgument(
+            "agent name cannot be empty. Omit --agent-name to auto-generate a valid name."
+                .to_string(),
+        ));
     }
 
     if let Some(normalized) = mcp_agent_mail_core::models::normalize_agent_name(name) {
-        return Ok(Some(normalized));
+        return Ok(normalized);
     }
 
     let message = mcp_agent_mail_core::models::detect_agent_name_mistake(name).map_or_else(
@@ -21927,16 +21930,18 @@ fn normalize_cli_macro_agent_name_value(name: &str) -> CliResult<Option<String>>
 
 fn normalize_cli_macro_optional_agent_name(name: Option<String>) -> CliResult<String> {
     match name {
-        Some(name) => Ok(normalize_cli_macro_agent_name_value(&name)?
-            .unwrap_or_else(mcp_agent_mail_core::models::generate_agent_name)),
+        Some(name) => normalize_cli_macro_agent_name_value(&name),
         None => Ok(mcp_agent_mail_core::models::generate_agent_name()),
     }
 }
 
 fn normalize_cli_macro_required_agent_name(name: String) -> CliResult<String> {
-    normalize_cli_macro_agent_name_value(&name)?.ok_or_else(|| {
-        CliError::InvalidArgument("agent name is required when --no-register is set".to_string())
-    })
+    if name.trim().is_empty() {
+        return Err(CliError::InvalidArgument(
+            "agent name is required when --no-register is set".to_string(),
+        ));
+    }
+    normalize_cli_macro_agent_name_value(&name)
 }
 
 fn normalize_cli_product_inbox_agent_name(agent_name: &str) -> CliResult<String> {
@@ -23477,9 +23482,20 @@ mod mail_server_cli_bridge_tests {
             "BlueLake"
         );
 
-        let generated = crate::normalize_cli_macro_optional_agent_name(Some("   ".to_string()))
-            .expect("blank optional agent name should generate");
+        let generated = crate::normalize_cli_macro_optional_agent_name(None)
+            .expect("omitted optional agent name should generate");
         assert!(mcp_agent_mail_core::models::is_valid_agent_name(&generated));
+
+        let err = crate::normalize_cli_macro_optional_agent_name(Some("   ".to_string()))
+            .expect_err("blank explicit agent name should fail");
+        assert!(err.to_string().contains("agent name cannot be empty"));
+
+        let err = crate::normalize_cli_macro_required_agent_name("   ".to_string())
+            .expect_err("blank no-register agent name should fail");
+        assert!(
+            err.to_string()
+                .contains("agent name is required when --no-register is set")
+        );
 
         let err =
             crate::normalize_cli_macro_optional_agent_name(Some("BackendHarmonizer".to_string()))
