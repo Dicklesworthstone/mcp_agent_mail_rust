@@ -4186,6 +4186,28 @@ fn os_str_starts_with(value: &OsStr, prefix: &OsStr) -> bool {
     }
 }
 
+#[must_use]
+fn os_str_ends_with(value: &OsStr, suffix: &OsStr) -> bool {
+    #[cfg(unix)]
+    {
+        value.as_bytes().ends_with(suffix.as_bytes())
+    }
+
+    #[cfg(windows)]
+    {
+        let value_units = value.encode_wide().collect::<Vec<_>>();
+        let suffix_units = suffix.encode_wide().collect::<Vec<_>>();
+        value_units.ends_with(&suffix_units)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        value
+            .to_string_lossy()
+            .ends_with(suffix.to_string_lossy().as_ref())
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn sqlite_file_is_healthy_canonical(path: &Path) -> Result<bool, SqlError> {
     let path_str = path.to_string_lossy();
@@ -4676,6 +4698,7 @@ fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
     let backup_prefix = os_string_with_suffix(file_name, ".backup-");
     let backup_bak_prefix = os_string_with_suffix(file_name, ".bak.");
     let recovery_prefix = os_string_with_suffix(file_name, ".recovery");
+    let sidecar_suffixes = SQLITE_RECOVERY_SIDECAR_SUFFIXES.map(OsString::from);
     if let Ok(entries) = std::fs::read_dir(scan_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -4695,6 +4718,12 @@ fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
             } else {
                 continue;
             };
+            if sidecar_suffixes
+                .iter()
+                .any(|suffix| os_str_ends_with(&name, suffix.as_os_str()))
+            {
+                continue;
+            }
             let modified = entry
                 .metadata()
                 .and_then(|meta| meta.modified())
@@ -7561,6 +7590,24 @@ mod tests {
             Some(backup_bak_series.as_path()),
             "timestamped .bak.* backups should be discovered and prioritized over .backup-*"
         );
+    }
+
+    #[test]
+    fn sqlite_backup_candidates_skip_backup_series_sidecars() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("storage.sqlite3");
+        let backup_bak_series = dir.path().join("storage.sqlite3.bak.20260212_000000");
+        let backup_wal = sqlite_sidecar_path(&backup_bak_series, "-wal");
+        let backup_shm = sqlite_sidecar_path(&backup_bak_series, "-shm");
+        let backup_journal = sqlite_sidecar_path(&backup_bak_series, "-journal");
+        std::fs::write(&primary, b"primary").expect("write primary");
+        std::fs::write(&backup_bak_series, b"backup").expect("write backup series");
+        std::fs::write(&backup_wal, b"wal").expect("write backup wal");
+        std::fs::write(&backup_shm, b"shm").expect("write backup shm");
+        std::fs::write(&backup_journal, b"journal").expect("write backup journal");
+
+        let candidates = sqlite_backup_candidates(&primary);
+        assert_eq!(candidates, vec![backup_bak_series]);
     }
 
     #[cfg(unix)]
