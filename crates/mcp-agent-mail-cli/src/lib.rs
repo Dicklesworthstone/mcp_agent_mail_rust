@@ -21882,6 +21882,63 @@ fn parse_cli_macro_inbox_limit(command: &str, limit: i32) -> CliResult<usize> {
     Ok(limit.min(CLI_MACRO_INBOX_LIMIT_MAX))
 }
 
+fn parse_cli_macro_required_text(command: &str, field: &str, value: String) -> CliResult<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(CliError::InvalidArgument(format!(
+            "{command} {field} cannot be empty"
+        )));
+    }
+    Ok(value.to_string())
+}
+
+fn parse_cli_macro_thread_id(thread_id: String) -> CliResult<String> {
+    let thread_id = thread_id.trim();
+    if thread_id.is_empty() {
+        return Err(CliError::InvalidArgument(
+            "macros prepare-thread thread_id must not be empty or whitespace-only".to_string(),
+        ));
+    }
+    Ok(thread_id.to_string())
+}
+
+fn normalize_cli_macro_agent_name_value(name: &str) -> CliResult<Option<String>> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(normalized) = mcp_agent_mail_core::models::normalize_agent_name(name) {
+        return Ok(Some(normalized));
+    }
+
+    let message = mcp_agent_mail_core::models::detect_agent_name_mistake(name).map_or_else(
+        || {
+            format!(
+                "Invalid agent name format: '{name}'. Agent names MUST be randomly generated \
+                     adjective+noun combinations (e.g., 'GreenLake', 'BlueDog'), NOT descriptive \
+                     names. Omit --agent-name to auto-generate a valid name."
+            )
+        },
+        |(_, message)| message,
+    );
+    Err(CliError::InvalidArgument(message))
+}
+
+fn normalize_cli_macro_optional_agent_name(name: Option<String>) -> CliResult<String> {
+    match name {
+        Some(name) => Ok(normalize_cli_macro_agent_name_value(&name)?
+            .unwrap_or_else(mcp_agent_mail_core::models::generate_agent_name)),
+        None => Ok(mcp_agent_mail_core::models::generate_agent_name()),
+    }
+}
+
+fn normalize_cli_macro_required_agent_name(name: String) -> CliResult<String> {
+    normalize_cli_macro_agent_name_value(&name)?.ok_or_else(|| {
+        CliError::InvalidArgument("agent name is required when --no-register is set".to_string())
+    })
+}
+
 fn normalize_cli_product_inbox_agent_name(agent_name: &str) -> CliResult<String> {
     let trimmed = agent_name.trim();
     if trimmed.is_empty() {
@@ -22357,6 +22414,10 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             if !reserve_paths.is_empty() {
                 validate_reservation_ttl_seconds(reserve_ttl)?;
             }
+            let program =
+                parse_cli_macro_required_text("macros start-session", "program", program)?;
+            let model = parse_cli_macro_required_text("macros start-session", "model", model)?;
+            let agent_name = normalize_cli_macro_optional_agent_name(agent_name)?;
             let inbox_limit = parse_cli_macro_inbox_limit("macros start-session", inbox_limit)?;
 
             // 1. Ensure project
@@ -22364,8 +22425,6 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             let pid = proj.id.unwrap_or(0);
 
             // 2. Register agent
-            let agent_name =
-                agent_name.unwrap_or_else(mcp_agent_mail_core::models::generate_agent_name);
             let agent = outcome_to_result(
                 mcp_agent_mail_db::queries::register_agent(
                     &cx,
@@ -22472,6 +22531,7 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
             let fmt = output::CliOutputFormat::resolve(format, json);
             let should_register = context::resolve_bool(register, no_register, true);
             let include_examples = context::resolve_bool(examples, no_examples, true);
+            let thread_id = parse_cli_macro_thread_id(thread_id)?;
             let inbox_limit = parse_cli_macro_inbox_limit("macros prepare-thread", inbox_limit)?;
 
             let proj = resolve_project_async(&cx, &ctx.pool, &project_key).await?;
@@ -22479,8 +22539,10 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
 
             // Register or resolve agent
             let agent = if should_register {
-                let name =
-                    agent_name.unwrap_or_else(mcp_agent_mail_core::models::generate_agent_name);
+                let program =
+                    parse_cli_macro_required_text("macros prepare-thread", "program", program)?;
+                let model = parse_cli_macro_required_text("macros prepare-thread", "model", model)?;
+                let name = normalize_cli_macro_optional_agent_name(agent_name)?;
                 outcome_to_result(
                     mcp_agent_mail_db::queries::register_agent(
                         &cx,
@@ -22496,11 +22558,14 @@ async fn handle_macros_async(action: MacroCommand) -> CliResult<()> {
                     .await,
                 )?
             } else {
-                let name = agent_name.ok_or_else(|| {
-                    CliError::InvalidArgument(
-                        "agent name is required when --no-register is set".into(),
-                    )
-                })?;
+                let name = agent_name
+                    .map(normalize_cli_macro_required_agent_name)
+                    .transpose()?
+                    .ok_or_else(|| {
+                        CliError::InvalidArgument(
+                            "agent name is required when --no-register is set".into(),
+                        )
+                    })?;
                 resolve_agent_async(&cx, &ctx.pool, pid, &name).await?
             };
 
@@ -23362,6 +23427,64 @@ mod mail_server_cli_bridge_tests {
                 .expect("large macro inbox limit should cap"),
             1000
         );
+    }
+
+    #[test]
+    fn macro_required_text_trims_and_rejects_empty_values() {
+        assert_eq!(
+            crate::parse_cli_macro_required_text(
+                "macros start-session",
+                "program",
+                "  codex-cli  ".to_string(),
+            )
+            .expect("non-empty program should parse"),
+            "codex-cli"
+        );
+
+        let err = crate::parse_cli_macro_required_text(
+            "macros prepare-thread",
+            "model",
+            " \t ".to_string(),
+        )
+        .expect_err("blank model should fail");
+        assert!(
+            err.to_string()
+                .contains("macros prepare-thread model cannot be empty")
+        );
+    }
+
+    #[test]
+    fn macro_thread_id_trims_and_rejects_blank_values() {
+        assert_eq!(
+            crate::parse_cli_macro_thread_id("  TKT-42  ".to_string())
+                .expect("non-empty thread_id should parse"),
+            "TKT-42"
+        );
+
+        let err = crate::parse_cli_macro_thread_id(" \n\t ".to_string())
+            .expect_err("blank thread_id should fail");
+        assert!(
+            err.to_string()
+                .contains("thread_id must not be empty or whitespace-only")
+        );
+    }
+
+    #[test]
+    fn macro_agent_name_normalizes_valid_names_and_rejects_invalid_names() {
+        assert_eq!(
+            crate::normalize_cli_macro_optional_agent_name(Some("bluelake".to_string()))
+                .expect("valid lowercase agent name should normalize"),
+            "BlueLake"
+        );
+
+        let generated = crate::normalize_cli_macro_optional_agent_name(Some("   ".to_string()))
+            .expect("blank optional agent name should generate");
+        assert!(mcp_agent_mail_core::models::is_valid_agent_name(&generated));
+
+        let err =
+            crate::normalize_cli_macro_optional_agent_name(Some("BackendHarmonizer".to_string()))
+                .expect_err("descriptive agent name should fail");
+        assert!(err.to_string().contains("Invalid agent name format"));
     }
 
     #[test]
