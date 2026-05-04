@@ -29250,6 +29250,36 @@ http_headers = { Authorization = "Bearer secret" }
         );
     }
 
+    #[test]
+    fn doctor_salvage_artifact_candidates_skip_sqlite_sidecars() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        std::fs::write(&db_path, b"live").expect("write db");
+
+        let quarantined = dir
+            .path()
+            .join("storage.sqlite3.corrupt-20260324_120000_000");
+        let quarantined_wal = sqlite_sidecar_path(&quarantined, "-wal");
+        let reconstruct = dir
+            .path()
+            .join("storage.sqlite3.reconstruct-20260324_120001_000.sqlite3");
+        let reconstruct_shm = sqlite_sidecar_path(&reconstruct, "-shm");
+        std::fs::write(&quarantined, b"quarantined").expect("write quarantined");
+        std::fs::write(&quarantined_wal, b"wal").expect("write wal sidecar");
+        std::fs::write(&reconstruct, b"reconstruct").expect("write reconstruct");
+        std::fs::write(&reconstruct_shm, b"shm").expect("write shm sidecar");
+
+        let paths: Vec<PathBuf> = doctor_salvage_artifact_candidates(&db_path)
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+
+        assert!(paths.contains(&quarantined));
+        assert!(paths.contains(&reconstruct));
+        assert!(!paths.contains(&quarantined_wal));
+        assert!(!paths.contains(&reconstruct_shm));
+    }
+
     fn write_marker_db(path: &Path, marker: &str) {
         let conn = mcp_agent_mail_db::DbConn::open_file(path.display().to_string())
             .expect("open marker db");
@@ -50198,6 +50228,7 @@ fn doctor_salvage_artifact_candidates(current_db: &Path) -> Vec<(String, PathBuf
             os_string_with_suffix(file_name, ".reconstruct-"),
         ),
     ];
+    let sidecar_suffixes = SQLITE_RECOVERY_SIDECAR_SUFFIXES.map(OsString::from);
 
     for (label, prefix) in prefixed_groups {
         let mut group = Vec::new();
@@ -50212,6 +50243,12 @@ fn doctor_salvage_artifact_candidates(current_db: &Path) -> Vec<(String, PathBuf
                 }
                 let name = entry.file_name();
                 if !os_str_starts_with(&name, prefix.as_os_str()) {
+                    continue;
+                }
+                if sidecar_suffixes
+                    .iter()
+                    .any(|suffix| os_str_ends_with(&name, suffix.as_os_str()))
+                {
                     continue;
                 }
                 let modified = entry
