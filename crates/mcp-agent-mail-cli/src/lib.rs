@@ -29250,6 +29250,38 @@ http_headers = { Authorization = "Bearer secret" }
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn doctor_salvage_artifact_candidates_dedupe_preserves_distinct_non_utf8_paths() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        std::fs::write(&db_path, b"live").expect("write db");
+
+        let corrupt_one = dir
+            .path()
+            .join(OsString::from_vec(b"storage.sqlite3.corrupt-\xFF".to_vec()));
+        let corrupt_two = dir
+            .path()
+            .join(OsString::from_vec(b"storage.sqlite3.corrupt-\xFE".to_vec()));
+        assert_eq!(
+            corrupt_one.to_string_lossy(),
+            corrupt_two.to_string_lossy(),
+            "test setup requires two distinct paths with the same lossy display"
+        );
+        std::fs::write(&corrupt_one, b"one").expect("write first corrupt artifact");
+        std::fs::write(&corrupt_two, b"two").expect("write second corrupt artifact");
+
+        let paths: Vec<PathBuf> = doctor_salvage_artifact_candidates(&db_path)
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+
+        assert!(paths.contains(&corrupt_one), "missing {corrupt_one:?}");
+        assert!(paths.contains(&corrupt_two), "missing {corrupt_two:?}");
+    }
+
     #[test]
     fn doctor_salvage_artifact_candidates_skip_sqlite_sidecars() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -50188,8 +50220,7 @@ fn doctor_salvage_artifact_candidates(current_db: &Path) -> Vec<(String, PathBuf
         if !path_is_real_file(&path) {
             return;
         }
-        let key = path.to_string_lossy().into_owned();
-        if seen.insert(key) {
+        if seen.insert(path.clone()) {
             candidates.push((label.to_string(), path));
         }
     };
