@@ -5082,6 +5082,7 @@ dependencies = [
  "mcp-agent-mail-core",
  "mcp-agent-mail-db",
  "mime_guess",
+ "nix 0.31.2",
  "regex",
  "serde",
  "serde_json",

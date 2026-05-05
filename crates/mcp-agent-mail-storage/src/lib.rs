@@ -5154,14 +5154,10 @@ fn update_thread_digest(
     // respect to other appenders. Even for larger payloads, combining
     // header + entry into one write avoids interleaving from concurrent
     // writers between the two calls.
-    let (mut file, is_new) = match fs::OpenOptions::new()
-        .append(true)
-        .create_new(true)
-        .open(&digest_path)
-    {
+    let (mut file, is_new) = match create_new_archive_append_file(&digest_path) {
         Ok(f) => (f, true),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let f = fs::OpenOptions::new().append(true).open(&digest_path)?;
+            let f = open_existing_archive_append_file(&digest_path)?;
             (f, false)
         }
         Err(e) => return Err(e.into()),
@@ -5520,10 +5516,7 @@ pub fn store_attachment(
         "bytes_original": original_bytes.len(),
         "ext": original_ext,
     });
-    let mut audit_file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&audit_path)?;
+    let mut audit_file = open_or_create_archive_append_file(&audit_path)?;
     audit_file.write_all(audit_entry.to_string().as_bytes())?;
     audit_file.write_all(b"\n")?;
     rel_paths.push(rel_path_cached(&archive.canonical_repo_root, &audit_path)?);
@@ -7956,6 +7949,52 @@ fn write_json(path: &Path, value: &serde_json::Value, sync: bool) -> Result<()> 
     ensure_parent_dir(path)?;
     let content = serde_json::to_string_pretty(value)?;
     atomic_write_bytes(path, content.as_bytes(), sync)
+}
+
+fn archive_append_open_options() -> fs::OpenOptions {
+    let mut options = fs::OpenOptions::new();
+    options.append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o644)
+            .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
+    }
+    options
+}
+
+fn validate_archive_append_target(path: &Path) -> std::io::Result<()> {
+    if path_existing_prefix_has_symlink(path)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "archive append target must not include symlinks: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn create_new_archive_append_file(path: &Path) -> std::io::Result<fs::File> {
+    ensure_parent_dir(path)?;
+    validate_archive_append_target(path)?;
+    let mut options = archive_append_open_options();
+    options.create_new(true).open(path)
+}
+
+fn open_existing_archive_append_file(path: &Path) -> std::io::Result<fs::File> {
+    ensure_parent_dir(path)?;
+    validate_archive_append_target(path)?;
+    archive_append_open_options().open(path)
+}
+
+fn open_or_create_archive_append_file(path: &Path) -> std::io::Result<fs::File> {
+    ensure_parent_dir(path)?;
+    validate_archive_append_target(path)?;
+    let mut options = archive_append_open_options();
+    options.create(true).open(path)
 }
 
 static ATOMIC_WRITE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -11323,6 +11362,41 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_store_attachment_rejects_symlinked_audit_log() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "attach-audit-symlink-proj").unwrap();
+        let img_path = tmp.path().join("source.png");
+        create_test_png(&img_path);
+
+        let original_bytes = fs::read(&img_path).unwrap();
+        let digest = {
+            let mut hasher = sha1::Sha1::new();
+            hasher.update(&original_bytes);
+            hex::encode(hasher.finalize())
+        };
+        let audit_path = archive
+            .root
+            .join("attachments")
+            .join("_audit")
+            .join(format!("{digest}.log"));
+        fs::create_dir_all(audit_path.parent().unwrap()).unwrap();
+        let outside = tmp.path().join("outside-audit.log");
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, &audit_path).unwrap();
+
+        let err = store_attachment(&archive, &config, &img_path, EmbedPolicy::File).unwrap_err();
+        assert!(
+            err.to_string().contains("must not include symlinks"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+    }
+
     #[test]
     fn test_store_raw_attachment_ignores_forged_archive_root() {
         let tmp = TempDir::new().unwrap();
@@ -13618,6 +13692,39 @@ mod tests {
             entry_header_count, NUM_MESSAGES,
             "expected {NUM_MESSAGES} entry headers, got {entry_header_count}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn thread_digest_rejects_symlinked_digest_file() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "thread-digest-symlink-proj").unwrap();
+        let digest_path = archive.root.join("messages").join("threads").join("t-1.md");
+        fs::create_dir_all(digest_path.parent().unwrap()).unwrap();
+        let outside = tmp.path().join("outside-thread.md");
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, &digest_path).unwrap();
+
+        let err = update_thread_digest(
+            &archive,
+            "T-1",
+            "SenderAgent",
+            &["ReceiverAgent".to_string()],
+            "Subject",
+            "2026-05-05T12:00:00Z",
+            "body",
+            "messages/2026/05/message.md",
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("must not include symlinks"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
     }
 
     // -----------------------------------------------------------------------
