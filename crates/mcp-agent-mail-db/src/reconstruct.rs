@@ -706,10 +706,28 @@ pub fn collect_db_message_ids(db_path: &Path) -> Result<BTreeSet<i64>, SqlError>
     // silently materialize an empty DB stub for a missing mailbox.  This is
     // a read-only inventory probe used by `compute_archive_drift_report` and
     // `scan_archive_anomalies_with_db`, so refuse cleanly rather than mutate
-    // the filesystem for the caller.
-    if !db_path.exists() {
+    // the filesystem for the caller. Reject symlinked paths as well: opening a
+    // symlink with SQLite can create journals or WAL files next to the target.
+    crate::pool::validate_sqlite_target_path(db_path, "DB message-id inventory target")
+        .map_err(|error| SqlError::Custom(format!("collect_db_message_ids: {error}")))?;
+    let metadata = match std::fs::symlink_metadata(db_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SqlError::Custom(format!(
+                "collect_db_message_ids: database file not found at {}",
+                db_path.display()
+            )));
+        }
+        Err(error) => {
+            return Err(SqlError::Custom(format!(
+                "collect_db_message_ids: failed to inspect database file {}: {error}",
+                db_path.display()
+            )));
+        }
+    };
+    if !metadata.file_type().is_file() {
         return Err(SqlError::Custom(format!(
-            "collect_db_message_ids: database file not found at {}",
+            "collect_db_message_ids: refusing non-regular database file {}",
             db_path.display()
         )));
     }
@@ -7519,6 +7537,25 @@ archive body
             .expect_err("in-memory message-id inventory should be unavailable");
         assert!(
             err.to_string().contains("in-memory"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_db_message_ids_rejects_symlinked_db_path() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real_db = tmp.path().join("real.db");
+        let linked_db = tmp.path().join("linked.db");
+        setup_db_with_messages(&real_db, &[5, 15, 25]);
+        symlink(&real_db, &linked_db).unwrap();
+
+        let err = collect_db_message_ids(&linked_db)
+            .expect_err("DB inventory should not follow symlinked sqlite paths");
+        assert!(
+            err.to_string().contains("symlinked path"),
             "unexpected error: {err}"
         );
     }
