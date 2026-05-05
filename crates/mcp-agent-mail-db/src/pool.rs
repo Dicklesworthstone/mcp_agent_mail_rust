@@ -9749,24 +9749,94 @@ mod tests {
         let backup = dir.path().join("storage.sqlite3.bak");
         let storage_root = dir.path().join("storage");
 
-        // Create a healthy backup with a marker table.
-        write_marker_db(&primary, "from-backup");
+        let proj_dir = storage_root.join("projects").join("backup-project");
+        let agent_dir = proj_dir.join("agents").join("Alice");
+        let msg_dir = proj_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        std::fs::write(
+            proj_dir.join("project.json"),
+            r#"{"slug":"backup-project","human_key":"/backup-project"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"First\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:00:00Z\",\"attachments\":[]}\n---\n\nfirst body\n",
+        )
+        .unwrap();
+
+        crate::reconstruct::reconstruct_from_archive(&primary, &storage_root)
+            .expect("seed backup db from archive");
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        conn.execute_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(3),
+                Value::BigInt(1),
+                Value::Text("BlueLake".to_string()),
+                Value::Text("coder".to_string()),
+                Value::Text("test".to_string()),
+                Value::Text(String::new()),
+                Value::BigInt(2),
+                Value::BigInt(2),
+                Value::Text("auto".to_string()),
+                Value::Text("auto".to_string()),
+            ],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO messages (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments, recipients_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                Value::BigInt(2),
+                Value::BigInt(1),
+                Value::BigInt(1),
+                Value::Text("t2".to_string()),
+                Value::Text("DB-only".to_string()),
+                Value::Text("db-only body".to_string()),
+                Value::Text("normal".to_string()),
+                Value::BigInt(0),
+                Value::BigInt(2_000_000),
+                Value::Text("[]".to_string()),
+                Value::Text(r#"{"to":["BlueLake"],"cc":[],"bcc":[]}"#.to_string()),
+            ],
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, ack_ts, read_ts) VALUES (?, ?, ?, NULL, NULL)",
+            &[
+                Value::BigInt(2),
+                Value::BigInt(3),
+                Value::Text("to".to_string()),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        checkpoint_and_remove_sqlite_sidecars(&primary);
         std::fs::copy(&primary, &backup).unwrap();
 
         // Corrupt the primary.
         std::fs::write(&primary, b"corrupted-data").unwrap();
 
-        // Create a minimal storage root (even though backup should win).
-        std::fs::create_dir_all(storage_root.join("projects").join("proj1")).unwrap();
-
         ensure_sqlite_file_healthy_with_archive(&primary, &storage_root).unwrap();
 
-        // Should have restored from backup (marker table present).
-        let val = sqlite_marker_value(&primary);
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id FROM messages",
+                &[],
+            )
+            .unwrap();
+        let row = rows.first().unwrap();
+        assert_eq!(row.get_named::<i64>("count").unwrap_or(0), 2);
         assert_eq!(
-            val.as_deref(),
-            Some("from-backup"),
-            "backup should take priority over archive"
+            row.get_named::<i64>("max_id").unwrap_or(0),
+            2,
+            "backup should retain DB-only mailbox state when it is ahead of the archive"
         );
     }
 
