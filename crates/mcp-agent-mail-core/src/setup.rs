@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::fmt;
+use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
@@ -427,6 +428,8 @@ pub fn save_token_to_env_file(env_path: &Path, token: &str) -> Result<(), SetupE
     if token.contains('\n') || token.contains('\r') {
         return Err(SetupError::Other("Token must not contain newlines".into()));
     }
+    ensure_setup_parent_dir(env_path, "token env file")?;
+    validate_setup_file_target(env_path, "token env file")?;
 
     let existing_content = if env_path.exists() {
         Some(std::fs::read_to_string(env_path)?)
@@ -465,30 +468,7 @@ pub fn save_token_to_env_file(env_path: &Path, token: &str) -> Result<(), SetupE
         return Ok(());
     }
 
-    if let Some(parent) = env_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Create file atomically with restricted permissions to avoid TOCTOU race
-    // where the file is briefly world-readable between creation and chmod.
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(env_path)?;
-        f.write_all(content.as_bytes())?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        std::fs::write(env_path, content)?;
-    }
-
+    write_setup_file_atomic(env_path, content.as_bytes(), 0o600, "token env file")?;
     Ok(())
 }
 
@@ -1101,10 +1081,191 @@ impl AgentPlatform {
 // Atomic file writes
 // ---------------------------------------------------------------------------
 
+fn invalid_setup_path(label: &str, path: &Path, reason: impl fmt::Display) -> SetupError {
+    SetupError::Other(format!("{label} {}: {}", reason, path.display()))
+}
+
+fn ensure_no_parent_traversal(path: &Path, label: &str) -> Result<(), SetupError> {
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(invalid_setup_path(
+            label,
+            path,
+            "must not contain parent traversal",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_setup_real_directory(path: &Path, label: &str) -> Result<(), SetupError> {
+    ensure_no_parent_traversal(path, label)?;
+
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            std::path::Component::RootDir => current.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => unreachable!("parent traversal checked above"),
+            std::path::Component::Normal(segment) => {
+                current.push(segment);
+                match std::fs::symlink_metadata(&current) {
+                    Ok(metadata) => {
+                        if metadata.file_type().is_symlink() {
+                            return Err(invalid_setup_path(
+                                label,
+                                &current,
+                                "must not traverse symlinked directories",
+                            ));
+                        }
+                        if !metadata.file_type().is_dir() {
+                            return Err(invalid_setup_path(
+                                label,
+                                &current,
+                                "expected directory component",
+                            ));
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir(&current)?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_setup_parent_dir(path: &Path, label: &str) -> Result<(), SetupError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    ensure_setup_real_directory(parent, label)
+}
+
+fn validate_setup_file_target(path: &Path, label: &str) -> Result<(), SetupError> {
+    ensure_no_parent_traversal(path, label)?;
+    if path.file_name().is_none_or(std::ffi::OsStr::is_empty) {
+        return Err(invalid_setup_path(label, path, "must name a file"));
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(invalid_setup_path(label, path, "must not be a symlink"));
+            }
+            if !metadata.file_type().is_file() {
+                return Err(invalid_setup_path(label, path, "must be a file path"));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn setup_new_file_options(permissions: u32) -> std::fs::OpenOptions {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(permissions)
+            .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
+    }
+    options
+}
+
+fn setup_read_file_options() -> std::fs::OpenOptions {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
+    }
+    options
+}
+
+fn create_unique_setup_file(
+    parent: &Path,
+    file_name: &str,
+    suffix: &str,
+    permissions: u32,
+) -> Result<(PathBuf, std::fs::File), SetupError> {
+    let pid = std::process::id();
+    let now = crate::timestamps::now_micros();
+    for attempt in 0..1024 {
+        let candidate = parent.join(format!(".{file_name}.{pid}.{now}.{attempt}.{suffix}"));
+        match setup_new_file_options(permissions).open(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(SetupError::Other(format!(
+        "could not create unique temporary setup file next to {}",
+        parent.display()
+    )))
+}
+
+fn write_setup_file_atomic(
+    path: &Path,
+    content: &[u8],
+    permissions: u32,
+    label: &str,
+) -> Result<(), SetupError> {
+    ensure_setup_parent_dir(path, label)?;
+    validate_setup_file_target(path, label)?;
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| invalid_setup_path(label, path, "must name a file"))?
+        .to_string_lossy();
+    let (temp, mut file) = create_unique_setup_file(parent, &file_name, "tmp", permissions)?;
+    file.write_all(content)?;
+    file.sync_all()?;
+    drop(file);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(permissions))?;
+    }
+
+    validate_setup_file_target(path, label)?;
+    std::fs::rename(&temp, path)?;
+    Ok(())
+}
+
+fn copy_setup_file_to_backup(
+    source: &Path,
+    backup_parent: &Path,
+    file_name: &str,
+    permissions: u32,
+) -> Result<(), SetupError> {
+    validate_setup_file_target(source, "config backup source")?;
+    let (backup, mut output) =
+        create_unique_setup_file(backup_parent, file_name, "bak", permissions)?;
+    validate_setup_file_target(&backup, "config backup target")?;
+    let mut input = setup_read_file_options().open(source)?;
+    let mut buf = Vec::new();
+    input.read_to_end(&mut buf)?;
+    output.write_all(&buf)?;
+    output.sync_all()?;
+    Ok(())
+}
+
 /// Execute a single config write action, returning the outcome.
 pub fn write_config_atomic(action: &ConfigAction) -> Result<ActionOutcome, SetupError> {
     let parent = action.file_path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
+    ensure_setup_parent_dir(&action.file_path, "config file")?;
+    validate_setup_file_target(&action.file_path, "config file")?;
 
     let existing = std::fs::read_to_string(&action.file_path).ok();
 
@@ -1139,34 +1300,20 @@ pub fn write_config_atomic(action: &ConfigAction) -> Result<ActionOutcome, Setup
 
     // Backup existing file
     if action.backup && was_existing {
-        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S");
         let file_name = action
             .file_path
             .file_name()
             .unwrap_or_default()
             .to_string_lossy();
-        let backup = parent.join(format!(".{file_name}.{ts}.bak"));
-        std::fs::copy(&action.file_path, &backup)?;
+        copy_setup_file_to_backup(&action.file_path, parent, &file_name, action.permissions)?;
     }
 
-    // Atomic write: write to unique temp file in same directory, then rename
-    let ts = crate::timestamps::now_micros();
-    let pid = std::process::id();
-    let file_name = action
-        .file_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let temp = parent.join(format!(".{file_name}.{pid}.{ts}.tmp"));
-    std::fs::write(&temp, &new_content)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(action.permissions))?;
-    }
-
-    std::fs::rename(&temp, &action.file_path)?;
+    write_setup_file_atomic(
+        &action.file_path,
+        new_content.as_bytes(),
+        action.permissions,
+        "config file",
+    )?;
 
     if was_existing {
         Ok(ActionOutcome::Updated)
@@ -1879,6 +2026,63 @@ mod tests {
         assert_eq!(entries.len(), 1, "should have one backup file");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn write_config_atomic_rejects_symlinked_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside.json");
+        let linked = tmp.path().join("config.json");
+        std::fs::write(&outside, r#"{"outside": true}"#).unwrap();
+        symlink(&outside, &linked).unwrap();
+
+        let action = ConfigAction {
+            platform: AgentPlatform::Cursor,
+            file_path: linked,
+            description: "test".into(),
+            content: ConfigContent::JsonFull(json!({"new": true})),
+            permissions: 0o644,
+            backup: true,
+        };
+        let err = write_config_atomic(&action).unwrap_err();
+
+        assert!(err.to_string().contains("must not be a symlink"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            r#"{"outside": true}"#
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_config_atomic_rejects_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside_dir = tmp.path().join("outside");
+        let linked_dir = tmp.path().join("linked");
+        std::fs::create_dir(&outside_dir).unwrap();
+        symlink(&outside_dir, &linked_dir).unwrap();
+
+        let action = ConfigAction {
+            platform: AgentPlatform::Cursor,
+            file_path: linked_dir.join("config.json"),
+            description: "test".into(),
+            content: ConfigContent::JsonFull(json!({"new": true})),
+            permissions: 0o644,
+            backup: false,
+        };
+        let err = write_config_atomic(&action).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("must not traverse symlinked directories"),
+            "{err}"
+        );
+        assert!(!outside_dir.join("config.json").exists());
+    }
+
     #[test]
     fn write_config_atomic_unchanged_noop() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1985,6 +2189,47 @@ mod tests {
         assert!(content.contains("OTHER=value"));
         assert!(content.contains("MORE=stuff"));
         assert!(content.ends_with('\n'), "file must end with newline");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_token_to_env_file_rejects_symlinked_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside.env");
+        let linked = tmp.path().join(".env");
+        std::fs::write(&outside, "HTTP_BEARER_TOKEN=outside\n").unwrap();
+        symlink(&outside, &linked).unwrap();
+
+        let err = save_token_to_env_file(&linked, "new-token").unwrap_err();
+
+        assert!(err.to_string().contains("must not be a symlink"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "HTTP_BEARER_TOKEN=outside\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_token_to_env_file_rejects_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside_dir = tmp.path().join("outside");
+        let linked_dir = tmp.path().join("linked");
+        std::fs::create_dir(&outside_dir).unwrap();
+        symlink(&outside_dir, &linked_dir).unwrap();
+
+        let err = save_token_to_env_file(&linked_dir.join(".env"), "new-token").unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("must not traverse symlinked directories"),
+            "{err}"
+        );
+        assert!(!outside_dir.join(".env").exists());
     }
 
     #[test]
