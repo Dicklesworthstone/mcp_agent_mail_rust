@@ -485,10 +485,10 @@ fn copy_file_without_overwrite(source: &Path, destination: &Path) -> Result<(), 
 }
 
 fn backup_path_candidate(path: &Path, stamp: &str, suffix: Option<u64>) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .unwrap_or_else(|| OsString::from("mcp-config.json"));
+    let file_name = path.file_name().map_or_else(
+        || OsString::from("mcp-config.json"),
+        std::ffi::OsStr::to_os_string,
+    );
     let mut backup_name = file_name;
     backup_name.push(".");
     backup_name.push(stamp);
