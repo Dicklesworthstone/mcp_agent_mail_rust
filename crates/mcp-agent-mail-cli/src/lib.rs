@@ -4393,9 +4393,22 @@ fn setup_self_heal_cache_path(config: &Config, project_dir: &Path) -> PathBuf {
         .join(format!("{key}.json"))
 }
 
+fn read_cache_file_if_real(path: &Path) -> Option<String> {
+    if !path_is_real_file(path) {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+fn write_cache_file_if_safe(path: &Path, content: &str, label: &str) {
+    if ensure_real_file_target_path(path, label).is_ok() {
+        let _ = std::fs::write(path, content);
+    }
+}
+
 fn read_setup_self_heal_cache(config: &Config, project_dir: &Path) -> Option<SetupSelfHealCache> {
     let path = setup_self_heal_cache_path(config, project_dir);
-    let content = std::fs::read_to_string(path).ok()?;
+    let content = read_cache_file_if_real(&path)?;
     serde_json::from_str::<SetupSelfHealCache>(&content).ok()
 }
 
@@ -4423,11 +4436,8 @@ fn load_self_heal_target_agents(
 
 fn write_setup_self_heal_cache(config: &Config, project_dir: &Path, cache: &SetupSelfHealCache) {
     let path = setup_self_heal_cache_path(config, project_dir);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
     if let Ok(content) = serde_json::to_string(cache) {
-        let _ = std::fs::write(path, content);
+        write_cache_file_if_safe(&path, &content, "setup self-heal cache");
     }
 }
 
@@ -12087,7 +12097,7 @@ fn update_check_cache_path() -> PathBuf {
 /// Read cached update check if it's less than 24 hours old.
 fn read_update_cache() -> Option<UpdateCheckResult> {
     let path = update_check_cache_path();
-    let content = std::fs::read_to_string(&path).ok()?;
+    let content = read_cache_file_if_real(&path)?;
     let cached: serde_json::Value = serde_json::from_str(&content).ok()?;
 
     // Check age
@@ -12123,16 +12133,14 @@ fn read_update_cache() -> Option<UpdateCheckResult> {
 /// Write update check result to cache.
 fn write_update_cache(result: &UpdateCheckResult) {
     let path = update_check_cache_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
     let cached = serde_json::json!({
         "checked_at": chrono::Utc::now().to_rfc3339(),
         "result": result,
     });
-    let _ = std::fs::write(
+    write_cache_file_if_safe(
         &path,
-        serde_json::to_string_pretty(&cached).unwrap_or_default(),
+        &serde_json::to_string_pretty(&cached).unwrap_or_default(),
+        "update-check cache",
     );
 }
 
@@ -26415,6 +26423,48 @@ http_headers = { Authorization = "Bearer secret" }
             SetupCommand::Run { path, .. } => assert_eq!(path, "/mcp/"),
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_self_heal_cache_ignores_symlinked_cache_file() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            storage_root: temp.path().join("storage"),
+            ..Config::default()
+        };
+        let project_dir = temp.path().join("project");
+        let cache_path = setup_self_heal_cache_path(&config, &project_dir);
+        let outside = temp.path().join("outside-cache-target.json");
+        let cache = SetupSelfHealCache {
+            schema_version: SETUP_SELF_HEAL_CACHE_VERSION,
+            project_dir: project_dir.display().to_string(),
+            server_url: "http://127.0.0.1:8765/mcp/".to_string(),
+            token_fingerprint: token_fingerprint("secret"),
+            target_agents: vec!["codex".to_string()],
+            skip_user_config: false,
+            skip_hooks: false,
+            file_fingerprints: Vec::new(),
+        };
+
+        std::fs::create_dir_all(cache_path.parent().expect("cache parent"))
+            .expect("create cache parent");
+        std::fs::write(&outside, "outside").expect("write outside target");
+        symlink(&outside, &cache_path).expect("symlink cache file");
+
+        write_setup_self_heal_cache(&config, &project_dir, &cache);
+
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("read outside target"),
+            "outside",
+            "setup self-heal cache writes must not follow symlinked cache files"
+        );
+        assert!(
+            read_setup_self_heal_cache(&config, &project_dir).is_none(),
+            "setup self-heal cache reads must ignore symlinked cache files"
+        );
     }
 
     #[test]
@@ -55408,6 +55458,42 @@ fn handle_self_update_check_result_returns_error_on_failed_check() {
     })
     .expect_err("failed update checks should return an error");
     assert!(format!("{err}").contains("update check failed"));
+}
+
+#[cfg(unix)]
+#[test]
+fn update_check_cache_ignores_symlinked_cache_file() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let home_text = home.to_string_lossy().to_string();
+
+    mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        &[("HOME", home_text.as_str())],
+        || {
+            let cache_path = update_check_cache_path();
+            let outside = temp.path().join("outside-update-cache.json");
+            std::fs::create_dir_all(cache_path.parent().expect("cache parent"))
+                .expect("create cache parent");
+            std::fs::write(&outside, "outside").expect("write outside target");
+            symlink(&outside, &cache_path).expect("symlink update cache");
+
+            write_update_cache(&UpdateCheckResult::UpToDate {
+                current: "0.0.0".to_string(),
+            });
+
+            assert_eq!(
+                std::fs::read_to_string(&outside).expect("read outside target"),
+                "outside",
+                "update cache writes must not follow symlinked cache files"
+            );
+            assert!(
+                read_update_cache().is_none(),
+                "update cache reads must ignore symlinked cache files"
+            );
+        },
+    );
 }
 
 #[test]
