@@ -7,6 +7,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashSet;
+use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// Supported MCP client tools that may hold config files.
@@ -216,8 +218,7 @@ pub fn update_mcp_config_file(
         });
     }
 
-    let backup_path = backup_path_for(config_path);
-    std::fs::copy(config_path, &backup_path)?;
+    let backup_path = create_backup(config_path)?;
     std::fs::write(config_path, &update.updated_text)?;
     validate_strict_json(&update.updated_text)?;
 
@@ -453,13 +454,49 @@ fn validate_strict_json(text: &str) -> Result<(), McpConfigUpdateError> {
         .map_err(|error| McpConfigUpdateError::Validation(error.to_string()))
 }
 
-fn backup_path_for(path: &Path) -> PathBuf {
+fn create_backup(path: &Path) -> Result<PathBuf, io::Error> {
     let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    create_backup_for_timestamp(path, &stamp.to_string())
+}
+
+fn create_backup_for_timestamp(path: &Path, stamp: &str) -> Result<PathBuf, io::Error> {
+    let mut suffix = None;
+    loop {
+        let backup_path = backup_path_candidate(path, stamp, suffix);
+        match copy_file_without_overwrite(path, &backup_path) {
+            Ok(()) => return Ok(backup_path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                suffix = Some(suffix.map_or(1, |suffix| suffix + 1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn copy_file_without_overwrite(source: &Path, destination: &Path) -> Result<(), io::Error> {
+    let mut source_file = std::fs::File::open(source)?;
+    let permissions = source_file.metadata()?.permissions();
+    let mut destination_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    io::copy(&mut source_file, &mut destination_file)?;
+    std::fs::set_permissions(destination, permissions)
+}
+
+fn backup_path_candidate(path: &Path, stamp: &str, suffix: Option<u64>) -> PathBuf {
     let file_name = path
         .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("mcp-config.json");
-    path.with_file_name(format!("{file_name}.{stamp}.bak"))
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_else(|| OsString::from("mcp-config.json"));
+    let mut backup_name = file_name;
+    backup_name.push(".");
+    backup_name.push(stamp);
+    if let Some(suffix) = suffix {
+        backup_name.push(format!("-{suffix:02}"));
+    }
+    backup_name.push(".bak");
+    path.with_file_name(backup_name)
 }
 
 fn push_candidate(
@@ -910,8 +947,7 @@ pub fn setup_mcp_config_file(
         });
     }
 
-    let backup = backup_path_for(config_path);
-    std::fs::copy(config_path, &backup)?;
+    let backup = create_backup(config_path)?;
     std::fs::write(config_path, &update.updated_text)?;
 
     Ok(McpConfigSetupResult {
@@ -2012,6 +2048,64 @@ mod tests {
         assert!(
             middle.chars().nth(8) == Some('_'),
             "separator at position 8: {middle}"
+        );
+    }
+
+    #[test]
+    fn create_backup_for_timestamp_preserves_existing_backup_candidates() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("claude_desktop_config.json");
+        let stamp = "20260505_010203";
+        std::fs::write(&config_path, "current config").expect("write config");
+
+        let first_backup = backup_path_candidate(&config_path, stamp, None);
+        let second_backup = backup_path_candidate(&config_path, stamp, Some(1));
+        std::fs::write(&first_backup, "older backup").expect("write first backup");
+        std::fs::write(&second_backup, "newer backup").expect("write second backup");
+
+        let backup = create_backup_for_timestamp(&config_path, stamp).expect("create backup");
+
+        assert_eq!(backup, backup_path_candidate(&config_path, stamp, Some(2)));
+        assert_eq!(
+            std::fs::read_to_string(first_backup).expect("read first backup"),
+            "older backup",
+            "existing backup must not be overwritten"
+        );
+        assert_eq!(
+            std::fs::read_to_string(second_backup).expect("read second backup"),
+            "newer backup",
+            "existing suffixed backup must not be overwritten"
+        );
+        assert_eq!(
+            std::fs::read_to_string(backup).expect("read created backup"),
+            "current config"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_backup_for_timestamp_skips_symlinked_candidate() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("claude_desktop_config.json");
+        let stamp = "20260505_010203";
+        let symlink_target = temp.path().join("symlink-target");
+        std::fs::write(&config_path, "current config").expect("write config");
+        std::fs::write(&symlink_target, "must stay intact").expect("write symlink target");
+
+        let first_backup = backup_path_candidate(&config_path, stamp, None);
+        std::os::unix::fs::symlink(&symlink_target, &first_backup).expect("create symlink");
+
+        let backup = create_backup_for_timestamp(&config_path, stamp).expect("create backup");
+
+        assert_eq!(backup, backup_path_candidate(&config_path, stamp, Some(1)));
+        assert_eq!(
+            std::fs::read_to_string(symlink_target).expect("read symlink target"),
+            "must stay intact",
+            "backup creation must not follow or overwrite symlinked candidates"
+        );
+        assert_eq!(
+            std::fs::read_to_string(backup).expect("read created backup"),
+            "current config"
         );
     }
 
