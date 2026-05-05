@@ -6028,7 +6028,7 @@ fn sqlite_backup_candidates(path: &Path) -> Vec<PathBuf> {
     };
 
     let bak = path.with_file_name(os_string_with_suffix(file_name, ".bak"));
-    if bak.is_file() {
+    if path_is_real_file(&bak) {
         let modified = bak
             .metadata()
             .and_then(|meta| meta.modified())
@@ -29233,6 +29233,31 @@ http_headers = { Authorization = "Bearer secret" }
 
         let backups = list_db_backups(&db_path, Some(dir.path())).expect("list backups");
         assert_eq!(backups, vec![newer, older]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_backup_candidates_skip_symlinked_legacy_bak() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        std::fs::write(&db_path, b"db").expect("write db");
+
+        let outside = dir.path().join("outside.sqlite3");
+        std::fs::write(&outside, b"outside").expect("write outside target");
+        let legacy_bak = dir.path().join("storage.sqlite3.bak");
+        symlink(&outside, &legacy_bak).expect("symlink legacy bak");
+
+        let timestamped_bak = dir.path().join("storage.sqlite3.bak.20260102_000000");
+        std::fs::write(&timestamped_bak, b"timestamped").expect("write timestamped backup");
+
+        let candidates = sqlite_backup_candidates(&db_path);
+        assert!(
+            !candidates.contains(&legacy_bak),
+            "legacy .bak symlinks must not be considered recovery candidates: {candidates:?}"
+        );
+        assert_eq!(candidates, vec![timestamped_bak]);
     }
 
     #[cfg(unix)]
