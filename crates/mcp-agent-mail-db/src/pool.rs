@@ -5536,6 +5536,25 @@ fn create_proactive_backup_stage(source: &Path, backup_path: &Path) -> DbResult<
     }
 }
 
+fn stage_backup_restore_candidate(
+    backup_path: &Path,
+    primary_path: &Path,
+    timestamp: &str,
+) -> Result<PathBuf, SqlError> {
+    let restore_candidate = restore_candidate_path(primary_path, timestamp);
+    if let Err(error) = copy_file_without_overwrite(backup_path, &restore_candidate) {
+        if error.kind() != std::io::ErrorKind::AlreadyExists {
+            cleanup_sqlite_candidate_artifact(&restore_candidate);
+        }
+        return Err(SqlError::Custom(format!(
+            "failed to stage sqlite backup {} into {}: {error}",
+            backup_path.display(),
+            restore_candidate.display()
+        )));
+    }
+    Ok(restore_candidate)
+}
+
 #[allow(clippy::result_large_err)]
 fn cleanup_sqlite_candidate_artifact(candidate: &Path) {
     let _ = std::fs::remove_file(candidate);
@@ -6051,15 +6070,7 @@ fn restore_from_backup(primary_path: &Path, backup_path: &Path) -> Result<(), Sq
     }
 
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
-    let restore_candidate = restore_candidate_path(primary_path, &timestamp);
-    if let Err(error) = std::fs::copy(backup_path, &restore_candidate) {
-        cleanup_sqlite_candidate_artifact(&restore_candidate);
-        return Err(SqlError::Custom(format!(
-            "failed to stage sqlite backup {} into {}: {error}",
-            backup_path.display(),
-            restore_candidate.display()
-        )));
-    }
+    let restore_candidate = stage_backup_restore_candidate(backup_path, primary_path, &timestamp)?;
     if !sqlite_file_is_healthy(&restore_candidate)? {
         cleanup_sqlite_candidate_artifact(&restore_candidate);
         return Err(SqlError::Custom(format!(
@@ -7592,6 +7603,13 @@ mod tests {
         rows.first()?.get_named::<String>("value").ok()
     }
 
+    fn checkpoint_and_remove_sqlite_sidecars(path: &Path) {
+        wal_checkpoint_truncate_path(path).expect("checkpoint test sqlite db");
+        for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+            let _ = std::fs::remove_file(sqlite_sidecar_path(path, suffix));
+        }
+    }
+
     fn write_marker_db(path: &Path, value: &str) {
         let path_str = path.to_string_lossy();
         let conn = DbConn::open_file(path_str.as_ref()).expect("open marker db");
@@ -7600,9 +7618,7 @@ mod tests {
         conn.execute_raw(&format!("INSERT INTO marker(value) VALUES('{value}')"))
             .expect("insert marker value");
         drop(conn);
-        for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
-            let _ = std::fs::remove_file(sqlite_sidecar_path(path, suffix));
-        }
+        checkpoint_and_remove_sqlite_sidecars(path);
     }
 
     #[test]
@@ -7756,8 +7772,7 @@ mod tests {
         conn.execute_raw("INSERT INTO marker(value) VALUES('from-backup')")
             .unwrap();
         drop(conn);
-        let _ = std::fs::remove_file(format!("{}-wal", primary.display()));
-        let _ = std::fs::remove_file(format!("{}-shm", primary.display()));
+        checkpoint_and_remove_sqlite_sidecars(&primary);
         std::fs::copy(&primary, &backup).unwrap();
 
         // Corrupt the primary DB file.
@@ -7810,14 +7825,7 @@ mod tests {
         let primary = dir.path().join("storage.sqlite3");
         let backup = dir.path().join("storage.sqlite3.bak");
 
-        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
-        conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL)")
-            .unwrap();
-        conn.execute_raw("INSERT INTO marker(value) VALUES('live-db')")
-            .unwrap();
-        drop(conn);
-        let _ = std::fs::remove_file(format!("{}-wal", primary.display()));
-        let _ = std::fs::remove_file(format!("{}-shm", primary.display()));
+        write_marker_db(&primary, "live-db");
         std::fs::write(&backup, b"not-a-valid-sqlite-backup").unwrap();
 
         let err = restore_from_backup(&primary, &backup)
@@ -7845,6 +7853,42 @@ mod tests {
                 .flatten()
                 .all(|entry| !entry.file_name().to_string_lossy().contains(".corrupt-")),
             "primary should not be quarantined before the staged replacement is proven healthy"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_backup_restore_candidate_rejects_symlinked_candidate() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let backup = dir.path().join("storage.sqlite3.bak");
+        let redirected_target = dir.path().join("redirected-target.sqlite3");
+        let timestamp = "20260505_010101_001";
+        let candidate = restore_candidate_path(&primary, timestamp);
+
+        std::fs::write(&backup, b"backup bytes").unwrap();
+        symlink(&redirected_target, &candidate).unwrap();
+
+        let err = stage_backup_restore_candidate(&backup, &primary, timestamp)
+            .expect_err("symlinked restore candidate must be rejected");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("failed to stage sqlite backup")
+                && err_text.contains(candidate.to_string_lossy().as_ref()),
+            "unexpected error: {err_text}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&candidate)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "failed restore staging must not remove a pre-existing symlink"
+        );
+        assert!(
+            !redirected_target.exists(),
+            "restore staging must not write through a symlinked candidate path"
         );
     }
 
@@ -7893,8 +7937,7 @@ mod tests {
         let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
         conn.execute_raw("CREATE TABLE t (x INTEGER)").unwrap();
         drop(conn);
-        let _ = std::fs::remove_file(format!("{}-wal", primary.display()));
-        let _ = std::fs::remove_file(format!("{}-shm", primary.display()));
+        checkpoint_and_remove_sqlite_sidecars(&primary);
 
         // Create dummy older backup and real newer backup (which must be a valid DB!).
         std::fs::write(&backup1, b"corrupted-old-backup").unwrap();
@@ -7903,6 +7946,7 @@ mod tests {
             .execute_raw("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (42);")
             .unwrap();
         drop(conn2);
+        checkpoint_and_remove_sqlite_sidecars(&backup2);
 
         // Corrupt the primary to trigger recovery.
         std::fs::write(&primary, b"broken").unwrap();
@@ -9706,14 +9750,7 @@ mod tests {
         let storage_root = dir.path().join("storage");
 
         // Create a healthy backup with a marker table.
-        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
-        conn.execute_raw("CREATE TABLE marker(value TEXT NOT NULL)")
-            .unwrap();
-        conn.execute_raw("INSERT INTO marker(value) VALUES('from-backup')")
-            .unwrap();
-        drop(conn);
-        let _ = std::fs::remove_file(format!("{}-wal", primary.display()));
-        let _ = std::fs::remove_file(format!("{}-shm", primary.display()));
+        write_marker_db(&primary, "from-backup");
         std::fs::copy(&primary, &backup).unwrap();
 
         // Corrupt the primary.
@@ -9859,8 +9896,7 @@ mod tests {
 
         crate::reconstruct::reconstruct_from_archive(&primary, &storage_root)
             .expect("seed db for backup");
-        let _ = std::fs::remove_file(format!("{}-wal", primary.display()));
-        let _ = std::fs::remove_file(format!("{}-shm", primary.display()));
+        checkpoint_and_remove_sqlite_sidecars(&primary);
         std::fs::copy(&primary, &backup).unwrap();
 
         std::fs::write(
