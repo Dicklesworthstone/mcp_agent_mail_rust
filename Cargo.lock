@@ -4900,6 +4900,7 @@ dependencies = [
  "globset",
  "json5 0.4.1",
  "loom",
+ "nix 0.31.2",
  "proptest",
  "regex",
  "serde",

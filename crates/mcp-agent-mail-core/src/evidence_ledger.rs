@@ -137,18 +137,92 @@ pub fn append_evidence_entry_if_configured(entry: &EvidenceLedgerEntry) -> io::R
 /// Parent directories are created automatically.
 pub fn append_evidence_entry_to_path(path: &Path, entry: &EvidenceLedgerEntry) -> io::Result<()> {
     with_write_lock(|| -> io::Result<()> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let file = open_ledger_append_file(path)?;
         let mut writer = BufWriter::new(file);
         serde_json::to_writer(&mut writer, entry).map_err(io::Error::other)?;
         writer.write_all(b"\n")?;
         writer.flush()?;
         Ok(())
     })
+}
+
+fn ledger_append_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o644)
+            .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
+    }
+    options
+}
+
+fn path_existing_prefix_has_symlink(path: &Path) -> io::Result<bool> {
+    let mut current = if path.is_absolute() {
+        PathBuf::new()
+    } else {
+        std::env::current_dir()?
+    };
+
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            std::path::Component::RootDir => {
+                current.push(Path::new(std::path::MAIN_SEPARATOR_STR));
+            }
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir => current.push(".."),
+            std::path::Component::Normal(part) => current.push(part),
+        }
+
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(false)
+}
+
+fn ensure_ledger_parent_dir(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        if path_existing_prefix_has_symlink(parent)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "refusing to create evidence ledger parent through symlinked path: {}",
+                    parent.display()
+                ),
+            ));
+        }
+        fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+fn validate_ledger_append_target(path: &Path) -> io::Result<()> {
+    if path_existing_prefix_has_symlink(path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "evidence ledger path must not include symlinks: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn open_ledger_append_file(path: &Path) -> io::Result<std::fs::File> {
+    ensure_ledger_parent_dir(path)?;
+    validate_ledger_append_target(path)?;
+    ledger_append_open_options().open(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -206,12 +280,7 @@ impl EvidenceLedger {
     ///
     /// Parent directories are created automatically.
     pub fn with_file(path: &Path, max_entries: usize) -> io::Result<Self> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let file = open_ledger_append_file(path)?;
         Ok(Self {
             entries: Mutex::new(VecDeque::with_capacity(max_entries.min(4096))),
             seq: AtomicU64::new(0),
@@ -435,6 +504,64 @@ mod tests {
         assert!(nested.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn append_to_path_rejects_symlinked_ledger_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let outside = dir.path().join("outside.jsonl");
+        let linked = dir.path().join("ledger.jsonl");
+        std::fs::write(&outside, b"outside\n").unwrap();
+        symlink(&outside, &linked).unwrap();
+
+        let entry = EvidenceLedgerEntry::new(
+            "decision-symlink",
+            "search.hybrid_budget",
+            "balanced",
+            0.67,
+            serde_json::json!({"mode":"auto"}),
+        );
+        let err = append_evidence_entry_to_path(&linked, &entry).unwrap_err();
+
+        assert!(
+            err.to_string().contains("must not include symlinks"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_to_path_rejects_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let outside_dir = dir.path().join("outside");
+        let linked_dir = dir.path().join("linked");
+        std::fs::create_dir(&outside_dir).unwrap();
+        symlink(&outside_dir, &linked_dir).unwrap();
+        let path = linked_dir.join("ledger.jsonl");
+
+        let entry = EvidenceLedgerEntry::new(
+            "decision-symlink-parent",
+            "search.hybrid_budget",
+            "balanced",
+            0.67,
+            serde_json::json!({"mode":"auto"}),
+        );
+        let err = append_evidence_entry_to_path(&path, &entry).unwrap_err();
+
+        assert!(
+            err.to_string().contains("symlinked path"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !outside_dir.join("ledger.jsonl").exists(),
+            "ledger append must not create a file through a symlinked parent"
+        );
+    }
+
     #[test]
     fn concurrent_appends_keep_all_records() {
         let dir = tempdir().unwrap();
@@ -623,6 +750,28 @@ mod tests {
         assert_eq!(outcome["type"], "outcome");
         assert_eq!(outcome["seq"], seq);
         assert_eq!(outcome["correct"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_with_file_rejects_symlinked_ledger_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let outside = dir.path().join("outside.jsonl");
+        let linked = dir.path().join("evidence.jsonl");
+        std::fs::write(&outside, b"outside\n").unwrap();
+        symlink(&outside, &linked).unwrap();
+
+        let Err(err) = EvidenceLedger::with_file(&linked, 1000) else {
+            panic!("symlinked evidence ledger paths must be rejected");
+        };
+
+        assert!(
+            err.to_string().contains("must not include symlinks"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside\n");
     }
 
     /// 7. Record 100 entries, all seq values are strictly increasing.
