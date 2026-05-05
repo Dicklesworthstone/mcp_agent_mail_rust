@@ -20038,7 +20038,6 @@ fn fix_mcp_config_entry(
 ) -> Result<String, String> {
     let content = std::fs::read_to_string(config_path)
         .map_err(|e| format!("cannot read {}: {e}", config_path.display()))?;
-    let backup_path = backup_path_for_mcp_config(config_path);
 
     if config_path.extension().and_then(|e| e.to_str()) == Some("toml") {
         let fixed = fix_mcp_config_toml_text(&content, desired_url, desired_bearer_token)
@@ -20048,7 +20047,8 @@ fn fix_mcp_config_entry(
                     config_path.display()
                 )
             })?;
-        std::fs::copy(config_path, &backup_path).map_err(|e| format!("backup failed: {e}"))?;
+        let backup_path =
+            create_mcp_config_backup(config_path).map_err(|e| format!("backup failed: {e}"))?;
         std::fs::write(config_path, fixed).map_err(|e| format!("write failed: {e}"))?;
         return Ok(format!(
             "Updated {} (backup: {})",
@@ -20087,7 +20087,8 @@ fn fix_mcp_config_entry(
     }
 
     // Write back with pretty formatting, preserving backup.
-    std::fs::copy(config_path, &backup_path).map_err(|e| format!("backup failed: {e}"))?;
+    let backup_path =
+        create_mcp_config_backup(config_path).map_err(|e| format!("backup failed: {e}"))?;
     let formatted =
         serde_json::to_string_pretty(&doc).map_err(|e| format!("serialize failed: {e}"))?;
     std::fs::write(config_path, format!("{formatted}\n"))
@@ -20188,12 +20189,42 @@ fn rewrite_json_mcp_entry_to_http_url(
     }
 }
 
-fn backup_path_for_mcp_config(config_path: &Path) -> PathBuf {
-    let ext = config_path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("bak");
-    config_path.with_extension(format!("{ext}.bak"))
+fn create_mcp_config_backup(config_path: &Path) -> Result<PathBuf, std::io::Error> {
+    let mut suffix = None;
+    loop {
+        let backup_path = mcp_config_backup_candidate(config_path, suffix);
+        match copy_file_without_overwrite(config_path, &backup_path) {
+            Ok(()) => return Ok(backup_path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                suffix = Some(suffix.map_or(1, |suffix| suffix + 1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn copy_file_without_overwrite(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
+    let mut source_file = std::fs::File::open(source)?;
+    let permissions = source_file.metadata()?.permissions();
+    let mut destination_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    std::io::copy(&mut source_file, &mut destination_file)?;
+    std::fs::set_permissions(destination, permissions)
+}
+
+fn mcp_config_backup_candidate(config_path: &Path, suffix: Option<u64>) -> PathBuf {
+    let file_name = config_path.file_name().map_or_else(
+        || OsString::from("mcp-config"),
+        std::ffi::OsStr::to_os_string,
+    );
+    let mut backup_name = file_name;
+    backup_name.push(".bak");
+    if let Some(suffix) = suffix {
+        backup_name.push(format!(".{suffix:02}"));
+    }
+    config_path.with_file_name(backup_name)
 }
 
 fn fix_mcp_config_toml_text(
@@ -32931,6 +32962,84 @@ http_headers = { Authorization = "Bearer secret" }
         assert_eq!(
             doc["mcpServers"]["mcp-agent-mail"]["headers"]["Authorization"],
             "Bearer tok123"
+        );
+    }
+
+    #[test]
+    fn fix_mcp_config_entry_preserves_existing_backup_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("mcp.json");
+        let desired_url = "http://127.0.0.1:8765/api/";
+        std::fs::write(
+            &config,
+            r#"{"mcpServers": {"mcp-agent-mail": {"command": "python", "args": ["-m", "mcp_agent_mail"]}}}"#,
+        )
+        .unwrap();
+        let first_backup = mcp_config_backup_candidate(&config, None);
+        std::fs::write(&first_backup, "older backup").unwrap();
+
+        let result = fix_mcp_config_entry(
+            &config,
+            desired_url,
+            Some("tok123"),
+            mcp_agent_mail_core::mcp_config::McpConfigTool::Claude,
+        )
+        .unwrap();
+
+        let second_backup = mcp_config_backup_candidate(&config, Some(1));
+        assert!(
+            result.contains(&second_backup.display().to_string()),
+            "result should report the collision-safe backup path: {result}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(first_backup).unwrap(),
+            "older backup"
+        );
+        assert!(
+            std::fs::read_to_string(second_backup)
+                .unwrap()
+                .contains(r#""command": "python""#)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fix_mcp_config_entry_skips_symlinked_backup_candidate() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("mcp.json");
+        let desired_url = "http://127.0.0.1:8765/api/";
+        let symlink_target = dir.path().join("outside-backup-target");
+        std::fs::write(
+            &config,
+            r#"{"mcpServers": {"mcp-agent-mail": {"command": "python", "args": ["-m", "mcp_agent_mail"]}}}"#,
+        )
+        .unwrap();
+        std::fs::write(&symlink_target, "must stay intact").unwrap();
+        symlink(&symlink_target, mcp_config_backup_candidate(&config, None)).unwrap();
+
+        let result = fix_mcp_config_entry(
+            &config,
+            desired_url,
+            Some("tok123"),
+            mcp_agent_mail_core::mcp_config::McpConfigTool::Claude,
+        )
+        .unwrap();
+
+        let real_backup = mcp_config_backup_candidate(&config, Some(1));
+        assert!(
+            result.contains(&real_backup.display().to_string()),
+            "result should report the non-symlink backup path: {result}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(symlink_target).unwrap(),
+            "must stay intact"
+        );
+        assert!(
+            std::fs::read_to_string(real_backup)
+                .unwrap()
+                .contains(r#""command": "python""#)
         );
     }
 
