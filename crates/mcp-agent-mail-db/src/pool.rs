@@ -307,7 +307,7 @@ impl RecoveryAction {
                 "Quarantines (renames) the corrupt file and copies back the system-created .bak"
             }
             Self::CreateProactiveBackup => {
-                "Copies the primary database to a .bak sibling; purely additive"
+                "Copies the primary database to a designated .bak sibling after destination validation"
             }
             Self::ReconstructFromArchive => {
                 "Replaces the live database from Git archive; may lose non-archived local state"
@@ -2762,15 +2762,35 @@ impl DbPool {
         }
 
         let bak_path = sqlite_path_with_file_name_suffix(primary, ".bak", "storage.sqlite3.bak");
-
-        // Skip if the existing backup is fresh enough.
-        if bak_path.is_file()
-            && let Ok(meta) = bak_path.metadata()
-            && let Ok(modified) = meta.modified()
-            && modified.elapsed().unwrap_or(max_age) < max_age
-        {
-            return Ok(None);
-        }
+        let backup_exists = match std::fs::symlink_metadata(&bak_path) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                if let Ok(modified) = metadata.modified()
+                    && modified.elapsed().unwrap_or(max_age) < max_age
+                {
+                    return Ok(None);
+                }
+                true
+            }
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(DbError::Sqlite(format!(
+                    "proactive backup destination {} must not be a symlink",
+                    bak_path.display()
+                )));
+            }
+            Ok(_) => {
+                return Err(DbError::Sqlite(format!(
+                    "proactive backup destination {} exists but is not a file",
+                    bak_path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(DbError::Sqlite(format!(
+                    "proactive backup failed to inspect destination {}: {error}",
+                    bak_path.display()
+                )));
+            }
+        };
 
         // Checkpoint WAL so the backup is self-contained.
         if let Err(e) = self.wal_checkpoint() {
@@ -2780,13 +2800,28 @@ impl DbPool {
             )));
         }
 
-        std::fs::copy(primary, &bak_path).map_err(|e| {
-            DbError::Sqlite(format!(
-                "proactive backup failed: {} -> {}: {e}",
-                primary.display(),
-                bak_path.display()
-            ))
-        })?;
+        if backup_exists {
+            let staged_backup = create_proactive_backup_stage(primary, &bak_path)?;
+            std::fs::rename(&staged_backup, &bak_path).map_err(|e| {
+                cleanup_sqlite_candidate_artifact(&staged_backup);
+                DbError::Sqlite(format!(
+                    "proactive backup failed to publish staged backup {} to {}: {e}",
+                    staged_backup.display(),
+                    bak_path.display()
+                ))
+            })?;
+        } else {
+            copy_file_without_overwrite(primary, &bak_path).map_err(|e| {
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    cleanup_sqlite_candidate_artifact(&bak_path);
+                }
+                DbError::Sqlite(format!(
+                    "proactive backup failed: {} -> {}: {e}",
+                    primary.display(),
+                    bak_path.display()
+                ))
+            })?;
+        }
 
         tracing::info!(
             primary = %primary.display(),
@@ -5453,6 +5488,52 @@ fn restore_candidate_path(primary_path: &Path, timestamp: &str) -> PathBuf {
         suffix = suffix.saturating_add(1);
     }
     candidate
+}
+
+fn proactive_backup_stage_path(backup_path: &Path, timestamp: &str, suffix: u32) -> PathBuf {
+    let suffix_label = if suffix == 0 {
+        format!(".backup-stage-{timestamp}")
+    } else {
+        format!(".backup-stage-{timestamp}-{suffix:02}")
+    };
+    sqlite_path_with_file_name_suffix(
+        backup_path,
+        &suffix_label,
+        &format!("storage.sqlite3.bak{suffix_label}"),
+    )
+}
+
+fn copy_file_without_overwrite(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let mut source_file = std::fs::File::open(source)?;
+    let permissions = source_file.metadata()?.permissions();
+    let mut destination_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    std::io::copy(&mut source_file, &mut destination_file)?;
+    std::fs::set_permissions(destination, permissions)
+}
+
+fn create_proactive_backup_stage(source: &Path, backup_path: &Path) -> DbResult<PathBuf> {
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let mut suffix = 0_u32;
+    loop {
+        let staged_backup = proactive_backup_stage_path(backup_path, &timestamp, suffix);
+        match copy_file_without_overwrite(source, &staged_backup) {
+            Ok(()) => return Ok(staged_backup),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                suffix = suffix.saturating_add(1);
+            }
+            Err(error) => {
+                cleanup_sqlite_candidate_artifact(&staged_backup);
+                return Err(DbError::Sqlite(format!(
+                    "proactive backup failed to stage {} at {}: {error}",
+                    source.display(),
+                    staged_backup.display()
+                )));
+            }
+        }
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -10751,6 +10832,46 @@ mod tests {
             .create_proactive_backup(std::time::Duration::from_hours(1))
             .unwrap();
         assert!(second.is_none(), "should skip since backup is fresh");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proactive_backup_rejects_symlinked_bak_destination() {
+        use asupersync::runtime::RuntimeBuilder;
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_symlink.db");
+        let target_path = dir.path().join("target-file");
+        let bak_path = dir.path().join("test_symlink.db.bak");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).unwrap();
+
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        let cx = Cx::for_testing();
+        rt.block_on(async {
+            let _conn = pool.acquire(&cx).await.into_result().unwrap();
+        });
+
+        std::fs::write(&target_path, b"sentinel").unwrap();
+        symlink(&target_path, &bak_path).unwrap();
+
+        let err = pool
+            .create_proactive_backup(std::time::Duration::ZERO)
+            .expect_err("symlinked backup destination should be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("proactive backup destination") && msg.contains("must not be a symlink"),
+            "unexpected error: {msg}"
+        );
+        assert_eq!(
+            std::fs::read(&target_path).unwrap(),
+            b"sentinel",
+            "proactive backup must not write through symlinked destinations"
+        );
     }
 
     /// Proactive backup is a no-op for :memory: databases.
