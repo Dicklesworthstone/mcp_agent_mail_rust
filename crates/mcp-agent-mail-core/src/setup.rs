@@ -647,7 +647,17 @@ pub fn ensure_gitignore_entries(
     gitignore_path: &Path,
     entries: &[&str],
 ) -> Result<bool, SetupError> {
-    let existing = std::fs::read_to_string(gitignore_path).unwrap_or_default();
+    ensure_setup_parent_dir(gitignore_path, "gitignore file")?;
+    validate_setup_file_target(gitignore_path, "gitignore file")?;
+    let existing = match setup_read_file_options().open(gitignore_path) {
+        Ok(mut file) => {
+            let mut content = String::new();
+            file.read_to_string(&mut content)?;
+            content
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
     let existing_lines: Vec<&str> = existing.lines().collect();
 
     let mut new_lines = Vec::new();
@@ -670,10 +680,7 @@ pub fn ensure_gitignore_entries(
         content.push('\n');
     }
 
-    if let Some(parent) = gitignore_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(gitignore_path, content)?;
+    write_setup_file_atomic(gitignore_path, content.as_bytes(), 0o644, "gitignore file")?;
     Ok(true)
 }
 
@@ -2250,6 +2257,48 @@ mod tests {
             1,
             "entry should appear exactly once"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_gitignore_entries_rejects_symlinked_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside-gitignore");
+        let linked = tmp.path().join(".gitignore");
+        std::fs::write(&outside, ".env\n").unwrap();
+        symlink(&outside, &linked).unwrap();
+
+        let err = ensure_gitignore_entries(&linked, &[".claude/settings.local.json"]).unwrap_err();
+
+        assert!(err.to_string().contains("must not be a symlink"), "{err}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), ".env\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_gitignore_entries_rejects_symlinked_parent_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside_dir = tmp.path().join("outside");
+        let linked_dir = tmp.path().join("linked");
+        std::fs::create_dir(&outside_dir).unwrap();
+        symlink(&outside_dir, &linked_dir).unwrap();
+
+        let err = ensure_gitignore_entries(
+            &linked_dir.join(".gitignore"),
+            &[".claude/settings.local.json"],
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("must not traverse symlinked directories"),
+            "{err}"
+        );
+        assert!(!outside_dir.join(".gitignore").exists());
     }
 
     #[test]
