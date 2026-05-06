@@ -4,7 +4,7 @@
 # Verifies (br-3qjmi T4.7):
 # - Direct mode: SQLite direct query path
 # - HTTP mode: JSON-RPC via /api/ endpoint
-# - Rate limiting: Lockfile-based check throttling
+# - Rate limiting: Stamp-file-based check throttling
 # - Output modes: JSON vs human-readable (emoji)
 # - Template detection: Silent exit for placeholder values
 # - Error handling: Fail-safe for hooks (silent exit on errors)
@@ -13,7 +13,7 @@
 # Artifacts (via e2e_lib.sh helpers):
 # - Server logs: tests/artifacts/check_inbox/<timestamp>/logs/server_*.log
 # - Per-case directories: <case_id>/stdout.txt, stderr.txt, exit_code.txt
-# - Rate limit lockfiles: /tmp/mcp-mail-check-*
+# - Rate limit stamp files: $XDG_CACHE_HOME/mcp-agent-mail/check-inbox/*.stamp
 
 set -euo pipefail
 
@@ -25,6 +25,11 @@ source "${SCRIPT_DIR}/../../scripts/e2e_lib.sh"
 e2e_init_artifacts
 e2e_banner "Check-Inbox E2E Test Suite"
 
+# Keep check-inbox rate-limit stamps isolated to this e2e artifact tree without
+# changing cache paths for cargo, rch, or server-side dependencies.
+CHECK_INBOX_XDG_CACHE_HOME="${E2E_ARTIFACT_DIR}/check-inbox-xdg-cache"
+mkdir -p "$CHECK_INBOX_XDG_CACHE_HOME"
+
 # ---------------------------------------------------------------------------
 # Prerequisites
 # ---------------------------------------------------------------------------
@@ -32,6 +37,14 @@ e2e_banner "Check-Inbox E2E Test Suite"
 if ! command -v curl >/dev/null 2>&1; then
     e2e_log "curl not found; skipping suite"
     e2e_skip "curl required"
+    e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
+    e2e_summary
+    exit 0
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    e2e_log "python3 not found; skipping suite"
+    e2e_skip "python3 required"
     e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
     e2e_summary
     exit 0
@@ -48,39 +61,28 @@ ensure_am_cli() {
         return 0
     fi
 
-    # First check if the binary already exists
-    AM_CLI_BIN="${CARGO_TARGET_DIR:-target}/debug/am"
-    if [ -x "$AM_CLI_BIN" ]; then
-        e2e_log "CLI binary: $AM_CLI_BIN (pre-built)"
-        return 0
-    fi
-
-    AM_CLI_BIN="$(pwd)/target/debug/am"
-    if [ -x "$AM_CLI_BIN" ]; then
-        e2e_log "CLI binary: $AM_CLI_BIN (pre-built)"
-        return 0
-    fi
-
-    # Build if not found
     e2e_log "Building mcp-agent-mail-cli..."
     local build_log="${E2E_ARTIFACT_DIR}/logs/cargo_build.log"
     mkdir -p "$(dirname "$build_log")"
-    if ! e2e_run_cargo build -p mcp-agent-mail-cli 2>"$build_log"; then
+    if ! e2e_run_cargo build -p mcp-agent-mail-cli --bin am 2>"$build_log"; then
         e2e_fail "Failed to build mcp-agent-mail-cli (see $build_log)"
         return 1
     fi
 
-    AM_CLI_BIN="${CARGO_TARGET_DIR:-target}/debug/am"
-    if [ ! -x "$AM_CLI_BIN" ]; then
-        AM_CLI_BIN="$(pwd)/target/debug/am"
-    fi
+    AM_CLI_BIN=""
+    local candidate
+    for candidate in "$(pwd)/target/debug/am" "${CARGO_TARGET_DIR:-target}/debug/am"; do
+        if [ -x "$candidate" ] && { [ -z "$AM_CLI_BIN" ] || [ "$candidate" -nt "$AM_CLI_BIN" ]; }; then
+            AM_CLI_BIN="$candidate"
+        fi
+    done
 
-    if [ ! -x "$AM_CLI_BIN" ]; then
-        e2e_fail "am binary not found at $AM_CLI_BIN"
+    if [ -z "$AM_CLI_BIN" ] || [ ! -x "$AM_CLI_BIN" ]; then
+        e2e_fail "am binary not found after build"
         return 1
     fi
 
-    e2e_log "CLI binary: $AM_CLI_BIN"
+    e2e_log "CLI binary: $AM_CLI_BIN (fresh build)"
 }
 
 # Run check-inbox and capture output
@@ -94,7 +96,7 @@ run_check_inbox() {
     mkdir -p "$case_dir"
 
     set +e
-    _STDOUT=$("$AM_CLI_BIN" check-inbox "$@" 2>"${case_dir}/stderr.txt")
+    _STDOUT=$(XDG_CACHE_HOME="$CHECK_INBOX_XDG_CACHE_HOME" "$AM_CLI_BIN" check-inbox "$@" 2>"${case_dir}/stderr.txt")
     _EXIT_CODE=$?
     set -e
 
@@ -103,13 +105,20 @@ run_check_inbox() {
     _STDERR=$(cat "${case_dir}/stderr.txt")
 }
 
-# Clean up rate limit lockfiles for a given agent
-cleanup_lockfile() {
+# Return the expected rate-limit stamp path for an agent/project scope.
+rate_limit_stamp_path() {
     local agent_name="$1"
-    # Sanitize agent name (non-alphanumeric -> underscore)
-    local sanitized
-    sanitized=$(echo "$agent_name" | tr -c '[:alnum:]' '_')
-    rm -f "/tmp/mcp-mail-check-${sanitized}" 2>/dev/null || true
+    local project_key="$2"
+    python3 - "$agent_name" "$project_key" "$CHECK_INBOX_XDG_CACHE_HOME" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+agent_name, project_key, cache_home = sys.argv[1:4]
+sanitized = "".join(ch if ch.isascii() and ch.isalnum() else "_" for ch in agent_name)
+project_hash = hashlib.sha256(project_key.strip().encode()).hexdigest()[:16]
+print(pathlib.Path(cache_home) / "mcp-agent-mail" / "check-inbox" / f"{sanitized}-{project_hash}.stamp")
+PY
 }
 
 # Start a test server with sample data
@@ -225,7 +234,6 @@ ensure_am_cli || {
 e2e_banner "Run 1: Template detection"
 
 e2e_case_banner "Template agent name exits silently"
-cleanup_lockfile '$AGENT_NAME'
 e2e_mark_case_start "template_agent"
 run_check_inbox "template_agent" --agent '$AGENT_NAME' --rate-limit 0
 e2e_assert_exit_code "template agent exit code" "0" "$_EXIT_CODE"
@@ -233,7 +241,6 @@ e2e_assert_eq "template agent stdout empty" "" "$_STDOUT"
 e2e_mark_case_end "template_agent"
 
 e2e_case_banner "Template project exits silently"
-cleanup_lockfile 'TestAgent'
 e2e_mark_case_start "template_project"
 run_check_inbox "template_project" --agent "TestAgent" --project '${PROJECT_KEY}' --rate-limit 0
 e2e_assert_exit_code "template project exit code" "0" "$_EXIT_CODE"
@@ -241,7 +248,6 @@ e2e_assert_eq "template project stdout empty" "" "$_STDOUT"
 e2e_mark_case_end "template_project"
 
 e2e_case_banner "Env var placeholder exits silently"
-cleanup_lockfile '__PLACEHOLDER__'
 e2e_mark_case_start "env_placeholder"
 run_check_inbox "env_placeholder" --agent '__PLACEHOLDER__' --rate-limit 0
 e2e_assert_exit_code "placeholder exit code" "0" "$_EXIT_CODE"
@@ -254,24 +260,28 @@ e2e_mark_case_end "env_placeholder"
 
 e2e_banner "Run 2: Rate limiting"
 
-e2e_case_banner "First check creates lockfile"
-cleanup_lockfile 'RateLimitAgent'
+RATE_LIMIT_PROJECT="${E2E_ARTIFACT_DIR}/rate-limit-project"
+mkdir -p "$RATE_LIMIT_PROJECT"
+
+e2e_case_banner "First check creates stamp file"
 e2e_mark_case_start "rate_limit_first"
-# Note: This will fail silently because there's no server, but should create lockfile
-run_check_inbox "rate_limit_first" --agent "RateLimitAgent" --rate-limit 3600 --host "127.0.0.1" --port 65432
+# Note: This will fail silently because there's no server, but should create the stamp file.
+run_check_inbox "rate_limit_first" --agent "RateLimitAgent" --project "$RATE_LIMIT_PROJECT" \
+    --rate-limit 3600 --host "127.0.0.1" --port 65432
 e2e_assert_exit_code "first check exit code" "0" "$_EXIT_CODE"
-# Check lockfile was created
-LOCKFILE="/tmp/mcp-mail-check-RateLimitAgent"
-if [ -f "$LOCKFILE" ]; then
-    e2e_pass "lockfile created"
+# Check stamp file was created
+STAMP_FILE="$(rate_limit_stamp_path "RateLimitAgent" "$RATE_LIMIT_PROJECT")"
+if [ -f "$STAMP_FILE" ]; then
+    e2e_pass "stamp file created"
 else
-    e2e_fail "lockfile not created at $LOCKFILE"
+    e2e_fail "stamp file not created at $STAMP_FILE"
 fi
 e2e_mark_case_end "rate_limit_first"
 
 e2e_case_banner "Second check within interval is rate-limited (silent exit)"
 e2e_mark_case_start "rate_limit_second"
-run_check_inbox "rate_limit_second" --agent "RateLimitAgent" --rate-limit 3600 --host "127.0.0.1" --port 65432
+run_check_inbox "rate_limit_second" --agent "RateLimitAgent" --project "$RATE_LIMIT_PROJECT" \
+    --rate-limit 3600 --host "127.0.0.1" --port 65432
 e2e_assert_exit_code "second check exit code" "0" "$_EXIT_CODE"
 e2e_assert_eq "rate-limited stdout empty" "" "$_STDOUT"
 e2e_mark_case_end "rate_limit_second"
@@ -282,8 +292,6 @@ run_check_inbox "rate_limit_zero" --agent "RateLimitAgent" --rate-limit 0 --host
 # Even with rate-limit 0, should still exit silently if server not available
 e2e_assert_exit_code "rate-limit-0 exit code" "0" "$_EXIT_CODE"
 e2e_mark_case_end "rate_limit_zero"
-
-cleanup_lockfile 'RateLimitAgent'
 
 # ---------------------------------------------------------------------------
 # Run 3: HTTP mode with live server
@@ -311,7 +319,6 @@ e2e_log "Using seeded agent: $AGENT_NAME"
 
 if [ "$SEED_SUCCESS" = "1" ]; then
     e2e_case_banner "HTTP mode with messages (human-readable)"
-    cleanup_lockfile "$AGENT_NAME"
     e2e_mark_case_start "http_human"
     run_check_inbox "http_human" --agent "$AGENT_NAME" --project "$PROJECT_KEY" \
         --host "127.0.0.1" --port "$HTTP_PORT" --rate-limit 0
@@ -321,7 +328,6 @@ if [ "$SEED_SUCCESS" = "1" ]; then
     e2e_mark_case_end "http_human"
 
     e2e_case_banner "HTTP mode with messages (JSON)"
-    cleanup_lockfile "$AGENT_NAME"
     e2e_mark_case_start "http_json"
     run_check_inbox "http_json" --agent "$AGENT_NAME" --project "$PROJECT_KEY" \
         --host "127.0.0.1" --port "$HTTP_PORT" --rate-limit 0 --json
@@ -339,7 +345,6 @@ else
 fi
 
 e2e_case_banner "HTTP mode with non-existent agent (silent exit)"
-cleanup_lockfile "GhostWolf"
 e2e_mark_case_start "http_no_agent"
 run_check_inbox "http_no_agent" --agent "GhostWolf" --project "$PROJECT_KEY" \
     --host "127.0.0.1" --port "$HTTP_PORT" --rate-limit 0
@@ -385,7 +390,6 @@ export STORAGE_ROOT="$STORAGE_ROOT"
 
 if [ "$SEED_SUCCESS" = "1" ]; then
     e2e_case_banner "Direct mode with messages (human-readable)"
-    cleanup_lockfile "$AGENT_NAME"
     e2e_mark_case_start "direct_human"
     run_check_inbox "direct_human" --agent "$AGENT_NAME" --project "$PROJECT_KEY" \
         --direct --rate-limit 0
@@ -395,7 +399,6 @@ if [ "$SEED_SUCCESS" = "1" ]; then
     e2e_mark_case_end "direct_human"
 
     e2e_case_banner "Direct mode with messages (JSON)"
-    cleanup_lockfile "$AGENT_NAME"
     e2e_mark_case_start "direct_json"
     run_check_inbox "direct_json" --agent "$AGENT_NAME" --project "$PROJECT_KEY" \
         --direct --rate-limit 0 --json
@@ -413,7 +416,6 @@ else
 fi
 
 e2e_case_banner "Direct mode with non-existent agent (silent exit)"
-cleanup_lockfile "PurpleFox"
 e2e_mark_case_start "direct_no_agent"
 run_check_inbox "direct_no_agent" --agent "PurpleFox" --project "$PROJECT_KEY" \
     --direct --rate-limit 0
@@ -445,7 +447,6 @@ e2e_mark_case_end "no_agent_config"
 e2e_banner "Run 6: Error handling (fail-safe)"
 
 e2e_case_banner "Connection refused exits silently"
-cleanup_lockfile "SilentBear"
 e2e_mark_case_start "conn_refused"
 run_check_inbox "conn_refused" --agent "SilentBear" --project "/tmp/nonexistent" \
     --host "127.0.0.1" --port 65432 --rate-limit 0
@@ -454,7 +455,6 @@ e2e_assert_exit_code "conn refused exit code" "0" "$_EXIT_CODE"
 e2e_mark_case_end "conn_refused"
 
 e2e_case_banner "Invalid project path in direct mode exits silently"
-cleanup_lockfile "QuietFrog"
 e2e_mark_case_start "direct_invalid_project"
 export DATABASE_URL="sqlite:////nonexistent/path/db.sqlite3"
 run_check_inbox "direct_invalid_project" --agent "QuietFrog" \

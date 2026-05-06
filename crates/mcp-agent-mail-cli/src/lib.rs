@@ -4618,7 +4618,7 @@ fn handle_check_inbox(
 
     // Apply rate limiting (unless disabled with rate_limit=0)
     if rate_limit > 0 {
-        let limiter = CheckInboxRateLimiter::new(&agent_name, Some(rate_limit));
+        let limiter = CheckInboxRateLimiter::new(&agent_name, &project_key, Some(rate_limit));
         if !limiter.should_check() {
             // Rate limited - exit silently
             return Ok(());
@@ -26412,105 +26412,148 @@ http_headers = { Authorization = "Bearer secret" }
         );
     }
 
-    #[test]
-    fn rate_limiter_lockfile_path_uses_sanitized_name() {
-        let limiter = CheckInboxRateLimiter::new("BlueLake", None);
-        assert_eq!(
-            limiter.lockfile_path().to_string_lossy(),
-            "/tmp/mcp-mail-check-BlueLake"
-        );
+    fn with_temp_check_inbox_cache<T>(f: impl FnOnce() -> T) -> T {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cache_home = temp.path().join("cache");
+        let cache_home_text = cache_home.to_string_lossy().into_owned();
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("XDG_CACHE_HOME", cache_home_text.as_str())],
+            f,
+        )
+    }
 
-        let limiter2 = CheckInboxRateLimiter::new("my-agent.v2", None);
-        assert_eq!(
-            limiter2.lockfile_path().to_string_lossy(),
-            "/tmp/mcp-mail-check-my_agent_v2"
-        );
+    #[test]
+    fn rate_limiter_stamp_file_path_uses_sanitized_name() {
+        with_temp_check_inbox_cache(|| {
+            let limiter = CheckInboxRateLimiter::new("BlueLake", "/tmp/project-a", None);
+            let path = limiter.stamp_file_path();
+            assert!(path.ends_with("mcp-agent-mail/check-inbox/BlueLake-bc05c6139334b0aa.stamp"));
+
+            let limiter2 = CheckInboxRateLimiter::new("my-agent.v2", "/tmp/project-a", None);
+            assert!(
+                limiter2
+                    .stamp_file_path()
+                    .ends_with("mcp-agent-mail/check-inbox/my_agent_v2-bc05c6139334b0aa.stamp")
+            );
+        });
+    }
+
+    #[test]
+    fn rate_limiter_scope_includes_project_key() {
+        with_temp_check_inbox_cache(|| {
+            let project_a = CheckInboxRateLimiter::new("BlueLake", "/tmp/project-a", Some(60));
+            let project_b = CheckInboxRateLimiter::new("BlueLake", "/tmp/project-b", Some(60));
+
+            assert_ne!(project_a.stamp_file_path(), project_b.stamp_file_path());
+
+            project_a.reset();
+            project_b.reset();
+            assert!(project_a.should_check(), "first project should proceed");
+            assert!(
+                project_b.should_check(),
+                "same agent name in another project should not be suppressed"
+            );
+            project_a.reset();
+            project_b.reset();
+        });
     }
 
     #[test]
     fn rate_limiter_default_interval_is_120_seconds() {
-        assert_eq!(CHECK_INBOX_RATE_LIMIT_DEFAULT_SECS, 120);
-        let limiter = CheckInboxRateLimiter::new("TestAgent", None);
-        assert_eq!(limiter.interval_secs, 120);
+        with_temp_check_inbox_cache(|| {
+            assert_eq!(CHECK_INBOX_RATE_LIMIT_DEFAULT_SECS, 120);
+            let limiter = CheckInboxRateLimiter::new("TestAgent", "/tmp/project", None);
+            assert_eq!(limiter.interval_secs, 120);
+        });
     }
 
     #[test]
     fn rate_limiter_custom_interval() {
-        let limiter = CheckInboxRateLimiter::new("TestAgent", Some(60));
-        assert_eq!(limiter.interval_secs, 60);
+        with_temp_check_inbox_cache(|| {
+            let limiter = CheckInboxRateLimiter::new("TestAgent", "/tmp/project", Some(60));
+            assert_eq!(limiter.interval_secs, 60);
+        });
     }
 
     #[test]
     fn rate_limiter_first_check_always_allowed() {
-        // Use unique agent name to avoid interference with other tests
-        let limiter = CheckInboxRateLimiter::new("TestFirstCheck", Some(1));
-        limiter.reset(); // Clean start
-        assert!(
-            limiter.should_check(),
-            "first check should always be allowed"
-        );
-        limiter.reset(); // Clean up
+        with_temp_check_inbox_cache(|| {
+            // Use unique agent name to avoid interference with other tests
+            let limiter = CheckInboxRateLimiter::new("TestFirstCheck", "/tmp/project", Some(1));
+            limiter.reset(); // Clean start
+            assert!(
+                limiter.should_check(),
+                "first check should always be allowed"
+            );
+            limiter.reset(); // Clean up
+        });
     }
 
     #[test]
     fn rate_limiter_blocks_rapid_checks() {
-        let limiter = CheckInboxRateLimiter::new("TestRapidCheck", Some(60));
-        limiter.reset(); // Clean start
-        assert!(limiter.should_check(), "first check should be allowed");
-        assert!(
-            !limiter.should_check(),
-            "second immediate check should be blocked"
-        );
-        limiter.reset(); // Clean up
+        with_temp_check_inbox_cache(|| {
+            let limiter = CheckInboxRateLimiter::new("TestRapidCheck", "/tmp/project", Some(60));
+            limiter.reset(); // Clean start
+            assert!(limiter.should_check(), "first check should be allowed");
+            assert!(
+                !limiter.should_check(),
+                "second immediate check should be blocked"
+            );
+            limiter.reset(); // Clean up
+        });
     }
 
     #[test]
     fn rate_limiter_disabled_with_zero_interval() {
-        let limiter = CheckInboxRateLimiter::new("TestZeroInterval", Some(0));
-        limiter.reset(); // Clean start
-        assert!(limiter.should_check(), "zero interval: first check allowed");
-        // With interval=0, next check should also be allowed immediately
-        // The condition is elapsed < interval, and 0 < 0 is false, so it proceeds
-        assert!(
-            limiter.should_check(),
-            "zero interval: second check also allowed"
-        );
-        limiter.reset(); // Clean up
+        with_temp_check_inbox_cache(|| {
+            let limiter = CheckInboxRateLimiter::new("TestZeroInterval", "/tmp/project", Some(0));
+            limiter.reset(); // Clean start
+            assert!(limiter.should_check(), "zero interval: first check allowed");
+            // With interval=0, next check should also be allowed immediately
+            // The condition is elapsed < interval, and 0 < 0 is false, so it proceeds
+            assert!(
+                limiter.should_check(),
+                "zero interval: second check also allowed"
+            );
+            limiter.reset(); // Clean up
+        });
     }
 
     #[test]
     fn rate_limiter_reset_clears_state() {
-        let limiter = CheckInboxRateLimiter::new("TestReset", Some(60));
-        limiter.reset(); // Clean start
-        let _ = limiter.should_check(); // Set the lockfile
-        assert!(
-            limiter.lockfile_path().exists(),
-            "lockfile should exist after check"
-        );
-        limiter.reset();
-        assert!(
-            !limiter.lockfile_path().exists(),
-            "lockfile should be removed after reset"
-        );
+        with_temp_check_inbox_cache(|| {
+            let limiter = CheckInboxRateLimiter::new("TestReset", "/tmp/project", Some(60));
+            limiter.reset(); // Clean start
+            let _ = limiter.should_check(); // Set the stamp file
+            assert!(
+                limiter.stamp_file_path().exists(),
+                "stamp file should exist after check"
+            );
+            limiter.reset();
+            assert!(
+                !limiter.stamp_file_path().exists(),
+                "stamp file should be removed after reset"
+            );
+        });
     }
 
     #[test]
-    fn rate_limiter_blocks_when_lockfile_write_fails() {
-        let limiter = CheckInboxRateLimiter::new("TestWriteFailure", Some(60));
-        limiter.reset();
+    fn rate_limiter_blocks_when_stamp_file_write_fails() {
+        with_temp_check_inbox_cache(|| {
+            let limiter = CheckInboxRateLimiter::new("TestWriteFailure", "/tmp/project", Some(60));
+            limiter.reset();
 
-        let path = limiter.lockfile_path();
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("create directory at lockfile path");
+            let path = limiter.stamp_file_path();
+            std::fs::create_dir_all(&path).expect("create directory at stamp file path");
 
-        assert!(limiter.should_check(), "first check should be allowed");
-        assert!(
-            !limiter.should_check(),
-            "second immediate check should still be blocked"
-        );
+            assert!(limiter.should_check(), "first check should be allowed");
+            assert!(
+                !limiter.should_check(),
+                "second immediate check should still be blocked"
+            );
 
-        limiter.reset();
+            limiter.reset();
+        });
     }
 
     #[test]
@@ -52578,11 +52621,11 @@ pub const CHECK_INBOX_RATE_LIMIT_DEFAULT_SECS: u64 = 120;
 /// Rate limiter for inbox checks.
 ///
 /// Prevents excessive inbox polling by tracking the last check time per agent.
-/// Uses a lockfile in /tmp with the agent name sanitized.
+/// Uses a user-cache stamp file scoped by agent name and project key.
 #[derive(Debug, Clone)]
 pub struct CheckInboxRateLimiter {
-    /// Sanitized agent name used in lockfile path.
-    agent_sanitized: String,
+    /// Sanitized rate-limit scope used in the stamp file path.
+    scope_sanitized: String,
     /// Minimum interval between checks.
     interval_secs: u64,
 }
@@ -52592,19 +52635,20 @@ impl CheckInboxRateLimiter {
     ///
     /// # Arguments
     /// - `agent_name`: Agent name (will be sanitized for filesystem)
+    /// - `project_key`: Project path or slug. Included so one project cannot suppress another.
     /// - `interval_secs`: Minimum seconds between checks (default: 120)
     #[must_use]
-    pub fn new(agent_name: &str, interval_secs: Option<u64>) -> Self {
+    pub fn new(agent_name: &str, project_key: &str, interval_secs: Option<u64>) -> Self {
         Self {
-            agent_sanitized: sanitize_agent_name(agent_name),
+            scope_sanitized: check_inbox_rate_limit_scope(agent_name, project_key),
             interval_secs: interval_secs.unwrap_or(CHECK_INBOX_RATE_LIMIT_DEFAULT_SECS),
         }
     }
 
-    /// Get the lockfile path for this agent.
+    /// Get the stamp file path for this agent/project scope.
     #[must_use]
-    pub fn lockfile_path(&self) -> std::path::PathBuf {
-        std::path::PathBuf::from(format!("/tmp/mcp-mail-check-{}", self.agent_sanitized))
+    pub fn stamp_file_path(&self) -> std::path::PathBuf {
+        check_inbox_rate_limit_dir().join(format!("{}.stamp", self.scope_sanitized))
     }
 
     fn process_local_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
@@ -52617,12 +52661,12 @@ impl CheckInboxRateLimiter {
     /// Check if enough time has elapsed since the last check.
     ///
     /// Returns `true` if a check should proceed, `false` if rate-limited.
-    /// Updates the lockfile timestamp if proceeding.
+    /// Updates the stamp file timestamp if proceeding.
     ///
     /// Errors are treated as "proceed" (fail-open) to avoid blocking agent work.
     #[must_use]
     pub fn should_check(&self) -> bool {
-        let path = self.lockfile_path();
+        let path = self.stamp_file_path();
         let cache_key = path.to_string_lossy().to_string();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -52660,20 +52704,20 @@ impl CheckInboxRateLimiter {
         }
 
         // Best-effort cross-process timestamp persistence.
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let _ = std::fs::write(&path, now.to_string());
 
         true
     }
 
-    /// Reset the rate limiter by removing the lockfile.
+    /// Reset the rate limiter by removing the stamp file.
     ///
     /// Errors are ignored.
     pub fn reset(&self) {
-        let path = self.lockfile_path();
+        let path = self.stamp_file_path();
         let _ = std::fs::remove_file(&path);
-        if path.is_dir() {
-            let _ = std::fs::remove_dir_all(&path);
-        }
         if let Ok(mut cache) = Self::process_local_cache().lock() {
             cache.remove(path.to_string_lossy().as_ref());
         }
@@ -52688,6 +52732,40 @@ pub fn sanitize_agent_name(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()
+}
+
+fn check_inbox_rate_limit_dir() -> std::path::PathBuf {
+    if let Some(cache_home) = mcp_agent_mail_core::config::process_env_value("XDG_CACHE_HOME")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        return std::path::PathBuf::from(cache_home)
+            .join("mcp-agent-mail")
+            .join("check-inbox");
+    }
+
+    if let Some(home) = mcp_agent_mail_core::config::process_env_value("HOME")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        return std::path::PathBuf::from(home)
+            .join(".cache")
+            .join("mcp-agent-mail")
+            .join("check-inbox");
+    }
+
+    std::env::temp_dir()
+        .join("mcp-agent-mail")
+        .join("check-inbox")
+}
+
+fn check_inbox_rate_limit_scope(agent_name: &str, project_key: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    let agent = sanitize_agent_name(agent_name);
+    let project_hash = Sha256::digest(project_key.trim().as_bytes());
+    let project_hash = hex::encode(&project_hash[..8]);
+    format!("{agent}-{project_hash}")
 }
 
 #[derive(Debug, PartialEq)]
