@@ -5267,6 +5267,23 @@ fn path_is_real_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
 }
 
+fn path_is_self_update_binary_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return false;
+        }
+    }
+    true
+}
+
 fn doctor_legacy_fts_tables(conn: &mcp_agent_mail_db::DbConn) -> Vec<String> {
     let mut names = conn
         .query_sync(
@@ -12949,15 +12966,16 @@ fn download_and_verify_release(version: &str) -> Result<DownloadedRelease, Strin
 fn find_binary_in_dir(dir: &Path, name: &str) -> Option<PathBuf> {
     // Check directly in dir
     let direct = dir.join(name);
-    if direct.is_file() {
+    if path_is_self_update_binary_file(&direct) {
         return Some(direct);
     }
     // Check one level deep (tarball might have a subdirectory)
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                let nested = entry.path().join(name);
-                if nested.is_file() {
+            let entry_path = entry.path();
+            if path_is_real_directory(&entry_path) {
+                let nested = entry_path.join(name);
+                if path_is_self_update_binary_file(&nested) {
                     return Some(nested);
                 }
             }
@@ -55701,6 +55719,57 @@ fn find_binary_in_dir_nested() {
     std::fs::write(sub.join("am"), b"binary").unwrap();
     assert_eq!(find_binary_in_dir(&tmp, "am"), Some(sub.join("am")));
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[cfg(unix)]
+#[test]
+fn find_binary_in_dir_rejects_symlinked_binary() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let outside = tmp.path().join("outside-binary");
+    std::fs::write(&outside, b"binary").expect("write outside binary");
+    symlink(&outside, tmp.path().join("am")).expect("symlink binary");
+
+    assert_eq!(
+        find_binary_in_dir(tmp.path(), "am"),
+        None,
+        "self-update must not accept symlinked release binaries"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn find_binary_in_dir_rejects_symlinked_nested_directory() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let outside_dir = tmp.path().join("outside-release");
+    std::fs::create_dir_all(&outside_dir).expect("create outside dir");
+    std::fs::write(outside_dir.join("am"), b"binary").expect("write outside binary");
+    symlink(&outside_dir, tmp.path().join("release")).expect("symlink nested dir");
+
+    assert_eq!(
+        find_binary_in_dir(tmp.path(), "am"),
+        None,
+        "self-update must not search through symlinked release directories"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn find_binary_in_dir_rejects_hardlinked_binary() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let outside = tmp.path().join("outside-binary");
+    let linked = tmp.path().join("am");
+    std::fs::write(&outside, b"binary").expect("write outside binary");
+    std::fs::hard_link(&outside, &linked).expect("hard-link binary");
+
+    assert_eq!(
+        find_binary_in_dir(tmp.path(), "am"),
+        None,
+        "self-update must not accept hard-linked release binaries"
+    );
 }
 
 #[test]
