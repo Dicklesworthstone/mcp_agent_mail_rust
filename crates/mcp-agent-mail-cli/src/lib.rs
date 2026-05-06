@@ -12468,6 +12468,35 @@ fn release_asset_url(version: &str, target: &str) -> (String, String) {
     (url, filename)
 }
 
+fn normalize_self_update_version(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let version = trimmed
+        .strip_prefix('v')
+        .or_else(|| trimmed.strip_prefix('V'))
+        .unwrap_or(trimmed);
+    if version.is_empty() {
+        return Err("self-update version must not be empty".to_string());
+    }
+    if version.len() > 128 {
+        return Err("self-update version is too long".to_string());
+    }
+    if !version.as_bytes()[0].is_ascii_digit() {
+        return Err(format!("invalid self-update version: {raw}"));
+    }
+    if version.contains("..")
+        || version.bytes().any(|b| {
+            !matches!(
+                b,
+                b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'.' | b'-' | b'_' | b'+'
+            )
+        })
+    {
+        return Err(format!("invalid self-update version: {raw}"));
+    }
+
+    Ok(version.to_string())
+}
+
 /// Result of downloading and verifying a release binary.
 #[derive(Debug)]
 struct DownloadedRelease {
@@ -12810,6 +12839,7 @@ fn extract_zip(archive_data: &[u8], dest_dir: &Path) -> Result<(), String> {
 
 /// Download, verify, and extract a release. Returns paths to the extracted binaries.
 fn download_and_verify_release(version: &str) -> Result<DownloadedRelease, String> {
+    let version = normalize_self_update_version(version)?;
     let target = detect_platform_target().ok_or_else(|| {
         format!(
             "unsupported platform: {}/{}",
@@ -12818,7 +12848,7 @@ fn download_and_verify_release(version: &str) -> Result<DownloadedRelease, Strin
         )
     })?;
 
-    let (asset_url, filename) = release_asset_url(version, &target);
+    let (asset_url, filename) = release_asset_url(&version, &target);
     let base = self_update_releases_base_url();
     let checksum_url = format!("{base}/v{version}/SHA256SUMS");
 
@@ -12842,11 +12872,11 @@ fn download_and_verify_release(version: &str) -> Result<DownloadedRelease, Strin
 
     // Create temp directory for extraction before the download so the
     // streaming sink has a stable path to write into.
-    let tmp_dir = std::env::temp_dir().join(format!("am-update-{version}"));
-    if tmp_dir.exists() {
-        std::fs::remove_dir_all(&tmp_dir).map_err(|e| format!("clean temp dir: {e}"))?;
-    }
-    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("create temp dir: {e}"))?;
+    let tmp_dir = tempfile::Builder::new()
+        .prefix(&format!("am-update-{version}-"))
+        .tempdir()
+        .map_err(|e| format!("create temp dir: {e}"))?
+        .keep();
 
     // Download the archive. Large (.tar.xz) release tarballs stream
     // directly to disk — they never reside in memory — so the updater
@@ -12911,7 +12941,7 @@ fn download_and_verify_release(version: &str) -> Result<DownloadedRelease, Strin
         extract_dir: tmp_dir,
         am_binary,
         server_binary,
-        version: version.to_string(),
+        version,
     })
 }
 
@@ -13087,13 +13117,14 @@ fn handle_self_update_full(force: bool, target_version: Option<String>) -> CliRe
 
     let version_to_install = if let Some(ref v) = target_version {
         // Specific version requested
-        let v = v.trim_start_matches('v');
-        ftui_runtime::ftui_println!("Installing version {v} (current: {current})");
-        v.to_string()
+        let version = normalize_self_update_version(v).map_err(CliError::InvalidArgument)?;
+        ftui_runtime::ftui_println!("Installing version {version} (current: {current})");
+        version
     } else if force {
         // Force reinstall current version
-        ftui_runtime::ftui_println!("Force reinstalling v{current}");
-        current.to_string()
+        let version = normalize_self_update_version(current).map_err(CliError::InvalidArgument)?;
+        ftui_runtime::ftui_println!("Force reinstalling v{version}");
+        version
     } else {
         // Normal update: check for newer version
         let result = check_for_update();
@@ -13104,7 +13135,7 @@ fn handle_self_update_full(force: bool, target_version: Option<String>) -> CliRe
                 url: _,
             } => {
                 ftui_runtime::ftui_println!("Update available: {cur} -> {latest}");
-                latest
+                normalize_self_update_version(&latest).map_err(CliError::InvalidArgument)?
             }
             UpdateCheckResult::UpToDate { current: cur } => {
                 ftui_runtime::ftui_println!("Already up to date (v{cur})");
@@ -55583,6 +55614,41 @@ fn release_asset_url_macos() {
     let (url, filename) = release_asset_url("1.0.0", "aarch64-apple-darwin");
     assert_eq!(filename, "mcp-agent-mail-aarch64-apple-darwin.tar.xz");
     assert!(url.contains("/releases/download/v1.0.0/"));
+}
+
+#[test]
+fn normalize_self_update_version_accepts_release_tag_forms() {
+    assert_eq!(
+        normalize_self_update_version("v0.2.50").as_deref(),
+        Ok("0.2.50")
+    );
+    assert_eq!(
+        normalize_self_update_version("V0.2.50").as_deref(),
+        Ok("0.2.50")
+    );
+    assert_eq!(
+        normalize_self_update_version("  0.2.50-rc.1+build_7  ").as_deref(),
+        Ok("0.2.50-rc.1+build_7")
+    );
+}
+
+#[test]
+fn normalize_self_update_version_rejects_pathlike_values() {
+    for raw in [
+        "",
+        "v",
+        "vv0.2.0",
+        "version",
+        "../0.2.0",
+        "0.2/evil",
+        "0.2\\evil",
+        ".hidden",
+    ] {
+        assert!(
+            normalize_self_update_version(raw).is_err(),
+            "{raw:?} should not be accepted as a self-update version"
+        );
+    }
 }
 
 #[test]
