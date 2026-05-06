@@ -330,6 +330,13 @@ const LISTENER_PID_HINT_DIR: &str = "mcp-agent-mail-port-pids";
 pub(crate) const HEALTH_SIGNATURE_HEADER_NAME: &str = "x-agent-mail-health";
 pub(crate) const HEALTH_SIGNATURE_HEADER_VALUE: &str = "1";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthProbeStatus {
+    AgentMailServer,
+    OtherListener,
+    NoResponse,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ListenerPidHint {
     pid: u32,
@@ -396,7 +403,8 @@ pub fn check_port_status(host: &str, port: u16) -> PortStatus {
     }
 
     // Step 2: Port is in use - try to identify if it's Agent Mail via health check
-    if is_agent_mail_health_check(host, port) {
+    let health_probe_status = agent_mail_health_probe(host, port);
+    if matches!(health_probe_status, HealthProbeStatus::AgentMailServer) {
         return PortStatus::AgentMailServer;
     }
 
@@ -417,7 +425,9 @@ pub fn check_port_status(host: &str, port: u16) -> PortStatus {
     // port as free so the caller can retry bind with `SO_REUSEADDR` and
     // proceed instead of surfacing a spurious "Unknown process listening"
     // error to the operator.
-    if !port_has_active_listener(host, port) {
+    if matches!(health_probe_status, HealthProbeStatus::NoResponse)
+        && !port_has_active_listener(host, port)
+    {
         tracing::debug!(
             %addr,
             "bind() returned AddrInUse but nothing is accepting on this port — \
@@ -517,35 +527,58 @@ fn normalize_connect_host_for_health_check(host: &str) -> std::borrow::Cow<'_, s
 /// Attempt to connect to a port and verify it's an Agent Mail server via health check.
 ///
 /// Sends a minimal HTTP GET request to `/health` and checks for a valid response.
-fn is_agent_mail_health_check(host: &str, port: u16) -> bool {
+fn agent_mail_health_probe(host: &str, port: u16) -> HealthProbeStatus {
     let connect_host = normalize_connect_host_for_health_check(host);
     let host_for_resolution = connect_host
         .strip_prefix('[')
         .and_then(|value| value.strip_suffix(']'))
         .unwrap_or_else(|| connect_host.as_ref());
     let Ok(addrs) = (host_for_resolution, port).to_socket_addrs() else {
-        return false;
+        return HealthProbeStatus::NoResponse;
     };
-    is_agent_mail_health_check_addrs(connect_host.as_ref(), port, addrs)
+    agent_mail_health_probe_addrs(connect_host.as_ref(), port, addrs)
 }
 
+#[cfg(test)]
 fn is_agent_mail_health_check_addrs(
     connect_host: &str,
     port: u16,
     addrs: impl IntoIterator<Item = std::net::SocketAddr>,
 ) -> bool {
-    for addr in addrs {
-        if probe_agent_mail_health_addr(connect_host, port, addr) {
-            return true;
-        }
-    }
-    false
+    matches!(
+        agent_mail_health_probe_addrs(connect_host, port, addrs),
+        HealthProbeStatus::AgentMailServer
+    )
 }
 
-fn probe_agent_mail_health_addr(connect_host: &str, port: u16, addr: std::net::SocketAddr) -> bool {
+fn agent_mail_health_probe_addrs(
+    connect_host: &str,
+    port: u16,
+    addrs: impl IntoIterator<Item = std::net::SocketAddr>,
+) -> HealthProbeStatus {
+    let mut saw_listener = false;
+    for addr in addrs {
+        match probe_agent_mail_health_addr(connect_host, port, addr) {
+            HealthProbeStatus::AgentMailServer => return HealthProbeStatus::AgentMailServer,
+            HealthProbeStatus::OtherListener => saw_listener = true,
+            HealthProbeStatus::NoResponse => {}
+        }
+    }
+    if saw_listener {
+        HealthProbeStatus::OtherListener
+    } else {
+        HealthProbeStatus::NoResponse
+    }
+}
+
+fn probe_agent_mail_health_addr(
+    connect_host: &str,
+    port: u16,
+    addr: std::net::SocketAddr,
+) -> HealthProbeStatus {
     // Try to connect with a short timeout
     let Ok(stream) = TcpStream::connect_timeout(&addr, HEALTH_CHECK_TIMEOUT) else {
-        return false;
+        return HealthProbeStatus::NoResponse;
     };
 
     // Set read/write timeouts
@@ -622,7 +655,11 @@ fn probe_agent_mail_health_addr(connect_host: &str, port: u16, addr: std::net::S
     // Ensure we explicitly close the connection per UBS warning.
     let _ = stream.shutdown(std::net::Shutdown::Both);
 
-    result
+    if result {
+        HealthProbeStatus::AgentMailServer
+    } else {
+        HealthProbeStatus::OtherListener
+    }
 }
 
 #[allow(dead_code)]
