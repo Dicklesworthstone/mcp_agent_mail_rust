@@ -8,7 +8,7 @@ const AGENTS_RELATIVE: &str = "AGENTS.md";
 const LIVE_DOCS: &[&str] = &[
     "README.md",
     "AGENTS.md",
-    "VISION.md",
+    "docs/VISION.md",
     "docs/OPERATOR_RUNBOOK.md",
     "docs/OPERATOR_COOKBOOK.md",
     "docs/RELEASE_CHECKLIST.md",

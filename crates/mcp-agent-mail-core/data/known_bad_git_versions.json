@@ -23,7 +23,7 @@
       "severity": "fail",
       "summary": "git 2.51.0 segfaults under concurrent .git/index access",
       "fingerprint": "ip 0x1db250, error 4 reading cache_entry",
-      "remediation_ref": "RECOVERY_RUNBOOK.md#git-2-51-0-index-race"
+      "remediation_ref": "docs/RECOVERY_RUNBOOK.md#git-2-51-0-index-race"
     }
   ]
 }

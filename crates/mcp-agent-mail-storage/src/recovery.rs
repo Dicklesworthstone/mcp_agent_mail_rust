@@ -1,7 +1,7 @@
 //! Recovery helpers for repos damaged by the git 2.51.0 index-race.
 //!
 //! See `docs/GIT_251_FINDINGS.md` for background on the bug and
-//! `RECOVERY_RUNBOOK.md` for the operator playbook.
+//! `docs/RECOVERY_RUNBOOK.md` for the operator playbook.
 //!
 //! # What this module does
 //!

@@ -64,7 +64,7 @@ and a storage ref-classification bug fix.
 
 - Foundation + data-driven known-bad git version catalog; `am doctor check` surfaces
   a `GIT_2_51_0_INDEX_RACE` finding (exit code 3 in CI mode) when the system git is
-  flagged. See `RECOVERY_RUNBOOK.md#git-2-51-0-index-race`.
+  flagged. See `docs/RECOVERY_RUNBOOK.md#git-2-51-0-index-race`.
 - `AM_GIT_BINARY` override plumbed through every in-process git shell-out path
   (guard, share export, reservation activity probes, project identity detection).
 - Pre-push hook handler wraps all three `get_push_paths` git calls in the SIGSEGV

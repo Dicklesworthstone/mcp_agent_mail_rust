@@ -37,6 +37,10 @@ crates/**/tests/artifacts/
 # bv (beads viewer) local config and caches
 .bv/
 
+# NTM/Beads transient recovery metadata
+.ntm/
+.beads/.br_recovery/
+
 # Profiling artifacts
 perf.data
 perf.data.*
@@ -109,6 +113,14 @@ SilverFox:
 # CASS session mining output
 LIST_OF_INPUT_MESSAGES.md
 
+# Agent-generated audit/session scratch at repo root
+/.skill-loop-progress.md
+/.test_out.txt
+/.ubs-output.txt
+/.ubs-verbose.txt
+/CONTEXT_SETUP_LOG.md
+/INTRODUCTION.md
+
 # Ephemeral files (agent-generated, build artifacts, test detritus)
 ci-artifacts/
 proptest-regressions/
@@ -140,12 +152,18 @@ rch-install/
 .agent-mail-project-id
 
 # Vendored dependencies (local overrides)
-vendor/
+vendor/*
 # But track uring-fs (required for builds; no crates.io release)
 !vendor/uring-fs/
+!vendor/uring-fs/**
+
+# Share viewer assets are bundled into the offline export viewer.
+!crates/mcp-agent-mail-share/viewer_assets/vendor/
+!crates/mcp-agent-mail-share/viewer_assets/vendor/**
 
 # Beads backup/conflict files
 .beads/*.bak_*
+*.json.bak
 
 # Beads DB corruption snapshots
 .beads/*.corrupt.*

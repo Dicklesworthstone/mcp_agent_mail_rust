@@ -33,28 +33,28 @@ Audit artifact for `br-o217s.9`.
 - `docs/MIGRATION_GUIDE.md`
 - `docs/RELEASE_CHECKLIST.md`
 
-## Root Markdown Audit
+## Root/Planning Markdown Audit
 
 | File | Findings | Action | Verification |
 |---|---|---|---|
 | `AGENTS.md` | none | no action | grep clean |
-| `AGENT_MAIL_RUST_VERSION_REPO_TRANSITION_PLAN.md` | none | no action | grep clean |
-| `CONTEXT_SETUP_LOG.md` | none | no action | grep clean |
-| `EXISTING_MCP_AGENT_MAIL_STRUCTURE.md` | none | no action | grep clean |
-| `FEATURE_PARITY.md` | `34 of 37 tools with fixtures` is current conformance wording | no action | retained as current wording |
-| `INTRODUCTION.md` | none | no action | grep clean |
-| `PLAN_TO_PORT_MCP_AGENT_MAIL_TO_RUST.md` | historical `20+ resources` / `35 tools` planning counts | added dated historical note | note added; file no longer reads as current surface doc |
-| `PROPOSED_ARCHITECTURE.md` | none | no action | grep clean |
+| `docs/planning/AGENT_MAIL_RUST_VERSION_REPO_TRANSITION_PLAN.md` | none | no action | grep clean |
+| `docs/archive/agent-session-notes/CONTEXT_SETUP_LOG.md` | none | no action | grep clean |
+| `docs/planning/EXISTING_MCP_AGENT_MAIL_STRUCTURE.md` | none | no action | grep clean |
+| `docs/planning/FEATURE_PARITY.md` | `34 of 37 tools with fixtures` is current conformance wording | no action | retained as current wording |
+| `docs/archive/agent-session-notes/INTRODUCTION.md` | none | no action | grep clean |
+| `docs/planning/PLAN_TO_PORT_MCP_AGENT_MAIL_TO_RUST.md` | historical `20+ resources` / `35 tools` planning counts | added dated historical note | note added; file no longer reads as current surface doc |
+| `docs/planning/PROPOSED_ARCHITECTURE.md` | none | no action | grep clean |
 | `README.md` | no stale count drift in this sweep | no action | grep clean |
-| `RECOVERY_RUNBOOK.md` | none | no action | grep clean |
-| `SYNC_STRATEGY.md` | none | no action | grep clean |
-| `TODO.md` | none | no action | grep clean |
-| `TODO_AGENT_MAIL_RUST_TRANSITION_EXECUTION.md` | none | no action | grep clean |
-| `TODO_ATC_ALIEN_UPGRADES.md` | none | no action | grep clean |
-| `UPGRADE_LOG.md` | none | no action | grep clean |
-| `VISION.md` | stale `11 screens` claim | fixed inline to `16 screens` | old phrase removed |
-| `beads_import.md` | none | no action | grep clean |
-| `beads_test_coverage.md` | none | no action | grep clean |
+| `docs/RECOVERY_RUNBOOK.md` | none | no action | grep clean |
+| `docs/planning/SYNC_STRATEGY.md` | none | no action | grep clean |
+| `docs/planning/TODO.md` | none | no action | grep clean |
+| `docs/planning/TODO_AGENT_MAIL_RUST_TRANSITION_EXECUTION.md` | none | no action | grep clean |
+| `docs/planning/TODO_ATC_ALIEN_UPGRADES.md` | none | no action | grep clean |
+| `docs/planning/UPGRADE_LOG.md` | none | no action | grep clean |
+| `docs/VISION.md` | stale `11 screens` claim | fixed inline to `16 screens` | old phrase removed |
+| `docs/planning/beads_import.md` | none | no action | grep clean |
+| `docs/planning/beads_test_coverage.md` | none | no action | grep clean |
 
 ## `docs/` Markdown Audit
 
@@ -118,7 +118,7 @@ broader live-doc set:
 
 - `README.md`
 - `AGENTS.md`
-- `VISION.md`
+- `docs/VISION.md`
 - `docs/OPERATOR_RUNBOOK.md`
 - `docs/OPERATOR_COOKBOOK.md`
 - `docs/RELEASE_CHECKLIST.md`

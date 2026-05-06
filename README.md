@@ -1380,7 +1380,7 @@ Some git versions have multi-process concurrency bugs that corrupt
 
 | Version | Status | Primary mitigation |
 |---------|--------|---------------------|
-| **2.51.0** | KNOWN BAD — segfaults in `cache_entry` walk under concurrent index writes (IP `0x1db250`). Ubuntu 25.10 "questing" is the main affected distro. | `export AM_GIT_BINARY=/path/to/git-2.50.x/bin/git` and/or upgrade to 2.51.1+ when available. See `RECOVERY_RUNBOOK.md#git-2-51-0-index-race`. |
+| **2.51.0** | KNOWN BAD — segfaults in `cache_entry` walk under concurrent index writes (IP `0x1db250`). Ubuntu 25.10 "questing" is the main affected distro. | `export AM_GIT_BINARY=/path/to/git-2.50.x/bin/git` and/or upgrade to 2.51.1+ when available. See `docs/RECOVERY_RUNBOOK.md#git-2-51-0-index-race`. |
 
 Run `am doctor check` to see whether your system git is flagged. The
 check emits a structured finding (code `GIT_2_51_0_INDEX_RACE`, exit

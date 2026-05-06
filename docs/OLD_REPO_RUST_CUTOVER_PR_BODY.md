@@ -17,7 +17,7 @@ Rust migration commands are now available and validated in the Rust repo:
 
 ## Source of Truth for This Cutover
 
-- Transition plan: `AGENT_MAIL_RUST_VERSION_REPO_TRANSITION_PLAN.md`
+- Transition plan: `docs/planning/AGENT_MAIL_RUST_VERSION_REPO_TRANSITION_PLAN.md`
 - Operator runbook: `docs/RUNBOOK_LEGACY_PYTHON_TO_RUST_IMPORT.md`
 - Cutover checklist template: `docs/TEMPLATE_OLD_REPO_RUST_CUTOVER_PR_CHECKLIST.md`
 - Release notes template: `docs/TEMPLATE_OLD_REPO_RUST_CUTOVER_RELEASE_NOTES.md`

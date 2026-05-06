@@ -1,1 +1,0 @@
-curl -X OPTIONS http://127.0.0.1:22745/api/ Origin:\ https://example.test Access-Control-Request-Method:\ POST Access-Control-Request-Headers:\ content-type\,authorization 

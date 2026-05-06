@@ -398,7 +398,7 @@ mv storage.sqlite3 "storage.sqlite3.corrupt.$(date +%Y%m%d_%H%M%S)"
 am serve-http
 ```
 
-See also: [RECOVERY_RUNBOOK.md](../RECOVERY_RUNBOOK.md)
+See also: [RECOVERY_RUNBOOK.md](RECOVERY_RUNBOOK.md)
 
 ### No events appearing in Dashboard
 

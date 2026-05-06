@@ -2375,7 +2375,7 @@ check_git_version_known_bad() {
       warn "  2. Upgrade system git to >= 2.51.1 once it is released"
       warn "  3. Run 'am doctor fix-orphan-refs --all --dry-run' on damaged repos"
       warn ""
-      warn "Details: RECOVERY_RUNBOOK.md#git-2-51-0-index-race"
+      warn "Details: docs/RECOVERY_RUNBOOK.md#git-2-51-0-index-race"
       warn ""
       ;;
     *)

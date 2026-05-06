@@ -35,7 +35,7 @@ jobs:
           live_docs=(
             README.md
             AGENTS.md
-            VISION.md
+            docs/VISION.md
             docs/OPERATOR_RUNBOOK.md
             docs/OPERATOR_COOKBOOK.md
             docs/RELEASE_CHECKLIST.md

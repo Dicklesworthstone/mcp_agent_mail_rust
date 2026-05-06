@@ -1,2 +1,0 @@
-    Blocking waiting for file lock on artifact directory
-   Compiling asupersync v0.2.8 (/data/projects/asupersync)
