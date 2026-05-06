@@ -4264,7 +4264,71 @@ mod tests {
     }
 
     #[test]
-    fn probe_integrity_quarantines_header_only_wal_before_pool_open() {
+    fn try_quarantine_corrupt_wal_preserves_sidecars() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        let wal_path = db_path.with_file_name("storage.sqlite3-wal");
+        let shm_path = db_path.with_file_name("storage.sqlite3-shm");
+        let wal_bytes = vec![0_u8; mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize];
+        std::fs::write(&wal_path, &wal_bytes).expect("write wal");
+        std::fs::write(&shm_path, b"stale-shm").expect("write shm");
+
+        assert!(
+            try_quarantine_corrupt_wal(&db_path),
+            "helper should quarantine at least one sidecar"
+        );
+        assert!(
+            !wal_path.exists(),
+            "live WAL sidecar should move out of the way"
+        );
+        assert!(
+            !shm_path.exists(),
+            "live SHM sidecar should move out of the way"
+        );
+
+        let wal_quarantines = std::fs::read_dir(dir.path())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("storage.sqlite3-wal.startup-quarantine-"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            wal_quarantines.len(),
+            1,
+            "startup recovery should preserve the suspicious WAL sidecar as evidence"
+        );
+        assert_eq!(
+            std::fs::read(&wal_quarantines[0]).expect("read quarantined wal"),
+            wal_bytes
+        );
+
+        let shm_quarantines = std::fs::read_dir(dir.path())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("storage.sqlite3-shm.startup-quarantine-"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shm_quarantines.len(),
+            1,
+            "startup recovery should preserve the suspicious SHM sidecar as evidence"
+        );
+        assert_eq!(
+            std::fs::read(&shm_quarantines[0]).expect("read quarantined shm"),
+            b"stale-shm"
+        );
+    }
+
+    #[test]
+    fn probe_integrity_tolerates_header_only_wal_before_pool_open() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("header_only_wal.db");
         let conn =
@@ -4292,50 +4356,6 @@ mod tests {
         assert!(
             matches!(result, ProbeResult::Ok { .. }),
             "startup integrity should clean header-only WAL and continue: {result:?}"
-        );
-
-        let wal_quarantines = std::fs::read_dir(dir.path())
-            .expect("read temp dir")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.starts_with("header_only_wal.db-wal.startup-quarantine-")
-                    })
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            wal_quarantines.len(),
-            1,
-            "startup recovery should preserve the suspicious WAL sidecar as evidence"
-        );
-        assert_eq!(
-            std::fs::read(&wal_quarantines[0]).expect("read quarantined wal"),
-            vec![0_u8; mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize]
-        );
-
-        let shm_quarantines = std::fs::read_dir(dir.path())
-            .expect("read temp dir")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.starts_with("header_only_wal.db-shm.startup-quarantine-")
-                    })
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            shm_quarantines.len(),
-            1,
-            "startup recovery should preserve the suspicious SHM sidecar as evidence"
-        );
-        assert_eq!(
-            std::fs::read(&shm_quarantines[0]).expect("read quarantined shm"),
-            b"stale-shm"
         );
 
         let conn =
