@@ -12995,30 +12995,150 @@ fn find_install_dir() -> Result<PathBuf, String> {
     Ok(dir.to_path_buf())
 }
 
+#[cfg(unix)]
+fn self_update_new_file_options(permissions: u32) -> std::fs::OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .mode(permissions)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
+    options
+}
+
+#[cfg(not(unix))]
+fn self_update_new_file_options(_permissions: u32) -> std::fs::OpenOptions {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    options
+}
+
+fn create_unique_self_update_file(
+    dir: &Path,
+    name: &str,
+    suffix: &str,
+    permissions: u32,
+) -> Result<(PathBuf, std::fs::File), String> {
+    let pid = std::process::id();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+
+    for attempt in 0..1024 {
+        let candidate = dir.join(format!(".{name}.{pid}.{now}.{attempt}.{suffix}"));
+        match self_update_new_file_options(permissions).open(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(format!("create {}: {error}", candidate.display())),
+        }
+    }
+
+    Err(format!(
+        "could not create unique self-update temp file in {}",
+        dir.display()
+    ))
+}
+
+#[cfg(unix)]
+fn open_self_update_binary_file(path: &Path) -> Result<std::fs::File, String> {
+    use std::os::unix::{fs::MetadataExt, fs::OpenOptionsExt};
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| format!("open replacement binary: {e}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("stat replacement binary: {e}"))?;
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+        return Err(format!(
+            "replacement binary is not a regular release file: {}",
+            path.display()
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_self_update_binary_file(path: &Path) -> Result<std::fs::File, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("open replacement binary: {e}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("stat replacement binary: {e}"))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "replacement binary is not a regular release file: {}",
+            path.display()
+        ));
+    }
+    Ok(file)
+}
+
+fn stage_replacement_binary(new_binary: &Path, dir: &Path, name: &str) -> Result<PathBuf, String> {
+    use std::io::Write as _;
+
+    let mut input = open_self_update_binary_file(new_binary)?;
+    let (tmp_new, mut output) = create_unique_self_update_file(dir, name, "new.tmp", 0o755)?;
+    if let Err(error) = std::io::copy(&mut input, &mut output) {
+        let _ = std::fs::remove_file(&tmp_new);
+        return Err(format!("stage new binary: {error}"));
+    }
+    if let Err(error) = output.flush().and_then(|()| output.sync_all()) {
+        let _ = std::fs::remove_file(&tmp_new);
+        return Err(format!("flush staged binary: {error}"));
+    }
+    drop(output);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) =
+            std::fs::set_permissions(&tmp_new, std::fs::Permissions::from_mode(0o755))
+        {
+            let _ = std::fs::remove_file(&tmp_new);
+            return Err(format!("chmod: {error}"));
+        }
+    }
+
+    Ok(tmp_new)
+}
+
+fn verify_install_dir_write_access(install_dir: &Path) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let (test_file, mut file) =
+        create_unique_self_update_file(install_dir, "am-update-test", "probe.tmp", 0o600)?;
+    let result = file
+        .write_all(b"test")
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all())
+        .map_err(|e| format!("no write access to {}: {e}", install_dir.display()));
+    drop(file);
+    let _ = std::fs::remove_file(&test_file);
+    result
+}
+
 /// Atomically replace a single binary (Unix).
 ///
 /// Strategy: write new → rename old to .old.tmp → rename new to target (atomic).
 #[cfg(unix)]
 fn atomic_replace_binary(new_binary: &Path, target_path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = target_path.parent().ok_or("no parent directory")?;
     let name = target_path
         .file_name()
         .ok_or("no filename")?
         .to_string_lossy();
 
-    let tmp_new = dir.join(format!(".{name}.new.tmp"));
     let tmp_old = dir.join(format!(".{name}.old.tmp"));
 
-    // 1. Copy new binary to staging location
-    std::fs::copy(new_binary, &tmp_new).map_err(|e| format!("stage new binary: {e}"))?;
+    // 1. Copy new binary to a freshly-created staging location.
+    let tmp_new = stage_replacement_binary(new_binary, dir, &name)?;
 
-    // 2. Set executable permissions
-    std::fs::set_permissions(&tmp_new, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("chmod: {e}"))?;
-
-    // 3. On macOS, handle Gatekeeper quarantine
+    // 2. On macOS, handle Gatekeeper quarantine
     #[cfg(target_os = "macos")]
     {
         // Copy quarantine xattr from old binary if it exists, or remove it from new
@@ -13030,14 +13150,17 @@ fn atomic_replace_binary(new_binary: &Path, target_path: &Path) -> Result<(), St
             .status();
     }
 
-    // 4. Rename old binary to backup (if it exists)
+    // 3. Rename old binary to backup (if it exists)
     if target_path.exists() {
         // Remove any leftover old backup
         let _ = std::fs::remove_file(&tmp_old);
-        std::fs::rename(target_path, &tmp_old).map_err(|e| format!("backup old binary: {e}"))?;
+        if let Err(e) = std::fs::rename(target_path, &tmp_old) {
+            let _ = std::fs::remove_file(&tmp_new);
+            return Err(format!("backup old binary: {e}"));
+        }
     }
 
-    // 5. Rename new binary to target (atomic on same filesystem)
+    // 4. Rename new binary to target (atomic on same filesystem)
     if let Err(e) = std::fs::rename(&tmp_new, target_path) {
         // Rollback: restore old binary
         if tmp_old.exists() {
@@ -13047,7 +13170,7 @@ fn atomic_replace_binary(new_binary: &Path, target_path: &Path) -> Result<(), St
         return Err(format!("atomic rename failed: {e}"));
     }
 
-    // 6. Clean up old backup
+    // 5. Clean up old backup
     let _ = std::fs::remove_file(&tmp_old);
 
     Ok(())
@@ -13066,16 +13189,18 @@ fn atomic_replace_binary(new_binary: &Path, target_path: &Path) -> Result<(), St
         .ok_or("no filename")?
         .to_string_lossy();
 
-    let tmp_new = dir.join(format!("{name}.new.tmp"));
     let tmp_old = dir.join(format!("{name}.old.tmp"));
 
-    // 1. Copy new binary to staging location
-    std::fs::copy(new_binary, &tmp_new).map_err(|e| format!("stage new binary: {e}"))?;
+    // 1. Copy new binary to a freshly-created staging location.
+    let tmp_new = stage_replacement_binary(new_binary, dir, &name)?;
 
     // 2. Rename old binary out of the way (Windows allows this even if locked)
     if target_path.exists() {
         let _ = std::fs::remove_file(&tmp_old);
-        std::fs::rename(target_path, &tmp_old).map_err(|e| format!("backup old binary: {e}"))?;
+        if let Err(e) = std::fs::rename(target_path, &tmp_old) {
+            let _ = std::fs::remove_file(&tmp_new);
+            return Err(format!("backup old binary: {e}"));
+        }
     }
 
     // 3. Rename new binary to target
@@ -13099,11 +13224,7 @@ fn atomic_replace_binary(new_binary: &Path, target_path: &Path) -> Result<(), St
 fn replace_binaries(release: &DownloadedRelease) -> Result<(), String> {
     let install_dir = find_install_dir()?;
 
-    // Verify write access
-    let test_file = install_dir.join(".am-update-test");
-    std::fs::write(&test_file, b"test")
-        .map_err(|e| format!("no write access to {}: {e}", install_dir.display()))?;
-    let _ = std::fs::remove_file(&test_file);
+    verify_install_dir_write_access(&install_dir)?;
 
     let (am_name, server_name) = if cfg!(windows) {
         ("am.exe", "mcp-agent-mail.exe")
@@ -57077,6 +57198,72 @@ fn atomic_replace_binary_roundtrip() {
     assert!(!backup.exists(), "backup should be cleaned up");
 
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_replace_binary_does_not_follow_stale_staging_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = tmp.path().join("am");
+    std::fs::write(&target, b"old-binary-v1").expect("write old binary");
+
+    let staging = tmp.path().join("staging");
+    std::fs::create_dir_all(&staging).expect("create staging");
+    let new_binary = staging.join("am");
+    std::fs::write(&new_binary, b"new-binary-v2").expect("write new binary");
+
+    let outside = tmp.path().join("outside-target");
+    std::fs::write(&outside, b"outside").expect("write outside target");
+    let stale_stage = tmp.path().join(".am.new.tmp");
+    symlink(&outside, &stale_stage).expect("create stale staging symlink");
+
+    atomic_replace_binary(&new_binary, &target).expect("replace binary");
+
+    assert_eq!(
+        std::fs::read(&target).expect("read target"),
+        b"new-binary-v2"
+    );
+    assert_eq!(
+        std::fs::read(&outside).expect("read outside"),
+        b"outside",
+        "self-update staging must not follow a stale symlink"
+    );
+    assert!(
+        std::fs::symlink_metadata(&stale_stage)
+            .expect("stale symlink should still exist")
+            .file_type()
+            .is_symlink(),
+        "fixed-name stale staging symlink should not be consumed"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_install_dir_write_access_does_not_follow_stale_probe_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let outside = tmp.path().join("outside-probe-target");
+    std::fs::write(&outside, b"outside").expect("write outside target");
+    let stale_probe = tmp.path().join(".am-update-test");
+    symlink(&outside, &stale_probe).expect("create stale probe symlink");
+
+    verify_install_dir_write_access(tmp.path()).expect("write probe");
+
+    assert_eq!(
+        std::fs::read(&outside).expect("read outside"),
+        b"outside",
+        "write-access probe must not follow a stale symlink"
+    );
+    assert!(
+        std::fs::symlink_metadata(&stale_probe)
+            .expect("stale symlink should still exist")
+            .file_type()
+            .is_symlink(),
+        "fixed-name stale probe symlink should not be consumed"
+    );
 }
 
 #[test]
