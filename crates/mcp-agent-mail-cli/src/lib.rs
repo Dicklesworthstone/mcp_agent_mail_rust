@@ -12799,9 +12799,109 @@ fn verify_sha256_file(path: &Path, expected_hex: &str) -> Result<bool, String> {
     Ok(actual == expected_hex.trim().to_lowercase())
 }
 
+fn validate_tar_archive_member_path(raw_path: &str) -> Result<(), String> {
+    let member = raw_path.trim();
+    if member.is_empty() {
+        return Err("tar archive contains an empty member path".to_string());
+    }
+
+    let path = Path::new(member);
+    if path.is_absolute() {
+        return Err(format!(
+            "tar archive member uses an absolute path: {member}"
+        ));
+    }
+
+    let mut has_normal_component = false;
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(_) => has_normal_component = true,
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err(format!("tar archive member escapes staging dir: {member}"));
+            }
+        }
+    }
+
+    if !has_normal_component {
+        return Err(format!(
+            "tar archive member is not a usable relative path: {member}"
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_tar_archive_listing(listing: &str) -> Result<(), String> {
+    for line in listing.lines() {
+        validate_tar_archive_member_path(line)?;
+    }
+    Ok(())
+}
+
+fn validate_tar_archive_member_type(verbose_line: &str) -> Result<(), String> {
+    let Some(kind) = verbose_line.as_bytes().first() else {
+        return Ok(());
+    };
+    match *kind {
+        b'-' | b'd' => Ok(()),
+        _ => Err(format!(
+            "tar archive contains unsupported member type {:?}; only regular files and directories are allowed",
+            char::from(*kind)
+        )),
+    }
+}
+
+fn validate_tar_archive_verbose_listing(listing: &str) -> Result<(), String> {
+    for line in listing.lines() {
+        validate_tar_archive_member_type(line)?;
+    }
+    Ok(())
+}
+
+fn validate_tar_xz_archive_paths(archive_path: &Path) -> Result<(), String> {
+    let path_output = std::process::Command::new("tar")
+        .args(["tJf", &archive_path.to_string_lossy()])
+        .output()
+        .map_err(|e| format!("failed to list tar archive: {e}"))?;
+    if !path_output.status.success() {
+        let stderr = String::from_utf8_lossy(&path_output.stderr);
+        return Err(format!(
+            "tar listing failed with exit code {:?}: {}",
+            path_output.status.code(),
+            stderr.trim()
+        ));
+    }
+
+    let path_listing = String::from_utf8(path_output.stdout)
+        .map_err(|_| "tar path listing was not valid UTF-8".to_string())?;
+    validate_tar_archive_listing(&path_listing)?;
+
+    let verbose_output = std::process::Command::new("tar")
+        .args(["tvJf", &archive_path.to_string_lossy()])
+        .output()
+        .map_err(|e| format!("failed to inspect tar archive: {e}"))?;
+    if !verbose_output.status.success() {
+        let stderr = String::from_utf8_lossy(&verbose_output.stderr);
+        return Err(format!(
+            "tar inspection failed with exit code {:?}: {}",
+            verbose_output.status.code(),
+            stderr.trim()
+        ));
+    }
+
+    let verbose_listing = String::from_utf8(verbose_output.stdout)
+        .map_err(|_| "tar verbose listing was not valid UTF-8".to_string())?;
+    validate_tar_archive_verbose_listing(&verbose_listing)
+}
+
 /// Extract binaries from a .tar.xz archive into a temporary directory.
 /// Returns the directory path containing extracted files.
 fn extract_tar_xz(archive_path: &Path, dest_dir: &Path) -> Result<(), String> {
+    validate_tar_xz_archive_paths(archive_path)?;
+
     let status = std::process::Command::new("tar")
         .args([
             "xJf",
@@ -55998,6 +56098,61 @@ fn normalize_self_update_version_rejects_pathlike_values() {
         assert!(
             normalize_self_update_version(raw).is_err(),
             "{raw:?} should not be accepted as a self-update version"
+        );
+    }
+}
+
+#[test]
+fn validate_tar_archive_listing_accepts_relative_release_paths() {
+    validate_tar_archive_listing(
+        "mcp-agent-mail-x86_64-unknown-linux-gnu/am\n\
+         mcp-agent-mail-x86_64-unknown-linux-gnu/mcp-agent-mail\n\
+         ./mcp-agent-mail-x86_64-unknown-linux-gnu/LICENSE\n",
+    )
+    .expect("normal release archive member paths should be accepted");
+}
+
+#[test]
+fn validate_tar_archive_listing_rejects_paths_outside_staging_dir() {
+    for member in [
+        "",
+        ".",
+        "/tmp/am",
+        "../am",
+        "release/../../am",
+        "./release/../..",
+    ] {
+        let err = validate_tar_archive_member_path(member)
+            .expect_err("unsafe tar archive member path should be rejected");
+        assert!(
+            err.contains("tar archive"),
+            "unexpected validation error for {member:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn validate_tar_archive_verbose_listing_accepts_files_and_directories() {
+    validate_tar_archive_verbose_listing(
+        "drwxr-xr-x user/group 0 2026-05-06 12:00 release/\n\
+         -rwxr-xr-x user/group 123 2026-05-06 12:00 release/am\n\
+         -rwxr-xr-x user/group 456 2026-05-06 12:00 release/mcp-agent-mail\n",
+    )
+    .expect("release archives should only need directories and regular files");
+}
+
+#[test]
+fn validate_tar_archive_verbose_listing_rejects_links_and_special_files() {
+    for line in [
+        "lrwxrwxrwx user/group 0 2026-05-06 12:00 release/am -> /tmp/am",
+        "hrwxrwxrwx user/group 0 2026-05-06 12:00 release/am link to outside",
+        "crw-rw-rw- user/group 1,3 2026-05-06 12:00 release/null",
+    ] {
+        let err = validate_tar_archive_member_type(line)
+            .expect_err("non-regular tar archive member type should be rejected");
+        assert!(
+            err.contains("unsupported member type"),
+            "unexpected validation error for {line:?}: {err}"
         );
     }
 }
