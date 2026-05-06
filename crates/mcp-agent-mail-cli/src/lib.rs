@@ -55744,7 +55744,8 @@ fn find_binary_in_dir_rejects_symlinked_nested_directory() {
     use std::os::unix::fs::symlink;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let outside_dir = tmp.path().join("outside-release");
+    let outside = tempfile::tempdir().expect("outside tempdir");
+    let outside_dir = outside.path().join("outside-release");
     std::fs::create_dir_all(&outside_dir).expect("create outside dir");
     std::fs::write(outside_dir.join("am"), b"binary").expect("write outside binary");
     symlink(&outside_dir, tmp.path().join("release")).expect("symlink nested dir");
