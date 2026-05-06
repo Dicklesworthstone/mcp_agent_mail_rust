@@ -35161,10 +35161,10 @@ startup_timeout_sec = 42
         let db_path = dir.path().join("readable-salvage.sqlite3");
         let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
             .expect("open sqlite db");
-        conn.execute_raw("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)")
-            .expect("create users table");
-        conn.execute_raw("INSERT INTO users VALUES(1, 'alice')")
-            .expect("insert user");
+        conn.execute_raw("CREATE TABLE messages(id INTEGER PRIMARY KEY)")
+            .expect("create messages table");
+        conn.execute_raw("INSERT INTO messages VALUES(1)")
+            .expect("insert message");
         drop(conn);
 
         let salvage = attempt_readable_sqlite_salvage_source(&db_path, "database");
@@ -35253,11 +35253,52 @@ startup_timeout_sec = 42
         let backup_path = dir.path().join("storage.sqlite3.bak");
         let conn = mcp_agent_mail_db::DbConn::open_file(backup_path.display().to_string())
             .expect("open backup sqlite db");
-        conn.execute_raw("CREATE TABLE marker(value TEXT)")
-            .expect("create marker table");
-        conn.execute_raw("INSERT INTO marker(value) VALUES('backup')")
-            .expect("insert marker");
+        conn.execute_raw("CREATE TABLE messages(id INTEGER PRIMARY KEY)")
+            .expect("create messages table");
+        conn.execute_raw("INSERT INTO messages(id) VALUES(2)")
+            .expect("insert backup message");
         drop(conn);
+
+        let salvage = attempt_best_doctor_salvage_artifact(&db_path);
+        match salvage {
+            DoctorSalvageAttempt::Succeeded(artifact) => {
+                assert_eq!(artifact.db_path, backup_path);
+                assert!(
+                    artifact.detail.contains("backup candidate"),
+                    "unexpected salvage detail: {}",
+                    artifact.detail
+                );
+            }
+            DoctorSalvageAttempt::Failed(detail) => {
+                panic!("expected backup salvage fallback, got failure: {detail}");
+            }
+        }
+    }
+
+    #[test]
+    fn attempt_best_doctor_salvage_artifact_falls_back_when_current_has_no_mail_tables() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        let live_conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open live sqlite db");
+        live_conn
+            .execute_raw("CREATE TABLE unrelated(value TEXT)")
+            .expect("create unrelated table");
+        live_conn
+            .execute_raw("INSERT INTO unrelated(value) VALUES('not-mail')")
+            .expect("insert unrelated marker");
+        drop(live_conn);
+
+        let backup_path = dir.path().join("storage.sqlite3.bak");
+        let backup_conn = mcp_agent_mail_db::DbConn::open_file(backup_path.display().to_string())
+            .expect("open backup sqlite db");
+        backup_conn
+            .execute_raw("CREATE TABLE messages(id INTEGER PRIMARY KEY)")
+            .expect("create backup messages table");
+        backup_conn
+            .execute_raw("INSERT INTO messages(id) VALUES(2)")
+            .expect("insert backup message");
+        drop(backup_conn);
 
         let salvage = attempt_best_doctor_salvage_artifact(&db_path);
         match salvage {
@@ -50863,6 +50904,7 @@ fn probe_doctor_salvage_tables(
     #[cfg(not(test))]
     let _ = sqlite_path;
 
+    let mut found_salvage_table = false;
     for table in DOCTOR_SALVAGE_PROBE_TABLES {
         let exists_sql = format!(
             "SELECT 1 AS exists_flag FROM sqlite_master \
@@ -50874,6 +50916,7 @@ fn probe_doctor_salvage_tables(
         if exists.is_empty() {
             continue;
         }
+        found_salvage_table = true;
 
         #[cfg(test)]
         if should_fail_doctor_salvage_table_scan(sqlite_path, table) {
@@ -50885,6 +50928,9 @@ fn probe_doctor_salvage_tables(
         let scan_sql = format!("SELECT COUNT(*) AS row_count FROM {table}");
         conn.query_sync(&scan_sql, &[])
             .map_err(|error| format!("scan {table}: {error}"))?;
+    }
+    if !found_salvage_table {
+        return Err("no expected Agent Mail salvage tables were present".to_string());
     }
     Ok(())
 }
