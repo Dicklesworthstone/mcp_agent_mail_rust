@@ -11,7 +11,7 @@ Agent: `ProudRidge`
 - Preserved the `broadcast=true` rejection path.
 - Removed baseline rustfmt drift in `crates/mcp-agent-mail-cli/src/lib.rs` and `crates/mcp-agent-mail-db/src/reconstruct.rs`.
 - Fresh-eyes cleanup replaced an awkward `format!("{}", n)` assertion helper with a named expected count string.
-- Second fresh-eyes cleanup reconciled `duplication_map.md` and `duplication_map.json` so the artifact set reflects the implemented candidates.
+- Second fresh-eyes cleanup reconciled `duplication_map.md` so the durable artifact set reflects the implemented candidates.
 
 ## Delta
 

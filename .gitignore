@@ -177,6 +177,7 @@ refactor/artifacts/**/tests_after.txt
 refactor/artifacts/**/test_output*.txt
 refactor/artifacts/**/skill_inventory.json
 refactor/artifacts/**/slop_scan.md
+refactor/artifacts/**/duplication_map.json
 
 # Generated graph output
 --graph-root.svg
