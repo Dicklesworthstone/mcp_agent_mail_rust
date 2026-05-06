@@ -1,146 +1,15 @@
-# Build artifacts
+# Build outputs
 /target/
 .cargo-target-*/
-
-# OS junk
-.DS_Store
-**/.DS_Store
-
-# SQLite databases (runtime)
-*.sqlite3
-*.sqlite3-wal
-*.sqlite3-shm
-*.db
-storage.sqlite3
-
-# Temp dirs
-_tmp_storage_root/
-experimental/**/Cargo.lock
-experimental/**/pkg/
-
-# Misc build output
-a.out
-
-# Local env (developer machine / CI)
-.env
-
-# Local server logs and PID files
-agent-mail-*.log
-agent-mail-*.pid
-
-# E2E test artifacts (generated per-run)
-tests/artifacts/
-
-# Crate-local test artifacts (generated per-run)
-crates/**/tests/artifacts/
-
-# bv (beads viewer) local config and caches
-.bv/
-
-# NTM/Beads transient recovery metadata
-.ntm/
-.beads/.br_recovery/
-
-# Profiling artifacts
-perf.data
-perf.data.*
-flamegraph.svg
-
-# Benchmark results (generated per-run by `am bench`)
-benches/results/
-
-# Conformance scratch runs (legacy python reference generator)
-crates/mcp-agent-mail-conformance/tests/conformance/python_reference/_scratch/
-
-# Legacy Python reference code (local-only, not part of Rust workspace)
-legacy_python_mcp_agent_mail_code/
-legacy/
-
-# FastEmbed model caches (downloaded at runtime)
-.fastembed_cache/
-**/.fastembed_cache/
-
-# Database backup and recovery files
-*.sqlite3.bak
-*.sqlite3.bak-*
-*.sqlite3-wal.bak
-*.sqlite3.corrupt-*
-*.sqlite3.archive-*
-
-# Temporary directories
-tmp/
-test_logs/
-
-# bv graph output
---graph-root.svg
---graph-format.svg
-
-# Agent coordination config
-.agent-mail.yaml
-
-# Compiler crash reports
-rustc-ice-*.txt
-
-# Codex/agent build artifacts
 target-codex*/
 target_*/
-
-# Archived mailbox state snapshots (ephemeral debug exports)
-**/archived_mailbox_states/
-
-# Ephemeral agent debug/test artifacts (accidental shell output)
-18
-42
-7
-GoldHawk:
-SilverFox:
-
-# Beads history snapshots
-.beads/.br_history/
-
-# Beads lock files (write/sync/bv/br advisory flocks)
-.beads/*.lock
-
-# Claude Code / AI agent ephemeral files
-.claude/
-
-# MCP config files (contain local bearer tokens — never commit)
-*.mcp.json
-
-# MCP config backup files (auto-generated during config updates)
-*.mcp.json.*.bak
-
-# CASS session mining output
-LIST_OF_INPUT_MESSAGES.md
-
-# Agent-generated audit/session scratch at repo root
-/.skill-loop-progress.md
-/.test_out.txt
-/.ubs-output.txt
-/.ubs-verbose.txt
-/CONTEXT_SETUP_LOG.md
-/INTRODUCTION.md
-
-# Ephemeral files (agent-generated, build artifacts, test detritus)
-ci-artifacts/
-proptest-regressions/
-test_meminfo
-
-# Compiled test binaries (accidentally committed, should never be tracked)
-migrate_bug_test
-parser_bug_test
-s3fifo_test
-s3fifo_leak_test
-test_glob
-test_panic
-ammonia_bug_test
-test_output.txt
-tmp.json
+target-rch*/
+target-local-*/
+target-review-*/
+dist/
 
 # Remote compilation helper artifacts
 rch-artifacts/
-target-rch-release/
-target-rch*/
 .rch-release-bin/
 .rch-release-root/
 .rch-target/
@@ -148,11 +17,166 @@ target-rch*/
 rch-bin/
 rch-install/
 
-# Agent mail project identity
+# OS, editor, and local machine state
+.DS_Store
+.env
+.vscode/
+.claude/
+__pycache__/
+scripts/__pycache__/
+core
+core.*
+rustc-ice-*.txt
+.codex/
+.codex-target-*/
+.codex-tmp/
+agent-mail-*.log
+agent-mail-*.pid
+
+# Local MCP and agent configuration
+.agent-mail.yaml
 .agent-mail-project-id
+*.mcp.json
+*.mcp.json.*.bak
+opencode.json
+.opencode.json.*.bak
+.windsurf.mcp.json.*.bak
+
+# SQLite databases, WAL files, backups, and corruption snapshots
+*.db
+*.db-*
+*.db.*
+*.sqlite3
+*.sqlite3-*
+*.sqlite3.*
+
+# Temp files and directories
+*.bak
+*.json.bak
+*.swp
+*.swo
+*~
+*.tmp
+a.out
+tmp/
+test_logs/
+_tmp_storage_root/
+ci-artifacts/
+.next_backup*/
+release-artifacts/
+.cargo-home-release-prep/
+target-release-prep/
+
+# Test, E2E, benchmark, and generated verification artifacts
+tests/artifacts/
+tests/artifacts_native/
+crates/**/tests/artifacts/
+benches/results/
+proptest-regressions/
+crates/mcp-agent-mail-conformance/tests/conformance/python_reference/_scratch/
+crates/mcp-agent-mail-db/file:*
+crates/mcp-agent-mail-db/mem_*
+atc-bench*/
+crates/**/atc_rollup_test_*
+atc_rollup_test_*
+
+# Profiling artifacts
+perf.data
+perf.data.*
+flamegraph.svg
+
+# Beads, bv, and NTM transient metadata
+.bv/
+.ntm/
+.beads/.br_history/
+.beads/.br_recovery/
+.beads/*.lock
+.beads/*.bak_*
+.beads/*.bad_*
+.beads/*.backup_*
+.beads/*.corrupt*
+.beads/*.pre_repair_*
+.beads/*.repair_candidate_*
+.beads/*.rebuild_*
+.beads/*.reindex_test_*
+.beads/*.vacuum_test_*
+.beads/recovery*/
+
+# Agent-generated root scratch files
+/.skill-loop-progress.md
+/.test_out.txt
+/.ubs-output.txt
+/.ubs-verbose.txt
+/CONTEXT_SETUP_LOG.md
+/INTRODUCTION.md
+/LIST_OF_INPUT_MESSAGES.md
+/git_log*.txt
+/.git_log*.txt
+/diffs*.txt
+/ftui-extras-cargo.toml
+/SESSION_TODO.md
+/SESSION_REPORT.md
+/SESSION_*.md
+/verify_*.sh
+/newfile.txt
+/repro_*.rs
+/fix_*.py
+/fix.py
+/debug_*.py
+/restore.py
+/find_*.py
+/parse_*.py
+/error.log
+/out.json
+/server_error*.log
+/server_warnings.txt
+/ubs-output.txt
+/Widget
+/data/
+/*.rs
+
+# Agent-generated one-off binaries and command outputs at repo root
+/migrate_bug_test
+/parser_bug_test
+/s3fifo_test
+/s3fifo_leak_test
+/test_glob
+/test_meminfo
+/test_output.txt
+/test_panic
+/test_*
+/tmp.json
+/ammonia_bug_test
+
+# Clippy and cargo diagnostic dumps
+clippy.log
+clippy_output.*
+clippy_out.*
+clippy.txt
+clippy.json
+clippy_results.json
+clippy_unwrap.json
+clippy_unwrap_clean.txt
+check_output.txt
+
+# Experimental and legacy local-only surfaces
+experimental/**/Cargo.lock
+experimental/**/pkg/
+legacy_python_mcp_agent_mail_code/
+legacy/
+
+# Runtime model caches and archived debug exports
+.fastembed_cache/
+**/.fastembed_cache/
+**/archived_mailbox_states/
+
+# Generated graph output
+--graph-root.svg
+--graph-format.svg
 
 # Vendored dependencies (local overrides)
 vendor/*
+
 # But track uring-fs (required for builds; no crates.io release)
 !vendor/uring-fs/
 !vendor/uring-fs/**
@@ -160,192 +184,3 @@ vendor/*
 # Share viewer assets are bundled into the offline export viewer.
 !crates/mcp-agent-mail-share/viewer_assets/vendor/
 !crates/mcp-agent-mail-share/viewer_assets/vendor/**
-
-# Beads backup/conflict files
-.beads/*.bak_*
-*.json.bak
-
-# Beads DB corruption snapshots
-.beads/*.corrupt.*
-.beads/*.corrupt_*
-
-# IDE config (agent-generated)
-.vscode/
-
-# Clippy output files
-clippy.log
-clippy_output.*
-clippy_out.*
-
-# Agent-generated git-log / diff scratch dumps at repo root
-# (captured by agents for analysis; never meant to be tracked)
-/git_log*.txt
-/.git_log*.txt
-/diffs*.txt
-
-# SQLite memory-mode test DB files (leaked by in-memory URI tests)
-crates/mcp-agent-mail-db/file:*
-
-# In-memory test scratch files (leaked by concurrent test runners)
-crates/mcp-agent-mail-db/mem_*
-
-# Agent-generated Python fix scripts
-/fix_*.py
-
-# Dist build output
-dist/
-
-# OpenCode config (local agent config)
-opencode.json
-
-# Python cache
-__pycache__/
-scripts/__pycache__/
-
-# SQLite corruption snapshots (timestamped)
-*.sqlite3.corrupt
-*.sqlite3.corrupt-*
-*.sqlite3-shm.corrupt-*
-*.sqlite3-wal.corrupt-*
-
-# Native TUI test artifacts
-tests/artifacts_native/
-
-# E2E TUI test scripts (ephemeral)
-tests/e2e/test_tui_*.sh
-
-# One-off test scripts at repo root
-/test_*.rs
-
-# Agent session ephemeral files
-SESSION_TODO.md
-SESSION_REPORT.md
-SESSION_*.md
-verify_*.sh
-newfile.txt
-repro_*.rs
-.claude/settings.local.json
-
-# Core dumps and agent config backups
-core.*
-core
-*.mcp.json.*.bak
-cline.mcp.json
-opencode.json
-windsurf.mcp.json
-clippy.txt
-clippy.json
-clippy_results.json
-clippy_unwrap.json
-clippy_unwrap_clean.txt
-check_output.txt
-.next_backup*/
-storage.sqlite3
-storage.sqlite3-shm
-storage.sqlite3-wal
-storage.sqlite3.bak
-storage.sqlite3.corrupt-*
-storage.sqlite3-shm.corrupt-*
-storage.sqlite3-wal.corrupt-*
-
-# ACFS ephemeral patterns (auto-generated agent artifacts)
-codex.mcp.json
-cursor.mcp.json
-gemini.mcp.json
-.opencode.json.*.bak
-.windsurf.mcp.json.*.bak
-*.sqlite3.corrupt*
-.beads/*.corrupt*
-.beads/*.pre_repair_*
-.beads/*.repair_candidate_*
-.beads/*.bak-corrupt
-
-# Beads ephemeral artifacts (recovery, backup, bad/rebuild snapshots)
-.beads/*.bad_*
-.beads/*.backup_*
-.beads/*.rebuild_*
-.beads/*.reindex_test_*
-.beads/*.vacuum_test_*
-.beads/recovery*/
-
-.rch-bin/
-.rch-target*/
-
-# Codex IDE cache
-.codex/
-
-# Agent-generated scratch Rust files at repo root
-/*.rs
-
-# Agent-generated scratch Cargo.toml fragments
-/ftui-extras-cargo.toml
-
-# Agent-generated debug/analysis Python scripts
-/debug_*.py
-/restore.py
-/find_*.py
-/parse_*.py
-/fix.py
-
-# Generic error log
-error.log
-
-# Scratch data/widget directories
-/Widget
-/data/
-
-# JSON output artifacts
-/out.json
-
-# Server log files
-server_error*.log
-server_warnings.txt
-
-# UBS scan output
-ubs-output.txt
-
-# Release build artifacts
-release-artifacts/
-
-# Codex CLI ephemeral target directories
-.codex-target-*/
-
-# Codex temp directory
-.codex-tmp/
-
-# Ephemeral test/runtime artifacts
-storage.sqlite3.activity.lock
-test_bug
-test_dir
-test_dotenv
-test_env_read
-test_guard
-test_*
-# Re-include real test_*.rs / test_*.sh files in subdirectories
-# (e.g. crates/*/tests/, tests/), but keep root-level `test_*.rs`
-# scratch files ignored — those are always agent-generated.
-!*/**/test_*.rs
-!*/**/test_*.sh
-
-# Ephemeral benchmark output dirs (random-suffixed per run by atc-bench harness)
-atc-bench*/
-
-# Local cargo target aliases used for side-by-side builds
-target-local-*/
-target-review-*/
-
-# NTM (agent tmux orchestrator) runtime state — per-machine churn, never tracked.
-# (Session summaries under .ntm/summaries/ are historical handoff records
-# and remain tracked deliberately.)
-.ntm/logs/
-.ntm/pids/
-.ntm/rate_limits.json
-.ntm/*.lock
-
-# ATC rollup scratch test databases (SQLite, created under crates/*)
-crates/**/atc_rollup_test_*
-atc_rollup_test_*
-
-# Release preparation build artifacts
-.cargo-home-release-prep/
-target-release-prep/
