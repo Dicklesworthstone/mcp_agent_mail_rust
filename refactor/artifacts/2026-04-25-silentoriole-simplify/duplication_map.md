@@ -1,8 +1,8 @@
 # Duplication Map — 2026-04-25-silentoriole-simplify
 
 Generated: 2026-04-25 01:09 UTC
-Tools run: (none installed)
-Raw outputs: refactor/artifacts/2026-04-25-silentoriole-simplify/scans/
+Tools run: local heuristic scan
+Raw scan transcript: local-only generated artifact; durable findings belong in the table below.
 
 ## How to fill this in
 

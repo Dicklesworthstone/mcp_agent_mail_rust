@@ -2,7 +2,7 @@
 
 Generated: 2026-04-24 22:21 UTC
 Tools run: manual diff/code review plus local heuristic scan
-Raw outputs: `refactor/artifacts/2026-04-24-proudridge-simplify/slop_scan.md`
+Raw scan transcript: local-only generated artifact; durable findings summarized below.
 
 | ID  | Kind | Locations | LOC each | × | Type | Notes |
 |-----|------|-----------|----------|---|------|-------|
