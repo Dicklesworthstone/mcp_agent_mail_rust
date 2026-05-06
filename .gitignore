@@ -153,6 +153,14 @@ benches/flamegraph*.svg
 /tmp.json
 /ammonia_bug_test
 
+# Local scratch Rust repros accidentally committed under crate source trees.
+/crates/mcp-agent-mail-core/src/config_bug_test.rs
+/crates/mcp-agent-mail-db/src/migrate_bug_test.rs
+/crates/mcp-agent-mail-db/src/s3fifo_leak_test.rs
+/crates/mcp-agent-mail-search-core/src/parser_bug_test.rs
+/crates/mcp-agent-mail-server/src/ammonia_bug_test.rs
+/crates/mcp-agent-mail-server/src/test_panic.rs
+
 # Clippy and cargo diagnostic dumps
 clippy.log
 clippy_output.*
