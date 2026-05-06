@@ -4066,12 +4066,21 @@ cleanup_mcp_configs() {
 
 remove_update_cache_and_logs() {
   local removed=0
-  local cache_file="${HOME}/.cache/mcp-agent-mail/update-check.json"
-  if [ -f "$cache_file" ]; then
-    rm -f "$cache_file"
-    record_uninstall_summary "Removed update cache ${cache_file}"
-    removed=$((removed + 1))
+  local cache_file
+  local cache_candidates=()
+  if [ -n "${XDG_CACHE_HOME:-}" ]; then
+    cache_candidates+=("${XDG_CACHE_HOME}/mcp-agent-mail/update-check.json")
   fi
+  if [ -n "${HOME:-}" ]; then
+    cache_candidates+=("${HOME}/.cache/mcp-agent-mail/update-check.json")
+  fi
+  for cache_file in "${cache_candidates[@]}"; do
+    if [ -f "$cache_file" ]; then
+      rm -f "$cache_file"
+      record_uninstall_summary "Removed update cache ${cache_file}"
+      removed=$((removed + 1))
+    fi
+  done
 
   local log_count=0
   while IFS= read -r log_path; do
