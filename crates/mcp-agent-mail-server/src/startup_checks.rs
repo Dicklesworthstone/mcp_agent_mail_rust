@@ -2223,7 +2223,7 @@ fn probe_integrity(config: &Config) -> ProbeResult {
     };
 
     // Helper: returns true when the error looks like a stale WAL / snapshot
-    // conflict that can be fixed by removing WAL+SHM sidecars. These are NOT
+    // conflict that can be fixed by quarantining WAL+SHM sidecars. These are NOT
     // genuine "another process is busy" situations — they mean the DB file has
     // a WAL that is inconsistent with the main file (e.g. after a crash or
     // SIGKILL). Treating them as hard "busy" failures causes `am` to refuse
@@ -2231,22 +2231,22 @@ fn probe_integrity(config: &Config) -> ProbeResult {
     let is_snapshot_conflict =
         |msg: &str| -> bool { mcp_agent_mail_db::is_sqlite_snapshot_conflict_error_message(msg) };
 
-    // Helper: attempt WAL removal + pool retry, falling back to full recovery.
+    // Helper: attempt WAL quarantine + pool retry, falling back to full recovery.
     let try_wal_cleanup_and_retry = |pool_config: &DbPoolConfig, config: &Config| -> ProbeResult {
         if let Some(db_path) = resolve_server_database_url_sqlite_path(&config.database_url) {
-            if try_remove_corrupt_wal(&db_path) {
+            if try_quarantine_corrupt_wal(&db_path) {
                 tracing::info!(
                     path = %db_path.display(),
-                    "removed corrupt/stale WAL/SHM sidecars; retrying pool open"
+                    "quarantined corrupt/stale WAL/SHM sidecars; retrying pool open"
                 );
                 if let Ok(p) = mcp_agent_mail_db::DbPool::new(pool_config) {
-                    tracing::info!("pool open succeeded after WAL removal");
+                    tracing::info!("pool open succeeded after WAL quarantine");
                     match p.run_startup_integrity_check() {
                         Ok(_) => return ProbeResult::Ok { name: "integrity" },
                         Err(ref e) => {
                             tracing::warn!(
                                 error = %e,
-                                "integrity check failed after WAL removal; falling back to recovery"
+                                "integrity check failed after WAL quarantine; falling back to recovery"
                             );
                         }
                     }
@@ -2341,24 +2341,77 @@ fn probe_integrity(config: &Config) -> ProbeResult {
     }
 }
 
-/// Try to remove corrupt WAL/SHM sidecars so SQLite can fall back to the
-/// main database file.  Returns `true` if at least one sidecar was removed.
-fn try_remove_corrupt_wal(db_path: &std::path::Path) -> bool {
-    let mut removed = false;
+/// Try to quarantine corrupt WAL/SHM sidecars so SQLite can fall back to the
+/// main database file. Returns `true` if at least one sidecar was quarantined.
+fn try_quarantine_corrupt_wal(db_path: &std::path::Path) -> bool {
+    let mut quarantined_any = false;
+    let nonce = startup_sidecar_quarantine_nonce();
     for suffix in ["-wal", "-shm"] {
         let mut sidecar_os = db_path.as_os_str().to_os_string();
         sidecar_os.push(suffix);
         let sidecar = std::path::PathBuf::from(sidecar_os);
-        if sidecar.exists() {
+        let metadata = match std::fs::symlink_metadata(&sidecar) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                tracing::warn!(
+                    path = %sidecar.display(),
+                    error = %error,
+                    "failed to inspect corrupt/stale WAL/SHM sidecar during startup recovery"
+                );
+                continue;
+            }
+        };
+        if !metadata.file_type().is_file() {
             tracing::warn!(
                 path = %sidecar.display(),
-                "removing corrupt/stale WAL/SHM sidecar during startup recovery"
+                "skipping non-file WAL/SHM sidecar during startup recovery"
             );
-            let _ = std::fs::remove_file(&sidecar);
-            removed = true;
+            continue;
+        }
+
+        let quarantine = startup_sidecar_quarantine_path(&sidecar, &nonce);
+        match std::fs::rename(&sidecar, &quarantine) {
+            Ok(()) => {
+                tracing::warn!(
+                    path = %sidecar.display(),
+                    quarantine = %quarantine.display(),
+                    "quarantined corrupt/stale WAL/SHM sidecar during startup recovery"
+                );
+                quarantined_any = true;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %sidecar.display(),
+                    quarantine = %quarantine.display(),
+                    error = %error,
+                    "failed to quarantine corrupt/stale WAL/SHM sidecar during startup recovery"
+                );
+            }
         }
     }
-    removed
+    quarantined_any
+}
+
+fn startup_sidecar_quarantine_nonce() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    format!("{}-{millis}", std::process::id())
+}
+
+fn startup_sidecar_quarantine_path(sidecar: &std::path::Path, nonce: &str) -> std::path::PathBuf {
+    let mut candidate_os = sidecar.as_os_str().to_os_string();
+    candidate_os.push(format!(".startup-quarantine-{nonce}"));
+    let mut candidate = std::path::PathBuf::from(candidate_os);
+    let mut suffix = 1_u32;
+    while candidate.exists() {
+        let mut candidate_os = sidecar.as_os_str().to_os_string();
+        candidate_os.push(format!(".startup-quarantine-{nonce}-{suffix:02}"));
+        candidate = std::path::PathBuf::from(candidate_os);
+        suffix = suffix.saturating_add(1);
+    }
+    candidate
 }
 
 fn compact_probe_detail(detail: &str) -> String {
@@ -4211,7 +4264,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_integrity_removes_header_only_wal_before_pool_open() {
+    fn probe_integrity_quarantines_header_only_wal_before_pool_open() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("header_only_wal.db");
         let conn =
@@ -4240,6 +4293,51 @@ mod tests {
             matches!(result, ProbeResult::Ok { .. }),
             "startup integrity should clean header-only WAL and continue: {result:?}"
         );
+
+        let wal_quarantines = std::fs::read_dir(dir.path())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("header_only_wal.db-wal.startup-quarantine-")
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            wal_quarantines.len(),
+            1,
+            "startup recovery should preserve the suspicious WAL sidecar as evidence"
+        );
+        assert_eq!(
+            std::fs::read(&wal_quarantines[0]).expect("read quarantined wal"),
+            vec![0_u8; mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize]
+        );
+
+        let shm_quarantines = std::fs::read_dir(dir.path())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("header_only_wal.db-shm.startup-quarantine-")
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shm_quarantines.len(),
+            1,
+            "startup recovery should preserve the suspicious SHM sidecar as evidence"
+        );
+        assert_eq!(
+            std::fs::read(&shm_quarantines[0]).expect("read quarantined shm"),
+            b"stale-shm"
+        );
+
         let conn =
             mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref()).unwrap();
         let rows = conn
