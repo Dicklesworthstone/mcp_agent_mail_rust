@@ -35462,6 +35462,64 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn doctor_reconstruct_rejects_in_memory_database() {
+        let cfg = mcp_agent_mail_db::DbPoolConfig {
+            database_url: "sqlite:///:memory:".to_string(),
+            ..Default::default()
+        };
+
+        let err = doctor_reconstruct_db_path_from_config(&cfg)
+            .expect_err("doctor reconstruct must refuse in-memory databases");
+        assert!(
+            err.to_string()
+                .contains("cannot reconstruct an in-memory database"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn doctor_reconstruct_dry_run_reports_resolved_absolute_candidate_path() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let absolute_db = tmp.path().join("doctor-reconstruct-absolute.sqlite3");
+        std::fs::write(&absolute_db, b"placeholder").expect("write absolute db");
+        let relative_db = absolute_db
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .to_string();
+        assert!(
+            !Path::new(&relative_db).exists(),
+            "relative fixture should be absent so the absolute candidate is selected"
+        );
+
+        let storage_root = tmp.path().join("storage");
+        std::fs::create_dir_all(storage_root.join("projects")).expect("create projects dir");
+        let database_url = format!("sqlite://{relative_db}");
+        let storage_root_text = storage_root.display().to_string();
+
+        let capture = ftui_runtime::StdioCapture::install().expect("capture stdio");
+        let result = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", database_url.as_str()),
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+            ],
+            || handle_doctor_reconstruct(true, true, false),
+        );
+        let output = capture.drain_to_string();
+
+        assert!(
+            result.is_ok(),
+            "doctor reconstruct dry-run failed: {output}"
+        );
+        assert!(
+            output.contains(&format!("Database path: {}", absolute_db.display())),
+            "dry-run output should use the resolved absolute database path, got: {output}"
+        );
+    }
+
+    #[test]
     fn storage_root_is_effectively_explicit_requires_matching_explicit_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let xdg_data_home = tmp.path().join("xdg");
@@ -50175,15 +50233,34 @@ fn handle_doctor_restore_to(
 fn handle_doctor_reconstruct(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
     let config = Config::from_env();
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
-    let db_path = PathBuf::from(resolve_sqlite_path_with_absolute_candidate(
-        &cfg.sqlite_path()
-            .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?,
-    ));
+    let db_path = doctor_reconstruct_db_path_from_config(&cfg)?;
     let _mailbox_storage_root_lock =
         acquire_doctor_mailbox_activity_lock_for_storage_root(&config.storage_root, dry_run)?;
     let _mailbox_sqlite_lock =
         acquire_doctor_mailbox_activity_lock_for_sqlite_path(&db_path, dry_run)?;
-    handle_doctor_reconstruct_with(None, None, dry_run, yes, json)
+    handle_doctor_reconstruct_with(
+        Some(&db_path),
+        Some(&config.storage_root),
+        dry_run,
+        yes,
+        json,
+    )
+}
+
+fn doctor_reconstruct_db_path_from_config(
+    cfg: &mcp_agent_mail_db::DbPoolConfig,
+) -> CliResult<PathBuf> {
+    let db_path = cfg
+        .sqlite_path()
+        .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?;
+    if db_path == ":memory:" {
+        return Err(CliError::InvalidArgument(
+            "cannot reconstruct an in-memory database (:memory:)".to_string(),
+        ));
+    }
+    Ok(PathBuf::from(resolve_sqlite_path_with_absolute_candidate(
+        &db_path,
+    )))
 }
 
 #[derive(Debug)]
@@ -50825,11 +50902,13 @@ fn handle_doctor_reconstruct_with(
         .unwrap_or_else(|| config.storage_root.clone());
     let db_path = match db_path_override {
         Some(p) => p.to_path_buf(),
-        None => PathBuf::from(
-            cfg.sqlite_path()
-                .map_err(|e| CliError::Other(format!("bad database URL: {e}")))?,
-        ),
+        None => doctor_reconstruct_db_path_from_config(&cfg)?,
     };
+    if db_path.as_os_str() == OsStr::new(":memory:") {
+        return Err(CliError::InvalidArgument(
+            "cannot reconstruct an in-memory database (:memory:)".to_string(),
+        ));
+    }
 
     if let Err(error) = validate_real_existing_directory(&storage_root, "reconstruct storage root")
     {
