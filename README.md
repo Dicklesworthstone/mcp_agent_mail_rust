@@ -454,7 +454,7 @@ For a project-local Gemini setup plus Agent Mail identity registration:
 
 ```bash
 scripts/register_gemini.sh /abs/path/to/repo
-# Optional: AGENT_NAME=BlueLake AGENT_MODEL=gemini-2.5-pro scripts/register_gemini.sh
+AGENT_NAME=BlueLake AGENT_MODEL=gemini-2.5-pro scripts/register_gemini.sh /abs/path/to/repo
 ```
 
 ### Any MCP-Compatible Client

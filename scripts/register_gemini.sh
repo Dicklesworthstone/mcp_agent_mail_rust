@@ -30,5 +30,10 @@ fi
 
 am "${register_args[@]}"
 
-echo "Registration complete."
-echo "To introduce yourself, use: am mail send --project '$PROJECT' --from <agent-name> --to <recipient> --subject 'Hello' --body '...'"
+if [[ -n "$AGENT_NAME" ]]; then
+  echo "Registration complete. Agent: ${AGENT_NAME}"
+  echo "To introduce yourself, use: am mail send --project '$PROJECT' --from '$AGENT_NAME' --to <recipient> --subject 'Hello' --body '...'"
+else
+  echo "Registration complete. Use the generated agent name printed above when sending mail."
+  echo "To introduce yourself, use: am mail send --project '$PROJECT' --from <generated-agent-name> --to <recipient> --subject 'Hello' --body '...'"
+fi
