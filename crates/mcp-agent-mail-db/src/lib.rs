@@ -169,8 +169,6 @@ pub mod search_embedder;
 #[cfg(feature = "hybrid")]
 pub mod search_embedding_jobs;
 #[cfg(feature = "hybrid")]
-pub mod search_fastembed;
-#[cfg(feature = "hybrid")]
 pub mod search_fs_bridge;
 #[cfg(feature = "hybrid")]
 pub mod search_metrics;

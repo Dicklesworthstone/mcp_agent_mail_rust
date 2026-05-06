@@ -36,22 +36,25 @@ half = { workspace = true, optional = true }
 wide = { workspace = true, optional = true }
 safetensors = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
-fastembed = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 dirs = { workspace = true, optional = true }
 
 [features]
 # Enable Tantivy-based lexical search engine
 tantivy-engine = ["dep:tantivy"]
-# Enable legacy FastEmbed quality tier (optional, may pull ONNX Runtime).
-quality-fastembed = ["dep:fastembed"]
-# Enable vector/semantic search engine with two-tier support
+# Enable vector/semantic search engine with two-tier support.
+#
+# Keep this pinned to no-Tokio local embedders. frankensearch's aggregate
+# `semantic` feature currently includes FastEmbed and must not be used here.
 semantic = [
     "dep:frankensearch",
+    "frankensearch/hash",
+    "frankensearch/model2vec",
     "dep:frankensearch-core",
     "dep:frankensearch-embed",
+    "frankensearch-embed/hash",
+    "frankensearch-embed/model2vec",
     "dep:frankensearch-fusion",
-    "quality-fastembed",
     "dep:half",
     "dep:wide",
     "dep:safetensors",
@@ -60,7 +63,12 @@ semantic = [
     "dep:dirs",
 ]
 # Enable hybrid fusion (requires both tantivy and semantic)
-hybrid = ["tantivy-engine", "semantic"]
+hybrid = [
+    "tantivy-engine",
+    "semantic",
+    "frankensearch/lexical",
+    "frankensearch-fusion/lexical",
+]
 
 [dev-dependencies]
 tempfile.workspace = true

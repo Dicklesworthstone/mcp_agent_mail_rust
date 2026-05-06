@@ -7,8 +7,10 @@
 //!
 //! On first access, the system automatically:
 //! 1. Checks for potion-128M (fast tier) in `HuggingFace` cache
-//! 2. Loads `MiniLM-L6-v2` (quality tier) via `FastEmbed`
-//! 3. Creates a global `TwoTierSearchContext` ready for use
+//! 2. Creates a global `TwoTierSearchContext` ready for use
+//!
+//! The old FastEmbed quality tier is intentionally not compiled in this
+//! workspace because it pulls the hf-hub/reqwest/hyper/tokio stack.
 //!
 //! # Usage
 //!
@@ -41,8 +43,6 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::error::SearchResult;
-#[cfg(feature = "quality-fastembed")]
-use crate::fastembed::get_quality_embedder;
 use crate::fs_bridge::{FsEmbedderStack, SyncEmbedderAdapter};
 use crate::metrics::TwoTierInitMetrics;
 use crate::model2vec::{Model2VecEmbedder, get_fast_embedder};
@@ -99,67 +99,27 @@ pub struct EmbedderInfo {
     pub dimension: usize,
 }
 
-#[cfg(feature = "quality-fastembed")]
-const QUALITY_INSTALL_HINT: &str = "pip install fastembed && python -c \"from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')\"";
-#[cfg(not(feature = "quality-fastembed"))]
 const QUALITY_INSTALL_HINT: &str =
-    "quality tier disabled at compile time; build with feature \"quality-fastembed\"";
+    "quality tier disabled by dependency policy; using local fast tier only";
 
-#[cfg(feature = "quality-fastembed")]
-fn current_quality_embedder_info() -> Option<EmbedderInfo> {
-    get_quality_embedder().map(|e| EmbedderInfo {
-        id: e.id().to_string(),
-        dimension: e.dimension(),
-    })
-}
-
-#[cfg(not(feature = "quality-fastembed"))]
 fn current_quality_embedder_info() -> Option<EmbedderInfo> {
     None
 }
 
-#[cfg(feature = "quality-fastembed")]
-fn quality_embedder_available() -> bool {
-    get_quality_embedder().is_some()
-}
-
-#[cfg(not(feature = "quality-fastembed"))]
 const fn quality_embedder_available() -> bool {
     false
 }
 
-#[cfg(feature = "quality-fastembed")]
-fn embed_quality_query(query: &str) -> SearchResult<Vec<f32>> {
-    get_quality_embedder()
-        .ok_or_else(|| {
-            crate::error::SearchError::ModeUnavailable("quality embedder unavailable".into())
-        })?
-        .embed(query)
-}
-
-#[cfg(not(feature = "quality-fastembed"))]
 fn embed_quality_query(_query: &str) -> SearchResult<Vec<f32>> {
     Err(crate::error::SearchError::ModeUnavailable(
         "quality embedder unavailable".into(),
     ))
 }
 
-#[cfg(feature = "quality-fastembed")]
-fn quality_embedder_dimension() -> usize {
-    get_quality_embedder().map_or(384, crate::fastembed::FastEmbedEmbedder::dimension)
-}
-
-#[cfg(not(feature = "quality-fastembed"))]
 const fn quality_embedder_dimension() -> usize {
     384
 }
 
-#[cfg(feature = "quality-fastembed")]
-fn quality_embedder_id() -> &'static str {
-    get_quality_embedder().map_or("unavailable", |e| e.id())
-}
-
-#[cfg(not(feature = "quality-fastembed"))]
 const fn quality_embedder_id() -> &'static str {
     "unavailable"
 }
@@ -239,7 +199,7 @@ impl TwoTierContext {
                     fast_embedder_load_ms,
                     quality_embedder_load_ms,
                     install_hint = QUALITY_INSTALL_HINT,
-                    "Two-tier search initialized in FAST-ONLY mode; install MiniLM-L6-v2 to enable quality refinement"
+                    "Two-tier search initialized in FAST-ONLY mode; quality refinement is disabled"
                 );
             }
             TwoTierAvailability::QualityOnly => {

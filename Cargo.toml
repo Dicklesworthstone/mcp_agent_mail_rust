@@ -104,10 +104,14 @@ tantivy = "0.25"
 indexmap = "2"
 nix = "0.31.1"
 
-# frankensearch: two-tier hybrid search engine + optional cross-encoder rerank
-frankensearch = { version = "0.3.0", path = "../frankensearch/frankensearch", features = ["hybrid", "rerank"] }
+# frankensearch: two-tier hybrid search engine + optional cross-encoder rerank.
+#
+# Do not enable frankensearch's aggregate `hybrid`/`semantic` features here:
+# those currently include FastEmbed, which pulls hf-hub/reqwest/hyper/tokio.
+# Downstream crates opt into the exact no-Tokio subfeatures they need.
+frankensearch = { version = "0.3.0", path = "../frankensearch/frankensearch", default-features = false }
 frankensearch-core = { version = "0.2.0", path = "../frankensearch/crates/frankensearch-core" }
-frankensearch-embed = { version = "0.2.0", path = "../frankensearch/crates/frankensearch-embed" }
+frankensearch-embed = { version = "0.2.0", path = "../frankensearch/crates/frankensearch-embed", default-features = false }
 frankensearch-index = { version = "0.2.0", path = "../frankensearch/crates/frankensearch-index" }
 frankensearch-fusion = { version = "0.2.0", path = "../frankensearch/crates/frankensearch-fusion" }
 
@@ -116,7 +120,6 @@ half = "2"
 wide = "1"
 safetensors = "0.7"
 tokenizers = "0.22"
-fastembed = "5.11.0"
 rayon = "1"
 dirs = "6"
 smallvec = { version = "1", features = ["serde"] }

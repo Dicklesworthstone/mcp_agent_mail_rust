@@ -51,9 +51,6 @@ pub mod two_tier;
 #[cfg(feature = "semantic")]
 pub mod model2vec;
 
-#[cfg(all(feature = "semantic", feature = "quality-fastembed"))]
-pub mod fastembed;
-
 #[cfg(feature = "semantic")]
 pub mod auto_init;
 
@@ -152,12 +149,6 @@ pub use two_tier::{
 pub use model2vec::{
     MODEL_POTION_32M, MODEL_POTION_128M, Model2VecEmbedder, get_fast_embedder,
     is_fast_embedder_available,
-};
-
-#[cfg(all(feature = "semantic", feature = "quality-fastembed"))]
-pub use fastembed::{
-    FastEmbedEmbedder, MODEL_BGE_SMALL, MODEL_MINILM_L6_V2, get_quality_embedder,
-    is_quality_embedder_available,
 };
 
 #[cfg(feature = "semantic")]

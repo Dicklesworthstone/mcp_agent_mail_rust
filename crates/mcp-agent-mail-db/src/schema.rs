@@ -1924,8 +1924,7 @@ pub fn schema_migrations() -> Vec<Migration> {
     // (#113).
     migrations.push(Migration::new(
         "v23_scrub_orphan_message_recipients_missing_message".to_string(),
-        "issue #119/#120: delete message_recipients rows whose parent message is gone"
-            .to_string(),
+        "issue #119/#120: delete message_recipients rows whose parent message is gone".to_string(),
         "DELETE FROM message_recipients \
          WHERE message_id NOT IN (SELECT id FROM messages)"
             .to_string(),
@@ -2005,7 +2004,7 @@ pub fn schema_migrations() -> Vec<Migration> {
          BEGIN \
              DELETE FROM message_recipients WHERE agent_id = OLD.id; \
          END"
-            .to_string(),
+        .to_string(),
         String::new(),
     ));
 
@@ -2020,7 +2019,7 @@ pub fn schema_migrations() -> Vec<Migration> {
          BEGIN \
              DELETE FROM file_reservations WHERE agent_id = OLD.id; \
          END"
-            .to_string(),
+        .to_string(),
         String::new(),
     ));
 
@@ -2037,7 +2036,7 @@ pub fn schema_migrations() -> Vec<Migration> {
          BEGIN \
              DELETE FROM file_reservation_releases WHERE reservation_id = OLD.id; \
          END"
-            .to_string(),
+        .to_string(),
         String::new(),
     ));
 
@@ -2053,7 +2052,7 @@ pub fn schema_migrations() -> Vec<Migration> {
              DELETE FROM agent_links \
              WHERE a_agent_id = OLD.id OR b_agent_id = OLD.id; \
          END"
-            .to_string(),
+        .to_string(),
         String::new(),
     ));
 
@@ -2067,7 +2066,7 @@ pub fn schema_migrations() -> Vec<Migration> {
          BEGIN \
              DELETE FROM inbox_stats WHERE agent_id = OLD.id; \
          END"
-            .to_string(),
+        .to_string(),
         String::new(),
     ));
 
@@ -2084,7 +2083,7 @@ pub fn schema_migrations() -> Vec<Migration> {
          BEGIN \
              DELETE FROM message_recipients WHERE message_id = OLD.id; \
          END"
-            .to_string(),
+        .to_string(),
         String::new(),
     ));
 

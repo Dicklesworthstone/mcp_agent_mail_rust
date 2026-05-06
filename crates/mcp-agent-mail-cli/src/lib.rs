@@ -34800,9 +34800,7 @@ startup_timeout_sec = 42
         let storage = tmp.path().join("storage");
         let db_path = tmp.path().join("storage.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
-        let quarantined_db = tmp
-            .path()
-            .join("storage.sqlite3.corrupt-20260502_073614");
+        let quarantined_db = tmp.path().join("storage.sqlite3.corrupt-20260502_073614");
         let quarantined_db_url = format!("sqlite:///{}", quarantined_db.display());
         let storage_root_text = storage.to_string_lossy().to_string();
         let db_url_text = db_url.clone();
@@ -46958,7 +46956,9 @@ startup_timeout_sec = 42
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("doctor_repair_prune_orphan_recipients.sqlite3");
+        let db_path = dir
+            .path()
+            .join("doctor_repair_prune_orphan_recipients.sqlite3");
         let db_url = format!("sqlite:///{}", db_path.display());
         let backup_dir = dir.path().join("backups");
 

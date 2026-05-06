@@ -2514,7 +2514,10 @@ fn v23_scrubs_orphan_message_recipients_with_missing_message() {
         move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
     });
 
-    conn.execute_raw("INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'p', '/tmp/p', 0)").expect("insert project");
+    conn.execute_raw(
+        "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'p', '/tmp/p', 0)",
+    )
+    .expect("insert project");
     conn.execute_raw(
         "INSERT INTO agents \
          (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \

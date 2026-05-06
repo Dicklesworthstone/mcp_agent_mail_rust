@@ -33,7 +33,6 @@ half = { workspace = true, optional = true }
 wide = { workspace = true, optional = true }
 safetensors = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
-fastembed = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 dirs = { workspace = true, optional = true }
 
@@ -55,19 +54,26 @@ asupersync.workspace = true
 
 [features]
 default = ["hybrid", "s3fifo", "tantivy-engine"]
-# Portable build: everything except hybrid/fastembed (avoids ONNX Runtime AVX2 SIGILL
-# on machines without AVX2).  Used by CI release builds.
+# Portable build: everything except hybrid search. Used by CI release builds.
 portable = ["s3fifo", "tantivy-engine"]
 # Enable Tantivy-based lexical search (moved from search-core)
 tantivy-engine = []
-# Enable hybrid search (lexical + semantic + frankensearch)
+# Enable hybrid search (lexical + local semantic + frankensearch) without
+# FastEmbed/hf-hub/reqwest/tokio. Do not use frankensearch's aggregate
+# `hybrid` feature here; it currently includes FastEmbed.
 hybrid = [
     "tantivy-engine",
-    "quality-fastembed",
     "dep:frankensearch",
+    "frankensearch/hash",
+    "frankensearch/model2vec",
+    "frankensearch/lexical",
+    "frankensearch/rerank",
     "dep:frankensearch-core",
     "dep:frankensearch-embed",
+    "frankensearch-embed/hash",
+    "frankensearch-embed/model2vec",
     "dep:frankensearch-fusion",
+    "frankensearch-fusion/lexical",
     "dep:frankensearch-index",
     "dep:half",
     "dep:wide",
@@ -76,8 +82,6 @@ hybrid = [
     "dep:rayon",
     "dep:dirs",
 ]
-# Enable legacy FastEmbed quality tier
-quality-fastembed = ["dep:fastembed"]
 # Enable loom model-checking tests (run with `cargo test --features loom-tests`)
 loom-tests = []
 # Use S3-FIFO eviction in ReadCache (replaces IndexMap LRU)

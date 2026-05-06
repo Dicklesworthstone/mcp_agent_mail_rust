@@ -1786,8 +1786,8 @@ fn emit_fast_only_search_hint_once(latency_ms: u64) {
         tracing::info!(
             target: "search.two_tier",
             latency_ms,
-            tip = "Install quality model via `pip install fastembed && python -c \"from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/all-MiniLM-L6-v2')\"`",
-            "Search completed in fast-only mode (quality embedder unavailable)"
+            tip = "FastEmbed quality tier is disabled by dependency policy; using local fast tier only",
+            "Search completed in fast-only mode"
         );
     }
 }
@@ -1796,7 +1796,8 @@ fn emit_fast_only_search_hint_once(latency_ms: u64) {
 ///
 /// Uses automatic embedder detection and initialization:
 /// - Fast tier: potion-128M (sub-ms, from `HuggingFace` cache)
-/// - Quality tier: `MiniLM-L6-v2` (128ms, via `FastEmbed`)
+/// - Quality tier: disabled in this workspace because FastEmbed pulls
+///   hf-hub/reqwest/hyper/tokio
 ///
 /// No manual setup required - embedders are auto-detected on first use.
 #[cfg(feature = "hybrid")]
