@@ -1151,11 +1151,14 @@ pub async fn query_open_experiences(
     }
 }
 
-fn minimum_retention_compaction_age_micros() -> Result<i64, DbError> {
+fn minimum_retention_drop_age_micros() -> Result<i64, DbError> {
     let rule = retention_rule(LearningArtifactKind::ResolvedExperienceRows).ok_or_else(|| {
         DbError::Internal("missing ATC retention rule for resolved experience rows".to_string())
     })?;
-    Ok(i64::from(rule.compact_after_days.unwrap_or(rule.hot_days)) * MICROS_PER_DAY)
+    let drop_after_days = rule.drop_after_days.ok_or_else(|| {
+        DbError::Internal("missing ATC drop-after policy for resolved experience rows".to_string())
+    })?;
+    Ok(i64::from(drop_after_days) * MICROS_PER_DAY)
 }
 
 fn validate_retention_compaction(
@@ -1169,12 +1172,12 @@ fn validate_retention_compaction(
         ));
     }
 
-    let minimum_age_micros = minimum_retention_compaction_age_micros()?;
+    let minimum_age_micros = minimum_retention_drop_age_micros()?;
     if max_age_micros < minimum_age_micros {
         return Err(DbError::invalid(
             "max_age_micros",
             format!(
-                "max_age_micros {max_age_micros} is below ATC retention policy minimum {minimum_age_micros}"
+                "max_age_micros {max_age_micros} is below ATC retention drop policy minimum {minimum_age_micros}"
             ),
         ));
     }
@@ -1263,10 +1266,12 @@ fn retention_compact_canonical(pool: &DbPool, cutoff_ts_micros: i64) -> Result<u
     result
 }
 
-/// Delete aged resolved/censored/expired raw rows while preserving rollups.
+/// Delete drop-eligible resolved/censored/expired raw rows while preserving rollups.
 ///
 /// The ATC retention contract keeps unresolved rows queryable and forces
-/// rollups to outlive raw resolved rows. This API enforces that policy.
+/// rollups to outlive raw resolved rows. Row-level detail becomes non-default
+/// after the compaction threshold, but this API only deletes raw rows after the
+/// later drop-after window.
 pub async fn retention_compact(
     cx: &Cx,
     pool: &DbPool,
@@ -2004,9 +2009,31 @@ mod tests {
     }
 
     #[test]
+    fn retention_compact_rejects_full_fidelity_compaction_age() {
+        let rule = retention_rule(LearningArtifactKind::ResolvedExperienceRows).expect("rule");
+        let compact_age_micros =
+            i64::from(rule.compact_after_days.expect("compact-after age")) * MICROS_PER_DAY;
+        let drop_age_micros = minimum_retention_drop_age_micros().expect("drop-after age");
+
+        assert!(
+            compact_age_micros < drop_age_micros,
+            "test must exercise the non-delete full-fidelity compaction window"
+        );
+
+        let error = validate_retention_compaction(compact_age_micros, true)
+            .expect_err("30-day full-fidelity cutoff must not be a deletion cutoff");
+        assert!(
+            error
+                .to_string()
+                .contains("below ATC retention drop policy minimum"),
+            "unexpected validation error: {error}"
+        );
+    }
+
+    #[test]
     fn retention_compact_deletes_old_terminal_rows_and_preserves_rollups() {
         let pool = test_pool();
-        let max_age_micros = minimum_retention_compaction_age_micros().expect("policy age");
+        let max_age_micros = minimum_retention_drop_age_micros().expect("policy age");
         let now = crate::now_micros();
         let old_resolved_ts = now - max_age_micros - 10_000_000;
         let old_censored_ts = now - max_age_micros - 20_000_000;
@@ -2082,7 +2109,7 @@ mod tests {
     #[test]
     fn refresh_rollups_can_erase_compacted_history_for_touched_stratum() {
         let pool = test_pool();
-        let max_age_micros = minimum_retention_compaction_age_micros().expect("policy age");
+        let max_age_micros = minimum_retention_drop_age_micros().expect("policy age");
         let now = crate::now_micros();
         let old_resolved_ts = now - max_age_micros - 10_000_000;
 

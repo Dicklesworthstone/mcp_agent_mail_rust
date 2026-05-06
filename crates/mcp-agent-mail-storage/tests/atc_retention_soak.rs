@@ -2,7 +2,7 @@
 //!
 //! This exercises the file-backed ATC APIs through a 7-day synthetic workload
 //! without touching the ATC TUI surface. The scenario intentionally straddles
-//! the raw-row retention boundary so the test can prove that:
+//! the raw-row drop boundary so the test can prove that:
 //! - old terminal rows compact away,
 //! - open rows remain queryable,
 //! - replay stays sequence-stable after compaction,
@@ -237,11 +237,14 @@ fn atc_retention_compaction_soak_preserves_rollups_and_open_rows() {
 
     let resolved_rule =
         retention_rule(LearningArtifactKind::ResolvedExperienceRows).expect("resolved rule");
-    let max_age_micros = i64::from(
-        resolved_rule
-            .compact_after_days
-            .unwrap_or(resolved_rule.hot_days),
-    ) * MICROS_PER_DAY;
+    let compact_age_micros =
+        i64::from(resolved_rule.compact_after_days.expect("compact-after age")) * MICROS_PER_DAY;
+    let max_age_micros =
+        i64::from(resolved_rule.drop_after_days.expect("drop-after age")) * MICROS_PER_DAY;
+    assert!(
+        compact_age_micros < max_age_micros,
+        "row-level compaction threshold must stay earlier than raw-row deletion"
+    );
     let now = now_micros();
     let start_day_micros = now
         .saturating_sub(max_age_micros)
@@ -343,6 +346,15 @@ fn atc_retention_compaction_soak_preserves_rollups_and_open_rows() {
         })
         .map(|row| row.experience_id)
         .collect::<Vec<_>>();
+    let expected_remaining_terminal_rows = inserted
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.state,
+                ExperienceState::Resolved | ExperienceState::Censored | ExperienceState::Expired
+            ) && row.resolved_ts_micros.unwrap_or(i64::MAX) > compact_summary.cutoff_ts_micros
+        })
+        .count();
 
     assert_eq!(compact_summary.deleted_rows, expected_deleted_rows);
     assert!(compact_summary.preserved_rollups);
@@ -385,7 +397,7 @@ fn atc_retention_compaction_soak_preserves_rollups_and_open_rows() {
                 )
             })
             .count(),
-        DAILY_TERMINAL_ROWS
+        expected_remaining_terminal_rows
     );
 
     let open_after = expect_outcome(
@@ -439,6 +451,6 @@ fn atc_retention_compaction_soak_preserves_rollups_and_open_rows() {
         .expect("oldest open created_ts");
     assert!(
         oldest_open_created_ts <= compact_summary.cutoff_ts_micros,
-        "scenario should include open rows older than the raw-row compaction cutoff"
+        "scenario should include open rows older than the raw-row drop cutoff"
     );
 }

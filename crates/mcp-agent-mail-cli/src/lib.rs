@@ -1591,6 +1591,21 @@ pub enum DoctorCommand {
         yes: bool,
         #[arg(long)]
         backup_dir: Option<PathBuf>,
+        /// Also delete `message_recipients` rows whose `agent_id` no longer exists
+        /// (issue #113).
+        ///
+        /// By default `am doctor repair` preserves these rows so the parent
+        /// message remains readable as "to: \[unknown-agent-N\]" in mailboxes —
+        /// the agent metadata is gone but the message itself is real.  Pass
+        /// this opt-in flag when you have audited the orphans (typically left
+        /// behind by an interrupted Python→Rust migration that did not remap
+        /// dedup'd agent IDs through `agent_links`) and confirmed they should
+        /// be dropped to clear `recovery.mode = degraded_read_only`.
+        ///
+        /// Intentionally **not** implied by `--yes`: this flag drops data and
+        /// must be requested explicitly.
+        #[arg(long)]
+        prune_orphan_recipients: bool,
     },
     Backups {
         /// Output format: table, json, or toon (default: auto-detect).
@@ -4846,7 +4861,8 @@ fn handle_doctor(action: DoctorCommand) -> CliResult<()> {
             dry_run,
             yes,
             backup_dir,
-        } => handle_doctor_repair(project, dry_run, yes, backup_dir),
+            prune_orphan_recipients,
+        } => handle_doctor_repair(project, dry_run, yes, backup_dir, prune_orphan_recipients),
         DoctorCommand::Backups { format, json } => handle_doctor_backups(format, json),
         DoctorCommand::Restore {
             backup_path,
@@ -15248,6 +15264,77 @@ fn doctor_rebuild_inbox_stats_for_agents(
     Ok(())
 }
 
+/// Issue #113: opt-in cleanup that drops `message_recipients` rows whose
+/// `agent_id` no longer exists in `agents`.
+///
+/// `doctor_cleanup_orphaned_message_recipients` deliberately preserves these
+/// rows so the parent message stays readable as "to: [unknown-agent-N]" —
+/// useful for forensic analysis of agent_links dedup gaps.  This function is
+/// the destructive counterpart, gated behind `--prune-orphan-recipients`, that
+/// users explicitly invoke once they have audited the orphans (typically left
+/// by an interrupted Python→Rust migration whose archive-replay path did not
+/// remap dedup'd agent IDs through `agent_links`).
+///
+/// Wraps `BEGIN IMMEDIATE` + per-row DELETE + COMMIT for crash safety; rebuilds
+/// `inbox_stats` for affected agents the same way the standard cleanup does
+/// (in this case, no rebuild is needed because the agent rows themselves are
+/// already gone, but we keep the same boundaries for symmetry).
+///
+/// Returns the number of rows actually deleted (or that would be deleted in
+/// `dry_run`).
+fn doctor_prune_missing_agent_recipients(
+    conn: &mcp_agent_mail_db::DbConn,
+    dry_run: bool,
+) -> CliResult<usize> {
+    let orphaned = doctor_orphaned_message_recipients(conn)?;
+    let to_prune: Vec<_> = orphaned
+        .iter()
+        .filter(|row| !row.missing_message && row.missing_agent)
+        .cloned()
+        .collect();
+
+    if to_prune.is_empty() || dry_run {
+        return Ok(to_prune.len());
+    }
+
+    conn.execute_raw("BEGIN IMMEDIATE").map_err(|e| {
+        CliError::Other(format!(
+            "failed to begin missing-agent recipient prune: {e}"
+        ))
+    })?;
+
+    let prune_result = (|| -> CliResult<()> {
+        let delete_sql = "DELETE FROM message_recipients WHERE message_id = ? AND agent_id = ?";
+        for orphan in &to_prune {
+            let params = [
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(orphan.message_id),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(orphan.agent_id),
+            ];
+            conn.execute_sync(delete_sql, &params).map_err(|e| {
+                CliError::Other(format!(
+                    "failed to prune missing-agent recipient (message_id={}, agent_id={}): {e}",
+                    orphan.message_id, orphan.agent_id
+                ))
+            })?;
+        }
+        Ok(())
+    })();
+
+    match prune_result {
+        Ok(()) => conn.execute_raw("COMMIT").map_err(|e| {
+            CliError::Other(format!(
+                "failed to commit missing-agent recipient prune: {e}"
+            ))
+        })?,
+        Err(err) => {
+            let _ = conn.execute_raw("ROLLBACK");
+            return Err(err);
+        }
+    }
+
+    Ok(to_prune.len())
+}
+
 fn doctor_cleanup_orphaned_message_recipients(
     conn: &mcp_agent_mail_db::DbConn,
     dry_run: bool,
@@ -21240,7 +21327,7 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
                     skipped_count += 1;
                 } else {
                     match run_doctor_subcommand_quietly(json, || {
-                        handle_doctor_repair(None, false, true, Some(backup_dir.clone()))
+                        handle_doctor_repair(None, false, true, Some(backup_dir.clone()), false)
                     }) {
                         Ok(()) => {
                             results.push(serde_json::json!({
@@ -33162,12 +33249,17 @@ http_headers = { Authorization = "Bearer secret" }
                         dry_run,
                         yes,
                         backup_dir,
+                        prune_orphan_recipients,
                     },
             } => {
                 assert!(project.is_none());
                 assert!(!dry_run);
                 assert!(!yes);
                 assert!(backup_dir.is_none());
+                assert!(
+                    !prune_orphan_recipients,
+                    "--prune-orphan-recipients must default off (drops data)"
+                );
             }
             _ => panic!("expected Doctor Repair"),
         }
@@ -33184,6 +33276,7 @@ http_headers = { Authorization = "Bearer secret" }
             "-y",
             "--backup-dir",
             "/tmp/bak",
+            "--prune-orphan-recipients",
         ])
         .unwrap();
         match cli.command.expect("expected command") {
@@ -33194,12 +33287,14 @@ http_headers = { Authorization = "Bearer secret" }
                         dry_run,
                         yes,
                         backup_dir,
+                        prune_orphan_recipients,
                     },
             } => {
                 assert_eq!(project.as_deref(), Some("proj"));
                 assert!(dry_run);
                 assert!(yes);
                 assert_eq!(backup_dir.unwrap(), PathBuf::from("/tmp/bak"));
+                assert!(prune_orphan_recipients);
             }
             _ => panic!("expected Doctor Repair"),
         }
@@ -35704,7 +35799,7 @@ startup_timeout_sec = 42
                 ("DATABASE_URL", db_url.as_str()),
                 ("STORAGE_ROOT", storage_root_text.as_str()),
             ],
-            || handle_doctor_repair(None, false, true, Some(backup_dir.clone())),
+            || handle_doctor_repair(None, false, true, Some(backup_dir.clone()), false),
         );
         assert!(
             result.is_ok(),
@@ -46736,6 +46831,92 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn doctor_repair_with_prune_orphan_recipients_drops_missing_agent_rows() {
+        // Issue #113: opt-in `--prune-orphan-recipients` must delete the
+        // missing-agent recipient rows that the default-behavior repair
+        // preserves.  Mirrors the missing-agent fixture above; differs only in
+        // passing `prune_orphan_recipients = true` and asserting the row is
+        // gone.
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("doctor_repair_prune_orphan_recipients.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let backup_dir = dir.path().join("backups");
+
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init pragmas");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys for fixture");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'repair-prune-recipient', '/tmp/repair-prune-recipient', 0)",
+        )
+        .expect("insert project");
+        conn.execute_raw(
+            "INSERT INTO agents
+             (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+             VALUES
+                (1, 1, 'Sender', 'codex-cli', 'gpt-5', 'sender', 0, 0, 'auto', 'auto')",
+        )
+        .expect("insert sender");
+        conn.execute_raw(
+            "INSERT INTO messages
+             (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts, attachments)
+             VALUES (1, 1, 1, 'THREAD-PRUNE-RECIPIENT', 'prune', 'body', 'normal', 0, 100, '[]')",
+        )
+        .expect("insert message");
+        conn.execute_raw(
+            "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (1, 999, 'to', NULL, NULL)",
+        )
+        .expect("insert missing-agent recipient");
+        drop(conn);
+
+        let capture = ftui_runtime::StdioCapture::install().unwrap();
+        handle_doctor_repair_with_options(
+            &db_url,
+            dir.path(),
+            &backup_dir,
+            None,
+            false,
+            true,
+            DoctorRepairOptions {
+                prune_orphan_recipients: true,
+            },
+        )
+        .expect("repair with prune");
+        let output = capture.drain_to_string();
+
+        let verify =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("reopen db");
+        let recipient_rows = verify
+            .query_sync(
+                "SELECT COUNT(*) AS count FROM message_recipients WHERE message_id = 1 AND agent_id = 999",
+                &[],
+            )
+            .expect("recipient count");
+        assert_eq!(
+            recipient_rows[0].get_named::<i64>("count").unwrap_or(-1),
+            0,
+            "--prune-orphan-recipients should delete the missing-agent recipient row"
+        );
+        assert!(
+            output.contains("Pruned missing-agent recipient rows: 1"),
+            "expected prune notice, got: {output}"
+        );
+        assert!(
+            !output.contains("Preserved recipient rows with missing agent metadata"),
+            "preserved-row notice should not appear when --prune-orphan-recipients is set: {output}"
+        );
+    }
+
+    #[test]
     fn doctor_repair_preserves_messages_when_project_metadata_is_missing() {
         let _guard = stdio_capture_lock()
             .lock()
@@ -50217,19 +50398,35 @@ fn handle_doctor_repair(
     dry_run: bool,
     yes: bool,
     backup_dir: Option<PathBuf>,
+    prune_orphan_recipients: bool,
 ) -> CliResult<()> {
     let config = Config::from_env();
     let cfg = mcp_agent_mail_db::DbPoolConfig::from_env();
     let database_url = &cfg.database_url;
     let bak_dir = backup_dir.unwrap_or_else(|| config.storage_root.join("backups"));
-    handle_doctor_repair_with(
+    handle_doctor_repair_with_options(
         database_url,
         &config.storage_root,
         &bak_dir,
         project,
         dry_run,
         yes,
+        DoctorRepairOptions {
+            prune_orphan_recipients,
+        },
     )
+}
+
+/// Optional toggles for `am doctor repair`.
+///
+/// Kept on its own struct so callers and tests cannot silently drift the flag
+/// surface as new options land.  All fields default to safe (data-preserving)
+/// behavior.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DoctorRepairOptions {
+    /// Issue #113: also delete `message_recipients` rows whose `agent_id` no
+    /// longer exists.  Off by default — see the CLI flag docs for context.
+    pub prune_orphan_recipients: bool,
 }
 
 fn handle_doctor_repair_with(
@@ -50239,6 +50436,26 @@ fn handle_doctor_repair_with(
     project: Option<String>,
     dry_run: bool,
     yes: bool,
+) -> CliResult<()> {
+    handle_doctor_repair_with_options(
+        database_url,
+        storage_root,
+        backup_dir,
+        project,
+        dry_run,
+        yes,
+        DoctorRepairOptions::default(),
+    )
+}
+
+fn handle_doctor_repair_with_options(
+    database_url: &str,
+    storage_root: &Path,
+    backup_dir: &Path,
+    project: Option<String>,
+    dry_run: bool,
+    yes: bool,
+    options: DoctorRepairOptions,
 ) -> CliResult<()> {
     let _mailbox_storage_root_lock =
         acquire_doctor_mailbox_activity_lock_for_storage_root(storage_root, dry_run)?;
@@ -50403,10 +50620,37 @@ fn handle_doctor_repair_with(
         }
     }
     if recipient_cleanup.preserved_missing_agent_rows > 0 {
-        ftui_runtime::ftui_println!(
-            "  Preserved recipient rows with missing agent metadata: {}",
-            recipient_cleanup.preserved_missing_agent_rows
-        );
+        if options.prune_orphan_recipients {
+            // Issue #113: opt-in destructive cleanup of recipient rows whose
+            // agent_id no longer exists.  Distinct from the
+            // missing-message-row deletion above: those are dangling pointers
+            // (parent message gone), while these are recipient rows whose
+            // parent message is intact but whose agent metadata was deleted
+            // (typically by `v10a_dedup_agents_case_insensitive` or by an
+            // agent_links remap that the historical message INSERT path did
+            // not consult — see issue #113).  Deleting them clears
+            // `recovery.mode = degraded_read_only` for users who already
+            // imported a corrupted Python DB; users who care about the "to:
+            // \[unknown-agent-N\]" placeholder must omit this flag.
+            let pruned = doctor_prune_missing_agent_recipients(&conn, dry_run)?;
+            if dry_run {
+                ftui_runtime::ftui_println!(
+                    "  Would prune missing-agent recipient rows: {} (--prune-orphan-recipients)",
+                    pruned,
+                );
+            } else {
+                ftui_runtime::ftui_println!(
+                    "  Pruned missing-agent recipient rows: {} (--prune-orphan-recipients)",
+                    pruned,
+                );
+            }
+        } else {
+            ftui_runtime::ftui_println!(
+                "  Preserved recipient rows with missing agent metadata: {} \
+                 (pass `--prune-orphan-recipients` to delete; opt-in because it drops data)",
+                recipient_cleanup.preserved_missing_agent_rows
+            );
+        }
     }
 
     // 4. Rebuild FTS if tables exist

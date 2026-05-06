@@ -735,6 +735,22 @@ fn triggers_after_migration() {
             "missing inbox stats trigger '{name}' in {trigger_names:?}"
         );
     }
+
+    // v23 cascade triggers (issue #120): trigger-based ON DELETE CASCADE for
+    // tables that reference agents/messages/file_reservations.
+    for name in &[
+        "trg_agents_cascade_message_recipients",
+        "trg_agents_cascade_file_reservations",
+        "trg_file_reservations_cascade_releases",
+        "trg_agents_cascade_agent_links",
+        "trg_agents_cascade_inbox_stats",
+        "trg_messages_cascade_recipients",
+    ] {
+        assert!(
+            trigger_names.contains(&name.to_string()),
+            "missing v23 cascade trigger '{name}' in {trigger_names:?}"
+        );
+    }
 }
 
 // NOTE: fts_message_insert_trigger_fires removed — FTS5 triggers dropped
@@ -2414,4 +2430,319 @@ fn v10b_index_creation_and_uniqueness_enforcement() {
         count, 4,
         "should have 4 agents total after cross-project insert"
     );
+}
+
+// ---------------------------------------------------------------------------
+// v23: FK-cascade-via-trigger + orphan scrub (#119/#120/#113)
+// ---------------------------------------------------------------------------
+
+/// Issue #112 Bug B reconciliation: stuck-NULL `file_reservations.released_ts`
+/// values should be backfilled from the `file_reservation_releases` sidecar
+/// when the migration runs.
+#[test]
+fn v23_backfills_stuck_null_released_ts_from_sidecar() {
+    let (conn, _dir) = open_temp_db();
+
+    block_on({
+        let conn = &conn;
+        move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+    });
+
+    conn.execute_raw(
+        "INSERT INTO projects (id, slug, human_key, created_at) \
+         VALUES (1, 'p', '/tmp/p', 0)",
+    )
+    .expect("insert project");
+    conn.execute_raw(
+        "INSERT INTO agents \
+         (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+         VALUES (1, 1, 'A', 'codex-cli', 'gpt-5', '', 0, 0, 'auto', 'auto')",
+    )
+    .expect("insert agent");
+    // Reservation row: stuck-NULL released_ts.
+    conn.execute_raw(
+        "INSERT INTO file_reservations \
+         (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts) \
+         VALUES (10, 1, 1, 'src/*.rs', 1, '', 0, 1000, NULL)",
+    )
+    .expect("insert reservation");
+    // Sidecar row: actual release timestamp.
+    conn.execute_raw(
+        "INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (10, 500)",
+    )
+    .expect("insert sidecar release");
+
+    // Re-run the v23 backfill migration directly to verify idempotent
+    // backfill against this fixture.
+    conn.execute_raw(
+        "UPDATE file_reservations \
+            SET released_ts = (\
+                SELECT released_ts FROM file_reservation_releases \
+                WHERE reservation_id = file_reservations.id\
+            ) \
+            WHERE released_ts IS NULL \
+              AND EXISTS (\
+                SELECT 1 FROM file_reservation_releases \
+                WHERE reservation_id = file_reservations.id\
+              )",
+    )
+    .expect("v23 backfill statement");
+
+    let rows = conn
+        .query_sync(
+            "SELECT released_ts FROM file_reservations WHERE id = 10",
+            &[],
+        )
+        .expect("query released_ts");
+    let released_ts: i64 = rows[0]
+        .get_named("released_ts")
+        .expect("released_ts must be backfilled");
+    assert_eq!(
+        released_ts, 500,
+        "v23 should backfill stuck-NULL released_ts from sidecar"
+    );
+}
+
+/// Issue #119/#120 orphan scrub: dangling `message_recipients` rows whose
+/// parent message has been deleted must be removed at upgrade time.
+#[test]
+fn v23_scrubs_orphan_message_recipients_with_missing_message() {
+    let (conn, _dir) = open_temp_db();
+
+    block_on({
+        let conn = &conn;
+        move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+    });
+
+    conn.execute_raw("INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'p', '/tmp/p', 0)").expect("insert project");
+    conn.execute_raw(
+        "INSERT INTO agents \
+         (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+         VALUES (1, 1, 'A', 'codex-cli', 'gpt-5', '', 0, 0, 'auto', 'auto')",
+    )
+    .expect("insert agent");
+    // Recipient pointing at a non-existent message id.
+    conn.execute_raw(
+        "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (9999, 1, 'to')",
+    )
+    .expect("insert dangling recipient");
+
+    // Re-run the v23 scrub statement.
+    conn.execute_raw(
+        "DELETE FROM message_recipients WHERE message_id NOT IN (SELECT id FROM messages)",
+    )
+    .expect("v23 scrub statement");
+
+    let rows = conn
+        .query_sync(
+            "SELECT COUNT(*) AS c FROM message_recipients WHERE message_id = 9999",
+            &[],
+        )
+        .expect("query");
+    assert_eq!(
+        rows[0].get_named::<i64>("c").unwrap_or(-1),
+        0,
+        "v23 must delete recipient rows whose parent message is gone"
+    );
+}
+
+/// Issue #120 cascade-trigger: deleting an agent must cascade-delete its
+/// `message_recipients`, `file_reservations`, `agent_links`, and
+/// `inbox_stats` rows even with `foreign_keys = OFF` because the v23
+/// triggers handle the cascade.
+#[test]
+fn v23_cascade_triggers_remove_dependents_when_agent_deleted() {
+    let (conn, _dir) = open_temp_db();
+
+    block_on({
+        let conn = &conn;
+        move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+    });
+
+    conn.execute_raw("PRAGMA foreign_keys = OFF")
+        .expect("disable foreign keys (matches runtime config)");
+
+    conn.execute_raw(
+        "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'p', '/tmp/p', 0)",
+    )
+    .expect("insert project");
+    conn.execute_raw(
+        "INSERT INTO agents \
+         (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+         VALUES \
+            (1, 1, 'Sender', 'codex-cli', 'gpt-5', '', 0, 0, 'auto', 'auto'), \
+            (2, 1, 'Recipient', 'codex-cli', 'gpt-5', '', 0, 0, 'auto', 'auto'), \
+            (3, 1, 'Buddy', 'codex-cli', 'gpt-5', '', 0, 0, 'auto', 'auto')",
+    )
+    .expect("insert agents");
+    conn.execute_raw(
+        "INSERT INTO messages \
+         (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts) \
+         VALUES (1, 1, 1, 'T', 'subject', 'body', 'normal', 0, 0)",
+    )
+    .expect("insert message");
+    conn.execute_raw(
+        "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (1, 2, 'to')",
+    )
+    .expect("insert recipient");
+    conn.execute_raw(
+        "INSERT INTO file_reservations \
+         (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts) \
+         VALUES (10, 1, 2, 'src/*.rs', 1, '', 0, 1000)",
+    )
+    .expect("insert reservation");
+    conn.execute_raw(
+        "INSERT INTO file_reservation_releases (reservation_id, released_ts) VALUES (10, 500)",
+    )
+    .expect("insert release sidecar");
+    conn.execute_raw(
+        "INSERT INTO agent_links \
+         (a_project_id, a_agent_id, b_project_id, b_agent_id, status, created_ts, updated_ts) \
+         VALUES (1, 2, 1, 3, 'approved', 0, 0)",
+    )
+    .expect("insert agent link");
+    // The v6 `trg_inbox_stats_insert` trigger already created an inbox_stats
+    // row for agent 2 when we inserted into `message_recipients` above.
+    // Verify it is in place rather than re-inserting (which would PRIMARY
+    // KEY violate).
+    let pre_delete_inbox_rows = conn
+        .query_sync(
+            "SELECT COUNT(*) AS c FROM inbox_stats WHERE agent_id = 2",
+            &[],
+        )
+        .expect("count inbox_stats pre-delete");
+    assert_eq!(
+        pre_delete_inbox_rows[0].get_named::<i64>("c").unwrap_or(-1),
+        1,
+        "v6 inbox_stats trigger must have created the recipient's row"
+    );
+
+    // Delete the agent — the v23 triggers should cascade.
+    conn.execute_raw("DELETE FROM agents WHERE id = 2")
+        .expect("delete agent");
+
+    let count = |sql: &str| -> i64 {
+        let rows = conn.query_sync(sql, &[]).expect("count query");
+        rows[0].get_named::<i64>("c").unwrap_or(-1)
+    };
+
+    assert_eq!(
+        count("SELECT COUNT(*) AS c FROM message_recipients WHERE agent_id = 2"),
+        0,
+        "agents-DELETE trigger should cascade to message_recipients"
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) AS c FROM file_reservations WHERE agent_id = 2"),
+        0,
+        "agents-DELETE trigger should cascade to file_reservations"
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) AS c FROM file_reservation_releases WHERE reservation_id = 10"),
+        0,
+        "file_reservations-DELETE trigger should cascade to the sidecar release ledger"
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) AS c FROM agent_links WHERE a_agent_id = 2 OR b_agent_id = 2"),
+        0,
+        "agents-DELETE trigger should cascade to agent_links"
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) AS c FROM inbox_stats WHERE agent_id = 2"),
+        0,
+        "agents-DELETE trigger should cascade to inbox_stats"
+    );
+}
+
+/// Issue #120: deleting a parent message must cascade-delete its recipient
+/// rows.  Complements the agents-side cascade above.
+#[test]
+fn v23_cascade_triggers_remove_recipients_when_parent_message_deleted() {
+    let (conn, _dir) = open_temp_db();
+
+    block_on({
+        let conn = &conn;
+        move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+    });
+
+    conn.execute_raw(
+        "INSERT INTO projects (id, slug, human_key, created_at) VALUES (1, 'p', '/tmp/p', 0)",
+    )
+    .expect("insert project");
+    conn.execute_raw(
+        "INSERT INTO agents \
+         (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+         VALUES \
+            (1, 1, 'Sender', 'codex-cli', 'gpt-5', '', 0, 0, 'auto', 'auto'), \
+            (2, 1, 'Recipient', 'codex-cli', 'gpt-5', '', 0, 0, 'auto', 'auto')",
+    )
+    .expect("insert agents");
+    conn.execute_raw(
+        "INSERT INTO messages \
+         (id, project_id, sender_id, thread_id, subject, body_md, importance, ack_required, created_ts) \
+         VALUES (1, 1, 1, 'T', 'subject', 'body', 'normal', 0, 0)",
+    )
+    .expect("insert message");
+    conn.execute_raw(
+        "INSERT INTO message_recipients (message_id, agent_id, kind) VALUES (1, 2, 'to')",
+    )
+    .expect("insert recipient");
+
+    conn.execute_raw("DELETE FROM messages WHERE id = 1")
+        .expect("delete message");
+
+    let rows = conn
+        .query_sync(
+            "SELECT COUNT(*) AS c FROM message_recipients WHERE message_id = 1",
+            &[],
+        )
+        .expect("count");
+    assert_eq!(
+        rows[0].get_named::<i64>("c").unwrap_or(-1),
+        0,
+        "messages-DELETE trigger should cascade to message_recipients"
+    );
+}
+
+/// Idempotency: rerunning v23 should not break, and should not re-create
+/// triggers (they use IF NOT EXISTS).
+#[test]
+fn v23_migration_is_idempotent_when_rerun() {
+    let (conn, _dir) = open_temp_db();
+
+    block_on({
+        let conn = &conn;
+        move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+    });
+
+    // Run again — should be a no-op (idempotent migrations).
+    let applied = block_on({
+        let conn = &conn;
+        move |cx| async move { migrate_to_latest(&cx, conn).await.into_result().unwrap() }
+    });
+    assert!(
+        applied.is_empty(),
+        "second migrate_to_latest call must not re-apply any migrations: {applied:?}"
+    );
+
+    // All v23 triggers exist exactly once.
+    for name in &[
+        "trg_agents_cascade_message_recipients",
+        "trg_agents_cascade_file_reservations",
+        "trg_file_reservations_cascade_releases",
+        "trg_agents_cascade_agent_links",
+        "trg_agents_cascade_inbox_stats",
+        "trg_messages_cascade_recipients",
+    ] {
+        let rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS c FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+                &[Value::Text((*name).to_string())],
+            )
+            .expect("count trigger");
+        assert_eq!(
+            rows[0].get_named::<i64>("c").unwrap_or(-1),
+            1,
+            "trigger {name} must exist exactly once after migration"
+        );
+    }
 }

@@ -1855,6 +1855,239 @@ pub fn schema_migrations() -> Vec<Migration> {
         ));
     }
 
+    // ── v23: FK-cascade-via-trigger + orphan scrub (#119/#120/#113) ──────
+    //
+    // Background.  The schema declares `REFERENCES agents(id)` on multiple
+    // tables (`message_recipients`, `file_reservations`, `agent_links`,
+    // `inbox_stats`, `messages.sender_id`) but the static-linked SQLite is
+    // configured with `foreign_keys = OFF` because:
+    //   - Tables have no `ON DELETE CASCADE` clause; flipping `foreign_keys`
+    //     to ON would make every `DELETE FROM agents` fail when dependents
+    //     exist (e.g. registered agents always have inbox_stats rows).
+    //   - Recreating tables to add CASCADE clauses requires the SQLite "12-
+    //     step" rebuild dance, which interacts badly with FrankenConnection's
+    //     pool warmup, the v10a case-insensitive dedup migration, and the
+    //     ATC follow-up canonical-only path.
+    //
+    // The pragmatic fix is to provide CASCADE semantics via `AFTER DELETE`
+    // triggers.  Triggers are supported by FrankenConnection, fire inside the
+    // same transaction as the parent DELETE, and do not require flipping the
+    // database-wide `foreign_keys` PRAGMA.  This closes the orphan-creation
+    // path documented in #120 (`message_recipients` accumulating after every
+    // multi-agent test run) and the migration-time orphan-creation path in
+    // #113 (v10a dedup deleting agent IDs that legacy Python rows still
+    // reference) — going forward.
+    //
+    // For databases already in the bad state, this migration also runs a
+    // one-shot orphan scrub.  We delete dangling `message_recipients` rows
+    // whose parent message is gone (the doctor's existing missing-message
+    // cleanup path) — the missing-agent rows are preserved by default for
+    // mailbox readability and only removed under `am doctor repair
+    // --prune-orphan-recipients` (see #113).  Stale `file_reservations`
+    // rows whose holder agent is gone are likewise scrubbed: a reservation
+    // with no holder is by definition unenforceable and the JSON archive
+    // remains the audit trail.
+
+    // Step 1: reconciliation pass — backfill `file_reservations.released_ts`
+    // from the sidecar release ledger so existing #112 Bug B drift heals at
+    // upgrade time.  The active-reservation predicate already consults the
+    // sidecar, but stuck-NULL released_ts values still confuse external
+    // tooling that reads `file_reservations` directly (and the doctor's
+    // forensic exports).  Idempotent: rows whose `released_ts` is already
+    // set are untouched.
+    migrations.push(Migration::new(
+        "v23_backfill_file_reservation_released_ts_from_sidecar".to_string(),
+        "issue #112: backfill stuck-NULL file_reservations.released_ts from the sidecar release ledger".to_string(),
+        "UPDATE file_reservations \
+            SET released_ts = (\
+                SELECT released_ts FROM file_reservation_releases \
+                WHERE reservation_id = file_reservations.id\
+            ) \
+            WHERE released_ts IS NULL \
+              AND EXISTS (\
+                SELECT 1 FROM file_reservation_releases \
+                WHERE reservation_id = file_reservations.id\
+              )"
+            .to_string(),
+        String::new(),
+    ));
+
+    // Step 2: scrub `message_recipients` rows whose parent message is gone.
+    // (#119/#120) These are the "dangling pointer" rows the startup
+    // self-heal previously raced against and the doctor previously cleaned
+    // up after open.  Doing the scrub at migration time means a fresh boot
+    // with an existing dirty DB can apply the new triggers cleanly.
+    //
+    // Missing-agent rows are intentionally NOT deleted here: they preserve
+    // mailbox readability ("to: \[unknown-agent-N\]").  Operators who want
+    // to drop them must opt in via `am doctor repair --prune-orphan-recipients`
+    // (#113).
+    migrations.push(Migration::new(
+        "v23_scrub_orphan_message_recipients_missing_message".to_string(),
+        "issue #119/#120: delete message_recipients rows whose parent message is gone"
+            .to_string(),
+        "DELETE FROM message_recipients \
+         WHERE message_id NOT IN (SELECT id FROM messages)"
+            .to_string(),
+        String::new(),
+    ));
+
+    // Step 3: scrub `file_reservations` rows whose holder agent is gone.
+    // Without a holder there is nothing to enforce — the JSON archive at
+    // <storage_root>/projects/<slug>/file_reservations/id-N.json remains the
+    // audit trail.  This closes the steady accumulation path documented in
+    // #120's "file_reservations|3|agents|0" foreign_key_check output.
+    migrations.push(Migration::new(
+        "v23_scrub_orphan_file_reservations_missing_agent".to_string(),
+        "issue #120: delete file_reservations rows whose holder agent is gone".to_string(),
+        "DELETE FROM file_reservations \
+         WHERE agent_id NOT IN (SELECT id FROM agents)"
+            .to_string(),
+        String::new(),
+    ));
+
+    // Step 4: also scrub the sidecar release ledger entries pointing at
+    // file_reservations rows that we just deleted (or that were already
+    // gone).  Keeps the sidecar consistent with the base table after step 3.
+    migrations.push(Migration::new(
+        "v23_scrub_orphan_file_reservation_releases".to_string(),
+        "issue #120: delete file_reservation_releases entries whose reservation row is gone"
+            .to_string(),
+        "DELETE FROM file_reservation_releases \
+         WHERE reservation_id NOT IN (SELECT id FROM file_reservations)"
+            .to_string(),
+        String::new(),
+    ));
+
+    // Step 5: scrub `agent_links` rows whose endpoints reference a missing
+    // agent (either side).  Contact graphs from a deleted agent have no
+    // valid edges by definition.
+    migrations.push(Migration::new(
+        "v23_scrub_orphan_agent_links_missing_a_agent".to_string(),
+        "issue #120: delete agent_links rows whose `a` endpoint agent is gone".to_string(),
+        "DELETE FROM agent_links \
+         WHERE a_agent_id NOT IN (SELECT id FROM agents)"
+            .to_string(),
+        String::new(),
+    ));
+    migrations.push(Migration::new(
+        "v23_scrub_orphan_agent_links_missing_b_agent".to_string(),
+        "issue #120: delete agent_links rows whose `b` endpoint agent is gone".to_string(),
+        "DELETE FROM agent_links \
+         WHERE b_agent_id NOT IN (SELECT id FROM agents)"
+            .to_string(),
+        String::new(),
+    ));
+
+    // Step 6: scrub `inbox_stats` rows whose owner agent is gone.  Inbox
+    // counters for a deleted agent are meaningless; the v6 backfill
+    // recomputes counts from `message_recipients` so this row will be
+    // recreated correctly when the agent is re-registered.
+    migrations.push(Migration::new(
+        "v23_scrub_orphan_inbox_stats_missing_agent".to_string(),
+        "issue #120: delete inbox_stats rows whose owner agent is gone".to_string(),
+        "DELETE FROM inbox_stats \
+         WHERE agent_id NOT IN (SELECT id FROM agents)"
+            .to_string(),
+        String::new(),
+    ));
+
+    // Step 7: cascade-trigger — when an agent is deleted, drop dependent
+    // `message_recipients` rows whose only purpose was to address that
+    // agent.  Issue #120: this prevents future steady accumulation of
+    // missing-agent recipient rows.  Fires inside the parent DELETE
+    // transaction, so the cascade is atomic.
+    migrations.push(Migration::new(
+        "v23_trg_agents_cascade_message_recipients".to_string(),
+        "issue #120: cascade-delete message_recipients when an agent is removed".to_string(),
+        "CREATE TRIGGER IF NOT EXISTS trg_agents_cascade_message_recipients \
+         AFTER DELETE ON agents \
+         BEGIN \
+             DELETE FROM message_recipients WHERE agent_id = OLD.id; \
+         END"
+            .to_string(),
+        String::new(),
+    ));
+
+    // Step 8: cascade-trigger — when an agent is deleted, drop their
+    // `file_reservations` rows.  A reservation with no holder cannot be
+    // enforced and the JSON archive retains the audit trail.
+    migrations.push(Migration::new(
+        "v23_trg_agents_cascade_file_reservations".to_string(),
+        "issue #120: cascade-delete file_reservations when an agent is removed".to_string(),
+        "CREATE TRIGGER IF NOT EXISTS trg_agents_cascade_file_reservations \
+         AFTER DELETE ON agents \
+         BEGIN \
+             DELETE FROM file_reservations WHERE agent_id = OLD.id; \
+         END"
+            .to_string(),
+        String::new(),
+    ));
+
+    // Step 9: cascade-trigger — when a `file_reservations` row is deleted
+    // (either directly or via Step 8), the matching sidecar release ledger
+    // entry must go too.  Keeps the audit invariant from Step 4 stable
+    // post-migration.
+    migrations.push(Migration::new(
+        "v23_trg_file_reservations_cascade_releases".to_string(),
+        "issue #120: cascade-delete file_reservation_releases when a reservation row is removed"
+            .to_string(),
+        "CREATE TRIGGER IF NOT EXISTS trg_file_reservations_cascade_releases \
+         AFTER DELETE ON file_reservations \
+         BEGIN \
+             DELETE FROM file_reservation_releases WHERE reservation_id = OLD.id; \
+         END"
+            .to_string(),
+        String::new(),
+    ));
+
+    // Step 10: cascade-trigger — drop `agent_links` rows for either endpoint
+    // when an agent is deleted.  The `OR` covers both sides in a single
+    // trigger body so we do not need two separate triggers.
+    migrations.push(Migration::new(
+        "v23_trg_agents_cascade_agent_links".to_string(),
+        "issue #120: cascade-delete agent_links when either endpoint agent is removed".to_string(),
+        "CREATE TRIGGER IF NOT EXISTS trg_agents_cascade_agent_links \
+         AFTER DELETE ON agents \
+         BEGIN \
+             DELETE FROM agent_links \
+             WHERE a_agent_id = OLD.id OR b_agent_id = OLD.id; \
+         END"
+            .to_string(),
+        String::new(),
+    ));
+
+    // Step 11: cascade-trigger — drop `inbox_stats` row when its owning
+    // agent is deleted.  Inbox counters lose meaning without the agent.
+    migrations.push(Migration::new(
+        "v23_trg_agents_cascade_inbox_stats".to_string(),
+        "issue #120: cascade-delete inbox_stats when an agent is removed".to_string(),
+        "CREATE TRIGGER IF NOT EXISTS trg_agents_cascade_inbox_stats \
+         AFTER DELETE ON agents \
+         BEGIN \
+             DELETE FROM inbox_stats WHERE agent_id = OLD.id; \
+         END"
+            .to_string(),
+        String::new(),
+    ));
+
+    // Step 12: cascade-trigger — when a `messages` row is deleted, drop its
+    // recipient rows.  This complements Step 7 (recipients are deleted on
+    // either parent agent or parent message removal) and matches what the
+    // existing `messages_ad` FTS trigger already does for FTS state.
+    migrations.push(Migration::new(
+        "v23_trg_messages_cascade_recipients".to_string(),
+        "issue #120: cascade-delete message_recipients when a parent message is removed"
+            .to_string(),
+        "CREATE TRIGGER IF NOT EXISTS trg_messages_cascade_recipients \
+         AFTER DELETE ON messages \
+         BEGIN \
+             DELETE FROM message_recipients WHERE message_id = OLD.id; \
+         END"
+            .to_string(),
+        String::new(),
+    ));
+
     migrations
 }
 

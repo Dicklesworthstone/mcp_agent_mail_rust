@@ -316,10 +316,17 @@ fn replay_rows(rt: &Runtime, cx: &Cx, pool: &DbPool) -> Vec<ExperienceRow> {
     .rows
 }
 
-fn resolved_retention_window_micros() -> i64 {
+fn resolved_raw_drop_window_micros() -> i64 {
     let rule = retention_rule(LearningArtifactKind::ResolvedExperienceRows)
         .expect("resolved experience retention rule");
-    i64::from(rule.compact_after_days.unwrap_or(rule.hot_days)) * MICROS_PER_DAY
+    let compact_window =
+        i64::from(rule.compact_after_days.expect("compact-after age")) * MICROS_PER_DAY;
+    let drop_window = i64::from(rule.drop_after_days.expect("drop-after age")) * MICROS_PER_DAY;
+    assert!(
+        compact_window < drop_window,
+        "row-level compaction threshold must stay earlier than raw-row deletion"
+    );
+    drop_window
 }
 
 fn context_message_id(row: &ExperienceRow) -> Option<i64> {
@@ -788,7 +795,7 @@ fn e2e_message_learning_loop_covers_ack_and_ack_overdue_branches() {
                 .block_on(retention_compact(
                     &cx,
                     &db_pool,
-                    resolved_retention_window_micros(),
+                    resolved_raw_drop_window_micros(),
                     true,
                 ))
                 .into_result()
