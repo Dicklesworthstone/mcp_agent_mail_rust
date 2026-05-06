@@ -135,6 +135,9 @@ benches/flamegraph*.svg
 /Widget
 /data/
 /*.rs
+/am_illustration.*
+/gh_og_share_image.*
+/og_share_image.*
 
 # Agent-generated one-off binaries and command outputs at repo root
 /migrate_bug_test

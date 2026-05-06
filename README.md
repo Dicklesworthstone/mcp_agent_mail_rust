@@ -1,7 +1,7 @@
 # MCP Agent Mail (Rust)
 
 <div align="center">
-  <img src="am_illustration.webp" alt="MCP Agent Mail - A mail-like coordination layer for AI coding agents">
+  <img src="docs/assets/am_illustration.webp" alt="MCP Agent Mail - A mail-like coordination layer for AI coding agents">
 </div>
 
 <div align="center">
