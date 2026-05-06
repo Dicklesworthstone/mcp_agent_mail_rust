@@ -1863,6 +1863,27 @@ fn encode_recipients_json(
     .to_string()
 }
 
+fn normalize_salvaged_recipient_kind(
+    raw_kind: Option<&str>,
+    message_id: i64,
+    stats: &mut ReconstructStats,
+) -> String {
+    let Some(trimmed) = raw_kind.map(str::trim).filter(|kind| !kind.is_empty()) else {
+        return "to".to_string();
+    };
+    match trimmed.to_ascii_lowercase().as_str() {
+        "to" => "to".to_string(),
+        "cc" => "cc".to_string(),
+        "bcc" => "bcc".to_string(),
+        _ => {
+            stats.warnings.push(format!(
+                "Salvage recipient for message {message_id} had invalid kind {trimmed:?}; defaulting to \"to\""
+            ));
+            "to".to_string()
+        }
+    }
+}
+
 fn malformed_attachments_json() -> String {
     serde_json::json!([{
         "name": MALFORMED_ATTACHMENTS_SENTINEL,
@@ -3646,9 +3667,9 @@ fn merge_salvaged_database(
                     let Some(&target_agent_id) = agent_id_map.get(&source_agent_id) else {
                         continue;
                     };
-                    let kind = row
-                        .get_named::<String>("kind")
-                        .unwrap_or_else(|_| "to".to_string());
+                    let raw_kind = row.get_named::<String>("kind").ok();
+                    let kind =
+                        normalize_salvaged_recipient_kind(raw_kind.as_deref(), message_id, stats);
                     let read_ts = row.get_named::<i64>("read_ts").ok();
                     let ack_ts = row.get_named::<i64>("ack_ts").ok();
                     recipient_json_updates.insert(message_id);
@@ -6381,7 +6402,7 @@ archive body
             .query_sync(
                 "INSERT INTO message_recipients (message_id, agent_id, kind, read_ts, ack_ts)
                  VALUES
-                    (1, 11, 'to', 123, 456),
+                    (1, 11, 'TO ', 123, 456),
                     (2, 12, 'to', NULL, NULL)",
                 &[],
             )
