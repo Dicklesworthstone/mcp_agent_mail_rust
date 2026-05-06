@@ -287,7 +287,7 @@ impl TwoTierContext {
     #[must_use]
     pub fn create_fs_embedder_stack(&self) -> Option<FsEmbedderStack> {
         let fast: Arc<dyn frankensearch::Embedder> = if get_fast_embedder().is_some() {
-            Arc::new(SyncEmbedderAdapter::fast(Arc::new(FastEmbedderWrapper)))
+            Arc::new(SyncEmbedderAdapter::fast(Arc::new(FastTierEmbedderWrapper)))
         } else {
             return None;
         };
@@ -309,7 +309,7 @@ impl TwoTierContext {
     #[must_use]
     pub fn create_searcher<'a>(&self, index: &'a TwoTierIndex) -> Option<TwoTierSearcher<'a>> {
         let fast_embedder: Option<Arc<dyn TwoTierEmbedder>> = match get_fast_embedder() {
-            Some(_) => Some(Arc::new(FastEmbedderWrapper)),
+            Some(_) => Some(Arc::new(FastTierEmbedderWrapper)),
             None => return None,
         };
 
@@ -355,9 +355,9 @@ impl TwoTierContext {
 // ────────────────────────────────────────────────────────────────────
 
 /// Wrapper to implement `TwoTierEmbedder` for the global fast embedder.
-struct FastEmbedderWrapper;
+struct FastTierEmbedderWrapper;
 
-impl TwoTierEmbedder for FastEmbedderWrapper {
+impl TwoTierEmbedder for FastTierEmbedderWrapper {
     fn embed(&self, text: &str) -> SearchResult<Vec<f32>> {
         get_fast_embedder()
             .ok_or_else(|| {

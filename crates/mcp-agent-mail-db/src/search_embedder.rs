@@ -7,8 +7,8 @@
 //!
 //! The embedding system has three quality tiers:
 //! - **Hash**: Content-hash fallback when no model is available (cosine = exact match only)
-//! - **Fast**: Lightweight model optimized for latency (e.g., `MiniLM`, `all-minilm-l6-v2`)
-//! - **Quality**: Full-size model for accuracy (e.g., e5-large, bge-large)
+//! - **Fast**: Lightweight local model optimized for latency (e.g., `Model2Vec`/`potion-128M`)
+//! - **Quality**: Full-size model for accuracy when a no-Tokio provider is wired in
 //!
 //! The [`ModelRegistry`] manages available models and their capabilities.
 //! The [`Embedder`] trait provides the embedding interface.
@@ -61,7 +61,7 @@ impl std::fmt::Display for ModelTier {
 /// Describes the capabilities and characteristics of an embedding model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
-    /// Unique identifier for this model (e.g., "all-minilm-l6-v2")
+    /// Unique identifier for this model (e.g., "potion-128m")
     pub id: String,
     /// Human-readable name
     pub name: String,

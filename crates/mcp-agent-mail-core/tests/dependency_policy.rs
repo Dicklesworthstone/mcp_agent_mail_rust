@@ -33,7 +33,12 @@ fn workspace_manifest() -> PathBuf {
 
 fn resolved_package_names(extra_args: &[&str]) -> BTreeSet<String> {
     let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .args(["metadata", "--format-version=1", "--manifest-path"])
+        .args([
+            "metadata",
+            "--locked",
+            "--format-version=1",
+            "--manifest-path",
+        ])
         .arg(workspace_manifest())
         .args(extra_args)
         .output()

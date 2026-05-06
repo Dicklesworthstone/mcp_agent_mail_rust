@@ -194,7 +194,7 @@ impl SyncEmbedderAdapter {
         Self::new(embedder, true, FsModelCategory::StaticEmbedder)
     }
 
-    /// Create a quality-tier adapter (e.g., for `FastEmbed`).
+    /// Create a quality-tier adapter for transformer-style embedders.
     #[must_use]
     pub fn quality(embedder: Arc<dyn crate::two_tier::TwoTierEmbedder>) -> Self {
         Self::new(embedder, true, FsModelCategory::TransformerEmbedder)
