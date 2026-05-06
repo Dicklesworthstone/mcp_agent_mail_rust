@@ -55979,24 +55979,21 @@ fn verify_sha256_with_filename_suffix() {
 
 #[test]
 fn find_binary_in_dir_flat() {
-    let tmp = std::env::temp_dir().join("am-test-find-flat");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
-    std::fs::write(tmp.join("am"), b"binary").unwrap();
-    assert_eq!(find_binary_in_dir(&tmp, "am"), Some(tmp.join("am")));
-    assert_eq!(find_binary_in_dir(&tmp, "missing"), None);
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let binary = tmp.path().join("am");
+    std::fs::write(&binary, b"binary").unwrap();
+    assert_eq!(find_binary_in_dir(tmp.path(), "am"), Some(binary));
+    assert_eq!(find_binary_in_dir(tmp.path(), "missing"), None);
 }
 
 #[test]
 fn find_binary_in_dir_nested() {
-    let tmp = std::env::temp_dir().join("am-test-find-nested");
-    let _ = std::fs::remove_dir_all(&tmp);
-    let sub = tmp.join("release");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let sub = tmp.path().join("release");
     std::fs::create_dir_all(&sub).unwrap();
-    std::fs::write(sub.join("am"), b"binary").unwrap();
-    assert_eq!(find_binary_in_dir(&tmp, "am"), Some(sub.join("am")));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let binary = sub.join("am");
+    std::fs::write(&binary, b"binary").unwrap();
+    assert_eq!(find_binary_in_dir(tmp.path(), "am"), Some(binary));
 }
 
 #[cfg(unix)]
@@ -57167,12 +57164,10 @@ fn find_install_dir_returns_existing_dir() {
 
 #[test]
 fn atomic_replace_binary_roundtrip() {
-    let tmp = std::env::temp_dir().join("am-test-atomic-replace");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp = tempfile::tempdir().expect("tempdir");
 
     // Create "old" binary
-    let target = tmp.join("am");
+    let target = tmp.path().join("am");
     std::fs::write(&target, b"old-binary-v1").unwrap();
     #[cfg(unix)]
     {
@@ -57181,7 +57176,7 @@ fn atomic_replace_binary_roundtrip() {
     }
 
     // Create "new" binary in a staging dir
-    let staging = tmp.join("staging");
+    let staging = tmp.path().join("staging");
     std::fs::create_dir_all(&staging).unwrap();
     let new_binary = staging.join("am");
     std::fs::write(&new_binary, b"new-binary-v2").unwrap();
@@ -57194,10 +57189,8 @@ fn atomic_replace_binary_roundtrip() {
     assert_eq!(content, b"new-binary-v2");
 
     // Verify old backup was cleaned up
-    let backup = tmp.join(".am.old.tmp");
+    let backup = tmp.path().join(".am.old.tmp");
     assert!(!backup.exists(), "backup should be cleaned up");
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[cfg(unix)]
@@ -57318,13 +57311,11 @@ fn resolve_deploy_tooling_repo_root_does_not_fall_back_to_unrelated_cwd_repo() {
 
 #[test]
 fn atomic_replace_binary_creates_new_file() {
-    let tmp = std::env::temp_dir().join("am-test-atomic-create");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp = tempfile::tempdir().expect("tempdir");
 
     // Target doesn't exist yet
-    let target = tmp.join("am");
-    let staging = tmp.join("staging");
+    let target = tmp.path().join("am");
+    let staging = tmp.path().join("staging");
     std::fs::create_dir_all(&staging).unwrap();
     let new_binary = staging.join("am");
     std::fs::write(&new_binary, b"fresh-binary").unwrap();
@@ -57333,17 +57324,13 @@ fn atomic_replace_binary_creates_new_file() {
 
     let content = std::fs::read(&target).unwrap();
     assert_eq!(content, b"fresh-binary");
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[test]
 fn atomic_replace_binary_rollback_on_failure() {
-    let tmp = std::env::temp_dir().join("am-test-atomic-rollback");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp = tempfile::tempdir().expect("tempdir");
 
-    let target = tmp.join("am");
+    let target = tmp.path().join("am");
     std::fs::write(&target, b"original").unwrap();
 
     // Try to replace with a non-existent source
@@ -57353,6 +57340,4 @@ fn atomic_replace_binary_rollback_on_failure() {
     // Original should still be intact
     let content = std::fs::read(&target).unwrap();
     assert_eq!(content, b"original");
-
-    let _ = std::fs::remove_dir_all(&tmp);
 }
