@@ -431,6 +431,7 @@ fn e2e_message_learning_loop_covers_ack_and_ack_overdue_branches() {
             ("HTTP_RBAC_ENABLED", "false"),
             ("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "true"),
             ("AM_ATC_WRITE_MODE", "live"),
+            ("AM_ALLOW_EPHEMERAL_PROJECT_ROOTS", "1"),
             ("DATABASE_POOL_SIZE", "1"),
             ("DATABASE_MAX_OVERFLOW", "0"),
             // The operator loop clamps probe cadence to at least 5s and only
