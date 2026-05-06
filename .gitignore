@@ -84,6 +84,7 @@ atc_rollup_test_*
 perf.data
 perf.data.*
 flamegraph.svg
+benches/flamegraph*.svg
 
 # Beads, bv, and NTM transient metadata
 .bv/

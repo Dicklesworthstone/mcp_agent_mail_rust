@@ -435,8 +435,8 @@ Generated via `cargo flamegraph --root` with `CARGO_PROFILE_RELEASE_DEBUG=true`.
 
 | Profile | File | Samples | Key Finding |
 |---------|------|---------|-------------|
-| Tool handlers | `benches/flamegraph_bench_tools.svg` | 45,056 | 65% kernel (btrfs fdatasync), syscall cancel dominates userspace |
-| Archive writes | `benches/flamegraph_bench_archive.svg` | 44,948 | Same pattern — I/O bound, not CPU bound |
+| Tool handlers | `docs/perf/flamegraphs/bench_tools.svg` | 45,056 | 65% kernel (btrfs fdatasync), syscall cancel dominates userspace |
+| Archive writes | `docs/perf/flamegraphs/bench_archive.svg` | 44,948 | Same pattern — I/O bound, not CPU bound |
 | Archive batch 100 (warm path, 2026-04-18) | `tests/artifacts/perf/archive_batch_100_flamegraph.svg` | 77,537 | Allocator churn plus `commit-coalesce`, `git`, `unlinkat`, and `fsync` dominate the targeted batch path; `wbq_flush` is not a hotspot |
 
 **Interpretation**: Both profiles confirm the strace analysis below. The Rust userspace code is
