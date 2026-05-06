@@ -34791,6 +34791,123 @@ startup_timeout_sec = 42
         );
     }
 
+    #[test]
+    fn doctor_reconstruct_salvages_quarantined_artifact_when_primary_is_missing() {
+        let _guard = stdio_capture_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = tmp.path().join("storage");
+        let db_path = tmp.path().join("storage.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let quarantined_db = tmp
+            .path()
+            .join("storage.sqlite3.corrupt-20260502_073614");
+        let quarantined_db_url = format!("sqlite:///{}", quarantined_db.display());
+        let storage_root_text = storage.to_string_lossy().to_string();
+        let db_url_text = db_url.clone();
+
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("STORAGE_ROOT", storage_root_text.as_str()),
+                ("DATABASE_URL", db_url_text.as_str()),
+            ],
+            || {
+                handle_migrate_with_database_url(&quarantined_db_url)
+                    .expect("migrate quarantined salvage artifact");
+                let conn = open_db_sync_with_database_url(&quarantined_db_url)
+                    .expect("open quarantined salvage artifact");
+                conn.execute_raw(
+                    "INSERT INTO projects (slug, human_key, created_at)
+                     VALUES ('legacy-project', '/tmp/legacy-project', 0)",
+                )
+                .expect("insert DB-only project into quarantined artifact");
+                drop(conn);
+
+                let archive_project = storage.join("projects").join("archive-only-project");
+                let archive_agent = archive_project.join("agents").join("ArchiveFox");
+                let archive_messages = archive_project.join("messages").join("2026").join("03");
+                std::fs::create_dir_all(&archive_agent).expect("create archive agent dir");
+                std::fs::create_dir_all(&archive_messages).expect("create archive message dir");
+                std::fs::write(
+                    archive_project.join("project.json"),
+                    r#"{"slug":"archive-only-project","human_key":"/tmp/archive-only-project"}"#,
+                )
+                .expect("write project.json");
+                std::fs::write(
+                    archive_agent.join("profile.json"),
+                    r#"{"name":"ArchiveFox","program":"codex","model":"gpt-5","task_description":"archive seed","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z","attachments_policy":"auto","contact_policy":"auto"}"#,
+                )
+                .expect("write profile");
+                std::fs::write(
+                    archive_messages.join("20260322T000001Z__9001.md"),
+                    "---json\n{\"id\":9001,\"from\":\"ArchiveFox\",\"to\":[\"LegacyAgent\"],\"subject\":\"Archive only message\",\"thread_id\":\"archive-thread\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T00:00:01Z\",\"attachments\":[]}\n---\nRecovered from archive only.\n",
+                )
+                .expect("write archive message");
+
+                let capture = ftui_runtime::StdioCapture::install().expect("install capture");
+                let result = handle_doctor_reconstruct_with(
+                    Some(&db_path),
+                    Some(&storage),
+                    false,
+                    true,
+                    true,
+                );
+                let output = capture.drain_to_string();
+                assert!(result.is_ok(), "reconstruct failed: {result:?}");
+                assert!(db_path.exists(), "reconstructed DB file should exist");
+                assert!(
+                    quarantined_db.exists(),
+                    "doctor reconstruct should read, not consume, the quarantined artifact"
+                );
+
+                let payload = output
+                    .lines()
+                    .find(|line| line.trim_start().starts_with('{'))
+                    .expect("json output line");
+                let value: serde_json::Value =
+                    serde_json::from_str(payload).expect("parse reconstruct json output");
+                assert_eq!(value["salvage"]["status"], "ok");
+                assert!(
+                    value["salvage"]["detail"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("quarantined corrupt artifact"),
+                    "unexpected salvage detail: {payload}"
+                );
+
+                let verify =
+                    mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+                        .expect("reopen db");
+                let rows = verify
+                    .query_sync("SELECT slug, human_key FROM projects ORDER BY slug", &[])
+                    .expect("query projects");
+                let projects = rows
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.get_named::<String>("slug").expect("slug"),
+                            row.get_named::<String>("human_key").expect("human_key"),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    projects,
+                    vec![
+                        (
+                            "archive-only-project".to_string(),
+                            "/tmp/archive-only-project".to_string(),
+                        ),
+                        (
+                            "legacy-project".to_string(),
+                            "/tmp/legacy-project".to_string(),
+                        ),
+                    ]
+                );
+            },
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn scan_archive_stats_skips_symlinked_project_entries() {
@@ -51479,9 +51596,12 @@ fn doctor_salvage_artifact_candidates(current_db: &Path) -> Vec<(String, PathBuf
     candidates
 }
 
-fn attempt_best_doctor_salvage_artifact(current_db: &Path) -> DoctorSalvageAttempt {
+fn attempt_best_doctor_salvage_artifact_from_candidates(
+    current_db: &Path,
+    candidates: Vec<(String, PathBuf)>,
+) -> DoctorSalvageAttempt {
     let mut first_failure = None;
-    for (label, candidate) in doctor_salvage_artifact_candidates(current_db) {
+    for (label, candidate) in candidates {
         match attempt_readable_sqlite_salvage_source(&candidate, &label) {
             DoctorSalvageAttempt::Succeeded(artifact) => {
                 return DoctorSalvageAttempt::Succeeded(artifact);
@@ -51500,6 +51620,13 @@ fn attempt_best_doctor_salvage_artifact(current_db: &Path) -> DoctorSalvageAttem
             current_db.display()
         )
     }))
+}
+
+fn attempt_best_doctor_salvage_artifact(current_db: &Path) -> DoctorSalvageAttempt {
+    attempt_best_doctor_salvage_artifact_from_candidates(
+        current_db,
+        doctor_salvage_artifact_candidates(current_db),
+    )
 }
 
 fn run_startup_doctor_subcommand_quietly<F>(operation: F) -> CliResult<()>
@@ -51670,11 +51797,16 @@ fn handle_doctor_reconstruct_with(
         temp_db_path.display()
     );
 
-    // Attempt salvage from the original DB *in place* (no rename yet).
-    let salvage_attempt = if db_path.exists() {
-        Some(attempt_best_doctor_salvage_artifact(&db_path))
-    } else {
+    // Attempt salvage from the original DB *in place* (no rename yet), or from
+    // nearby doctor artifacts when an operator already moved the primary aside.
+    let salvage_candidates = doctor_salvage_artifact_candidates(&db_path);
+    let salvage_attempt = if salvage_candidates.is_empty() {
         None
+    } else {
+        Some(attempt_best_doctor_salvage_artifact_from_candidates(
+            &db_path,
+            salvage_candidates,
+        ))
     };
     let salvage_db_path = salvage_attempt.as_ref().and_then(|attempt| match attempt {
         DoctorSalvageAttempt::Succeeded(artifact) => Some(artifact.db_path.as_path()),
