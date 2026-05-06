@@ -396,16 +396,51 @@ fn message_query_uses_sql_plan(query: &SearchQuery) -> bool {
     trimmed.is_empty() || crate::queries::extract_like_terms(trimmed, 5).is_empty()
 }
 
-fn lexical_candidate_limit(query: &SearchQuery) -> usize {
-    let limit = query.effective_limit();
-    let needs_extra_candidates = query.product_id.is_some()
-        || query.ack_required.is_some()
-        || query_needs_recipient_filter(query);
-    if needs_extra_candidates {
-        limit.saturating_mul(16).clamp(64, 100_000).max(limit)
-    } else {
-        limit
+fn importance_filter_requires_sql_plan(query: &SearchQuery) -> bool {
+    if query.importance.is_empty() {
+        return false;
     }
+
+    let has_urgent = query.importance.contains(&Importance::Urgent);
+    let has_high = query.importance.contains(&Importance::High);
+    let has_normal = query.importance.contains(&Importance::Normal);
+    let has_low = query.importance.contains(&Importance::Low);
+
+    let exactly_urgent = has_urgent && !has_high && !has_normal && !has_low;
+    let high_or_urgent = has_urgent && has_high && !has_normal && !has_low;
+    let exactly_normal = !has_urgent && !has_high && has_normal && !has_low;
+    let exactly_low = !has_urgent && !has_high && !has_normal && has_low;
+
+    !(exactly_urgent || high_or_urgent || exactly_normal || exactly_low)
+}
+
+fn scoped_project_set_requires_sql_plan(query: &SearchQuery) -> bool {
+    matches!(
+        query.scope,
+        ScopePolicy::ProjectSet {
+            ref allowed_project_ids,
+        } if !allowed_project_ids.is_empty()
+    )
+}
+
+/// Use the SQL planner when correctness depends on filters or ordering that
+/// the Tantivy index cannot enforce before candidate truncation.
+fn message_query_requires_sql_plan(query: &SearchQuery) -> bool {
+    if !matches!(query.doc_kind, DocKind::Message | DocKind::Thread) {
+        return false;
+    }
+
+    message_query_uses_sql_plan(query)
+        || query.ranking == RankingMode::Recency
+        || query.product_id.is_some()
+        || query.ack_required.is_some()
+        || query_needs_recipient_filter(query)
+        || importance_filter_requires_sql_plan(query)
+        || scoped_project_set_requires_sql_plan(query)
+}
+
+fn lexical_candidate_limit(query: &SearchQuery) -> usize {
+    query.effective_limit()
 }
 
 fn legacy_candidate_limit(query: &SearchQuery) -> usize {
@@ -3472,7 +3507,7 @@ pub async fn execute_search(
     let assistance = query_assistance_payload(query);
 
     if matches!(query.doc_kind, DocKind::Agent | DocKind::Project)
-        || message_query_uses_sql_plan(query)
+        || message_query_requires_sql_plan(query)
     {
         return execute_sql_plan_search(
             cx, pool, query, options, cache, cache_key, assistance, timer,
@@ -5410,24 +5445,83 @@ mod tests {
     }
 
     #[test]
-    fn lexical_candidate_limit_expands_for_inbox_agent_filter() {
+    fn message_query_requires_sql_plan_for_inbox_agent_filter() {
         let query = SearchQuery {
+            text: "rollback".to_string(),
             agent_name: Some("BlueLake".to_string()),
             direction: Some(Direction::Inbox),
             limit: Some(3),
             ..Default::default()
         };
-        assert_eq!(lexical_candidate_limit(&query), 64);
+        assert!(message_query_requires_sql_plan(&query));
+        assert_eq!(lexical_candidate_limit(&query), 3);
     }
 
     #[test]
-    fn lexical_candidate_limit_expands_for_ack_required_filter() {
+    fn message_query_requires_sql_plan_for_ack_required_filter() {
         let query = SearchQuery {
+            text: "rollback".to_string(),
             ack_required: Some(true),
             limit: Some(5),
             ..Default::default()
         };
-        assert_eq!(lexical_candidate_limit(&query), 80);
+        assert!(message_query_requires_sql_plan(&query));
+        assert_eq!(lexical_candidate_limit(&query), 5);
+    }
+
+    #[test]
+    fn message_query_requires_sql_plan_for_product_scope() {
+        let query = SearchQuery {
+            text: "rollback".to_string(),
+            product_id: Some(12),
+            ..SearchQuery::default()
+        };
+        assert!(message_query_requires_sql_plan(&query));
+    }
+
+    #[test]
+    fn message_query_requires_sql_plan_for_restricted_project_scope() {
+        let query = SearchQuery {
+            text: "rollback".to_string(),
+            scope: ScopePolicy::ProjectSet {
+                allowed_project_ids: vec![1, 2],
+            },
+            ..SearchQuery::default()
+        };
+        assert!(message_query_requires_sql_plan(&query));
+    }
+
+    #[test]
+    fn message_query_requires_sql_plan_for_recency_ranking() {
+        let query = SearchQuery {
+            text: "rollback".to_string(),
+            ranking: RankingMode::Recency,
+            ..SearchQuery::default()
+        };
+        assert!(message_query_requires_sql_plan(&query));
+    }
+
+    #[test]
+    fn message_query_requires_sql_plan_for_non_exact_importance_filters() {
+        let high_only = SearchQuery {
+            text: "rollback".to_string(),
+            importance: vec![Importance::High],
+            ..SearchQuery::default()
+        };
+        assert!(message_query_requires_sql_plan(&high_only));
+
+        let high_or_urgent = SearchQuery {
+            importance: vec![Importance::High, Importance::Urgent],
+            ..high_only
+        };
+        assert!(!message_query_requires_sql_plan(&high_or_urgent));
+
+        let mixed_non_adjacent = SearchQuery {
+            text: "rollback".to_string(),
+            importance: vec![Importance::High, Importance::Low],
+            ..SearchQuery::default()
+        };
+        assert!(message_query_requires_sql_plan(&mixed_non_adjacent));
     }
 
     #[test]
@@ -5466,6 +5560,7 @@ mod tests {
             ..SearchQuery::messages("rollback", 1)
         };
         assert!(!message_query_uses_sql_plan(&query));
+        assert!(!message_query_requires_sql_plan(&query));
     }
 
     #[test]
