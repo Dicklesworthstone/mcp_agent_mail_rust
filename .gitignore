@@ -171,6 +171,11 @@ legacy/
 **/.fastembed_cache/
 **/archived_mailbox_states/
 
+# Raw refactor-loop command transcripts. Keep summarized ledgers in Git instead.
+refactor/artifacts/**/tests_before.txt
+refactor/artifacts/**/tests_after.txt
+refactor/artifacts/**/test_output*.txt
+
 # Generated graph output
 --graph-root.svg
 --graph-format.svg
