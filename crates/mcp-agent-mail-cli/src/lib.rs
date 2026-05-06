@@ -12208,6 +12208,15 @@ enum UpdateCheckResult {
 
 /// Cache file path for update check results.
 fn update_check_cache_path() -> PathBuf {
+    if let Some(cache_home) = mcp_agent_mail_core::config::process_env_value("XDG_CACHE_HOME")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        return PathBuf::from(cache_home)
+            .join("mcp-agent-mail")
+            .join("update-check.json");
+    }
+
     let cache_dir = mcp_agent_mail_core::config::process_env_value("HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
@@ -56156,6 +56165,46 @@ fn update_check_cache_ignores_symlinked_cache_file() {
             assert!(
                 read_update_cache().is_none(),
                 "update cache reads must ignore symlinked cache files"
+            );
+        },
+    );
+}
+
+#[test]
+fn update_check_cache_prefers_xdg_cache_home_over_home() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    let cache_home = temp.path().join("xdg-cache");
+    let home_text = home.to_string_lossy().to_string();
+    let cache_home_text = cache_home.to_string_lossy().to_string();
+
+    mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+        &[
+            ("HOME", home_text.as_str()),
+            ("XDG_CACHE_HOME", cache_home_text.as_str()),
+        ],
+        || {
+            let cache_path = update_check_cache_path();
+            assert_eq!(
+                cache_path,
+                cache_home.join("mcp-agent-mail").join("update-check.json")
+            );
+
+            write_update_cache(&UpdateCheckResult::UpToDate {
+                current: env!("CARGO_PKG_VERSION").to_string(),
+            });
+
+            assert!(
+                cache_path.is_file(),
+                "self-update cache should be written under XDG_CACHE_HOME"
+            );
+            assert!(
+                !home
+                    .join(".cache")
+                    .join("mcp-agent-mail")
+                    .join("update-check.json")
+                    .exists(),
+                "self-update cache should not fall back to HOME when XDG_CACHE_HOME is set"
             );
         },
     );
