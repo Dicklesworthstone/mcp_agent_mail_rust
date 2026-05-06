@@ -463,6 +463,7 @@ Agent Mail supports both stdio and HTTP transports:
 
 - **stdio**: Run `mcp-agent-mail` as a subprocess (the default for most MCP clients)
 - **HTTP**: Connect to `http://127.0.0.1:8765/mcp/` when the server is running via `am` or `mcp-agent-mail serve`
+- **Examples**: Token-free client templates live under `docs/examples/mcp/`
 
 ---
 

@@ -37,6 +37,7 @@ agent-mail-*.pid
 .agent-mail.yaml
 .agent-mail-project-id
 *.mcp.json
+/*.mcp.json.template
 *.mcp.json.*.bak
 opencode.json
 .opencode.json.*.bak
