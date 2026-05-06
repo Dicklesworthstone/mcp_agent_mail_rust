@@ -4092,11 +4092,29 @@ fn sqlite_canonical_incremental_check_is_ok(
     sqlite_pragma_check_is_ok_canonical(conn, integrity::CheckKind::Incremental)
 }
 
+/// Size of a SQLite WAL file header, in bytes.
+///
+/// A WAL file at or below this size contains no committed frames. Removing it
+/// cannot discard durable data because the smallest possible frame adds a
+/// 24-byte frame header plus at least one SQLite page.
+pub const SQLITE_WAL_HEADER_BYTES: u64 = 32;
+
+#[must_use]
+pub const fn sqlite_wal_has_committed_frames(wal_len: u64) -> bool {
+    wal_len > SQLITE_WAL_HEADER_BYTES
+}
+
+#[must_use]
+pub const fn sqlite_wal_is_header_only_or_truncated(wal_len: u64) -> bool {
+    !sqlite_wal_has_committed_frames(wal_len)
+}
+
 /// Remove corrupt or truncated WAL/SHM sidecars that cause "WAL file too
 /// small for header" errors during SQLite open.
 ///
 /// The SQLite WAL header is 32 bytes.  Any WAL file shorter than that is
-/// pathological and cannot be used.  A truncated WAL can be left behind when:
+/// pathological and cannot be used; a header-only WAL has no committed frame
+/// data and is equally safe to remove.  A truncated WAL can be left behind when:
 /// - A crash occurs during the `DELETE` -> `WAL` journal mode transition
 /// - A `PRAGMA journal_size_limit` triggers truncation racing with a reader
 /// - The process is killed between WAL creation and first header write
@@ -4105,14 +4123,19 @@ fn sqlite_canonical_incremental_check_is_ok(
 /// Removing a sub-header WAL is always safe because SQLite recreates the WAL
 /// on the next write.  We also remove SHM files whose companion WAL was
 /// removed, since the SHM is meaningless without a WAL.
-fn cleanup_empty_wal_sidecar(sqlite_path: &str) {
-    /// Size of a SQLite WAL file that contains only the 32-byte header and no
-    /// committed frames. Anything `<=` this is safe to delete: SQLite will
-    /// recreate the WAL on the next write, and no durable frame data exists
-    /// that could be lost. Frames are 24-byte header + page_size bytes, so
-    /// the smallest valid frame is well above 32 bytes (min page size = 512).
-    const WAL_HEADER_BYTES: u64 = 32;
+///
+/// Public alias for [`cleanup_empty_wal_sidecar`] so callers outside this crate
+/// (e.g. CLI startup self-heal) can run the same WAL cleanup _before_ opening
+/// any connection.  Issue #119: if a force-killed daemon left a header-only
+/// (<=32-byte) WAL sidecar, opening the DB to run orphan-recipient repair fails
+/// with "WAL file too small for header during rebuild".  This entry point lets
+/// the doctor self-heal cleanup truncated WALs first so subsequent open and
+/// integrity probes do not wedge.  Idempotent and safe to call repeatedly.
+pub fn cleanup_truncated_wal_sidecar(sqlite_path: &Path) {
+    cleanup_empty_wal_sidecar(sqlite_path.to_string_lossy().as_ref());
+}
 
+fn cleanup_empty_wal_sidecar(sqlite_path: &str) {
     let db_path = Path::new(sqlite_path);
     if !db_path.exists() {
         return;
@@ -4131,11 +4154,11 @@ fn cleanup_empty_wal_sidecar(sqlite_path: &str) {
             // tripping "WAL file too small for header during rebuild" on
             // checkpoint, which the verdict engine used to escalate to
             // Broken/corrupt. Cleaning it up here prevents that cycle.
-            Ok(meta) if meta.len() <= WAL_HEADER_BYTES => {
+            Ok(meta) if sqlite_wal_is_header_only_or_truncated(meta.len()) => {
                 tracing::warn!(
                     path = %wal_path.display(),
                     size = meta.len(),
-                    "removing header-only/truncated WAL sidecar (<={WAL_HEADER_BYTES} bytes; prevents 'WAL file too small for header' errors)"
+                    "removing header-only/truncated WAL sidecar (<={SQLITE_WAL_HEADER_BYTES} bytes; prevents 'WAL file too small for header' errors)"
                 );
                 let _ = std::fs::remove_file(&wal_path);
                 wal_removed = true;
@@ -11120,6 +11143,19 @@ mod tests {
     fn recovery_error_detects_wal_file_too_small() {
         assert!(is_sqlite_recovery_error_message(
             "WAL file too small for header during rebuild: read 0, need 32"
+        ));
+    }
+
+    #[test]
+    fn sqlite_wal_frame_boundary_treats_header_only_as_no_committed_frames() {
+        assert!(sqlite_wal_is_header_only_or_truncated(0));
+        assert!(sqlite_wal_is_header_only_or_truncated(
+            SQLITE_WAL_HEADER_BYTES
+        ));
+        assert!(!sqlite_wal_has_committed_frames(SQLITE_WAL_HEADER_BYTES));
+        assert!(sqlite_wal_has_committed_frames(SQLITE_WAL_HEADER_BYTES + 1));
+        assert!(!sqlite_wal_is_header_only_or_truncated(
+            SQLITE_WAL_HEADER_BYTES + 1
         ));
     }
 

@@ -3016,17 +3016,23 @@ fn cleanup_stale_db_artifacts(db_path: &Path) -> CliResult<()> {
     }
 
     // Remove truncated/corrupt WAL and orphaned SHM sidecars.
-    const WAL_HEADER_BYTES: u64 = 32;
+    //
+    // Issue #119: A 32-byte (header-only) WAL file is just as fatal as a
+    // 0-byte truncated WAL. Use the database-layer predicate so startup,
+    // doctor, and pool recovery cannot drift on the frame-data boundary.
     let wal_path = sqlite_sidecar_path(db_path, "-wal");
     let mut wal_removed = false;
 
     if let Ok(meta) = std::fs::metadata(&wal_path) {
-        if meta.len() < WAL_HEADER_BYTES {
-            // Truncated WAL — definitely corrupt, just remove.
+        if mcp_agent_mail_db::pool::sqlite_wal_is_header_only_or_truncated(meta.len()) {
+            // Header-only or truncated WAL: by definition no committed
+            // frames, so removing it is non-destructive. SQLite recreates the
+            // WAL on the next write.
             eprintln!(
-                "[info] Removing truncated WAL file {} ({} bytes)",
+                "[info] Removing header-only/truncated WAL file {} ({} bytes; <= {} byte WAL header)",
                 wal_path.display(),
-                meta.len()
+                meta.len(),
+                mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES
             );
             std::fs::remove_file(&wal_path).map_err(|e| {
                 CliError::Other(format!(
@@ -18204,6 +18210,14 @@ fn doctor_database_fix_strategy(
             ))
         });
     }
+
+    // Issue #119: Run truncated-WAL self-heal BEFORE any open or integrity
+    // probe.  A header-only or 0-byte WAL sidecar (left by a force-killed
+    // daemon) makes every subsequent SQLite open trip "WAL file too small for
+    // header during rebuild", including the orphan-recipient probe further
+    // down this function.  The cleanup is idempotent and non-destructive: a
+    // <=32-byte WAL contains no committed frames by definition.
+    mcp_agent_mail_db::pool::cleanup_truncated_wal_sidecar(resolved);
 
     match sqlite_doctor_file_sanity(&resolved_path) {
         Ok((false, detail, _, _)) => {
@@ -33888,6 +33902,42 @@ startup_timeout_sec = 42
         );
     }
 
+    #[test]
+    fn doctor_database_fix_strategy_cleans_header_only_wal_before_open_probe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("header-only-wal.sqlite3");
+        seed_project_only_db(&db_path, "header-only-wal", "/header-only-wal");
+        mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&db_path)
+            .expect("checkpoint seeded db before adding header-only wal");
+
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        std::fs::write(
+            &wal_path,
+            vec![0_u8; mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize],
+        )
+        .expect("write header-only wal");
+        std::fs::write(&shm_path, b"stale-shm").expect("write stale shm");
+
+        let db_url = format!("sqlite:///{}", db_path.display());
+        let strategy = doctor_database_fix_strategy(&db_url, dir.path()).expect("strategy");
+
+        assert!(
+            matches!(strategy, DoctorDatabaseFixStrategy::None(_)),
+            "header-only WAL cleanup should avoid false repair/reconstruct strategy: {strategy:?}"
+        );
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref())
+            .expect("open db after doctor strategy");
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS count FROM projects", &[])
+            .expect("query db after doctor strategy");
+        assert_eq!(
+            rows[0].get_named::<i64>("count").expect("project count"),
+            1,
+            "doctor strategy should preserve the healthy main database"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn doctor_database_fix_strategy_ignores_symlinked_archive_projects_dir() {
@@ -44182,6 +44232,32 @@ startup_timeout_sec = 42
         assert!(
             wal_path.exists(),
             "blocking wal directory should remain in place after failure"
+        );
+    }
+
+    #[test]
+    fn cleanup_stale_db_artifacts_removes_header_only_wal_and_orphaned_shm() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("cleanup-header-only-wal.sqlite3");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+
+        std::fs::write(
+            &wal_path,
+            vec![0_u8; mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize],
+        )
+        .expect("write header-only wal");
+        std::fs::write(&shm_path, b"stale-shm").expect("write stale shm");
+
+        cleanup_stale_db_artifacts(&db_path).expect("cleanup header-only wal");
+
+        assert!(
+            !wal_path.exists(),
+            "header-only WAL should be removed before startup/doctor SQLite opens"
+        );
+        assert!(
+            !shm_path.exists(),
+            "SHM should be removed when its header-only WAL companion is removed"
         );
     }
 
@@ -56155,6 +56231,56 @@ fn validate_tar_archive_verbose_listing_rejects_links_and_special_files() {
             "unexpected validation error for {line:?}: {err}"
         );
     }
+}
+
+#[cfg(all(test, unix))]
+fn create_test_tar_xz(staging_dir: &Path, archive_path: &Path, entries: &[&str]) {
+    let status = std::process::Command::new("tar")
+        .arg("-cJf")
+        .arg(archive_path)
+        .arg("-C")
+        .arg(staging_dir)
+        .args(entries)
+        .status()
+        .expect("tar should be available for Unix self-update archives");
+    assert!(status.success(), "test tar archive creation failed");
+}
+
+#[cfg(unix)]
+#[test]
+fn validate_tar_xz_archive_paths_accepts_dist_release_layout() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let staging = tmp.path().join("staging");
+    std::fs::create_dir_all(&staging).expect("create staging dir");
+    std::fs::write(staging.join("am"), b"am").expect("write am");
+    std::fs::write(staging.join("mcp-agent-mail"), b"server").expect("write server");
+
+    let archive = tmp.path().join("mcp-agent-mail-test.tar.xz");
+    create_test_tar_xz(&staging, &archive, &["mcp-agent-mail", "am"]);
+
+    validate_tar_xz_archive_paths(&archive)
+        .expect("dist release tarball layout should pass archive preflight");
+}
+
+#[cfg(unix)]
+#[test]
+fn validate_tar_xz_archive_paths_rejects_actual_symlink_member() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let staging = tmp.path().join("staging");
+    std::fs::create_dir_all(&staging).expect("create staging dir");
+    symlink("/tmp/am-outside", staging.join("am")).expect("create symlink");
+
+    let archive = tmp.path().join("mcp-agent-mail-symlink.tar.xz");
+    create_test_tar_xz(&staging, &archive, &["am"]);
+
+    let err = validate_tar_xz_archive_paths(&archive)
+        .expect_err("archive preflight should reject real symlink members");
+    assert!(
+        err.contains("unsupported member type"),
+        "unexpected validation error: {err}"
+    );
 }
 
 #[test]

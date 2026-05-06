@@ -4211,6 +4211,51 @@ mod tests {
     }
 
     #[test]
+    fn probe_integrity_removes_header_only_wal_before_pool_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("header_only_wal.db");
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        drop(conn);
+        mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(&db_path)
+            .expect("checkpoint seeded db before adding header-only wal");
+
+        let wal_path = db_path.with_file_name("header_only_wal.db-wal");
+        let shm_path = db_path.with_file_name("header_only_wal.db-shm");
+        std::fs::write(
+            &wal_path,
+            vec![0_u8; mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize],
+        )
+        .expect("write header-only wal");
+        std::fs::write(&shm_path, b"stale-shm").expect("write stale shm");
+
+        let mut config = default_config();
+        config.database_url = format!("sqlite:///{}", db_path.display());
+        config.storage_root = dir.path().join("storage");
+
+        let result = probe_integrity(&config);
+        assert!(
+            matches!(result, ProbeResult::Ok { .. }),
+            "startup integrity should clean header-only WAL and continue: {result:?}"
+        );
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.to_string_lossy().as_ref()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = 'projects'",
+                &[],
+            )
+            .expect("query db after startup integrity");
+        assert_eq!(
+            rows[0].get_named::<i64>("count").expect("table count"),
+            1,
+            "startup integrity should preserve the healthy main database"
+        );
+    }
+
+    #[test]
     fn probe_integrity_reports_busy_when_mailbox_activity_lock_is_held() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("busy.db");
