@@ -4394,16 +4394,120 @@ fn setup_self_heal_cache_path(config: &Config, project_dir: &Path) -> PathBuf {
 }
 
 fn read_cache_file_if_real(path: &Path) -> Option<String> {
+    read_cache_file_if_real_inner(path).ok()
+}
+
+#[cfg(unix)]
+fn read_cache_file_if_real_inner(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
     if !path_is_real_file(path) {
-        return None;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("cache path {} is not a file", path.display()),
+        ));
     }
-    std::fs::read_to_string(path).ok()
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK | nix::libc::O_NOFOLLOW)
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("cache path {} is not a file", path.display()),
+        ));
+    }
+
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
+}
+
+#[cfg(not(unix))]
+fn read_cache_file_if_real_inner(path: &Path) -> std::io::Result<String> {
+    if !path_is_real_file(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("cache path {} is not a file", path.display()),
+        ));
+    }
+    std::fs::read_to_string(path)
 }
 
 fn write_cache_file_if_safe(path: &Path, content: &str, label: &str) {
-    if ensure_real_file_target_path(path, label).is_ok() {
-        let _ = std::fs::write(path, content);
+    let _ = write_cache_file_atomically_if_safe(path, content.as_bytes(), label);
+}
+
+#[cfg(unix)]
+fn cache_new_file_options() -> std::fs::OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_NOFOLLOW);
+    options
+}
+
+#[cfg(not(unix))]
+fn cache_new_file_options() -> std::fs::OpenOptions {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    options
+}
+
+fn create_unique_cache_file(
+    parent: &Path,
+    file_name: &OsStr,
+    label: &str,
+) -> CliResult<(PathBuf, std::fs::File)> {
+    let pid = std::process::id();
+    let now = chrono::Utc::now().timestamp_micros();
+    for attempt in 0..1024 {
+        let mut candidate_name = OsString::from(".");
+        candidate_name.push(file_name);
+        candidate_name.push(format!(".{pid}.{now}.{attempt}.tmp"));
+        let candidate = parent.join(candidate_name);
+        match cache_new_file_options().open(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(CliError::Io(err)),
+        }
     }
+
+    Err(CliError::Other(format!(
+        "could not create unique temporary {label} next to {}",
+        parent.display()
+    )))
+}
+
+fn write_cache_file_atomically_if_safe(path: &Path, content: &[u8], label: &str) -> CliResult<()> {
+    use std::io::Write;
+
+    ensure_real_file_target_path(path, label)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| CliError::Other(format!("{label} {} must name a file", path.display())))?;
+
+    let (temp, mut file) = create_unique_cache_file(parent, file_name, label)?;
+    file.write_all(content)?;
+    file.sync_all()?;
+    drop(file);
+
+    ensure_real_file_target_path(path, label)?;
+    std::fs::rename(&temp, path).map_err(|err| {
+        CliError::Other(format!(
+            "could not atomically replace {label} {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(())
 }
 
 fn read_setup_self_heal_cache(config: &Config, project_dir: &Path) -> Option<SetupSelfHealCache> {
@@ -12087,8 +12191,9 @@ enum UpdateCheckResult {
 
 /// Cache file path for update check results.
 fn update_check_cache_path() -> PathBuf {
-    let cache_dir = std::env::var_os("HOME")
+    let cache_dir = mcp_agent_mail_core::config::process_env_value("HOME")
         .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".cache/mcp-agent-mail");
     cache_dir.join("update-check.json")
@@ -26495,6 +26600,46 @@ http_headers = { Authorization = "Bearer secret" }
         assert!(
             read_setup_self_heal_cache(&config, &project_dir).is_none(),
             "setup self-heal cache reads must ignore symlinked cache files"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_self_heal_cache_replaces_hard_link_without_mutating_linked_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            storage_root: temp.path().join("storage"),
+            ..Config::default()
+        };
+        let project_dir = temp.path().join("project");
+        let cache_path = setup_self_heal_cache_path(&config, &project_dir);
+        let outside = temp.path().join("outside-cache-target.json");
+        let cache = SetupSelfHealCache {
+            schema_version: SETUP_SELF_HEAL_CACHE_VERSION,
+            project_dir: project_dir.display().to_string(),
+            server_url: "http://127.0.0.1:8765/mcp/".to_string(),
+            token_fingerprint: token_fingerprint("secret"),
+            target_agents: vec!["codex".to_string()],
+            skip_user_config: false,
+            skip_hooks: false,
+            file_fingerprints: Vec::new(),
+        };
+
+        std::fs::create_dir_all(cache_path.parent().expect("cache parent"))
+            .expect("create cache parent");
+        std::fs::write(&outside, "outside").expect("write outside target");
+        std::fs::hard_link(&outside, &cache_path).expect("hard-link cache file");
+
+        write_setup_self_heal_cache(&config, &project_dir, &cache);
+
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("read outside target"),
+            "outside",
+            "setup self-heal cache writes must replace cache paths, not mutate linked files"
+        );
+        assert!(
+            read_setup_self_heal_cache(&config, &project_dir).is_some(),
+            "setup self-heal cache should still be readable after replacing a hard-linked path"
         );
     }
 
