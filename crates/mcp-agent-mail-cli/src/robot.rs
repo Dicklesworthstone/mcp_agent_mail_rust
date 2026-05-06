@@ -5714,14 +5714,12 @@ fn fetch_robot_agent_ack_stats(
     if agent_ids_sql.is_empty() {
         return HashMap::new();
     }
-    let ack_threshold_micros = 30 * 60 * 1_000_000_i64;
+    let ack_threshold_micros = u64::try_from(30 * MICROS_PER_MINUTE).unwrap_or(u64::MAX);
     let sql = format!(
         "SELECT \
             mr.agent_id AS agent_id, \
-            CASE WHEN mr.ack_ts > 0 THEN (mr.ack_ts - m.created_ts) ELSE NULL END AS ack_latency_micros, \
-            CASE WHEN mr.ack_ts > 0 AND (mr.ack_ts - m.created_ts) <= {ack_threshold_micros} THEN 1 ELSE 0 END AS ack_on_time, \
-            CASE WHEN mr.ack_ts > 0 AND (mr.ack_ts - m.created_ts) > {ack_threshold_micros} THEN 1 ELSE 0 END AS ack_late, \
-            CASE WHEN COALESCE(mr.ack_ts, 0) <= 0 THEN 1 ELSE 0 END AS ack_pending \
+            m.created_ts AS created_ts, \
+            mr.ack_ts AS ack_ts \
          FROM message_recipients mr \
          JOIN messages m ON m.id = mr.message_id \
          WHERE mr.agent_id IN ({agent_ids_sql}) \
@@ -5740,14 +5738,22 @@ fn fetch_robot_agent_ack_stats(
         for row in rows {
             let agent_id = row.get_named::<i64>("agent_id").unwrap_or(0);
             let entry = stats.entry(agent_id).or_default();
-            entry.on_time_count += row.get_named::<i64>("ack_on_time").unwrap_or(0).max(0) as u64;
-            entry.late_count += row.get_named::<i64>("ack_late").unwrap_or(0).max(0) as u64;
-            entry.pending_count += row.get_named::<i64>("ack_pending").unwrap_or(0).max(0) as u64;
-            if let Some(latency) = row.get_named::<i64>("ack_latency_micros").ok()
-                && latency > 0
-            {
-                latencies.entry(agent_id).or_default().push(latency as u64);
+            let Some(ack_ts) = row.get_named::<i64>("ack_ts").ok().filter(|ts| *ts > 0) else {
+                entry.pending_count = entry.pending_count.saturating_add(1);
+                continue;
+            };
+            let created_ts = row.get_named::<i64>("created_ts").unwrap_or(0);
+            if ack_ts < created_ts {
+                entry.late_count = entry.late_count.saturating_add(1);
+                continue;
             }
+            let latency = u64::try_from(ack_ts.saturating_sub(created_ts)).unwrap_or(u64::MAX);
+            if latency <= ack_threshold_micros {
+                entry.on_time_count = entry.on_time_count.saturating_add(1);
+            } else {
+                entry.late_count = entry.late_count.saturating_add(1);
+            }
+            latencies.entry(agent_id).or_default().push(latency);
         }
         for (agent_id, mut values) in latencies {
             if let Some(entry) = stats.get_mut(&agent_id) {
@@ -13223,6 +13229,72 @@ mod tests {
             .find(|metric| metric.label == "Response time")
             .expect("response time metric present");
         assert_eq!(response_time.evidence, "p50 ack latency 30m");
+    }
+
+    #[test]
+    fn fetch_robot_agent_ack_stats_rejects_impossible_and_keeps_zero_latency_ack() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_ack_health_timestamps.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+        let now_us = mcp_agent_mail_db::now_micros();
+        let created_immediate = micros_ago(now_us, 10 * MICROS_PER_MINUTE);
+        let created_impossible = micros_ago(now_us, 9 * MICROS_PER_MINUTE);
+        let ack_before_created = micros_ago(created_impossible, MICROS_PER_MINUTE);
+        let created_pending = micros_ago(now_us, 8 * MICROS_PER_MINUTE);
+
+        conn.query_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                created_ts INTEGER NOT NULL,
+                ack_required INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create messages");
+        conn.query_sync(
+            "CREATE TABLE message_recipients (
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                ack_ts INTEGER
+            )",
+            &empty,
+        )
+        .expect("create recipients");
+        conn.query_sync(
+            "INSERT INTO messages (id, project_id, created_ts, ack_required) VALUES
+                (1, 1, ?, 1),
+                (2, 1, ?, 1),
+                (3, 1, ?, 1)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_immediate),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_impossible),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_pending),
+            ],
+        )
+        .expect("insert messages");
+        conn.query_sync(
+            "INSERT INTO message_recipients (message_id, agent_id, ack_ts) VALUES
+                (1, 1, ?),
+                (2, 1, ?),
+                (3, 1, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(created_immediate),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(ack_before_created),
+            ],
+        )
+        .expect("insert recipients");
+
+        let stats =
+            fetch_robot_agent_ack_stats(&conn, 1, "1", micros_ago(now_us, 30 * MICROS_PER_DAY));
+        let entry = stats.get(&1).expect("agent stats present");
+
+        assert_eq!(entry.on_time_count, 1);
+        assert_eq!(entry.late_count, 1);
+        assert_eq!(entry.pending_count, 1);
+        assert_eq!(entry.p50_latency_micros, Some(0));
     }
 
     #[test]
