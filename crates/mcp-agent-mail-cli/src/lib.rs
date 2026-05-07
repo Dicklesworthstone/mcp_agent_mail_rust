@@ -3030,96 +3030,222 @@ fn cleanup_stale_db_artifacts(db_path: &Path) -> CliResult<()> {
         }
     }
 
-    // Remove truncated/corrupt WAL and orphaned SHM sidecars.
+    // Detach truncated/corrupt WAL and orphaned SHM sidecars from the live DB.
     //
     // Issue #119: A 32-byte (header-only) WAL file is just as fatal as a
     // 0-byte truncated WAL. Use the database-layer predicate so startup,
     // doctor, and pool recovery cannot drift on the frame-data boundary.
     let wal_path = sqlite_sidecar_path(db_path, "-wal");
-    let mut wal_removed = false;
+    let mut wal_detached = false;
 
     if let Ok(meta) = std::fs::metadata(&wal_path) {
         if mcp_agent_mail_db::pool::sqlite_wal_is_header_only_or_truncated(meta.len()) {
             // Header-only or truncated WAL: by definition no committed
-            // frames, so removing it is non-destructive. SQLite recreates the
-            // WAL on the next write.
+            // frames, so detaching it from the live DB is non-destructive.
+            // Quarantine it instead of deleting it so recovery remains
+            // forensics-first.
+            let quarantined =
+                quarantine_startup_sqlite_sidecar(&wal_path, "header-only/truncated WAL")?;
             eprintln!(
-                "[info] Removing header-only/truncated WAL file {} ({} bytes; <= {} byte WAL header)",
+                "[info] Quarantined header-only/truncated WAL file {} to {} ({} bytes; <= {} byte WAL header)",
                 wal_path.display(),
+                quarantined.display(),
                 meta.len(),
                 mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES
             );
-            std::fs::remove_file(&wal_path).map_err(|e| {
-                CliError::Other(format!(
-                    "failed to remove truncated WAL sidecar {}: {e}",
-                    wal_path.display()
-                ))
-            })?;
-            wal_removed = true;
+            wal_detached = true;
         } else if meta.len() > 0 {
             // Non-empty WAL exists.  If no process holds the DB file open, try
             // to checkpoint it into the main file.  If that fails (snapshot
-            // conflict, corruption, etc.), remove the WAL so startup can proceed
-            // with the main file alone.  The Git archive is the real source of
-            // truth; losing uncommitted WAL data is acceptable for startup
-            // resilience.
+            // conflict, corruption, etc.), quarantine the WAL so startup can
+            // proceed with the main file alone without destroying the artifact.
             let holders = mcp_agent_mail_server::startup_checks::pids_holding_file(db_path);
             if holders.is_empty() {
+                let pre_checkpoint_wal =
+                    copy_startup_sqlite_sidecar_snapshot(&wal_path, "pre-checkpoint WAL")?;
+                let shm_path = sqlite_sidecar_path(db_path, "-shm");
+                let pre_checkpoint_shm =
+                    copy_startup_sqlite_sidecar_snapshot(&shm_path, "pre-checkpoint SHM")?;
                 // No process holds the file — try a TRUNCATE checkpoint
                 // to merge the WAL into the main file and clear it.
                 let checkpoint_ok =
                     mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(db_path).is_ok();
                 if checkpoint_ok {
+                    cleanup_startup_sqlite_sidecar_snapshot(pre_checkpoint_wal);
+                    cleanup_startup_sqlite_sidecar_snapshot(pre_checkpoint_shm);
                     eprintln!(
                         "[info] Checkpointed stale WAL file {} ({} bytes)",
                         wal_path.display(),
                         meta.len()
                     );
-                    // Also remove the SHM after a successful checkpoint —
+                    // Also detach the SHM after a successful checkpoint —
                     // SQLite recreates it on next open, and a stale SHM can
                     // confuse FrankenSQLite.
-                    let shm_path = sqlite_sidecar_path(db_path, "-shm");
                     if shm_path.exists() {
-                        std::fs::remove_file(&shm_path).map_err(|e| {
-                            CliError::Other(format!(
-                                "failed to remove checkpointed SHM sidecar {}: {e}",
-                                shm_path.display()
-                            ))
-                        })?;
+                        let quarantined =
+                            quarantine_startup_sqlite_sidecar(&shm_path, "checkpointed SHM")?;
+                        eprintln!(
+                            "[info] Quarantined checkpointed SHM file {} to {}",
+                            shm_path.display(),
+                            quarantined.display()
+                        );
                     }
                 } else {
-                    // Checkpoint failed — remove the WAL to unblock startup.
-                    eprintln!(
-                        "[info] Removing stale WAL file {} ({} bytes; checkpoint failed)",
-                        wal_path.display(),
-                        meta.len()
-                    );
-                    std::fs::remove_file(&wal_path).map_err(|e| {
-                        CliError::Other(format!(
-                            "failed to remove stale WAL sidecar {} after checkpoint failure: {e}",
+                    // Checkpoint failed — quarantine the WAL to unblock startup
+                    // while preserving the failed state for later inspection.
+                    if let Some(quarantined) =
+                        quarantine_startup_sqlite_sidecar_if_exists(&wal_path, "stale WAL")?
+                    {
+                        eprintln!(
+                            "[info] Quarantined stale WAL file {} to {} ({} bytes; checkpoint failed)",
+                            wal_path.display(),
+                            quarantined.display(),
+                            meta.len(),
+                        );
+                    } else if let Some(snapshot) = pre_checkpoint_wal {
+                        eprintln!(
+                            "[info] WAL file {} disappeared during failed checkpoint; preserved pre-checkpoint snapshot {} ({} bytes)",
+                            wal_path.display(),
+                            snapshot.display(),
+                            meta.len(),
+                        );
+                    } else {
+                        eprintln!(
+                            "[info] WAL file {} disappeared during failed checkpoint before quarantine",
                             wal_path.display()
-                        ))
-                    })?;
-                    wal_removed = true;
+                        );
+                    }
+                    if let Some(snapshot) = pre_checkpoint_shm {
+                        eprintln!(
+                            "[info] Preserved pre-checkpoint SHM snapshot {} while detaching failed-checkpoint WAL",
+                            snapshot.display()
+                        );
+                    }
+                    wal_detached = true;
                 }
             }
         }
     }
 
-    if wal_removed {
+    if wal_detached {
         let shm_path = sqlite_sidecar_path(db_path, "-shm");
         if shm_path.exists() {
-            eprintln!("[info] Removing orphaned SHM file {}", shm_path.display());
-            std::fs::remove_file(&shm_path).map_err(|e| {
-                CliError::Other(format!(
-                    "failed to remove orphaned SHM sidecar {}: {e}",
-                    shm_path.display()
-                ))
-            })?;
+            let quarantined = quarantine_startup_sqlite_sidecar(&shm_path, "orphaned SHM")?;
+            eprintln!(
+                "[info] Quarantined orphaned SHM file {} to {}",
+                shm_path.display(),
+                quarantined.display()
+            );
         }
     }
 
     Ok(())
+}
+
+fn next_startup_sqlite_sidecar_artifact_path(
+    sidecar_path: &Path,
+    label: &str,
+    timestamp: &str,
+) -> PathBuf {
+    let mut candidate = path_with_file_name_suffix(
+        sidecar_path,
+        &format!(".{label}-{timestamp}"),
+        &format!("sqlite-sidecar.{label}-{timestamp}"),
+    );
+    let mut suffix = 1_u32;
+    while candidate.exists() {
+        candidate = path_with_file_name_suffix(
+            sidecar_path,
+            &format!(".{label}-{timestamp}-{suffix:02}"),
+            &format!("sqlite-sidecar.{label}-{timestamp}-{suffix:02}"),
+        );
+        suffix = suffix.saturating_add(1);
+    }
+    candidate
+}
+
+fn next_startup_sqlite_sidecar_quarantine_path(sidecar_path: &Path, timestamp: &str) -> PathBuf {
+    next_startup_sqlite_sidecar_artifact_path(sidecar_path, "startup-quarantine", timestamp)
+}
+
+fn next_startup_sqlite_sidecar_snapshot_path(sidecar_path: &Path, timestamp: &str) -> PathBuf {
+    next_startup_sqlite_sidecar_artifact_path(sidecar_path, "startup-precheckpoint", timestamp)
+}
+
+fn quarantine_startup_sqlite_sidecar_if_exists(
+    sidecar_path: &Path,
+    context: &str,
+) -> CliResult<Option<PathBuf>> {
+    match std::fs::symlink_metadata(sidecar_path) {
+        Ok(_) => {}
+        Err(e) => {
+            if matches!(e.kind(), std::io::ErrorKind::NotFound) {
+                return Ok(None);
+            }
+            return Err(CliError::Io(e));
+        }
+    }
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let quarantined = next_startup_sqlite_sidecar_quarantine_path(sidecar_path, &timestamp);
+    match std::fs::rename(sidecar_path, &quarantined) {
+        Ok(()) => Ok(Some(quarantined)),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound) => Ok(None),
+        Err(e) => Err(CliError::Other(format!(
+            "failed to quarantine {context} sidecar {} to {}: {e}",
+            sidecar_path.display(),
+            quarantined.display()
+        ))),
+    }
+}
+
+fn quarantine_startup_sqlite_sidecar(sidecar_path: &Path, context: &str) -> CliResult<PathBuf> {
+    quarantine_startup_sqlite_sidecar_if_exists(sidecar_path, context)?.ok_or_else(|| {
+        CliError::Other(format!(
+            "failed to quarantine {context} sidecar {}: sidecar disappeared before quarantine",
+            sidecar_path.display()
+        ))
+    })
+}
+
+fn copy_startup_sqlite_sidecar_snapshot(
+    sidecar_path: &Path,
+    context: &str,
+) -> CliResult<Option<PathBuf>> {
+    let metadata = match std::fs::symlink_metadata(sidecar_path) {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            if matches!(e.kind(), std::io::ErrorKind::NotFound) {
+                return Ok(None);
+            }
+            return Err(CliError::Io(e));
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return Ok(None);
+    }
+
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
+    let snapshot = next_startup_sqlite_sidecar_snapshot_path(sidecar_path, &timestamp);
+    std::fs::copy(sidecar_path, &snapshot).map_err(|e| {
+        CliError::Other(format!(
+            "failed to snapshot {context} sidecar {} to {}: {e}",
+            sidecar_path.display(),
+            snapshot.display()
+        ))
+    })?;
+    Ok(Some(snapshot))
+}
+
+fn cleanup_startup_sqlite_sidecar_snapshot(snapshot: Option<PathBuf>) {
+    if let Some(snapshot) = snapshot
+        && let Err(error) = std::fs::remove_file(&snapshot)
+    {
+        tracing::debug!(
+            path = %snapshot.display(),
+            error = %error,
+            "failed to remove successful-startup sqlite sidecar snapshot"
+        );
+    }
 }
 
 /// If an Agent Mail server is already listening on `host:port`, stop it so we can start fresh.
@@ -44458,29 +44584,38 @@ startup_timeout_sec = 42
     }
 
     #[test]
-    fn cleanup_stale_db_artifacts_fails_closed_when_stale_wal_cannot_be_removed() {
+    fn cleanup_stale_db_artifacts_quarantines_non_file_wal_sidecar() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("cleanup-stale-wal.sqlite3");
         let wal_path = sqlite_sidecar_path(&db_path, "-wal");
 
         std::fs::create_dir(&wal_path).expect("create blocking wal directory");
 
-        let err = cleanup_stale_db_artifacts(&db_path)
-            .expect_err("cleanup should fail closed when stale wal removal is blocked");
-        let msg = err.to_string();
+        cleanup_stale_db_artifacts(&db_path).expect("cleanup should quarantine malformed wal");
         assert!(
-            msg.contains("failed to remove stale WAL sidecar")
-                || msg.contains("failed to remove truncated WAL sidecar"),
-            "unexpected error: {msg}"
+            !wal_path.exists(),
+            "blocking wal directory should move out of the active SQLite path"
         );
+        let quarantined_wal = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("cleanup-stale-wal.sqlite3-wal.startup-quarantine-")
+                    })
+            })
+            .expect("quarantined wal directory");
         assert!(
-            wal_path.exists(),
-            "blocking wal directory should remain in place after failure"
+            quarantined_wal.is_dir(),
+            "non-file WAL sidecar should be preserved under startup quarantine"
         );
     }
 
     #[test]
-    fn cleanup_stale_db_artifacts_removes_header_only_wal_and_orphaned_shm() {
+    fn cleanup_stale_db_artifacts_quarantines_header_only_wal_and_orphaned_shm() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("cleanup-header-only-wal.sqlite3");
         let wal_path = sqlite_sidecar_path(&db_path, "-wal");
@@ -44497,16 +44632,96 @@ startup_timeout_sec = 42
 
         assert!(
             !wal_path.exists(),
-            "header-only WAL should be removed before startup/doctor SQLite opens"
+            "header-only WAL should move out of the active SQLite path before startup"
         );
         assert!(
             !shm_path.exists(),
-            "SHM should be removed when its header-only WAL companion is removed"
+            "SHM should move out of the active SQLite path with its WAL companion"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("read dir")
+                .flatten()
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("cleanup-header-only-wal.sqlite3-wal.startup-quarantine-")),
+            "header-only WAL should be preserved under startup quarantine"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("read dir")
+                .flatten()
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("cleanup-header-only-wal.sqlite3-shm.startup-quarantine-")),
+            "orphaned SHM should be preserved under startup quarantine"
         );
     }
 
     #[test]
-    fn cleanup_stale_db_artifacts_fails_closed_when_orphaned_shm_cannot_be_removed() {
+    fn cleanup_stale_db_artifacts_quarantines_nonempty_wal_when_checkpoint_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("cleanup-failed-checkpoint.sqlite3");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let shm_path = sqlite_sidecar_path(&db_path, "-shm");
+        let wal_bytes = vec![0xA5; mcp_agent_mail_db::pool::SQLITE_WAL_HEADER_BYTES as usize + 64];
+
+        std::fs::write(&db_path, b"not-a-sqlite-db").expect("write malformed db");
+        std::fs::write(&wal_path, &wal_bytes).expect("write nonempty wal");
+        std::fs::write(&shm_path, b"stale-shm").expect("write stale shm");
+
+        cleanup_stale_db_artifacts(&db_path).expect("cleanup failed checkpoint wal");
+
+        assert!(
+            db_path.exists(),
+            "cleanup should not mutate the main DB file"
+        );
+        assert!(
+            !wal_path.exists(),
+            "failed-checkpoint WAL should move out of the active SQLite path"
+        );
+        assert!(
+            !shm_path.exists(),
+            "SHM should move out of the active SQLite path with failed-checkpoint WAL"
+        );
+        let snapshot_wal = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with(
+                            "cleanup-failed-checkpoint.sqlite3-wal.startup-precheckpoint-",
+                        )
+                    })
+            })
+            .expect("pre-checkpoint failed-checkpoint wal snapshot");
+        assert_eq!(
+            std::fs::read(snapshot_wal).expect("read pre-checkpoint wal snapshot"),
+            wal_bytes,
+            "failed-checkpoint WAL bytes should be preserved for forensics"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("read dir")
+                .flatten()
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("cleanup-failed-checkpoint.sqlite3-shm.startup-quarantine-")
+                    || entry.file_name().to_string_lossy().starts_with(
+                        "cleanup-failed-checkpoint.sqlite3-shm.startup-precheckpoint-",
+                    )),
+            "failed-checkpoint SHM should be preserved under startup quarantine or pre-checkpoint snapshot"
+        );
+    }
+
+    #[test]
+    fn cleanup_stale_db_artifacts_quarantines_non_file_orphaned_shm() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("cleanup-orphaned-shm.sqlite3");
         let wal_path = sqlite_sidecar_path(&db_path, "-wal");
@@ -44515,20 +44730,25 @@ startup_timeout_sec = 42
         std::fs::write(&wal_path, b"tiny-wal").expect("write truncated wal file");
         std::fs::create_dir(&shm_path).expect("create blocking shm directory");
 
-        let err = cleanup_stale_db_artifacts(&db_path)
-            .expect_err("cleanup should fail closed when orphaned shm removal is blocked");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("failed to remove orphaned SHM sidecar"),
-            "unexpected error: {msg}"
-        );
+        cleanup_stale_db_artifacts(&db_path).expect("cleanup should quarantine orphaned shm");
         assert!(
             !wal_path.exists(),
-            "truncated wal should be removed before failing"
+            "truncated WAL should move out of the active SQLite path"
         );
         assert!(
-            shm_path.exists(),
-            "blocking shm directory should remain in place after failure"
+            !shm_path.exists(),
+            "blocking SHM directory should move out of the active SQLite path"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("read dir")
+                .flatten()
+                .any(|entry| entry.path().is_dir()
+                    && entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("cleanup-orphaned-shm.sqlite3-shm.startup-quarantine-")),
+            "non-file SHM sidecar should be preserved under startup quarantine"
         );
     }
 
