@@ -292,7 +292,7 @@ impl RecoveryAction {
                 "Only removes locks whose owning PID no longer exists; idempotent"
             }
             Self::EmptyWalSidecarCleanup => {
-                "Only removes zero-byte WAL files that prevent clean open; idempotent"
+                "Quarantines zero-byte or header-only WAL files that prevent clean open; idempotent"
             }
             Self::ConnectionPoolRefresh => {
                 "Closes stale file descriptors and opens fresh connections; no data mutation"
@@ -4158,7 +4158,8 @@ fn sqlite_cleanup_quarantine_path(sidecar_path: &Path, nonce: &str) -> PathBuf {
 }
 
 fn cleanup_quarantine_nonce(nonce: &mut Option<String>) -> &str {
-    nonce.get_or_insert_with(sqlite_sidecar_cleanup_nonce)
+    nonce
+        .get_or_insert_with(sqlite_sidecar_cleanup_nonce)
         .as_str()
 }
 
@@ -4234,19 +4235,13 @@ fn cleanup_empty_wal_sidecar(sqlite_path: &str) {
         shm_os.push("-shm");
         let shm_path = PathBuf::from(shm_os);
         match std::fs::symlink_metadata(&shm_path) {
-            Ok(meta)
-                if wal_quarantined || (meta.file_type().is_file() && meta.len() == 0) =>
-            {
+            Ok(meta) if wal_quarantined || (meta.file_type().is_file() && meta.len() == 0) => {
                 let reason = if wal_quarantined {
                     "companion WAL quarantined"
                 } else {
                     "empty SHM sidecar"
                 };
-                let _ = quarantine_sqlite_cleanup_sidecar(
-                    &shm_path,
-                    &mut quarantine_nonce,
-                    reason,
-                );
+                let _ = quarantine_sqlite_cleanup_sidecar(&shm_path, &mut quarantine_nonce, reason);
             }
             _ => {}
         }
@@ -4582,13 +4577,14 @@ fn refuse_auto_recovery_with_live_sidecars(primary_path: &Path) -> Result<(), Sq
     }
 }
 
-/// Try to open/checkpoint the database and remove sidecar files.
+/// Try to open/checkpoint the database and quarantine residual sidecar files.
 #[allow(clippy::result_large_err)]
 fn try_checkpoint_and_clear_sidecars(primary_path: &Path) -> Result<(), SqlError> {
     wal_checkpoint_truncate_path(primary_path)
         .map_err(|e| SqlError::Custom(format!("checkpoint: {e}")))?;
-    // Remove any residual sidecars left after the successful checkpoint.
-    remove_sqlite_sidecars(primary_path);
+    // Move any residual sidecars left after the successful checkpoint out of
+    // the live DB family while keeping them available for post-mortem review.
+    quarantine_sqlite_sidecars_after_checkpoint(primary_path)?;
     if sqlite_file_has_live_sidecars(primary_path) {
         return Err(SqlError::Custom(format!(
             "checkpoint completed for {} but non-empty rollback-journal/WAL/SHM sidecars remain",
@@ -4598,20 +4594,34 @@ fn try_checkpoint_and_clear_sidecars(primary_path: &Path) -> Result<(), SqlError
     Ok(())
 }
 
-/// Remove rollback-journal, WAL, and SHM sidecar files if they exist.
-fn remove_sqlite_sidecars(primary_path: &Path) {
+#[allow(clippy::result_large_err)]
+fn quarantine_sqlite_sidecars_after_checkpoint(primary_path: &Path) -> Result<(), SqlError> {
+    let mut quarantine_nonce = None;
     for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
         let sidecar_path = sqlite_path_with_suffix(primary_path, suffix);
-        if sidecar_path.exists()
-            && let Err(e) = std::fs::remove_file(&sidecar_path)
-        {
-            tracing::warn!(
-                path = %sidecar_path.display(),
-                error = %e,
-                "failed to remove sqlite sidecar"
-            );
+        match std::fs::symlink_metadata(&sidecar_path) {
+            Ok(_) => {
+                if !quarantine_sqlite_cleanup_sidecar(
+                    &sidecar_path,
+                    &mut quarantine_nonce,
+                    "residual sidecar after successful checkpoint",
+                ) {
+                    return Err(SqlError::Custom(format!(
+                        "failed to quarantine residual sqlite sidecar {} after checkpoint",
+                        sidecar_path.display()
+                    )));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(SqlError::Custom(format!(
+                    "failed to inspect residual sqlite sidecar {} after checkpoint: {e}",
+                    sidecar_path.display()
+                )));
+            }
         }
     }
+    Ok(())
 }
 
 #[must_use]
@@ -9332,9 +9342,9 @@ mod tests {
 
     #[test]
     fn ensure_sqlite_file_healthy_clears_stale_sidecars_and_recovers() {
-        // Stale sidecars from a crash should be cleaned up automatically.
-        // The checkpoint will fail (corrupt primary) but remove_sqlite_sidecars
-        // should delete the fake sidecar files, allowing recovery to proceed.
+        // Stale sidecars from a crash should be cleaned up automatically. The
+        // fake WAL is sub-header, so cleanup quarantines it before the corrupt
+        // primary reaches the standard recovery path.
         let dir = tempfile::tempdir().expect("tempdir");
         let primary = dir.path().join("storage.sqlite3");
         let wal = dir.path().join("storage.sqlite3-wal");
@@ -11282,7 +11292,9 @@ mod tests {
             "empty WAL should be preserved as a cleanup quarantine artifact"
         );
         assert_eq!(
-            std::fs::metadata(&quarantines[0]).expect("quarantined WAL metadata").len(),
+            std::fs::metadata(&quarantines[0])
+                .expect("quarantined WAL metadata")
+                .len(),
             0
         );
     }
@@ -11359,6 +11371,47 @@ mod tests {
         assert_eq!(
             std::fs::read(&shm_quarantines[0]).expect("read quarantined SHM"),
             b"stale-shm"
+        );
+    }
+
+    #[test]
+    fn checkpoint_sidecar_cleanup_quarantines_residual_artifacts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("checkpoint_sidecars.db");
+        std::fs::write(&primary, b"not-used-by-helper").expect("write primary");
+        let journal = dir.path().join("checkpoint_sidecars.db-journal");
+        let wal = dir.path().join("checkpoint_sidecars.db-wal");
+        let shm = dir.path().join("checkpoint_sidecars.db-shm");
+        std::fs::write(&journal, b"journal").expect("write journal");
+        std::fs::write(&wal, [0xAA; 64]).expect("write wal");
+        std::fs::write(&shm, b"shm").expect("write shm");
+
+        quarantine_sqlite_sidecars_after_checkpoint(&primary).expect("quarantine sidecars");
+
+        assert!(
+            !journal.exists(),
+            "residual journal should move out of the live DB family"
+        );
+        assert!(
+            !wal.exists(),
+            "residual WAL should move out of the live DB family"
+        );
+        assert!(
+            !shm.exists(),
+            "residual SHM should move out of the live DB family"
+        );
+
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "checkpoint_sidecars.db-journal").len(),
+            1
+        );
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "checkpoint_sidecars.db-wal").len(),
+            1
+        );
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "checkpoint_sidecars.db-shm").len(),
+            1
         );
     }
 
