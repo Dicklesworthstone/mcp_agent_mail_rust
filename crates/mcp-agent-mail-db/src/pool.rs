@@ -6088,38 +6088,62 @@ fn reconstruct_sqlite_file_with_archive_salvage_inner(
 /// this window, a successful prior reconstruct is returned verbatim.
 const RECONSTRUCT_COALESCE_WINDOW: Duration = Duration::from_secs(10);
 
-static RECENT_RECONSTRUCT_CACHE: OnceLock<
-    Mutex<HashMap<PathBuf, (Instant, crate::reconstruct::ReconstructStats)>>,
-> = OnceLock::new();
+#[derive(Clone)]
+struct RecentReconstructEntry {
+    completed_at: Instant,
+    archive_inventory: crate::reconstruct::ArchiveMessageInventory,
+    stats: crate::reconstruct::ReconstructStats,
+}
 
-fn recent_reconstruct_cache()
--> &'static Mutex<HashMap<PathBuf, (Instant, crate::reconstruct::ReconstructStats)>> {
+static RECENT_RECONSTRUCT_CACHE: OnceLock<Mutex<HashMap<PathBuf, RecentReconstructEntry>>> =
+    OnceLock::new();
+
+fn recent_reconstruct_cache() -> &'static Mutex<HashMap<PathBuf, RecentReconstructEntry>> {
     RECENT_RECONSTRUCT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn recent_reconstruct_lookup(
     primary_path: &Path,
+    archive_inventory: &crate::reconstruct::ArchiveMessageInventory,
     now: Instant,
 ) -> Option<(Duration, crate::reconstruct::ReconstructStats)> {
     let mut cache = recent_reconstruct_cache()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    cache.retain(|_, (t, _)| now.saturating_duration_since(*t) <= RECONSTRUCT_COALESCE_WINDOW);
+    cache.retain(|_, entry| {
+        now.saturating_duration_since(entry.completed_at) <= RECONSTRUCT_COALESCE_WINDOW
+    });
     cache
         .get(primary_path)
-        .map(|(t, stats)| (now.saturating_duration_since(*t), stats.clone()))
+        .filter(|entry| entry.archive_inventory == *archive_inventory)
+        .map(|entry| {
+            (
+                now.saturating_duration_since(entry.completed_at),
+                entry.stats.clone(),
+            )
+        })
 }
 
 fn recent_reconstruct_store(
     primary_path: &Path,
     now: Instant,
+    archive_inventory: &crate::reconstruct::ArchiveMessageInventory,
     stats: &crate::reconstruct::ReconstructStats,
 ) {
     let mut cache = recent_reconstruct_cache()
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    cache.retain(|_, (t, _)| now.saturating_duration_since(*t) <= RECONSTRUCT_COALESCE_WINDOW);
-    cache.insert(primary_path.to_path_buf(), (now, stats.clone()));
+    cache.retain(|_, entry| {
+        now.saturating_duration_since(entry.completed_at) <= RECONSTRUCT_COALESCE_WINDOW
+    });
+    cache.insert(
+        primary_path.to_path_buf(),
+        RecentReconstructEntry {
+            completed_at: now,
+            archive_inventory: archive_inventory.clone(),
+            stats: stats.clone(),
+        },
+    );
 }
 
 /// Clear the coalescing cache. Intended for tests only — production code
@@ -6159,6 +6183,31 @@ fn validate_archive_salvage_storage_root(
 }
 
 #[allow(clippy::result_large_err)]
+fn reconstruct_sqlite_file_with_archive_salvage_uncached(
+    primary_path: &Path,
+    storage_root: &Path,
+) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
+    let result = with_recovery_admission(primary_path, "archive salvage reconstruction", || {
+        reconstruct_sqlite_file_with_archive_salvage_inner(primary_path, storage_root, true)
+    });
+    if let Ok(stats) = &result {
+        let completed_archive_inventory =
+            crate::reconstruct::scan_archive_message_inventory(storage_root);
+        // Store the *completion* timestamp, not the entry timestamp. A
+        // reconstruct can take seconds (or longer on larger archives), and
+        // if we reused the caller's entry time here the effective coalesce
+        // window would shrink by that duration.
+        recent_reconstruct_store(
+            primary_path,
+            Instant::now(),
+            &completed_archive_inventory,
+            stats,
+        );
+    }
+    result
+}
+
+#[allow(clippy::result_large_err)]
 pub fn reconstruct_sqlite_file_with_archive_salvage(
     primary_path: &Path,
     storage_root: &Path,
@@ -6166,7 +6215,34 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
     validate_archive_salvage_storage_root(primary_path, storage_root)?;
 
     let lookup_at = Instant::now();
-    if let Some((age, stats)) = recent_reconstruct_lookup(primary_path, lookup_at) {
+    let lookup_archive_inventory = crate::reconstruct::scan_archive_message_inventory(storage_root);
+    if let Some((age, stats)) =
+        recent_reconstruct_lookup(primary_path, &lookup_archive_inventory, lookup_at)
+    {
+        match sqlite_file_is_healthy(primary_path) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    path = %primary_path.display(),
+                    "archive salvage reconstruction cache hit ignored because the live sqlite file is not healthy"
+                );
+                return reconstruct_sqlite_file_with_archive_salvage_uncached(
+                    primary_path,
+                    storage_root,
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %primary_path.display(),
+                    error = %error,
+                    "archive salvage reconstruction cache hit ignored because live sqlite health could not be verified"
+                );
+                return reconstruct_sqlite_file_with_archive_salvage_uncached(
+                    primary_path,
+                    storage_root,
+                );
+            }
+        }
         // age is capped at RECONSTRUCT_COALESCE_WINDOW, so u64 always fits,
         // but express the saturation explicitly to satisfy the lint.
         let age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX);
@@ -6180,19 +6256,7 @@ pub fn reconstruct_sqlite_file_with_archive_salvage(
         return Ok(stats);
     }
 
-    let result = with_recovery_admission(primary_path, "archive salvage reconstruction", || {
-        reconstruct_sqlite_file_with_archive_salvage_inner(primary_path, storage_root, true)
-    });
-    if let Ok(stats) = &result {
-        // Store the *completion* timestamp, not the entry timestamp. A
-        // reconstruct can take seconds (or longer on larger archives), and
-        // if we reused `lookup_at` here the effective coalesce window
-        // would shrink by that duration — worst case to zero, silently
-        // defeating the coalesce for exactly the workloads it most needs
-        // to protect (slow recoveries where duplicate work is expensive).
-        recent_reconstruct_store(primary_path, Instant::now(), stats);
-    }
-    result
+    reconstruct_sqlite_file_with_archive_salvage_uncached(primary_path, storage_root)
 }
 
 #[allow(clippy::result_large_err)]
@@ -7054,6 +7118,21 @@ mod tests {
         paths
     }
 
+    fn reconstruct_cache_inventory(
+        projects: usize,
+        agents: usize,
+        messages: usize,
+        latest_message_id: Option<i64>,
+    ) -> crate::reconstruct::ArchiveMessageInventory {
+        crate::reconstruct::ArchiveMessageInventory {
+            projects,
+            agents,
+            unique_message_ids: messages,
+            latest_message_id,
+            ..crate::reconstruct::ArchiveMessageInventory::default()
+        }
+    }
+
     #[test]
     fn recent_reconstruct_cache_returns_fresh_entry_within_window() {
         // Regression for #105: back-to-back reconstructs with identical
@@ -7064,13 +7143,14 @@ mod tests {
         let mut stats = crate::reconstruct::ReconstructStats::default();
         stats.projects = 10;
         stats.messages = 342;
+        let inventory = reconstruct_cache_inventory(10, 21, 342, Some(342));
 
         let stored_at = Instant::now();
-        recent_reconstruct_store(&path, stored_at, &stats);
+        recent_reconstruct_store(&path, stored_at, &inventory, &stats);
 
         // Lookup 10ms later — within the coalesce window.
         let lookup_at = stored_at + Duration::from_millis(10);
-        let hit = recent_reconstruct_lookup(&path, lookup_at)
+        let hit = recent_reconstruct_lookup(&path, &inventory, lookup_at)
             .expect("reconstruct cache must return the stored entry within the window");
         assert_eq!(hit.1.projects, 10);
         assert_eq!(hit.1.messages, 342);
@@ -7086,13 +7166,14 @@ mod tests {
         reset_recent_reconstruct_cache_for_test();
         let path = PathBuf::from("/tmp/agent-mail-coalesce-window-2.db");
         let stats = crate::reconstruct::ReconstructStats::default();
+        let inventory = crate::reconstruct::ArchiveMessageInventory::default();
 
         let stored_at = Instant::now();
-        recent_reconstruct_store(&path, stored_at, &stats);
+        recent_reconstruct_store(&path, stored_at, &inventory, &stats);
 
         let beyond = stored_at + RECONSTRUCT_COALESCE_WINDOW + Duration::from_millis(1);
         assert!(
-            recent_reconstruct_lookup(&path, beyond).is_none(),
+            recent_reconstruct_lookup(&path, &inventory, beyond).is_none(),
             "cache entries must be invisible past the coalesce window"
         );
         reset_recent_reconstruct_cache_for_test();
@@ -7119,6 +7200,7 @@ mod tests {
         reset_recent_reconstruct_cache_for_test();
         let path = PathBuf::from("/tmp/agent-mail-coalesce-completion-time.db");
         let stats = crate::reconstruct::ReconstructStats::default();
+        let inventory = crate::reconstruct::ArchiveMessageInventory::default();
 
         let simulated_entry_time = Instant::now();
         let simulated_slow_reconstruct = RECONSTRUCT_COALESCE_WINDOW + Duration::from_secs(5);
@@ -7127,9 +7209,9 @@ mod tests {
         // If we (incorrectly) stored the *entry* time and then a sibling
         // caller arrives right after completion, the lookup age would
         // exceed the window and miss. Assert that shape first.
-        recent_reconstruct_store(&path, simulated_entry_time, &stats);
+        recent_reconstruct_store(&path, simulated_entry_time, &inventory, &stats);
         assert!(
-            recent_reconstruct_lookup(&path, simulated_completion_time).is_none(),
+            recent_reconstruct_lookup(&path, &inventory, simulated_completion_time).is_none(),
             "using entry-time as the stored timestamp defeats coalescing for slow reconstructs — \
              the wrapper must pass completion time instead"
         );
@@ -7138,10 +7220,10 @@ mod tests {
         // and assert a sibling caller arriving immediately after is
         // coalesced.
         reset_recent_reconstruct_cache_for_test();
-        recent_reconstruct_store(&path, simulated_completion_time, &stats);
+        recent_reconstruct_store(&path, simulated_completion_time, &inventory, &stats);
         let sibling_arrival = simulated_completion_time + Duration::from_millis(10);
         assert!(
-            recent_reconstruct_lookup(&path, sibling_arrival).is_some(),
+            recent_reconstruct_lookup(&path, &inventory, sibling_arrival).is_some(),
             "completion-time storage must let an immediate-follow-up caller coalesce"
         );
         reset_recent_reconstruct_cache_for_test();
@@ -7153,13 +7235,36 @@ mod tests {
         let path_a = PathBuf::from("/tmp/agent-mail-coalesce-path-a.db");
         let path_b = PathBuf::from("/tmp/agent-mail-coalesce-path-b.db");
         let stats_a = crate::reconstruct::ReconstructStats::default();
+        let inventory = crate::reconstruct::ArchiveMessageInventory::default();
         let now = Instant::now();
-        recent_reconstruct_store(&path_a, now, &stats_a);
+        recent_reconstruct_store(&path_a, now, &inventory, &stats_a);
 
-        assert!(recent_reconstruct_lookup(&path_a, now).is_some());
+        assert!(recent_reconstruct_lookup(&path_a, &inventory, now).is_some());
         assert!(
-            recent_reconstruct_lookup(&path_b, now).is_none(),
+            recent_reconstruct_lookup(&path_b, &inventory, now).is_none(),
             "cache must not coalesce across distinct primary paths — each DB is independent"
+        );
+        reset_recent_reconstruct_cache_for_test();
+    }
+
+    #[test]
+    fn recent_reconstruct_cache_is_keyed_by_archive_inventory() {
+        reset_recent_reconstruct_cache_for_test();
+        let path = PathBuf::from("/tmp/agent-mail-coalesce-archive-inventory.db");
+        let stats = crate::reconstruct::ReconstructStats::default();
+        let original_inventory = reconstruct_cache_inventory(1, 1, 1, Some(1));
+        let advanced_inventory = reconstruct_cache_inventory(1, 1, 2, Some(2));
+        let now = Instant::now();
+
+        recent_reconstruct_store(&path, now, &original_inventory, &stats);
+
+        assert!(
+            recent_reconstruct_lookup(&path, &original_inventory, now).is_some(),
+            "same archive inventory should coalesce"
+        );
+        assert!(
+            recent_reconstruct_lookup(&path, &advanced_inventory, now).is_none(),
+            "archive changes must force a fresh reconstruction instead of reusing stale stats"
         );
         reset_recent_reconstruct_cache_for_test();
     }
@@ -10187,6 +10292,36 @@ mod tests {
     }
 
     #[test]
+    fn reconstruct_cache_hit_does_not_skip_missing_primary_activation() {
+        reset_recent_reconstruct_cache_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+        let proj_dir = storage_root.join("projects").join("project-only");
+        std::fs::create_dir_all(&proj_dir).unwrap();
+        std::fs::write(
+            proj_dir.join("project.json"),
+            r#"{"slug":"project-only","human_key":"/project-only"}"#,
+        )
+        .unwrap();
+
+        let inventory = crate::reconstruct::scan_archive_message_inventory(&storage_root);
+        let mut stats = crate::reconstruct::ReconstructStats::default();
+        stats.projects = 1;
+        recent_reconstruct_store(&primary, Instant::now(), &inventory, &stats);
+
+        let rebuilt_stats =
+            reconstruct_sqlite_file_with_archive_salvage(&primary, &storage_root).unwrap();
+
+        assert!(
+            primary.exists(),
+            "a cache hit must not report success while leaving a missing live sqlite file absent"
+        );
+        assert_eq!(rebuilt_stats.projects, 1);
+        reset_recent_reconstruct_cache_for_test();
+    }
+
+    #[test]
     fn reconcile_archive_state_before_init_ignores_unrelated_default_archive_overlap() {
         let dir = tempfile::tempdir().unwrap();
         let xdg_data_root = dir.path().join("xdg-data");
@@ -10295,6 +10430,71 @@ mod tests {
         let row = rows.first().unwrap();
         assert_eq!(row.get_named::<i64>("count").unwrap_or(0), 2);
         assert_eq!(row.get_named::<i64>("max_id").unwrap_or(0), 2);
+    }
+
+    #[test]
+    fn reconcile_archive_state_before_init_rebuilds_again_when_archive_advances_inside_cache_window()
+     {
+        reset_recent_reconstruct_cache_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let storage_root = dir.path().join("storage");
+
+        let proj_dir = storage_root.join("projects").join("ahead-project");
+        let agent_dir = proj_dir.join("agents").join("Alice");
+        let msg_dir = proj_dir.join("messages").join("2026").join("03");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&msg_dir).unwrap();
+        std::fs::write(
+            proj_dir.join("project.json"),
+            r#"{"slug":"ahead-project","human_key":"/ahead-project"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("profile.json"),
+            r#"{"name":"Alice","program":"coder","model":"test","inception_ts":"2026-03-22T00:00:00Z","last_active_ts":"2026-03-22T00:00:01Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-00-00Z__first__1.md"),
+            "---json\n{\"id\":1,\"from\":\"Alice\",\"to\":[\"Bob\"],\"subject\":\"First\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:00:00Z\",\"attachments\":[]}\n---\n\nfirst body\n",
+        )
+        .unwrap();
+
+        crate::reconstruct::reconstruct_from_archive(&primary, &storage_root)
+            .expect("seed stale sqlite db from archive");
+
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-05-00Z__second__2.md"),
+            "---json\n{\"id\":2,\"from\":\"Alice\",\"to\":[\"Carol\"],\"subject\":\"Second\",\"importance\":\"urgent\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:05:00Z\",\"attachments\":[]}\n---\n\nsecond body\n",
+        )
+        .unwrap();
+        assert!(
+            reconcile_archive_state_before_init(&primary, &storage_root).unwrap(),
+            "first archive-ahead pass should rebuild and populate the recent reconstruct cache"
+        );
+
+        std::fs::write(
+            msg_dir.join("2026-03-22T12-10-00Z__third__3.md"),
+            "---json\n{\"id\":3,\"from\":\"Alice\",\"to\":[\"Dana\"],\"subject\":\"Third\",\"importance\":\"normal\",\"ack_required\":false,\"created_ts\":\"2026-03-22T12:10:00Z\",\"attachments\":[]}\n---\n\nthird body\n",
+        )
+        .unwrap();
+        assert!(
+            reconcile_archive_state_before_init(&primary, &storage_root).unwrap(),
+            "a fresh archive change inside the coalesce window must force a second rebuild"
+        );
+
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        let rows = conn
+            .query_sync(
+                "SELECT COUNT(*) AS count, COALESCE(MAX(id), 0) AS max_id FROM messages",
+                &[],
+            )
+            .unwrap();
+        let row = rows.first().unwrap();
+        assert_eq!(row.get_named::<i64>("count").unwrap_or(0), 3);
+        assert_eq!(row.get_named::<i64>("max_id").unwrap_or(0), 3);
+        reset_recent_reconstruct_cache_for_test();
     }
 
     #[test]
