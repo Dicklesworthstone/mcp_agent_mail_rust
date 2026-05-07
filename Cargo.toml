@@ -156,8 +156,10 @@ strip = "symbols"        # Remove debug symbols from production binary
 inherits = "release"     # Benchmarks use same optimizations as release
 
 [patch.crates-io]
-# asupersync + franken-* are pulled from crates.io v0.3.0 directly —
-# no sibling path patch needed.
+# Keep asupersync unified with the sibling frankensearch checkout. Its workspace
+# dependency is currently a path dependency on ../asupersync, so resolving our
+# direct crates.io dependency from the registry would split Cx/Outcome types.
+asupersync = { path = "../asupersync" }
 #
 # fastmcp-rust is temporarily force-patched to the sibling checkout
 # until its own v0.3 release propagates to crates.io. The currently
@@ -215,6 +217,3 @@ ftui-style = { path = "../frankentui/crates/ftui-style" }
 ftui-text = { path = "../frankentui/crates/ftui-text" }
 ftui-backend = { path = "../frankentui/crates/ftui-backend" }
 ftui-i18n = { path = "../frankentui/crates/ftui-i18n" }
-
-# asupersync git-pin redirect removed — frankensearch's v0.3.0 release should
-# also reference crates.io asupersync so Cx types unify without a patch block.
