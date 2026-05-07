@@ -12076,6 +12076,22 @@ fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> PathBuf {
 
 const SQLITE_RECOVERY_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
 
+fn remove_sqlite_artifact_file_if_exists(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn cleanup_sqlite_artifact_family(path: &Path) -> std::io::Result<()> {
+    remove_sqlite_artifact_file_if_exists(path)?;
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+        remove_sqlite_artifact_file_if_exists(&sqlite_sidecar_path(path, suffix))?;
+    }
+    Ok(())
+}
+
 fn sqlite_checkpoint_truncate(db_path: &Path) -> CliResult<()> {
     mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(db_path)
         .map_err(|e| CliError::Other(format!("WAL checkpoint failed before backup: {e}")))?;
@@ -36778,6 +36794,24 @@ startup_timeout_sec = 42
     }
 
     #[test]
+    fn cleanup_sqlite_artifact_family_removes_main_file_and_sidecars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snapshot_path = tmp.path().join("_snapshot.sqlite3");
+        std::fs::write(&snapshot_path, b"snapshot").unwrap();
+        for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+            std::fs::write(sqlite_sidecar_path(&snapshot_path, suffix), b"sidecar").unwrap();
+        }
+
+        cleanup_sqlite_artifact_family(&snapshot_path).expect("cleanup snapshot family");
+        cleanup_sqlite_artifact_family(&snapshot_path).expect("cleanup should be idempotent");
+
+        assert!(!snapshot_path.exists());
+        for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+            assert!(!sqlite_sidecar_path(&snapshot_path, suffix).exists());
+        }
+    }
+
+    #[test]
     fn doctor_backups_inventory_accepts_legacy_and_created_backup_names() {
         assert!(is_doctor_backup_inventory_file_name(OsStr::new(
             "pre_repair_20260101_120000.sqlite3"
@@ -49000,11 +49034,7 @@ fn run_share_export(params: ShareExportParams) -> CliResult<()> {
             if self.cleaned {
                 return Ok(());
             }
-            match std::fs::remove_file(&self.path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err),
-            }
+            cleanup_sqlite_artifact_family(&self.path)?;
             self.cleaned = true;
             Ok(())
         }
@@ -49331,7 +49361,7 @@ fn run_share_update(params: ShareUpdateParams) -> CliResult<()> {
     }
 
     // 10. Clean up snapshot
-    let _ = std::fs::remove_file(&snapshot_path);
+    let _ = cleanup_sqlite_artifact_family(&snapshot_path);
 
     ftui_runtime::ftui_println!(
         "Synchronizing updated bundle into: {}",
@@ -57735,6 +57765,12 @@ fn run_share_export_removes_snapshot_when_signing_fails() {
         !output.join("_snapshot.sqlite3").exists(),
         "snapshot should be removed after export failure"
     );
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+        assert!(
+            !sqlite_sidecar_path(&output.join("_snapshot.sqlite3"), suffix).exists(),
+            "snapshot sidecar {suffix} should be removed after export failure"
+        );
+    }
 }
 
 #[test]
