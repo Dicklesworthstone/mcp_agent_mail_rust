@@ -6146,11 +6146,8 @@ fn recent_reconstruct_store(
     );
 }
 
-/// Clear the coalescing cache. Intended for tests only — production code
-/// should never need to invalidate, because re-corruption after a
-/// successful reconstruct sets the verdict back to `broken` via a
-/// normally-occurring integrity check failure, and the next reconstruct
-/// call will land after the window expires naturally.
+/// Clear the coalescing cache. Intended for tests only — production lookup
+/// also gates every hit on matching archive inventory and a healthy live file.
 #[cfg(test)]
 pub(crate) fn reset_recent_reconstruct_cache_for_test() {
     recent_reconstruct_cache()
@@ -10433,8 +10430,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_archive_state_before_init_rebuilds_again_when_archive_advances_inside_cache_window()
-     {
+    fn archive_reconcile_rebuilds_again_when_archive_advances_inside_cache_window() {
         reset_recent_reconstruct_cache_for_test();
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
