@@ -4109,20 +4109,21 @@ pub const fn sqlite_wal_is_header_only_or_truncated(wal_len: u64) -> bool {
     !sqlite_wal_has_committed_frames(wal_len)
 }
 
-/// Remove corrupt or truncated WAL/SHM sidecars that cause "WAL file too
+/// Quarantine corrupt or truncated WAL/SHM sidecars that cause "WAL file too
 /// small for header" errors during SQLite open.
 ///
 /// The SQLite WAL header is 32 bytes.  Any WAL file shorter than that is
 /// pathological and cannot be used; a header-only WAL has no committed frame
-/// data and is equally safe to remove.  A truncated WAL can be left behind when:
+/// data and is equally safe to move out of the live DB family.  A truncated WAL
+/// can be left behind when:
 /// - A crash occurs during the `DELETE` -> `WAL` journal mode transition
 /// - A `PRAGMA journal_size_limit` triggers truncation racing with a reader
 /// - The process is killed between WAL creation and first header write
 /// - SIGKILL terminates a writer mid-checkpoint
 ///
-/// Removing a sub-header WAL is always safe because SQLite recreates the WAL
-/// on the next write.  We also remove SHM files whose companion WAL was
-/// removed, since the SHM is meaningless without a WAL.
+/// Moving a sub-header WAL aside is safe because SQLite recreates the WAL on
+/// the next write.  We also quarantine SHM artifacts whose companion WAL was
+/// moved, since the SHM is meaningless without a WAL.
 ///
 /// Public alias for [`cleanup_empty_wal_sidecar`] so callers outside this crate
 /// (e.g. CLI startup self-heal) can run the same WAL cleanup _before_ opening
@@ -4135,52 +4136,117 @@ pub fn cleanup_truncated_wal_sidecar(sqlite_path: &Path) {
     cleanup_empty_wal_sidecar(sqlite_path.to_string_lossy().as_ref());
 }
 
+fn sqlite_sidecar_cleanup_nonce() -> String {
+    let millis = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis());
+    format!("{}-{millis}", std::process::id())
+}
+
+fn sqlite_cleanup_quarantine_path(sidecar_path: &Path, nonce: &str) -> PathBuf {
+    let mut candidate_os = sidecar_path.as_os_str().to_os_string();
+    candidate_os.push(format!(".cleanup-quarantine-{nonce}"));
+    let mut candidate = PathBuf::from(candidate_os);
+    let mut suffix = 1_u32;
+    while candidate.exists() {
+        let mut candidate_os = sidecar_path.as_os_str().to_os_string();
+        candidate_os.push(format!(".cleanup-quarantine-{nonce}-{suffix:02}"));
+        candidate = PathBuf::from(candidate_os);
+        suffix = suffix.saturating_add(1);
+    }
+    candidate
+}
+
+fn cleanup_quarantine_nonce(nonce: &mut Option<String>) -> &str {
+    nonce.get_or_insert_with(sqlite_sidecar_cleanup_nonce)
+        .as_str()
+}
+
+fn quarantine_sqlite_cleanup_sidecar(
+    sidecar_path: &Path,
+    nonce: &mut Option<String>,
+    reason: &str,
+) -> bool {
+    let quarantine = sqlite_cleanup_quarantine_path(sidecar_path, cleanup_quarantine_nonce(nonce));
+    match std::fs::rename(sidecar_path, &quarantine) {
+        Ok(()) => {
+            tracing::warn!(
+                path = %sidecar_path.display(),
+                quarantine = %quarantine.display(),
+                reason,
+                "quarantined sqlite sidecar before opening database"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %sidecar_path.display(),
+                quarantine = %quarantine.display(),
+                reason,
+                error = %e,
+                "failed to quarantine sqlite sidecar before opening database"
+            );
+            false
+        }
+    }
+}
+
 fn cleanup_empty_wal_sidecar(sqlite_path: &str) {
     let db_path = Path::new(sqlite_path);
     if !db_path.exists() {
         return;
     }
 
-    let mut wal_removed = false;
+    let mut wal_quarantined = false;
+    let mut quarantine_nonce = None;
 
     // Check WAL first.
     {
         let mut wal_os = db_path.as_os_str().to_os_string();
         wal_os.push("-wal");
         let wal_path = PathBuf::from(wal_os);
-        match std::fs::metadata(&wal_path) {
-            // Remove WAL files that are header-only or smaller (<= 32 bytes).
+        match std::fs::symlink_metadata(&wal_path) {
+            // Quarantine WAL files that are header-only or smaller (<= 32
+            // bytes).
             // GH#99: a 32-byte header-only WAL (normal post-init state) was
             // tripping "WAL file too small for header during rebuild" on
             // checkpoint, which the verdict engine used to escalate to
-            // Broken/corrupt. Cleaning it up here prevents that cycle.
-            Ok(meta) if sqlite_wal_is_header_only_or_truncated(meta.len()) => {
-                tracing::warn!(
-                    path = %wal_path.display(),
-                    size = meta.len(),
-                    "removing header-only/truncated WAL sidecar (<={SQLITE_WAL_HEADER_BYTES} bytes; prevents 'WAL file too small for header' errors)"
+            // Broken/corrupt. Moving it out of the live DB family prevents
+            // that cycle without losing forensic evidence.
+            Ok(meta)
+                if meta.file_type().is_file()
+                    && sqlite_wal_is_header_only_or_truncated(meta.len()) =>
+            {
+                wal_quarantined = quarantine_sqlite_cleanup_sidecar(
+                    &wal_path,
+                    &mut quarantine_nonce,
+                    "header-only/truncated WAL sidecar",
                 );
-                let _ = std::fs::remove_file(&wal_path);
-                wal_removed = true;
             }
             _ => {}
         }
     }
 
-    // Remove SHM when it's empty OR when we just removed the WAL (the SHM
-    // is meaningless without a companion WAL).
+    // Quarantine SHM when it's empty OR when we just quarantined the WAL (the
+    // SHM is meaningless without a companion WAL).
     {
         let mut shm_os = db_path.as_os_str().to_os_string();
         shm_os.push("-shm");
         let shm_path = PathBuf::from(shm_os);
-        match std::fs::metadata(&shm_path) {
-            Ok(meta) if meta.len() == 0 || wal_removed => {
-                tracing::warn!(
-                    path = %shm_path.display(),
-                    reason = if wal_removed { "companion WAL removed" } else { "empty" },
-                    "removing orphaned SHM sidecar"
+        match std::fs::symlink_metadata(&shm_path) {
+            Ok(meta)
+                if wal_quarantined || (meta.file_type().is_file() && meta.len() == 0) =>
+            {
+                let reason = if wal_quarantined {
+                    "companion WAL quarantined"
+                } else {
+                    "empty SHM sidecar"
+                };
+                let _ = quarantine_sqlite_cleanup_sidecar(
+                    &shm_path,
+                    &mut quarantine_nonce,
+                    reason,
                 );
-                let _ = std::fs::remove_file(&shm_path);
             }
             _ => {}
         }
@@ -6925,6 +6991,22 @@ mod tests {
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
+
+    fn sqlite_cleanup_quarantines(dir: &Path, sidecar_file_name: &str) -> Vec<PathBuf> {
+        let prefix = format!("{sidecar_file_name}.cleanup-quarantine-");
+        let mut paths = std::fs::read_dir(dir)
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
 
     #[test]
     fn recent_reconstruct_cache_returns_fresh_entry_within_window() {
@@ -11172,7 +11254,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_empty_wal_sidecar_removes_zero_byte_wal() {
+    fn cleanup_empty_wal_sidecar_quarantines_zero_byte_wal() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("cleanup_test.db");
         // Create a real DB so the main file exists.
@@ -11189,7 +11271,20 @@ mod tests {
 
         cleanup_empty_wal_sidecar(db_path.to_str().unwrap());
 
-        assert!(!wal_path.exists(), "empty WAL should have been removed");
+        assert!(
+            !wal_path.exists(),
+            "empty WAL should move out of the live DB family"
+        );
+        let quarantines = sqlite_cleanup_quarantines(dir.path(), "cleanup_test.db-wal");
+        assert_eq!(
+            quarantines.len(),
+            1,
+            "empty WAL should be preserved as a cleanup quarantine artifact"
+        );
+        assert_eq!(
+            std::fs::metadata(&quarantines[0]).expect("quarantined WAL metadata").len(),
+            0
+        );
     }
 
     #[test]
@@ -11215,10 +11310,11 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_empty_wal_sidecar_removes_header_only_wal() {
+    fn cleanup_empty_wal_sidecar_quarantines_header_only_wal_and_companion_shm() {
         // GH#99: a 32-byte header-only WAL (normal post-init state) was
         // causing "WAL file too small for header during rebuild" on
-        // checkpoint. Cleaning it up here short-circuits that cycle.
+        // checkpoint. Moving it out of the live DB family short-circuits
+        // that cycle without destroying the evidence.
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("header_only_test.db");
         let conn = DbConn::open_file(db_path.to_str().unwrap()).expect("open");
@@ -11229,12 +11325,40 @@ mod tests {
         let wal_path = dir.path().join("header_only_test.db-wal");
         std::fs::write(&wal_path, [0x00; 32]).expect("create header-only wal");
         assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 32);
+        let shm_path = dir.path().join("header_only_test.db-shm");
+        std::fs::write(&shm_path, b"stale-shm").expect("create companion shm");
 
         cleanup_empty_wal_sidecar(db_path.to_str().unwrap());
 
         assert!(
             !wal_path.exists(),
-            "header-only (32-byte) WAL should be removed"
+            "header-only (32-byte) WAL should move out of the live DB family"
+        );
+        assert!(
+            !shm_path.exists(),
+            "companion SHM should move out of the live DB family with the WAL"
+        );
+
+        let wal_quarantines = sqlite_cleanup_quarantines(dir.path(), "header_only_test.db-wal");
+        assert_eq!(
+            wal_quarantines.len(),
+            1,
+            "header-only WAL should be preserved as a cleanup quarantine artifact"
+        );
+        assert_eq!(
+            std::fs::read(&wal_quarantines[0]).expect("read quarantined WAL"),
+            [0x00; 32]
+        );
+
+        let shm_quarantines = sqlite_cleanup_quarantines(dir.path(), "header_only_test.db-shm");
+        assert_eq!(
+            shm_quarantines.len(),
+            1,
+            "companion SHM should be preserved as a cleanup quarantine artifact"
+        );
+        assert_eq!(
+            std::fs::read(&shm_quarantines[0]).expect("read quarantined SHM"),
+            b"stale-shm"
         );
     }
 
@@ -11259,7 +11383,12 @@ mod tests {
         );
         assert!(
             !wal.exists(),
-            "empty wal stub should be removed instead of forcing backup/reinit recovery"
+            "empty wal stub should move out of the live DB family instead of forcing backup/reinit recovery"
+        );
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "zero-byte-wal.db-wal").len(),
+            1,
+            "automatic recovery should preserve the empty WAL as a quarantine artifact"
         );
     }
 
@@ -11291,7 +11420,12 @@ mod tests {
         );
         assert!(
             !wal.exists(),
-            "archive-aware recovery should remove empty wal stub instead of escalating"
+            "archive-aware recovery should move the empty wal stub out of the live DB family instead of escalating"
+        );
+        assert_eq!(
+            sqlite_cleanup_quarantines(dir.path(), "zero-byte-wal-archive.db-wal").len(),
+            1,
+            "archive-aware recovery should preserve the empty WAL as a quarantine artifact"
         );
     }
 
