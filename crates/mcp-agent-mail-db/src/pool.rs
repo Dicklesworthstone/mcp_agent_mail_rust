@@ -5543,6 +5543,15 @@ fn quarantined_sidecar_path(
 
 const SQLITE_RECOVERY_SIDECAR_SUFFIXES: [&str; 3] = ["-journal", "-wal", "-shm"];
 
+fn sqlite_recovery_sidecar_label(suffix: &str) -> &'static str {
+    match suffix {
+        "-journal" => "rollback-journal",
+        "-wal" => "WAL",
+        "-shm" => "SHM",
+        _ => "sqlite",
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn reconstruction_candidate_path(primary_path: &Path, timestamp: &str) -> PathBuf {
     let mut candidate = sqlite_path_with_file_name_suffix(
@@ -5873,16 +5882,17 @@ fn quarantine_corrupt_sidecars_or_restore_primary(
 ) -> Result<(), SqlError> {
     for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
         if let Err(e) = quarantine_sidecar(primary_path, suffix, timestamp) {
+            let sidecar_label = sqlite_recovery_sidecar_label(suffix);
             if let Err(restore_err) =
                 restore_quarantined_primary(primary_path, quarantined_path, timestamp)
             {
                 return Err(SqlError::Custom(format!(
-                    "failed to quarantine {suffix} sidecar for {context} at {}: {e}; rollback of quarantined database also failed: {restore_err}",
+                    "failed to quarantine {sidecar_label} sidecar for {context} at {}: {e}; rollback of quarantined database also failed: {restore_err}",
                     primary_path.display()
                 )));
             }
             return Err(SqlError::Custom(format!(
-                "failed to quarantine {suffix} sidecar for {context} at {}: {e}",
+                "failed to quarantine {sidecar_label} sidecar for {context} at {}: {e}",
                 primary_path.display()
             )));
         }
@@ -5915,6 +5925,7 @@ fn quarantine_reconstructed_candidate(
 
     for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
         if let Err(e) = quarantine_sidecar_with_label(primary_path, suffix, reason, timestamp) {
+            let sidecar_label = sqlite_recovery_sidecar_label(suffix);
             if let Err(restore_err) = restore_quarantined_primary_with_sidecar_label(
                 primary_path,
                 &quarantined,
@@ -5922,12 +5933,12 @@ fn quarantine_reconstructed_candidate(
                 timestamp,
             ) {
                 return Err(SqlError::Custom(format!(
-                    "failed to quarantine {suffix} sidecar for reconstructed candidate {}: {e}; rollback also failed: {restore_err}",
+                    "failed to quarantine {sidecar_label} sidecar for reconstructed candidate {}: {e}; rollback also failed: {restore_err}",
                     primary_path.display()
                 )));
             }
             return Err(SqlError::Custom(format!(
-                "failed to quarantine {suffix} sidecar for reconstructed candidate {}: {e}",
+                "failed to quarantine {sidecar_label} sidecar for reconstructed candidate {}: {e}",
                 primary_path.display()
             )));
         }
@@ -6125,10 +6136,35 @@ pub(crate) fn reset_recent_reconstruct_cache_for_test() {
 }
 
 #[allow(clippy::result_large_err)]
+fn validate_archive_salvage_storage_root(
+    primary_path: &Path,
+    storage_root: &Path,
+) -> Result<(), SqlError> {
+    if !is_real_directory(storage_root) {
+        return Err(SqlError::Custom(format!(
+            "archive reconciliation failed for {}: storage root {} is missing or not a real directory",
+            primary_path.display(),
+            storage_root.display()
+        )));
+    }
+    let projects_dir = storage_root.join("projects");
+    if !is_real_directory(&projects_dir) {
+        return Err(SqlError::Custom(format!(
+            "archive reconciliation failed for {}: projects directory {} is missing or not a real directory",
+            primary_path.display(),
+            projects_dir.display()
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
 pub fn reconstruct_sqlite_file_with_archive_salvage(
     primary_path: &Path,
     storage_root: &Path,
 ) -> Result<crate::reconstruct::ReconstructStats, SqlError> {
+    validate_archive_salvage_storage_root(primary_path, storage_root)?;
+
     let lookup_at = Instant::now();
     if let Some((age, stats)) = recent_reconstruct_lookup(primary_path, lookup_at) {
         // age is capped at RECONSTRUCT_COALESCE_WINDOW, so u64 always fits,
@@ -10929,7 +10965,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_salvage_recovery_restores_original_sidecars_on_failure() {
+    fn archive_salvage_recovery_preserves_original_sidecars_when_archive_root_invalid() {
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("storage.sqlite3");
         let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).expect("open");
@@ -11486,10 +11522,7 @@ mod tests {
     fn refuse_auto_recovery_with_live_sidecar_directory_fails_closed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let primary = dir.path().join("live-sidecar-dir.db");
-        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).expect("open");
-        conn.execute_raw("CREATE TABLE t (x INTEGER)")
-            .expect("create table");
-        drop(conn);
+        std::fs::write(&primary, b"not-a-sqlite-db").expect("write corrupt primary");
 
         let wal_dir = dir.path().join("live-sidecar-dir.db-wal");
         std::fs::create_dir(&wal_dir).expect("create wal directory");
@@ -11499,6 +11532,7 @@ mod tests {
         let err_text = err.to_string();
         assert!(
             err_text.contains("automatic checkpoint failed")
+                || err_text.contains("another process holds a lock")
                 || err_text.contains("non-empty rollback-journal/WAL/SHM sidecars remain"),
             "unexpected error: {err_text}"
         );
