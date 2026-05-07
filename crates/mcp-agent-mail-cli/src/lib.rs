@@ -12152,19 +12152,6 @@ fn restore_db_from_backup(db_path: &Path, backup_path: &Path) -> CliResult<()> {
         })?;
     }
 
-    for (suffix, label) in [
-        ("-journal", "pre-restore rollback-journal"),
-        ("-wal", "pre-restore WAL"),
-        ("-shm", "pre-restore SHM"),
-    ] {
-        if let Err(error) =
-            remove_sqlite_sidecar_if_exists(&sqlite_sidecar_path(db_path, suffix), label)
-        {
-            cleanup_doctor_temp_sqlite_artifact(&staged_restore);
-            return Err(error);
-        }
-    }
-
     swap_validated_sqlite_artifact(db_path, &staged_restore, &restore_ts)?;
 
     // Never restore rollback-journal/WAL/SHM sidecars from backup artifacts.
@@ -30086,6 +30073,36 @@ http_headers = { Authorization = "Bearer secret" }
             assert_ne!(shm_bytes, b"backup-shm");
         }
 
+        let quarantined_sidecar = |suffix: &str| {
+            std::fs::read_dir(dir.path())
+                .expect("read dir")
+                .flatten()
+                .map(|entry| entry.path())
+                .find(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with("storage.sqlite3.corrupt-") && name.ends_with(suffix)
+                        })
+                })
+                .expect("missing quarantined sqlite sidecar")
+        };
+        assert_eq!(
+            std::fs::read(quarantined_sidecar("-journal")).expect("read quarantined journal"),
+            b"live-journal",
+            "restore should preserve live rollback journal as a quarantined artifact"
+        );
+        assert_eq!(
+            std::fs::read(quarantined_sidecar("-wal")).expect("read quarantined wal"),
+            b"live-wal",
+            "restore should preserve live WAL as a quarantined artifact"
+        );
+        assert_eq!(
+            std::fs::read(quarantined_sidecar("-shm")).expect("read quarantined shm"),
+            b"live-shm",
+            "restore should preserve live SHM as a quarantined artifact"
+        );
+
         let backup_prefix = "storage.sqlite3.pre_rollback.";
         let rollback_artifacts: Vec<std::path::PathBuf> = std::fs::read_dir(dir.path())
             .expect("read dir")
@@ -30105,7 +30122,7 @@ http_headers = { Authorization = "Bearer secret" }
     }
 
     #[test]
-    fn restore_db_from_backup_fails_closed_when_pre_restore_wal_cannot_be_removed() {
+    fn restore_db_from_backup_quarantines_pre_restore_wal_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("blocked-restore.sqlite3");
         let backup_path = dir
@@ -30118,23 +30135,40 @@ http_headers = { Authorization = "Bearer secret" }
         std::fs::copy(&backup_source_path, &backup_path).expect("seed backup db");
 
         let db_wal = sqlite_sidecar_path(&db_path, "-wal");
+        if db_wal.exists() {
+            std::fs::remove_file(&db_wal)
+                .expect("remove auto-created wal before directory fixture");
+        }
         std::fs::create_dir(&db_wal).expect("create blocking wal directory");
 
-        let err = restore_db_from_backup(&db_path, &backup_path)
-            .expect_err("restore should fail closed when pre-restore wal cleanup is blocked");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("failed to remove pre-restore WAL sidecar"),
-            "unexpected error: {msg}"
-        );
+        restore_db_from_backup(&db_path, &backup_path).expect("restore should quarantine sidecars");
         assert_eq!(
             read_marker_db(&db_path),
-            "live-db",
-            "live database should remain untouched after failed restore"
+            "backup-db",
+            "validated backup should be restored after quarantining live sidecars"
         );
         assert!(
-            db_wal.exists(),
-            "blocking wal directory should remain in place after failure"
+            !std::fs::symlink_metadata(&db_wal)
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false),
+            "old WAL directory should move out of the active SQLite path"
+        );
+        let quarantined_wal_dir = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("blocked-restore.sqlite3.corrupt-")
+                            && name.ends_with("-wal")
+                    })
+            })
+            .expect("quarantined wal directory");
+        assert!(
+            quarantined_wal_dir.is_dir(),
+            "non-file WAL sidecars should be preserved under quarantine"
         );
     }
 
