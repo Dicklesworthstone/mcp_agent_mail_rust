@@ -2767,7 +2767,18 @@ impl DbPool {
                 if let Ok(modified) = metadata.modified()
                     && modified.elapsed().unwrap_or(max_age) < max_age
                 {
-                    return Ok(None);
+                    match sqlite_file_is_healthy(&bak_path) {
+                        Ok(true) => return Ok(None),
+                        Ok(false) => tracing::warn!(
+                            backup = %bak_path.display(),
+                            "fresh proactive backup failed health checks; refreshing from primary"
+                        ),
+                        Err(error) => tracing::warn!(
+                            backup = %bak_path.display(),
+                            error = %error,
+                            "fresh proactive backup health check failed; refreshing from primary"
+                        ),
+                    }
                 }
                 true
             }
@@ -2792,6 +2803,8 @@ impl DbPool {
             }
         };
 
+        ensure_proactive_backup_source_is_safe(primary, &bak_path)?;
+
         // Checkpoint WAL so the backup is self-contained.
         if let Err(e) = self.wal_checkpoint() {
             return Err(DbError::Sqlite(format!(
@@ -2800,32 +2813,24 @@ impl DbPool {
             )));
         }
 
-        if backup_exists {
-            let staged_backup = create_proactive_backup_stage(primary, &bak_path)?;
-            std::fs::rename(&staged_backup, &bak_path).map_err(|e| {
-                cleanup_sqlite_candidate_artifact(&staged_backup);
-                DbError::Sqlite(format!(
-                    "proactive backup failed to publish staged backup {} to {}: {e}",
-                    staged_backup.display(),
-                    bak_path.display()
-                ))
-            })?;
-        } else {
-            copy_file_without_overwrite(primary, &bak_path).map_err(|e| {
-                if e.kind() != std::io::ErrorKind::AlreadyExists {
-                    cleanup_sqlite_candidate_artifact(&bak_path);
-                }
-                DbError::Sqlite(format!(
-                    "proactive backup failed: {} -> {}: {e}",
-                    primary.display(),
-                    bak_path.display()
-                ))
-            })?;
+        let staged_backup = create_proactive_backup_stage(primary, &bak_path)?;
+        if let Err(error) = validate_proactive_backup_stage(primary, &staged_backup) {
+            cleanup_sqlite_candidate_artifact(&staged_backup);
+            return Err(error);
         }
+        std::fs::rename(&staged_backup, &bak_path).map_err(|e| {
+            cleanup_sqlite_candidate_artifact(&staged_backup);
+            DbError::Sqlite(format!(
+                "proactive backup failed to publish staged backup {} to {}: {e}",
+                staged_backup.display(),
+                bak_path.display()
+            ))
+        })?;
 
         tracing::info!(
             primary = %primary.display(),
             backup = %bak_path.display(),
+            replaced_existing = backup_exists,
             "created proactive database backup"
         );
 
@@ -5620,6 +5625,61 @@ fn copy_file_without_overwrite(source: &Path, destination: &Path) -> std::io::Re
         .open(destination)?;
     std::io::copy(&mut source_file, &mut destination_file)?;
     std::fs::set_permissions(destination, permissions)
+}
+
+fn sqlite_file_is_backup_safe(path: &Path) -> Result<bool, SqlError> {
+    if !sqlite_file_is_healthy(path)? {
+        return Ok(false);
+    }
+    sqlite_canonical_file_check_is_ok(path, integrity::CheckKind::Full)
+}
+
+fn ensure_proactive_backup_source_is_safe(primary: &Path, backup_path: &Path) -> DbResult<()> {
+    match sqlite_file_is_backup_safe(primary) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(DbError::Sqlite(format!(
+            "proactive backup aborted: source database {} failed full health checks; preserving existing backup at {}",
+            primary.display(),
+            backup_path.display()
+        ))),
+        Err(error) => Err(DbError::Sqlite(format!(
+            "proactive backup aborted: source database {} health check failed: {error}; preserving existing backup at {}",
+            primary.display(),
+            backup_path.display()
+        ))),
+    }
+}
+
+fn validate_proactive_backup_stage(primary: &Path, staged_backup: &Path) -> DbResult<()> {
+    match sqlite_file_is_backup_safe(staged_backup) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(DbError::Sqlite(format!(
+                "proactive backup aborted: staged copy {} from {} failed full health checks; existing backup is untouched",
+                staged_backup.display(),
+                primary.display()
+            )));
+        }
+        Err(error) => {
+            return Err(DbError::Sqlite(format!(
+                "proactive backup aborted: staged copy {} from {} could not be health checked: {error}; existing backup is untouched",
+                staged_backup.display(),
+                primary.display()
+            )));
+        }
+    }
+
+    wal_checkpoint_truncate_path(staged_backup).map_err(|error| {
+        DbError::Sqlite(format!(
+            "proactive backup aborted: staged copy {} from {} failed checkpoint validation: {error}; existing backup is untouched",
+            staged_backup.display(),
+            primary.display()
+        ))
+    })?;
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+        let _ = std::fs::remove_file(sqlite_sidecar_path(staged_backup, suffix));
+    }
+    Ok(())
 }
 
 fn create_proactive_backup_stage(source: &Path, backup_path: &Path) -> DbResult<PathBuf> {
@@ -11285,6 +11345,103 @@ mod tests {
             .create_proactive_backup(std::time::Duration::from_hours(1))
             .unwrap();
         assert!(second.is_none(), "should skip since backup is fresh");
+    }
+
+    #[test]
+    fn proactive_backup_refreshes_fresh_but_unhealthy_bak() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_refresh_bad_bak.db");
+        let bak_path = dir.path().join("test_refresh_bad_bak.db.bak");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).unwrap();
+
+        write_marker_db(&db_path, "healthy-primary");
+        std::fs::write(&bak_path, b"not-a-sqlite-backup").unwrap();
+
+        let refreshed = pool
+            .create_proactive_backup(std::time::Duration::from_hours(1))
+            .expect("fresh corrupt backup should be refreshed");
+        assert_eq!(
+            refreshed.as_deref(),
+            Some(bak_path.as_path()),
+            "refresh should publish a replacement .bak"
+        );
+        assert_eq!(
+            sqlite_marker_value(&bak_path).as_deref(),
+            Some("healthy-primary"),
+            "fresh but unhealthy .bak should be replaced from the healthy primary"
+        );
+    }
+
+    #[test]
+    fn proactive_backup_refuses_unhealthy_primary_and_preserves_existing_bak() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_preserve_existing.db");
+        let bak_path = dir.path().join("test_preserve_existing.db.bak");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).unwrap();
+
+        write_marker_db(&bak_path, "last-good-backup");
+        std::fs::write(&db_path, b"not-a-sqlite-db").unwrap();
+
+        let err = pool
+            .create_proactive_backup(std::time::Duration::ZERO)
+            .expect_err("unhealthy primary must not overwrite backup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("proactive backup aborted")
+                && msg.contains("source database")
+                && msg.contains("preserving existing backup"),
+            "unexpected error: {msg}"
+        );
+        assert_eq!(
+            sqlite_marker_value(&bak_path).as_deref(),
+            Some("last-good-backup"),
+            "existing .bak should remain the last known-good database"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".backup-stage-")),
+            "source validation should fail before any staged backup is written"
+        );
+    }
+
+    #[test]
+    fn proactive_backup_refuses_unhealthy_primary_without_creating_new_bak() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_no_new_bad_backup.db");
+        let bak_path = dir.path().join("test_no_new_bad_backup.db.bak");
+        let config = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            ..Default::default()
+        };
+        let pool = DbPool::new(&config).unwrap();
+
+        std::fs::write(&db_path, b"not-a-sqlite-db").unwrap();
+
+        let err = pool
+            .create_proactive_backup(std::time::Duration::ZERO)
+            .expect_err("unhealthy primary must not create a backup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("proactive backup aborted") && msg.contains("source database"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !bak_path.exists(),
+            "no .bak should be materialized from an unhealthy primary"
+        );
     }
 
     #[cfg(unix)]
