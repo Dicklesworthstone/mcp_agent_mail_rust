@@ -12082,6 +12082,47 @@ fn sqlite_checkpoint_truncate(db_path: &Path) -> CliResult<()> {
     Ok(())
 }
 
+fn ensure_sqlite_backup_source_is_healthy(source_db: &Path, backup_path: &Path) -> CliResult<()> {
+    if sqlite_file_is_healthy(source_db)? {
+        return Ok(());
+    }
+    Err(CliError::Other(format!(
+        "backup aborted: source database {} failed health checks; backup {} was not created",
+        source_db.display(),
+        backup_path.display()
+    )))
+}
+
+fn validate_staged_sqlite_backup(
+    source_db: &Path,
+    staged_backup: &Path,
+    backup_path: &Path,
+) -> CliResult<()> {
+    if !sqlite_file_is_healthy(staged_backup)? {
+        return Err(CliError::Other(format!(
+            "backup aborted: staged copy {} from {} failed health checks; backup {} was not created",
+            staged_backup.display(),
+            source_db.display(),
+            backup_path.display()
+        )));
+    }
+    sqlite_checkpoint_truncate(staged_backup).map_err(|e| {
+        CliError::Other(format!(
+            "backup aborted: staged copy {} from {} failed checkpoint validation: {e}; backup {} was not created",
+            staged_backup.display(),
+            source_db.display(),
+            backup_path.display()
+        ))
+    })?;
+    for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
+        remove_sqlite_sidecar_if_exists(
+            &sqlite_sidecar_path(staged_backup, suffix),
+            "staged backup",
+        )?;
+    }
+    Ok(())
+}
+
 fn validate_real_existing_directory(path: &Path, label: &str) -> CliResult<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
@@ -12184,6 +12225,7 @@ fn copy_sqlite_backup_consistently(source_db: &Path, backup_path: &Path) -> CliR
         )));
     }
 
+    ensure_sqlite_backup_source_is_healthy(source_db, backup_path)?;
     sqlite_checkpoint_truncate(source_db)?;
 
     if let Some(parent) = backup_path.parent() {
@@ -12203,6 +12245,10 @@ fn copy_sqlite_backup_consistently(source_db: &Path, backup_path: &Path) -> CliR
             staged_backup.display()
         ))
     })?;
+    if let Err(error) = validate_staged_sqlite_backup(source_db, &staged_backup, backup_path) {
+        cleanup_doctor_temp_sqlite_artifact(&staged_backup);
+        return Err(error);
+    }
     std::fs::rename(&staged_backup, backup_path).map_err(|e| {
         let _ = std::fs::remove_file(&staged_backup);
         CliError::Other(format!(
@@ -30327,6 +30373,57 @@ http_headers = { Authorization = "Bearer secret" }
                 .flatten()
                 .all(|entry| !entry.file_name().to_string_lossy().contains(".restore-")),
             "staged restore artifacts should be cleaned up after failure"
+        );
+    }
+
+    #[test]
+    fn copy_sqlite_backup_consistently_creates_readable_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        let backup_path = dir.path().join("storage.sqlite3.bak.20260102_000000");
+
+        write_marker_db(&db_path, "snapshot");
+
+        copy_sqlite_backup_consistently(&db_path, &backup_path).expect("copy backup");
+        assert_eq!(
+            read_marker_db(&backup_path),
+            "snapshot",
+            "published backup should be a readable sqlite copy"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("read dir")
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().contains("backup-stage")),
+            "successful backup should not leave staged artifacts behind"
+        );
+    }
+
+    #[test]
+    fn copy_sqlite_backup_consistently_rejects_unhealthy_source_without_artifacts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("storage.sqlite3");
+        let backup_path = dir.path().join("storage.sqlite3.bak.20260102_000000");
+
+        std::fs::write(&db_path, b"not-a-valid-sqlite-db").expect("seed corrupt source");
+
+        let err = copy_sqlite_backup_consistently(&db_path, &backup_path)
+            .expect_err("unhealthy source must not be backed up");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("backup aborted") && msg.contains("source database"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !backup_path.exists(),
+            "backup destination should not be created from an unhealthy source"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("read dir")
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().contains("backup-stage")),
+            "source validation should fail before any staged backup artifact is written"
         );
     }
 
