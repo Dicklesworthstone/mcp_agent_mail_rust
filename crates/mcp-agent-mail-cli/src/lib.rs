@@ -5415,6 +5415,13 @@ fn path_is_real_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
 }
 
+fn path_is_occupied(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(err) => err.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
 fn path_is_self_update_binary_file(path: &Path) -> bool {
     let Ok(metadata) = std::fs::symlink_metadata(path) else {
         return false;
@@ -12278,13 +12285,15 @@ fn copy_sqlite_backup_consistently(source_db: &Path, backup_path: &Path) -> CliR
 }
 
 fn remove_sqlite_sidecar_if_exists(sidecar_path: &Path, context: &str) -> CliResult<()> {
-    if sidecar_path.exists() {
-        std::fs::remove_file(sidecar_path).map_err(|e| {
+    match std::fs::symlink_metadata(sidecar_path) {
+        Ok(_) => std::fs::remove_file(sidecar_path).map_err(|e| {
             CliError::Other(format!(
                 "failed to remove {context} sidecar {}: {e}",
                 sidecar_path.display()
             ))
-        })?;
+        })?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(CliError::Io(err)),
     }
     Ok(())
 }
@@ -36451,6 +36460,46 @@ startup_timeout_sec = 42
         assert!(!quarantine.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_sqlite_state_roundtrips_broken_sidecar_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("storage.sqlite3");
+        let quarantine = tmp.path().join("storage.sqlite3.corrupt");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let quarantined_wal_path = quarantine_sidecar_path(&quarantine, "-wal");
+        let missing_target = tmp.path().join("missing-wal-target");
+
+        std::fs::write(&db_path, b"main").unwrap();
+        symlink(&missing_target, &wal_path).unwrap();
+
+        let state = quarantine_sqlite_state(&db_path, &quarantine).unwrap();
+        assert!(!path_is_occupied(&db_path));
+        assert!(!path_is_occupied(&wal_path));
+        assert!(path_is_occupied(&quarantine));
+        assert!(
+            std::fs::symlink_metadata(&quarantined_wal_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "broken WAL symlink should be preserved under quarantine"
+        );
+
+        restore_quarantined_sqlite_state(&state).unwrap();
+        assert!(path_is_occupied(&db_path));
+        assert!(
+            std::fs::symlink_metadata(&wal_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "broken WAL symlink should roundtrip back to the original sidecar path"
+        );
+        assert!(!path_is_occupied(&quarantine));
+        assert!(!path_is_occupied(&quarantined_wal_path));
+    }
+
     #[test]
     fn swap_validated_sqlite_artifact_restores_quarantined_state_on_swap_failure() {
         let tmp = tempfile::tempdir().unwrap();
@@ -36691,6 +36740,44 @@ startup_timeout_sec = 42
         assert_ne!(
             first, second,
             "sidecar-only collisions should force a new temp artifact path"
+        );
+        assert!(
+            second
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("-01.sqlite3")),
+            "expected suffixed temp artifact path, got {}",
+            second.display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn next_doctor_artifact_path_skips_broken_symlink_sidecar_collisions() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("storage.sqlite3");
+        let first = next_doctor_artifact_path_with_timestamp(
+            &db_path,
+            "restore",
+            "sqlite3",
+            "20260324_120000_003",
+        );
+        let first_wal = sqlite_sidecar_path(&first, "-wal");
+        let missing_target = tmp.path().join("missing-wal-target");
+        symlink(&missing_target, &first_wal).unwrap();
+
+        let second = next_doctor_artifact_path_with_timestamp(
+            &db_path,
+            "restore",
+            "sqlite3",
+            "20260324_120000_003",
+        );
+
+        assert_ne!(
+            first, second,
+            "broken sidecar symlinks must force a new temp artifact path"
         );
         assert!(
             second
@@ -51417,7 +51504,7 @@ fn quarantine_sqlite_state(
     let mut sidecars = Vec::new();
     for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
         let original = sqlite_sidecar_path(db_path, suffix);
-        if !original.exists() {
+        if !path_is_occupied(&original) {
             continue;
         }
         let quarantined = quarantine_sidecar_path(quarantine_db, suffix);
@@ -51439,15 +51526,15 @@ fn quarantine_sqlite_state(
 }
 
 fn restore_quarantined_sqlite_state(state: &QuarantinedSqliteState) -> CliResult<()> {
-    if state.original_db.exists() {
+    if path_is_occupied(&state.original_db) {
         std::fs::remove_file(&state.original_db)?;
     }
     std::fs::rename(&state.quarantined_db, &state.original_db)?;
     for (original, quarantined) in &state.sidecars {
-        if original.exists() {
+        if path_is_occupied(original) {
             std::fs::remove_file(original)?;
         }
-        if quarantined.exists() {
+        if path_is_occupied(quarantined) {
             std::fs::rename(quarantined, original)?;
         }
     }
@@ -51455,10 +51542,10 @@ fn restore_quarantined_sqlite_state(state: &QuarantinedSqliteState) -> CliResult
 }
 
 fn sqlite_artifact_conflicts(candidate: &Path) -> bool {
-    candidate.exists()
+    path_is_occupied(candidate)
         || SQLITE_RECOVERY_SIDECAR_SUFFIXES
             .iter()
-            .any(|suffix| sqlite_sidecar_path(candidate, suffix).exists())
+            .any(|suffix| path_is_occupied(&sqlite_sidecar_path(candidate, suffix)))
 }
 
 fn next_sqlite_quarantine_path(db_path: &Path, timestamp: &str) -> PathBuf {
@@ -51603,7 +51690,7 @@ fn cleanup_replacement_sqlite_sidecars(
     context: &str,
 ) -> Result<(), CliError> {
     for sidecar in sidecars.iter().rev() {
-        if sidecar.exists() {
+        if path_is_occupied(sidecar) {
             std::fs::remove_file(sidecar).map_err(|e| {
                 CliError::Other(format!(
                     "failed to remove replacement sidecar {} during {context}: {e}",
@@ -51620,13 +51707,13 @@ fn restore_swapped_replacement_sqlite_artifact_without_original(
     temp_db_path: &Path,
     moved_sidecars: &[(PathBuf, PathBuf)],
 ) -> Result<(), CliError> {
-    if temp_db_path.exists() {
+    if path_is_occupied(temp_db_path) {
         return Err(CliError::Other(format!(
             "cannot roll back replacement sqlite artifact because temp destination {} already exists",
             temp_db_path.display()
         )));
     }
-    if db_path.exists() {
+    if path_is_occupied(db_path) {
         std::fs::rename(db_path, temp_db_path).map_err(|e| {
             CliError::Other(format!(
                 "failed to move replacement sqlite artifact {} back to {} during rollback: {e}",
@@ -51636,13 +51723,13 @@ fn restore_swapped_replacement_sqlite_artifact_without_original(
         })?;
     }
     for (final_sidecar, temp_sidecar) in moved_sidecars.iter().rev() {
-        if temp_sidecar.exists() {
+        if path_is_occupied(temp_sidecar) {
             return Err(CliError::Other(format!(
                 "cannot roll back replacement sidecar because temp destination {} already exists",
                 temp_sidecar.display()
             )));
         }
-        if final_sidecar.exists() {
+        if path_is_occupied(final_sidecar) {
             std::fs::rename(final_sidecar, temp_sidecar).map_err(|e| {
                 CliError::Other(format!(
                     "failed to move replacement sidecar {} back to {} during rollback: {e}",
@@ -51663,11 +51750,11 @@ fn cleanup_doctor_temp_sqlite_artifact(path: &Path) {
 }
 
 fn doctor_temp_sqlite_artifact_conflicts(candidate: &Path, extension: &str) -> bool {
-    candidate.exists()
+    path_is_occupied(candidate)
         || (extension.eq_ignore_ascii_case("sqlite3")
             && SQLITE_RECOVERY_SIDECAR_SUFFIXES
                 .iter()
-                .any(|suffix| sqlite_sidecar_path(candidate, suffix).exists()))
+                .any(|suffix| path_is_occupied(&sqlite_sidecar_path(candidate, suffix))))
 }
 
 #[derive(Debug, Clone)]
