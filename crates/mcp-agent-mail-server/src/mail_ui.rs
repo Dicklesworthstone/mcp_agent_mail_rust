@@ -2458,10 +2458,12 @@ fn ts_display_opt(micros: Option<i64>) -> String {
     micros.map_or_else(String::new, ts_display)
 }
 
-/// Format micros as "Month DD, YYYY at I:MM PM" (Python parity: `created_full`).
+/// Format micros as "Month DD, YYYY at I:MM PM UTC" (Python parity: `created_full`,
+/// extended with an explicit UTC label so the rendered string is honest about
+/// its zone when the client-side `formatTimestampLocal` helper isn't available).
 fn ts_display_full(micros: i64) -> String {
     micros_to_naive(micros)
-        .format("%B %d, %Y at %l:%M %p")
+        .format("%B %d, %Y at %l:%M %p UTC")
         .to_string()
 }
 

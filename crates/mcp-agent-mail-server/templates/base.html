@@ -131,6 +131,50 @@
     <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/plugin/relativeTime.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/dayjs@1.11.10/plugin/calendar.min.js"></script>
 
+    <!--
+      Local-timezone timestamp formatter shared by every Alpine template.
+      Server-side rendering of `created_full` was producing a UTC clock face
+      with no zone label, which made messages look several hours off on non-UTC
+      machines. This helper takes the canonical ISO field (always UTC, ends
+      in `Z`) and renders it in the operator's browser timezone, including a
+      short zone abbreviation. Falls back gracefully on null/invalid input.
+    -->
+    <script>
+      window.formatTimestampLocal = function (input) {
+        if (input === null || input === undefined) return '';
+        const value = typeof input === 'string' ? input.trim() : input;
+        if (value === '') return '';
+        // Accept either an ISO-8601 string (canonical wire form) or a numeric
+        // microsecond/millisecond epoch as a defensive shim. Exported snapshots
+        // can carry those epochs as strings, so digit-only strings use the same
+        // path as numeric values.
+        let date;
+        if (typeof value === 'number' || (typeof value === 'string' && /^\d+$/.test(value))) {
+          const epoch = Number(value);
+          if (!Number.isFinite(epoch)) return '';
+          // Heuristic: values larger than plausible millisecond epochs are micros.
+          date = new Date(epoch > 1e14 ? epoch / 1000 : epoch);
+        } else {
+          date = new Date(String(value));
+        }
+        if (Number.isNaN(date.getTime())) return '';
+        try {
+          return new Intl.DateTimeFormat(undefined, {
+            year: 'numeric',
+            month: 'long',
+            day: 'numeric',
+            hour: 'numeric',
+            minute: '2-digit',
+            timeZoneName: 'short',
+          }).format(date);
+        } catch (_) {
+          // Older browsers without full Intl support — fall back to the
+          // host's default locale string, which still uses local time.
+          return date.toLocaleString();
+        }
+      };
+    </script>
+
     <!-- Tippy.js for beautiful tooltips -->
     <script src="https://unpkg.com/@popperjs/core@2"></script>
     <script src="https://unpkg.com/tippy.js@6"></script>

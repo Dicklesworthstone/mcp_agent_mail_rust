@@ -91,6 +91,47 @@
     }
   </script>
 
+  <!--
+    Local-timezone timestamp formatter. The static share viewer used to bind
+    `selectedMessage.created_full` directly, which was a server-precomputed UTC
+    clock face with no zone label — viewers in non-UTC timezones saw the wrong
+    wall time. This helper takes the canonical ISO field (always UTC, ends in
+    `Z`) and renders it in the operator's browser timezone, with a short zone
+    abbreviation. It also doubles as `formatTimestampFull` for legacy bindings
+    elsewhere on the page that pass `created_ts`.
+  -->
+  <script>
+    window.formatTimestampLocal = function (input) {
+      if (input === null || input === undefined) return '';
+      const value = typeof input === 'string' ? input.trim() : input;
+      if (value === '') return '';
+      let date;
+      if (typeof value === 'number' || (typeof value === 'string' && /^\d+$/.test(value))) {
+        const epoch = Number(value);
+        if (!Number.isFinite(epoch)) return '';
+        // Heuristic: values larger than plausible millisecond epochs are micros.
+        date = new Date(epoch > 1e14 ? epoch / 1000 : epoch);
+      } else {
+        date = new Date(String(value));
+      }
+      if (Number.isNaN(date.getTime())) return '';
+      try {
+        return new Intl.DateTimeFormat(undefined, {
+          year: 'numeric',
+          month: 'long',
+          day: 'numeric',
+          hour: 'numeric',
+          minute: '2-digit',
+          timeZoneName: 'short',
+        }).format(date);
+      } catch (_) {
+        return date.toLocaleString();
+      }
+    };
+    // Backwards-compatible alias for legacy bindings.
+    window.formatTimestampFull = window.formatTimestampLocal;
+  </script>
+
   <!-- Remove any legacy html-level Alpine bindings before Alpine starts -->
   <script>
     (function () {
@@ -788,7 +829,7 @@
                       <div class="text-xs text-slate-600 dark:text-slate-400 font-medium uppercase tracking-wide">Sent
                       </div>
                       <div class="text-sm font-semibold text-slate-900 dark:text-white"
-                        x-text="selectedMessage.created_full"></div>
+                        x-text="formatTimestampLocal(selectedMessage.created_ts) || selectedMessage.created_full"></div>
                     </div>
                   </div>
 

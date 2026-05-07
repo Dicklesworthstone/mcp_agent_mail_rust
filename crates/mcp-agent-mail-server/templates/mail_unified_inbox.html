@@ -484,7 +484,7 @@
                   </div>
                   <div>
                     <div class="text-xs text-slate-600 dark:text-slate-400 font-medium uppercase tracking-wide">Sent</div>
-                    <div class="text-sm font-semibold text-slate-900 dark:text-white" x-text="selectedMessage.created_full"></div>
+                    <div class="text-sm font-semibold text-slate-900 dark:text-white" x-text="formatTimestampLocal(selectedMessage.created) || selectedMessage.created_full"></div>
                   </div>
                 </div>
 
