@@ -8054,6 +8054,11 @@ pub struct BatchAcknowledgeResult {
 /// coordination bursts. Input IDs are deduplicated in first-seen order, existing
 /// rows are updated in one transaction, and missing recipient rows are reported
 /// per item instead of failing the whole batch.
+///
+/// Archive/event policy: this helper only mutates SQLite read/ack state. It
+/// intentionally does not write per-message Git archive artifacts or emit
+/// operator events; higher-level batch surfaces should use the returned per-item
+/// statuses to emit one grouped event rather than recreating a per-message storm.
 pub async fn acknowledge_messages_batch(
     cx: &Cx,
     pool: &DbPool,

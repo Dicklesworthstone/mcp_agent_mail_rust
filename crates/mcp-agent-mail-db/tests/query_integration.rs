@@ -30,8 +30,9 @@ use mcp_agent_mail_db::search_scope::{
 use mcp_agent_mail_db::search_service::{SearchOptions, execute_search, execute_search_simple};
 #[cfg(feature = "tantivy-engine")]
 use mcp_agent_mail_db::search_v3::{get_bridge, init_bridge};
-use mcp_agent_mail_db::{DbError, DbPool, DbPoolConfig};
+use mcp_agent_mail_db::{DbError, DbPool, DbPoolConfig, QueryTracker};
 use sqlmodel_core::{Connection, Value};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "tantivy-engine")]
 use std::sync::{Mutex, Once};
@@ -491,6 +492,153 @@ fn acknowledge_message_idempotent() {
             other => panic!("second ack failed: {other:?}"),
         }
     });
+}
+
+#[test]
+fn acknowledge_messages_batch_integration_large_ack_wave_uses_fixed_recipient_queries() {
+    let (pool, _dir) = make_pool();
+    let pid = setup_project(&pool);
+    let sender_id = setup_agent(&pool, pid, "GoldFox");
+    let recip_id = setup_agent(&pool, pid, "SilverWolf");
+
+    let message_ids = block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            let mut ids = Vec::with_capacity(128);
+            for idx in 0_i64..128 {
+                let msg = match queries::create_message_with_recipients(
+                    &cx,
+                    &pool,
+                    pid,
+                    sender_id,
+                    &format!("batch ack integration {idx}"),
+                    "body",
+                    Some("batch-ack-integration"),
+                    "normal",
+                    true,
+                    "[]",
+                    &[(recip_id, "to")],
+                )
+                .await
+                {
+                    Outcome::Ok(msg) => msg,
+                    other => panic!("create batch ack message failed: {other:?}"),
+                };
+                ids.push(msg.id.unwrap());
+            }
+            ids
+        }
+    });
+
+    let first_message_id = message_ids[0];
+    let (original_read_ts, original_ack_ts) = block_on(|cx| {
+        let pool = pool.clone();
+        async move {
+            match queries::acknowledge_message(&cx, &pool, recip_id, first_message_id).await {
+                Outcome::Ok(timestamps) => timestamps,
+                other => panic!("pre-ack first message failed: {other:?}"),
+            }
+        }
+    });
+
+    let missing_id = message_ids.iter().copied().max().unwrap() + 10_000;
+    let mut requested_ids = message_ids.clone();
+    requested_ids.insert(17, message_ids[16]);
+    requested_ids.push(missing_id);
+
+    let tracker = Arc::new(QueryTracker::new());
+    tracker.enable(None);
+    let results = block_on(|cx| {
+        let pool = pool.clone();
+        let requested_ids = requested_ids.clone();
+        let tracker = Arc::clone(&tracker);
+        async move {
+            tracker.reset();
+            let _guard = mcp_agent_mail_db::set_active_tracker(Arc::clone(&tracker));
+            queries::acknowledge_messages_batch(&cx, &pool, recip_id, &requested_ids).await
+        }
+    });
+    let results = match results {
+        Outcome::Ok(results) => results,
+        other => panic!("batch acknowledge integration failed: {other:?}"),
+    };
+    let snapshot = tracker.snapshot();
+
+    assert_eq!(
+        results.len(),
+        message_ids.len() + 1,
+        "duplicate message IDs should be collapsed while missing IDs keep a status row"
+    );
+    assert_eq!(results[16].message_id, message_ids[16]);
+    assert_eq!(results[17].message_id, message_ids[17]);
+    assert_eq!(
+        results.iter().filter(|result| result.found).count(),
+        message_ids.len()
+    );
+    assert!(
+        results
+            .iter()
+            .any(|result| result.message_id == missing_id && !result.found),
+        "missing recipient row should be reported per item"
+    );
+
+    let first = results
+        .iter()
+        .find(|result| result.message_id == message_ids[0])
+        .expect("pre-acked message should be present");
+    assert_eq!(first.read_ts, Some(original_read_ts));
+    assert_eq!(first.ack_ts, Some(original_ack_ts));
+
+    assert!(
+        snapshot.total <= 6,
+        "batch acknowledgement should stay fixed-query for a 100+ ack wave, got {snapshot:?}"
+    );
+    assert_eq!(
+        snapshot.per_table.get("message_recipients").copied(),
+        Some(2),
+        "one chunked recipient update and one chunked recipient read-back should cover the wave"
+    );
+    assert!(
+        snapshot
+            .per_table
+            .get("message_recipients")
+            .copied()
+            .unwrap_or(0)
+            < u64::try_from(message_ids.len()).expect("message count fits u64"),
+        "batch path should avoid one recipient update/read per message"
+    );
+
+    let conn = mcp_agent_mail_db::open_sqlite_file_with_recovery(pool.sqlite_path())
+        .expect("open sqlite connection for verification");
+    let placeholders = vec!["?"; message_ids.len()].join(", ");
+    let mut params = Vec::with_capacity(1 + message_ids.len());
+    params.push(Value::BigInt(recip_id));
+    params.extend(message_ids.iter().copied().map(Value::BigInt));
+    let rows = conn
+        .query_sync(
+            &format!(
+                "SELECT COUNT(*) AS count \
+                 FROM message_recipients \
+                 WHERE agent_id = ? AND message_id IN ({placeholders}) \
+                 AND read_ts IS NOT NULL AND ack_ts IS NOT NULL"
+            ),
+            &params,
+        )
+        .expect("query acknowledged rows");
+    let acked_count: i64 = rows[0].get_named("count").expect("acked count");
+    assert_eq!(acked_count, 128);
+
+    let stats = block_on(|cx| {
+        let pool = pool.clone();
+        async move { queries::get_inbox_stats(&cx, &pool, recip_id).await }
+    });
+    let stats = match stats {
+        Outcome::Ok(Some(stats)) => stats,
+        other => panic!("get inbox stats after batch ack failed: {other:?}"),
+    };
+    assert_eq!(stats.total_count, 128);
+    assert_eq!(stats.unread_count, 0);
+    assert_eq!(stats.ack_pending_count, 0);
 }
 
 #[test]
