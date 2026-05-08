@@ -82,9 +82,15 @@ fn default_signals() -> HealthSignals {
         pool_utilization_pct: 0,
         pool_over_80_for_s: 0,
         wbq_depth_pct: 0,
+        wbq_queue_p95_us: 0,
         wbq_over_80_for_s: 0,
         commit_depth_pct: 0,
+        commit_queue_p95_us: 0,
         commit_over_80_for_s: 0,
+        disk_pressure_level: 0,
+        disk_pressure_stale: false,
+        memory_pressure_level: 0,
+        memory_pressure_stale: false,
     }
 }
 
@@ -1071,9 +1077,15 @@ fn worst_signal_wins_classification() {
         pool_utilization_pct: 90,
         pool_over_80_for_s: 300,
         wbq_depth_pct: 80,
+        wbq_queue_p95_us: backpressure::red::QUEUE_WAIT_P95_US,
         wbq_over_80_for_s: 300,
         commit_depth_pct: 80,
+        commit_queue_p95_us: backpressure::red::QUEUE_WAIT_P95_US,
         commit_over_80_for_s: 300,
+        disk_pressure_level: backpressure::red::RESOURCE_PRESSURE_LEVEL,
+        disk_pressure_stale: false,
+        memory_pressure_level: backpressure::red::RESOURCE_PRESSURE_LEVEL,
+        memory_pressure_stale: false,
     };
     assert_eq!(all_red.classify(), HealthLevel::Red);
 

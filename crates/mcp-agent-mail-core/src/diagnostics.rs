@@ -1750,9 +1750,15 @@ mod tests {
             pool_utilization_pct: 0,
             pool_over_80_for_s: 0,
             wbq_depth_pct: 0,
+            wbq_queue_p95_us: 0,
             wbq_over_80_for_s: 0,
             commit_depth_pct: 0,
+            commit_queue_p95_us: 0,
             commit_over_80_for_s: 0,
+            disk_pressure_level: 0,
+            disk_pressure_stale: false,
+            memory_pressure_level: 0,
+            memory_pressure_stale: false,
         }
     }
 

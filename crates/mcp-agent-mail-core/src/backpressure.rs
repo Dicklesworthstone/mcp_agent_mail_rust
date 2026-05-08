@@ -1,8 +1,9 @@
 //! System-wide backpressure framework with Green/Yellow/Red health levels.
 //!
-//! Computes a composite health level from DB pool, WBQ, and commit queue
-//! metrics. The level is used by the server dispatch layer to shed
-//! non-critical work under extreme load (1000+ concurrent agents).
+//! Computes a composite health level from DB pool, WBQ, commit queue,
+//! queue-wait, disk, and memory metrics. The level is used by the server
+//! dispatch layer to shed non-critical work under extreme load (1000+
+//! concurrent agents).
 //!
 //! Design principles:
 //! - **Lock-free**: computed from existing atomic metrics, no new locks.
@@ -85,6 +86,12 @@ pub mod yellow {
     /// Commit queue pending as percentage of soft cap.
     pub const COMMIT_DEPTH_PCT: u64 = 50;
 
+    /// WBQ/commit queue wait p95 threshold (microseconds).
+    pub const QUEUE_WAIT_P95_US: u64 = super::slo::READ_P95_US; // 50 ms
+
+    /// Disk or memory pressure level that marks elevated resource pressure.
+    pub const RESOURCE_PRESSURE_LEVEL: u64 = 1;
+
     /// Pool utilization percentage.
     pub const POOL_UTIL_PCT: u64 = 70;
 
@@ -103,6 +110,12 @@ pub mod red {
     /// Commit queue pending as percentage of soft cap.
     pub const COMMIT_DEPTH_PCT: u64 = 80;
 
+    /// WBQ/commit queue wait p95 threshold (microseconds).
+    pub const QUEUE_WAIT_P95_US: u64 = super::slo::TOOL_P99_US; // 250 ms
+
+    /// Disk or memory pressure level that marks critical resource pressure.
+    pub const RESOURCE_PRESSURE_LEVEL: u64 = 2;
+
     /// Pool utilization percentage.
     pub const POOL_UTIL_PCT: u64 = 90;
 
@@ -115,6 +128,8 @@ const _: () = {
     assert!(yellow::POOL_ACQUIRE_P95_US < red::POOL_ACQUIRE_P95_US);
     assert!(yellow::WBQ_DEPTH_PCT < red::WBQ_DEPTH_PCT);
     assert!(yellow::COMMIT_DEPTH_PCT < red::COMMIT_DEPTH_PCT);
+    assert!(yellow::QUEUE_WAIT_P95_US < red::QUEUE_WAIT_P95_US);
+    assert!(yellow::RESOURCE_PRESSURE_LEVEL < red::RESOURCE_PRESSURE_LEVEL);
     assert!(yellow::POOL_UTIL_PCT < red::POOL_UTIL_PCT);
     assert!(yellow::OVER_80_DURATION_S < red::OVER_80_DURATION_S);
 };
@@ -133,9 +148,15 @@ pub struct HealthSignals {
     pub pool_utilization_pct: u64,
     pub pool_over_80_for_s: u64,
     pub wbq_depth_pct: u64,
+    pub wbq_queue_p95_us: u64,
     pub wbq_over_80_for_s: u64,
     pub commit_depth_pct: u64,
+    pub commit_queue_p95_us: u64,
     pub commit_over_80_for_s: u64,
+    pub disk_pressure_level: u64,
+    pub disk_pressure_stale: bool,
+    pub memory_pressure_level: u64,
+    pub memory_pressure_stale: bool,
 }
 
 impl HealthSignals {
@@ -162,15 +183,43 @@ impl HealthSignals {
             snap.storage.commit_pending_requests,
             snap.storage.commit_soft_cap,
         );
+        // Queue latency histograms are cumulative; ignore historical spikes
+        // once the queue has drained so old pressure does not pin health.
+        let wbq_queue_p95_us = if snap.storage.wbq_depth == 0 {
+            0
+        } else {
+            snap.storage.wbq_queue_latency_us.p95
+        };
+        let commit_queue_p95_us = if snap.storage.commit_pending_requests == 0 {
+            0
+        } else {
+            snap.storage.commit_queue_latency_us.p95
+        };
+        let (disk_pressure_level, disk_pressure_stale) = fresh_pressure_level(
+            snap.system.disk_pressure_level,
+            snap.system.disk_last_sample_us,
+            now_us,
+        );
+        let (memory_pressure_level, memory_pressure_stale) = fresh_pressure_level(
+            snap.system.memory_pressure_level,
+            snap.system.memory_last_sample_us,
+            now_us,
+        );
 
         Self {
             pool_acquire_p95_us,
             pool_utilization_pct: snap.db.pool_utilization_pct,
             pool_over_80_for_s,
             wbq_depth_pct,
+            wbq_queue_p95_us,
             wbq_over_80_for_s,
             commit_depth_pct,
+            commit_queue_p95_us,
             commit_over_80_for_s,
+            disk_pressure_level,
+            disk_pressure_stale,
+            memory_pressure_level,
+            memory_pressure_stale,
         }
     }
 
@@ -182,9 +231,13 @@ impl HealthSignals {
             || self.pool_utilization_pct >= red::POOL_UTIL_PCT
             || self.pool_over_80_for_s >= red::OVER_80_DURATION_S
             || self.wbq_depth_pct >= red::WBQ_DEPTH_PCT
+            || self.wbq_queue_p95_us >= red::QUEUE_WAIT_P95_US
             || self.wbq_over_80_for_s >= red::OVER_80_DURATION_S
             || self.commit_depth_pct >= red::COMMIT_DEPTH_PCT
+            || self.commit_queue_p95_us >= red::QUEUE_WAIT_P95_US
             || self.commit_over_80_for_s >= red::OVER_80_DURATION_S
+            || self.disk_pressure_level >= red::RESOURCE_PRESSURE_LEVEL
+            || self.memory_pressure_level >= red::RESOURCE_PRESSURE_LEVEL
         {
             return HealthLevel::Red;
         }
@@ -194,14 +247,125 @@ impl HealthSignals {
             || self.pool_utilization_pct >= yellow::POOL_UTIL_PCT
             || self.pool_over_80_for_s >= yellow::OVER_80_DURATION_S
             || self.wbq_depth_pct >= yellow::WBQ_DEPTH_PCT
+            || self.wbq_queue_p95_us >= yellow::QUEUE_WAIT_P95_US
             || self.wbq_over_80_for_s >= yellow::OVER_80_DURATION_S
             || self.commit_depth_pct >= yellow::COMMIT_DEPTH_PCT
+            || self.commit_queue_p95_us >= yellow::QUEUE_WAIT_P95_US
             || self.commit_over_80_for_s >= yellow::OVER_80_DURATION_S
+            || self.disk_pressure_level >= yellow::RESOURCE_PRESSURE_LEVEL
+            || self.memory_pressure_level >= yellow::RESOURCE_PRESSURE_LEVEL
         {
             return HealthLevel::Yellow;
         }
 
         HealthLevel::Green
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Capacity governor decisions
+// ---------------------------------------------------------------------------
+
+/// Admission recommendation for a tool call under current capacity pressure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityAction {
+    /// Accept the request normally.
+    Accept,
+    /// Caller should retry later if it can; this is observation-only today.
+    Defer,
+    /// Caller should use a cheaper path if it can; this is observation-only today.
+    Downgrade,
+    /// Reject the request now. Only used when shedding is explicitly enabled.
+    Shed,
+}
+
+impl CapacityAction {
+    /// String label for JSON and robot output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::Defer => "defer",
+            Self::Downgrade => "downgrade",
+            Self::Shed => "shed",
+        }
+    }
+}
+
+impl std::fmt::Display for CapacityAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Operator-visible capacity governor decision for a single tool class.
+#[derive(Debug, Clone, Serialize)]
+pub struct CapacityGovernorDecision {
+    pub action: CapacityAction,
+    pub health_level: HealthLevel,
+    pub tool_is_shedable: bool,
+    pub shedding_enabled: bool,
+    pub enforced: bool,
+    pub reason: &'static str,
+    pub signals: HealthSignals,
+}
+
+impl CapacityGovernorDecision {
+    /// Whether dispatch should reject the request.
+    #[must_use]
+    pub const fn should_shed(&self) -> bool {
+        matches!(self.action, CapacityAction::Shed) && self.enforced
+    }
+}
+
+/// Compute a live capacity decision for observability surfaces.
+#[must_use]
+pub fn compute_capacity_governor_decision(tool_name: &str) -> CapacityGovernorDecision {
+    let snap = global_metrics().snapshot();
+    let now_us = now_micros_u64();
+    let signals = HealthSignals::from_snapshot(&snap, now_us);
+    let level = signals.classify();
+    capacity_governor_decision_from_parts(tool_name, level, signals, shedding_enabled())
+}
+
+/// Compute a capacity decision using the cached health level.
+///
+/// This is useful when the caller has just refreshed the cache and wants the
+/// detailed decision record that corresponds to the fast dispatch path.
+#[must_use]
+pub fn capacity_governor_decision(tool_name: &str) -> CapacityGovernorDecision {
+    let snap = global_metrics().snapshot();
+    let now_us = now_micros_u64();
+    let signals = HealthSignals::from_snapshot(&snap, now_us);
+    capacity_governor_decision_from_parts(
+        tool_name,
+        cached_health_level(),
+        signals,
+        shedding_enabled(),
+    )
+}
+
+/// Deterministic capacity decision helper for tests and synthetic load probes.
+#[must_use]
+pub fn capacity_governor_decision_from_parts(
+    tool_name: &str,
+    health_level: HealthLevel,
+    signals: HealthSignals,
+    shedding_enabled: bool,
+) -> CapacityGovernorDecision {
+    let tool_is_shedable = is_shedable_tool(tool_name);
+    let (action, enforced, reason) =
+        capacity_action_for(health_level, tool_is_shedable, shedding_enabled);
+
+    CapacityGovernorDecision {
+        action,
+        health_level,
+        tool_is_shedable,
+        shedding_enabled,
+        enforced,
+        reason,
+        signals,
     }
 }
 
@@ -337,7 +501,12 @@ pub fn is_shedable_tool(tool_name: &str) -> bool {
 /// 3. The tool is classified as shedable.
 #[must_use]
 pub fn should_shed_tool(tool_name: &str) -> bool {
-    shedding_enabled() && cached_health_level().should_shed(is_shedable_tool(tool_name))
+    let (action, enforced, _) = capacity_action_for(
+        cached_health_level(),
+        is_shedable_tool(tool_name),
+        shedding_enabled(),
+    );
+    matches!(action, CapacityAction::Shed) && enforced
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +533,58 @@ const fn pct(value: u64, total: u64) -> u64 {
     if p > 100 { 100 } else { p }
 }
 
+/// Resource pressure samples older than three monitor intervals are ignored.
+const RESOURCE_PRESSURE_STALE_AFTER_S: u64 = 180;
+
+#[inline]
+const fn fresh_pressure_level(level: u64, last_sample_us: u64, now_us: u64) -> (u64, bool) {
+    let bounded_level = if level <= 3 { level } else { 0 };
+    if bounded_level == 0 {
+        return (0, false);
+    }
+    if last_sample_us == 0 {
+        return (0, true);
+    }
+    if duration_since_s(last_sample_us, now_us) > RESOURCE_PRESSURE_STALE_AFTER_S {
+        return (0, true);
+    }
+    (bounded_level, false)
+}
+
+#[inline]
+const fn capacity_action_for(
+    health_level: HealthLevel,
+    tool_is_shedable: bool,
+    shedding_enabled: bool,
+) -> (CapacityAction, bool, &'static str) {
+    if !tool_is_shedable {
+        return (
+            CapacityAction::Accept,
+            false,
+            "coordination-critical tool protected from shedding",
+        );
+    }
+
+    match health_level {
+        HealthLevel::Green => (CapacityAction::Accept, false, "capacity healthy"),
+        HealthLevel::Yellow => (
+            CapacityAction::Defer,
+            false,
+            "elevated load; shedable read should retry later if possible",
+        ),
+        HealthLevel::Red if shedding_enabled => (
+            CapacityAction::Shed,
+            true,
+            "red health and shedding gate enabled for shedable read",
+        ),
+        HealthLevel::Red => (
+            CapacityAction::Downgrade,
+            false,
+            "red health observed in shadow mode; shedding gate disabled",
+        ),
+    }
+}
+
 /// Current time in microseconds (Unix epoch). Infallible.
 #[inline]
 fn now_micros_u64() -> u64 {
@@ -388,9 +609,15 @@ mod tests {
             pool_utilization_pct: 0,
             pool_over_80_for_s: 0,
             wbq_depth_pct: 0,
+            wbq_queue_p95_us: 0,
             wbq_over_80_for_s: 0,
             commit_depth_pct: 0,
+            commit_queue_p95_us: 0,
             commit_over_80_for_s: 0,
+            disk_pressure_level: 0,
+            disk_pressure_stale: false,
+            memory_pressure_level: 0,
+            memory_pressure_stale: false,
         }
     }
 
@@ -439,6 +666,34 @@ mod tests {
     fn commit_at_80_pct_is_red() {
         let mut s = default_signals();
         s.commit_depth_pct = 80;
+        assert_eq!(s.classify(), HealthLevel::Red);
+    }
+
+    #[test]
+    fn queue_wait_p95_yellow_and_red_thresholds() {
+        let mut s = default_signals();
+        s.wbq_queue_p95_us = yellow::QUEUE_WAIT_P95_US;
+        assert_eq!(s.classify(), HealthLevel::Yellow);
+
+        s.wbq_queue_p95_us = red::QUEUE_WAIT_P95_US;
+        assert_eq!(s.classify(), HealthLevel::Red);
+
+        s.wbq_queue_p95_us = 0;
+        s.commit_queue_p95_us = red::QUEUE_WAIT_P95_US;
+        assert_eq!(s.classify(), HealthLevel::Red);
+    }
+
+    #[test]
+    fn resource_pressure_yellow_and_red_thresholds() {
+        let mut s = default_signals();
+        s.memory_pressure_level = yellow::RESOURCE_PRESSURE_LEVEL;
+        assert_eq!(s.classify(), HealthLevel::Yellow);
+
+        s.memory_pressure_level = red::RESOURCE_PRESSURE_LEVEL;
+        assert_eq!(s.classify(), HealthLevel::Red);
+
+        s.memory_pressure_level = 0;
+        s.disk_pressure_level = red::RESOURCE_PRESSURE_LEVEL;
         assert_eq!(s.classify(), HealthLevel::Red);
     }
 
@@ -805,10 +1060,31 @@ mod tests {
         snap.db.pool_over_80_since_us = now_us - 42_000_000;
         snap.storage.wbq_depth = 75;
         snap.storage.wbq_capacity = 100;
+        snap.storage.wbq_queue_latency_us = HistogramSnapshot {
+            count: 1,
+            sum: 44_000,
+            min: 44_000,
+            max: 44_000,
+            p50: 44_000,
+            p95: 44_000,
+            p99: 44_000,
+        };
         snap.storage.wbq_over_80_since_us = now_us - 5_000_000;
         snap.storage.commit_pending_requests = 45;
         snap.storage.commit_soft_cap = 90;
+        snap.storage.commit_queue_latency_us = HistogramSnapshot {
+            count: 1,
+            sum: 49_000,
+            min: 49_000,
+            max: 49_000,
+            p50: 49_000,
+            p95: 49_000,
+            p99: 49_000,
+        };
         snap.storage.commit_over_80_since_us = now_us - 8_000_000;
+        snap.system.disk_pressure_level = 1;
+        snap.system.disk_last_sample_us = now_us - 1_000_000;
+        snap.system.memory_pressure_level = 0;
 
         let signals = HealthSignals::from_snapshot(&snap, now_us);
 
@@ -816,9 +1092,14 @@ mod tests {
         assert_eq!(signals.pool_utilization_pct, 77);
         assert_eq!(signals.pool_over_80_for_s, 42);
         assert_eq!(signals.wbq_depth_pct, 75);
+        assert_eq!(signals.wbq_queue_p95_us, 44_000);
         assert_eq!(signals.wbq_over_80_for_s, 5);
         assert_eq!(signals.commit_depth_pct, 50);
+        assert_eq!(signals.commit_queue_p95_us, 49_000);
         assert_eq!(signals.commit_over_80_for_s, 8);
+        assert_eq!(signals.disk_pressure_level, 1);
+        assert!(!signals.disk_pressure_stale);
+        assert_eq!(signals.memory_pressure_level, 0);
         assert_eq!(signals.classify(), HealthLevel::Yellow);
     }
 
@@ -841,6 +1122,38 @@ mod tests {
         let signals = HealthSignals::from_snapshot(&snap, now_us);
 
         assert_eq!(signals.pool_acquire_p95_us, 0);
+        assert_eq!(signals.classify(), HealthLevel::Green);
+    }
+
+    #[test]
+    fn health_signals_ignore_drained_queue_latency() {
+        let mut snap = GlobalMetrics::default().snapshot();
+        let now_us = 1_000_000_000;
+        snap.storage.wbq_depth = 0;
+        snap.storage.wbq_queue_latency_us = HistogramSnapshot {
+            count: 1,
+            sum: red::QUEUE_WAIT_P95_US,
+            min: red::QUEUE_WAIT_P95_US,
+            max: red::QUEUE_WAIT_P95_US,
+            p50: red::QUEUE_WAIT_P95_US,
+            p95: red::QUEUE_WAIT_P95_US,
+            p99: red::QUEUE_WAIT_P95_US,
+        };
+        snap.storage.commit_pending_requests = 0;
+        snap.storage.commit_queue_latency_us = HistogramSnapshot {
+            count: 1,
+            sum: red::QUEUE_WAIT_P95_US,
+            min: red::QUEUE_WAIT_P95_US,
+            max: red::QUEUE_WAIT_P95_US,
+            p50: red::QUEUE_WAIT_P95_US,
+            p95: red::QUEUE_WAIT_P95_US,
+            p99: red::QUEUE_WAIT_P95_US,
+        };
+
+        let signals = HealthSignals::from_snapshot(&snap, now_us);
+
+        assert_eq!(signals.wbq_queue_p95_us, 0);
+        assert_eq!(signals.commit_queue_p95_us, 0);
         assert_eq!(signals.classify(), HealthLevel::Green);
     }
 
@@ -871,6 +1184,25 @@ mod tests {
         let signals = HealthSignals::from_snapshot(&snap, now_us);
         assert_eq!(signals.wbq_depth_pct, 0);
         assert_eq!(signals.commit_depth_pct, 0);
+        assert_eq!(signals.classify(), HealthLevel::Green);
+    }
+
+    #[test]
+    fn stale_resource_pressure_falls_back_to_green() {
+        let mut snap = GlobalMetrics::default().snapshot();
+        let now_us = 1_000_000_000;
+        snap.system.disk_pressure_level = 3;
+        snap.system.disk_last_sample_us =
+            now_us - (RESOURCE_PRESSURE_STALE_AFTER_S + 1) * 1_000_000;
+        snap.system.memory_pressure_level = 2;
+        snap.system.memory_last_sample_us = 0;
+
+        let signals = HealthSignals::from_snapshot(&snap, now_us);
+
+        assert_eq!(signals.disk_pressure_level, 0);
+        assert!(signals.disk_pressure_stale);
+        assert_eq!(signals.memory_pressure_level, 0);
+        assert!(signals.memory_pressure_stale);
         assert_eq!(signals.classify(), HealthLevel::Green);
     }
 
@@ -934,9 +1266,15 @@ mod tests {
             pool_utilization_pct: red::POOL_UTIL_PCT,
             pool_over_80_for_s: red::OVER_80_DURATION_S,
             wbq_depth_pct: red::WBQ_DEPTH_PCT,
+            wbq_queue_p95_us: red::QUEUE_WAIT_P95_US,
             wbq_over_80_for_s: red::OVER_80_DURATION_S,
             commit_depth_pct: red::COMMIT_DEPTH_PCT,
+            commit_queue_p95_us: red::QUEUE_WAIT_P95_US,
             commit_over_80_for_s: red::OVER_80_DURATION_S,
+            disk_pressure_level: red::RESOURCE_PRESSURE_LEVEL,
+            disk_pressure_stale: false,
+            memory_pressure_level: red::RESOURCE_PRESSURE_LEVEL,
+            memory_pressure_stale: false,
         };
         assert_eq!(s.classify(), HealthLevel::Red);
     }
@@ -973,6 +1311,64 @@ mod tests {
         assert!(!HealthLevel::Red.should_shed(is_shedable_tool("health_check")));
         assert!(!HealthLevel::Red.should_shed(is_shedable_tool("fetch_inbox")));
         assert!(!HealthLevel::Red.should_shed(is_shedable_tool("file_reservation_paths")));
+    }
+
+    #[test]
+    fn capacity_governor_observes_before_enforcing_shed() {
+        let signals = default_signals();
+
+        let yellow = capacity_governor_decision_from_parts(
+            "search_messages",
+            HealthLevel::Yellow,
+            signals.clone(),
+            false,
+        );
+        assert_eq!(yellow.action, CapacityAction::Defer);
+        assert!(!yellow.enforced);
+        assert!(!yellow.should_shed());
+
+        let red_shadow = capacity_governor_decision_from_parts(
+            "search_messages",
+            HealthLevel::Red,
+            signals.clone(),
+            false,
+        );
+        assert_eq!(red_shadow.action, CapacityAction::Downgrade);
+        assert!(!red_shadow.enforced);
+        assert!(!red_shadow.should_shed());
+
+        let red_enforced = capacity_governor_decision_from_parts(
+            "search_messages",
+            HealthLevel::Red,
+            signals,
+            true,
+        );
+        assert_eq!(red_enforced.action, CapacityAction::Shed);
+        assert!(red_enforced.enforced);
+        assert!(red_enforced.should_shed());
+    }
+
+    #[test]
+    fn capacity_governor_protects_critical_mutations_under_red() {
+        let decision = capacity_governor_decision_from_parts(
+            "send_message",
+            HealthLevel::Red,
+            default_signals(),
+            true,
+        );
+
+        assert_eq!(decision.action, CapacityAction::Accept);
+        assert!(!decision.tool_is_shedable);
+        assert!(!decision.enforced);
+        assert!(!decision.should_shed());
+    }
+
+    #[test]
+    fn capacity_action_display_is_stable_for_robot_output() {
+        assert_eq!(CapacityAction::Accept.to_string(), "accept");
+        assert_eq!(CapacityAction::Defer.to_string(), "defer");
+        assert_eq!(CapacityAction::Downgrade.to_string(), "downgrade");
+        assert_eq!(CapacityAction::Shed.to_string(), "shed");
     }
 
     #[test]

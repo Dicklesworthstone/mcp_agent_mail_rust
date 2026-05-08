@@ -32,7 +32,7 @@ am flags off TUI_EFFECTS
 | `ACK_TTL_ENABLED` | `ACK_TTL_ENABLED` | `false` | stable | no | Overdue-ack scanning and warnings |
 | `ATC_LEARNING_DISABLED` | `ATC_LEARNING_DISABLED` | `false` | stable | yes | ATC learning kill switch |
 | `ATC_WRITE_MODE` | `AM_ATC_WRITE_MODE` | `off` | experimental | no | ATC persistence mode (`off|shadow|live`) |
-| `BACKPRESSURE_SHEDDING_ENABLED` | `BACKPRESSURE_SHEDDING_ENABLED` | `false` | experimental | no | Load shedding under degraded health |
+| `BACKPRESSURE_SHEDDING_ENABLED` | `BACKPRESSURE_SHEDDING_ENABLED` | `false` | experimental | no | Capacity-governor shedding for low-priority reads under red health |
 | `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED` | `HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED` | `false` | experimental | no | Local development auth bypass |
 | `LLM_ENABLED` | `LLM_ENABLED` | `false` | experimental | no | LLM-backed features |
 | `NOTIFICATIONS_ENABLED` | `NOTIFICATIONS_ENABLED` | `false` | stable | no | Filesystem notification signals |
@@ -46,5 +46,8 @@ am flags off TUI_EFFECTS
 ### Notes
 
 - `ATC_LEARNING_DISABLED` takes precedence over `ATC_WRITE_MODE`.
+- `BACKPRESSURE_SHEDDING_ENABLED=false` keeps the capacity governor in shadow mode:
+  robot health still reports `defer`/`downgrade` recommendations for shedable
+  reads, but dispatch only rejects them when the flag is explicitly enabled.
 - `WORKTREES_ENABLED` may also be implied by `GIT_IDENTITY_ENABLED`; the registry reports the effective state.
 - `TUI_EFFECTS` and `ATC_LEARNING_DISABLED` are the first dynamically writable flags because they already use the persisted operator envfile path. The rest of the registry is intentionally read-first until more hot-reload plumbing exists.

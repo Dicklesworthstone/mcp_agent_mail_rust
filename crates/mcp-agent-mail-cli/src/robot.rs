@@ -9457,19 +9457,44 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 });
             }
 
-            // 3. Health level (backpressure)
-            let (health_level, signals) =
-                mcp_agent_mail_core::backpressure::compute_health_level_with_signals();
-            let health_str = format!("{health_level:?}").to_lowercase();
+            // 3. Capacity governor / health level (backpressure)
+            let capacity_decision =
+                mcp_agent_mail_core::backpressure::compute_capacity_governor_decision(
+                    "search_messages",
+                );
+            let health_str = capacity_decision.health_level.to_string();
+            let signals = &capacity_decision.signals;
             let backpressure_degraded = health_str != "green";
             let backpressure_unhealthy = health_str == "red";
+            let disk_stale = if signals.disk_pressure_stale {
+                ":stale"
+            } else {
+                ""
+            };
+            let memory_stale = if signals.memory_pressure_stale {
+                ":stale"
+            } else {
+                ""
+            };
             probes.push(HealthProbe {
                 name: "backpressure".into(),
                 status: health_str.clone(),
                 latency_ms: 0.0,
                 detail: format!(
-                    "pool={}% wbq={}% commit={}%",
-                    signals.pool_utilization_pct, signals.wbq_depth_pct, signals.commit_depth_pct
+                    "decision={} enforced={} shedable={} pool={}% wbq={}% commit={}% \
+                     wbq_wait_p95_us={} commit_wait_p95_us={} disk={}{} memory={}{}",
+                    capacity_decision.action,
+                    capacity_decision.enforced,
+                    capacity_decision.tool_is_shedable,
+                    signals.pool_utilization_pct,
+                    signals.wbq_depth_pct,
+                    signals.commit_depth_pct,
+                    signals.wbq_queue_p95_us,
+                    signals.commit_queue_p95_us,
+                    signals.disk_pressure_level,
+                    disk_stale,
+                    signals.memory_pressure_level,
+                    memory_stale,
                 ),
             });
 

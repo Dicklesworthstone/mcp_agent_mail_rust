@@ -14702,6 +14702,7 @@ mod tests {
     use super::*;
     use asupersync::http::h1::types::Version as Http1Version;
     use chrono::Utc;
+    use fastmcp::ToolHandler as _;
     use ftui_runtime::stdio_capture::StdioCapture;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -14712,6 +14713,100 @@ mod tests {
     static HEALTH_ROUTE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static HEALTH_COUNT_CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static REDIS_RATE_LIMIT_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    struct NoopTool;
+
+    impl fastmcp::ToolHandler for NoopTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "noop".to_string(),
+                description: Some("test-only no-op tool".to_string()),
+                input_schema: serde_json::json!({ "type": "object" }),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(
+            &self,
+            _ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn with_red_wbq_capacity_metrics<F>(f: F)
+    where
+        F: FnOnce(),
+    {
+        let _lock = TOOL_DISPATCH_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let metrics = mcp_agent_mail_core::global_metrics();
+        let old = metrics.snapshot();
+        let old_shedding = mcp_agent_mail_core::shedding_enabled();
+
+        metrics.storage.wbq_depth.set(100);
+        metrics.storage.wbq_capacity.set(100);
+        metrics.storage.wbq_over_80_since_us.set(0);
+        metrics.storage.commit_pending_requests.set(0);
+        metrics.storage.commit_soft_cap.set(100);
+        metrics.storage.commit_over_80_since_us.set(0);
+        metrics.db.pool_total_connections.set(100);
+        metrics.db.pool_idle_connections.set(100);
+        metrics.db.pool_active_connections.set(0);
+        metrics.db.pool_pending_requests.set(0);
+        metrics.db.pool_over_80_since_us.set(0);
+        mcp_agent_mail_core::set_shedding_enabled(true);
+        let _ = mcp_agent_mail_core::refresh_health_level();
+
+        f();
+
+        metrics.storage.wbq_depth.set(old.storage.wbq_depth);
+        metrics.storage.wbq_capacity.set(old.storage.wbq_capacity);
+        metrics
+            .storage
+            .wbq_over_80_since_us
+            .set(old.storage.wbq_over_80_since_us);
+        metrics
+            .storage
+            .commit_pending_requests
+            .set(old.storage.commit_pending_requests);
+        metrics
+            .storage
+            .commit_soft_cap
+            .set(old.storage.commit_soft_cap);
+        metrics
+            .storage
+            .commit_over_80_since_us
+            .set(old.storage.commit_over_80_since_us);
+        metrics
+            .db
+            .pool_total_connections
+            .set(old.db.pool_total_connections);
+        metrics
+            .db
+            .pool_idle_connections
+            .set(old.db.pool_idle_connections);
+        metrics
+            .db
+            .pool_active_connections
+            .set(old.db.pool_active_connections);
+        metrics
+            .db
+            .pool_pending_requests
+            .set(old.db.pool_pending_requests);
+        metrics
+            .db
+            .pool_over_80_since_us
+            .set(old.db.pool_over_80_since_us);
+        mcp_agent_mail_core::set_shedding_enabled(old_shedding);
+        let _ = mcp_agent_mail_core::refresh_health_level();
+    }
 
     /// Regression test: Budget deadline must be relative to `wall_now()`, not absolute.
     ///
@@ -14773,6 +14868,35 @@ mod tests {
              wall_now()={now:?} is always > 0 (the absolute deadline). \
              This demonstrates why with_deadline_secs is WRONG for relative timeouts.",
         );
+    }
+
+    #[test]
+    fn dispatch_backpressure_sheds_low_priority_before_critical_mutations() {
+        with_red_wbq_capacity_metrics(|| {
+            let ctx = McpContext::new(Cx::for_testing(), 1);
+            let low_priority = InstrumentedTool {
+                tool_index: 0,
+                tool_name: "search_messages",
+                inner: NoopTool,
+            };
+            let critical_mutation = InstrumentedTool {
+                tool_index: 0,
+                tool_name: "send_message",
+                inner: NoopTool,
+            };
+
+            let low_priority_error = low_priority
+                .call(&ctx, serde_json::json!({}))
+                .expect_err("shedable read should be rejected under red enforced capacity");
+            let low_priority_error = format!("{low_priority_error:?}");
+            assert!(low_priority_error.contains("Server overloaded"));
+            assert!(low_priority_error.contains("search_messages"));
+
+            let critical_result = critical_mutation
+                .call(&ctx, serde_json::json!({}))
+                .expect("critical message mutation should not be shed");
+            assert!(critical_result.is_empty());
+        });
     }
 
     #[test]

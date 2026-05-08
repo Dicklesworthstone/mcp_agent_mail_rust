@@ -440,6 +440,38 @@ DATABASE_POOL_SIZE=10 DATABASE_MAX_OVERFLOW=20 am serve-http
 # Check memory pressure on System Health screen (8)
 ```
 
+### Capacity governor warnings
+
+**Symptom:** `am robot health` shows the `backpressure` probe as `yellow` or
+`red`, with a detail like `decision=defer`, `decision=downgrade`, or
+`decision=shed`.
+
+**Model:** The governor combines DB pool pressure, WBQ depth, commit-coalescer
+depth, queue wait p95, disk pressure, and RSS pressure. Missing or stale
+disk/RSS samples are ignored so the system falls back to the older static
+queue/pool behavior instead of pinning itself in a stale overload state.
+
+**Policy:** Coordination-critical mutations such as `send_message`,
+reservations, acknowledgements, contacts writes, and build-slot writes remain
+accepted. Low-priority read paths such as search, summarization, `whois`,
+`list_contacts`, and product-bus reads are the only shedable class.
+
+**Fix:**
+```bash
+# Inspect the decision and raw signals.
+AM_INTERFACE_MODE=cli am robot health --format json
+
+# Confirm queue and storage pressure.
+AM_INTERFACE_MODE=cli am robot metrics --format json
+
+# Enforce shedding only after confirming callers can tolerate retries.
+BACKPRESSURE_SHEDDING_ENABLED=true am serve-http
+```
+
+Leave `BACKPRESSURE_SHEDDING_ENABLED=false` for shadow mode. In shadow mode the
+probe still reports the admission recommendation, but dispatch does not reject
+shedable reads.
+
 ### Git index.lock contention
 
 **Symptom:** `index.lock` errors in logs during high-throughput commits
