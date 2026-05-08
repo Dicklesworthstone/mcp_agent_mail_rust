@@ -54,6 +54,29 @@ WORK="$(e2e_mktemp "e2e_guard_live")"
 GUARD_DB="${WORK}/guard_live.sqlite3"
 REPO="${WORK}/repo"
 PROJECT_PATH="${REPO}"
+STORAGE_ROOT="${WORK}/storage_root"
+export STORAGE_ROOT
+mkdir -p "${STORAGE_ROOT}"
+e2e_log "Storage root: ${STORAGE_ROOT}"
+
+PROJECT_SLUG="$(python3 - "${PROJECT_PATH}" <<'PY'
+import sys
+
+value = sys.argv[1].strip().lower()
+out = []
+prev_dash = False
+for ch in value:
+    if ("a" <= ch <= "z") or ("0" <= ch <= "9"):
+        out.append(ch)
+        prev_dash = False
+    elif not prev_dash:
+        out.append("-")
+        prev_dash = True
+slug = "".join(out).strip("-")
+print(slug or "project")
+PY
+)"
+ARCHIVE_PROJECT_ROOT="${STORAGE_ROOT}/projects/${PROJECT_SLUG}"
 
 INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"e2e-guard-live","version":"1.0"}}}'
 
@@ -72,42 +95,111 @@ e2e_git_commit "$REPO" "initial commit"
 # Helpers
 # ---------------------------------------------------------------------------
 
+MCP_OUTPUT_FILE=""
+MCP_STDERR_FILE=""
+MCP_FIFO=""
+MCP_PID=""
+MCP_INITIALIZED=0
+MCP_LAST_RESPONSE=""
+
+cleanup_shared_mcp() {
+    exec 3>&- 2>/dev/null || true
+    if [ -n "${MCP_PID:-}" ]; then
+        kill "$MCP_PID" 2>/dev/null || true
+        wait "$MCP_PID" 2>/dev/null || true
+        MCP_PID=""
+    fi
+    MCP_INITIALIZED=0
+}
+
+trap 'cleanup_shared_mcp; _e2e_cleanup' EXIT
+
+jsonrpc_request_id() {
+    python3 -c 'import json, sys; print(json.loads(sys.stdin.read()).get("id", ""))' 2>/dev/null
+}
+
+wait_for_jsonrpc_response() {
+    local req_id="$1"
+    local label="$2"
+
+    for _ in $(seq 1 100); do
+        if python3 - "$MCP_OUTPUT_FILE" "$req_id" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+req_id = sys.argv[2]
+if not path.is_file():
+    sys.exit(1)
+
+for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+    try:
+        data = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if str(data.get("id", "")) == req_id:
+        sys.exit(0)
+sys.exit(1)
+PY
+        then
+            return 0
+        fi
+        sleep 0.1
+    done
+
+    e2e_fail "${label}: MCP response id ${req_id} timed out"
+    e2e_save_artifact "${label//[^A-Za-z0-9_]/_}_mcp_stdout.txt" \
+        "$(cat "$MCP_OUTPUT_FILE" 2>/dev/null || true)"
+    e2e_save_artifact "${label//[^A-Za-z0-9_]/_}_mcp_stderr.txt" \
+        "$(cat "$MCP_STDERR_FILE" 2>/dev/null || true)"
+    return 1
+}
+
+start_shared_mcp_session() {
+    local db_path="$1"
+
+    if [ -n "${MCP_PID:-}" ] && kill -0 "$MCP_PID" 2>/dev/null; then
+        return 0
+    fi
+
+    local srv_work
+    srv_work="$(mktemp -d "${WORK}/srv.shared.XXXXXX")"
+    MCP_OUTPUT_FILE="${srv_work}/stdout.txt"
+    MCP_STDERR_FILE="${srv_work}/stderr.txt"
+    MCP_FIFO="${srv_work}/stdin_fifo"
+    mkfifo "$MCP_FIFO"
+
+    DATABASE_URL="sqlite:////${db_path}" RUST_LOG="${RUST_LOG:-error}" \
+        am serve-stdio < "$MCP_FIFO" > "$MCP_OUTPUT_FILE" 2>"$MCP_STDERR_FILE" &
+    MCP_PID=$!
+    exec 3>"$MCP_FIFO"
+    sleep 0.3
+}
+
 send_jsonrpc_session() {
     local db_path="$1"; shift
     local requests=("$@")
-    local output_file
-    output_file="$(mktemp "${WORK}/session_resp.XXXXXX")"
-    local srv_work
-    srv_work="$(mktemp -d "${WORK}/srv.XXXXXX")"
-    local fifo="${srv_work}/stdin_fifo"
-    mkfifo "$fifo"
+    start_shared_mcp_session "$db_path"
 
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
-        am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
-    local srv_pid=$!
-    sleep 0.3
+    for req in "${requests[@]}"; do
+        if [ "$req" = "$INIT_REQ" ]; then
+            if [ "$MCP_INITIALIZED" = "0" ]; then
+                echo "$req" >&3
+                wait_for_jsonrpc_response "1" "initialize" || return 1
+                MCP_INITIALIZED=1
+            fi
+            continue
+        fi
 
-    {
-        for req in "${requests[@]}"; do
-            echo "$req"
-            sleep 0.15
-        done
-    } > "$fifo" &
-    local write_pid=$!
-
-    local timeout_s=30
-    local elapsed=0
-    while [ "$elapsed" -lt "$timeout_s" ]; do
-        if ! kill -0 "$srv_pid" 2>/dev/null; then break; fi
-        sleep 0.5
-        elapsed=$((elapsed + 1))
+        local req_id
+        req_id="$(printf '%s' "$req" | jsonrpc_request_id)"
+        echo "$req" >&3
+        sleep 0.15
+        wait_for_jsonrpc_response "$req_id" "request_${req_id}" || return 1
     done
 
-    wait "$write_pid" 2>/dev/null || true
-    kill "$srv_pid" 2>/dev/null || true
-    wait "$srv_pid" 2>/dev/null || true
-
-    [ -f "$output_file" ] && cat "$output_file"
+    MCP_LAST_RESPONSE="$(cat "$MCP_OUTPUT_FILE" 2>/dev/null || true)"
 }
 
 extract_result() {
@@ -153,17 +245,84 @@ print('false')
 " 2>/dev/null
 }
 
+wait_for_archive_project() {
+    local label="$1"
+
+    for _ in $(seq 1 50); do
+        if [ -d "${ARCHIVE_PROJECT_ROOT}" ]; then
+            e2e_log "${label}: archive project visible"
+            return 0
+        fi
+        sleep 0.2
+    done
+
+    e2e_fail "${label}: archive project did not become visible"
+    e2e_save_artifact "${label//[^A-Za-z0-9_]/_}_archive_tree.txt" \
+        "$(find "${STORAGE_ROOT}" -maxdepth 4 -type d -print 2>&1 || true)"
+}
+
+wait_for_reservation_artifact() {
+    local label="$1"
+    local pattern="$2"
+    local state="$3"
+
+    for _ in $(seq 1 50); do
+        if python3 - "${ARCHIVE_PROJECT_ROOT}" "${pattern}" "${state}" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+pattern = sys.argv[2]
+state = sys.argv[3]
+reservations_dir = root / "file_reservations"
+if not reservations_dir.is_dir():
+    sys.exit(1)
+
+found_pattern = False
+for path in reservations_dir.glob("*.json"):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        continue
+    if data.get("path_pattern") != pattern:
+        continue
+    found_pattern = True
+    released = data.get("released_ts") not in (None, "", 0, "0", "null")
+    if state == "active" and not released:
+        sys.exit(0)
+    if state == "released" and released:
+        sys.exit(0)
+    if state == "absent_or_released" and released:
+        sys.exit(0)
+
+if state == "absent_or_released" and not found_pattern:
+    sys.exit(0)
+sys.exit(1)
+PY
+        then
+            e2e_log "${label}: reservation ${state} artifact visible for ${pattern}"
+            return 0
+        fi
+        sleep 0.2
+    done
+
+    e2e_fail "${label}: reservation ${state} artifact not visible for ${pattern}"
+    e2e_save_artifact "${label//[^A-Za-z0-9_]/_}_reservations.txt" \
+        "$(find "${ARCHIVE_PROJECT_ROOT}/file_reservations" -maxdepth 1 -type f -print -exec cat {} \; 2>&1 || true)"
+}
+
 # ===========================================================================
 # Setup: create project + agents via MCP
 # ===========================================================================
 e2e_case_banner "Setup: project + agents via MCP"
 
-SETUP_RESP="$(send_jsonrpc_session "$GUARD_DB" \
+send_jsonrpc_session "$GUARD_DB" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"ensure_project\",\"arguments\":{\"human_key\":\"${PROJECT_PATH}\"}}}" \
     "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"RedFox\",\"project_key\":\"${PROJECT_PATH}\",\"program\":\"test\",\"model\":\"test\"}}}" \
-    "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"BlueLake\",\"project_key\":\"${PROJECT_PATH}\",\"program\":\"test\",\"model\":\"test\"}}}" \
-)"
+    "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\",\"params\":{\"name\":\"register_agent\",\"arguments\":{\"name\":\"BlueLake\",\"project_key\":\"${PROJECT_PATH}\",\"program\":\"test\",\"model\":\"test\"}}}"
+SETUP_RESP="$MCP_LAST_RESPONSE"
 e2e_save_artifact "setup.txt" "$SETUP_RESP"
 
 SETUP_OK=true
@@ -180,6 +339,7 @@ else
     e2e_summary
     exit 1
 fi
+wait_for_archive_project "setup"
 
 # Install guard hook — set DATABASE_URL so the hook embeds the DB path
 set +e
@@ -198,10 +358,10 @@ e2e_assert_file_exists "hook plugin exists" "${HOOKS_DIR}/hooks.d/pre-commit/50-
 e2e_case_banner "precommit_blocks_mcp_reservation"
 
 # Create exclusive reservation via MCP tool (BlueLake reserves app/api/views.py)
-RES1_RESP="$(send_jsonrpc_session "$GUARD_DB" \
+send_jsonrpc_session "$GUARD_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"BlueLake\",\"paths\":[\"app/api/views.py\"],\"exclusive\":true,\"ttl_seconds\":3600,\"reason\":\"Working on API views\"}}}" \
-)"
+    "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"BlueLake\",\"paths\":[\"app/api/views.py\"],\"exclusive\":true,\"ttl_seconds\":3600,\"reason\":\"Working on API views\"}}}"
+RES1_RESP="$MCP_LAST_RESPONSE"
 e2e_save_artifact "case_01_reserve.txt" "$RES1_RESP"
 
 if [ "$(is_error_result "$RES1_RESP" 20)" = "true" ]; then
@@ -209,6 +369,7 @@ if [ "$(is_error_result "$RES1_RESP" 20)" = "true" ]; then
 else
     e2e_pass "case1: exclusive reservation created via MCP"
 fi
+wait_for_reservation_artifact "case1" "app/api/views.py" "active"
 
 # Stage a conflicting change and attempt commit (RedFox)
 echo "# modified by RedFox" >> "$REPO/app/api/views.py"
@@ -247,10 +408,10 @@ e2e_save_artifact "case_02_stderr.txt" "$(cat "${WORK}/case2_stderr.txt" 2>/dev/
 e2e_case_banner "precommit_after_release"
 
 # Release via MCP tool
-REL_RESP="$(send_jsonrpc_session "$GUARD_DB" \
+send_jsonrpc_session "$GUARD_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\":{\"name\":\"release_file_reservations\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"BlueLake\",\"paths\":[\"app/api/views.py\"]}}}" \
-)"
+    "{\"jsonrpc\":\"2.0\",\"id\":30,\"method\":\"tools/call\",\"params\":{\"name\":\"release_file_reservations\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"BlueLake\",\"paths\":[\"app/api/views.py\"]}}}"
+REL_RESP="$MCP_LAST_RESPONSE"
 e2e_save_artifact "case_03_release.txt" "$REL_RESP"
 
 if [ "$(is_error_result "$REL_RESP" 30)" = "true" ]; then
@@ -258,6 +419,7 @@ if [ "$(is_error_result "$REL_RESP" 30)" = "true" ]; then
 else
     e2e_pass "case3: release_file_reservations succeeded"
 fi
+wait_for_reservation_artifact "case3" "app/api/views.py" "absent_or_released"
 
 # Stage new change and commit as RedFox — should pass now
 echo "# second modification by RedFox" >> "$REPO/app/api/views.py"
@@ -278,10 +440,10 @@ e2e_save_artifact "case_03_stderr.txt" "$(cat "${WORK}/case3_stderr.txt" 2>/dev/
 e2e_case_banner "precommit_glob_pattern"
 
 # Create glob-pattern reservation via MCP (BlueLake reserves app/api/*.py)
-RES4_RESP="$(send_jsonrpc_session "$GUARD_DB" \
+send_jsonrpc_session "$GUARD_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"BlueLake\",\"paths\":[\"app/api/*.py\"],\"exclusive\":true,\"ttl_seconds\":3600,\"reason\":\"Working on all API files\"}}}" \
-)"
+    "{\"jsonrpc\":\"2.0\",\"id\":40,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"BlueLake\",\"paths\":[\"app/api/*.py\"],\"exclusive\":true,\"ttl_seconds\":3600,\"reason\":\"Working on all API files\"}}}"
+RES4_RESP="$MCP_LAST_RESPONSE"
 e2e_save_artifact "case_04_reserve.txt" "$RES4_RESP"
 
 if [ "$(is_error_result "$RES4_RESP" 40)" = "true" ]; then
@@ -289,6 +451,7 @@ if [ "$(is_error_result "$RES4_RESP" 40)" = "true" ]; then
 else
     e2e_pass "case4: glob pattern reservation created"
 fi
+wait_for_reservation_artifact "case4" "app/api/*.py" "active"
 
 # Stage change to app/api/models.py (matches glob app/api/*.py) and commit as RedFox
 echo "# modified by RedFox" >> "$REPO/app/api/models.py"
@@ -342,13 +505,15 @@ fi
 e2e_log "force-releasing reservation ID: $RES4_ID"
 
 # Force-release via MCP tool (RedFox force-releases BlueLake's glob reservation)
-# Set inactivity threshold to 0 so the recently-created reservation is considered stale
+# Restart the shared stdio server with short inactivity thresholds so the
+# recently-created reservation is considered stale by the server-side config.
+cleanup_shared_mcp
 export FILE_RESERVATION_INACTIVITY_SECONDS=0
 export FILE_RESERVATION_ACTIVITY_GRACE_SECONDS=0
-FREL_RESP="$(send_jsonrpc_session "$GUARD_DB" \
+send_jsonrpc_session "$GUARD_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"RedFox\",\"file_reservation_id\":${RES4_ID},\"note\":\"Needed urgently\"}}}" \
-)"
+    "{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"tools/call\",\"params\":{\"name\":\"force_release_file_reservation\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"RedFox\",\"file_reservation_id\":${RES4_ID},\"note\":\"Needed urgently\"}}}"
+FREL_RESP="$MCP_LAST_RESPONSE"
 e2e_save_artifact "case_05_force_release.txt" "$FREL_RESP"
 
 if [ "$(is_error_result "$FREL_RESP" 50)" = "true" ]; then
@@ -357,6 +522,7 @@ else
     e2e_pass "case5: force_release_file_reservation succeeded"
 fi
 unset FILE_RESERVATION_INACTIVITY_SECONDS FILE_RESERVATION_ACTIVITY_GRACE_SECONDS
+wait_for_reservation_artifact "case5" "app/api/*.py" "absent_or_released"
 
 # Now commit the previously conflicting file — should pass
 echo "# modified after force-release" >> "$REPO/app/api/models.py"
@@ -377,10 +543,10 @@ e2e_save_artifact "case_05_stderr.txt" "$(cat "${WORK}/case5_stderr.txt" 2>/dev/
 e2e_case_banner "precommit_rename_scenario"
 
 # Create reservation on the original file path via MCP
-RES6_RESP="$(send_jsonrpc_session "$GUARD_DB" \
+send_jsonrpc_session "$GUARD_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"BlueLake\",\"paths\":[\"lib/original_module.py\"],\"exclusive\":true,\"ttl_seconds\":3600,\"reason\":\"Refactoring module\"}}}" \
-)"
+    "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${PROJECT_PATH}\",\"agent_name\":\"BlueLake\",\"paths\":[\"lib/original_module.py\"],\"exclusive\":true,\"ttl_seconds\":3600,\"reason\":\"Refactoring module\"}}}"
+RES6_RESP="$MCP_LAST_RESPONSE"
 e2e_save_artifact "case_06_reserve.txt" "$RES6_RESP"
 
 if [ "$(is_error_result "$RES6_RESP" 60)" = "true" ]; then
@@ -388,6 +554,7 @@ if [ "$(is_error_result "$RES6_RESP" 60)" = "true" ]; then
 else
     e2e_pass "case6: reservation on original path created"
 fi
+wait_for_reservation_artifact "case6" "lib/original_module.py" "active"
 
 # Stage a rename in git
 git -C "$REPO" mv lib/original_module.py lib/renamed_module.py

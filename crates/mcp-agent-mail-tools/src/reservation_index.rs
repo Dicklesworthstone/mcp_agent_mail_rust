@@ -56,6 +56,13 @@ pub(crate) struct ReservationIndex {
     root_globs: Vec<(Arc<CompiledPattern>, ReservationRef)>,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ScanStats {
+    exact_paths: usize,
+    prefixed_globs: usize,
+    root_globs: usize,
+}
+
 impl ReservationIndex {
     /// Build an index from an iterator of `(raw_pattern, reservation_ref)` pairs.
     pub fn build(reservations: impl Iterator<Item = (String, ReservationRef)>) -> Self {
@@ -100,6 +107,26 @@ impl ReservationIndex {
         request_pat: &CompiledPattern,
         conflicts: &mut Vec<&'a ReservationRef>,
     ) {
+        self.find_conflicts_inner::<false>(request_pat, conflicts, &mut None);
+    }
+
+    #[cfg(test)]
+    fn find_conflicts_with_stats<'a>(
+        &'a self,
+        request_pat: &CompiledPattern,
+        conflicts: &mut Vec<&'a ReservationRef>,
+    ) -> ScanStats {
+        let mut stats = ScanStats::default();
+        self.find_conflicts_inner::<true>(request_pat, conflicts, &mut Some(&mut stats));
+        stats
+    }
+
+    fn find_conflicts_inner<'a, const COUNT_STATS: bool>(
+        &'a self,
+        request_pat: &CompiledPattern,
+        conflicts: &mut Vec<&'a ReservationRef>,
+        stats: &mut Option<&mut ScanStats>,
+    ) {
         conflicts.clear();
         let req_norm = request_pat.normalized();
         let req_is_glob = request_pat.is_glob();
@@ -109,14 +136,21 @@ impl ReservationIndex {
             // Glob request: must scan relevant prefix groups + root for both
             // exact and glob reservations, because a glob request can overlap
             // exact paths via one-directional matching.
-            self.scan_glob_request(request_pat, req_prefix, conflicts);
+            self.scan_glob_request::<COUNT_STATS>(request_pat, req_prefix, conflicts, stats);
         } else {
             // Exact request path: check for exact equality + overlapping globs.
-            self.scan_exact_request(request_pat, req_norm, req_prefix, conflicts);
+            self.scan_exact_request::<COUNT_STATS>(
+                request_pat,
+                req_norm,
+                req_prefix,
+                conflicts,
+                stats,
+            );
         }
 
         // Always check root-level globs.
         for (res_pat, rref) in &self.root_globs {
+            note_root_glob_entry::<COUNT_STATS>(stats);
             if res_pat.overlaps(request_pat) {
                 conflicts.push(rref);
             }
@@ -124,15 +158,17 @@ impl ReservationIndex {
     }
 
     /// Scan for conflicts when the request is an exact path (no glob chars).
-    fn scan_exact_request<'a>(
+    fn scan_exact_request<'a, const COUNT_STATS: bool>(
         &'a self,
         request_pat: &CompiledPattern,
         req_norm: &str,
         req_prefix: Option<&str>,
         conflicts: &mut Vec<&'a ReservationRef>,
+        stats: &mut Option<&mut ScanStats>,
     ) {
         let route_norm = routing_key(req_norm);
         if let Some(entries) = self.exact_by_path.get(&route_norm) {
+            note_exact_entries::<COUNT_STATS>(stats, entries.len());
             for (_, rref) in entries {
                 conflicts.push(rref);
             }
@@ -142,6 +178,7 @@ impl ReservationIndex {
         if !req_norm.is_empty() {
             let route_root = routing_key("");
             if let Some(entries) = self.exact_by_path.get(&route_root) {
+                note_exact_entries::<COUNT_STATS>(stats, entries.len());
                 for (_, rref) in entries {
                     conflicts.push(rref);
                 }
@@ -152,6 +189,7 @@ impl ReservationIndex {
             let ancestor = &req_norm[..slash_idx];
             let route_ancestor = routing_key(ancestor);
             if let Some(entries) = self.exact_by_path.get(&route_ancestor) {
+                note_exact_entries::<COUNT_STATS>(stats, entries.len());
                 for (_, rref) in entries {
                     conflicts.push(rref);
                 }
@@ -163,6 +201,7 @@ impl ReservationIndex {
                 if !path.starts_with(&descendant_prefix) {
                     break;
                 }
+                note_exact_entries::<COUNT_STATS>(stats, entries.len());
                 for (_, rref) in entries {
                     conflicts.push(rref);
                 }
@@ -173,6 +212,7 @@ impl ReservationIndex {
             let route_prefix = routing_key(prefix);
             if let Some(entries) = self.globs_by_prefix.get(&route_prefix) {
                 for (res_pat, rref) in entries {
+                    note_glob_entry::<COUNT_STATS>(stats);
                     if res_pat.overlaps(request_pat) {
                         conflicts.push(rref);
                     }
@@ -181,6 +221,7 @@ impl ReservationIndex {
         } else {
             for entries in self.globs_by_prefix.values() {
                 for (res_pat, rref) in entries {
+                    note_glob_entry::<COUNT_STATS>(stats);
                     if res_pat.overlaps(request_pat) {
                         conflicts.push(rref);
                     }
@@ -193,11 +234,12 @@ impl ReservationIndex {
     ///
     /// A glob request like `src/**` can match exact reservations like `src/main.rs`,
     /// so we must scan the exact anchor (`src`) and exact descendants (`src/...`).
-    fn scan_glob_request<'a>(
+    fn scan_glob_request<'a, const COUNT_STATS: bool>(
         &'a self,
         request_pat: &CompiledPattern,
         req_prefix: Option<&str>,
         conflicts: &mut Vec<&'a ReservationRef>,
+        stats: &mut Option<&mut ScanStats>,
     ) {
         if let Some(prefix) = req_prefix {
             let route_prefix = routing_key(prefix);
@@ -205,6 +247,7 @@ impl ReservationIndex {
             // Check ancestors of the prefix (including the prefix itself and root)
             // against exact reservations.
             if let Some(entries) = self.exact_by_path.get(&route_prefix) {
+                note_exact_entries::<COUNT_STATS>(stats, entries.len());
                 for (exact_pat, rref) in entries {
                     if request_pat.matches(exact_pat.normalized())
                         || exact_pat.overlaps(request_pat)
@@ -217,6 +260,7 @@ impl ReservationIndex {
             // Always check root (empty string) ancestor
             let route_root = routing_key("");
             if let Some(entries) = self.exact_by_path.get(&route_root) {
+                note_exact_entries::<COUNT_STATS>(stats, entries.len());
                 for (exact_pat, rref) in entries {
                     if request_pat.matches(exact_pat.normalized())
                         || exact_pat.overlaps(request_pat)
@@ -230,6 +274,7 @@ impl ReservationIndex {
                 let ancestor = &prefix[..slash_idx];
                 let route_ancestor = routing_key(ancestor);
                 if let Some(entries) = self.exact_by_path.get(&route_ancestor) {
+                    note_exact_entries::<COUNT_STATS>(stats, entries.len());
                     for (exact_pat, rref) in entries {
                         if request_pat.matches(exact_pat.normalized())
                             || exact_pat.overlaps(request_pat)
@@ -245,6 +290,7 @@ impl ReservationIndex {
                     if !path.starts_with(&descendant_prefix) {
                         break;
                     }
+                    note_exact_entries::<COUNT_STATS>(stats, entries.len());
                     for (exact_pat, rref) in entries {
                         if request_pat.matches(exact_pat.normalized())
                             || exact_pat.overlaps(request_pat)
@@ -257,6 +303,7 @@ impl ReservationIndex {
 
             if let Some(entries) = self.globs_by_prefix.get(&route_prefix) {
                 for (res_pat, rref) in entries {
+                    note_glob_entry::<COUNT_STATS>(stats);
                     if res_pat.overlaps(request_pat) {
                         conflicts.push(rref);
                     }
@@ -265,6 +312,7 @@ impl ReservationIndex {
         } else {
             // Root glob request (no prefix): must check ALL groups.
             for entries in self.exact_by_path.values() {
+                note_exact_entries::<COUNT_STATS>(stats, entries.len());
                 for (exact_pat, rref) in entries {
                     if request_pat.matches(exact_pat.normalized())
                         || exact_pat.overlaps(request_pat)
@@ -275,12 +323,31 @@ impl ReservationIndex {
             }
             for entries in self.globs_by_prefix.values() {
                 for (res_pat, rref) in entries {
+                    note_glob_entry::<COUNT_STATS>(stats);
                     if res_pat.overlaps(request_pat) {
                         conflicts.push(rref);
                     }
                 }
             }
         }
+    }
+}
+
+fn note_exact_entries<const COUNT_STATS: bool>(stats: &mut Option<&mut ScanStats>, entries: usize) {
+    if COUNT_STATS && let Some(stats) = stats.as_deref_mut() {
+        stats.exact_paths += entries;
+    }
+}
+
+fn note_glob_entry<const COUNT_STATS: bool>(stats: &mut Option<&mut ScanStats>) {
+    if COUNT_STATS && let Some(stats) = stats.as_deref_mut() {
+        stats.prefixed_globs += 1;
+    }
+}
+
+fn note_root_glob_entry<const COUNT_STATS: bool>(stats: &mut Option<&mut ScanStats>) {
+    if COUNT_STATS && let Some(stats) = stats.as_deref_mut() {
+        stats.root_globs += 1;
     }
 }
 
@@ -295,6 +362,7 @@ fn descendant_prefix(norm: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn make_ref(agent_id: i64) -> ReservationRef {
         ReservationRef {
@@ -303,6 +371,184 @@ mod tests {
             exclusive: true,
             expires_ts: 0,
         }
+    }
+
+    fn make_ref_for_pattern(agent_id: i64, pattern: &str) -> ReservationRef {
+        ReservationRef {
+            agent_id,
+            path_pattern: pattern.to_string(),
+            exclusive: true,
+            expires_ts: agent_id,
+        }
+    }
+
+    fn assert_index_matches_exhaustive(
+        reservation_patterns: &[String],
+        request_patterns: &[String],
+    ) {
+        let reservations: Vec<_> = reservation_patterns
+            .iter()
+            .enumerate()
+            .map(|(idx, pattern)| {
+                (
+                    pattern.clone(),
+                    make_ref_for_pattern(
+                        i64::try_from(idx).expect("fixture index fits i64"),
+                        pattern,
+                    ),
+                )
+            })
+            .collect();
+        let index = ReservationIndex::build(reservations.clone().into_iter());
+
+        for request_pattern in request_patterns {
+            let request = CompiledPattern::new(request_pattern);
+            let mut conflicts = Vec::new();
+            index.find_conflicts(&request, &mut conflicts);
+            let mut actual: Vec<i64> = conflicts.iter().map(|rref| rref.agent_id).collect();
+            actual.sort_unstable();
+
+            let mut expected: Vec<i64> = reservations
+                .iter()
+                .filter_map(|(reservation_pattern, rref)| {
+                    CompiledPattern::new(reservation_pattern)
+                        .overlaps(&request)
+                        .then_some(rref.agent_id)
+                })
+                .collect();
+            expected.sort_unstable();
+
+            assert_eq!(
+                actual, expected,
+                "indexed conflicts differed from exhaustive scan for request {request_pattern:?}"
+            );
+        }
+    }
+
+    fn reservation_pattern_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("src".to_string()),
+            Just("src/main.rs".to_string()),
+            Just("src/lib.rs".to_string()),
+            Just("src/**".to_string()),
+            Just("src/**/*.rs".to_string()),
+            Just("src/*.rs".to_string()),
+            Just("src/auth/*".to_string()),
+            Just("src/auth/**/*.rs".to_string()),
+            Just("docs".to_string()),
+            Just("docs/readme.md".to_string()),
+            Just("docs/**".to_string()),
+            Just("*.rs".to_string()),
+            Just("**/*.rs".to_string()),
+            Just("**".to_string()),
+            Just("Cargo.toml".to_string()),
+            Just("./src/main.rs".to_string()),
+            Just("src\\windows.rs".to_string()),
+            Just("[abc".to_string()),
+            (0_usize..48).prop_map(|idx| format!("crate_{idx}/src/lib.rs")),
+            (0_usize..48).prop_map(|idx| format!("crate_{idx}/**/*.rs")),
+            (0_usize..48).prop_map(|idx| format!("crate_{idx}/tests/*.rs")),
+        ]
+    }
+
+    fn request_pattern_strategy() -> impl Strategy<Value = String> {
+        reservation_pattern_strategy()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn generated_index_matches_exhaustive_overlap(
+            reservations in proptest::collection::vec(reservation_pattern_strategy(), 0..64),
+            requests in proptest::collection::vec(request_pattern_strategy(), 1..16),
+        ) {
+            assert_index_matches_exhaustive(&reservations, &requests);
+        }
+    }
+
+    #[test]
+    fn adversarial_index_matches_exhaustive_overlap() {
+        let reservations = vec![
+            String::new(),
+            "src".to_string(),
+            "src/main.rs".to_string(),
+            "src/**".to_string(),
+            "src/**/*.rs".to_string(),
+            "src/auth/*".to_string(),
+            "src/auth/**/*.rs".to_string(),
+            "docs/**".to_string(),
+            "docs/*.md".to_string(),
+            "*.rs".to_string(),
+            "**/*.rs".to_string(),
+            "crates/db/src/schema.rs".to_string(),
+            "crates/**/schema.rs".to_string(),
+            "crates/*/tests/*.rs".to_string(),
+            "./src/main.rs".to_string(),
+            "src\\windows.rs".to_string(),
+            "[abc".to_string(),
+        ];
+        let requests = vec![
+            "src".to_string(),
+            "src/main.rs".to_string(),
+            "src/auth/mod.rs".to_string(),
+            "src/auth/sub/mod.rs".to_string(),
+            "src/*.rs".to_string(),
+            "docs/readme.md".to_string(),
+            "crates/db".to_string(),
+            "crates/db/src/schema.rs".to_string(),
+            "crates/db/tests/schema.rs".to_string(),
+            "**".to_string(),
+            "[abc".to_string(),
+        ];
+
+        assert_index_matches_exhaustive(&reservations, &requests);
+    }
+
+    #[test]
+    fn exact_path_index_prunes_ten_thousand_unrelated_reservations() {
+        let reservations = (0_i64..10_000).map(|idx| {
+            let pattern = format!("project_{idx}/src/lib.rs");
+            (pattern.clone(), make_ref_for_pattern(idx, &pattern))
+        });
+        let index = ReservationIndex::build(reservations);
+        let request = CompiledPattern::new("project_7777/src/lib.rs");
+        let mut conflicts = Vec::new();
+
+        let stats = index.find_conflicts_with_stats(&request, &mut conflicts);
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].agent_id, 7777);
+        assert_eq!(stats.exact_paths, 1);
+        assert_eq!(stats.prefixed_globs, 0);
+        assert_eq!(stats.root_globs, 0);
+        assert!(
+            stats.exact_paths < 100,
+            "indexed exact-path scan should not approach a 10k exhaustive walk: {stats:?}"
+        );
+    }
+
+    #[test]
+    fn prefixed_glob_index_prunes_ten_thousand_unrelated_reservations() {
+        let reservations = (0_i64..10_000).map(|idx| {
+            let pattern = format!("project_{idx}/**/*.rs");
+            (pattern.clone(), make_ref_for_pattern(idx, &pattern))
+        });
+        let index = ReservationIndex::build(reservations);
+        let request = CompiledPattern::new("project_7777/src/lib.rs");
+        let mut conflicts = Vec::new();
+
+        let stats = index.find_conflicts_with_stats(&request, &mut conflicts);
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].agent_id, 7777);
+        assert_eq!(stats.exact_paths, 0);
+        assert_eq!(stats.prefixed_globs, 1);
+        assert_eq!(stats.root_globs, 0);
+        assert!(
+            stats.prefixed_globs < 100,
+            "prefixed glob bucket should not approach a 10k exhaustive walk: {stats:?}"
+        );
     }
 
     #[test]

@@ -8636,11 +8636,24 @@ pub async fn create_file_reservations(
             released_ts: None,
         };
 
-        // Insert the row (execute returns rows_affected, not ID)
+        // Insert the row explicitly so this critical coordination path does not
+        // depend on macro-generated SQL shape.
+        let insert_sql = "INSERT INTO file_reservations \
+            (project_id, agent_id, path_pattern, \"exclusive\", reason, created_ts, expires_ts, released_ts) \
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL)";
+        let insert_params = [
+            Value::BigInt(row.project_id),
+            Value::BigInt(row.agent_id),
+            Value::Text(row.path_pattern.clone()),
+            Value::BigInt(row.exclusive),
+            Value::Text(row.reason.clone()),
+            Value::BigInt(row.created_ts),
+            Value::BigInt(row.expires_ts),
+        ];
         try_in_tx!(
             cx,
             &tracked,
-            map_sql_outcome(insert!(&row).execute(cx, &tracked).await)
+            map_sql_outcome(traw_execute(cx, &tracked, insert_sql, &insert_params).await)
         );
 
         // Use connection-local rowid state to retrieve the ID for this exact insert.

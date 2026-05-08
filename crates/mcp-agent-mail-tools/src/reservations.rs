@@ -145,6 +145,13 @@ fn invalid_file_reservation_pattern(pattern: &str) -> Option<String> {
     None
 }
 
+fn dispatch_reservation_archive_write(op: mcp_agent_mail_storage::WriteOp, context: &str) {
+    try_dispatch_archive_write(op, context);
+    // The pre-commit guard reads reservation JSON artifacts directly. Keep
+    // reservation mutations visible once the tool call returns.
+    mcp_agent_mail_storage::wbq_flush();
+}
+
 fn path_looks_absolute(input: &str) -> bool {
     if input.starts_with("//") {
         return false;
@@ -759,7 +766,7 @@ pub async fn file_reservation_paths(
             config: config.clone(),
             reservations: res_jsons,
         };
-        try_dispatch_archive_write(
+        dispatch_reservation_archive_write(
             op,
             &format!("reservation archive write project={}", project.slug),
         );
@@ -887,8 +894,7 @@ pub async fn release_file_reservations(
             config: Config::get(),
             reservations: res_jsons,
         };
-        // Use match to ignore result (consistent with create path)
-        try_dispatch_archive_write(
+        dispatch_reservation_archive_write(
             op,
             &format!("reservation release archive write project={}", project.slug),
         );
@@ -1011,7 +1017,7 @@ pub async fn renew_file_reservations(
             config: Config::get(),
             reservations: res_jsons,
         };
-        try_dispatch_archive_write(
+        dispatch_reservation_archive_write(
             op,
             &format!("reservation renewal archive write project={}", project.slug),
         );
@@ -1289,7 +1295,7 @@ pub async fn force_release_file_reservation(
             config: Config::get(),
             reservations: vec![res_json],
         };
-        try_dispatch_archive_write(
+        dispatch_reservation_archive_write(
             op,
             &format!(
                 "forced reservation release archive write project={}",
