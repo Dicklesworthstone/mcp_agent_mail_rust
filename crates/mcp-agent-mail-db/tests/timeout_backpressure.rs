@@ -32,6 +32,7 @@ use mcp_agent_mail_db::search_planner::{QueryExplain, SearchQuery};
 use mcp_agent_mail_db::search_service::{SearchOptions, execute_search, execute_search_simple};
 use mcp_agent_mail_db::{DbPool, DbPoolConfig};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 // ─────────────────────────────────────────────────────────────────
 // Async/pool infrastructure
@@ -258,6 +259,88 @@ fn seed_corpus(cx: &Cx, pool: &DbPool) -> i64 {
             }
         }
         project_id
+    })
+}
+
+fn seed_product_corpus(
+    cx: &Cx,
+    pool: &DbPool,
+    project_count: usize,
+    messages_per_project: usize,
+) -> i64 {
+    let cx = cx.clone();
+    let pool = pool.clone();
+    common::spin_poll(async move {
+        let product = match queries::ensure_product(
+            &cx,
+            &pool,
+            Some(&format!("prod-timeout-budget-{}", unique_suffix())),
+            Some("Timeout Budget Product"),
+        )
+        .await
+        {
+            Outcome::Ok(product) => product,
+            other => panic!("ensure_product failed: {other:?}"),
+        };
+        let product_id = product.id.expect("product id");
+
+        let mut project_ids = Vec::with_capacity(project_count);
+        for project_idx in 0..project_count {
+            let human_key = format!("/tmp/product-budget-{}-{project_idx}", unique_suffix());
+            let project_id = match queries::ensure_project(&cx, &pool, &human_key).await {
+                Outcome::Ok(project) => project.id.expect("project id"),
+                other => panic!("ensure_project({human_key}) failed: {other:?}"),
+            };
+            project_ids.push(project_id);
+
+            let agent_id = match queries::register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "RedHarbor",
+                "test-prog",
+                "test-model",
+                None,
+                None,
+                None,
+            )
+            .await
+            {
+                Outcome::Ok(agent) => agent.id.expect("agent id"),
+                other => panic!("register_agent failed: {other:?}"),
+            };
+
+            for message_idx in 0..messages_per_project {
+                let subject = format!("Product budget page {project_idx}-{message_idx}");
+                let body = format!(
+                    "swarm budget marker product project {project_idx} message {message_idx}"
+                );
+                match queries::create_message(
+                    &cx,
+                    &pool,
+                    project_id,
+                    agent_id,
+                    &subject,
+                    &body,
+                    Some("PRODUCT-BUDGET"),
+                    "normal",
+                    false,
+                    "[]",
+                )
+                .await
+                {
+                    Outcome::Ok(_) => {}
+                    other => panic!("create_message({subject}) failed: {other:?}"),
+                }
+            }
+        }
+
+        match queries::link_product_to_projects(&cx, &pool, product_id, &project_ids).await {
+            Outcome::Ok(linked) => assert_eq!(linked, project_count),
+            other => panic!("link_product_to_projects failed: {other:?}"),
+        }
+
+        product_id
     })
 }
 
@@ -765,6 +848,111 @@ fn execute_search_with_budget_options() {
     eprintln!("execute_search_with_budget_options: 2 scenarios passed");
 }
 
+#[test]
+fn product_search_budget_many_project_p95_and_diagnostics() {
+    let (pool, _dir) = make_pool();
+    let cx_setup = Cx::for_testing();
+    let product_id = seed_product_corpus(&cx_setup, &pool, 16, 8);
+    let requested_limit = 20usize;
+    let pool_c = pool.clone();
+    let seed_probe_count = block_on_with_budget(Budget::new(), move |cx| async move {
+        match queries::search_messages_for_product(
+            &cx,
+            &pool_c,
+            product_id,
+            "budget",
+            requested_limit,
+        )
+        .await
+        {
+            Outcome::Ok(rows) => rows.len(),
+            other => panic!("seeded product search probe failed: {other:?}"),
+        }
+    });
+    assert!(
+        seed_probe_count >= requested_limit,
+        "seeded product corpus should have at least {requested_limit} searchable rows, got {seed_probe_count}"
+    );
+
+    let iterations = 25usize;
+    let mut latencies_us = Vec::with_capacity(iterations);
+    let mut last_effective_limit = None;
+
+    for _ in 0..iterations {
+        let pool_c = pool.clone();
+        let started = Instant::now();
+        let resp = block_on_with_budget(Budget::new().with_cost_quota(0), move |cx| async move {
+            let query = SearchQuery {
+                limit: Some(requested_limit),
+                explain: true,
+                ..SearchQuery::product_messages("budget", product_id)
+            };
+            let opts = SearchOptions {
+                track_telemetry: false,
+                ..Default::default()
+            };
+            match execute_search(&cx, &pool_c, &query, &opts).await {
+                Outcome::Ok(response) => response,
+                other => panic!("product budget search failed: {other:?}"),
+            }
+        });
+        latencies_us.push(started.elapsed().as_micros());
+
+        let explain = resp.explain.as_ref().expect("explain metadata");
+        assert!(
+            explain
+                .facets_applied
+                .iter()
+                .any(|facet| facet == "product_budget_limited:true"),
+            "expected product budget limiter facet: {explain:?}"
+        );
+        assert_eq!(
+            facet_value(&explain.facets_applied, "product_budget_tier"),
+            Some("critical")
+        );
+        assert_eq!(
+            facet_value(&explain.facets_applied, "product_budget_exhausted"),
+            Some("true")
+        );
+        assert_eq!(
+            facet_value(&explain.facets_applied, "product_budget_requested_limit"),
+            Some("20")
+        );
+        let effective_limit =
+            facet_value(&explain.facets_applied, "product_budget_effective_limit")
+                .and_then(|value| value.parse::<usize>().ok())
+                .expect("effective limit facet");
+        assert!(
+            effective_limit < requested_limit,
+            "budget governor should reduce {requested_limit} below requested limit, got {effective_limit}"
+        );
+        assert_eq!(
+            resp.results.len(),
+            effective_limit,
+            "page-limited product search should fill the effective page"
+        );
+        assert!(
+            resp.next_cursor.is_some(),
+            "filled budget page should expose next_cursor"
+        );
+        last_effective_limit = Some(effective_limit);
+    }
+
+    latencies_us.sort_unstable();
+    let p95_idx = (latencies_us.len() * 95).div_ceil(100).saturating_sub(1);
+    let p95_us = *latencies_us
+        .get(p95_idx)
+        .expect("p95 index should exist for non-empty latency sample");
+    eprintln!(
+        "product_search_budget_many_project_p95_and_diagnostics: iterations={iterations} p95_us={p95_us} effective_limit={}",
+        last_effective_limit.unwrap_or_default()
+    );
+    assert!(
+        p95_us < 1_000_000,
+        "many-project product search p95 exceeded 1s budget: {p95_us}us"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────
 // 8. Health level transitions are deterministic
 // ─────────────────────────────────────────────────────────────────
@@ -1037,7 +1225,7 @@ fn ci_structured_report() {
     let report = serde_json::json!({
         "suite": "timeout_backpressure",
         "bead": "br-2tnl.7.21",
-        "test_count": 14,
+        "test_count": 15,
         "categories": [
             "health_classification_matrix",
             "tool_shedding_matrix",
@@ -1046,6 +1234,7 @@ fn ci_structured_report() {
             "health_signals_from_snapshot_correctly_classifies",
             "search_with_cost_quota_budget",
             "execute_search_with_budget_options",
+            "product_search_budget_many_project_p95_and_diagnostics",
             "health_level_transitions_are_deterministic",
             "all_degraded_diagnostics_have_remediation_hints",
             "health_level_ordering_and_serialization",

@@ -27,9 +27,18 @@ e2e_log "am binary: $(command -v am 2>/dev/null || echo NOT_FOUND)"
 # Product bus requires WORKTREES_ENABLED=true in the server environment
 export WORKTREES_ENABLED=true
 
+# Force the product SQL budget governor onto a deterministic critical path for
+# the JSON contract assertion below. The stdio dispatcher uses a 30s request
+# budget; a 60s critical threshold makes the product search page-limited.
+export AM_SEARCH_BUDGET_CRITICAL_MS=60000
+export AM_SEARCH_BUDGET_CRITICAL_SCALE_PCT=40
+export AM_SEARCH_BUDGET_RESULT_FLOOR=1
+
 # Temp workspace
 WORK="$(e2e_mktemp "e2e_product_bus")"
 PB_DB="${WORK}/product_bus_test.sqlite3"
+PB_STORAGE="${WORK}/mailbox_storage"
+mkdir -p "$PB_STORAGE"
 PROJECT_ALPHA="/tmp/e2e_pb_alpha_$$"
 PROJECT_BETA="/tmp/e2e_pb_beta_$$"
 
@@ -48,7 +57,7 @@ send_jsonrpc_session() {
     local fifo="${srv_work}/stdin_fifo"
     mkfifo "$fifo"
 
-    DATABASE_URL="sqlite:////${db_path}" RUST_LOG=error \
+    DATABASE_URL="sqlite:////${db_path}" STORAGE_ROOT="$PB_STORAGE" RUST_LOG=error \
         am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
     local srv_pid=$!
     sleep 0.3
@@ -303,11 +312,19 @@ MSG_RESP="$(send_jsonrpc_session "$PB_DB" \
     "$INIT_REQ" \
     "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_ALPHA}\",\"sender_name\":\"RedFox\",\"to\":[\"SilverWolf\"],\"subject\":\"Cross-project design\",\"body_md\":\"Proposal for shared API.\",\"thread_id\":\"XPROJ-1\",\"importance\":\"high\"}}}" \
     "{\"jsonrpc\":\"2.0\",\"id\":61,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_BETA}\",\"sender_name\":\"GoldPeak\",\"to\":[\"GoldPeak\"],\"subject\":\"Cross-project design\",\"body_md\":\"Beta perspective on shared API.\",\"thread_id\":\"XPROJ-1\",\"importance\":\"normal\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":62,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_ALPHA}\",\"sender_name\":\"RedFox\",\"to\":[\"SilverWolf\"],\"subject\":\"API budget page alpha one\",\"body_md\":\"API budget marker alpha one.\",\"thread_id\":\"XPROJ-1\",\"importance\":\"normal\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_ALPHA}\",\"sender_name\":\"RedFox\",\"to\":[\"SilverWolf\"],\"subject\":\"API budget page alpha two\",\"body_md\":\"API budget marker alpha two.\",\"thread_id\":\"XPROJ-1\",\"importance\":\"normal\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":64,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_BETA}\",\"sender_name\":\"GoldPeak\",\"to\":[\"GoldPeak\"],\"subject\":\"API budget page beta one\",\"body_md\":\"API budget marker beta one.\",\"thread_id\":\"XPROJ-1\",\"importance\":\"normal\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":65,\"method\":\"tools/call\",\"params\":{\"name\":\"send_message\",\"arguments\":{\"project_key\":\"${PROJECT_BETA}\",\"sender_name\":\"GoldPeak\",\"to\":[\"GoldPeak\"],\"subject\":\"API budget page beta two\",\"body_md\":\"API budget marker beta two.\",\"thread_id\":\"XPROJ-1\",\"importance\":\"normal\"}}}" \
 )"
 e2e_save_artifact "case_06_messages.txt" "$MSG_RESP"
 
 assert_ok "send message in alpha" "$MSG_RESP" 60
 assert_ok "send message in beta" "$MSG_RESP" 61
+assert_ok "send API budget marker alpha one" "$MSG_RESP" 62
+assert_ok "send API budget marker alpha two" "$MSG_RESP" 63
+assert_ok "send API budget marker beta one" "$MSG_RESP" 64
+assert_ok "send API budget marker beta two" "$MSG_RESP" 65
 
 # ===========================================================================
 # Case 7: search_messages_product -- search across the product
@@ -316,7 +333,7 @@ e2e_case_banner "search_messages_product: cross-project search"
 
 SEARCH_RESP="$(send_jsonrpc_session "$PB_DB" \
     "$INIT_REQ" \
-    "{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"tools/call\",\"params\":{\"name\":\"search_messages_product\",\"arguments\":{\"product_key\":\"${PRODUCT_UID}\",\"query\":\"API\"}}}" \
+    "{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"tools/call\",\"params\":{\"name\":\"search_messages_product\",\"arguments\":{\"product_key\":\"${PRODUCT_UID}\",\"query\":\"API\",\"limit\":5}}}" \
 )"
 e2e_save_artifact "case_07_search.txt" "$SEARCH_RESP"
 
@@ -361,6 +378,30 @@ except Exception:
 " 2>/dev/null)"
 
 e2e_assert_eq "search results contain project_id" "true" "$SEARCH_HAS_PID"
+
+SEARCH_DIAGNOSTICS="$(echo "$SEARCH_TEXT" | python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.stdin.read())
+    diagnostics = d.get('diagnostics') or {}
+    next_cursor = d.get('next_cursor')
+    result = d.get('result') or []
+    print(f\"result_count={len(result)}\")
+    print(f\"fallback_mode={diagnostics.get('fallback_mode', '')}\")
+    print(f\"budget_tier={diagnostics.get('budget_tier', '')}\")
+    print(f\"budget_exhausted={str(diagnostics.get('budget_exhausted', '')).lower()}\")
+    print(f\"degraded={str(diagnostics.get('degraded', '')).lower()}\")
+    print(f\"next_cursor={str(bool(next_cursor)).lower()}\")
+except Exception as e:
+    print(f'PARSE_ERROR: {e}')
+" 2>/dev/null)"
+e2e_save_artifact "case_07_budget_diagnostics.txt" "$SEARCH_DIAGNOSTICS"
+
+e2e_assert_contains "product search budget fallback mode" "$SEARCH_DIAGNOSTICS" "fallback_mode=product_sql_budget_governor"
+e2e_assert_contains "product search budget tier critical" "$SEARCH_DIAGNOSTICS" "budget_tier=critical"
+e2e_assert_contains "product search budget exhausted" "$SEARCH_DIAGNOSTICS" "budget_exhausted=true"
+e2e_assert_contains "product search diagnostics degraded" "$SEARCH_DIAGNOSTICS" "degraded=true"
+e2e_assert_contains "product search budget exposes next cursor" "$SEARCH_DIAGNOSTICS" "next_cursor=true"
 
 # ===========================================================================
 # Case 8: fetch_inbox_product -- cross-project inbox

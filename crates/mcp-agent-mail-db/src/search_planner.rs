@@ -782,7 +782,7 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
     // ── SELECT + FROM + JOIN ───────────────────────────────────────
     // NOTE: FTS5 MATCH SQL was removed in Search V3 decommission (br-2tnl.8.4).
     // The planner now only generates LIKE-based SQL for fallback.
-    let (select_cols, from_clause, order_clause) = match method {
+    let (select_cols, mut from_clause, order_clause) = match method {
         PlanMethod::Like => {
             let terms = extract_like_terms(&query.text, 5);
             let mut like_parts = Vec::new();
@@ -830,10 +830,8 @@ fn plan_message_search(query: &SearchQuery) -> SearchPlan {
         params.push(PlanParam::Int(pid));
         facets_applied.push("project_id".to_string());
     } else if let Some(prod_id) = query.product_id {
-        where_clauses.push(
-            "m.project_id IN (SELECT project_id FROM product_project_links WHERE product_id = ?)"
-                .to_string(),
-        );
+        from_clause.push_str(" JOIN product_project_links ppl ON ppl.project_id = m.project_id");
+        where_clauses.push("ppl.product_id = ?".to_string());
         params.push(PlanParam::Int(prod_id));
         facets_applied.push("product_id".to_string());
     }
@@ -1452,7 +1450,11 @@ mod tests {
         let q = SearchQuery::product_messages("needle", 7);
         let plan = plan_search(&q);
         assert_eq!(plan.method, PlanMethod::Like);
-        assert!(plan.sql.contains("product_project_links"));
+        assert!(
+            plan.sql
+                .contains("JOIN product_project_links ppl ON ppl.project_id = m.project_id")
+        );
+        assert!(plan.sql.contains("ppl.product_id = ?"));
         assert!(
             plan.sql
                 .contains("LEFT JOIN agents a ON a.id = m.sender_id")
