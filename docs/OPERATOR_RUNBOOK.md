@@ -257,6 +257,8 @@ is used in hot paths.
 | `DATABASE_POOL_SIZE`           | auto (25)             | Connection pool size             |
 | `DATABASE_MAX_OVERFLOW`        | auto (75)             | Additional overflow connections   |
 | `DATABASE_POOL_TIMEOUT`        | `15` (seconds)        | Pool acquisition timeout         |
+| `AM_CACHE_PROFILE`             | `balanced`            | Cache budget preset: `conservative`, `balanced`, or `high-memory` |
+| `DATABASE_CACHE_BUDGET_KB`     | profile-derived `524288` | Total SQLite page-cache budget across pooled connections, clamped to 16 MiB..4 GiB |
 | `INTEGRITY_CHECK_ON_STARTUP`   | `true`                | Run `PRAGMA quick_check` at boot |
 | `INTEGRITY_CHECK_INTERVAL_HOURS` | `24`               | Periodic full integrity check    |
 

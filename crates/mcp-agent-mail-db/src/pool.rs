@@ -1698,12 +1698,14 @@ impl DbPoolConfig {
     ///    restore the legacy Python defaults (not recommended for production).
     #[must_use]
     pub fn from_env() -> Self {
+        let core_config = mcp_agent_mail_core::Config::from_env();
+
         // Use infra_env_value so a project-local .env cannot hijack the
         // database path.  When no explicit DATABASE_URL is set, derive it
         // from the resolved storage_root via Config (which handles the
         // storage-root-relative default).
-        let database_url = infra_env_value("DATABASE_URL")
-            .unwrap_or_else(|| mcp_agent_mail_core::Config::get().database_url.clone());
+        let database_url =
+            infra_env_value("DATABASE_URL").unwrap_or_else(|| core_config.database_url.clone());
 
         let pool_timeout = env_value("DATABASE_POOL_TIMEOUT")
             .and_then(|s| s.parse().ok())
@@ -1738,20 +1740,19 @@ impl DbPoolConfig {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0)
             .min(min_conn);
+        let storage_root = core_config.storage_root;
+        let cache_budget_kb = core_config.database_cache_budget_kb;
 
         Self {
             database_url,
-            storage_root: Some(mcp_agent_mail_core::Config::from_env().storage_root),
+            storage_root: Some(storage_root),
             min_connections: min_conn,
             max_connections: max_conn,
             acquire_timeout_ms: pool_timeout,
             max_lifetime_ms: DEFAULT_POOL_RECYCLE_MS,
             run_migrations: true,
             warmup_connections: warmup,
-            cache_budget_kb: env_value("DATABASE_CACHE_BUDGET_KB")
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(schema::DEFAULT_CACHE_BUDGET_KB)
-                .clamp(16_384, 4_194_304),
+            cache_budget_kb,
         }
     }
 
@@ -12564,6 +12565,20 @@ mod tests {
         assert!(!config.database_url.is_empty() || config.database_url.is_empty()); // just ensure it doesn't panic
         assert!(config.min_connections > 0);
         assert!(config.max_connections >= config.min_connections);
+    }
+
+    #[test]
+    fn pool_config_from_env_uses_cache_profile_budget() {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_CACHE_PROFILE", "high-memory"),
+                ("DATABASE_CACHE_BUDGET_KB", ""),
+            ],
+            || {
+                let config = DbPoolConfig::from_env();
+                assert_eq!(config.cache_budget_kb, 2 * 1024 * 1024);
+            },
+        );
     }
 
     // ── RecoveryAction / RecoveryApproval policy tests ─────────────────

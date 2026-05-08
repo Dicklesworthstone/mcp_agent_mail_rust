@@ -96,11 +96,14 @@ pub struct Config {
     pub database_pool_size: Option<usize>,
     pub database_max_overflow: Option<usize>,
     pub database_pool_timeout: Option<u64>,
+    /// Preset cache budget profile. Explicit per-budget env vars still win.
+    pub cache_profile: CacheProfile,
     /// Total page-cache budget across all pooled connections (KiB).
     ///
     /// The per-connection `cache_size` PRAGMA is set to
     /// `database_cache_budget_kb / max_connections`, clamped to \[2 MiB, 64 MiB\].
-    /// Override via `DATABASE_CACHE_BUDGET_KB`. Default: `524_288` (512 MiB).
+    /// Override via `DATABASE_CACHE_BUDGET_KB`. Default: profile-derived
+    /// `524_288` (512 MiB).
     pub database_cache_budget_kb: usize,
     /// Run `PRAGMA quick_check` on pool initialization (default: true).
     pub integrity_check_on_startup: bool,
@@ -411,6 +414,48 @@ impl std::fmt::Display for AppEnvironment {
         match self {
             Self::Development => write!(f, "development"),
             Self::Production => write!(f, "production"),
+        }
+    }
+}
+
+/// Operator-selected cache sizing profile.
+///
+/// Profiles only choose safe defaults; explicit per-budget environment
+/// variables such as `DATABASE_CACHE_BUDGET_KB` still override them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheProfile {
+    Conservative,
+    #[default]
+    Balanced,
+    HighMemory,
+}
+
+impl CacheProfile {
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "conservative" | "small" | "low" => Self::Conservative,
+            "high-memory" | "high_memory" | "large-memory" | "large" | "256gb" => Self::HighMemory,
+            _ => Self::Balanced,
+        }
+    }
+
+    #[must_use]
+    pub const fn database_cache_budget_kb(self) -> usize {
+        match self {
+            Self::Conservative => 128 * 1024,
+            Self::Balanced => 512 * 1024,
+            Self::HighMemory => 2 * 1024 * 1024,
+        }
+    }
+}
+
+impl std::fmt::Display for CacheProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conservative => write!(f, "conservative"),
+            Self::Balanced => write!(f, "balanced"),
+            Self::HighMemory => write!(f, "high-memory"),
         }
     }
 }
@@ -1089,7 +1134,8 @@ impl Default for Config {
             database_pool_size: None,
             database_max_overflow: None,
             database_pool_timeout: None,
-            database_cache_budget_kb: 512 * 1024, // 512 MiB
+            cache_profile: CacheProfile::Balanced,
+            database_cache_budget_kb: CacheProfile::Balanced.database_cache_budget_kb(),
             integrity_check_on_startup: true,
             integrity_check_interval_hours: 1,
 
@@ -1412,6 +1458,8 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("app_environment", &self.app_environment)
             .field("database_url", &redact_db_url(&self.database_url))
+            .field("cache_profile", &self.cache_profile)
+            .field("database_cache_budget_kb", &self.database_cache_budget_kb)
             .field("http_host", &self.http_host)
             .field("http_port", &self.http_port)
             .field("http_path", &self.http_path)
@@ -1481,9 +1529,14 @@ impl Config {
         config.database_pool_size = env_usize_opt("DATABASE_POOL_SIZE");
         config.database_max_overflow = env_usize_opt("DATABASE_MAX_OVERFLOW");
         config.database_pool_timeout = env_u64_opt("DATABASE_POOL_TIMEOUT");
-        config.database_cache_budget_kb =
-            env_usize("DATABASE_CACHE_BUDGET_KB", config.database_cache_budget_kb)
-                .clamp(16_384, 4_194_304); // 16 MiB .. 4 GiB
+        if let Some(v) = env_value("AM_CACHE_PROFILE") {
+            config.cache_profile = CacheProfile::parse(&v);
+            config.database_cache_budget_kb = config.cache_profile.database_cache_budget_kb();
+        }
+        config.database_cache_budget_kb = env_value("DATABASE_CACHE_BUDGET_KB")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(config.database_cache_budget_kb)
+            .clamp(16_384, 4_194_304); // 16 MiB .. 4 GiB
         config.integrity_check_on_startup = env_bool(
             "INTEGRITY_CHECK_ON_STARTUP",
             config.integrity_check_on_startup,
@@ -3188,6 +3241,8 @@ mod tests {
         assert!(config.database_pool_size.is_none());
         assert!(config.database_max_overflow.is_none());
         assert!(config.database_pool_timeout.is_none());
+        assert_eq!(config.cache_profile, CacheProfile::Balanced);
+        assert_eq!(config.database_cache_budget_kb, 512 * 1024);
         assert_eq!(
             config.database_url,
             "sqlite+aiosqlite:///./storage.sqlite3".to_string()
@@ -3195,6 +3250,46 @@ mod tests {
         assert!(config.contact_enforcement_enabled);
         assert!(!config.allow_absolute_attachment_paths);
         assert!(!config.allow_ephemeral_projects_in_default_storage);
+    }
+
+    #[test]
+    fn test_cache_profile_parsing_and_budget_defaults() {
+        assert_eq!(
+            CacheProfile::parse("conservative"),
+            CacheProfile::Conservative
+        );
+        assert_eq!(
+            CacheProfile::parse(" high_memory "),
+            CacheProfile::HighMemory
+        );
+        assert_eq!(CacheProfile::parse("256GB"), CacheProfile::HighMemory);
+        assert_eq!(CacheProfile::parse("unknown"), CacheProfile::Balanced);
+
+        let _env = TestEnvOverrideGuard::set(&[("AM_CACHE_PROFILE", "high-memory")]);
+        let config = Config::from_env();
+        assert_eq!(config.cache_profile, CacheProfile::HighMemory);
+        assert_eq!(config.database_cache_budget_kb, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_database_cache_budget_overrides_profile_and_clamps() {
+        let env_guard = TestEnvOverrideGuard::set(&[
+            ("AM_CACHE_PROFILE", "high-memory"),
+            ("DATABASE_CACHE_BUDGET_KB", "999999999"),
+        ]);
+        let config = Config::from_env();
+        assert_eq!(config.cache_profile, CacheProfile::HighMemory);
+        assert_eq!(config.database_cache_budget_kb, 4_194_304);
+
+        drop(env_guard);
+
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_CACHE_PROFILE", "conservative"),
+            ("DATABASE_CACHE_BUDGET_KB", "1"),
+        ]);
+        let config = Config::from_env();
+        assert_eq!(config.cache_profile, CacheProfile::Conservative);
+        assert_eq!(config.database_cache_budget_kb, 16_384);
     }
 
     #[test]
