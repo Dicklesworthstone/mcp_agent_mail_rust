@@ -3153,7 +3153,7 @@ fn next_startup_sqlite_sidecar_artifact_path(
         &format!("sqlite-sidecar.{label}-{timestamp}"),
     );
     let mut suffix = 1_u32;
-    while candidate.exists() {
+    while path_is_occupied(&candidate) {
         candidate = path_with_file_name_suffix(
             sidecar_path,
             &format!(".{label}-{timestamp}-{suffix:02}"),
@@ -44912,6 +44912,33 @@ startup_timeout_sec = 42
         assert!(
             quarantined_wal.is_dir(),
             "non-file WAL sidecar should be preserved under startup quarantine"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_sidecar_artifact_path_skips_broken_symlink_collision() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("cleanup-stale-wal.sqlite3");
+        let wal_path = sqlite_sidecar_path(&db_path, "-wal");
+        let timestamp = "20260102_120000_000";
+        let first_quarantine = dir
+            .path()
+            .join("cleanup-stale-wal.sqlite3-wal.startup-quarantine-20260102_120000_000");
+        symlink(
+            dir.path().join("missing-quarantine-target"),
+            &first_quarantine,
+        )
+        .expect("create broken quarantine symlink");
+
+        let quarantine = next_startup_sqlite_sidecar_quarantine_path(&wal_path, timestamp);
+
+        assert_eq!(
+            quarantine.file_name().and_then(|name| name.to_str()),
+            Some("cleanup-stale-wal.sqlite3-wal.startup-quarantine-20260102_120000_000-01"),
+            "startup quarantine allocation must not overwrite broken symlink artifacts"
         );
     }
 
