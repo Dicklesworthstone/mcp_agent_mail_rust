@@ -1742,6 +1742,28 @@ fn checkpoint_sqlite_for_copy(db_path: &Path) -> CliResult<()> {
     Ok(())
 }
 
+fn remove_stale_target_sidecar(target_sidecar: &Path) -> CliResult<()> {
+    match fs::symlink_metadata(target_sidecar) {
+        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            fs::remove_file(target_sidecar).map_err(|e| {
+                CliError::Other(format!(
+                    "failed to clear stale target sidecar {}: {e}",
+                    target_sidecar.display()
+                ))
+            })
+        }
+        Ok(_) => Err(CliError::Other(format!(
+            "failed to clear stale target sidecar {}: sidecar is not a file or symlink",
+            target_sidecar.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(CliError::Other(format!(
+            "failed to inspect stale target sidecar {}: {error}",
+            target_sidecar.display()
+        ))),
+    }
+}
+
 fn copy_db_with_sidecars(source_db: &Path, target_db: &Path) -> CliResult<()> {
     if !source_db.exists() {
         return Err(CliError::Other(format!(
@@ -1761,17 +1783,8 @@ fn copy_db_with_sidecars(source_db: &Path, target_db: &Path) -> CliResult<()> {
     // imported database. Sidecars are ephemeral and can be inconsistent with
     // the copied main DB.
     for suffix in SQLITE_IMPORT_SIDECAR_SUFFIXES {
-        let mut target_sidecar_os = target_db.as_os_str().to_os_string();
-        target_sidecar_os.push(suffix);
-        let target_sidecar = PathBuf::from(target_sidecar_os);
-        if target_sidecar.exists() {
-            fs::remove_file(&target_sidecar).map_err(|e| {
-                CliError::Other(format!(
-                    "failed to clear stale target sidecar {}: {e}",
-                    target_sidecar.display()
-                ))
-            })?;
-        }
+        let target_sidecar = sqlite_sidecar_path(target_db, suffix);
+        remove_stale_target_sidecar(&target_sidecar)?;
     }
     Ok(())
 }
@@ -2735,6 +2748,47 @@ mod tests {
             }
             other => panic!("expected copy failure, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_db_with_sidecars_removes_broken_stale_target_sidecar_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let source_db = tmp.path().join("source.sqlite3");
+        let target_db = tmp.path().join("target.sqlite3");
+
+        let source_conn = DbConn::open_file(source_db.display().to_string()).unwrap();
+        source_conn
+            .execute_raw("CREATE TABLE marker(value TEXT)")
+            .unwrap();
+        source_conn
+            .execute_raw("INSERT INTO marker(value) VALUES('from-source')")
+            .unwrap();
+        let _ = source_conn.execute_raw("PRAGMA wal_checkpoint(TRUNCATE)");
+        drop(source_conn);
+
+        let target_wal = sqlite_sidecar_path(&target_db, "-wal");
+        let missing_target = tmp.path().join("missing-target-wal");
+        symlink(&missing_target, &target_wal).unwrap();
+
+        copy_db_with_sidecars(&source_db, &target_db).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&target_wal)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+            "broken target WAL symlink should be removed"
+        );
+        let target_conn = DbConn::open_file(target_db.display().to_string()).unwrap();
+        let rows = target_conn
+            .query_sync("SELECT value FROM marker LIMIT 1", &[])
+            .unwrap();
+        let marker = rows
+            .first()
+            .and_then(|row| row.get_named::<String>("value").ok())
+            .unwrap();
+        assert_eq!(marker, "from-source");
     }
 
     #[cfg(unix)]
