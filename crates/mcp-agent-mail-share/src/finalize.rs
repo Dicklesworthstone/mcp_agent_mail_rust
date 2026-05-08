@@ -631,7 +631,7 @@ pub fn finalize_snapshot_for_export(snapshot_path: &Path) -> Result<(), ShareErr
 
     apply_export_finalize_pragmas(&rebuilt_path)?;
     replace_snapshot_with_rebuilt_path(&rebuilt_path, &snapshot_path, &backup_path)?;
-    cleanup_snapshot_sidecars(&snapshot_path);
+    cleanup_snapshot_sidecars(&snapshot_path)?;
 
     Ok(())
 }
@@ -679,7 +679,7 @@ pub fn finalize_export_db(snapshot_path: &Path) -> Result<FinalizeResult, ShareE
                     "finalize export failed ({error}); restoring pre-FTS snapshot state also failed ({rollback_error})"
                 )))
             })?;
-            cleanup_snapshot_sidecars(&snapshot_path);
+            cleanup_snapshot_sidecars(&snapshot_path)?;
             Err(error)
         }
     }
@@ -734,7 +734,7 @@ fn rewrite_snapshot_storage(snapshot_path: &Path) -> Result<(), ShareError> {
     let snapshot_path = crate::require_real_share_sqlite_path(snapshot_path)?;
     let (_temp_dir, rebuilt_path, backup_path) = prepare_rebuilt_snapshot_storage(&snapshot_path)?;
     replace_snapshot_with_rebuilt_path(&rebuilt_path, &snapshot_path, &backup_path)?;
-    cleanup_snapshot_sidecars(&snapshot_path);
+    cleanup_snapshot_sidecars(&snapshot_path)?;
     Ok(())
 }
 
@@ -757,15 +757,36 @@ fn apply_export_finalize_pragmas(snapshot_path: &Path) -> Result<(), ShareError>
     Ok(())
 }
 
-fn cleanup_snapshot_sidecars(snapshot_path: &Path) {
+fn cleanup_snapshot_sidecars(snapshot_path: &Path) -> Result<(), ShareError> {
     for suffix in SQLITE_SNAPSHOT_SIDECAR_SUFFIXES {
         let mut sidecar_os = snapshot_path.as_os_str().to_os_string();
         sidecar_os.push(suffix);
         let sidecar_path = std::path::PathBuf::from(sidecar_os);
-        if sidecar_path.exists() {
-            let _ = std::fs::remove_file(sidecar_path);
+        match std::fs::symlink_metadata(&sidecar_path) {
+            Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+                std::fs::remove_file(&sidecar_path).map_err(|error| {
+                    ShareError::Io(std::io::Error::other(format!(
+                        "failed to remove SQLite snapshot sidecar {}: {error}",
+                        sidecar_path.display()
+                    )))
+                })?;
+            }
+            Ok(_) => {
+                return Err(ShareError::Io(std::io::Error::other(format!(
+                    "refusing to ignore non-file SQLite snapshot sidecar {}",
+                    sidecar_path.display()
+                ))));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ShareError::Io(std::io::Error::other(format!(
+                    "failed to inspect SQLite snapshot sidecar {}: {error}",
+                    sidecar_path.display()
+                ))));
+            }
         }
     }
+    Ok(())
 }
 
 fn replace_snapshot_with_rebuilt_path(
@@ -851,6 +872,15 @@ mod tests {
 
     fn file_size(path: &std::path::Path) -> u64 {
         std::fs::metadata(path).unwrap().len()
+    }
+
+    fn checkpoint_test_db_and_remove_sidecars(db: &Path) {
+        mcp_agent_mail_db::pool::wal_checkpoint_truncate_path(db).unwrap();
+        for suffix in SQLITE_SNAPSHOT_SIDECAR_SUFFIXES {
+            let mut sidecar_os = db.as_os_str().to_os_string();
+            sidecar_os.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(sidecar_os));
+        }
     }
 
     /// Create a test DB with the standard schema.
@@ -1781,6 +1811,7 @@ mod tests {
     fn rewrite_snapshot_storage_removes_stale_sidecars() {
         let dir = tempfile::tempdir().unwrap();
         let db = create_test_db(dir.path());
+        checkpoint_test_db_and_remove_sidecars(&db);
         let journal_path = std::path::PathBuf::from(format!("{}-journal", db.display()));
         let wal_path = std::path::PathBuf::from(format!("{}-wal", db.display()));
         let shm_path = std::path::PathBuf::from(format!("{}-shm", db.display()));
@@ -1801,6 +1832,55 @@ mod tests {
             .unwrap();
         let count: i64 = rows[0].get_named("cnt").unwrap();
         assert_eq!(count, 2, "snapshot should remain queryable after rewrite");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_snapshot_storage_removes_broken_symlink_sidecar() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        checkpoint_test_db_and_remove_sidecars(&db);
+        let wal_path = std::path::PathBuf::from(format!("{}-wal", db.display()));
+        let missing_target = dir.path().join("missing-wal-target");
+        symlink(&missing_target, &wal_path).expect("create broken WAL sidecar symlink");
+
+        rewrite_snapshot_storage(&db).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&wal_path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+            "broken WAL sidecar symlink should be removed during snapshot rewrite"
+        );
+
+        let conn = SqliteConnection::open_file(db.display().to_string()).unwrap();
+        let rows = conn
+            .query_sync("SELECT COUNT(*) AS cnt FROM messages", &[])
+            .unwrap();
+        let count: i64 = rows[0].get_named("cnt").unwrap();
+        assert_eq!(count, 2, "snapshot should remain queryable after rewrite");
+    }
+
+    #[test]
+    fn cleanup_snapshot_sidecars_rejects_non_file_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = create_test_db(dir.path());
+        checkpoint_test_db_and_remove_sidecars(&db);
+        let wal_path = std::path::PathBuf::from(format!("{}-wal", db.display()));
+        std::fs::create_dir(&wal_path).expect("create blocking WAL sidecar directory");
+
+        let err = cleanup_snapshot_sidecars(&db)
+            .expect_err("non-file sidecar should fail closed instead of being ignored");
+        assert!(
+            err.to_string()
+                .contains("refusing to ignore non-file SQLite snapshot sidecar"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            wal_path.is_dir(),
+            "operator-visible blocking sidecar directory should be left for explicit cleanup"
+        );
     }
 
     #[test]
