@@ -472,6 +472,35 @@ Leave `BACKPRESSURE_SHEDDING_ENABLED=false` for shadow mode. In shadow mode the
 probe still reports the admission recommendation, but dispatch does not reject
 shedable reads.
 
+### Adaptive archive commit coalescing
+
+**Symptom:** Archive commits lag during bursts, or Git churn is too high when
+disk pressure is elevated.
+
+**Model:** The commit coalescer now computes a recommended flush window from
+per-repo depth, global pending commit requests, disk pressure, and the operator
+latency budget. By default this is shadow-only: workers record the recommended
+target window, the effective window, batching ratio, and max archive lag while
+continuing to use the static `AM_ARCHIVE_BATCH_MS` cadence.
+
+**Fix:**
+```bash
+# Inspect queue health and storage latency.
+AM_INTERFACE_MODE=cli am robot metrics --format json
+
+# Tune the latency budget while staying in shadow mode.
+AM_COALESCER_TARGET_ARCHIVE_LAG_MS=1000 am serve-http
+
+# Enable adaptive worker cadence after confirming operators tolerate the lag.
+AM_COALESCER_ADAPTIVE_FLUSH_ENABLED=true \
+  AM_COALESCER_TARGET_ARCHIVE_LAG_MS=1000 \
+  am serve-http
+```
+
+The adaptive window is clamped to 5-5000 ms. `flush_sync`, graceful shutdown,
+and explicit flushes still bypass the timed window and drain queued work before
+returning or timing out.
+
 ### Git index.lock contention
 
 **Symptom:** `index.lock` errors in logs during high-throughput commits

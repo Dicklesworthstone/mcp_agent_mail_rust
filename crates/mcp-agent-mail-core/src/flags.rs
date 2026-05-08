@@ -248,6 +248,10 @@ fn current_backpressure_shedding_enabled(config: &Config) -> String {
     bool_string(config.backpressure_shedding_enabled)
 }
 
+fn current_coalescer_adaptive_flush_enabled(config: &Config) -> String {
+    resolve_env_bool(config, "AM_COALESCER_ADAPTIVE_FLUSH_ENABLED", false)
+}
+
 fn current_ack_ttl_enabled(config: &Config) -> String {
     bool_string(config.ack_ttl_enabled)
 }
@@ -339,6 +343,25 @@ pub const FLAG_REGISTRY: &[FlagDefinition] = &[
         notes: Some("Server processes read this at startup."),
         resolve_value: current_backpressure_shedding_enabled,
         resolve_source: |config| process_or_config_source(config, "BACKPRESSURE_SHEDDING_ENABLED"),
+    },
+    FlagDefinition {
+        name: "COALESCER_ADAPTIVE_FLUSH_ENABLED",
+        env_var: "AM_COALESCER_ADAPTIVE_FLUSH_ENABLED",
+        kind: FlagKind::Bool,
+        default_value: "false",
+        doc: "Use adaptive archive commit-coalescer flush windows instead of shadow-only recommendations.",
+        stability: FlagStability::Experimental,
+        subsystem: "storage",
+        affected_subsystems: &["storage", "archive", "robot"],
+        dynamic_toggle: false,
+        restart_required: true,
+        notes: Some(
+            "False keeps the controller in shadow mode; workers still record target/effective windows in per-repo stats.",
+        ),
+        resolve_value: current_coalescer_adaptive_flush_enabled,
+        resolve_source: |config| {
+            process_or_config_source(config, "AM_COALESCER_ADAPTIVE_FLUSH_ENABLED")
+        },
     },
     FlagDefinition {
         name: "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED",

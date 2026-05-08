@@ -636,9 +636,23 @@ fn stress_commit_coalescer_batching_100_writes() {
     let repo_stats = per_repo.get(&repo_root);
     let errs = errors.load(Ordering::Relaxed);
 
-    let (enqueued_total, commits_total) = repo_stats
-        .map(|s| (s.enqueued_total, s.commits_total))
-        .unwrap_or((0, 0));
+    let (
+        enqueued_total,
+        commits_total,
+        max_archive_lag_us,
+        adaptive_target_ms,
+        adaptive_effective_ms,
+    ) = repo_stats
+        .map(|s| {
+            (
+                s.enqueued_total,
+                s.commits_total,
+                s.max_archive_lag_us,
+                s.adaptive_flush_target_ms,
+                s.adaptive_flush_effective_ms,
+            )
+        })
+        .unwrap_or((0, 0, 0, 0, 0));
 
     eprintln!("\n=== stress_commit_coalescer_batching_100_writes ===");
     eprintln!("  Writes enqueued: {n_writes}");
@@ -647,6 +661,11 @@ fn stress_commit_coalescer_batching_100_writes() {
         "  Batching ratio: {:.1}x",
         enqueued_total as f64 / commits_total.max(1) as f64
     );
+    eprintln!(
+        "  Max archive lag: {:.2} ms",
+        max_archive_lag_us as f64 / 1_000.0
+    );
+    eprintln!("  Adaptive flush target/effective: {adaptive_target_ms}/{adaptive_effective_ms} ms");
     eprintln!("  File write errors: {errs}");
 
     assert_eq!(errs, 0, "file writes should not fail");
@@ -664,6 +683,10 @@ fn stress_commit_coalescer_batching_100_writes() {
     assert!(
         commits_total <= (enqueued_total / 2),
         "batching ratio too low: {commits_total} commits for {enqueued_total} enqueued (< 2x)"
+    );
+    assert!(
+        max_archive_lag_us > 0,
+        "per-repo max archive lag should be reported after successful commits"
     );
 }
 

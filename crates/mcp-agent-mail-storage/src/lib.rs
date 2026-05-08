@@ -1683,6 +1683,10 @@ struct RepoCommitMetrics {
     retries_total: AtomicU64,
     commit_latency_us_sum: AtomicU64,
     commit_latency_us_count: AtomicU64,
+    max_archive_lag_us: AtomicU64,
+    adaptive_flush_enabled: AtomicU64,
+    adaptive_flush_target_ms: AtomicU64,
+    adaptive_flush_effective_ms: AtomicU64,
 }
 
 impl Default for RepoCommitMetrics {
@@ -1695,6 +1699,10 @@ impl Default for RepoCommitMetrics {
             retries_total: AtomicU64::new(0),
             commit_latency_us_sum: AtomicU64::new(0),
             commit_latency_us_count: AtomicU64::new(0),
+            max_archive_lag_us: AtomicU64::new(0),
+            adaptive_flush_enabled: AtomicU64::new(0),
+            adaptive_flush_target_ms: AtomicU64::new(DEFAULT_ARCHIVE_BATCH_MS),
+            adaptive_flush_effective_ms: AtomicU64::new(DEFAULT_ARCHIVE_BATCH_MS),
         }
     }
 }
@@ -1709,6 +1717,10 @@ pub struct RepoCommitStats {
     pub errors_total: u64,
     pub retries_total: u64,
     pub avg_commit_latency_us: u64,
+    pub max_archive_lag_us: u64,
+    pub adaptive_flush_enabled: bool,
+    pub adaptive_flush_target_ms: u64,
+    pub adaptive_flush_effective_ms: u64,
 }
 
 /// Fire-and-forget git commit coalescer with per-repo queues and worker pool.
@@ -1753,6 +1765,8 @@ const MIN_ARCHIVE_BATCH_EVENTS: usize = 1;
 const MIN_COALESCER_FLUSH_MS: u64 = 5;
 const MAX_COALESCER_FLUSH_MS: u64 = 5_000;
 const MIN_COALESCER_FLUSH_INTERVAL: Duration = Duration::from_millis(MIN_COALESCER_FLUSH_MS);
+const DEFAULT_COALESCER_ADAPTIVE_FLUSH_ENABLED: bool = false;
+const DEFAULT_COALESCER_TARGET_ARCHIVE_LAG_MS: u64 = DEFAULT_ARCHIVE_BATCH_MS;
 
 const COMMIT_COALESCER_SOFT_CAP: u64 = 8_192;
 
@@ -1779,6 +1793,17 @@ fn parse_archive_batch_u64(primary_key: &str, legacy_key: &str, default: u64) ->
         .unwrap_or(default)
 }
 
+fn parse_archive_bool(key: &str, default: bool) -> bool {
+    config::env_value(key)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
 fn configured_coalescer_flush_interval() -> Duration {
     let ms = parse_archive_batch_u64(
         "AM_ARCHIVE_BATCH_MS",
@@ -1789,6 +1814,21 @@ fn configured_coalescer_flush_interval() -> Duration {
     Duration::from_millis(ms)
 }
 
+fn configured_coalescer_adaptive_flush_enabled() -> bool {
+    parse_archive_bool(
+        "AM_COALESCER_ADAPTIVE_FLUSH_ENABLED",
+        DEFAULT_COALESCER_ADAPTIVE_FLUSH_ENABLED,
+    )
+}
+
+fn configured_coalescer_target_archive_lag() -> Duration {
+    let ms = config::env_value("AM_COALESCER_TARGET_ARCHIVE_LAG_MS")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_COALESCER_TARGET_ARCHIVE_LAG_MS)
+        .clamp(MIN_COALESCER_FLUSH_MS, MAX_COALESCER_FLUSH_MS);
+    Duration::from_millis(ms)
+}
+
 fn configured_coalescer_batch_size() -> usize {
     parse_archive_batch_usize(
         "AM_ARCHIVE_BATCH_EVENTS",
@@ -1796,6 +1836,97 @@ fn configured_coalescer_batch_size() -> usize {
         DEFAULT_ARCHIVE_BATCH_EVENTS,
     )
     .clamp(MIN_ARCHIVE_BATCH_EVENTS, COMMIT_COALESCER_SOFT_CAP as usize)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CoalescerAdaptiveFlushDecision {
+    enabled: bool,
+    target_interval: Duration,
+    effective_interval: Duration,
+}
+
+#[inline]
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis().min(u128::from(u64::MAX))).unwrap_or(u64::MAX)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn coalescer_adaptive_flush_decision(
+    adaptive_enabled: bool,
+    base_interval: Duration,
+    latency_budget: Duration,
+    max_batch_size: usize,
+    repo_depth: u64,
+    repo_queue_cap: usize,
+    global_pending: u64,
+    disk_pressure_level: u64,
+) -> CoalescerAdaptiveFlushDecision {
+    let min_interval = MIN_COALESCER_FLUSH_INTERVAL;
+    let max_interval = clamp_coalescer_flush_interval(latency_budget)
+        .min(Duration::from_millis(MAX_COALESCER_FLUSH_MS));
+    let static_interval = clamp_coalescer_flush_interval(base_interval)
+        .min(Duration::from_millis(MAX_COALESCER_FLUSH_MS));
+    let max_batch_size = max_batch_size.max(1);
+
+    let mut target = static_interval.min(max_interval);
+    if repo_depth > 0 {
+        let filled_slots = repo_depth
+            .min(u64::try_from(max_batch_size).unwrap_or(u64::MAX))
+            .max(1);
+        let filled_slots_u32 = u32::try_from(filled_slots).unwrap_or(u32::MAX);
+        target = target.min(max_interval / filled_slots_u32);
+    }
+
+    if global_pending > 0 {
+        let pending_batches = global_pending
+            .saturating_div(u64::try_from(max_batch_size).unwrap_or(u64::MAX))
+            .saturating_add(1)
+            .min(16);
+        let pending_batches_u32 = u32::try_from(pending_batches).unwrap_or(16);
+        target = target.min(max_interval / pending_batches_u32);
+    }
+
+    let repo_queue_cap = u64::try_from(repo_queue_cap.max(1)).unwrap_or(u64::MAX);
+    if repo_depth.saturating_mul(100) >= repo_queue_cap.saturating_mul(80) {
+        target = min_interval;
+    } else if repo_depth.saturating_mul(100) >= repo_queue_cap.saturating_mul(50) {
+        target = target.min(max_interval / 4);
+    }
+
+    let disk_pressure = mcp_agent_mail_core::disk::DiskPressure::from_u64(disk_pressure_level);
+    target = match disk_pressure {
+        mcp_agent_mail_core::disk::DiskPressure::Ok => target,
+        mcp_agent_mail_core::disk::DiskPressure::Warning => target
+            .max(static_interval.saturating_mul(2))
+            .min(max_interval),
+        mcp_agent_mail_core::disk::DiskPressure::Critical
+        | mcp_agent_mail_core::disk::DiskPressure::Fatal => max_interval,
+    };
+
+    target = target.clamp(min_interval, max_interval);
+    CoalescerAdaptiveFlushDecision {
+        enabled: adaptive_enabled,
+        target_interval: target,
+        effective_interval: if adaptive_enabled {
+            target
+        } else {
+            static_interval
+        },
+    }
+}
+
+fn record_coalescer_adaptive_decision(rq: &RepoQueue, decision: CoalescerAdaptiveFlushDecision) {
+    rq.metrics
+        .adaptive_flush_enabled
+        .store(u64::from(decision.enabled), Ordering::Relaxed);
+    rq.metrics.adaptive_flush_target_ms.store(
+        duration_millis_u64(decision.target_interval),
+        Ordering::Relaxed,
+    );
+    rq.metrics.adaptive_flush_effective_ms.store(
+        duration_millis_u64(decision.effective_interval),
+        Ordering::Relaxed,
+    );
 }
 
 /// Auto-detect worker count bounded by `Config::coalescer_max_workers`.
@@ -2120,6 +2251,20 @@ impl CommitCoalescer {
                         errors_total: rq.metrics.errors_total.load(Ordering::Relaxed),
                         retries_total: rq.metrics.retries_total.load(Ordering::Relaxed),
                         avg_commit_latency_us: avg,
+                        max_archive_lag_us: rq.metrics.max_archive_lag_us.load(Ordering::Relaxed),
+                        adaptive_flush_enabled: rq
+                            .metrics
+                            .adaptive_flush_enabled
+                            .load(Ordering::Relaxed)
+                            != 0,
+                        adaptive_flush_target_ms: rq
+                            .metrics
+                            .adaptive_flush_target_ms
+                            .load(Ordering::Relaxed),
+                        adaptive_flush_effective_ms: rq
+                            .metrics
+                            .adaptive_flush_effective_ms
+                            .load(Ordering::Relaxed),
                     },
                 )
             })
@@ -2271,6 +2416,14 @@ fn coalescer_pool_worker(
         // Phase 2: Pick a repo via LRS (least-recently-serviced) scheduling
         loop {
             let max_batch_size = configured_coalescer_batch_size();
+            let adaptive_enabled = configured_coalescer_adaptive_flush_enabled();
+            let target_archive_lag = configured_coalescer_target_archive_lag();
+            let repo_queue_cap = Config::get().coalescer_queue_cap;
+            let global_pending = pending_requests.load(Ordering::Relaxed);
+            let disk_pressure_level = mcp_agent_mail_core::global_metrics()
+                .system
+                .disk_pressure_level
+                .load();
             let force_now = force_flush.load(Ordering::Acquire);
             let mut next_due: Option<Duration> = None;
             let chosen: Option<(PathBuf, Arc<RepoQueue>)> = {
@@ -2281,7 +2434,23 @@ fn coalescer_pool_worker(
                     if rq.processing.load(Ordering::Relaxed) {
                         continue;
                     }
-                    match coalescer_repo_readiness(rq, max_batch_size, flush_interval, force_now) {
+                    let decision = coalescer_adaptive_flush_decision(
+                        adaptive_enabled,
+                        flush_interval,
+                        target_archive_lag,
+                        max_batch_size,
+                        rq.depth.load(Ordering::Relaxed),
+                        repo_queue_cap,
+                        global_pending,
+                        disk_pressure_level,
+                    );
+                    record_coalescer_adaptive_decision(rq, decision);
+                    match coalescer_repo_readiness(
+                        rq,
+                        max_batch_size,
+                        decision.effective_interval,
+                        force_now,
+                    ) {
                         CoalescerRepoReadiness::Ready => {}
                         CoalescerRepoReadiness::Waiting(wait_for) => {
                             next_due =
@@ -2489,6 +2658,9 @@ fn self_process_repo(
                     .unwrap_or(u64::MAX);
                     metrics.storage.commit_queue_latency_us.record(latency_us);
                     rq.metrics
+                        .max_archive_lag_us
+                        .fetch_max(latency_us, Ordering::Relaxed);
+                    rq.metrics
                         .commit_latency_us_sum
                         .fetch_add(latency_us, Ordering::Relaxed);
                     rq.metrics
@@ -2535,6 +2707,9 @@ fn self_process_repo(
             )
             .unwrap_or(u64::MAX);
             metrics.storage.commit_queue_latency_us.record(latency_us);
+            rq.metrics
+                .max_archive_lag_us
+                .fetch_max(latency_us, Ordering::Relaxed);
             rq.metrics
                 .commit_latency_us_sum
                 .fetch_add(latency_us, Ordering::Relaxed);
@@ -8498,6 +8673,103 @@ mod tests {
                 assert_eq!(configured_coalescer_batch_size(), 64);
             },
         );
+    }
+
+    #[test]
+    fn coalescer_adaptive_flush_disabled_keeps_static_effective_window() {
+        let decision = coalescer_adaptive_flush_decision(
+            false,
+            Duration::from_millis(1_000),
+            Duration::from_millis(1_000),
+            8,
+            4,
+            512,
+            4,
+            mcp_agent_mail_core::disk::DiskPressure::Ok.as_u64(),
+        );
+
+        assert!(!decision.enabled);
+        assert_eq!(decision.target_interval, Duration::from_millis(250));
+        assert_eq!(decision.effective_interval, Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn coalescer_adaptive_flush_disabled_ignores_latency_budget() {
+        let decision = coalescer_adaptive_flush_decision(
+            false,
+            Duration::from_millis(1_000),
+            Duration::from_millis(100),
+            8,
+            4,
+            512,
+            4,
+            mcp_agent_mail_core::disk::DiskPressure::Ok.as_u64(),
+        );
+
+        assert_eq!(decision.target_interval, Duration::from_millis(25));
+        assert_eq!(decision.effective_interval, Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn coalescer_adaptive_flush_enabled_shortens_under_queue_pressure() {
+        let decision = coalescer_adaptive_flush_decision(
+            true,
+            Duration::from_millis(1_000),
+            Duration::from_millis(1_000),
+            8,
+            4,
+            512,
+            4,
+            mcp_agent_mail_core::disk::DiskPressure::Ok.as_u64(),
+        );
+
+        assert!(decision.enabled);
+        assert_eq!(decision.target_interval, Duration::from_millis(250));
+        assert_eq!(decision.effective_interval, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn coalescer_adaptive_flush_extends_for_disk_pressure_within_budget() {
+        let warning = coalescer_adaptive_flush_decision(
+            true,
+            Duration::from_millis(100),
+            Duration::from_millis(1_000),
+            16,
+            1,
+            512,
+            1,
+            mcp_agent_mail_core::disk::DiskPressure::Warning.as_u64(),
+        );
+        assert_eq!(warning.effective_interval, Duration::from_millis(200));
+
+        let critical = coalescer_adaptive_flush_decision(
+            true,
+            Duration::from_millis(100),
+            Duration::from_millis(1_000),
+            16,
+            1,
+            512,
+            1,
+            mcp_agent_mail_core::disk::DiskPressure::Critical.as_u64(),
+        );
+        assert_eq!(critical.effective_interval, Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn coalescer_adaptive_flush_clamps_to_bounded_window() {
+        let decision = coalescer_adaptive_flush_decision(
+            true,
+            Duration::ZERO,
+            Duration::from_millis(1),
+            1,
+            10_000,
+            10,
+            10_000,
+            mcp_agent_mail_core::disk::DiskPressure::Ok.as_u64(),
+        );
+
+        assert_eq!(decision.target_interval, MIN_COALESCER_FLUSH_INTERVAL);
+        assert_eq!(decision.effective_interval, MIN_COALESCER_FLUSH_INTERVAL);
     }
 
     fn test_repo_queue() -> RepoQueue {
