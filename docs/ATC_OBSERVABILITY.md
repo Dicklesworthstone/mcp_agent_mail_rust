@@ -36,6 +36,15 @@ Every ATC boundary operation emits a span with a stable field schema.
 
 Exposed via the existing `global_metrics().atc` surface (`AtcMetrics` in `metrics.rs`).
 
+High-cardinality labeled counters use a bounded Space-Saving heavy-hitter sketch
+for operator rollups. Each counter sketch retains at most 64 labels in memory,
+emits the top 16 labels in its `*_sketch.entries` summary, and reports a
+conservative additive error bound of `ceil(total / capacity)`. Per-entry
+`estimate` values never intentionally undercount the retained label; `error`
+records the maximum folded-in count for that entry. The exact ATC experience
+rows remain in the persistence layer for forensic reads; the metrics snapshot is
+not the source of forensic truth.
+
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `atc_experiences_written_total` | counter | event_kind | Total experience rows appended to the ledger |

@@ -769,19 +769,238 @@ pub struct SearchMetricsSnapshot {
 // ATC observability metrics
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default)]
+/// Maximum labels retained by each in-memory heavy-hitter counter sketch.
+///
+/// The exact ATC experience rows remain in the persistence layer for forensic
+/// reads. This metrics surface is an operator rollup, so high-cardinality label
+/// sets are intentionally capped here.
+pub const LABELED_COUNTER_SKETCH_CAPACITY: usize = 64;
+
+const LABELED_COUNTER_SKETCH_SNAPSHOT_LIMIT: usize = 16;
+const BITS_PER_WORD: usize = 64;
+const DISTINCT_LABEL_SKETCH_BITS: usize = 1024;
+const DISTINCT_LABEL_SKETCH_WORDS: usize = DISTINCT_LABEL_SKETCH_BITS / BITS_PER_WORD;
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LabeledCounterSketchEntry {
+    pub label: String,
+    pub estimate: u64,
+    pub error: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LabeledCounterSketchSnapshot {
+    pub total: u64,
+    pub capacity: usize,
+    pub tracked_labels: usize,
+    pub distinct_labels_estimate: u64,
+    pub distinct_labels_saturated: bool,
+    pub not_tracked_labels_estimate: u64,
+    pub additive_error_bound: u64,
+    pub entries: Vec<LabeledCounterSketchEntry>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LabeledCounterSketchBucket {
+    estimate: u64,
+    error: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DistinctLabelSketch {
+    bits: [u64; DISTINCT_LABEL_SKETCH_WORDS],
+}
+
+impl Default for DistinctLabelSketch {
+    fn default() -> Self {
+        Self {
+            bits: [0; DISTINCT_LABEL_SKETCH_WORDS],
+        }
+    }
+}
+
+impl DistinctLabelSketch {
+    fn observe(&mut self, label: &str) {
+        let bit_count = u64::try_from(DISTINCT_LABEL_SKETCH_BITS).unwrap_or(u64::MAX);
+        let bit = usize::try_from(fnv1a64(label.as_bytes()) % bit_count).unwrap_or_default();
+        let word = bit / BITS_PER_WORD;
+        let offset = bit % BITS_PER_WORD;
+        self.bits[word] |= 1u64 << offset;
+    }
+
+    fn occupied_bits(&self) -> u32 {
+        self.bits.iter().map(|word| word.count_ones()).sum()
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
+    fn estimate(&self) -> (u64, bool) {
+        let occupied = self.occupied_bits();
+        let zeros = DISTINCT_LABEL_SKETCH_BITS.saturating_sub(occupied as usize);
+        if zeros == 0 {
+            return (DISTINCT_LABEL_SKETCH_BITS as u64, true);
+        }
+
+        let m = DISTINCT_LABEL_SKETCH_BITS as f64;
+        let zero_ratio = zeros as f64 / m;
+        let estimate = (-m * zero_ratio.ln()).round();
+        (estimate.max(0.0) as u64, false)
+    }
+}
+
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(FNV_OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+    })
+}
+
+#[derive(Debug)]
+struct LabeledCounterSketch {
+    capacity: usize,
+    total: u64,
+    entries: BTreeMap<String, LabeledCounterSketchBucket>,
+    distinct: DistinctLabelSketch,
+}
+
+impl Default for LabeledCounterSketch {
+    fn default() -> Self {
+        Self::with_capacity(LABELED_COUNTER_SKETCH_CAPACITY)
+    }
+}
+
+impl LabeledCounterSketch {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            capacity,
+            total: 0,
+            entries: BTreeMap::new(),
+            distinct: DistinctLabelSketch::default(),
+        }
+    }
+
+    fn add(&mut self, label: String, delta: u64) {
+        self.distinct.observe(&label);
+        self.total = self.total.saturating_add(delta);
+
+        if let Some(entry) = self.entries.get_mut(&label) {
+            entry.estimate = entry.estimate.saturating_add(delta);
+            return;
+        }
+
+        if self.entries.len() < self.capacity {
+            self.entries.insert(
+                label,
+                LabeledCounterSketchBucket {
+                    estimate: delta,
+                    error: 0,
+                },
+            );
+            return;
+        }
+
+        if self.capacity == 0 || delta == 0 {
+            return;
+        }
+
+        let Some((victim_label, victim)) = self
+            .entries
+            .iter()
+            .min_by(|(left_label, left), (right_label, right)| {
+                left.estimate
+                    .cmp(&right.estimate)
+                    .then_with(|| left_label.cmp(right_label))
+            })
+            .map(|(entry_label, entry)| (entry_label.clone(), entry.clone()))
+        else {
+            return;
+        };
+
+        self.entries.remove(&victim_label);
+        self.entries.insert(
+            label,
+            LabeledCounterSketchBucket {
+                estimate: victim.estimate.saturating_add(delta),
+                error: victim.estimate,
+            },
+        );
+    }
+
+    fn snapshot(&self) -> BTreeMap<String, u64> {
+        self.entries
+            .iter()
+            .map(|(label, entry)| (label.clone(), entry.estimate))
+            .collect()
+    }
+
+    fn summary(&self, limit: usize) -> LabeledCounterSketchSnapshot {
+        let mut entries: Vec<_> = self
+            .entries
+            .iter()
+            .map(|(label, entry)| LabeledCounterSketchEntry {
+                label: label.clone(),
+                estimate: entry.estimate,
+                error: entry.error,
+            })
+            .collect();
+        entries.sort_by(|left, right| {
+            right
+                .estimate
+                .cmp(&left.estimate)
+                .then_with(|| left.label.cmp(&right.label))
+        });
+        entries.truncate(limit);
+
+        let (distinct_labels_estimate, distinct_labels_saturated) = self.distinct.estimate();
+        let tracked_labels = self.entries.len();
+        let tracked_labels_u64 = u64::try_from(tracked_labels).unwrap_or(u64::MAX);
+        let capacity_u64 = u64::try_from(self.capacity).unwrap_or(u64::MAX).max(1);
+
+        LabeledCounterSketchSnapshot {
+            total: self.total,
+            capacity: self.capacity,
+            tracked_labels,
+            distinct_labels_estimate,
+            distinct_labels_saturated,
+            not_tracked_labels_estimate: distinct_labels_estimate
+                .saturating_sub(tracked_labels_u64),
+            additive_error_bound: self.total.div_ceil(capacity_u64),
+            entries,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct LabeledCounterMap {
-    inner: Mutex<BTreeMap<String, u64>>,
+    inner: Mutex<LabeledCounterSketch>,
+}
+
+impl Default for LabeledCounterMap {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(LabeledCounterSketch::default()),
+        }
+    }
 }
 
 impl LabeledCounterMap {
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(LabeledCounterSketch::with_capacity(capacity)),
+        }
+    }
+
     pub fn add(&self, label: impl Into<String>, delta: u64) {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(label.into())
-            .and_modify(|v| *v = v.saturating_add(delta))
-            .or_insert(delta);
+            .add(label.into(), delta);
     }
 
     #[must_use]
@@ -789,7 +1008,15 @@ impl LabeledCounterMap {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+            .snapshot()
+    }
+
+    #[must_use]
+    pub fn summary(&self, limit: usize) -> LabeledCounterSketchSnapshot {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .summary(limit)
     }
 }
 
@@ -880,18 +1107,24 @@ pub struct AtcMetrics {
 pub struct AtcMetricsSnapshot {
     pub experiences_written_total: u64,
     pub experiences_written_by_kind: BTreeMap<String, u64>,
+    pub experiences_written_by_kind_sketch: LabeledCounterSketchSnapshot,
     pub experiences_resolved_total: u64,
     pub experiences_resolved_by_outcome: BTreeMap<String, u64>,
+    pub experiences_resolved_by_outcome_sketch: LabeledCounterSketchSnapshot,
     pub experiences_open_by_stratum: BTreeMap<String, u64>,
     pub sweep_duration_micros: BTreeMap<String, HistogramSnapshot>,
     pub sweep_rows_resolved_total: BTreeMap<String, u64>,
+    pub sweep_rows_resolved_total_sketch: LabeledCounterSketchSnapshot,
     pub rollup_refresh_latency_micros: HistogramSnapshot,
     pub retention_rows_deleted_total: u64,
     pub kill_switch_enabled_gauge: u64,
     pub decision_latency_micros: BTreeMap<String, HistogramSnapshot>,
     pub safe_mode_transitions_total: BTreeMap<String, u64>,
+    pub safe_mode_transitions_total_sketch: LabeledCounterSketchSnapshot,
     pub shadow_events_total: BTreeMap<String, u64>,
+    pub shadow_events_total_sketch: LabeledCounterSketchSnapshot,
     pub derivation_errors_total: BTreeMap<String, u64>,
+    pub derivation_errors_total_sketch: LabeledCounterSketchSnapshot,
 }
 
 impl AtcMetrics {
@@ -949,18 +1182,36 @@ impl AtcMetrics {
         AtcMetricsSnapshot {
             experiences_written_total: self.experiences_written_total.load(),
             experiences_written_by_kind: self.experiences_written_by_kind.snapshot(),
+            experiences_written_by_kind_sketch: self
+                .experiences_written_by_kind
+                .summary(LABELED_COUNTER_SKETCH_SNAPSHOT_LIMIT),
             experiences_resolved_total: self.experiences_resolved_total.load(),
             experiences_resolved_by_outcome: self.experiences_resolved_by_outcome.snapshot(),
+            experiences_resolved_by_outcome_sketch: self
+                .experiences_resolved_by_outcome
+                .summary(LABELED_COUNTER_SKETCH_SNAPSHOT_LIMIT),
             experiences_open_by_stratum: self.experiences_open_by_stratum.snapshot(),
             sweep_duration_micros: self.sweep_duration_micros.snapshot(),
             sweep_rows_resolved_total: self.sweep_rows_resolved_total.snapshot(),
+            sweep_rows_resolved_total_sketch: self
+                .sweep_rows_resolved_total
+                .summary(LABELED_COUNTER_SKETCH_SNAPSHOT_LIMIT),
             rollup_refresh_latency_micros: self.rollup_refresh_latency_micros.snapshot(),
             retention_rows_deleted_total: self.retention_rows_deleted_total.load(),
             kill_switch_enabled_gauge: self.kill_switch_enabled_gauge.load(),
             decision_latency_micros: self.decision_latency_micros.snapshot(),
             safe_mode_transitions_total: self.safe_mode_transitions_total.snapshot(),
+            safe_mode_transitions_total_sketch: self
+                .safe_mode_transitions_total
+                .summary(LABELED_COUNTER_SKETCH_SNAPSHOT_LIMIT),
             shadow_events_total: self.shadow_events_total.snapshot(),
+            shadow_events_total_sketch: self
+                .shadow_events_total
+                .summary(LABELED_COUNTER_SKETCH_SNAPSHOT_LIMIT),
             derivation_errors_total: self.derivation_errors_total.snapshot(),
+            derivation_errors_total_sketch: self
+                .derivation_errors_total
+                .summary(LABELED_COUNTER_SKETCH_SNAPSHOT_LIMIT),
         }
     }
 }
@@ -1922,6 +2173,81 @@ mod tests {
     }
 
     #[test]
+    fn labeled_counter_sketch_is_exact_below_capacity() {
+        let counters = LabeledCounterMap::with_capacity(4);
+        counters.add("alpha", 2);
+        counters.add("beta", 3);
+        counters.add("alpha", 5);
+
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot.get("alpha").copied(), Some(7));
+        assert_eq!(snapshot.get("beta").copied(), Some(3));
+
+        let summary = counters.summary(4);
+        assert_eq!(summary.total, 10);
+        assert_eq!(summary.capacity, 4);
+        assert_eq!(summary.tracked_labels, 2);
+        assert_eq!(summary.entries.len(), 2);
+        assert!(summary.entries.iter().all(|entry| entry.error == 0));
+        assert!(summary.distinct_labels_estimate >= 2);
+        assert!(!summary.distinct_labels_saturated);
+    }
+
+    #[test]
+    fn labeled_counter_sketch_caps_tracked_labels() {
+        let counters = LabeledCounterMap::with_capacity(4);
+        for i in 0..50 {
+            counters.add(format!("cold-{i}"), 1);
+        }
+
+        let snapshot = counters.snapshot();
+        assert!(snapshot.len() <= 4);
+
+        let summary = counters.summary(4);
+        assert_eq!(summary.total, 50);
+        assert_eq!(summary.capacity, 4);
+        assert!(summary.tracked_labels <= 4);
+        assert!(summary.entries.len() <= 4);
+        assert!(summary.distinct_labels_estimate >= 40);
+        assert!(summary.not_tracked_labels_estimate > 0);
+    }
+
+    #[test]
+    fn labeled_counter_sketch_keeps_heavy_hitters_with_error_bound() {
+        let counters = LabeledCounterMap::with_capacity(4);
+        for i in 0..40 {
+            counters.add(format!("cold-{i}"), 1);
+        }
+        for _ in 0..40 {
+            counters.add("hot-a", 1);
+        }
+        for _ in 0..25 {
+            counters.add("hot-b", 1);
+        }
+
+        let summary = counters.summary(4);
+        let hot_a = summary
+            .entries
+            .iter()
+            .find(|entry| entry.label == "hot-a")
+            .expect("hot-a should survive as a heavy hitter");
+        let hot_b = summary
+            .entries
+            .iter()
+            .find(|entry| entry.label == "hot-b")
+            .expect("hot-b should survive as a heavy hitter");
+
+        assert_eq!(summary.total, 105);
+        assert!(hot_a.estimate >= 40);
+        assert!(hot_b.estimate >= 25);
+        assert!(hot_a.estimate.saturating_sub(40) <= summary.additive_error_bound);
+        assert!(hot_b.estimate.saturating_sub(25) <= summary.additive_error_bound);
+        assert!(hot_a.error <= summary.additive_error_bound);
+        assert!(hot_b.error <= summary.additive_error_bound);
+    }
+
+    #[test]
     fn labeled_gauge_map_saturates_and_drops_zero_entries() {
         let gauges = LabeledGaugeMap::default();
         gauges.add("liveness:probe:0", 3);
@@ -1953,6 +2279,15 @@ mod tests {
             snapshot.experiences_written_by_kind.get("probe").copied(),
             Some(2)
         );
+        assert_eq!(snapshot.experiences_written_by_kind_sketch.total, 2);
+        assert_eq!(
+            snapshot
+                .experiences_written_by_kind_sketch
+                .entries
+                .first()
+                .map(|entry| (entry.label.as_str(), entry.estimate, entry.error)),
+            Some(("probe", 2, 0))
+        );
         assert_eq!(
             snapshot
                 .experiences_resolved_by_outcome
@@ -1960,6 +2295,7 @@ mod tests {
                 .copied(),
             Some(1)
         );
+        assert_eq!(snapshot.experiences_resolved_by_outcome_sketch.total, 1);
         assert_eq!(
             snapshot
                 .experiences_open_by_stratum
@@ -1973,7 +2309,9 @@ mod tests {
             snapshot.safe_mode_transitions_total.get("enter").copied(),
             Some(1)
         );
+        assert_eq!(snapshot.safe_mode_transitions_total_sketch.total, 1);
         assert_eq!(snapshot.shadow_events_total.get("probe").copied(), Some(1));
+        assert_eq!(snapshot.shadow_events_total_sketch.total, 1);
         assert_eq!(
             snapshot
                 .derivation_errors_total
@@ -1981,6 +2319,7 @@ mod tests {
                 .copied(),
             Some(1)
         );
+        assert_eq!(snapshot.derivation_errors_total_sketch.total, 1);
         assert_eq!(
             snapshot
                 .sweep_rows_resolved_total
@@ -1988,6 +2327,7 @@ mod tests {
                 .copied(),
             Some(3)
         );
+        assert_eq!(snapshot.sweep_rows_resolved_total_sketch.total, 3);
         assert_eq!(
             snapshot
                 .sweep_duration_micros
