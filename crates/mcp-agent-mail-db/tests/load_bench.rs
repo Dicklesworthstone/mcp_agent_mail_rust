@@ -264,7 +264,7 @@ struct SwarmLoadLabReport {
 }
 
 impl SwarmLoadLabOperationReport {
-    fn from_latency_report(operation: &'static str, report: &LatencyReport) -> Self {
+    const fn from_latency_report(operation: &'static str, report: &LatencyReport) -> Self {
         Self {
             operation,
             count: report.count,
@@ -594,7 +594,7 @@ fn swarm_load_lab_ci_smoke_writes_slo_artifacts() {
     }
 
     let t0 = Instant::now();
-    let product_id = match block_on(|cx| {
+    let product_id = if let Outcome::Ok(product) = block_on(|cx| {
         let pp = pool.clone();
         async move {
             queries::ensure_product(
@@ -606,14 +606,11 @@ fn swarm_load_lab_ci_smoke_writes_slo_artifacts() {
             .await
         }
     }) {
-        Outcome::Ok(product) => {
-            product_lats.push(t0.elapsed().as_micros() as u64);
-            product.id.expect("product id")
-        }
-        _ => {
-            product_errors += 1;
-            -1
-        }
+        product_lats.push(t0.elapsed().as_micros() as u64);
+        product.id.expect("product id")
+    } else {
+        product_errors += 1;
+        -1
     };
     if product_id > 0 {
         let project_ids: Vec<i64> = project_data.iter().map(|(id, _)| *id).collect();

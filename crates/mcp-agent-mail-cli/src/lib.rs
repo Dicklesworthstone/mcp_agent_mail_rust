@@ -19314,6 +19314,32 @@ fn handle_doctor_check_with(
         }
     }
 
+    // Check 1e: Hot query-plan drift diagnostics.
+    if db_file_sanity_failed {
+        checks.push(serde_json::json!({
+            "check": "query_plan_hot_paths",
+            "status": "warn",
+            "detail": "Skipped because db_file_sanity failed",
+        }));
+    } else {
+        match open_db_for_doctor_check(database_url).and_then(|conn| {
+            mcp_agent_mail_db::query_plan_diagnostics::summarize_hot_query_plans(&conn)
+                .map_err(|error| CliError::Other(error.to_string()))
+        }) {
+            Ok(summary) => checks.push(serde_json::json!({
+                "check": "query_plan_hot_paths",
+                "status": summary.status,
+                "detail": summary.detail,
+                "summary": summary,
+            })),
+            Err(error) => checks.push(serde_json::json!({
+                "check": "query_plan_hot_paths",
+                "status": "warn",
+                "detail": format!("Skipped hot query-plan diagnostics: {error}"),
+            })),
+        }
+    }
+
     // Check 1d: Git binary version — flag known-bad versions (br-8ujfs.1.2 / A2).
     //
     // Reports on BOTH the resolver used by mcp-agent-mail (AM_GIT_BINARY

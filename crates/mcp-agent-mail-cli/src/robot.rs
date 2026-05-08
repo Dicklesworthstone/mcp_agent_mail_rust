@@ -4107,6 +4107,8 @@ struct SearchData {
     query: String,
     total_results: usize,
     results: Vec<SearchResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan_diagnostic: Option<mcp_agent_mail_db::query_plan_diagnostics::QueryPlanDiagnostic>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     by_thread: Vec<FacetEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -4131,6 +4133,7 @@ fn build_search(
             query: query.to_string(),
             total_results: 0,
             results: vec![],
+            plan_diagnostic: None,
             by_thread: vec![],
             by_agent: vec![],
             by_importance: vec![],
@@ -4160,6 +4163,12 @@ fn build_search(
     }
 
     let recipient_kind = parse_search_recipient_kind(kind_filter)?;
+    let plan_diagnostic =
+        mcp_agent_mail_db::query_plan_diagnostics::search_fallback_plan_diagnostic(
+            conn,
+            &search_query,
+        )
+        .ok();
     let search_rows =
         collect_search_rows(conn, pool, &search_query, recipient_kind.as_deref(), limit)?;
 
@@ -4232,6 +4241,7 @@ fn build_search(
         query: query.to_string(),
         total_results: total,
         results,
+        plan_diagnostic,
         by_thread,
         by_agent,
         by_importance,
@@ -10239,6 +10249,7 @@ mod tests {
                     age: "3h ago".into(),
                 },
             ],
+            plan_diagnostic: None,
             by_thread: vec![FacetEntry {
                 value: "FEAT-123".into(),
                 count: 2,
@@ -11641,6 +11652,7 @@ mod tests {
             query: "authentication".into(),
             total_results: 10,
             results: vec![],
+            plan_diagnostic: None,
             by_thread: vec![FacetEntry {
                 value: "AUTH-1".into(),
                 count: 5,
@@ -11666,6 +11678,7 @@ mod tests {
             query: "nonexistent".into(),
             total_results: 0,
             results: vec![],
+            plan_diagnostic: None,
             by_thread: vec![],
             by_agent: vec![],
             by_importance: vec![],

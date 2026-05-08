@@ -47,6 +47,7 @@ pub mod models;
 pub mod pool;
 pub mod queries;
 pub mod query_assistance;
+pub mod query_plan_diagnostics;
 pub mod reconstruct;
 pub mod retry;
 pub mod s3fifo;
