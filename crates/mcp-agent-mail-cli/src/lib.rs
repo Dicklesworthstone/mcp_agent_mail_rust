@@ -34702,6 +34702,13 @@ startup_timeout_sec = 42
             dir.path(),
             || {
                 repair_called.set(true);
+                std::fs::write(&db_path, b"").expect("replace corrupt db with empty sqlite db");
+                let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                    .expect("open repaired db");
+                conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+                    .expect("apply init pragmas");
+                conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                    .expect("initialize repaired schema");
                 Ok(())
             },
             |_| {
