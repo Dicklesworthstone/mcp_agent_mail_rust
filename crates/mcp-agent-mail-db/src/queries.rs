@@ -20768,6 +20768,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn fetch_inbox_for_product_agent_uses_single_global_fan_in() {
         use asupersync::runtime::RuntimeBuilder;
+        use std::sync::Arc;
 
         let rt = RuntimeBuilder::current_thread()
             .build()
@@ -20791,6 +20792,19 @@ mod tests {
             let project_a_id = project_a.id.expect("project a id");
             let project_b_id = project_b.id.expect("project b id");
             let project_c_id = project_c.id.expect("project c id");
+            let mut linked_project_ids = vec![project_a_id, project_b_id, project_c_id];
+            const EXTRA_LINKED_PROJECTS: usize = 40;
+            for index in 0..EXTRA_LINKED_PROJECTS {
+                let project = ensure_project(
+                    &cx,
+                    &pool,
+                    &format!("/tmp/am-product-inbox-extra-{base}-{index}"),
+                )
+                .await
+                .into_result()
+                .expect("ensure extra linked project");
+                linked_project_ids.push(project.id.expect("extra project id"));
+            }
 
             let product_uid = format!("prod_product_inbox_{base}");
             let product = ensure_product(&cx, &pool, Some(&product_uid), Some(&product_uid))
@@ -20798,15 +20812,11 @@ mod tests {
                 .into_result()
                 .expect("ensure product");
             let product_id = product.id.expect("product id");
-            link_product_to_projects(
-                &cx,
-                &pool,
-                product_id,
-                &[project_a_id, project_b_id, project_c_id],
-            )
-            .await
-            .into_result()
-            .expect("link product projects");
+            link_product_to_projects(&cx, &pool, product_id, &linked_project_ids)
+                .await
+                .into_result()
+                .expect("link product projects");
+            assert_eq!(linked_project_ids.len(), EXTRA_LINKED_PROJECTS + 3);
 
             let recipient_a = create_agent(
                 &cx,
@@ -20953,12 +20963,31 @@ mod tests {
             }
             drop(conn);
 
-            let metadata_rows = fetch_inbox_for_product_agent_metadata(
-                &cx, &pool, product_id, "BlueLake", false, None, 10,
-            )
-            .await
-            .into_result()
-            .expect("fetch product metadata inbox");
+            let tracker = Arc::new(crate::QueryTracker::new());
+            tracker.enable(None);
+
+            let metadata_rows = {
+                tracker.reset();
+                let _guard = crate::set_active_tracker(Arc::clone(&tracker));
+                fetch_inbox_for_product_agent_metadata(
+                    &cx, &pool, product_id, "BlueLake", false, None, 10,
+                )
+                .await
+                .into_result()
+                .expect("fetch product metadata inbox")
+            };
+            let snapshot = tracker.snapshot();
+            assert_eq!(
+                snapshot.total,
+                1,
+                "product metadata inbox should use one fan-in query for {} linked projects",
+                linked_project_ids.len()
+            );
+            assert_eq!(
+                snapshot.per_table.get("product_project_links").copied(),
+                Some(1),
+                "product metadata inbox should start from the product-project fan-in table"
+            );
             assert_eq!(metadata_rows.len(), 2);
             assert_eq!(metadata_rows[0].message.subject, "newer urgent");
             assert_eq!(metadata_rows[1].message.subject, "older normal");
@@ -20969,18 +20998,27 @@ mod tests {
                 "metadata product inbox must not hydrate message bodies"
             );
 
-            let since_rows = fetch_inbox_for_product_agent_metadata(
-                &cx,
-                &pool,
-                product_id,
-                "bluelake",
-                false,
-                Some(base_ts),
-                10,
-            )
-            .await
-            .into_result()
-            .expect("fetch product metadata inbox since timestamp");
+            let since_rows = {
+                tracker.reset();
+                let _guard = crate::set_active_tracker(Arc::clone(&tracker));
+                fetch_inbox_for_product_agent_metadata(
+                    &cx,
+                    &pool,
+                    product_id,
+                    "bluelake",
+                    false,
+                    Some(base_ts),
+                    10,
+                )
+                .await
+                .into_result()
+                .expect("fetch product metadata inbox since timestamp")
+            };
+            let snapshot = tracker.snapshot();
+            assert_eq!(
+                snapshot.total, 1,
+                "product metadata inbox with since filter should use one fan-in query"
+            );
             assert_eq!(since_rows.len(), 1);
             assert_eq!(since_rows[0].message.subject, "newer urgent");
             assert!(
@@ -20988,11 +21026,19 @@ mod tests {
                 "metadata product inbox must not hydrate message bodies"
             );
 
-            let urgent_rows =
+            let urgent_rows = {
+                tracker.reset();
+                let _guard = crate::set_active_tracker(Arc::clone(&tracker));
                 fetch_inbox_for_product_agent(&cx, &pool, product_id, "BlueLake", true, None, 10)
                     .await
                     .into_result()
-                    .expect("fetch urgent product inbox");
+                    .expect("fetch urgent product inbox")
+            };
+            let snapshot = tracker.snapshot();
+            assert_eq!(
+                snapshot.total, 1,
+                "product full-body urgent inbox should use one fan-in query"
+            );
             assert_eq!(urgent_rows.len(), 1);
             assert_eq!(urgent_rows[0].message.subject, "newer urgent");
             assert_eq!(urgent_rows[0].message.body_md, "newer body hydrated");
