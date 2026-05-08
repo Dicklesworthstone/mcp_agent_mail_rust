@@ -4219,7 +4219,11 @@ where
                 "Startup detected mailbox database issues; running automatic repair ({detail})"
             ));
             run_startup_doctor_subcommand_quietly(run_repair)?;
-            output::info("Automatic mailbox repair completed; continuing startup");
+            let post_repair_detail =
+                verify_doctor_database_repair_cleared(database_url, storage_root, &detail)?;
+            output::info(&format!(
+                "Automatic mailbox repair completed; {post_repair_detail}; continuing startup"
+            ));
             Ok(())
         }
         StartupDatabaseSelfHealAction::Reconstruct(detail) => {
@@ -18643,6 +18647,26 @@ fn doctor_database_fix_strategy(
     )))
 }
 
+fn verify_doctor_database_repair_cleared(
+    database_url: &str,
+    storage_root: &Path,
+    original_detail: &str,
+) -> CliResult<String> {
+    match doctor_database_fix_strategy(database_url, storage_root)? {
+        DoctorDatabaseFixStrategy::None(detail) => {
+            Ok(format!("post-repair verification passed: {detail}"))
+        }
+        DoctorDatabaseFixStrategy::Repair(detail) => Err(CliError::Other(format!(
+            "database repair completed but post-repair verification still recommends repair: \
+             {detail}; original repair reason: {original_detail}"
+        ))),
+        DoctorDatabaseFixStrategy::Reconstruct(detail) => Err(CliError::Other(format!(
+            "database repair completed but post-repair verification now recommends reconstruction: \
+             {detail}; original repair reason: {original_detail}"
+        ))),
+    }
+}
+
 fn classify_mcp_agent_mail_config(
     config_path: &Path,
     content: &str,
@@ -21513,14 +21537,32 @@ fn handle_doctor_fix(dry_run: bool, yes: bool, json: bool) -> CliResult<()> {
                     match run_doctor_subcommand_quietly(json, || {
                         handle_doctor_repair(None, false, true, Some(backup_dir.clone()), false)
                     }) {
-                        Ok(()) => {
-                            results.push(serde_json::json!({
-                                "check": "database_repair",
-                                "action": "fixed",
-                                "detail": format!("Database repair completed: {detail}"),
-                            }));
-                            fixed_count += 1;
-                        }
+                        Ok(()) => match verify_doctor_database_repair_cleared(
+                            &cfg.database_url,
+                            storage_root,
+                            &detail,
+                        ) {
+                            Ok(post_repair_detail) => {
+                                results.push(serde_json::json!({
+                                    "check": "database_repair",
+                                    "action": "fixed",
+                                    "detail": format!(
+                                        "Database repair completed: {detail}; {post_repair_detail}"
+                                    ),
+                                }));
+                                fixed_count += 1;
+                            }
+                            Err(err) => {
+                                let msg = format!("Database repair verification failed: {err}");
+                                ftui_runtime::ftui_eprintln!("[fail] {msg}");
+                                results.push(serde_json::json!({
+                                    "check": "database_repair",
+                                    "action": "failed",
+                                    "detail": msg,
+                                }));
+                                failed_count += 1;
+                            }
+                        },
                         Err(err) => {
                             let msg = format!("Database repair failed: {err}");
                             ftui_runtime::ftui_eprintln!("[fail] {msg}");
@@ -34543,6 +34585,11 @@ startup_timeout_sec = 42
             dir.path(),
             || {
                 repair_called.set(true);
+                std::fs::write(&db_path, b"").expect("clear corrupt fixture db");
+                let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                    .expect("reopen repaired db");
+                conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                    .expect("initialize repaired schema");
                 Ok(())
             },
             |_| {
@@ -34614,6 +34661,33 @@ startup_timeout_sec = 42
         );
     }
 
+    fn seed_startup_self_heal_fk_orphan(db_path: &Path) {
+        let conn =
+            mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string()).expect("open db");
+        conn.execute_raw(mcp_agent_mail_db::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init pragmas");
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .expect("initialize base schema");
+        conn.execute_raw("PRAGMA foreign_keys = OFF")
+            .expect("disable foreign keys for fixture");
+        conn.execute_raw(
+            "INSERT INTO projects (id, slug, human_key, created_at)
+             VALUES (1, 'startup-fk', '/tmp/startup-fk', 0)",
+        )
+        .expect("insert project");
+        conn.execute_raw(
+            "INSERT INTO agents
+             (id, project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy)
+             VALUES (1, 1, 'RedLake', 'codex-cli', 'gpt-5', 'startup self-heal test', 0, 0, 'auto', 'auto')",
+        )
+        .expect("insert agent");
+        conn.execute_raw(
+            "INSERT INTO message_recipients (message_id, agent_id, kind)
+             VALUES (999, 1, 'to')",
+        )
+        .expect("insert orphaned recipient");
+    }
+
     #[test]
     fn startup_database_self_heal_dispatches_repair_for_corrupt_db_without_archive() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -34641,6 +34715,74 @@ startup_timeout_sec = 42
         assert!(
             !reconstruct_called.get(),
             "reconstruct runner should not be used without archive"
+        );
+    }
+
+    #[test]
+    fn startup_database_self_heal_rechecks_fk_orphans_after_repair() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("startup_fk_repair.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        seed_startup_self_heal_fk_orphan(&db_path);
+
+        let repair_called = std::cell::Cell::new(false);
+        let reconstruct_called = std::cell::Cell::new(false);
+        run_startup_database_self_heal_with(
+            &db_url,
+            dir.path(),
+            || {
+                repair_called.set(true);
+                let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+                    .expect("reopen db for repair fixture");
+                conn.execute_raw("DELETE FROM message_recipients WHERE message_id = 999")
+                    .expect("clear orphaned recipient");
+                Ok(())
+            },
+            |_| {
+                reconstruct_called.set(true);
+                Ok(())
+            },
+        )
+        .expect("startup self-heal should verify the cleared FK issue");
+
+        assert!(repair_called.get(), "repair runner should be used");
+        assert!(
+            !reconstruct_called.get(),
+            "reconstruct runner should not be used for FK-only repair"
+        );
+        assert!(
+            matches!(
+                doctor_database_fix_strategy(&db_url, dir.path()).expect("strategy after repair"),
+                DoctorDatabaseFixStrategy::None(_)
+            ),
+            "post-repair strategy should be clean"
+        );
+    }
+
+    #[test]
+    fn startup_database_self_heal_fails_when_repair_leaves_fk_orphans() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("startup_fk_still_dirty.sqlite3");
+        let db_url = format!("sqlite:///{}", db_path.display());
+        seed_startup_self_heal_fk_orphan(&db_path);
+
+        let result = run_startup_database_self_heal_with(
+            &db_url,
+            dir.path(),
+            || Ok(()),
+            |_| {
+                panic!("FK-only repair should not reconstruct");
+            },
+        );
+        let err = result.expect_err("uncleared FK orphans should fail post-repair verification");
+        let err = err.to_string();
+        assert!(
+            err.contains("post-repair verification still recommends repair"),
+            "expected post-repair verification failure, got: {err}"
+        );
+        assert!(
+            err.contains("orphaned message recipient"),
+            "expected FK/orphan detail in verification error, got: {err}"
         );
     }
 

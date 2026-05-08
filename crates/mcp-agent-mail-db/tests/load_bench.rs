@@ -31,6 +31,9 @@ use asupersync::{Cx, Outcome};
 use mcp_agent_mail_core::models::{VALID_ADJECTIVES, VALID_NOUNS};
 use mcp_agent_mail_db::queries;
 use mcp_agent_mail_db::{DbPool, DbPoolConfig, QUERY_TRACKER, read_cache};
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
@@ -123,6 +126,7 @@ fn generate_agent_names(count: usize) -> Vec<String> {
 }
 
 /// Compute percentiles from a sorted slice of microsecond latencies.
+#[derive(Clone, serde::Serialize)]
 struct LatencyReport {
     count: usize,
     p50: u64,
@@ -200,6 +204,616 @@ fn run_inbox_stats_polling_phase(
         LatencyReport::from_latencies(&mut latencies, 0),
         inbox_stats_queries,
     )
+}
+
+#[derive(serde::Serialize)]
+struct SwarmLoadLabScenario {
+    name: &'static str,
+    projects: usize,
+    agents_per_project: usize,
+    total_agents: usize,
+    messages_per_agent: usize,
+    default_ci: bool,
+    ignored_heavy: bool,
+    operations: Vec<&'static str>,
+}
+
+#[derive(serde::Serialize)]
+struct SwarmLoadLabOperationReport {
+    operation: &'static str,
+    count: usize,
+    errors: u64,
+    p50_us: u64,
+    p95_us: u64,
+    p99_us: u64,
+    max_us: u64,
+}
+
+#[derive(serde::Serialize)]
+struct SwarmLoadLabResourceLedger {
+    baseline_rss_kb: u64,
+    final_rss_kb: u64,
+    rss_growth_kb: u64,
+    wal_bytes: u64,
+    process_cpu_ticks_delta: u64,
+    db_query_count: u64,
+    per_table_queries: BTreeMap<String, u64>,
+    isolated_storage_root: String,
+    isolated_sqlite_path: String,
+}
+
+#[derive(serde::Serialize)]
+struct SwarmLoadLabGate {
+    name: &'static str,
+    budget: String,
+    actual: String,
+    passed: bool,
+}
+
+#[derive(serde::Serialize)]
+struct SwarmLoadLabReport {
+    bead: &'static str,
+    generated_at: String,
+    scenario: &'static str,
+    operation_reports: Vec<SwarmLoadLabOperationReport>,
+    scenario_definitions: Vec<SwarmLoadLabScenario>,
+    resource_ledger: SwarmLoadLabResourceLedger,
+    gates: Vec<SwarmLoadLabGate>,
+    reproduction_commands: Vec<String>,
+    realism_notes: Vec<&'static str>,
+}
+
+impl SwarmLoadLabOperationReport {
+    fn from_latency_report(operation: &'static str, report: &LatencyReport) -> Self {
+        Self {
+            operation,
+            count: report.count,
+            errors: report.errors,
+            p50_us: report.p50,
+            p95_us: report.p95,
+            p99_us: report.p99,
+            max_us: report.max,
+        }
+    }
+}
+
+fn rss_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| {
+            s.split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u64>().ok())
+        })
+        .map_or(0, |pages| pages * 4)
+}
+
+fn process_cpu_ticks() -> u64 {
+    std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|s| {
+            let (_, fields) = s.rsplit_once(") ")?;
+            let fields: Vec<&str> = fields.split_whitespace().collect();
+            let utime = fields.get(11)?.parse::<u64>().ok()?;
+            let stime = fields.get(12)?.parse::<u64>().ok()?;
+            Some(utime + stime)
+        })
+        .unwrap_or(0)
+}
+
+fn wal_size_bytes(db_path: &str) -> u64 {
+    std::fs::metadata(format!("{db_path}-wal")).map_or(0, |meta| meta.len())
+}
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("repo root")
+        .to_path_buf()
+}
+
+fn swarm_load_lab_artifact_dir() -> PathBuf {
+    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    repo_root().join(format!(
+        "tests/artifacts/perf/swarm_load_lab/{ts}_{}",
+        std::process::id()
+    ))
+}
+
+fn markdown_for_swarm_load_lab(report: &SwarmLoadLabReport) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "# Swarm Load Lab Report");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "- Bead: `{}`", report.bead);
+    let _ = writeln!(out, "- Scenario: `{}`", report.scenario);
+    let _ = writeln!(out, "- Generated: `{}`", report.generated_at);
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Operation Latency");
+    let _ = writeln!(
+        out,
+        "| Operation | Count | Errors | p50 | p95 | p99 | Max |"
+    );
+    let _ = writeln!(out, "|---|---:|---:|---:|---:|---:|---:|");
+    for op in &report.operation_reports {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {}us | {}us | {}us | {}us |",
+            op.operation, op.count, op.errors, op.p50_us, op.p95_us, op.p99_us, op.max_us
+        );
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Resource Ledger");
+    let _ = writeln!(
+        out,
+        "- RSS growth: `{}` KiB",
+        report.resource_ledger.rss_growth_kb
+    );
+    let _ = writeln!(out, "- WAL bytes: `{}`", report.resource_ledger.wal_bytes);
+    let _ = writeln!(
+        out,
+        "- CPU ticks delta: `{}`",
+        report.resource_ledger.process_cpu_ticks_delta
+    );
+    let _ = writeln!(
+        out,
+        "- DB query count: `{}`",
+        report.resource_ledger.db_query_count
+    );
+    let _ = writeln!(
+        out,
+        "- Isolated SQLite path: `{}`",
+        report.resource_ledger.isolated_sqlite_path
+    );
+    let _ = writeln!(
+        out,
+        "- Isolated storage root: `{}`",
+        report.resource_ledger.isolated_storage_root
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Gates");
+    let _ = writeln!(out, "| Gate | Budget | Actual | Verdict |");
+    let _ = writeln!(out, "|---|---:|---:|---|");
+    for gate in &report.gates {
+        let verdict = if gate.passed { "PASS" } else { "FAIL" };
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} |",
+            gate.name, gate.budget, gate.actual, verdict
+        );
+    }
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Reproduction");
+    for command in &report.reproduction_commands {
+        let _ = writeln!(out, "- `{command}`");
+    }
+    out
+}
+
+fn write_swarm_load_lab_artifacts(report: &SwarmLoadLabReport) {
+    let dir = swarm_load_lab_artifact_dir();
+    std::fs::create_dir_all(&dir).expect("create swarm load lab artifact dir");
+    let json_path = dir.join("report.json");
+    let markdown_path = dir.join("report.md");
+    let json = serde_json::to_string_pretty(report).expect("serialize swarm load lab report");
+    std::fs::write(&json_path, json).expect("write swarm load lab json report");
+    std::fs::write(&markdown_path, markdown_for_swarm_load_lab(report))
+        .expect("write swarm load lab markdown report");
+    eprintln!("swarm load lab json artifact: {}", json_path.display());
+    eprintln!(
+        "swarm load lab markdown artifact: {}",
+        markdown_path.display()
+    );
+}
+
+fn build_swarm_load_lab_gates(
+    operation_reports: &[SwarmLoadLabOperationReport],
+    resource_ledger: &SwarmLoadLabResourceLedger,
+) -> Vec<SwarmLoadLabGate> {
+    let max_p95 = operation_reports
+        .iter()
+        .map(|report| report.p95_us)
+        .max()
+        .unwrap_or(0);
+    let max_p99 = operation_reports
+        .iter()
+        .map(|report| report.p99_us)
+        .max()
+        .unwrap_or(0);
+    let total_errors: u64 = operation_reports.iter().map(|report| report.errors).sum();
+
+    vec![
+        SwarmLoadLabGate {
+            name: "operation_errors",
+            budget: "0".to_string(),
+            actual: total_errors.to_string(),
+            passed: total_errors == 0,
+        },
+        SwarmLoadLabGate {
+            name: "max_operation_p95_us",
+            budget: "1_000_000".to_string(),
+            actual: max_p95.to_string(),
+            passed: max_p95 <= 1_000_000,
+        },
+        SwarmLoadLabGate {
+            name: "max_operation_p99_us",
+            budget: "3_000_000".to_string(),
+            actual: max_p99.to_string(),
+            passed: max_p99 <= 3_000_000,
+        },
+        SwarmLoadLabGate {
+            name: "rss_growth_kb",
+            budget: "204_800".to_string(),
+            actual: resource_ledger.rss_growth_kb.to_string(),
+            passed: resource_ledger.rss_growth_kb <= 204_800,
+        },
+        SwarmLoadLabGate {
+            name: "wal_bytes",
+            budget: "134_217_728".to_string(),
+            actual: resource_ledger.wal_bytes.to_string(),
+            passed: resource_ledger.wal_bytes <= 134_217_728,
+        },
+        SwarmLoadLabGate {
+            name: "db_queries_present",
+            budget: ">0".to_string(),
+            actual: resource_ledger.db_query_count.to_string(),
+            passed: resource_ledger.db_query_count > 0,
+        },
+    ]
+}
+
+fn swarm_load_lab_scenario_definitions() -> Vec<SwarmLoadLabScenario> {
+    vec![
+        SwarmLoadLabScenario {
+            name: "ci_smoke",
+            projects: 3,
+            agents_per_project: 4,
+            total_agents: 12,
+            messages_per_agent: 2,
+            default_ci: true,
+            ignored_heavy: false,
+            operations: vec![
+                "ensure_project",
+                "register_agent",
+                "ensure_product",
+                "products_link",
+                "send_message",
+                "fetch_inbox",
+                "search_messages",
+                "file_reservation_paths",
+                "robot_status_snapshot_surrogate",
+                "startup_integrity_check",
+            ],
+        },
+        SwarmLoadLabScenario {
+            name: "ignored_1k_registration_storm",
+            projects: 50,
+            agents_per_project: 20,
+            total_agents: 1000,
+            messages_per_agent: 0,
+            default_ci: false,
+            ignored_heavy: true,
+            operations: vec!["ensure_project", "register_agent"],
+        },
+        SwarmLoadLabScenario {
+            name: "ignored_1k_mixed_workload",
+            projects: 50,
+            agents_per_project: 20,
+            total_agents: 1000,
+            messages_per_agent: 0,
+            default_ci: false,
+            ignored_heavy: true,
+            operations: vec![
+                "fetch_inbox",
+                "send_message",
+                "search_messages",
+                "file_reservation_paths",
+                "acknowledge_message",
+            ],
+        },
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// CI-safe swarm load lab smoke
+// ---------------------------------------------------------------------------
+
+#[test]
+fn swarm_load_lab_ci_smoke_writes_slo_artifacts() {
+    let (pool, _dir) = make_load_pool(24);
+    let sqlite_path = pool.sqlite_path().to_string();
+    let storage_root = Path::new(&sqlite_path)
+        .parent()
+        .expect("sqlite path parent")
+        .join("storage");
+    let names = generate_agent_names(12);
+    let baseline_rss = rss_kb();
+    let baseline_cpu = process_cpu_ticks();
+
+    QUERY_TRACKER.enable(None);
+    QUERY_TRACKER.reset();
+
+    let mut register_lats = Vec::new();
+    let mut product_lats = Vec::new();
+    let mut send_lats = Vec::new();
+    let mut inbox_lats = Vec::new();
+    let mut search_lats = Vec::new();
+    let mut reservation_lats = Vec::new();
+    let mut robot_snapshot_lats = Vec::new();
+    let mut recovery_lats = Vec::new();
+    let mut register_errors = 0_u64;
+    let mut product_errors = 0_u64;
+    let mut send_errors = 0_u64;
+    let mut inbox_errors = 0_u64;
+    let mut search_errors = 0_u64;
+    let mut reservation_errors = 0_u64;
+    let mut robot_snapshot_errors = 0_u64;
+    let mut recovery_errors = 0_u64;
+
+    let mut project_data: Vec<(i64, Vec<i64>)> = Vec::new();
+    for project_idx in 0..3 {
+        let project_start = Instant::now();
+        let project_id = block_on_with_retry(5, |cx| {
+            let pp = pool.clone();
+            let key = format!("/data/swarm-load-lab/ci/project-{project_idx}");
+            async move { queries::ensure_project(&cx, &pp, &key).await }
+        })
+        .id
+        .expect("project id");
+        register_lats.push(project_start.elapsed().as_micros() as u64);
+
+        let mut agent_ids = Vec::new();
+        for agent_idx in 0..4 {
+            let name = names[project_idx * 4 + agent_idx].clone();
+            let t0 = Instant::now();
+            match block_on(|cx| {
+                let pp = pool.clone();
+                async move {
+                    queries::register_agent(
+                        &cx,
+                        &pp,
+                        project_id,
+                        &name,
+                        "swarm-load-lab",
+                        "ci-smoke",
+                        Some("br-72syp CI smoke"),
+                        None,
+                        None,
+                    )
+                    .await
+                }
+            }) {
+                Outcome::Ok(agent) => {
+                    register_lats.push(t0.elapsed().as_micros() as u64);
+                    agent_ids.push(agent.id.expect("agent id"));
+                }
+                _ => register_errors += 1,
+            }
+        }
+        project_data.push((project_id, agent_ids));
+    }
+
+    let t0 = Instant::now();
+    let product_id = match block_on(|cx| {
+        let pp = pool.clone();
+        async move {
+            queries::ensure_product(
+                &cx,
+                &pp,
+                Some("swarm-load-lab-ci"),
+                Some("Swarm Load Lab CI"),
+            )
+            .await
+        }
+    }) {
+        Outcome::Ok(product) => {
+            product_lats.push(t0.elapsed().as_micros() as u64);
+            product.id.expect("product id")
+        }
+        _ => {
+            product_errors += 1;
+            -1
+        }
+    };
+    if product_id > 0 {
+        let project_ids: Vec<i64> = project_data.iter().map(|(id, _)| *id).collect();
+        let t0 = Instant::now();
+        match block_on(|cx| {
+            let pp = pool.clone();
+            async move { queries::link_product_to_projects(&cx, &pp, product_id, &project_ids).await }
+        }) {
+            Outcome::Ok(_) => product_lats.push(t0.elapsed().as_micros() as u64),
+            _ => product_errors += 1,
+        }
+    }
+
+    for (project_id, agent_ids) in &project_data {
+        for (agent_idx, sender_id) in agent_ids.iter().copied().enumerate() {
+            for msg_idx in 0..2 {
+                let receiver = agent_ids[(agent_idx + msg_idx + 1) % agent_ids.len()];
+                let t0 = Instant::now();
+                match block_on(|cx| {
+                    let pp = pool.clone();
+                    async move {
+                        queries::create_message_with_recipients(
+                            &cx,
+                            &pp,
+                            *project_id,
+                            sender_id,
+                            &format!("swarm smoke {project_id}-{agent_idx}-{msg_idx}"),
+                            "swarm load lab smoke body for inbox and search paths",
+                            Some("br-72syp-ci-smoke"),
+                            "normal",
+                            msg_idx == 0,
+                            "",
+                            &[(receiver, "to")],
+                        )
+                        .await
+                    }
+                }) {
+                    Outcome::Ok(_) => send_lats.push(t0.elapsed().as_micros() as u64),
+                    _ => send_errors += 1,
+                }
+            }
+        }
+    }
+
+    for (project_id, agent_ids) in &project_data {
+        for agent_id in agent_ids {
+            let t0 = Instant::now();
+            match block_on(|cx| {
+                let pp = pool.clone();
+                async move {
+                    queries::fetch_inbox(&cx, &pp, *project_id, *agent_id, false, None, 20).await
+                }
+            }) {
+                Outcome::Ok(_) => inbox_lats.push(t0.elapsed().as_micros() as u64),
+                _ => inbox_errors += 1,
+            }
+
+            let t0 = Instant::now();
+            match block_on(|cx| {
+                let pp = pool.clone();
+                async move { queries::get_inbox_stats(&cx, &pp, *agent_id).await }
+            }) {
+                Outcome::Ok(_) => robot_snapshot_lats.push(t0.elapsed().as_micros() as u64),
+                _ => robot_snapshot_errors += 1,
+            }
+        }
+    }
+
+    for (project_id, agent_ids) in &project_data {
+        let t0 = Instant::now();
+        match block_on(|cx| {
+            let pp = pool.clone();
+            async move { queries::search_messages(&cx, &pp, *project_id, "swarm", 20).await }
+        }) {
+            Outcome::Ok(_) => search_lats.push(t0.elapsed().as_micros() as u64),
+            _ => search_errors += 1,
+        }
+
+        for (idx, agent_id) in agent_ids.iter().copied().take(2).enumerate() {
+            let t0 = Instant::now();
+            let path = format!("src/swarm_lab/project_{project_id}/agent_{idx}.rs");
+            match block_on(|cx| {
+                let pp = pool.clone();
+                async move {
+                    queries::create_file_reservations(
+                        &cx,
+                        &pp,
+                        *project_id,
+                        agent_id,
+                        &[path.as_str()],
+                        300,
+                        true,
+                        "br-72syp ci smoke",
+                    )
+                    .await
+                }
+            }) {
+                Outcome::Ok(_) => reservation_lats.push(t0.elapsed().as_micros() as u64),
+                _ => reservation_errors += 1,
+            }
+        }
+    }
+
+    let t0 = Instant::now();
+    match pool.run_startup_integrity_check() {
+        Ok(_) => recovery_lats.push(t0.elapsed().as_micros() as u64),
+        Err(_) => recovery_errors += 1,
+    }
+
+    let tracker_snapshot = QUERY_TRACKER.snapshot();
+    QUERY_TRACKER.disable();
+    QUERY_TRACKER.reset();
+
+    let final_rss = rss_kb();
+    let final_cpu = process_cpu_ticks();
+    let per_table_queries: BTreeMap<String, u64> = tracker_snapshot.per_table.into_iter().collect();
+    let db_query_count = per_table_queries.values().sum();
+
+    let register_report = LatencyReport::from_latencies(&mut register_lats, register_errors);
+    let product_report = LatencyReport::from_latencies(&mut product_lats, product_errors);
+    let send_report = LatencyReport::from_latencies(&mut send_lats, send_errors);
+    let inbox_report = LatencyReport::from_latencies(&mut inbox_lats, inbox_errors);
+    let search_report = LatencyReport::from_latencies(&mut search_lats, search_errors);
+    let reservation_report =
+        LatencyReport::from_latencies(&mut reservation_lats, reservation_errors);
+    let robot_snapshot_report =
+        LatencyReport::from_latencies(&mut robot_snapshot_lats, robot_snapshot_errors);
+    let recovery_report = LatencyReport::from_latencies(&mut recovery_lats, recovery_errors);
+    register_report.print("load_lab_register_agent");
+    product_report.print("load_lab_product_bus");
+    send_report.print("load_lab_send_message");
+    inbox_report.print("load_lab_fetch_inbox");
+    search_report.print("load_lab_search_messages");
+    reservation_report.print("load_lab_file_reservations");
+    robot_snapshot_report.print("load_lab_robot_status_snapshot_surrogate");
+    recovery_report.print("load_lab_startup_integrity_check");
+
+    let operation_reports = vec![
+        SwarmLoadLabOperationReport::from_latency_report("register_agent", &register_report),
+        SwarmLoadLabOperationReport::from_latency_report("product_bus", &product_report),
+        SwarmLoadLabOperationReport::from_latency_report("send_message", &send_report),
+        SwarmLoadLabOperationReport::from_latency_report("fetch_inbox", &inbox_report),
+        SwarmLoadLabOperationReport::from_latency_report("search_messages", &search_report),
+        SwarmLoadLabOperationReport::from_latency_report(
+            "file_reservation_paths",
+            &reservation_report,
+        ),
+        SwarmLoadLabOperationReport::from_latency_report(
+            "robot_status_snapshot_surrogate",
+            &robot_snapshot_report,
+        ),
+        SwarmLoadLabOperationReport::from_latency_report(
+            "startup_integrity_check",
+            &recovery_report,
+        ),
+    ];
+    let resource_ledger = SwarmLoadLabResourceLedger {
+        baseline_rss_kb: baseline_rss,
+        final_rss_kb: final_rss,
+        rss_growth_kb: final_rss.saturating_sub(baseline_rss),
+        wal_bytes: wal_size_bytes(&sqlite_path),
+        process_cpu_ticks_delta: final_cpu.saturating_sub(baseline_cpu),
+        db_query_count,
+        per_table_queries,
+        isolated_storage_root: storage_root.display().to_string(),
+        isolated_sqlite_path: sqlite_path,
+    };
+    let gates = build_swarm_load_lab_gates(&operation_reports, &resource_ledger);
+    let report = SwarmLoadLabReport {
+        bead: "br-72syp",
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        scenario: "ci_smoke",
+        operation_reports,
+        scenario_definitions: swarm_load_lab_scenario_definitions(),
+        resource_ledger,
+        gates,
+        reproduction_commands: vec![
+            "rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_mcp_agent_mail_swarm_lab cargo test -p mcp-agent-mail-db --test load_bench swarm_load_lab_ci_smoke_writes_slo_artifacts -- --nocapture".to_string(),
+            "rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_mcp_agent_mail_swarm_lab cargo test -p mcp-agent-mail-db --test load_bench load_scenario_a_registration_storm -- --ignored --nocapture".to_string(),
+            "rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_mcp_agent_mail_swarm_lab cargo test -p mcp-agent-mail-db --test load_bench load_scenario_c_mixed_workload -- --ignored --nocapture".to_string(),
+        ],
+        realism_notes: vec![
+            "CI smoke uses the real DB query layer with isolated SQLite and storage roots; it does not touch the operator mailbox.",
+            "The robot status lane is represented by the inbox-stats snapshot path used by robot status summaries, not by a live CLI transport process.",
+            "The ignored 1k scenarios are the heavy-capacity lanes and must run through rch on suitable workers.",
+        ],
+    };
+    write_swarm_load_lab_artifacts(&report);
+
+    let failed_gates: Vec<&SwarmLoadLabGate> =
+        report.gates.iter().filter(|gate| !gate.passed).collect();
+    assert!(
+        failed_gates.is_empty(),
+        "swarm load lab gates failed: {}",
+        failed_gates
+            .iter()
+            .map(|gate| gate.name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 }
 
 // ---------------------------------------------------------------------------
