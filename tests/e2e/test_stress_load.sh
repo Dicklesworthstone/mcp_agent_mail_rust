@@ -180,6 +180,38 @@ rss_kb_for_pid() {
     '
 }
 
+cpu_ticks_for_pid() {
+    local pid="$1"
+    awk '{ print $14 + $15 }' "/proc/${pid}/stat" 2>/dev/null || echo 0
+}
+
+file_size_bytes() {
+    local path="$1"
+    if [ -f "$path" ]; then
+        stat --format='%s' "$path" 2>/dev/null || stat -f '%z' "$path" 2>/dev/null || echo 0
+    else
+        echo 0
+    fi
+}
+
+tree_size_bytes() {
+    local path="$1"
+    if [ -d "$path" ]; then
+        du -sb "$path" 2>/dev/null | awk '{ print $1 + 0 }' || echo 0
+    else
+        echo 0
+    fi
+}
+
+tree_file_count() {
+    local path="$1"
+    if [ -d "$path" ]; then
+        find "$path" -type f 2>/dev/null | wc -l | awk '{ print $1 + 0 }'
+    else
+        echo 0
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Setup: create temp workspace, start server
 # ---------------------------------------------------------------------------
@@ -224,7 +256,9 @@ SERVER_URL="${E2E_SERVER_URL%/mcp/}"
 MCP_URL="${E2E_SERVER_URL}"
 echo "  Server: ${SERVER_URL}"
 echo "  Server PID: ${E2E_SERVER_PID}"
+CLK_TCK="$(getconf CLK_TCK 2>/dev/null || echo 100)"
 SERVER_RSS_START_KB="$(rss_kb_for_pid "${E2E_SERVER_PID}")"
+SERVER_CPU_START_TICKS="$(cpu_ticks_for_pid "${E2E_SERVER_PID}")"
 
 # ---------------------------------------------------------------------------
 # Helper: send MCP tool call via HTTP
@@ -813,6 +847,15 @@ fi
 SERVER_RSS_END_KB="$(rss_kb_for_pid "${E2E_SERVER_PID}")"
 RSS_GROWTH_KB=$(( SERVER_RSS_END_KB - SERVER_RSS_START_KB ))
 [ "$RSS_GROWTH_KB" -lt 0 ] && RSS_GROWTH_KB=0
+SERVER_CPU_END_TICKS="$(cpu_ticks_for_pid "${E2E_SERVER_PID}")"
+SERVER_CPU_TICKS_DELTA=$(( SERVER_CPU_END_TICKS - SERVER_CPU_START_TICKS ))
+[ "$SERVER_CPU_TICKS_DELTA" -lt 0 ] && SERVER_CPU_TICKS_DELTA=0
+SERVER_CPU_SECONDS="$(python3 -c "print(round(${SERVER_CPU_TICKS_DELTA} / max(${CLK_TCK}, 1), 3))" 2>/dev/null || echo "0")"
+STRESS_DB_BYTES="$(file_size_bytes "${STRESS_DB}")"
+STRESS_DB_WAL_BYTES="$(file_size_bytes "${STRESS_DB}-wal")"
+STRESS_DB_SHM_BYTES="$(file_size_bytes "${STRESS_DB}-shm")"
+STRESS_STORAGE_BYTES="$(tree_size_bytes "${STRESS_STORAGE}")"
+STRESS_STORAGE_FILE_COUNT="$(tree_file_count "${STRESS_STORAGE}")"
 
 # Robot commands take the same storage activity lock as the live server. Stop
 # the server after measuring RSS so the robot snapshot proves the operator path
@@ -891,9 +934,19 @@ write_load_lab_reports() {
     PRODUCT_KEY="$PRODUCT_KEY" \
     STRESS_DB="$STRESS_DB" \
     STRESS_STORAGE="$STRESS_STORAGE" \
+    CLK_TCK="$CLK_TCK" \
     SERVER_RSS_START_KB="$SERVER_RSS_START_KB" \
     SERVER_RSS_END_KB="$SERVER_RSS_END_KB" \
     RSS_GROWTH_KB="$RSS_GROWTH_KB" \
+    SERVER_CPU_START_TICKS="$SERVER_CPU_START_TICKS" \
+    SERVER_CPU_END_TICKS="$SERVER_CPU_END_TICKS" \
+    SERVER_CPU_TICKS_DELTA="$SERVER_CPU_TICKS_DELTA" \
+    SERVER_CPU_SECONDS="$SERVER_CPU_SECONDS" \
+    STRESS_DB_BYTES="$STRESS_DB_BYTES" \
+    STRESS_DB_WAL_BYTES="$STRESS_DB_WAL_BYTES" \
+    STRESS_DB_SHM_BYTES="$STRESS_DB_SHM_BYTES" \
+    STRESS_STORAGE_BYTES="$STRESS_STORAGE_BYTES" \
+    STRESS_STORAGE_FILE_COUNT="$STRESS_STORAGE_FILE_COUNT" \
     REG_OK="$REG_OK" \
     REG_FAIL="$REG_FAIL" \
     PRODUCT_SETUP_OK="$PRODUCT_SETUP_OK" \
@@ -947,6 +1000,12 @@ def env_int(name: str, default: int = 0) -> int:
     if raw is None or raw == "":
         return default
     return int(raw)
+
+def env_float(name: str, default: float = 0.0) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return float(raw)
 
 def pct(values: list[int], percentile: float) -> int:
     if not values:
@@ -1157,6 +1216,16 @@ report = {
         "server_rss_end_kb": env_int("SERVER_RSS_END_KB"),
         "server_rss_growth_kb": rss_growth_kb,
         "server_rss_growth_budget_kb": rss_growth_budget_kb,
+        "server_cpu_start_ticks": env_int("SERVER_CPU_START_TICKS"),
+        "server_cpu_end_ticks": env_int("SERVER_CPU_END_TICKS"),
+        "server_cpu_ticks_delta": env_int("SERVER_CPU_TICKS_DELTA"),
+        "server_cpu_seconds": env_float("SERVER_CPU_SECONDS"),
+        "clock_ticks_per_second": env_int("CLK_TCK"),
+        "sqlite_main_bytes": env_int("STRESS_DB_BYTES"),
+        "sqlite_wal_bytes": env_int("STRESS_DB_WAL_BYTES"),
+        "sqlite_shm_bytes": env_int("STRESS_DB_SHM_BYTES"),
+        "storage_tree_bytes": env_int("STRESS_STORAGE_BYTES"),
+        "storage_file_count": env_int("STRESS_STORAGE_FILE_COUNT"),
     },
     "summary": summary,
     "latencies": latencies,
@@ -1201,9 +1270,15 @@ for phase, stats in latencies.items():
 
 lines.extend([
     "",
-    "## Resource Gates",
+    "## Resource Ledger",
     "",
     f"RSS growth: {rss_growth_kb} KB / {rss_growth_budget_kb} KB",
+    f"Server CPU: {report['resources']['server_cpu_seconds']} s "
+    f"({report['resources']['server_cpu_ticks_delta']} ticks @ {report['resources']['clock_ticks_per_second']} Hz)",
+    f"SQLite main/WAL/SHM: {report['resources']['sqlite_main_bytes']} / "
+    f"{report['resources']['sqlite_wal_bytes']} / {report['resources']['sqlite_shm_bytes']} bytes",
+    f"Storage tree: {report['resources']['storage_file_count']} files, "
+    f"{report['resources']['storage_tree_bytes']} bytes",
     "",
     "## Gate Verdicts",
     "",
@@ -1254,6 +1329,9 @@ echo "  Phase 7 (Product Bus):   S:${PRODUCT_SEARCH_OK}/${CONCURRENCY} I:${PRODU
 echo "  Phase 8 (Health):        ${HEALTH_OK}/${HEALTH_CHECKS} ok, avg ${HEALTH_AVG_MS}ms"
 echo "  Phase 9 (Robot Status):  ${ROBOT_OK}/1 ok"
 echo "  RSS Growth:              ${RSS_GROWTH_KB} KB / ${STRESS_RSS_GROWTH_BUDGET_KB} KB"
+echo "  Server CPU:              ${SERVER_CPU_SECONDS}s (${SERVER_CPU_TICKS_DELTA} ticks)"
+echo "  SQLite bytes:            main=${STRESS_DB_BYTES} wal=${STRESS_DB_WAL_BYTES} shm=${STRESS_DB_SHM_BYTES}"
+echo "  Storage tree:            ${STRESS_STORAGE_FILE_COUNT} files, ${STRESS_STORAGE_BYTES} bytes"
 echo "  Reports:                 ${E2E_ARTIFACT_DIR}/load_lab_report.{json,md}"
 echo "================================================================"
 
