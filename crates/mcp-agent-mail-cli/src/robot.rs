@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use sqlmodel_core::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::CliError;
 
@@ -783,7 +785,7 @@ pub fn resolve_format_for_terminal() -> OutputFormat {
 // so it can be used as `RobotEnvelope<T>` data.
 
 /// robot status — dashboard synthesis.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct StatusData {
     pub health: String,
     pub unread: usize,
@@ -805,7 +807,7 @@ pub struct StatusData {
 }
 
 /// Recovery state surfaced in `robot status` when the mailbox is degraded or recovering.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RecoveryStatus {
     /// Current durability mode: "healthy", "degraded_read_only", "recovering", or "corrupt".
     pub mode: String,
@@ -841,7 +843,7 @@ pub struct RecoveryStatus {
 }
 
 /// Deferred-write backlog summary for operator-facing recovery status.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DeferredWriteBacklog {
     /// Number of writes currently queued for replay.
     pub queued: usize,
@@ -858,7 +860,7 @@ pub struct DeferredWriteBacklog {
 }
 
 /// Snapshot of the recovery admission controller for operator diagnostics.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RecoveryAdmissionSnapshot {
     /// Whether a recovery operation is currently in progress.
     pub in_progress: bool,
@@ -885,7 +887,7 @@ pub struct ReservationEntry {
 }
 
 /// Summary entry for a thread (used in status and overview).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ThreadSummary {
     pub id: String,
     pub subject: String,
@@ -920,7 +922,7 @@ pub struct TimelineEvent {
 }
 
 /// robot overview — per-project summary.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct OverviewProject {
     pub slug: String,
     pub unread: usize,
@@ -2544,6 +2546,294 @@ const MICROS_PER_DAY: i64 = 24 * MICROS_PER_HOUR;
 const ACK_OVERDUE_THRESHOLD_US: i64 = 30 * MICROS_PER_MINUTE;
 const ACK_SLA_VIOLATION_THRESHOLD_US: i64 = MICROS_PER_HOUR;
 
+/// Freshness budget for coalesced robot status/overview snapshots.
+///
+/// The generation stamp below invalidates on mailbox writes that affect the
+/// dashboard. This TTL bounds time-derived drift such as age strings,
+/// reservation countdowns, and active-agent windows.
+const ROBOT_SNAPSHOT_CACHE_TTL: Duration = Duration::from_millis(500);
+const ROBOT_SNAPSHOT_CACHE_MAX_ENTRIES: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RobotSnapshotGeneration {
+    values: [i64; 10],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RobotStatusSnapshotKey {
+    db_identity: String,
+    project_id: i64,
+    project_slug: String,
+    agent_id: Option<i64>,
+    agent_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RobotOverviewSnapshotKey {
+    db_identity: String,
+}
+
+#[derive(Debug, Clone)]
+struct RobotStatusSnapshotEntry {
+    generation: RobotSnapshotGeneration,
+    cached_at: Instant,
+    data: StatusData,
+    actions: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RobotOverviewSnapshotEntry {
+    generation: RobotSnapshotGeneration,
+    cached_at: Instant,
+    projects: Vec<OverviewProject>,
+}
+
+static ROBOT_STATUS_SNAPSHOT_CACHE: OnceLock<
+    Mutex<HashMap<RobotStatusSnapshotKey, RobotStatusSnapshotEntry>>,
+> = OnceLock::new();
+static ROBOT_OVERVIEW_SNAPSHOT_CACHE: OnceLock<
+    Mutex<HashMap<RobotOverviewSnapshotKey, RobotOverviewSnapshotEntry>>,
+> = OnceLock::new();
+
+fn robot_status_snapshot_cache()
+-> &'static Mutex<HashMap<RobotStatusSnapshotKey, RobotStatusSnapshotEntry>> {
+    ROBOT_STATUS_SNAPSHOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn robot_overview_snapshot_cache()
+-> &'static Mutex<HashMap<RobotOverviewSnapshotKey, RobotOverviewSnapshotEntry>> {
+    ROBOT_OVERVIEW_SNAPSHOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn robot_db_identity(conn: &DbConn) -> String {
+    conn.query_sync("PRAGMA database_list", &[])
+        .ok()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row.get_named::<String>("name").ok().as_deref() == Some("main"))
+                .and_then(|row| row.get_named::<String>("file").ok())
+                .filter(|path| !path.is_empty())
+        })
+        .unwrap_or_else(|| format!("conn:{conn:p}"))
+}
+
+fn robot_snapshot_i64(row: &sqlmodel_core::Row, field: &str, label: &str) -> Result<i64, CliError> {
+    row.get_by_name(field)
+        .and_then(sqlmodel_core::Value::as_i64)
+        .ok_or_else(|| CliError::Other(format!("{label} generation missing integer {field}")))
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_ROBOT_SNAPSHOT_GENERATION_ERROR: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn robot_snapshot_generation_forced_error() -> bool {
+    FORCE_ROBOT_SNAPSHOT_GENERATION_ERROR.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn robot_snapshot_generation_forced_error() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn set_robot_snapshot_generation_forced_error(value: bool) {
+    FORCE_ROBOT_SNAPSHOT_GENERATION_ERROR.with(|cell| cell.set(value));
+}
+
+#[cfg(test)]
+fn clear_robot_snapshot_caches_for_tests() {
+    if let Some(cache) = ROBOT_STATUS_SNAPSHOT_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+    if let Some(cache) = ROBOT_OVERVIEW_SNAPSHOT_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+    set_robot_snapshot_generation_forced_error(false);
+}
+
+#[allow(clippy::too_many_lines)]
+fn robot_status_snapshot_generation(
+    conn: &DbConn,
+    project_id: i64,
+) -> Result<RobotSnapshotGeneration, CliError> {
+    if robot_snapshot_generation_forced_error() {
+        return Err(CliError::Other(
+            "forced robot snapshot generation failure".to_string(),
+        ));
+    }
+
+    let has_release_ledger = has_file_reservation_release_ledger(conn);
+    let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
+    let reservation_max_expr = if has_legacy_released_ts_column {
+        "MAX(CASE
+             WHEN COALESCE(fr.released_ts, 0) >= fr.created_ts
+              AND COALESCE(fr.released_ts, 0) >= fr.expires_ts
+             THEN COALESCE(fr.released_ts, 0)
+             WHEN fr.created_ts >= fr.expires_ts THEN fr.created_ts
+             ELSE fr.expires_ts
+         END)"
+    } else {
+        "MAX(CASE WHEN fr.created_ts >= fr.expires_ts THEN fr.created_ts ELSE fr.expires_ts END)"
+    };
+    let release_columns = if has_release_ledger {
+        ",
+         COALESCE((
+             SELECT COUNT(*)
+             FROM file_reservation_releases rr
+             JOIN file_reservations fr ON fr.id = rr.reservation_id
+             WHERE fr.project_id = ?
+         ), 0) AS release_count,
+         COALESCE((
+             SELECT MAX(rr.released_ts)
+             FROM file_reservation_releases rr
+             JOIN file_reservations fr ON fr.id = rr.reservation_id
+             WHERE fr.project_id = ?
+         ), 0) AS release_max_ts"
+            .to_string()
+    } else {
+        ", 0 AS release_count, 0 AS release_max_ts".to_string()
+    };
+    let sql = format!(
+        "SELECT
+             COALESCE((SELECT COUNT(*) FROM messages WHERE project_id = ?), 0) AS message_count,
+             COALESCE((SELECT MAX(created_ts) FROM messages WHERE project_id = ?), 0) AS message_max_ts,
+             COALESCE((
+                 SELECT COUNT(*)
+                 FROM message_recipients mr
+                 JOIN messages m ON m.id = mr.message_id
+                 WHERE m.project_id = ?
+             ), 0) AS recipient_count,
+             COALESCE((
+                 SELECT MAX(CASE
+                     WHEN COALESCE(mr.read_ts, 0) >= COALESCE(mr.ack_ts, 0)
+                     THEN COALESCE(mr.read_ts, 0)
+                     ELSE COALESCE(mr.ack_ts, 0)
+                 END)
+                 FROM message_recipients mr
+                 JOIN messages m ON m.id = mr.message_id
+                 WHERE m.project_id = ?
+             ), 0) AS recipient_max_touch_ts,
+             COALESCE((SELECT COUNT(*) FROM agents WHERE project_id = ?), 0) AS agent_count,
+             COALESCE((SELECT MAX(last_active_ts) FROM agents WHERE project_id = ?), 0) AS agent_max_active_ts,
+             COALESCE((SELECT COUNT(*) FROM file_reservations WHERE project_id = ?), 0) AS reservation_count,
+             COALESCE((SELECT {reservation_max_expr} FROM file_reservations fr WHERE fr.project_id = ?), 0) AS reservation_max_ts
+             {release_columns}"
+    );
+    let mut params = vec![
+        Value::BigInt(project_id),
+        Value::BigInt(project_id),
+        Value::BigInt(project_id),
+        Value::BigInt(project_id),
+        Value::BigInt(project_id),
+        Value::BigInt(project_id),
+        Value::BigInt(project_id),
+        Value::BigInt(project_id),
+    ];
+    if has_release_ledger {
+        params.push(Value::BigInt(project_id));
+        params.push(Value::BigInt(project_id));
+    }
+    let rows = conn
+        .query_sync(&sql, &params)
+        .map_err(|e| CliError::Other(format!("status snapshot generation failed: {e}")))?;
+    let row = rows
+        .first()
+        .ok_or_else(|| CliError::Other("status snapshot generation returned no rows".into()))?;
+    Ok(RobotSnapshotGeneration {
+        values: [
+            robot_snapshot_i64(row, "message_count", "status")?,
+            robot_snapshot_i64(row, "message_max_ts", "status")?,
+            robot_snapshot_i64(row, "recipient_count", "status")?,
+            robot_snapshot_i64(row, "recipient_max_touch_ts", "status")?,
+            robot_snapshot_i64(row, "agent_count", "status")?,
+            robot_snapshot_i64(row, "agent_max_active_ts", "status")?,
+            robot_snapshot_i64(row, "reservation_count", "status")?,
+            robot_snapshot_i64(row, "reservation_max_ts", "status")?,
+            robot_snapshot_i64(row, "release_count", "status")?,
+            robot_snapshot_i64(row, "release_max_ts", "status")?,
+        ],
+    })
+}
+
+fn robot_overview_snapshot_generation(conn: &DbConn) -> Result<RobotSnapshotGeneration, CliError> {
+    if robot_snapshot_generation_forced_error() {
+        return Err(CliError::Other(
+            "forced robot snapshot generation failure".to_string(),
+        ));
+    }
+
+    let has_release_ledger = has_file_reservation_release_ledger(conn);
+    let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
+    let reservation_max_expr = if has_legacy_released_ts_column {
+        "MAX(CASE
+             WHEN COALESCE(released_ts, 0) >= created_ts
+              AND COALESCE(released_ts, 0) >= expires_ts
+             THEN COALESCE(released_ts, 0)
+             WHEN created_ts >= expires_ts THEN created_ts
+             ELSE expires_ts
+         END)"
+    } else {
+        "MAX(CASE WHEN created_ts >= expires_ts THEN created_ts ELSE expires_ts END)"
+    };
+    let release_columns = if has_release_ledger {
+        ",
+         COALESCE((SELECT COUNT(*) FROM file_reservation_releases), 0) AS release_count,
+         COALESCE((SELECT MAX(released_ts) FROM file_reservation_releases), 0) AS release_max_ts"
+            .to_string()
+    } else {
+        ", 0 AS release_count, 0 AS release_max_ts".to_string()
+    };
+    let sql = format!(
+        "SELECT
+             COALESCE((SELECT COUNT(*) FROM projects), 0) AS project_count,
+             COALESCE((SELECT COUNT(*) FROM messages), 0) AS message_count,
+             COALESCE((SELECT MAX(created_ts) FROM messages), 0) AS message_max_ts,
+             COALESCE((SELECT COUNT(*) FROM message_recipients), 0) AS recipient_count,
+             COALESCE((
+                 SELECT MAX(CASE
+                     WHEN COALESCE(read_ts, 0) >= COALESCE(ack_ts, 0)
+                     THEN COALESCE(read_ts, 0)
+                     ELSE COALESCE(ack_ts, 0)
+                 END)
+                 FROM message_recipients
+             ), 0) AS recipient_max_touch_ts,
+             COALESCE((SELECT COUNT(*) FROM agents), 0) AS agent_count,
+             COALESCE((SELECT COUNT(*) FROM file_reservations), 0) AS reservation_count,
+             COALESCE((SELECT {reservation_max_expr} FROM file_reservations), 0) AS reservation_max_ts
+             {release_columns}"
+    );
+    let rows = conn
+        .query_sync(&sql, &[])
+        .map_err(|e| CliError::Other(format!("overview snapshot generation failed: {e}")))?;
+    let row = rows
+        .first()
+        .ok_or_else(|| CliError::Other("overview snapshot generation returned no rows".into()))?;
+    Ok(RobotSnapshotGeneration {
+        values: [
+            robot_snapshot_i64(row, "project_count", "overview")?,
+            robot_snapshot_i64(row, "message_count", "overview")?,
+            robot_snapshot_i64(row, "message_max_ts", "overview")?,
+            robot_snapshot_i64(row, "recipient_count", "overview")?,
+            robot_snapshot_i64(row, "recipient_max_touch_ts", "overview")?,
+            robot_snapshot_i64(row, "agent_count", "overview")?,
+            robot_snapshot_i64(row, "reservation_count", "overview")?,
+            robot_snapshot_i64(row, "reservation_max_ts", "overview")?,
+            robot_snapshot_i64(row, "release_count", "overview")?,
+            robot_snapshot_i64(row, "release_max_ts", "overview")?,
+        ],
+    })
+}
+
 fn micros_ago(now_us: i64, delta_us: i64) -> i64 {
     now_us.saturating_sub(delta_us)
 }
@@ -3191,6 +3481,64 @@ fn build_status_with_phase(
         recovery,
     };
 
+    Ok((data, actions))
+}
+
+fn build_status_with_snapshot_cache(
+    conn: &DbConn,
+    project_id: i64,
+    project_slug: &str,
+    agent: Option<(i64, String)>,
+    mut phase: Option<&mut TailLatencyPhaseRecorder>,
+) -> Result<(StatusData, Vec<String>), CliError> {
+    let db_identity = robot_db_identity(conn);
+    let generation = match robot_status_snapshot_generation(conn, project_id) {
+        Ok(generation) => {
+            mark_tail_latency_phase(&mut phase, "snapshot_generation");
+            generation
+        }
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                "robot status snapshot generation unavailable; falling back to live build"
+            );
+            mark_tail_latency_phase(&mut phase, "snapshot_cache_unavailable");
+            return build_status_with_phase(conn, project_id, project_slug, agent, phase);
+        }
+    };
+    let key = RobotStatusSnapshotKey {
+        db_identity,
+        project_id,
+        project_slug: project_slug.to_string(),
+        agent_id: agent.as_ref().map(|(id, _)| *id),
+        agent_name: agent.as_ref().map(|(_, name)| name.clone()),
+    };
+    let now = Instant::now();
+    let mut cache = robot_status_snapshot_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = cache.get(&key)
+        && entry.generation == generation
+        && now.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+    {
+        mark_tail_latency_phase(&mut phase, "snapshot_cache_hit");
+        return Ok((entry.data.clone(), entry.actions.clone()));
+    }
+
+    mark_tail_latency_phase(&mut phase, "snapshot_cache_miss");
+    let (data, actions) = build_status_with_phase(conn, project_id, project_slug, agent, phase)?;
+    if cache.len() >= ROBOT_SNAPSHOT_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(
+        key,
+        RobotStatusSnapshotEntry {
+            generation,
+            cached_at: now,
+            data: data.clone(),
+            actions: actions.clone(),
+        },
+    );
     Ok((data, actions))
 }
 
@@ -5301,6 +5649,54 @@ fn build_overview(conn: &DbConn) -> Result<Vec<OverviewProject>, CliError> {
         });
     }
 
+    Ok(projects)
+}
+
+fn build_overview_with_snapshot_cache(
+    conn: &DbConn,
+    mut phase: Option<&mut TailLatencyPhaseRecorder>,
+) -> Result<Vec<OverviewProject>, CliError> {
+    let db_identity = robot_db_identity(conn);
+    let generation = match robot_overview_snapshot_generation(conn) {
+        Ok(generation) => {
+            mark_tail_latency_phase(&mut phase, "snapshot_generation");
+            generation
+        }
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                "robot overview snapshot generation unavailable; falling back to live build"
+            );
+            mark_tail_latency_phase(&mut phase, "snapshot_cache_unavailable");
+            return build_overview(conn);
+        }
+    };
+    let key = RobotOverviewSnapshotKey { db_identity };
+    let now = Instant::now();
+    let mut cache = robot_overview_snapshot_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = cache.get(&key)
+        && entry.generation == generation
+        && now.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+    {
+        mark_tail_latency_phase(&mut phase, "snapshot_cache_hit");
+        return Ok(entry.projects.clone());
+    }
+
+    mark_tail_latency_phase(&mut phase, "snapshot_cache_miss");
+    let projects = build_overview(conn)?;
+    if cache.len() >= ROBOT_SNAPSHOT_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(
+        key,
+        RobotOverviewSnapshotEntry {
+            generation,
+            cached_at: now,
+            projects: projects.clone(),
+        },
+    );
     Ok(projects)
 }
 
@@ -8250,7 +8646,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
 
             let agent_name = scope.agent.as_ref().map(|(_, n)| n.clone());
             let agent = scope.agent.clone();
-            let (data, actions) = build_status_with_phase(
+            let (data, actions) = build_status_with_snapshot_cache(
                 scope.conn(),
                 scope.project_id,
                 &scope.project_slug,
@@ -8834,7 +9230,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         }
         RobotSubcommand::Overview => {
             let conn = crate::open_db_sync_robot()?;
-            let projects = build_overview(&conn)?;
+            let projects = build_overview_with_snapshot_cache(&conn, None)?;
 
             #[derive(Serialize)]
             struct OverviewData {
@@ -9202,6 +9598,92 @@ mod tests {
 
     static NAVIGATE_RESOURCE_TEST_LOCK: Mutex<()> = Mutex::new(());
     static ROBOT_COMMAND_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn setup_robot_status_snapshot_test_db() -> (tempfile::TempDir, mcp_agent_mail_db::DbConn) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("robot_status_snapshot.sqlite3");
+        let conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+
+        conn.query_sync(
+            "CREATE TABLE agents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                last_active_ts INTEGER NOT NULL
+            )",
+            &empty,
+        )
+        .expect("create agents");
+        conn.query_sync(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL,
+                thread_id TEXT,
+                subject TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                ack_required INTEGER NOT NULL DEFAULT 0,
+                importance TEXT NOT NULL DEFAULT 'normal'
+            )",
+            &empty,
+        )
+        .expect("create messages");
+        conn.query_sync(
+            "CREATE TABLE message_recipients (
+                id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                read_ts INTEGER,
+                ack_ts INTEGER
+            )",
+            &empty,
+        )
+        .expect("create recipients");
+        conn.query_sync(
+            "CREATE TABLE file_reservations (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                agent_id INTEGER NOT NULL,
+                path_pattern TEXT NOT NULL,
+                exclusive INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                expires_ts INTEGER NOT NULL,
+                released_ts INTEGER
+            )",
+            &empty,
+        )
+        .expect("create reservations");
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, last_active_ts) VALUES
+                (1, 1, 'Sender', ?),
+                (2, 1, 'Reader', ?)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us),
+            ],
+        )
+        .expect("seed agents");
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, thread_id, subject, created_ts, ack_required, importance)
+             VALUES (1, 1, 1, 'thread-1', 'Initial subject', ?, 0, 'normal')",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us)],
+        )
+        .expect("seed message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (1, 1, 2, 'to', NULL, NULL)",
+            &empty,
+        )
+        .expect("seed recipient");
+
+        (temp_dir, conn)
+    }
 
     fn with_navigate_resource_env<F, T>(database_url: &str, storage_root: &str, f: F) -> T
     where
@@ -11333,6 +11815,192 @@ mod tests {
             .map(|thread| thread.id.as_str())
             .collect();
         assert_eq!(thread_ids, vec!["320", "310"]);
+    }
+
+    #[test]
+    fn build_status_snapshot_cache_reuses_fresh_generation() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_robot_snapshot_caches_for_tests();
+        let (_temp_dir, conn) = setup_robot_status_snapshot_test_db();
+
+        let mut first_phase = TailLatencyPhaseRecorder::new("robot_status");
+        let (first, _) = build_status_with_snapshot_cache(
+            &conn,
+            1,
+            "demo",
+            Some((2, "Reader".to_string())),
+            Some(&mut first_phase),
+        )
+        .expect("first status build");
+        assert_eq!(first.unread, 1);
+
+        let mut second_phase = TailLatencyPhaseRecorder::new("robot_status");
+        let (second, _) = build_status_with_snapshot_cache(
+            &conn,
+            1,
+            "demo",
+            Some((2, "Reader".to_string())),
+            Some(&mut second_phase),
+        )
+        .expect("second status build");
+        assert_eq!(second.unread, 1);
+        let phase_names: Vec<String> = second_phase
+            .finish("ok")
+            .phases
+            .into_iter()
+            .map(|phase| phase.name)
+            .collect();
+        assert!(phase_names.iter().any(|name| name == "snapshot_cache_hit"));
+        assert!(
+            !phase_names.iter().any(|name| name == "sqlite_inbox_counts"),
+            "fresh cache hits should skip the expensive status query pipeline"
+        );
+    }
+
+    #[test]
+    fn build_status_snapshot_cache_invalidates_on_mailbox_generation_change() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_robot_snapshot_caches_for_tests();
+        let (_temp_dir, conn) = setup_robot_status_snapshot_test_db();
+
+        build_status_with_snapshot_cache(&conn, 1, "demo", Some((2, "Reader".to_string())), None)
+            .expect("prime status cache");
+
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, thread_id, subject, created_ts, ack_required, importance)
+             VALUES (2, 1, 1, 'thread-2', 'New subject', ?, 0, 'normal')",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us)],
+        )
+        .expect("insert invalidating message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (2, 2, 2, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert invalidating recipient");
+
+        let mut phase = TailLatencyPhaseRecorder::new("robot_status");
+        let (status, _) = build_status_with_snapshot_cache(
+            &conn,
+            1,
+            "demo",
+            Some((2, "Reader".to_string())),
+            Some(&mut phase),
+        )
+        .expect("status rebuild after invalidation");
+        assert_eq!(status.unread, 2);
+        assert_eq!(status.top_threads[0].subject, "New subject");
+        let phase_names: Vec<String> = phase
+            .finish("ok")
+            .phases
+            .into_iter()
+            .map(|phase| phase.name)
+            .collect();
+        assert!(phase_names.iter().any(|name| name == "snapshot_cache_miss"));
+        assert!(phase_names.iter().any(|name| name == "sqlite_inbox_counts"));
+    }
+
+    #[test]
+    fn build_status_snapshot_cache_falls_back_when_generation_is_unavailable() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_robot_snapshot_caches_for_tests();
+        let (_temp_dir, conn) = setup_robot_status_snapshot_test_db();
+        set_robot_snapshot_generation_forced_error(true);
+
+        let mut phase = TailLatencyPhaseRecorder::new("robot_status");
+        let (status, _) = build_status_with_snapshot_cache(
+            &conn,
+            1,
+            "demo",
+            Some((2, "Reader".to_string())),
+            Some(&mut phase),
+        )
+        .expect("status fallback build");
+        assert_eq!(status.unread, 1);
+        let phase_names: Vec<String> = phase
+            .finish("ok")
+            .phases
+            .into_iter()
+            .map(|phase| phase.name)
+            .collect();
+        assert!(
+            phase_names
+                .iter()
+                .any(|name| name == "snapshot_cache_unavailable")
+        );
+        assert!(phase_names.iter().any(|name| name == "sqlite_inbox_counts"));
+        set_robot_snapshot_generation_forced_error(false);
+    }
+
+    #[test]
+    fn build_overview_snapshot_cache_reuses_and_invalidates_generation() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_robot_snapshot_caches_for_tests();
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+
+        let mut first_phase = TailLatencyPhaseRecorder::new("robot_overview");
+        let first = build_overview_with_snapshot_cache(&conn, Some(&mut first_phase))
+            .expect("first overview build");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].unread, 0);
+
+        let mut hit_phase = TailLatencyPhaseRecorder::new("robot_overview");
+        let cached = build_overview_with_snapshot_cache(&conn, Some(&mut hit_phase))
+            .expect("cached overview build");
+        assert_eq!(cached[0].unread, 0);
+        let hit_phase_names: Vec<String> = hit_phase
+            .finish("ok")
+            .phases
+            .into_iter()
+            .map(|phase| phase.name)
+            .collect();
+        assert!(
+            hit_phase_names
+                .iter()
+                .any(|name| name == "snapshot_cache_hit")
+        );
+
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (410, 1, 1, 'Overview invalidation', 'overview', 'urgent', 1, ?, 'body', '[]')",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us)],
+        )
+        .expect("insert overview message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (410, 410, 2, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert overview recipient");
+
+        let mut miss_phase = TailLatencyPhaseRecorder::new("robot_overview");
+        let updated = build_overview_with_snapshot_cache(&conn, Some(&mut miss_phase))
+            .expect("overview rebuild after invalidation");
+        assert_eq!(updated[0].unread, 1);
+        assert_eq!(updated[0].urgent, 1);
+        let miss_phase_names: Vec<String> = miss_phase
+            .finish("ok")
+            .phases
+            .into_iter()
+            .map(|phase| phase.name)
+            .collect();
+        assert!(
+            miss_phase_names
+                .iter()
+                .any(|name| name == "snapshot_cache_miss")
+        );
     }
 
     #[test]
