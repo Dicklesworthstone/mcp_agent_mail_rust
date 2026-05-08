@@ -8039,6 +8039,146 @@ pub async fn acknowledge_message(
     .await
 }
 
+/// Per-message outcome for [`acknowledge_messages_batch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchAcknowledgeResult {
+    pub message_id: i64,
+    pub read_ts: Option<i64>,
+    pub ack_ts: Option<i64>,
+    pub found: bool,
+}
+
+/// Batch-acknowledge multiple messages for a single recipient agent.
+///
+/// This is the high-performance counterpart of [`acknowledge_message`] for
+/// coordination bursts. Input IDs are deduplicated in first-seen order, existing
+/// rows are updated in one transaction, and missing recipient rows are reported
+/// per item instead of failing the whole batch.
+pub async fn acknowledge_messages_batch(
+    cx: &Cx,
+    pool: &DbPool,
+    agent_id: i64,
+    message_ids: &[i64],
+) -> Outcome<Vec<BatchAcknowledgeResult>, DbError> {
+    if message_ids.is_empty() {
+        return Outcome::Ok(Vec::new());
+    }
+
+    let mut seen = HashSet::with_capacity(message_ids.len());
+    let mut unique_message_ids = Vec::with_capacity(message_ids.len());
+    for &message_id in message_ids {
+        if seen.insert(message_id) {
+            unique_message_ids.push(message_id);
+        }
+    }
+
+    let now = now_micros();
+
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(c) => c,
+        Outcome::Err(e) => return Outcome::Err(e),
+        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
+        Outcome::Panicked(p) => return Outcome::Panicked(p),
+    };
+
+    let tracked = tracked(&*conn);
+    run_with_mvcc_retry(cx, "acknowledge_messages_batch", || async {
+        try_in_tx!(cx, &tracked, begin_concurrent_tx(cx, &tracked).await);
+
+        for chunk in unique_message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+            let ph = placeholders(chunk.len());
+            let sql = format!(
+                "UPDATE message_recipients \
+                 SET read_ts = COALESCE(read_ts, ?), ack_ts = COALESCE(ack_ts, ?) \
+                 WHERE agent_id = ? AND message_id IN ({ph})"
+            );
+            let mut params = Vec::with_capacity(3 + chunk.len());
+            params.push(Value::BigInt(now));
+            params.push(Value::BigInt(now));
+            params.push(Value::BigInt(agent_id));
+            params.extend(chunk.iter().map(|&message_id| Value::BigInt(message_id)));
+
+            try_in_tx!(
+                cx,
+                &tracked,
+                map_sql_outcome(traw_execute(cx, &tracked, &sql, &params).await)
+            );
+        }
+
+        try_in_tx!(
+            cx,
+            &tracked,
+            rebuild_agents_inbox_stats_in_tx(cx, &tracked, &[agent_id]).await
+        );
+
+        crate::cache::read_cache()
+            .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
+
+        let mut stored_by_message_id = BTreeMap::new();
+        for chunk in unique_message_ids.chunks(MAX_IN_CLAUSE_ITEMS) {
+            let ph = placeholders(chunk.len());
+            let read_sql = format!(
+                "SELECT message_id, read_ts, ack_ts \
+                 FROM message_recipients \
+                 WHERE agent_id = ? AND message_id IN ({ph})"
+            );
+            let mut read_params = Vec::with_capacity(1 + chunk.len());
+            read_params.push(Value::BigInt(agent_id));
+            read_params.extend(chunk.iter().map(|&message_id| Value::BigInt(message_id)));
+
+            let rows =
+                match map_sql_outcome(traw_query(cx, &tracked, &read_sql, &read_params).await) {
+                    Outcome::Ok(rows) => rows,
+                    Outcome::Err(e) => {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Err(e);
+                    }
+                    Outcome::Cancelled(r) => {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Cancelled(r);
+                    }
+                    Outcome::Panicked(p) => {
+                        rollback_tx(cx, &tracked).await;
+                        return Outcome::Panicked(p);
+                    }
+                };
+
+            for row in rows {
+                let Some(message_id) = row.get(0).and_then(value_as_i64) else {
+                    continue;
+                };
+                let read_ts = row.get(1).and_then(value_as_i64);
+                let ack_ts = row.get(2).and_then(value_as_i64);
+                stored_by_message_id.insert(message_id, (read_ts, ack_ts));
+            }
+        }
+
+        let results = unique_message_ids
+            .iter()
+            .map(|&message_id| {
+                stored_by_message_id.remove(&message_id).map_or(
+                    BatchAcknowledgeResult {
+                        message_id,
+                        read_ts: None,
+                        ack_ts: None,
+                        found: false,
+                    },
+                    |(read_ts, ack_ts)| BatchAcknowledgeResult {
+                        message_id,
+                        read_ts,
+                        ack_ts,
+                        found: true,
+                    },
+                )
+            })
+            .collect();
+
+        try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
+        Outcome::Ok(results)
+    })
+    .await
+}
+
 // =============================================================================
 // Inbox Stats Queries (materialized aggregate counters)
 // =============================================================================
@@ -22977,6 +23117,254 @@ mod tests {
             .into_result()
             .expect("fetch unread project B");
             assert_eq!(unread_b.len(), 1, "other project inbox must stay unread");
+        });
+    }
+
+    #[test]
+    #[allow(clippy::similar_names)]
+    #[allow(clippy::too_many_lines)]
+    fn acknowledge_messages_batch_marks_large_ack_wave_with_per_item_status() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let (cx, pool, _dir) = setup_test_pool("acknowledge_messages_batch_large_wave.db");
+
+        rt.block_on(async {
+            let project_a = ensure_project(&cx, &pool, "/tmp/am-batch-ack-project-a")
+                .await
+                .into_result()
+                .expect("ensure project A");
+            let project_b = ensure_project(&cx, &pool, "/tmp/am-batch-ack-project-b")
+                .await
+                .into_result()
+                .expect("ensure project B");
+            let project_a_id = project_a.id.expect("project A id");
+            let project_b_id = project_b.id.expect("project B id");
+
+            let sender_a = register_agent(
+                &cx,
+                &pool,
+                project_a_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender A");
+            let recipient_a = register_agent(
+                &cx,
+                &pool,
+                project_a_id,
+                "GreenStone",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient A");
+            let sender_b = register_agent(
+                &cx,
+                &pool,
+                project_b_id,
+                "AmberHill",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender B");
+            let recipient_b = register_agent(
+                &cx,
+                &pool,
+                project_b_id,
+                "PurpleRiver",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register recipient B");
+
+            let recipient_a_id = recipient_a.id.expect("recipient A id");
+            let recipient_b_id = recipient_b.id.expect("recipient B id");
+            let sender_a_id = sender_a.id.expect("sender A id");
+            let sender_b_id = sender_b.id.expect("sender B id");
+
+            let mut existing_ids = Vec::with_capacity(120);
+            for idx in 0_i64..120 {
+                let message = create_message_with_recipients(
+                    &cx,
+                    &pool,
+                    project_a_id,
+                    sender_a_id,
+                    &format!("batch-{idx}"),
+                    "body",
+                    Some("batch-ack"),
+                    "normal",
+                    true,
+                    "[]",
+                    &[(recipient_a_id, "to")],
+                )
+                .await
+                .into_result()
+                .expect("create project A message");
+                existing_ids.push(message.id.expect("project A message id"));
+            }
+
+            let other_project_message = create_message_with_recipients(
+                &cx,
+                &pool,
+                project_b_id,
+                sender_b_id,
+                "other",
+                "body",
+                Some("batch-ack-other"),
+                "urgent",
+                true,
+                "[]",
+                &[(recipient_b_id, "to")],
+            )
+            .await
+            .into_result()
+            .expect("create other project message");
+            let other_project_id = other_project_message.id.expect("other project message id");
+            let missing_id = existing_ids
+                .iter()
+                .copied()
+                .chain(std::iter::once(other_project_id))
+                .max()
+                .expect("seeded message ids")
+                + 10_000;
+
+            let (old_read_ts, old_ack_ts) = acknowledge_message(
+                &cx,
+                &pool,
+                recipient_a_id,
+                existing_ids[0],
+            )
+            .await
+            .into_result()
+            .expect("pre-ack first message");
+
+            let mut requested = existing_ids.clone();
+            requested.insert(5, existing_ids[4]);
+            requested.insert(20, missing_id);
+            requested.push(other_project_id);
+
+            let tracker = Arc::new(crate::QueryTracker::new());
+            tracker.enable(None);
+            let results = {
+                tracker.reset();
+                let _guard = crate::set_active_tracker(Arc::clone(&tracker));
+                acknowledge_messages_batch(&cx, &pool, recipient_a_id, &requested)
+                    .await
+                    .into_result()
+                    .expect("batch acknowledge")
+            };
+            let snapshot = tracker.snapshot();
+            assert!(
+                snapshot.total <= 6,
+                "batch acknowledge should use a fixed query count for a 100+ message wave, got {snapshot:?}"
+            );
+            assert_eq!(
+                snapshot.per_table.get("message_recipients").copied(),
+                Some(2),
+                "one chunked update and one chunked read-back should touch message_recipients"
+            );
+
+            assert_eq!(
+                results.len(),
+                existing_ids.len() + 2,
+                "duplicate input IDs are collapsed in first-seen order"
+            );
+            assert_eq!(results[4].message_id, existing_ids[4]);
+            assert_eq!(results[5].message_id, existing_ids[5]);
+
+            let found_count = results.iter().filter(|result| result.found).count();
+            assert_eq!(found_count, existing_ids.len());
+            let missing: Vec<i64> = results
+                .iter()
+                .filter(|result| !result.found)
+                .map(|result| result.message_id)
+                .collect();
+            assert_eq!(missing, vec![missing_id, other_project_id]);
+
+            let first = results
+                .iter()
+                .find(|result| result.message_id == existing_ids[0])
+                .expect("first result");
+            assert_eq!(first.read_ts, Some(old_read_ts));
+            assert_eq!(first.ack_ts, Some(old_ack_ts));
+            for result in results.iter().filter(|result| result.found).skip(1) {
+                assert!(result.read_ts.is_some(), "read_ts set for {result:?}");
+                assert!(result.ack_ts.is_some(), "ack_ts set for {result:?}");
+            }
+
+            let stats = get_inbox_stats(&cx, &pool, recipient_a_id)
+                .await
+                .into_result()
+                .expect("get recipient stats")
+                .expect("recipient stats row");
+            assert_eq!(stats.total_count, 120);
+            assert_eq!(stats.unread_count, 0);
+            assert_eq!(stats.ack_pending_count, 0);
+
+            let conn = crate::open_sqlite_file_with_recovery(pool.sqlite_path())
+                .expect("open sqlite connection for verification");
+            let ph = placeholders(existing_ids.len());
+            let mut acked_params = Vec::with_capacity(1 + existing_ids.len());
+            acked_params.push(Value::BigInt(recipient_a_id));
+            acked_params.extend(
+                existing_ids
+                    .iter()
+                    .copied()
+                    .map(Value::BigInt),
+            );
+            let acked_rows = conn
+                .query_sync(
+                    &format!(
+                        "SELECT COUNT(*) AS count \
+                     FROM message_recipients \
+                     WHERE agent_id = ? AND message_id IN ({ph}) \
+                     AND read_ts IS NOT NULL AND ack_ts IS NOT NULL"
+                    ),
+                    &acked_params,
+                )
+                .expect("query acknowledged rows");
+            let acked_count: i64 = acked_rows[0].get_named("count").expect("acked count");
+            assert_eq!(acked_count, 120);
+
+            let other_rows = conn
+                .query_sync(
+                    "SELECT read_ts, ack_ts FROM message_recipients \
+                     WHERE agent_id = ? AND message_id = ?",
+                    &[
+                        Value::BigInt(recipient_b_id),
+                        Value::BigInt(other_project_id),
+                    ],
+                )
+                .expect("query other project row");
+            let other_read_ts: Option<i64> =
+                other_rows[0].get_named("read_ts").expect("other read_ts");
+            let other_ack_ts: Option<i64> =
+                other_rows[0].get_named("ack_ts").expect("other ack_ts");
+            assert_eq!(other_read_ts, None);
+            assert_eq!(other_ack_ts, None);
         });
     }
 
