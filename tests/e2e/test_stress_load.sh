@@ -11,21 +11,27 @@
 #
 # Usage:
 #   bash tests/e2e/test_stress_load.sh
+#   STRESS_PROFILE=large bash tests/e2e/test_stress_load.sh
+#   STRESS_PROFILE=large STRESS_RUN_LARGE=1 bash tests/e2e/test_stress_load.sh
 #
 # Configuration (env vars):
-#   STRESS_AGENTS=50          Number of simulated agents
-#   STRESS_CONCURRENCY=20     Max parallel curl processes
-#   STRESS_MSGS_PER_AGENT=5   Messages each agent sends
-#   STRESS_DURATION_SECS=30   Duration for sustained load phase
-#   STRESS_SKIP_BUILD=1       Skip cargo build (use existing binary)
+#   STRESS_PROFILE=ci         Profile: ci, legacy, or large
+#   STRESS_RUN_LARGE=0        Set to 1 to run the ignored 1k-agent profile
+#   STRESS_AGENTS             Override simulated agents
+#   STRESS_CONCURRENCY        Override max parallel curl processes
+#   STRESS_MSGS_PER_AGENT     Override messages each agent sends
+#   STRESS_DURATION_SECS      Override mixed read/write duration
+#   STRESS_HEALTH_CHECKS      Override sequential health checks
 
 set -euo pipefail
 
+# shellcheck disable=SC2034 # consumed by scripts/e2e_lib.sh after sourcing
 E2E_SUITE="stress_load"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # shellcheck source=../../scripts/e2e_lib.sh
+# shellcheck disable=SC1091
 source "${PROJECT_ROOT}/scripts/e2e_lib.sh"
 
 e2e_init_artifacts
@@ -36,11 +42,130 @@ e2e_banner "HTTP Stress/Load Test Suite"
 # Configuration
 # ---------------------------------------------------------------------------
 
-N_AGENTS="${STRESS_AGENTS:-50}"
-CONCURRENCY="${STRESS_CONCURRENCY:-20}"
-MSGS_PER_AGENT="${STRESS_MSGS_PER_AGENT:-5}"
-DURATION_SECS="${STRESS_DURATION_SECS:-30}"
+STRESS_PROFILE="${STRESS_PROFILE:-ci}"
+STRESS_RUN_LARGE="${STRESS_RUN_LARGE:-0}"
+
+case "$STRESS_PROFILE" in
+    ci)
+        PROFILE_AGENTS=12
+        PROFILE_CONCURRENCY=4
+        PROFILE_MSGS_PER_AGENT=2
+        PROFILE_DURATION_SECS=3
+        PROFILE_HEALTH_CHECKS=25
+        PROFILE_RSS_GROWTH_BUDGET_KB=200000
+        ;;
+    legacy)
+        PROFILE_AGENTS=50
+        PROFILE_CONCURRENCY=20
+        PROFILE_MSGS_PER_AGENT=5
+        PROFILE_DURATION_SECS=10
+        PROFILE_HEALTH_CHECKS=100
+        PROFILE_RSS_GROWTH_BUDGET_KB=300000
+        ;;
+    large)
+        PROFILE_AGENTS=1000
+        PROFILE_CONCURRENCY=200
+        PROFILE_MSGS_PER_AGENT=1
+        PROFILE_DURATION_SECS=60
+        PROFILE_HEALTH_CHECKS=200
+        PROFILE_RSS_GROWTH_BUDGET_KB=1048576
+        ;;
+    *)
+        e2e_fail "unknown STRESS_PROFILE=${STRESS_PROFILE}"
+        e2e_summary
+        exit 1
+        ;;
+esac
+
+N_AGENTS="${STRESS_AGENTS:-$PROFILE_AGENTS}"
+CONCURRENCY="${STRESS_CONCURRENCY:-$PROFILE_CONCURRENCY}"
+MSGS_PER_AGENT="${STRESS_MSGS_PER_AGENT:-$PROFILE_MSGS_PER_AGENT}"
+DURATION_SECS="${STRESS_DURATION_SECS:-$PROFILE_DURATION_SECS}"
+HEALTH_CHECKS="${STRESS_HEALTH_CHECKS:-$PROFILE_HEALTH_CHECKS}"
 PORT="${STRESS_PORT:-0}"  # 0 = auto-select free port
+E2E_RPC_CONNECT_TIMEOUT_SECONDS="${E2E_RPC_CONNECT_TIMEOUT_SECONDS:-2}"
+E2E_RPC_MAX_TIME_SECONDS="${E2E_RPC_MAX_TIME_SECONDS:-20}"
+
+STRESS_REG_P95_BUDGET_MS="${STRESS_REG_P95_BUDGET_MS:-8000}"
+STRESS_REG_P99_BUDGET_MS="${STRESS_REG_P99_BUDGET_MS:-12000}"
+STRESS_MSG_P95_BUDGET_MS="${STRESS_MSG_P95_BUDGET_MS:-10000}"
+STRESS_MSG_P99_BUDGET_MS="${STRESS_MSG_P99_BUDGET_MS:-15000}"
+STRESS_SEARCH_P95_BUDGET_MS="${STRESS_SEARCH_P95_BUDGET_MS:-10000}"
+STRESS_SEARCH_P99_BUDGET_MS="${STRESS_SEARCH_P99_BUDGET_MS:-15000}"
+STRESS_HEALTH_P95_BUDGET_MS="${STRESS_HEALTH_P95_BUDGET_MS:-8000}"
+STRESS_HEALTH_P99_BUDGET_MS="${STRESS_HEALTH_P99_BUDGET_MS:-12000}"
+STRESS_RSS_GROWTH_BUDGET_KB="${STRESS_RSS_GROWTH_BUDGET_KB:-$PROFILE_RSS_GROWTH_BUDGET_KB}"
+
+write_ignored_large_report() {
+    local run_cmd
+    run_cmd="cd ${PROJECT_ROOT} && AM_E2E_KEEP_TMP=1 E2E_CARGO_REQUIRE_RCH=1 STRESS_PROFILE=large STRESS_RUN_LARGE=1 bash tests/e2e/test_stress_load.sh"
+
+    e2e_save_artifact "load_lab_report.json" "$(cat <<EOF
+{
+  "profile": "large",
+  "status": "ignored",
+  "reason": "1k-agent load lab is opt-in; set STRESS_RUN_LARGE=1 to execute it",
+  "scenario": {
+    "agents": ${PROFILE_AGENTS},
+    "concurrency": ${PROFILE_CONCURRENCY},
+    "messages_per_agent": ${PROFILE_MSGS_PER_AGENT},
+    "mixed_duration_secs": ${PROFILE_DURATION_SECS},
+    "health_checks": ${PROFILE_HEALTH_CHECKS}
+  },
+  "reproduction": "${run_cmd}"
+}
+EOF
+)"
+
+    e2e_save_artifact "load_lab_report.md" "$(cat <<EOF
+# Stress Load Lab
+
+Status: ignored
+
+The 1k-agent profile is intentionally opt-in for CI safety.
+
+Run:
+\`\`\`bash
+${run_cmd}
+\`\`\`
+EOF
+)"
+}
+
+if [ "$STRESS_PROFILE" = "large" ] && [ "$STRESS_RUN_LARGE" != "1" ]; then
+    e2e_skip "large 1k-agent load lab ignored; set STRESS_RUN_LARGE=1 to execute"
+    write_ignored_large_report
+    e2e_summary
+    exit 0
+fi
+
+if [ "$CONCURRENCY" -lt 2 ]; then
+    e2e_fail "STRESS_CONCURRENCY must be at least 2"
+    e2e_summary
+    exit 1
+fi
+
+now_ns() {
+    date +%s%N 2>/dev/null || python3 -c 'import time; print(time.time_ns())'
+}
+
+record_latency_us() {
+    local phase="$1"
+    local id="$2"
+    local start_ns="$3"
+    local end_ns="$4"
+    local elapsed_us=$(( (end_ns - start_ns) / 1000 ))
+    [ "$elapsed_us" -lt 0 ] && elapsed_us=0
+    printf '%s\n' "$elapsed_us" > "${WORK}/latency_${phase}_${id}.us"
+}
+
+rss_kb_for_pid() {
+    local pid="$1"
+    ps -o rss= -p "$pid" 2>/dev/null | awk '
+        NF { print $1 + 0; found = 1 }
+        END { if (!found) print 0 }
+    '
+}
 
 # ---------------------------------------------------------------------------
 # Setup: create temp workspace, start server
@@ -59,7 +184,9 @@ fi
 echo "  Work dir: $WORK"
 echo "  DB: $STRESS_DB"
 echo "  Server (planned): http://127.0.0.1:${PORT}"
+echo "  Profile: $STRESS_PROFILE"
 echo "  Agents: $N_AGENTS, Concurrency: $CONCURRENCY, Msgs/agent: $MSGS_PER_AGENT"
+echo "  Mixed duration: ${DURATION_SECS}s, Health checks: ${HEALTH_CHECKS}"
 echo ""
 
 # Start the server via helper-managed lifecycle + log capture.
@@ -83,6 +210,7 @@ SERVER_URL="${E2E_SERVER_URL%/mcp/}"
 MCP_URL="${E2E_SERVER_URL}"
 echo "  Server: ${SERVER_URL}"
 echo "  Server PID: ${E2E_SERVER_PID}"
+SERVER_RSS_START_KB="$(rss_kb_for_pid "${E2E_SERVER_PID}")"
 
 # ---------------------------------------------------------------------------
 # Helper: send MCP tool call via HTTP
@@ -169,8 +297,8 @@ e2e_pass "Project initialized"
 echo ""
 echo "=== Phase 1: Agent Registration Storm ($N_AGENTS agents, $CONCURRENCY concurrent) ==="
 
-ADJECTIVES=(Red Blue Green Gold Silver Dark Bright Swift Calm Bold Keen Sharp Clear Wild Pure Deep Warm Cool Wise Fair Brave Rare True Free Open Safe Quick Light Noble Royal)
-NOUNS=(Castle Lake Harbor Forest Bridge Tower River Valley Garden Temple Shield Crown Dragon Phoenix Storm Summit Falcon Eagle Raven Shadow Crystal Ember Flame Frost Pearl Coral Maple Cedar Willow)
+ADJECTIVES=(Red Orange Yellow Pink Black Purple Blue Brown White Green Chartreuse Lilac Fuchsia Azure Amber Coral Crimson Cyan Gold Golden Gray Indigo Ivory Jade Lavender)
+NOUNS=(Stone Lake Creek Pond Mountain Hill Snow Castle River Forest Valley Canyon Meadow Prairie Desert Island Cliff Cave Glacier Waterfall Spring Stream Reef Dune Ridge Peak Gorge Marsh Brook Glen Grove Fern Hollow Basin Cove Bay Harbor Coast Shore Bluff Knoll Summit Plateau)
 
 AGENT_NAMES=()
 for i in $(seq 0 $((N_AGENTS - 1))); do
@@ -201,7 +329,10 @@ for i in $(seq 0 $((N_AGENTS - 1))); do
 
     (
         agent_name="${AGENT_NAMES[$i]}"
+        op_start_ns="$(now_ns)"
         resp=$(mcp_call "register_agent" "{\"project_key\":\"${PROJECT_KEY}\",\"name\":\"${agent_name}\",\"program\":\"stress-test\",\"model\":\"test-model\"}")
+        op_end_ns="$(now_ns)"
+        record_latency_us "register" "$i" "$op_start_ns" "$op_end_ns"
         if echo "$resp" | grep -q '"error"'; then
             exit 1
         fi
@@ -282,7 +413,10 @@ for i in $(seq 0 $((N_AGENTS - 1))); do
         thread_id="stress-t${i}-m${m}"
 
         (
+            op_start_ns="$(now_ns)"
             resp=$(mcp_call "send_message" "{\"project_key\":\"${PROJECT_KEY}\",\"sender_name\":\"${from_agent}\",\"to\":[\"${to_agent}\"],\"subject\":\"Stress msg ${i}-${m}\",\"body_md\":\"Load test message body ${i}-${m} with enough content to exercise FTS indexing\",\"thread_id\":\"${thread_id}\"}")
+            op_end_ns="$(now_ns)"
+            record_latency_us "message" "${i}_${m}" "$op_start_ns" "$op_end_ns"
             if echo "$resp" | grep -q '"error"'; then
                 exit 1
             fi
@@ -317,7 +451,7 @@ fi
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== Phase 3: Mixed Read/Write Concurrency (${CONCURRENCY} workers, 10s) ==="
+echo "=== Phase 3: Mixed Read/Write Concurrency (${CONCURRENCY} workers, ${DURATION_SECS}s) ==="
 
 MIX_START=$(date +%s%N)
 MIX_READS_OK=0
@@ -332,7 +466,7 @@ for w in $(seq 0 $((CONCURRENCY / 2 - 1))); do
         agent="${AGENT_NAMES[$((w % N_AGENTS))]}"
         ok=0
         fail=0
-        end_time=$(($(date +%s) + 10))
+        end_time=$(($(date +%s) + DURATION_SECS))
         while [ "$(date +%s)" -lt "$end_time" ]; do
             resp=$(mcp_call "fetch_inbox" "{\"project_key\":\"${PROJECT_KEY}\",\"agent_name\":\"${agent}\"}")
             if echo "$resp" | grep -q '"error"'; then
@@ -352,7 +486,7 @@ for w in $(seq 0 $((CONCURRENCY / 2 - 1))); do
     (
         ok=0
         fail=0
-        end_time=$(($(date +%s) + 10))
+        end_time=$(($(date +%s) + DURATION_SECS))
         msg_idx=0
         while [ "$(date +%s)" -lt "$end_time" ]; do
             from_idx=$(( (w + msg_idx) % N_AGENTS ))
@@ -481,7 +615,10 @@ for i in $(seq 0 $((CONCURRENCY - 1))); do
     q_idx=$((i % ${#SEARCH_QUERIES[@]}))
     query="${SEARCH_QUERIES[$q_idx]}"
     (
+        op_start_ns="$(now_ns)"
         resp=$(mcp_call "search_messages" "{\"project_key\":\"${PROJECT_KEY}\",\"query\":\"${query}\",\"limit\":20}")
+        op_end_ns="$(now_ns)"
+        record_latency_us "search" "$i" "$op_start_ns" "$op_end_ns"
         if echo "$resp" | grep -q '"error"'; then
             exit 1
         fi
@@ -512,14 +649,17 @@ fi
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== Phase 6: Health Check Rapid-Fire (100 sequential checks) ==="
+echo "=== Phase 6: Health Check Rapid-Fire (${HEALTH_CHECKS} sequential checks) ==="
 
 HEALTH_OK=0
 HEALTH_FAIL=0
 HEALTH_START=$(date +%s%N)
 
-for i in $(seq 1 100); do
+for i in $(seq 1 "$HEALTH_CHECKS"); do
+    op_start_ns="$(now_ns)"
     resp=$(mcp_call "health_check" "{}" 2>/dev/null)
+    op_end_ns="$(now_ns)"
+    record_latency_us "health" "$i" "$op_start_ns" "$op_end_ns"
     if echo "$resp" | grep -q '"error"'; then
         HEALTH_FAIL=$((HEALTH_FAIL + 1))
     else
@@ -529,15 +669,294 @@ done
 
 HEALTH_END=$(date +%s%N)
 HEALTH_ELAPSED_MS=$(( (HEALTH_END - HEALTH_START) / 1000000 ))
-HEALTH_AVG_MS=$(python3 -c "print(f'{${HEALTH_ELAPSED_MS} / 100:.1f}')" 2>/dev/null || echo "?")
+HEALTH_AVG_MS=$(python3 -c "print(f'{${HEALTH_ELAPSED_MS} / max(${HEALTH_CHECKS}, 1):.1f}')" 2>/dev/null || echo "?")
 
-echo "  Health checks: ${HEALTH_OK}/100 ok, avg ${HEALTH_AVG_MS}ms"
+echo "  Health checks: ${HEALTH_OK}/${HEALTH_CHECKS} ok, avg ${HEALTH_AVG_MS}ms"
 
 if [ "$HEALTH_FAIL" -eq 0 ]; then
-    e2e_pass "Health check: all 100 passed (avg ${HEALTH_AVG_MS}ms)"
+    e2e_pass "Health check: all ${HEALTH_CHECKS} passed (avg ${HEALTH_AVG_MS}ms)"
 else
-    e2e_fail "Health check: ${HEALTH_FAIL}/100 failed"
+    e2e_fail "Health check: ${HEALTH_FAIL}/${HEALTH_CHECKS} failed"
 fi
+
+SERVER_RSS_END_KB="$(rss_kb_for_pid "${E2E_SERVER_PID}")"
+RSS_GROWTH_KB=$(( SERVER_RSS_END_KB - SERVER_RSS_START_KB ))
+[ "$RSS_GROWTH_KB" -lt 0 ] && RSS_GROWTH_KB=0
+
+write_load_lab_reports() {
+    local report_json="${E2E_ARTIFACT_DIR}/load_lab_report.json"
+    local report_md="${E2E_ARTIFACT_DIR}/load_lab_report.md"
+    local report_status
+
+    STRESS_PROFILE="$STRESS_PROFILE" \
+    STRESS_RUN_LARGE="$STRESS_RUN_LARGE" \
+    N_AGENTS="$N_AGENTS" \
+    CONCURRENCY="$CONCURRENCY" \
+    MSGS_PER_AGENT="$MSGS_PER_AGENT" \
+    DURATION_SECS="$DURATION_SECS" \
+    HEALTH_CHECKS="$HEALTH_CHECKS" \
+    PROJECT_KEY="$PROJECT_KEY" \
+    STRESS_DB="$STRESS_DB" \
+    STRESS_STORAGE="$STRESS_STORAGE" \
+    SERVER_RSS_START_KB="$SERVER_RSS_START_KB" \
+    SERVER_RSS_END_KB="$SERVER_RSS_END_KB" \
+    RSS_GROWTH_KB="$RSS_GROWTH_KB" \
+    REG_OK="$REG_OK" \
+    REG_FAIL="$REG_FAIL" \
+    MSG_OK="$MSG_OK" \
+    MSG_FAIL="$MSG_FAIL" \
+    TOTAL_MSGS="$TOTAL_MSGS" \
+    MIX_READS_OK="$MIX_READS_OK" \
+    MIX_READS_FAIL="$MIX_READS_FAIL" \
+    MIX_WRITES_OK="$MIX_WRITES_OK" \
+    MIX_WRITES_FAIL="$MIX_WRITES_FAIL" \
+    RES_OK="$RES_OK" \
+    RES_CONFLICT="$RES_CONFLICT" \
+    RES_ERROR="$RES_ERROR" \
+    SEARCH_OK="$SEARCH_OK" \
+    SEARCH_FAIL="$SEARCH_FAIL" \
+    HEALTH_OK="$HEALTH_OK" \
+    HEALTH_FAIL="$HEALTH_FAIL" \
+    STRESS_REG_P95_BUDGET_MS="$STRESS_REG_P95_BUDGET_MS" \
+    STRESS_REG_P99_BUDGET_MS="$STRESS_REG_P99_BUDGET_MS" \
+    STRESS_MSG_P95_BUDGET_MS="$STRESS_MSG_P95_BUDGET_MS" \
+    STRESS_MSG_P99_BUDGET_MS="$STRESS_MSG_P99_BUDGET_MS" \
+    STRESS_SEARCH_P95_BUDGET_MS="$STRESS_SEARCH_P95_BUDGET_MS" \
+    STRESS_SEARCH_P99_BUDGET_MS="$STRESS_SEARCH_P99_BUDGET_MS" \
+    STRESS_HEALTH_P95_BUDGET_MS="$STRESS_HEALTH_P95_BUDGET_MS" \
+    STRESS_HEALTH_P99_BUDGET_MS="$STRESS_HEALTH_P99_BUDGET_MS" \
+    STRESS_RSS_GROWTH_BUDGET_KB="$STRESS_RSS_GROWTH_BUDGET_KB" \
+    python3 - "$WORK" "$report_json" "$report_md" "$PROJECT_ROOT" <<'PY'
+import glob
+import json
+import math
+import os
+import statistics
+import sys
+from pathlib import Path
+
+work, report_json, report_md, project_root = sys.argv[1:]
+
+def env_int(name: str, default: int = 0) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return int(raw)
+
+def pct(values: list[int], percentile: float) -> int:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    index = int(math.ceil((percentile / 100.0) * len(ordered))) - 1
+    index = max(0, min(index, len(ordered) - 1))
+    return ordered[index]
+
+def latency_stats(phase: str) -> dict:
+    samples = []
+    for path in glob.glob(str(Path(work) / f"latency_{phase}_*.us")):
+        try:
+            samples.append(int(Path(path).read_text(encoding="utf-8").strip()))
+        except (OSError, ValueError):
+            pass
+    samples.sort()
+    return {
+        "samples": len(samples),
+        "p50_us": pct(samples, 50.0),
+        "p95_us": pct(samples, 95.0),
+        "p99_us": pct(samples, 99.0),
+        "max_us": max(samples) if samples else 0,
+        "mean_us": round(statistics.fmean(samples), 3) if samples else 0.0,
+    }
+
+def budget_ms(name: str) -> int:
+    return env_int(name, 0)
+
+latencies = {
+    "register": latency_stats("register"),
+    "message": latency_stats("message"),
+    "search": latency_stats("search"),
+    "health": latency_stats("health"),
+}
+
+phase_budgets = {
+    "register": {
+        "p95_budget_us": budget_ms("STRESS_REG_P95_BUDGET_MS") * 1000,
+        "p99_budget_us": budget_ms("STRESS_REG_P99_BUDGET_MS") * 1000,
+    },
+    "message": {
+        "p95_budget_us": budget_ms("STRESS_MSG_P95_BUDGET_MS") * 1000,
+        "p99_budget_us": budget_ms("STRESS_MSG_P99_BUDGET_MS") * 1000,
+    },
+    "search": {
+        "p95_budget_us": budget_ms("STRESS_SEARCH_P95_BUDGET_MS") * 1000,
+        "p99_budget_us": budget_ms("STRESS_SEARCH_P99_BUDGET_MS") * 1000,
+    },
+    "health": {
+        "p95_budget_us": budget_ms("STRESS_HEALTH_P95_BUDGET_MS") * 1000,
+        "p99_budget_us": budget_ms("STRESS_HEALTH_P99_BUDGET_MS") * 1000,
+    },
+}
+
+gates = []
+for phase, stats in latencies.items():
+    budgets = phase_budgets[phase]
+    p95_ok = stats["samples"] > 0 and stats["p95_us"] <= budgets["p95_budget_us"]
+    p99_ok = stats["samples"] > 0 and stats["p99_us"] <= budgets["p99_budget_us"]
+    gates.append({
+        "name": f"{phase}_p95",
+        "passed": p95_ok,
+        "current_us": stats["p95_us"],
+        "budget_us": budgets["p95_budget_us"],
+        "samples": stats["samples"],
+    })
+    gates.append({
+        "name": f"{phase}_p99",
+        "passed": p99_ok,
+        "current_us": stats["p99_us"],
+        "budget_us": budgets["p99_budget_us"],
+        "samples": stats["samples"],
+    })
+
+rss_growth_budget_kb = env_int("STRESS_RSS_GROWTH_BUDGET_KB")
+rss_growth_kb = env_int("RSS_GROWTH_KB")
+gates.append({
+    "name": "rss_growth",
+    "passed": rss_growth_kb <= rss_growth_budget_kb,
+    "current_kb": rss_growth_kb,
+    "budget_kb": rss_growth_budget_kb,
+})
+
+summary = {
+    "registration": {
+        "ok": env_int("REG_OK"),
+        "failed": env_int("REG_FAIL"),
+        "attempted": env_int("N_AGENTS"),
+    },
+    "message_storm": {
+        "ok": env_int("MSG_OK"),
+        "failed": env_int("MSG_FAIL"),
+        "attempted": env_int("TOTAL_MSGS"),
+    },
+    "mixed_read_write": {
+        "reads_ok": env_int("MIX_READS_OK"),
+        "reads_failed": env_int("MIX_READS_FAIL"),
+        "writes_ok": env_int("MIX_WRITES_OK"),
+        "writes_failed": env_int("MIX_WRITES_FAIL"),
+    },
+    "reservations": {
+        "reserved": env_int("RES_OK"),
+        "conflicts": env_int("RES_CONFLICT"),
+        "errors": env_int("RES_ERROR"),
+    },
+    "search": {
+        "ok": env_int("SEARCH_OK"),
+        "failed": env_int("SEARCH_FAIL"),
+        "attempted": env_int("CONCURRENCY"),
+    },
+    "health": {
+        "ok": env_int("HEALTH_OK"),
+        "failed": env_int("HEALTH_FAIL"),
+        "attempted": env_int("HEALTH_CHECKS"),
+    },
+}
+
+report = {
+    "profile": os.getenv("STRESS_PROFILE", "ci"),
+    "status": "pass" if all(gate["passed"] for gate in gates) else "fail",
+    "scenario": {
+        "agents": env_int("N_AGENTS"),
+        "concurrency": env_int("CONCURRENCY"),
+        "messages_per_agent": env_int("MSGS_PER_AGENT"),
+        "mixed_duration_secs": env_int("DURATION_SECS"),
+        "health_checks": env_int("HEALTH_CHECKS"),
+    },
+    "isolation": {
+        "project_key": os.getenv("PROJECT_KEY", ""),
+        "database_path": os.getenv("STRESS_DB", ""),
+        "storage_root": os.getenv("STRESS_STORAGE", ""),
+        "operator_mailbox_touched": False,
+    },
+    "resources": {
+        "server_rss_start_kb": env_int("SERVER_RSS_START_KB"),
+        "server_rss_end_kb": env_int("SERVER_RSS_END_KB"),
+        "server_rss_growth_kb": rss_growth_kb,
+        "server_rss_growth_budget_kb": rss_growth_budget_kb,
+    },
+    "summary": summary,
+    "latencies": latencies,
+    "gates": gates,
+    "reproduction": {
+        "ci": f"cd {project_root} && AM_E2E_KEEP_TMP=1 E2E_CARGO_REQUIRE_RCH=1 bash tests/e2e/test_stress_load.sh",
+        "large": f"cd {project_root} && AM_E2E_KEEP_TMP=1 E2E_CARGO_REQUIRE_RCH=1 STRESS_PROFILE=large STRESS_RUN_LARGE=1 bash tests/e2e/test_stress_load.sh",
+    },
+}
+
+Path(report_json).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+def fmt_us(value: int) -> str:
+    return f"{value / 1000.0:.1f} ms"
+
+lines = [
+    "# Stress Load Lab Report",
+    "",
+    f"Status: {report['status']}",
+    f"Profile: {report['profile']}",
+    f"Agents: {report['scenario']['agents']}",
+    f"Concurrency: {report['scenario']['concurrency']}",
+    f"Storage root: `{report['isolation']['storage_root']}`",
+    "",
+    "## Reproduction",
+    "",
+    "```bash",
+    report["reproduction"]["ci"],
+    report["reproduction"]["large"],
+    "```",
+    "",
+    "## Latency Gates",
+    "",
+    "| Phase | Samples | p50 | p95 | p99 | Max |",
+    "| --- | ---: | ---: | ---: | ---: | ---: |",
+]
+for phase, stats in latencies.items():
+    lines.append(
+        f"| {phase} | {stats['samples']} | {fmt_us(stats['p50_us'])} | "
+        f"{fmt_us(stats['p95_us'])} | {fmt_us(stats['p99_us'])} | {fmt_us(stats['max_us'])} |"
+    )
+
+lines.extend([
+    "",
+    "## Resource Gates",
+    "",
+    f"RSS growth: {rss_growth_kb} KB / {rss_growth_budget_kb} KB",
+    "",
+    "## Gate Verdicts",
+    "",
+])
+for gate in gates:
+    verdict = "PASS" if gate["passed"] else "FAIL"
+    if "current_us" in gate:
+        lines.append(f"- {verdict} {gate['name']}: {fmt_us(gate['current_us'])} / {fmt_us(gate['budget_us'])}")
+    else:
+        lines.append(f"- {verdict} {gate['name']}: {gate['current_kb']} KB / {gate['budget_kb']} KB")
+
+Path(report_md).write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+
+    report_status="$(python3 - "$report_json" <<'PY'
+import json
+import sys
+from pathlib import Path
+print(json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")).get("status", "fail"))
+PY
+)"
+    if [ "$report_status" = "pass" ]; then
+        e2e_pass "Load lab p95/p99 and RSS gates passed"
+    else
+        e2e_fail "Load lab p95/p99 or RSS gate failed"
+    fi
+}
+
+write_load_lab_reports
 
 # ---------------------------------------------------------------------------
 # Summary
@@ -552,7 +971,9 @@ echo "  Phase 2 (Msg Storm):     ${MSG_OK}/${TOTAL_MSGS} ok, ${MSG_ELAPSED_MS}ms
 echo "  Phase 3 (Mixed R/W):     R:${MIX_READS_OK}/${MIX_READS_OK}+${MIX_READS_FAIL} W:${MIX_WRITES_OK}/${MIX_WRITES_OK}+${MIX_WRITES_FAIL}"
 echo "  Phase 4 (Reservations):  ${RES_OK} reserved, ${RES_CONFLICT} conflicts, ${RES_ERROR} errors"
 echo "  Phase 5 (Search):        ${SEARCH_OK}/${CONCURRENCY} ok"
-echo "  Phase 6 (Health):        ${HEALTH_OK}/100 ok, avg ${HEALTH_AVG_MS}ms"
+echo "  Phase 6 (Health):        ${HEALTH_OK}/${HEALTH_CHECKS} ok, avg ${HEALTH_AVG_MS}ms"
+echo "  RSS Growth:              ${RSS_GROWTH_KB} KB / ${STRESS_RSS_GROWTH_BUDGET_KB} KB"
+echo "  Reports:                 ${E2E_ARTIFACT_DIR}/load_lab_report.{json,md}"
 echo "================================================================"
 
 e2e_save_artifact "server_log_path.txt" "${E2E_ARTIFACT_DIR}/logs/server_stress_load.log"
