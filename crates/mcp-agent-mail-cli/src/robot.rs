@@ -1095,6 +1095,59 @@ pub struct AnomalyCard {
     pub remediation: String,
 }
 
+/// robot analytics — swarm topology coverage counts.
+#[derive(Debug, Clone, Serialize)]
+pub struct SwarmTopologyCoverage {
+    pub agents: usize,
+    pub threads: usize,
+    pub reservations: usize,
+    pub build_slots: usize,
+    pub products: usize,
+    pub nodes: usize,
+    pub edges: usize,
+}
+
+/// robot analytics — high-signal topology node.
+#[derive(Debug, Clone, Serialize)]
+pub struct SwarmTopologyNode {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub weight: u64,
+    pub heat_score: u64,
+    pub edge_count: u64,
+}
+
+/// robot analytics — high-signal topology edge.
+#[derive(Debug, Clone, Serialize)]
+pub struct SwarmTopologyEdge {
+    pub from: String,
+    pub to: String,
+    pub kind: String,
+    pub weight: u64,
+    pub heat_score: u64,
+}
+
+/// robot analytics — contention-heavy topology point.
+#[derive(Debug, Clone, Serialize)]
+pub struct SwarmTopologyHotspot {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub heat_score: u64,
+    pub edge_count: u64,
+}
+
+/// robot analytics — compact swarm topology and contention map.
+#[derive(Debug, Clone, Serialize)]
+pub struct SwarmTopologySummary {
+    pub coverage: SwarmTopologyCoverage,
+    pub nodes: Vec<SwarmTopologyNode>,
+    pub edges: Vec<SwarmTopologyEdge>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub contention: Vec<SwarmTopologyHotspot>,
+}
+
 /// robot agents — agent roster entry.
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentHealthMetricRow {
@@ -6219,6 +6272,429 @@ fn build_analytics(
     Ok(anomalies)
 }
 
+const SWARM_TOPOLOGY_NODE_LIMIT: usize = 12;
+const SWARM_TOPOLOGY_EDGE_LIMIT: usize = 20;
+const SWARM_TOPOLOGY_HOTSPOT_LIMIT: usize = 6;
+
+type TopologyEdgeKey = (String, String, String);
+
+fn topology_table_exists(conn: &DbConn, table_name: &str) -> bool {
+    conn.query_sync(
+        "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+        &[Value::Text(table_name.to_string())],
+    )
+    .ok()
+    .is_some_and(|rows| !rows.is_empty())
+}
+
+fn nonnegative_u64(value: i64) -> u64 {
+    u64::try_from(value.max(0)).unwrap_or(0)
+}
+
+fn usize_from_u64_saturating(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+fn topology_agent_id(agent_name: &str) -> String {
+    format!("agent:{agent_name}")
+}
+
+fn topology_thread_id(thread_ref: &str) -> String {
+    format!("thread:{thread_ref}")
+}
+
+fn topology_reservation_id(path_pattern: &str) -> String {
+    format!("reservation:{path_pattern}")
+}
+
+fn topology_product_id(product_label: &str) -> String {
+    format!("product:{product_label}")
+}
+
+fn topology_project_id(project_id: i64) -> String {
+    format!("project:{project_id}")
+}
+
+fn record_topology_node(
+    nodes: &mut HashMap<String, SwarmTopologyNode>,
+    id: &str,
+    kind: &str,
+    label: &str,
+    weight: u64,
+    heat_score: u64,
+) {
+    let entry = nodes
+        .entry(id.to_string())
+        .or_insert_with(|| SwarmTopologyNode {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            label: truncate_str(label, 96),
+            weight: 0,
+            heat_score: 0,
+            edge_count: 0,
+        });
+    entry.weight = entry.weight.saturating_add(weight);
+    entry.heat_score = entry.heat_score.saturating_add(heat_score);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_topology_edge(
+    nodes: &mut HashMap<String, SwarmTopologyNode>,
+    edges: &mut HashMap<TopologyEdgeKey, SwarmTopologyEdge>,
+    from_id: &str,
+    from_kind: &str,
+    from_label: &str,
+    to_id: &str,
+    to_kind: &str,
+    to_label: &str,
+    edge_kind: &str,
+    weight: u64,
+    heat_score: u64,
+) {
+    record_topology_node(nodes, from_id, from_kind, from_label, weight, heat_score);
+    record_topology_node(nodes, to_id, to_kind, to_label, weight, heat_score);
+
+    let from_key = from_id.to_string();
+    let to_key = to_id.to_string();
+    let edge_kind_key = edge_kind.to_string();
+    let edge_key = (from_key.clone(), to_key.clone(), edge_kind_key.clone());
+    let is_new_edge = match edges.entry(edge_key) {
+        std::collections::hash_map::Entry::Occupied(mut occupied) => {
+            let entry = occupied.get_mut();
+            entry.weight = entry.weight.saturating_add(weight);
+            entry.heat_score = entry.heat_score.saturating_add(heat_score);
+            false
+        }
+        std::collections::hash_map::Entry::Vacant(vacant) => {
+            vacant.insert(SwarmTopologyEdge {
+                from: from_key.clone(),
+                to: to_key.clone(),
+                kind: edge_kind_key,
+                weight,
+                heat_score,
+            });
+            true
+        }
+    };
+
+    if is_new_edge {
+        if let Some(from_node) = nodes.get_mut(&from_key) {
+            from_node.edge_count = from_node.edge_count.saturating_add(1);
+        }
+        if let Some(to_node) = nodes.get_mut(&to_key) {
+            to_node.edge_count = to_node.edge_count.saturating_add(1);
+        }
+    }
+}
+
+fn add_agent_topology_nodes(
+    conn: &DbConn,
+    project_id: i64,
+    nodes: &mut HashMap<String, SwarmTopologyNode>,
+) -> Result<usize, CliError> {
+    let rows = conn
+        .query_sync(
+            "SELECT COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || a.id || ']') AS agent_name,
+                    COUNT(m.id) AS message_count
+             FROM agents a
+             LEFT JOIN messages m ON m.project_id = a.project_id AND m.sender_id = a.id
+             WHERE a.project_id = ?
+             GROUP BY a.id, a.name
+             ORDER BY message_count DESC, agent_name ASC",
+            &[Value::BigInt(project_id)],
+        )
+        .map_err(|e| CliError::Other(format!("topology agents query failed: {e}")))?;
+
+    for row in &rows {
+        let agent_name: String = row.get_named("agent_name").unwrap_or_default();
+        let message_count = nonnegative_u64(row.get_named("message_count").unwrap_or(0));
+        record_topology_node(
+            nodes,
+            &topology_agent_id(&agent_name),
+            "agent",
+            &agent_name,
+            message_count,
+            message_count.max(1),
+        );
+    }
+
+    Ok(rows.len())
+}
+
+fn add_message_topology_edges(
+    conn: &DbConn,
+    project_id: i64,
+    nodes: &mut HashMap<String, SwarmTopologyNode>,
+    edges: &mut HashMap<TopologyEdgeKey, SwarmTopologyEdge>,
+) -> Result<usize, CliError> {
+    const THREAD_REF_SQL: &str = "COALESCE(NULLIF(m.thread_id, ''), CAST(m.id AS TEXT))";
+    let mut thread_refs = std::collections::BTreeSet::new();
+
+    let sender_rows = conn
+        .query_sync(
+            &format!(
+                "SELECT {THREAD_REF_SQL} AS thread_ref,
+                        COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || m.sender_id || ']') AS agent_name,
+                        COUNT(*) AS message_count
+                 FROM messages m
+                 LEFT JOIN agents a ON a.id = m.sender_id
+                 WHERE m.project_id = ?
+                 GROUP BY m.sender_id, {THREAD_REF_SQL}
+                 ORDER BY message_count DESC, agent_name ASC, thread_ref ASC"
+            ),
+            &[Value::BigInt(project_id)],
+        )
+        .map_err(|e| CliError::Other(format!("topology sender query failed: {e}")))?;
+    for row in &sender_rows {
+        let thread_ref: String = row.get_named("thread_ref").unwrap_or_default();
+        let agent_name: String = row.get_named("agent_name").unwrap_or_default();
+        let message_count = nonnegative_u64(row.get_named("message_count").unwrap_or(0));
+        thread_refs.insert(thread_ref.clone());
+        record_topology_edge(
+            nodes,
+            edges,
+            &topology_agent_id(&agent_name),
+            "agent",
+            &agent_name,
+            &topology_thread_id(&thread_ref),
+            "thread",
+            &thread_ref,
+            "sent_messages",
+            message_count,
+            message_count.saturating_mul(2),
+        );
+    }
+
+    let recipient_rows = conn
+        .query_sync(
+            &format!(
+                "SELECT {THREAD_REF_SQL} AS thread_ref,
+                        COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || mr.agent_id || ']') AS agent_name,
+                        COUNT(*) AS delivery_count
+                 FROM message_recipients mr
+                 JOIN messages m ON m.id = mr.message_id
+                 LEFT JOIN agents a ON a.id = mr.agent_id
+                 WHERE m.project_id = ?
+                 GROUP BY mr.agent_id, {THREAD_REF_SQL}
+                 ORDER BY delivery_count DESC, agent_name ASC, thread_ref ASC"
+            ),
+            &[Value::BigInt(project_id)],
+        )
+        .map_err(|e| CliError::Other(format!("topology recipient query failed: {e}")))?;
+    for row in &recipient_rows {
+        let thread_ref: String = row.get_named("thread_ref").unwrap_or_default();
+        let agent_name: String = row.get_named("agent_name").unwrap_or_default();
+        let delivery_count = nonnegative_u64(row.get_named("delivery_count").unwrap_or(0));
+        thread_refs.insert(thread_ref.clone());
+        record_topology_edge(
+            nodes,
+            edges,
+            &topology_thread_id(&thread_ref),
+            "thread",
+            &thread_ref,
+            &topology_agent_id(&agent_name),
+            "agent",
+            &agent_name,
+            "delivered_messages",
+            delivery_count,
+            delivery_count,
+        );
+    }
+
+    Ok(thread_refs.len())
+}
+
+fn add_reservation_topology_edges(
+    conn: &DbConn,
+    project_id: i64,
+    nodes: &mut HashMap<String, SwarmTopologyNode>,
+    edges: &mut HashMap<TopologyEdgeKey, SwarmTopologyEdge>,
+) -> Result<usize, CliError> {
+    let now_us = mcp_agent_mail_db::now_micros();
+    let has_release_ledger = has_file_reservation_release_ledger(conn);
+    let has_legacy_released_ts_column = has_file_reservations_released_ts_column(conn);
+    let active_reservation_join =
+        active_reservation_release_join_sql(has_release_ledger, "fr", "rr");
+    let active_reservation_predicate = active_reservation_filter_sql(
+        has_release_ledger,
+        has_legacy_released_ts_column,
+        "fr",
+        "rr",
+    );
+    let rows = conn
+        .query_sync(
+            &format!(
+                "SELECT COALESCE(NULLIF(a.name, ''), '[unknown-agent-' || fr.agent_id || ']') AS agent_name,
+                        fr.path_pattern AS path_pattern,
+                        COUNT(*) AS reservation_count
+                 FROM file_reservations fr{active_reservation_join}
+                 LEFT JOIN agents a ON a.id = fr.agent_id
+                 WHERE fr.project_id = ? AND ({active_reservation_predicate}) AND fr.expires_ts > ?
+                 GROUP BY fr.agent_id, fr.path_pattern
+                 ORDER BY reservation_count DESC, agent_name ASC, path_pattern ASC"
+            ),
+            &[Value::BigInt(project_id), Value::BigInt(now_us)],
+        )
+        .map_err(|e| CliError::Other(format!("topology reservations query failed: {e}")))?;
+
+    let mut reservation_count = 0_u64;
+    for row in &rows {
+        let agent_name: String = row.get_named("agent_name").unwrap_or_default();
+        let path_pattern: String = row.get_named("path_pattern").unwrap_or_default();
+        let hold_count = nonnegative_u64(row.get_named("reservation_count").unwrap_or(0));
+        reservation_count = reservation_count.saturating_add(hold_count);
+        record_topology_edge(
+            nodes,
+            edges,
+            &topology_agent_id(&agent_name),
+            "agent",
+            &agent_name,
+            &topology_reservation_id(&path_pattern),
+            "reservation",
+            &path_pattern,
+            "holds_reservation",
+            hold_count,
+            hold_count.saturating_mul(3),
+        );
+    }
+
+    Ok(usize_from_u64_saturating(reservation_count))
+}
+
+fn add_product_topology_edges(
+    conn: &DbConn,
+    project_id: i64,
+    nodes: &mut HashMap<String, SwarmTopologyNode>,
+    edges: &mut HashMap<TopologyEdgeKey, SwarmTopologyEdge>,
+) -> Result<usize, CliError> {
+    if !topology_table_exists(conn, "products")
+        || !topology_table_exists(conn, "product_project_links")
+    {
+        return Ok(0);
+    }
+
+    let project_node_id = topology_project_id(project_id);
+    let project_label = format!("project:{project_id}");
+    record_topology_node(nodes, &project_node_id, "project", &project_label, 0, 1);
+
+    let rows = conn
+        .query_sync(
+            "SELECT COALESCE(NULLIF(p.name, ''), NULLIF(p.product_uid, ''), '[product-' || p.id || ']') AS product_label,
+                    COUNT(*) AS link_count
+             FROM product_project_links ppl
+             JOIN products p ON p.id = ppl.product_id
+             WHERE ppl.project_id = ?
+             GROUP BY p.id, p.name, p.product_uid
+             ORDER BY product_label ASC",
+            &[Value::BigInt(project_id)],
+        )
+        .map_err(|e| CliError::Other(format!("topology products query failed: {e}")))?;
+    for row in &rows {
+        let product_label: String = row.get_named("product_label").unwrap_or_default();
+        let link_count = nonnegative_u64(row.get_named("link_count").unwrap_or(0));
+        record_topology_edge(
+            nodes,
+            edges,
+            &topology_product_id(&product_label),
+            "product",
+            &product_label,
+            &project_node_id,
+            "project",
+            &project_label,
+            "links_project",
+            link_count,
+            link_count,
+        );
+    }
+
+    Ok(rows.len())
+}
+
+fn sort_topology_nodes(mut nodes: Vec<SwarmTopologyNode>) -> Vec<SwarmTopologyNode> {
+    nodes.sort_by(|left, right| {
+        right
+            .heat_score
+            .cmp(&left.heat_score)
+            .then(right.weight.cmp(&left.weight))
+            .then(right.edge_count.cmp(&left.edge_count))
+            .then(left.kind.cmp(&right.kind))
+            .then(left.id.cmp(&right.id))
+    });
+    nodes
+}
+
+fn sort_topology_edges(mut edges: Vec<SwarmTopologyEdge>) -> Vec<SwarmTopologyEdge> {
+    edges.sort_by(|left, right| {
+        right
+            .heat_score
+            .cmp(&left.heat_score)
+            .then(right.weight.cmp(&left.weight))
+            .then(left.kind.cmp(&right.kind))
+            .then(left.from.cmp(&right.from))
+            .then(left.to.cmp(&right.to))
+    });
+    edges
+}
+
+fn build_topology_hotspots(nodes: &[SwarmTopologyNode]) -> Vec<SwarmTopologyHotspot> {
+    let mut hotspots: Vec<_> = nodes
+        .iter()
+        .filter(|node| node.edge_count > 1)
+        .map(|node| SwarmTopologyHotspot {
+            id: node.id.clone(),
+            kind: node.kind.clone(),
+            label: node.label.clone(),
+            heat_score: node.heat_score,
+            edge_count: node.edge_count,
+        })
+        .collect();
+    hotspots.sort_by(|left, right| {
+        right
+            .edge_count
+            .cmp(&left.edge_count)
+            .then(right.heat_score.cmp(&left.heat_score))
+            .then(left.kind.cmp(&right.kind))
+            .then(left.id.cmp(&right.id))
+    });
+    hotspots.truncate(SWARM_TOPOLOGY_HOTSPOT_LIMIT);
+    hotspots
+}
+
+fn build_swarm_topology(conn: &DbConn, project_id: i64) -> Result<SwarmTopologySummary, CliError> {
+    let mut nodes = HashMap::new();
+    let mut edges = HashMap::new();
+
+    let agents = add_agent_topology_nodes(conn, project_id, &mut nodes)?;
+    let threads = add_message_topology_edges(conn, project_id, &mut nodes, &mut edges)?;
+    let reservations = add_reservation_topology_edges(conn, project_id, &mut nodes, &mut edges)?;
+    let products = add_product_topology_edges(conn, project_id, &mut nodes, &mut edges)?;
+
+    let node_count = nodes.len();
+    let edge_count = edges.len();
+    let sorted_all_nodes = sort_topology_nodes(nodes.into_values().collect());
+    let contention = build_topology_hotspots(&sorted_all_nodes);
+    let mut top_nodes = sorted_all_nodes;
+    top_nodes.truncate(SWARM_TOPOLOGY_NODE_LIMIT);
+
+    let mut top_edges = sort_topology_edges(edges.into_values().collect());
+    top_edges.truncate(SWARM_TOPOLOGY_EDGE_LIMIT);
+
+    Ok(SwarmTopologySummary {
+        coverage: SwarmTopologyCoverage {
+            agents,
+            threads,
+            reservations,
+            build_slots: 0,
+            products,
+            nodes: node_count,
+            edges: edge_count,
+        },
+        nodes: top_nodes,
+        edges: top_edges,
+        contention,
+    })
+}
+
 // ── Agents command implementation ───────────────────────────────────────────
 
 fn build_agents(
@@ -9704,11 +10180,13 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         RobotSubcommand::Analytics => {
             let scope = resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
             let anomalies = build_analytics(scope.conn(), scope.project_id, scope.agent.clone())?;
+            let topology = build_swarm_topology(scope.conn(), scope.project_id)?;
 
             #[derive(Serialize)]
             struct AnalyticsData {
                 anomaly_count: usize,
                 anomalies: Vec<AnomalyCard>,
+                topology: SwarmTopologySummary,
             }
 
             let anomaly_count = anomalies.len();
@@ -9718,6 +10196,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 AnalyticsData {
                     anomaly_count,
                     anomalies: anomalies.clone(),
+                    topology,
                 },
             );
             env._meta.project = Some(scope.project_slug);
@@ -16506,6 +16985,153 @@ mod tests {
             "unexpected anomaly headline: {}",
             reservation_conflict.headline
         );
+    }
+
+    #[test]
+    fn build_swarm_topology_summarizes_contention_without_message_content() {
+        use mcp_agent_mail_db::sqlmodel_core::Value as DbValue;
+
+        let (_temp_dir, conn) = setup_robot_thread_message_test_db();
+        let now_us = mcp_agent_mail_db::now_micros();
+
+        for offset in 0_i64..30 {
+            let message_id = 1_000 + offset;
+            conn.query_sync(
+                "INSERT INTO messages
+                 (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+                 VALUES (?, 1, 1, ?, 'hot-thread', 'normal', 0, ?, ?, '[]')",
+                &[
+                    DbValue::BigInt(message_id),
+                    DbValue::Text(format!("SECRET_SUBJECT_HOT_{offset}")),
+                    DbValue::BigInt(now_us + offset),
+                    DbValue::Text(format!("SECRET_BODY_HOT_{offset}")),
+                ],
+            )
+            .expect("insert hot message");
+            conn.query_sync(
+                "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+                 VALUES (?, ?, 2, 'to', NULL, NULL), (?, ?, 3, 'cc', NULL, NULL)",
+                &[
+                    DbValue::BigInt(10_000 + (offset * 2)),
+                    DbValue::BigInt(message_id),
+                    DbValue::BigInt(10_001 + (offset * 2)),
+                    DbValue::BigInt(message_id),
+                ],
+            )
+            .expect("insert hot recipients");
+        }
+
+        for offset in 0_i64..5 {
+            let message_id = 2_000 + offset;
+            conn.query_sync(
+                "INSERT INTO messages
+                 (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+                 VALUES (?, 1, 1, ?, 'cold-thread', 'normal', 0, ?, ?, '[]')",
+                &[
+                    DbValue::BigInt(message_id),
+                    DbValue::Text(format!("SECRET_SUBJECT_COLD_{offset}")),
+                    DbValue::BigInt(now_us + 100 + offset),
+                    DbValue::Text(format!("SECRET_BODY_COLD_{offset}")),
+                ],
+            )
+            .expect("insert cold message");
+            conn.query_sync(
+                "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+                 VALUES (?, ?, 2, 'to', NULL, NULL)",
+                &[
+                    DbValue::BigInt(20_000 + offset),
+                    DbValue::BigInt(message_id),
+                ],
+            )
+            .expect("insert cold recipient");
+        }
+
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES
+                (300, 1, 2, 'crates/mcp-agent-mail-cli/src/**', 1, 'br-scfay', ?, ?, NULL),
+                (301, 1, 3, 'crates/mcp-agent-mail-cli/src/robot.rs', 1, 'br-scfay', ?, ?, NULL)",
+            &[
+                DbValue::BigInt(now_us),
+                DbValue::BigInt(now_us + 3_600_000_000),
+                DbValue::BigInt(now_us),
+                DbValue::BigInt(now_us + 3_600_000_000),
+            ],
+        )
+        .expect("insert active reservations");
+        conn.query_sync(
+            "CREATE TABLE products (
+                id INTEGER PRIMARY KEY,
+                product_uid TEXT NOT NULL,
+                name TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+            &[],
+        )
+        .expect("create products");
+        conn.query_sync(
+            "CREATE TABLE product_project_links (
+                id INTEGER PRIMARY KEY,
+                product_id INTEGER NOT NULL,
+                project_id INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+            &[],
+        )
+        .expect("create product links");
+        conn.query_sync(
+            "INSERT INTO products (id, product_uid, name, created_at)
+             VALUES (1, 'prod-mail', 'Agent Mail', ?)",
+            &[DbValue::BigInt(now_us)],
+        )
+        .expect("insert product");
+        conn.query_sync(
+            "INSERT INTO product_project_links (id, product_id, project_id, created_at)
+             VALUES (1, 1, 1, ?)",
+            &[DbValue::BigInt(now_us)],
+        )
+        .expect("insert product link");
+
+        let topology = build_swarm_topology(&conn, 1).expect("build topology");
+
+        assert_eq!(topology.coverage.agents, 3);
+        assert_eq!(topology.coverage.threads, 2);
+        assert_eq!(topology.coverage.reservations, 2);
+        assert_eq!(topology.coverage.products, 1);
+        assert_eq!(topology.coverage.build_slots, 0);
+        assert!(
+            topology.coverage.edges >= 7,
+            "expected message, reservation, and product edges: {:?}",
+            topology.coverage
+        );
+
+        assert_eq!(
+            topology.nodes.first().map(|node| node.id.as_str()),
+            Some("thread:hot-thread")
+        );
+        assert!(
+            topology.edges.iter().any(|edge| {
+                edge.kind == "sent_messages"
+                    && edge.from == "agent:Alice"
+                    && edge.to == "thread:hot-thread"
+                    && edge.weight == 30
+            }),
+            "missing hot sent edge: {:?}",
+            topology.edges
+        );
+        assert!(
+            topology
+                .contention
+                .iter()
+                .any(|hotspot| hotspot.id == "thread:hot-thread"),
+            "hot thread should be a contention hotspot: {:?}",
+            topology.contention
+        );
+
+        let serialized = serde_json::to_string(&topology).expect("serialize topology");
+        assert!(!serialized.contains("SECRET_SUBJECT"));
+        assert!(!serialized.contains("SECRET_BODY"));
     }
 
     #[test]
