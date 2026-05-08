@@ -15452,6 +15452,35 @@ fn doctor_rebuild_inbox_stats_for_agents(
     Ok(())
 }
 
+fn doctor_rebuild_all_inbox_stats(conn: &mcp_agent_mail_db::DbConn) -> CliResult<usize> {
+    conn.execute_raw("DELETE FROM inbox_stats")
+        .map_err(|e| CliError::Other(format!("failed to clear inbox_stats: {e}")))?;
+    conn.execute_raw(
+        "INSERT INTO inbox_stats \
+         (agent_id, total_count, unread_count, ack_pending_count, last_message_ts) \
+         SELECT \
+             r.agent_id, \
+             COUNT(*) AS total_count, \
+             COALESCE(SUM(CASE WHEN r.read_ts IS NULL THEN 1 ELSE 0 END), 0) AS unread_count, \
+             COALESCE(SUM(CASE WHEN m.ack_required = 1 AND r.ack_ts IS NULL THEN 1 ELSE 0 END), 0) AS ack_pending_count, \
+             MAX(m.created_ts) AS last_message_ts \
+         FROM message_recipients r \
+         JOIN messages m ON m.id = r.message_id \
+         JOIN agents a ON a.id = r.agent_id \
+         GROUP BY r.agent_id",
+    )
+    .map_err(|e| CliError::Other(format!("failed to rebuild inbox_stats: {e}")))?;
+
+    let rows = conn
+        .query_sync("SELECT COUNT(*) AS count FROM inbox_stats", &[])
+        .map_err(|e| CliError::Other(format!("failed to count rebuilt inbox_stats: {e}")))?;
+    let count = rows
+        .first()
+        .and_then(|row| row.get_named::<i64>("count").ok())
+        .unwrap_or(0);
+    Ok(usize::try_from(count).unwrap_or(0))
+}
+
 /// Issue #113: opt-in cleanup that drops `message_recipients` rows whose
 /// `agent_id` no longer exists in `agents`.
 ///
@@ -51539,6 +51568,16 @@ fn handle_doctor_repair_with_options(
             .execute_raw("REINDEX")
             .map_err(|e| CliError::Other(format!("REINDEX failed: {e}")))?;
         ftui_runtime::ftui_println!("  VACUUM + ANALYZE + REINDEX complete.");
+
+        let stats_conn =
+            mcp_agent_mail_db::DbConn::open_file(reconstruct_db_path.display().to_string())
+                .map_err(|e| {
+                    CliError::Other(format!("Failed to open DB for inbox_stats rebuild: {e}"))
+                })?;
+        let rebuilt_stats_rows = doctor_rebuild_all_inbox_stats(&stats_conn)?;
+        ftui_runtime::ftui_println!(
+            "  Rebuilt inbox_stats from repaired rows: {rebuilt_stats_rows} agent(s)."
+        );
     }
 
     if let Some(ref slug) = project {
