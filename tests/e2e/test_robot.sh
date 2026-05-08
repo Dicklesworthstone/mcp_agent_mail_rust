@@ -87,7 +87,7 @@ seed_data() {
     local fifo="${srv_work}/stdin_fifo"
     mkfifo "$fifo"
 
-    DATABASE_URL="sqlite:///${db_path}" RUST_LOG=error \
+    DATABASE_URL="sqlite:///${db_path}" RUST_LOG=error WORKTREES_ENABLED=true \
         am serve-stdio < "$fifo" > "$output_file" 2>"${srv_work}/stderr.txt" &
     local srv_pid=$!
     sleep 0.3
@@ -113,6 +113,9 @@ seed_data() {
         sleep 0.5
         # Create a file reservation
         echo "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"file_reservation_paths\",\"arguments\":{\"project_key\":\"${project}\",\"agent_name\":\"BlueLake\",\"paths\":[\"src/test.rs\"],\"ttl_seconds\":7200,\"exclusive\":true,\"reason\":\"E2E test\"}}}"
+        sleep 0.5
+        # Create a build slot lease for robot analytics topology coverage.
+        echo "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\",\"params\":{\"name\":\"acquire_build_slot\",\"arguments\":{\"project_key\":\"${project}\",\"agent_name\":\"BlueLake\",\"slot\":\"cargo-build\",\"ttl_seconds\":7200,\"exclusive\":true}}}"
         sleep 0.5
         # Keep stdin open briefly so the server can flush all responses.
         sleep 1
@@ -150,8 +153,8 @@ if ! echo "$SEED_RESP" | grep -q '"id":2'; then
     e2e_summary
     exit 1
 fi
-if ! echo "$SEED_RESP" | grep -q '"id":9'; then
-    e2e_fail "Data seeding failed (missing final seed response id=9)"
+if ! echo "$SEED_RESP" | grep -q '"id":10'; then
+    e2e_fail "Data seeding failed (missing final seed response id=10)"
     e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
     e2e_summary
     exit 1
@@ -371,6 +374,21 @@ e2e_case_banner "robot analytics -> anomaly insights"
 ANALYTICS_OUT="$(run_robot analytics --format json)"
 e2e_save_artifact "case_analytics.json" "$ANALYTICS_OUT"
 assert_valid_json "analytics" "$ANALYTICS_OUT" && assert_envelope "analytics" "$ANALYTICS_OUT"
+if echo "$ANALYTICS_OUT" | jq -e '.topology.coverage.build_slots >= 1' >/dev/null 2>&1; then
+    e2e_pass "analytics: build slot topology coverage present"
+else
+    e2e_fail "analytics: expected build slot topology coverage"
+fi
+if echo "$ANALYTICS_OUT" | jq -e '.topology.edges | any(.kind == "holds_build_slot")' >/dev/null 2>&1; then
+    e2e_pass "analytics: build slot topology edge present"
+else
+    e2e_fail "analytics: expected build slot topology edge"
+fi
+if echo "$ANALYTICS_OUT" | grep -q "This is test message"; then
+    e2e_fail "analytics: topology leaked message body content"
+else
+    e2e_pass "analytics: topology omits message body content"
+fi
 
 # ---------------------------------------------------------------------------
 # Track 5: Entity Views

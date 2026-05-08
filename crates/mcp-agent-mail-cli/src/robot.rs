@@ -6311,6 +6311,10 @@ fn topology_product_id(product_label: &str) -> String {
     format!("product:{product_label}")
 }
 
+fn topology_build_slot_id(slot: &str) -> String {
+    format!("build_slot:{slot}")
+}
+
 fn topology_project_id(project_id: i64) -> String {
     format!("project:{project_id}")
 }
@@ -6610,6 +6614,96 @@ fn add_product_topology_edges(
     Ok(rows.len())
 }
 
+fn active_build_slot_leases(
+    storage_root: &Path,
+    project_slug: &str,
+) -> Vec<mcp_agent_mail_tools::build_slots::BuildSlotLease> {
+    let slots_root = storage_root
+        .join("projects")
+        .join(project_slug)
+        .join("build_slots");
+    let Ok(slot_entries) = std::fs::read_dir(&slots_root) else {
+        return Vec::new();
+    };
+    let now = Utc::now();
+    let mut leases = Vec::new();
+
+    for slot_entry in slot_entries.flatten() {
+        let Ok(slot_file_type) = slot_entry.file_type() else {
+            continue;
+        };
+        if !slot_file_type.is_dir() || slot_file_type.is_symlink() {
+            continue;
+        }
+        let Ok(lease_entries) = std::fs::read_dir(slot_entry.path()) else {
+            continue;
+        };
+        for lease_entry in lease_entries.flatten() {
+            let Ok(lease_file_type) = lease_entry.file_type() else {
+                continue;
+            };
+            if !lease_file_type.is_file() || lease_file_type.is_symlink() {
+                continue;
+            }
+            if lease_entry
+                .path()
+                .extension()
+                .and_then(|value| value.to_str())
+                != Some("json")
+            {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(lease_entry.path()) else {
+                continue;
+            };
+            let Ok(lease) =
+                serde_json::from_str::<mcp_agent_mail_tools::build_slots::BuildSlotLease>(&text)
+            else {
+                continue;
+            };
+            if lease.released_ts.is_some() {
+                continue;
+            }
+            let Ok(expires_ts) = chrono::DateTime::parse_from_rfc3339(&lease.expires_ts) else {
+                continue;
+            };
+            if expires_ts.with_timezone(&Utc) <= now {
+                continue;
+            }
+            leases.push(lease);
+        }
+    }
+
+    leases
+}
+
+fn add_build_slot_topology_edges(
+    storage_root: &Path,
+    project_slug: &str,
+    nodes: &mut HashMap<String, SwarmTopologyNode>,
+    edges: &mut HashMap<TopologyEdgeKey, SwarmTopologyEdge>,
+) -> usize {
+    let leases = active_build_slot_leases(storage_root, project_slug);
+    for lease in &leases {
+        let heat_score = if lease.exclusive { 4 } else { 2 };
+        record_topology_edge(
+            nodes,
+            edges,
+            &topology_agent_id(&lease.agent),
+            "agent",
+            &lease.agent,
+            &topology_build_slot_id(&lease.slot),
+            "build_slot",
+            &lease.slot,
+            "holds_build_slot",
+            1,
+            heat_score,
+        );
+    }
+
+    leases.len()
+}
+
 fn sort_topology_nodes(mut nodes: Vec<SwarmTopologyNode>) -> Vec<SwarmTopologyNode> {
     nodes.sort_by(|left, right| {
         right
@@ -6660,7 +6754,12 @@ fn build_topology_hotspots(nodes: &[SwarmTopologyNode]) -> Vec<SwarmTopologyHots
     hotspots
 }
 
-fn build_swarm_topology(conn: &DbConn, project_id: i64) -> Result<SwarmTopologySummary, CliError> {
+fn build_swarm_topology(
+    conn: &DbConn,
+    project_id: i64,
+    storage_root: &Path,
+    project_slug: &str,
+) -> Result<SwarmTopologySummary, CliError> {
     let mut nodes = HashMap::new();
     let mut edges = HashMap::new();
 
@@ -6668,6 +6767,8 @@ fn build_swarm_topology(conn: &DbConn, project_id: i64) -> Result<SwarmTopologyS
     let threads = add_message_topology_edges(conn, project_id, &mut nodes, &mut edges)?;
     let reservations = add_reservation_topology_edges(conn, project_id, &mut nodes, &mut edges)?;
     let products = add_product_topology_edges(conn, project_id, &mut nodes, &mut edges)?;
+    let build_slots =
+        add_build_slot_topology_edges(storage_root, project_slug, &mut nodes, &mut edges);
 
     let node_count = nodes.len();
     let edge_count = edges.len();
@@ -6684,7 +6785,7 @@ fn build_swarm_topology(conn: &DbConn, project_id: i64) -> Result<SwarmTopologyS
             agents,
             threads,
             reservations,
-            build_slots: 0,
+            build_slots,
             products,
             nodes: node_count,
             edges: edge_count,
@@ -10180,7 +10281,13 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         RobotSubcommand::Analytics => {
             let scope = resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
             let anomalies = build_analytics(scope.conn(), scope.project_id, scope.agent.clone())?;
-            let topology = build_swarm_topology(scope.conn(), scope.project_id)?;
+            let config = mcp_agent_mail_core::Config::from_env();
+            let topology = build_swarm_topology(
+                scope.conn(),
+                scope.project_id,
+                &config.storage_root,
+                &scope.project_slug,
+            )?;
 
             #[derive(Serialize)]
             struct AnalyticsData {
@@ -17093,13 +17200,50 @@ mod tests {
         )
         .expect("insert product link");
 
-        let topology = build_swarm_topology(&conn, 1).expect("build topology");
+        let storage_root = _temp_dir.path().join("storage");
+        let slot_dir = storage_root
+            .join("projects")
+            .join("proj")
+            .join("build_slots")
+            .join("cargo-build");
+        std::fs::create_dir_all(&slot_dir).expect("create build slot dir");
+        for (idx, agent, exclusive, released, expired) in [
+            (0_i64, "Bob", true, false, false),
+            (1_i64, "Carol", false, false, false),
+            (2_i64, "Alice", true, true, false),
+            (3_i64, "Alice", true, false, true),
+        ] {
+            let expires_ts = if expired {
+                (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339()
+            } else {
+                (chrono::Utc::now() + chrono::Duration::minutes(30)).to_rfc3339()
+            };
+            let released_ts = released.then(|| chrono::Utc::now().to_rfc3339());
+            let lease = serde_json::json!({
+                "slot": "cargo-build",
+                "agent": agent,
+                "branch": "main",
+                "exclusive": exclusive,
+                "acquired_ts": chrono::Utc::now().to_rfc3339(),
+                "expires_ts": expires_ts,
+                "released_ts": released_ts,
+            });
+            std::fs::write(
+                slot_dir.join(format!("lease-{idx}.json")),
+                serde_json::to_string(&lease).expect("serialize lease"),
+            )
+            .expect("write lease");
+        }
+        std::fs::write(slot_dir.join("malformed.json"), "{not-json").expect("write malformed");
+
+        let topology =
+            build_swarm_topology(&conn, 1, &storage_root, "proj").expect("build topology");
 
         assert_eq!(topology.coverage.agents, 3);
         assert_eq!(topology.coverage.threads, 2);
         assert_eq!(topology.coverage.reservations, 2);
         assert_eq!(topology.coverage.products, 1);
-        assert_eq!(topology.coverage.build_slots, 0);
+        assert_eq!(topology.coverage.build_slots, 2);
         assert!(
             topology.coverage.edges >= 7,
             "expected message, reservation, and product edges: {:?}",
@@ -17118,6 +17262,16 @@ mod tests {
                     && edge.weight == 30
             }),
             "missing hot sent edge: {:?}",
+            topology.edges
+        );
+        assert!(
+            topology.edges.iter().any(|edge| {
+                edge.kind == "holds_build_slot"
+                    && edge.from == "agent:Bob"
+                    && edge.to == "build_slot:cargo-build"
+                    && edge.weight == 1
+            }),
+            "missing active build-slot edge: {:?}",
             topology.edges
         );
         assert!(
