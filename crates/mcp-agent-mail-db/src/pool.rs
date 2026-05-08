@@ -4153,7 +4153,7 @@ fn sqlite_cleanup_quarantine_path(sidecar_path: &Path, nonce: &str) -> PathBuf {
     candidate_os.push(format!(".cleanup-quarantine-{nonce}"));
     let mut candidate = PathBuf::from(candidate_os);
     let mut suffix = 1_u32;
-    while candidate.exists() {
+    while sqlite_candidate_artifact_conflicts(&candidate) {
         let mut candidate_os = sidecar_path.as_os_str().to_os_string();
         candidate_os.push(format!(".cleanup-quarantine-{nonce}-{suffix:02}"));
         candidate = PathBuf::from(candidate_os);
@@ -4257,10 +4257,15 @@ fn cleanup_empty_wal_sidecar(sqlite_path: &str) {
 fn sqlite_file_has_live_sidecars(path: &Path) -> bool {
     for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
         let sidecar_path = sqlite_path_with_suffix(path, suffix);
-        if let Ok(meta) = std::fs::metadata(&sidecar_path)
-            && meta.len() > 0
-        {
-            return true;
+        match std::fs::symlink_metadata(&sidecar_path) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                if metadata.len() > 0 {
+                    return true;
+                }
+            }
+            Ok(_) => return true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return true,
         }
     }
     false
@@ -4813,6 +4818,24 @@ fn is_real_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
 }
 
+fn path_is_occupied(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+fn sqlite_sidecar_occupancy(path: &Path) -> (bool, Option<u64>) {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let bytes = metadata.file_type().is_file().then_some(metadata.len());
+            (true, bytes)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (false, None),
+        Err(_) => (true, None),
+    }
+}
+
 fn sqlite_backup_candidates(primary_path: &Path) -> Vec<PathBuf> {
     let mut candidates: Vec<(SystemTime, bool, u8, PathBuf)> = Vec::new();
     let Some(file_name) = primary_path.file_name() else {
@@ -5014,19 +5037,17 @@ pub fn inspect_mailbox_sidecar_state(db_path: &Path) -> MailboxSidecarState {
     let journal_path = sqlite_path_with_suffix(db_path, "-journal");
     let wal_path = sqlite_path_with_suffix(db_path, "-wal");
     let shm_path = sqlite_path_with_suffix(db_path, "-shm");
-    let journal_meta = std::fs::metadata(&journal_path).ok();
-    let wal_meta = std::fs::metadata(&wal_path).ok();
-    let shm_meta = std::fs::metadata(&shm_path).ok();
+    let (journal_exists, journal_bytes) = sqlite_sidecar_occupancy(&journal_path);
+    let (wal_exists, wal_bytes) = sqlite_sidecar_occupancy(&wal_path);
+    let (shm_exists, shm_bytes) = sqlite_sidecar_occupancy(&shm_path);
 
     MailboxSidecarState {
-        wal_exists: wal_meta.as_ref().is_some_and(std::fs::Metadata::is_file),
-        wal_bytes: wal_meta.as_ref().map(std::fs::Metadata::len),
-        shm_exists: shm_meta.as_ref().is_some_and(std::fs::Metadata::is_file),
-        shm_bytes: shm_meta.as_ref().map(std::fs::Metadata::len),
-        journal_exists: journal_meta
-            .as_ref()
-            .is_some_and(std::fs::Metadata::is_file),
-        journal_bytes: journal_meta.as_ref().map(std::fs::Metadata::len),
+        wal_exists,
+        wal_bytes,
+        shm_exists,
+        shm_bytes,
+        journal_exists,
+        journal_bytes,
         live_sidecars: sqlite_file_has_live_sidecars(db_path),
     }
 }
@@ -5565,7 +5586,7 @@ fn reconstruction_candidate_path(primary_path: &Path, timestamp: &str) -> PathBu
         &format!("storage.sqlite3.reconstructing-{timestamp}"),
     );
     let mut suffix = 1_u32;
-    while candidate.exists() {
+    while sqlite_candidate_artifact_conflicts(&candidate) {
         candidate = sqlite_path_with_file_name_suffix(
             primary_path,
             &format!(".reconstructing-{timestamp}-{suffix:02}"),
@@ -5578,10 +5599,10 @@ fn reconstruction_candidate_path(primary_path: &Path, timestamp: &str) -> PathBu
 
 #[allow(clippy::result_large_err)]
 fn sqlite_candidate_artifact_conflicts(candidate: &Path) -> bool {
-    candidate.exists()
+    path_is_occupied(candidate)
         || SQLITE_RECOVERY_SIDECAR_SUFFIXES
             .iter()
-            .any(|suffix| sqlite_sidecar_path(candidate, suffix).exists())
+            .any(|suffix| path_is_occupied(&sqlite_sidecar_path(candidate, suffix)))
 }
 
 #[allow(clippy::result_large_err)]
@@ -5738,7 +5759,7 @@ fn quarantine_reconstruction_candidate_path(
     reason: &str,
     timestamp: &str,
 ) -> Result<Option<PathBuf>, SqlError> {
-    if !candidate_path.exists() {
+    if !path_is_occupied(candidate_path) {
         return Ok(None);
     }
 
@@ -5758,7 +5779,7 @@ fn quarantine_reconstruction_candidate_path(
         let mut source_os = candidate_path.as_os_str().to_os_string();
         source_os.push(suffix);
         let source = PathBuf::from(source_os);
-        if !source.exists() {
+        if !path_is_occupied(&source) {
             continue;
         }
         let mut target_os = quarantined.as_os_str().to_os_string();
@@ -5780,7 +5801,7 @@ fn activate_reconstruction_candidate(
     candidate_path: &Path,
     primary_path: &Path,
 ) -> Result<(), SqlError> {
-    if primary_path.exists() {
+    if path_is_occupied(primary_path) {
         return Err(SqlError::Custom(format!(
             "refusing to activate reconstructed candidate {} over existing live database {}",
             candidate_path.display(),
@@ -5878,7 +5899,7 @@ fn quarantine_sidecar_with_label(
     let mut source_os = primary_path.as_os_str().to_os_string();
     source_os.push(suffix);
     let source = PathBuf::from(source_os);
-    if !source.exists() {
+    if !path_is_occupied(&source) {
         return Ok(());
     }
     let target = quarantined_sidecar_path(primary_path, suffix, label, timestamp);
@@ -5902,7 +5923,7 @@ fn restore_quarantined_primary_with_sidecar_label(
     sidecar_label: &str,
     timestamp: &str,
 ) -> Result<(), SqlError> {
-    if primary_path.exists() {
+    if path_is_occupied(primary_path) {
         let restore_timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f").to_string();
         quarantine_reconstructed_candidate(
             primary_path,
@@ -5917,7 +5938,7 @@ fn restore_quarantined_primary_with_sidecar_label(
         })?;
     }
 
-    if quarantined_path.exists() {
+    if path_is_occupied(quarantined_path) {
         std::fs::rename(quarantined_path, primary_path).map_err(|e| {
             SqlError::Custom(format!(
                 "failed to restore original database {} from {}: {e}",
@@ -5967,7 +5988,7 @@ fn quarantine_reconstructed_candidate(
     timestamp: &str,
     reason: &str,
 ) -> Result<Option<PathBuf>, SqlError> {
-    if !primary_path.exists() {
+    if !path_is_occupied(primary_path) {
         return Ok(None);
     }
 
@@ -6026,7 +6047,7 @@ fn restore_quarantined_sidecar(
         }
     };
 
-    if !metadata.file_type().is_file() {
+    if !metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
         tracing::warn!(
             path = %quarantined.display(),
             "skipping non-file sqlite sidecar quarantine artifact during restore"
@@ -6037,7 +6058,7 @@ fn restore_quarantined_sidecar(
     let mut live_os = primary_path.as_os_str().to_os_string();
     live_os.push(suffix);
     let live_path = PathBuf::from(live_os);
-    if live_path.exists() {
+    if path_is_occupied(&live_path) {
         std::fs::remove_file(&live_path).map_err(|e| {
             SqlError::Custom(format!(
                 "failed to clear restored sidecar destination {}: {e}",
@@ -6083,7 +6104,7 @@ fn reconstruct_sqlite_file_with_archive_salvage_inner(
             capture_automatic_recovery_bundle(primary_path, storage_root, "reconstruct")?;
     }
 
-    if !primary_path.exists() {
+    if !path_is_occupied(primary_path) {
         if has_quarantined_primary_artifact(primary_path) {
             return Err(SqlError::Custom(format!(
                 "database file {} is missing but quarantined recovery artifact(s) exist; refusing archive salvage reconstruction without operator action",
@@ -6344,7 +6365,7 @@ fn restore_from_backup(primary_path: &Path, backup_path: &Path) -> Result<(), Sq
         &format!("storage.sqlite3.corrupt-{timestamp}"),
     );
 
-    if primary_path.exists() {
+    if path_is_occupied(primary_path) {
         std::fs::rename(primary_path, &quarantined_db).map_err(|e| {
             SqlError::Custom(format!(
                 "failed to quarantine corrupted database {}: {e}",
@@ -6395,7 +6416,7 @@ fn reinitialize_without_backup(primary_path: &Path) -> Result<(), SqlError> {
         &format!("storage.sqlite3.corrupt-{timestamp}"),
     );
 
-    if primary_path.exists() {
+    if path_is_occupied(primary_path) {
         std::fs::rename(primary_path, &quarantined_db).map_err(|e| {
             SqlError::Custom(format!(
                 "failed to quarantine corrupted database {}: {e}",
@@ -8205,6 +8226,27 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn restore_candidate_path_avoids_broken_symlink_sidecar_artifacts() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("storage.sqlite3");
+        let timestamp = "20260505_010101_001";
+        let first = restore_candidate_path(&primary, timestamp);
+        let first_wal = sqlite_sidecar_path(&first, "-wal");
+        let missing_target = dir.path().join("missing-wal-target");
+        symlink(&missing_target, &first_wal).expect("create broken staged wal symlink");
+
+        let candidate = restore_candidate_path(&primary, timestamp);
+        assert_eq!(
+            candidate.file_name().and_then(OsStr::to_str),
+            Some("storage.sqlite3.restoring-20260505_010101_001-01"),
+            "broken sidecar symlinks must force a unique restore candidate"
+        );
+    }
+
     #[test]
     fn restore_from_backup_quarantines_stale_journal_sidecars() {
         let dir = tempfile::tempdir().unwrap();
@@ -9419,6 +9461,25 @@ mod tests {
         assert!(sqlite_file_has_live_sidecars(&path));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_file_has_live_sidecars_detects_broken_symlink_sidecar() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("symlink-sidecar.db");
+        let wal_path = sqlite_path_with_suffix(&path, "-wal");
+        let missing_target = dir.path().join("missing-wal-target");
+
+        std::fs::write(&path, b"not a real sqlite database").expect("write db marker");
+        symlink(&missing_target, &wal_path).expect("create broken wal symlink");
+
+        assert!(
+            sqlite_file_has_live_sidecars(&path),
+            "broken sidecar symlinks should be treated as live sqlite-family artifacts"
+        );
+    }
+
     #[test]
     fn inspect_mailbox_sidecar_state_reports_rollback_journal() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -9435,6 +9496,24 @@ mod tests {
         let state = inspect_mailbox_sidecar_state(&path);
         assert!(state.journal_exists);
         assert_eq!(state.journal_bytes, Some(16));
+        assert!(state.live_sidecars);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_mailbox_sidecar_state_reports_broken_symlink_sidecar() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sidecar-symlink.db");
+        let wal_path = sqlite_path_with_suffix(&path, "-wal");
+        let missing_target = dir.path().join("missing-wal-target");
+
+        symlink(&missing_target, &wal_path).expect("create broken wal symlink");
+
+        let state = inspect_mailbox_sidecar_state(&path);
+        assert!(state.wal_exists);
+        assert_eq!(state.wal_bytes, None);
         assert!(state.live_sidecars);
     }
 
@@ -9896,6 +9975,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn reconstruction_candidate_path_avoids_broken_symlink_artifacts() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("test.db");
+        let existing = dir
+            .path()
+            .join("test.db.reconstructing-20260218_120000_000");
+        let missing_target = dir.path().join("missing-reconstruct-target");
+        symlink(&missing_target, &existing).expect("create broken reconstruct symlink");
+
+        let candidate = reconstruction_candidate_path(&primary, "20260218_120000_000");
+        assert_eq!(
+            candidate,
+            dir.path()
+                .join("test.db.reconstructing-20260218_120000_000-01"),
+            "broken symlink candidate paths must force a unique reconstruction artifact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn reconstruction_candidate_path_preserves_non_utf8_primary_basename() {
         let dir = tempfile::tempdir().expect("tempdir");
         let base_name = OsString::from_vec(b"test-\xFF.db".to_vec());
@@ -9944,6 +10045,47 @@ mod tests {
             )
             .unwrap(),
             b"journal"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_reconstruction_candidate_path_moves_broken_sidecar_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("test.db");
+        let candidate = dir
+            .path()
+            .join("test.db.reconstructing-20260218_120000_000");
+        let candidate_wal = dir
+            .path()
+            .join("test.db.reconstructing-20260218_120000_000-wal");
+        let missing_target = dir.path().join("missing-wal-target");
+
+        std::fs::write(&candidate, b"candidate").expect("write candidate");
+        symlink(&missing_target, &candidate_wal).expect("create broken candidate wal symlink");
+
+        quarantine_reconstruction_candidate_path(
+            &candidate,
+            &primary,
+            "reconstruct-failed",
+            "20260218_120000_000",
+        )
+        .expect("quarantine candidate")
+        .expect("quarantined path");
+
+        assert!(!path_is_occupied(&candidate));
+        assert!(!path_is_occupied(&candidate_wal));
+        assert!(
+            std::fs::symlink_metadata(
+                dir.path()
+                    .join("test.db.reconstruct-failed-20260218_120000_000-wal")
+            )
+            .expect("quarantined wal symlink")
+            .file_type()
+            .is_symlink(),
+            "broken WAL symlink should move with the failed reconstruction candidate"
         );
     }
 
