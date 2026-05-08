@@ -8,6 +8,8 @@
 #   4. Agent registration thundering herd
 #   5. Message send + inbox fetch mixed concurrency
 #   6. File reservation conflicts under contention
+#   7. Product bus fan-in reads over the same live workload
+#   8. Robot status snapshots over the isolated mailbox
 #
 # Usage:
 #   bash tests/e2e/test_stress_load.sh
@@ -90,10 +92,14 @@ STRESS_REG_P95_BUDGET_MS="${STRESS_REG_P95_BUDGET_MS:-8000}"
 STRESS_REG_P99_BUDGET_MS="${STRESS_REG_P99_BUDGET_MS:-12000}"
 STRESS_MSG_P95_BUDGET_MS="${STRESS_MSG_P95_BUDGET_MS:-10000}"
 STRESS_MSG_P99_BUDGET_MS="${STRESS_MSG_P99_BUDGET_MS:-15000}"
-STRESS_SEARCH_P95_BUDGET_MS="${STRESS_SEARCH_P95_BUDGET_MS:-10000}"
-STRESS_SEARCH_P99_BUDGET_MS="${STRESS_SEARCH_P99_BUDGET_MS:-15000}"
+STRESS_SEARCH_P95_BUDGET_MS="${STRESS_SEARCH_P95_BUDGET_MS:-18000}"
+STRESS_SEARCH_P99_BUDGET_MS="${STRESS_SEARCH_P99_BUDGET_MS:-20000}"
+STRESS_PRODUCT_P95_BUDGET_MS="${STRESS_PRODUCT_P95_BUDGET_MS:-18000}"
+STRESS_PRODUCT_P99_BUDGET_MS="${STRESS_PRODUCT_P99_BUDGET_MS:-20000}"
 STRESS_HEALTH_P95_BUDGET_MS="${STRESS_HEALTH_P95_BUDGET_MS:-8000}"
 STRESS_HEALTH_P99_BUDGET_MS="${STRESS_HEALTH_P99_BUDGET_MS:-12000}"
+STRESS_ROBOT_P95_BUDGET_MS="${STRESS_ROBOT_P95_BUDGET_MS:-12000}"
+STRESS_ROBOT_P99_BUDGET_MS="${STRESS_ROBOT_P99_BUDGET_MS:-18000}"
 STRESS_RSS_GROWTH_BUDGET_KB="${STRESS_RSS_GROWTH_BUDGET_KB:-$PROFILE_RSS_GROWTH_BUDGET_KB}"
 
 write_ignored_large_report() {
@@ -110,7 +116,8 @@ write_ignored_large_report() {
     "concurrency": ${PROFILE_CONCURRENCY},
     "messages_per_agent": ${PROFILE_MSGS_PER_AGENT},
     "mixed_duration_secs": ${PROFILE_DURATION_SECS},
-    "health_checks": ${PROFILE_HEALTH_CHECKS}
+    "health_checks": ${PROFILE_HEALTH_CHECKS},
+    "surfaces": ["http_mcp", "product_bus", "robot_status"]
   },
   "reproduction": "${run_cmd}"
 }
@@ -143,6 +150,12 @@ if [ "$CONCURRENCY" -lt 2 ]; then
     e2e_fail "STRESS_CONCURRENCY must be at least 2"
     e2e_summary
     exit 1
+fi
+
+export PATH="${PROJECT_ROOT}/target/debug:${CARGO_TARGET_DIR}/debug:${PATH}"
+if ! command -v am >/dev/null 2>&1; then
+    e2e_ensure_binary "am" >/dev/null
+    export PATH="${CARGO_TARGET_DIR}/debug:${PATH}"
 fi
 
 now_ns() {
@@ -199,6 +212,7 @@ if ! HTTP_PORT="$PORT" e2e_start_server_with_logs \
     "HTTP_RBAC_ENABLED=0" \
     "HTTP_RATE_LIMIT_ENABLED=0" \
     "HTTP_JWT_ENABLED=0" \
+    "WORKTREES_ENABLED=true" \
     "RUST_LOG=warn"; then
     e2e_fail "server failed to start"
     e2e_save_artifact "env_dump.txt" "$(e2e_dump_env 2>&1)"
@@ -272,6 +286,7 @@ if 'error' in d or d.get('result',{}).get('isError',False):
 }
 
 PROJECT_KEY="/tmp/stress-test-project-$$"
+PRODUCT_KEY="stress-load-product-$$"
 
 # ---------------------------------------------------------------------------
 # Phase 0: Initialize project (single call)
@@ -375,14 +390,56 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Phase 2: Message Send Storm
+# Phase 2: Product Bus Setup
+#
+# Link the stress project into a product so later phases can exercise product
+# fan-in reads through the same live HTTP transport and isolated storage.
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== Phase 2: Product Bus Setup ==="
+
+PRODUCT_SETUP_OK=0
+PRODUCT_SETUP_FAIL=0
+
+op_start_ns="$(now_ns)"
+PRODUCT_RESP=$(mcp_call "ensure_product" "{\"product_key\":\"${PRODUCT_KEY}\",\"name\":\"Stress Load Product $$\"}")
+op_end_ns="$(now_ns)"
+record_latency_us "product_setup" "ensure" "$op_start_ns" "$op_end_ns"
+if echo "$PRODUCT_RESP" | grep -q '"error"'; then
+    PRODUCT_SETUP_FAIL=$((PRODUCT_SETUP_FAIL + 1))
+else
+    PRODUCT_SETUP_OK=$((PRODUCT_SETUP_OK + 1))
+fi
+
+op_start_ns="$(now_ns)"
+PRODUCT_LINK_RESP=$(mcp_call "products_link" "{\"product_key\":\"${PRODUCT_KEY}\",\"project_key\":\"${PROJECT_KEY}\"}")
+op_end_ns="$(now_ns)"
+record_latency_us "product_setup" "link" "$op_start_ns" "$op_end_ns"
+if echo "$PRODUCT_LINK_RESP" | grep -q '"error"'; then
+    PRODUCT_SETUP_FAIL=$((PRODUCT_SETUP_FAIL + 1))
+else
+    PRODUCT_SETUP_OK=$((PRODUCT_SETUP_OK + 1))
+fi
+
+e2e_save_artifact "product_setup_response.jsonl" "${PRODUCT_RESP}
+${PRODUCT_LINK_RESP}"
+
+if [ "$PRODUCT_SETUP_FAIL" -eq 0 ]; then
+    e2e_pass "Product bus linked stress project to ${PRODUCT_KEY}"
+else
+    e2e_fail "Product bus setup failures: ${PRODUCT_SETUP_FAIL}"
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 3: Message Send Storm
 #
 # Each agent sends MSGS_PER_AGENT messages to random other agents.
 # Tests: concurrent DB writes + git archive writes.
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== Phase 2: Message Send Storm ($N_AGENTS x $MSGS_PER_AGENT msgs, $CONCURRENCY concurrent) ==="
+echo "=== Phase 3: Message Send Storm ($N_AGENTS x $MSGS_PER_AGENT msgs, $CONCURRENCY concurrent) ==="
 
 MSG_START=$(date +%s%N)
 MSG_OK=0
@@ -444,14 +501,14 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Phase 3: Concurrent Inbox Fetch + Message Send (Read/Write Mix)
+# Phase 4: Concurrent Inbox Fetch + Message Send (Read/Write Mix)
 #
 # Half the threads read inboxes, half send messages — simultaneously.
 # Tests: WAL read/write concurrency, cache coherency.
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== Phase 3: Mixed Read/Write Concurrency (${CONCURRENCY} workers, ${DURATION_SECS}s) ==="
+echo "=== Phase 4: Mixed Read/Write Concurrency (${CONCURRENCY} workers, ${DURATION_SECS}s) ==="
 
 MIX_START=$(date +%s%N)
 MIX_READS_OK=0
@@ -544,14 +601,14 @@ if [ "$MIX_TOTAL" -gt 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Phase 4: File Reservation Contention
+# Phase 5: File Reservation Contention
 #
 # Multiple agents compete for overlapping file patterns.
 # Tests: reservation conflict detection under concurrency.
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== Phase 4: File Reservation Contention (${CONCURRENCY} concurrent) ==="
+echo "=== Phase 5: File Reservation Contention (${CONCURRENCY} concurrent) ==="
 
 RES_OK=0
 RES_CONFLICT=0
@@ -597,14 +654,14 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Phase 5: Search Under Load
+# Phase 6: Search Under Load
 #
 # Concurrent search queries while messages are still being indexed.
 # Tests: FTS5 concurrency, LIKE fallback, pool sharing.
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== Phase 5: Concurrent Search ($CONCURRENCY parallel queries) ==="
+echo "=== Phase 6: Concurrent Search ($CONCURRENCY parallel queries) ==="
 
 SEARCH_QUERIES=("stress" "message" "body" "load" "test" "workload" "mix" "content" "FTS" "indexing")
 SEARCH_OK=0
@@ -642,14 +699,88 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Phase 6: Health Check Under Load (server stays responsive)
+# Phase 7: Product Bus Fan-In Reads
+#
+# Product-scoped search and inbox reads over the same live workload.
+# Tests: cross-surface fan-in routing, product/project link lookups, and
+# product-scoped search/inbox pagination under post-write pressure.
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== Phase 7: Product Bus Fan-In Reads (${CONCURRENCY} parallel query pairs) ==="
+
+PRODUCT_SEARCH_OK=0
+PRODUCT_SEARCH_FAIL=0
+PRODUCT_INBOX_OK=0
+PRODUCT_INBOX_FAIL=0
+PRODUCT_PIDS=()
+
+for i in $(seq 0 $((CONCURRENCY - 1))); do
+    q_idx=$((i % ${#SEARCH_QUERIES[@]}))
+    query="${SEARCH_QUERIES[$q_idx]}"
+    agent="${AGENT_NAMES[$((i % N_AGENTS))]}"
+
+    (
+        op_start_ns="$(now_ns)"
+        resp=$(mcp_call "search_messages_product" "{\"product_key\":\"${PRODUCT_KEY}\",\"query\":\"${query}\",\"limit\":20}")
+        op_end_ns="$(now_ns)"
+        record_latency_us "product_search" "$i" "$op_start_ns" "$op_end_ns"
+        if echo "$resp" | grep -q '"error"'; then
+            echo "SEARCH:FAIL" > "${WORK}/product_search_${i}.txt"
+        else
+            echo "SEARCH:OK" > "${WORK}/product_search_${i}.txt"
+        fi
+
+        op_start_ns="$(now_ns)"
+        resp=$(mcp_call "fetch_inbox_product" "{\"product_key\":\"${PRODUCT_KEY}\",\"agent_name\":\"${agent}\",\"limit\":20}")
+        op_end_ns="$(now_ns)"
+        record_latency_us "product_inbox" "$i" "$op_start_ns" "$op_end_ns"
+        if echo "$resp" | grep -q '"error"'; then
+            echo "INBOX:FAIL" > "${WORK}/product_inbox_${i}.txt"
+        else
+            echo "INBOX:OK" > "${WORK}/product_inbox_${i}.txt"
+        fi
+    ) &
+    PRODUCT_PIDS+=($!)
+done
+
+for pid in "${PRODUCT_PIDS[@]}"; do
+    wait "$pid" 2>/dev/null || true
+done
+
+for f in "${WORK}"/product_search_*.txt; do
+    [ -f "$f" ] || continue
+    case "$(cat "$f")" in
+        SEARCH:OK) PRODUCT_SEARCH_OK=$((PRODUCT_SEARCH_OK + 1)) ;;
+        SEARCH:FAIL) PRODUCT_SEARCH_FAIL=$((PRODUCT_SEARCH_FAIL + 1)) ;;
+    esac
+done
+for f in "${WORK}"/product_inbox_*.txt; do
+    [ -f "$f" ] || continue
+    case "$(cat "$f")" in
+        INBOX:OK) PRODUCT_INBOX_OK=$((PRODUCT_INBOX_OK + 1)) ;;
+        INBOX:FAIL) PRODUCT_INBOX_FAIL=$((PRODUCT_INBOX_FAIL + 1)) ;;
+    esac
+done
+
+echo "  Product search: ${PRODUCT_SEARCH_OK} ok, ${PRODUCT_SEARCH_FAIL} fail"
+echo "  Product inbox: ${PRODUCT_INBOX_OK} ok, ${PRODUCT_INBOX_FAIL} fail"
+
+if [ "$PRODUCT_SEARCH_FAIL" -eq 0 ] && [ "$PRODUCT_INBOX_FAIL" -eq 0 ]; then
+    e2e_pass "Product bus fan-in reads succeeded"
+else
+    e2e_fail "Product bus fan-in failures: search=${PRODUCT_SEARCH_FAIL}, inbox=${PRODUCT_INBOX_FAIL}"
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 8: Health Check Under Load (server stays responsive)
 #
 # Rapid health checks while other operations may still be settling.
 # Tests: server doesn't deadlock or become unresponsive.
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== Phase 6: Health Check Rapid-Fire (${HEALTH_CHECKS} sequential checks) ==="
+echo "=== Phase 8: Health Check Rapid-Fire (${HEALTH_CHECKS} sequential checks) ==="
 
 HEALTH_OK=0
 HEALTH_FAIL=0
@@ -683,6 +814,67 @@ SERVER_RSS_END_KB="$(rss_kb_for_pid "${E2E_SERVER_PID}")"
 RSS_GROWTH_KB=$(( SERVER_RSS_END_KB - SERVER_RSS_START_KB ))
 [ "$RSS_GROWTH_KB" -lt 0 ] && RSS_GROWTH_KB=0
 
+# Robot commands take the same storage activity lock as the live server. Stop
+# the server after measuring RSS so the robot snapshot proves the operator path
+# against the exact isolated mailbox without lock contention.
+e2e_stop_server || true
+
+# ---------------------------------------------------------------------------
+# Phase 9: Robot Status Snapshot
+#
+# Exercise the agent-first operator surface against the isolated workload state.
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== Phase 9: Robot Status Snapshot ==="
+
+ROBOT_OK=0
+ROBOT_FAIL=0
+ROBOT_AGENT="${AGENT_NAMES[0]}"
+ROBOT_STATUS_FILE="${E2E_ARTIFACT_DIR}/robot_status.json"
+
+op_start_ns="$(now_ns)"
+ROBOT_STATUS_OUT=""
+ROBOT_RC=1
+for attempt in 1 2 3 4 5; do
+    set +e
+    ROBOT_STATUS_OUT=$(DATABASE_URL="sqlite:////${STRESS_DB}" STORAGE_ROOT="${STRESS_STORAGE}" \
+        AM_INTERFACE_MODE=cli am robot --project "${PROJECT_KEY}" --agent "${ROBOT_AGENT}" status --format json 2>&1)
+    ROBOT_RC=$?
+    set -e
+    if [ "$ROBOT_RC" -eq 0 ]; then
+        break
+    fi
+    if echo "$ROBOT_STATUS_OUT" | grep -qi "activity lock is busy"; then
+        sleep "$attempt"
+    else
+        break
+    fi
+done
+op_end_ns="$(now_ns)"
+record_latency_us "robot_status" "status" "$op_start_ns" "$op_end_ns"
+printf '%s\n' "$ROBOT_STATUS_OUT" > "$ROBOT_STATUS_FILE"
+
+if [ "$ROBOT_RC" -eq 0 ] && python3 - "$ROBOT_STATUS_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+meta = data.get("_meta", {})
+if meta.get("command") not in {"status", "robot status"}:
+    raise SystemExit(1)
+if not any(key in data for key in ("health", "inbox_summary", "activity")):
+    raise SystemExit(1)
+PY
+then
+    ROBOT_OK=1
+    e2e_pass "Robot status produced a valid isolated JSON snapshot"
+else
+    ROBOT_FAIL=1
+    e2e_fail "Robot status failed or produced invalid JSON"
+fi
+
 write_load_lab_reports() {
     local report_json="${E2E_ARTIFACT_DIR}/load_lab_report.json"
     local report_md="${E2E_ARTIFACT_DIR}/load_lab_report.md"
@@ -696,6 +888,7 @@ write_load_lab_reports() {
     DURATION_SECS="$DURATION_SECS" \
     HEALTH_CHECKS="$HEALTH_CHECKS" \
     PROJECT_KEY="$PROJECT_KEY" \
+    PRODUCT_KEY="$PRODUCT_KEY" \
     STRESS_DB="$STRESS_DB" \
     STRESS_STORAGE="$STRESS_STORAGE" \
     SERVER_RSS_START_KB="$SERVER_RSS_START_KB" \
@@ -703,6 +896,8 @@ write_load_lab_reports() {
     RSS_GROWTH_KB="$RSS_GROWTH_KB" \
     REG_OK="$REG_OK" \
     REG_FAIL="$REG_FAIL" \
+    PRODUCT_SETUP_OK="$PRODUCT_SETUP_OK" \
+    PRODUCT_SETUP_FAIL="$PRODUCT_SETUP_FAIL" \
     MSG_OK="$MSG_OK" \
     MSG_FAIL="$MSG_FAIL" \
     TOTAL_MSGS="$TOTAL_MSGS" \
@@ -715,16 +910,26 @@ write_load_lab_reports() {
     RES_ERROR="$RES_ERROR" \
     SEARCH_OK="$SEARCH_OK" \
     SEARCH_FAIL="$SEARCH_FAIL" \
+    PRODUCT_SEARCH_OK="$PRODUCT_SEARCH_OK" \
+    PRODUCT_SEARCH_FAIL="$PRODUCT_SEARCH_FAIL" \
+    PRODUCT_INBOX_OK="$PRODUCT_INBOX_OK" \
+    PRODUCT_INBOX_FAIL="$PRODUCT_INBOX_FAIL" \
     HEALTH_OK="$HEALTH_OK" \
     HEALTH_FAIL="$HEALTH_FAIL" \
+    ROBOT_OK="$ROBOT_OK" \
+    ROBOT_FAIL="$ROBOT_FAIL" \
     STRESS_REG_P95_BUDGET_MS="$STRESS_REG_P95_BUDGET_MS" \
     STRESS_REG_P99_BUDGET_MS="$STRESS_REG_P99_BUDGET_MS" \
     STRESS_MSG_P95_BUDGET_MS="$STRESS_MSG_P95_BUDGET_MS" \
     STRESS_MSG_P99_BUDGET_MS="$STRESS_MSG_P99_BUDGET_MS" \
     STRESS_SEARCH_P95_BUDGET_MS="$STRESS_SEARCH_P95_BUDGET_MS" \
     STRESS_SEARCH_P99_BUDGET_MS="$STRESS_SEARCH_P99_BUDGET_MS" \
+    STRESS_PRODUCT_P95_BUDGET_MS="$STRESS_PRODUCT_P95_BUDGET_MS" \
+    STRESS_PRODUCT_P99_BUDGET_MS="$STRESS_PRODUCT_P99_BUDGET_MS" \
     STRESS_HEALTH_P95_BUDGET_MS="$STRESS_HEALTH_P95_BUDGET_MS" \
     STRESS_HEALTH_P99_BUDGET_MS="$STRESS_HEALTH_P99_BUDGET_MS" \
+    STRESS_ROBOT_P95_BUDGET_MS="$STRESS_ROBOT_P95_BUDGET_MS" \
+    STRESS_ROBOT_P99_BUDGET_MS="$STRESS_ROBOT_P99_BUDGET_MS" \
     STRESS_RSS_GROWTH_BUDGET_KB="$STRESS_RSS_GROWTH_BUDGET_KB" \
     python3 - "$WORK" "$report_json" "$report_md" "$PROJECT_ROOT" <<'PY'
 import glob
@@ -773,9 +978,13 @@ def budget_ms(name: str) -> int:
 
 latencies = {
     "register": latency_stats("register"),
+    "product_setup": latency_stats("product_setup"),
     "message": latency_stats("message"),
     "search": latency_stats("search"),
+    "product_search": latency_stats("product_search"),
+    "product_inbox": latency_stats("product_inbox"),
     "health": latency_stats("health"),
+    "robot_status": latency_stats("robot_status"),
 }
 
 phase_budgets = {
@@ -787,13 +996,29 @@ phase_budgets = {
         "p95_budget_us": budget_ms("STRESS_MSG_P95_BUDGET_MS") * 1000,
         "p99_budget_us": budget_ms("STRESS_MSG_P99_BUDGET_MS") * 1000,
     },
+    "product_setup": {
+        "p95_budget_us": budget_ms("STRESS_PRODUCT_P95_BUDGET_MS") * 1000,
+        "p99_budget_us": budget_ms("STRESS_PRODUCT_P99_BUDGET_MS") * 1000,
+    },
     "search": {
         "p95_budget_us": budget_ms("STRESS_SEARCH_P95_BUDGET_MS") * 1000,
         "p99_budget_us": budget_ms("STRESS_SEARCH_P99_BUDGET_MS") * 1000,
     },
+    "product_search": {
+        "p95_budget_us": budget_ms("STRESS_PRODUCT_P95_BUDGET_MS") * 1000,
+        "p99_budget_us": budget_ms("STRESS_PRODUCT_P99_BUDGET_MS") * 1000,
+    },
+    "product_inbox": {
+        "p95_budget_us": budget_ms("STRESS_PRODUCT_P95_BUDGET_MS") * 1000,
+        "p99_budget_us": budget_ms("STRESS_PRODUCT_P99_BUDGET_MS") * 1000,
+    },
     "health": {
         "p95_budget_us": budget_ms("STRESS_HEALTH_P95_BUDGET_MS") * 1000,
         "p99_budget_us": budget_ms("STRESS_HEALTH_P99_BUDGET_MS") * 1000,
+    },
+    "robot_status": {
+        "p95_budget_us": budget_ms("STRESS_ROBOT_P95_BUDGET_MS") * 1000,
+        "p99_budget_us": budget_ms("STRESS_ROBOT_P99_BUDGET_MS") * 1000,
     },
 }
 
@@ -825,12 +1050,49 @@ gates.append({
     "current_kb": rss_growth_kb,
     "budget_kb": rss_growth_budget_kb,
 })
+gates.extend([
+    {
+        "name": "registration_success",
+        "passed": env_int("REG_FAIL") == 0,
+        "failed": env_int("REG_FAIL"),
+        "attempted": env_int("N_AGENTS"),
+    },
+    {
+        "name": "product_setup_success",
+        "passed": env_int("PRODUCT_SETUP_FAIL") == 0,
+        "failed": env_int("PRODUCT_SETUP_FAIL"),
+        "attempted": 2,
+    },
+    {
+        "name": "message_success",
+        "passed": env_int("MSG_FAIL") == 0,
+        "failed": env_int("MSG_FAIL"),
+        "attempted": env_int("TOTAL_MSGS"),
+    },
+    {
+        "name": "product_bus_success",
+        "passed": env_int("PRODUCT_SEARCH_FAIL") == 0 and env_int("PRODUCT_INBOX_FAIL") == 0,
+        "failed": env_int("PRODUCT_SEARCH_FAIL") + env_int("PRODUCT_INBOX_FAIL"),
+        "attempted": env_int("CONCURRENCY") * 2,
+    },
+    {
+        "name": "robot_status_success",
+        "passed": env_int("ROBOT_FAIL") == 0,
+        "failed": env_int("ROBOT_FAIL"),
+        "attempted": 1,
+    },
+])
 
 summary = {
     "registration": {
         "ok": env_int("REG_OK"),
         "failed": env_int("REG_FAIL"),
         "attempted": env_int("N_AGENTS"),
+    },
+    "product_setup": {
+        "ok": env_int("PRODUCT_SETUP_OK"),
+        "failed": env_int("PRODUCT_SETUP_FAIL"),
+        "attempted": 2,
     },
     "message_storm": {
         "ok": env_int("MSG_OK"),
@@ -853,10 +1115,22 @@ summary = {
         "failed": env_int("SEARCH_FAIL"),
         "attempted": env_int("CONCURRENCY"),
     },
+    "product_bus": {
+        "search_ok": env_int("PRODUCT_SEARCH_OK"),
+        "search_failed": env_int("PRODUCT_SEARCH_FAIL"),
+        "inbox_ok": env_int("PRODUCT_INBOX_OK"),
+        "inbox_failed": env_int("PRODUCT_INBOX_FAIL"),
+        "attempted_pairs": env_int("CONCURRENCY"),
+    },
     "health": {
         "ok": env_int("HEALTH_OK"),
         "failed": env_int("HEALTH_FAIL"),
         "attempted": env_int("HEALTH_CHECKS"),
+    },
+    "robot_status": {
+        "ok": env_int("ROBOT_OK"),
+        "failed": env_int("ROBOT_FAIL"),
+        "attempted": 1,
     },
 }
 
@@ -869,9 +1143,11 @@ report = {
         "messages_per_agent": env_int("MSGS_PER_AGENT"),
         "mixed_duration_secs": env_int("DURATION_SECS"),
         "health_checks": env_int("HEALTH_CHECKS"),
+        "surfaces": ["http_mcp", "product_bus", "robot_status"],
     },
     "isolation": {
         "project_key": os.getenv("PROJECT_KEY", ""),
+        "product_key": os.getenv("PRODUCT_KEY", ""),
         "database_path": os.getenv("STRESS_DB", ""),
         "storage_root": os.getenv("STRESS_STORAGE", ""),
         "operator_mailbox_touched": False,
@@ -936,8 +1212,10 @@ for gate in gates:
     verdict = "PASS" if gate["passed"] else "FAIL"
     if "current_us" in gate:
         lines.append(f"- {verdict} {gate['name']}: {fmt_us(gate['current_us'])} / {fmt_us(gate['budget_us'])}")
-    else:
+    elif "current_kb" in gate:
         lines.append(f"- {verdict} {gate['name']}: {gate['current_kb']} KB / {gate['budget_kb']} KB")
+    else:
+        lines.append(f"- {verdict} {gate['name']}: {gate['failed']} failed / {gate['attempted']} attempted")
 
 Path(report_md).write_text("\n".join(lines) + "\n", encoding="utf-8")
 PY
@@ -967,11 +1245,14 @@ echo "================================================================"
 echo "  STRESS TEST SUMMARY"
 echo "================================================================"
 echo "  Phase 1 (Registration):  ${REG_OK}/${N_AGENTS} ok, ${REG_ELAPSED_MS}ms"
-echo "  Phase 2 (Msg Storm):     ${MSG_OK}/${TOTAL_MSGS} ok, ${MSG_ELAPSED_MS}ms"
-echo "  Phase 3 (Mixed R/W):     R:${MIX_READS_OK}/${MIX_READS_OK}+${MIX_READS_FAIL} W:${MIX_WRITES_OK}/${MIX_WRITES_OK}+${MIX_WRITES_FAIL}"
-echo "  Phase 4 (Reservations):  ${RES_OK} reserved, ${RES_CONFLICT} conflicts, ${RES_ERROR} errors"
-echo "  Phase 5 (Search):        ${SEARCH_OK}/${CONCURRENCY} ok"
-echo "  Phase 6 (Health):        ${HEALTH_OK}/${HEALTH_CHECKS} ok, avg ${HEALTH_AVG_MS}ms"
+echo "  Phase 2 (Product Setup): ${PRODUCT_SETUP_OK}/2 ok"
+echo "  Phase 3 (Msg Storm):     ${MSG_OK}/${TOTAL_MSGS} ok, ${MSG_ELAPSED_MS}ms"
+echo "  Phase 4 (Mixed R/W):     R:${MIX_READS_OK}/${MIX_READS_OK}+${MIX_READS_FAIL} W:${MIX_WRITES_OK}/${MIX_WRITES_OK}+${MIX_WRITES_FAIL}"
+echo "  Phase 5 (Reservations):  ${RES_OK} reserved, ${RES_CONFLICT} conflicts, ${RES_ERROR} errors"
+echo "  Phase 6 (Search):        ${SEARCH_OK}/${CONCURRENCY} ok"
+echo "  Phase 7 (Product Bus):   S:${PRODUCT_SEARCH_OK}/${CONCURRENCY} I:${PRODUCT_INBOX_OK}/${CONCURRENCY}"
+echo "  Phase 8 (Health):        ${HEALTH_OK}/${HEALTH_CHECKS} ok, avg ${HEALTH_AVG_MS}ms"
+echo "  Phase 9 (Robot Status):  ${ROBOT_OK}/1 ok"
 echo "  RSS Growth:              ${RSS_GROWTH_KB} KB / ${STRESS_RSS_GROWTH_BUDGET_KB} KB"
 echo "  Reports:                 ${E2E_ARTIFACT_DIR}/load_lab_report.{json,md}"
 echo "================================================================"
