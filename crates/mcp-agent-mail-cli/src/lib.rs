@@ -31430,6 +31430,89 @@ http_headers = { Authorization = "Bearer secret" }
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn archive_restore_state_backs_up_broken_sqlite_sidecar_symlink() {
+        let _lock = ARCHIVE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        let _cwd = CwdGuard::chdir(root.path());
+
+        let storage_root = root.path().join("storage_repo");
+        seed_storage_root(&storage_root);
+        let source_db = root.path().join("mailbox.sqlite3");
+        seed_mailbox_db(&source_db);
+        let archive_path = archive_save_state(
+            &source_db,
+            &storage_root,
+            vec!["proj-alpha".to_string()],
+            "archive".to_string(),
+            Some("broken-sidecar-restore".to_string()),
+        )
+        .expect("archive save");
+
+        let restore_dir = root.path().join("restore");
+        let restore_db = restore_dir.join("mailbox.sqlite3");
+        let restore_storage = restore_dir.join("storage_repo");
+        std::fs::create_dir_all(&restore_dir).unwrap();
+        std::fs::write(&restore_db, b"old-db").unwrap();
+        std::fs::create_dir_all(&restore_storage).unwrap();
+        std::fs::write(restore_storage.join("old.txt"), b"old-storage").unwrap();
+
+        let restore_wal = sqlite_sidecar_path(&restore_db, "-wal");
+        let missing_target = restore_dir.join("missing-wal-target");
+        symlink(&missing_target, &restore_wal).unwrap();
+
+        archive_restore_state(
+            PathBuf::from(archive_path.file_name().unwrap()),
+            &restore_db,
+            &restore_storage,
+            true,
+            false,
+        )
+        .expect("archive restore should back up broken sidecar symlink");
+
+        assert!(
+            std::fs::symlink_metadata(&restore_wal)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+            "live broken WAL symlink should not remain after archive restore"
+        );
+        let wal_backup = find_backup_entry(&restore_dir, "mailbox.sqlite3-wal.backup-")
+            .expect("broken WAL symlink should be backed up");
+        assert!(
+            std::fs::symlink_metadata(&wal_backup)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink()),
+            "backup should preserve the original sidecar symlink artifact"
+        );
+        assert_eq!(std::fs::read_link(&wal_backup).unwrap(), missing_target);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn next_backup_path_skips_broken_symlink_collision() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("mailbox.sqlite3-wal");
+        let timestamp = "20260102-120000";
+        let first_backup = root
+            .path()
+            .join("mailbox.sqlite3-wal.backup-20260102-120000");
+        symlink(root.path().join("missing-backup-target"), &first_backup).unwrap();
+
+        let backup = next_backup_path(&target, timestamp);
+
+        assert_eq!(
+            backup.file_name().and_then(|name| name.to_str()),
+            Some("mailbox.sqlite3-wal.backup-20260102-120000-01"),
+            "backup path allocation must not overwrite broken symlink artifacts"
+        );
+    }
+
     #[test]
     fn archive_restore_state_keeps_live_state_when_archive_snapshot_is_invalid() {
         let _lock = ARCHIVE_TEST_LOCK
@@ -49665,7 +49748,7 @@ fn next_backup_path(path: &Path, timestamp: &str) -> PathBuf {
         &format!("backup.backup-{timestamp}"),
     );
     let mut counter = 1;
-    while candidate.exists() {
+    while path_is_occupied(&candidate) {
         candidate = path_with_file_name_suffix(
             path,
             &format!(".backup-{timestamp}-{counter:02}"),
@@ -49766,7 +49849,7 @@ fn archive_restore_target_parent(path: &Path) -> &Path {
 fn validate_archive_restore_targets(database_path: &Path, storage_root: &Path) -> CliResult<()> {
     let database_parent = archive_restore_snapshot_staging_parent(database_path, storage_root);
     ensure_real_directory_tree(database_parent, "archive restore database parent")?;
-    if database_path.exists() && !path_is_real_file(database_path) {
+    if path_is_occupied(database_path) && !path_is_real_file(database_path) {
         return Err(CliError::Other(format!(
             "archive restore database target {} must be a real file",
             database_path.display()
@@ -49775,7 +49858,7 @@ fn validate_archive_restore_targets(database_path: &Path, storage_root: &Path) -
 
     let storage_parent = archive_restore_target_parent(storage_root);
     ensure_real_directory_tree(storage_parent, "archive restore storage root parent")?;
-    if storage_root.exists() {
+    if path_is_occupied(storage_root) {
         share_update_require_real_directory(storage_root, "archive restore storage root")?;
     }
 
@@ -50558,7 +50641,7 @@ fn archive_restore_state(
     let mut planned_ops: Vec<String> = Vec::new();
     let db_embedded_in_storage_root =
         archive_restore_db_embedded_in_storage_root(&database_path, &storage_root);
-    if database_path.exists() && !db_embedded_in_storage_root {
+    if path_is_occupied(&database_path) && !db_embedded_in_storage_root {
         planned_ops.push(format!(
             "backup {} -> {}",
             database_path.display(),
@@ -50569,7 +50652,7 @@ fn archive_restore_state(
         for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
             let sidecar_path =
                 mcp_agent_mail_core::disk::sqlite_sidecar_path(&database_path, suffix);
-            if sidecar_path.exists() {
+            if path_is_occupied(&sidecar_path) {
                 planned_ops.push(format!(
                     "backup {} -> {}",
                     sidecar_path.display(),
@@ -50578,7 +50661,7 @@ fn archive_restore_state(
             }
         }
     }
-    if storage_root.exists() {
+    if path_is_occupied(&storage_root) {
         planned_ops.push(format!(
             "backup {} -> {}",
             storage_root.display(),
@@ -50643,8 +50726,8 @@ fn archive_restore_state(
         )));
     }
 
-    let database_existed = database_path.exists();
-    let storage_root_existed = storage_root.exists();
+    let database_existed = path_is_occupied(&database_path);
+    let storage_root_existed = path_is_occupied(&storage_root);
     validate_archive_restore_targets(&database_path, &storage_root)?;
     let (_staged_db_dir, staged_db_path) = stage_archive_restore_snapshot(
         &mut archive,
@@ -50691,7 +50774,7 @@ fn archive_restore_state(
             for suffix in SQLITE_RECOVERY_SIDECAR_SUFFIXES {
                 let sidecar_path =
                     mcp_agent_mail_core::disk::sqlite_sidecar_path(&database_path, suffix);
-                if sidecar_path.exists() {
+                if path_is_occupied(&sidecar_path) {
                     let backup = next_backup_path(&sidecar_path, &timestamp);
                     std::fs::rename(&sidecar_path, &backup)?;
                     backup_entries.push(ArchiveRestoreBackupEntry {
