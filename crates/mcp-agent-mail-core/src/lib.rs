@@ -107,8 +107,11 @@ pub use diagnostics::{
     ArchiveScanDedupeRule, ArchiveScanDiagnostic, ArchiveScanScope, ArchiveScanSeverityBucket,
     ArchiveScanSummary, ArchiveScanSummaryBucket, ArchiveScanSummaryFinding, ArtifactPointer,
     ArtifactStatus, CappedWarning, DEFAULT_WARNING_CAP_PER_CATEGORY, DiagnosticFindingCounts,
-    DiagnosticPayload, DiagnosticPayloadSchema, DiagnosticReport, HealthInfo, Recommendation,
-    SystemInfo, WarningCategoryOverflow, WarningFloodGate, WarningFloodSummary, init_process_start,
+    DiagnosticPayload, DiagnosticPayloadSchema, DiagnosticReport, HealthInfo,
+    MAX_TAIL_LATENCY_PHASES, Recommendation, SystemInfo, TAIL_LATENCY_PHASE_LEDGER_SCHEMA,
+    TailLatencyPhase, TailLatencyPhaseLedger, TailLatencyPhaseRecorder, WarningCategoryOverflow,
+    WarningFloodGate, WarningFloodSummary, append_tail_latency_evidence_if_configured,
+    duration_to_micros, init_process_start,
 };
 pub use ephemeral::{
     EphemeralClass, EphemeralMode, EphemeralSignals, EphemeralTier, classify_ephemeral,

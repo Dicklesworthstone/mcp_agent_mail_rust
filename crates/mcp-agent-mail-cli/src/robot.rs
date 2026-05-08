@@ -12,6 +12,7 @@ use fastmcp::McpErrorCode;
 use fastmcp::prelude::{McpContext, McpError, McpResult};
 use mcp_agent_mail_core::{
     AgentHealthGrade, AgentHealthInputs, AgentHealthMetric, AgentHealthScorecard,
+    TailLatencyPhaseLedger, TailLatencyPhaseRecorder, append_tail_latency_evidence_if_configured,
     compute_agent_health,
 };
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,22 @@ use crate::CliError;
 
 const UNKNOWN_SENDER_DISPLAY: &str = "[unknown sender]";
 const UNKNOWN_RECIPIENT_DISPLAY: &str = "[unknown recipient]";
+
+fn mark_tail_latency_phase(phase: &mut Option<&mut TailLatencyPhaseRecorder>, name: &'static str) {
+    if let Some(recorder) = phase.as_deref_mut() {
+        recorder.mark(name);
+    }
+}
+
+fn emit_tail_latency_evidence(ledger: &TailLatencyPhaseLedger) {
+    if let Err(error) = append_tail_latency_evidence_if_configured(ledger) {
+        tracing::debug!(
+            operation = %ledger.operation,
+            error = %error,
+            "failed to append tail-latency phase ledger evidence"
+        );
+    }
+}
 
 fn has_file_reservations_released_ts_column(conn: &DbConn) -> bool {
     conn.query_sync("PRAGMA table_info(file_reservations)", &[])
@@ -540,6 +557,8 @@ pub struct RobotEnvelope<T: Serialize> {
     pub _alerts: Vec<RobotAlert>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub _actions: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub _diagnostics: Option<TailLatencyPhaseLedger>,
     #[serde(flatten)]
     pub data: T,
 }
@@ -582,6 +601,7 @@ impl<T: Serialize> RobotEnvelope<T> {
             },
             _alerts: Vec::new(),
             _actions: Vec::new(),
+            _diagnostics: None,
             data,
         }
     }
@@ -604,6 +624,13 @@ impl<T: Serialize> RobotEnvelope<T> {
     /// Add a suggested action command.
     pub fn with_action(mut self, action: impl Into<String>) -> Self {
         self._actions.push(action.into());
+        self
+    }
+
+    /// Attach compact operator diagnostics to the envelope.
+    #[must_use]
+    pub fn with_diagnostics(mut self, diagnostics: TailLatencyPhaseLedger) -> Self {
+        self._diagnostics = Some(diagnostics);
         self
     }
 }
@@ -648,6 +675,8 @@ struct RobotEnvelopeView<'a, T: Serialize> {
     _alerts: &'a [RobotAlert],
     #[serde(skip_serializing_if = "string_refs_empty")]
     _actions: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    _diagnostics: Option<&'a TailLatencyPhaseLedger>,
     #[serde(flatten)]
     data: &'a T,
 }
@@ -669,6 +698,7 @@ fn serialize_envelope_with_format<T: Serialize>(
         },
         _alerts: &envelope._alerts,
         _actions: &envelope._actions,
+        _diagnostics: envelope._diagnostics.as_ref(),
         data: &envelope.data,
     };
     if pretty {
@@ -2859,11 +2889,23 @@ fn find_latest_forensic_bundle_for_robot(
     latest.map(|(_, path)| path.display().to_string())
 }
 
+#[cfg(test)]
 fn build_status(
     conn: &DbConn,
     project_id: i64,
     project_slug: &str,
     agent: Option<(i64, String)>,
+) -> Result<(StatusData, Vec<String>), CliError> {
+    let mut phase = TailLatencyPhaseRecorder::new("robot_status");
+    build_status_with_phase(conn, project_id, project_slug, agent, Some(&mut phase))
+}
+
+fn build_status_with_phase(
+    conn: &DbConn,
+    project_id: i64,
+    project_slug: &str,
+    agent: Option<(i64, String)>,
+    mut phase: Option<&mut TailLatencyPhaseRecorder>,
 ) -> Result<(StatusData, Vec<String>), CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
     let _now_s = now_us / 1_000_000;
@@ -2915,6 +2957,7 @@ fn build_status(
     } else {
         (0, 0, 0, 0)
     };
+    mark_tail_latency_phase(&mut phase, "sqlite_inbox_counts");
 
     // 2. Active agents (active in last 15 minutes)
     let active_threshold = micros_ago(now_us, 15 * MICROS_PER_MINUTE);
@@ -2927,6 +2970,7 @@ fn build_status(
         .first()
         .and_then(|r| r.get_named::<i64>("cnt").ok())
         .unwrap_or(0) as usize;
+    mark_tail_latency_phase(&mut phase, "sqlite_active_agents");
 
     // 3. Recent messages (last hour)
     let hour_ago = micros_ago(now_us, MICROS_PER_HOUR);
@@ -2939,6 +2983,7 @@ fn build_status(
         .first()
         .and_then(|r| r.get_named::<i64>("cnt").ok())
         .unwrap_or(0) as usize;
+    mark_tail_latency_phase(&mut phase, "sqlite_recent_messages");
 
     // 4. File reservations (active = not released and not expired)
     let active_reservations = conn
@@ -2954,6 +2999,7 @@ fn build_status(
         .first()
         .and_then(|r| r.get_named::<i64>("cnt").ok())
         .unwrap_or(0) as usize;
+    mark_tail_latency_phase(&mut phase, "sqlite_active_reservations");
 
     // Reservations expiring soon (within 5 minutes)
     let expiring_threshold = micros_from_now(now_us, 5 * MICROS_PER_MINUTE);
@@ -2975,6 +3021,7 @@ fn build_status(
         .first()
         .and_then(|r| r.get_named::<i64>("cnt").ok())
         .unwrap_or(0) as usize;
+    mark_tail_latency_phase(&mut phase, "sqlite_expiring_reservations");
 
     // 5. My reservations (agent-specific)
     let my_reservations = if let Some((agent_id, _)) = &agent {
@@ -3009,6 +3056,7 @@ fn build_status(
     } else {
         vec![]
     };
+    mark_tail_latency_phase(&mut phase, "sqlite_my_reservations");
 
     // 6. Top threads (3 most recently active)
     let top_threads_rows = conn
@@ -3050,6 +3098,7 @@ fn build_status(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    mark_tail_latency_phase(&mut phase, "sqlite_top_threads_materialization");
 
     // 7. Build anomalies
     let mut anomalies = Vec::new();
@@ -3095,6 +3144,7 @@ fn build_status(
             top.id
         ));
     }
+    mark_tail_latency_phase(&mut phase, "downstream_actions");
 
     let recovery = build_recovery_status_for_robot();
 
@@ -3167,6 +3217,38 @@ fn build_inbox(
     limit: usize,
     include_bodies: bool,
 ) -> Result<InboxResult, CliError> {
+    let mut phase = TailLatencyPhaseRecorder::new("robot_inbox");
+    build_inbox_with_phase(
+        conn,
+        project_id,
+        project_slug,
+        agent_id,
+        agent_name,
+        urgent_only,
+        ack_overdue_only,
+        unread_only,
+        show_all,
+        limit,
+        include_bodies,
+        Some(&mut phase),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_inbox_with_phase(
+    conn: &DbConn,
+    project_id: i64,
+    project_slug: &str,
+    agent_id: i64,
+    agent_name: &str,
+    urgent_only: bool,
+    ack_overdue_only: bool,
+    unread_only: bool,
+    show_all: bool,
+    limit: usize,
+    include_bodies: bool,
+    mut phase: Option<&mut TailLatencyPhaseRecorder>,
+) -> Result<InboxResult, CliError> {
     let now_us = mcp_agent_mail_db::now_micros();
     // ack_overdue threshold: 30 minutes
     let ack_threshold = micros_ago(now_us, ACK_OVERDUE_THRESHOLD_US);
@@ -3226,6 +3308,7 @@ fn build_inbox(
             ],
         )
         .map_err(|e| CliError::Other(format!("inbox query failed: {e}")))?;
+    mark_tail_latency_phase(&mut phase, "sqlite_query");
 
     let mut entries = Vec::new();
     let mut overdue_ids = Vec::new();
@@ -3288,6 +3371,14 @@ fn build_inbox(
             body_md,
         });
     }
+    mark_tail_latency_phase(
+        &mut phase,
+        if include_bodies {
+            "body_hydration_and_row_materialization"
+        } else {
+            "row_materialization"
+        },
+    );
 
     // Build alerts
     let mut alerts = Vec::new();
@@ -3322,6 +3413,7 @@ fn build_inbox(
             entry.thread
         ));
     }
+    mark_tail_latency_phase(&mut phase, "downstream_actions");
 
     Ok(InboxResult {
         entries,
@@ -8141,12 +8233,20 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
 
     let out = match args.command {
         RobotSubcommand::Status => {
+            let mut phase = TailLatencyPhaseRecorder::new("robot_status");
+            phase.mark("queue_wait");
             let scope = resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
+            phase.mark("scope_resolution");
 
             let agent_name = scope.agent.as_ref().map(|(_, n)| n.clone());
             let agent = scope.agent.clone();
-            let (data, actions) =
-                build_status(scope.conn(), scope.project_id, &scope.project_slug, agent)?;
+            let (data, actions) = build_status_with_phase(
+                scope.conn(),
+                scope.project_id,
+                &scope.project_slug,
+                agent,
+                Some(&mut phase),
+            )?;
             let mut env = RobotEnvelope::new(cmd_name, format, data);
             env._meta.project = Some(scope.project_slug);
             env._meta.agent = agent_name.clone();
@@ -8162,7 +8262,11 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             }
             let anomalies = env.data.anomalies.clone();
             env = append_status_anomaly_alerts(env, &anomalies);
-            format_output(&env, format)?
+            env = env.with_diagnostics(phase.snapshot("pre_render"));
+            let output = format_output(&env, format)?;
+            phase.mark("render_serialization");
+            emit_tail_latency_evidence(&phase.finish("ok"));
+            output
         }
         RobotSubcommand::Inbox {
             urgent,
@@ -8172,7 +8276,11 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             limit,
             include_bodies,
         } => {
+            let mut phase = TailLatencyPhaseRecorder::new("robot_inbox");
+            phase.set_include_bodies(include_bodies);
+            phase.mark("queue_wait");
             let scope = resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
+            phase.mark("scope_resolution");
             let (agent_id, agent_name_str) = scope.agent.clone().ok_or_else(|| {
                 CliError::InvalidArgument(
                     "agent required for inbox — use --agent or set AGENT_MAIL_AGENT/AGENT_NAME"
@@ -8180,7 +8288,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 )
             })?;
 
-            let result = build_inbox(
+            let result = build_inbox_with_phase(
                 scope.conn(),
                 scope.project_id,
                 &scope.project_slug,
@@ -8192,6 +8300,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 all,
                 limit.unwrap_or(20),
                 include_bodies,
+                Some(&mut phase),
             )?;
 
             #[derive(Serialize)]
@@ -8201,6 +8310,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             }
 
             let count = result.entries.len();
+            phase.set_rows_returned(count);
             let mut env = RobotEnvelope::new(
                 cmd_name,
                 format,
@@ -8217,7 +8327,11 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             for a in result.actions {
                 env = env.with_action(&a);
             }
-            format_output(&env, format)?
+            env = env.with_diagnostics(phase.snapshot("pre_render"));
+            let output = format_output(&env, format)?;
+            phase.mark("render_serialization");
+            emit_tail_latency_evidence(&phase.finish("ok"));
+            output
         }
         RobotSubcommand::Thread { id, limit, since } => {
             let scope = resolve_robot_project_scope(args.project.as_deref())?;
@@ -15867,6 +15981,30 @@ mod tests {
         let parsed: Value = serde_json::from_str(&json).unwrap();
 
         assert_eq!(parsed["_meta"]["format"], "toon");
+    }
+
+    #[test]
+    fn robot_envelope_diagnostics_omit_payload_strings() {
+        let mut ledger = TailLatencyPhaseLedger::new("robot_inbox", 100, "pre_render");
+        ledger.rows_returned = Some(1);
+        ledger.include_bodies = Some(true);
+        ledger.push_phase("sqlite_query", 12);
+        let data = TestData {
+            items: vec!["secret message body".into()],
+            count: 1,
+        };
+        let envelope =
+            RobotEnvelope::new("robot inbox", OutputFormat::Json, data).with_diagnostics(ledger);
+
+        let result = format_output(&envelope, OutputFormat::Json).unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["_diagnostics"]["operation"], "robot_inbox");
+        assert_eq!(parsed["_diagnostics"]["include_bodies"], true);
+        assert!(
+            !parsed["_diagnostics"]
+                .to_string()
+                .contains("secret message body")
+        );
     }
 
     #[test]

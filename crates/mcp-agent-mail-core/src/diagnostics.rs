@@ -13,7 +13,9 @@
 
 #![forbid(unsafe_code)]
 
-use serde::Serialize;
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use crate::backpressure::{self, HealthLevel, HealthSignals};
 use crate::lock_order::{LockContentionEntry, lock_contention_snapshot};
@@ -24,10 +26,172 @@ use crate::metrics::{
 
 /// Maximum serialized report size in bytes (100KB).
 const MAX_REPORT_BYTES: usize = 100 * 1024;
+/// Schema label for compact hot-path phase timing diagnostics.
+pub const TAIL_LATENCY_PHASE_LEDGER_SCHEMA: &str = "tail_latency_phase_ledger.v1";
+/// Hard cap on phase entries so diagnostic payload size is predictable.
+pub const MAX_TAIL_LATENCY_PHASES: usize = 12;
 
 // ---------------------------------------------------------------------------
 // Report types
 // ---------------------------------------------------------------------------
+
+/// One bounded hot-path timing phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TailLatencyPhase {
+    /// Stable `snake_case` phase name.
+    pub name: String,
+    /// Elapsed time spent in this phase.
+    pub elapsed_us: u64,
+}
+
+/// Compact timing ledger for latency-sensitive operator read paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TailLatencyPhaseLedger {
+    /// Stable schema label for downstream parsers.
+    pub schema: String,
+    /// Stable operation name, for example `robot_inbox` or `fetch_inbox`.
+    pub operation: String,
+    /// End-to-end elapsed time covered by this ledger.
+    pub total_us: u64,
+    /// Individual bounded phase timings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phases: Vec<TailLatencyPhase>,
+    /// Number of rows/messages returned, when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows_returned: Option<usize>,
+    /// Whether the caller explicitly requested message bodies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_bodies: Option<bool>,
+    /// `ok`, `error`, or a narrower stable outcome label.
+    pub outcome: String,
+}
+
+impl TailLatencyPhaseLedger {
+    #[must_use]
+    pub fn new(operation: impl Into<String>, total_us: u64, outcome: impl Into<String>) -> Self {
+        Self {
+            schema: TAIL_LATENCY_PHASE_LEDGER_SCHEMA.to_string(),
+            operation: operation.into(),
+            total_us,
+            phases: Vec::new(),
+            rows_returned: None,
+            include_bodies: None,
+            outcome: outcome.into(),
+        }
+    }
+
+    /// Add one phase if the bounded phase budget has not been exhausted.
+    pub fn push_phase(&mut self, name: impl Into<String>, elapsed_us: u64) {
+        if self.phases.len() < MAX_TAIL_LATENCY_PHASES {
+            self.phases.push(TailLatencyPhase {
+                name: name.into(),
+                elapsed_us,
+            });
+        }
+    }
+}
+
+/// In-process helper for collecting compact phase timing diagnostics.
+#[derive(Debug, Clone)]
+pub struct TailLatencyPhaseRecorder {
+    operation: String,
+    started: Instant,
+    current_phase_started: Instant,
+    phases: Vec<TailLatencyPhase>,
+    rows_returned: Option<usize>,
+    include_bodies: Option<bool>,
+}
+
+impl TailLatencyPhaseRecorder {
+    #[must_use]
+    pub fn new(operation: impl Into<String>) -> Self {
+        let now = Instant::now();
+        Self {
+            operation: operation.into(),
+            started: now,
+            current_phase_started: now,
+            phases: Vec::new(),
+            rows_returned: None,
+            include_bodies: None,
+        }
+    }
+
+    pub fn mark(&mut self, name: impl Into<String>) {
+        let now = Instant::now();
+        let elapsed_us = duration_to_micros(now.duration_since(self.current_phase_started));
+        self.current_phase_started = now;
+        if self.phases.len() < MAX_TAIL_LATENCY_PHASES {
+            self.phases.push(TailLatencyPhase {
+                name: name.into(),
+                elapsed_us,
+            });
+        }
+    }
+
+    pub const fn set_rows_returned(&mut self, rows_returned: usize) {
+        self.rows_returned = Some(rows_returned);
+    }
+
+    pub const fn set_include_bodies(&mut self, include_bodies: bool) {
+        self.include_bodies = Some(include_bodies);
+    }
+
+    #[must_use]
+    pub fn snapshot(&self, outcome: impl Into<String>) -> TailLatencyPhaseLedger {
+        self.build_ledger(outcome, Instant::now())
+    }
+
+    #[must_use]
+    pub fn finish(self, outcome: impl Into<String>) -> TailLatencyPhaseLedger {
+        self.build_ledger(outcome, Instant::now())
+    }
+
+    fn build_ledger(
+        &self,
+        outcome: impl Into<String>,
+        finished_at: Instant,
+    ) -> TailLatencyPhaseLedger {
+        let mut ledger = TailLatencyPhaseLedger::new(
+            self.operation.clone(),
+            duration_to_micros(finished_at.duration_since(self.started)),
+            outcome,
+        );
+        ledger.phases.clone_from(&self.phases);
+        ledger.rows_returned = self.rows_returned;
+        ledger.include_bodies = self.include_bodies;
+        ledger
+    }
+}
+
+#[must_use]
+pub fn duration_to_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Append a phase ledger to the configured evidence JSONL, if enabled.
+///
+/// The emitted evidence intentionally contains only timings and safe counters:
+/// no query strings, subjects, message bodies, agent messages, or result payloads.
+pub fn append_tail_latency_evidence_if_configured(
+    ledger: &TailLatencyPhaseLedger,
+) -> std::io::Result<bool> {
+    let evidence = serde_json::to_value(ledger).map_err(std::io::Error::other)?;
+    let mut entry = crate::evidence_ledger::EvidenceLedgerEntry::new(
+        format!(
+            "tail-latency:{}:{}",
+            ledger.operation,
+            crate::timestamps::now_micros()
+        ),
+        "operator.tail_latency",
+        ledger.operation.clone(),
+        1.0,
+        evidence,
+    );
+    entry.expected = Some("bounded phase timings for operator read path".to_string());
+    entry.actual = Some(ledger.outcome.clone());
+    entry.model = TAIL_LATENCY_PHASE_LEDGER_SCHEMA.to_string();
+    crate::evidence_ledger::append_evidence_entry_if_configured(&entry)
+}
 
 /// Top-level diagnostic report.
 #[derive(Debug, Clone, Serialize)]
@@ -2216,5 +2380,52 @@ mod tests {
     fn flood_gate_cap_at_least_one() {
         let gate = WarningFloodGate::new(0); // should be clamped to 1
         assert_eq!(gate.cap_per_category, 1);
+    }
+
+    #[test]
+    fn tail_latency_phase_recorder_caps_phase_count() {
+        let mut recorder = TailLatencyPhaseRecorder::new("robot_inbox");
+        for i in 0..(MAX_TAIL_LATENCY_PHASES + 3) {
+            recorder.mark(format!("phase_{i}"));
+        }
+        recorder.set_rows_returned(2);
+        recorder.set_include_bodies(false);
+
+        let ledger = recorder.finish("ok");
+        assert_eq!(ledger.schema, TAIL_LATENCY_PHASE_LEDGER_SCHEMA);
+        assert_eq!(ledger.operation, "robot_inbox");
+        assert_eq!(ledger.rows_returned, Some(2));
+        assert_eq!(ledger.include_bodies, Some(false));
+        assert_eq!(ledger.phases.len(), MAX_TAIL_LATENCY_PHASES);
+    }
+
+    #[test]
+    fn tail_latency_phase_ledger_serializes_without_message_payloads() {
+        let mut ledger = TailLatencyPhaseLedger::new("fetch_inbox", 42, "ok");
+        ledger.rows_returned = Some(1);
+        ledger.include_bodies = Some(true);
+        ledger.push_phase("sqlite_query", 7);
+        ledger.push_phase("body_hydration", 3);
+
+        let json = serde_json::to_value(&ledger).expect("serialize phase ledger");
+        assert_eq!(json["operation"], "fetch_inbox");
+        assert_eq!(json["include_bodies"], true);
+        assert!(json.get("body_md").is_none());
+        assert!(json.get("subject").is_none());
+        assert!(json.get("messages").is_none());
+        assert!(!json.to_string().contains("secret message body"));
+    }
+
+    #[test]
+    fn tail_latency_phase_recorder_handles_empty_and_error_outcomes() {
+        let empty = TailLatencyPhaseRecorder::new("search_messages").finish("empty");
+        assert_eq!(empty.outcome, "empty");
+        assert!(empty.phases.is_empty());
+
+        let mut failing = TailLatencyPhaseRecorder::new("fetch_inbox");
+        failing.mark("argument_validation");
+        let error = failing.finish("error");
+        assert_eq!(error.outcome, "error");
+        assert_eq!(error.phases.len(), 1);
     }
 }

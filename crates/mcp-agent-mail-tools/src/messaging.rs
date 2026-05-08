@@ -10,7 +10,10 @@
 use asupersync::Outcome;
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
-use mcp_agent_mail_core::Config;
+use mcp_agent_mail_core::{
+    Config, TailLatencyPhaseLedger, TailLatencyPhaseRecorder,
+    append_tail_latency_evidence_if_configured,
+};
 use mcp_agent_mail_db::{DbError, micros_to_iso};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -25,6 +28,16 @@ use crate::tool_util::{
     resolve_project,
 };
 use mcp_agent_mail_core::pattern_overlap::CompiledPattern;
+
+fn emit_tail_latency_evidence(ledger: &TailLatencyPhaseLedger) {
+    if let Err(error) = append_tail_latency_evidence_if_configured(ledger) {
+        tracing::debug!(
+            operation = %ledger.operation,
+            error = %error,
+            "failed to append tail-latency phase ledger evidence"
+        );
+    }
+}
 
 pub(crate) fn try_dispatch_archive_write(op: mcp_agent_mail_storage::WriteOp, context: &str) {
     match mcp_agent_mail_storage::wbq_enqueue(op.clone()) {
@@ -3027,6 +3040,8 @@ pub async fn fetch_inbox(
     include_bodies: Option<bool>,
     topic: Option<String>,
 ) -> McpResult<String> {
+    let mut phase = TailLatencyPhaseRecorder::new("fetch_inbox");
+    phase.mark("queue_wait");
     let agent_name = normalize_agent_name_or_original(agent_name);
     let mut msg_limit = limit.unwrap_or(20);
     if msg_limit < 1 {
@@ -3055,6 +3070,8 @@ pub async fn fetch_inbox(
     let include_body = include_bodies.unwrap_or(false);
     let urgent = urgent_only.unwrap_or(false);
     reject_unsupported_topic_argument(topic.as_deref(), "fetch_inbox")?;
+    phase.set_include_bodies(include_body);
+    phase.mark("argument_validation");
 
     // Use archive-aware read pool so that inbox reads fall back to archive
     // snapshots when the live SQLite is suspect (DegradedReadOnly).
@@ -3072,6 +3089,7 @@ pub async fn fetch_inbox(
     )
     .await?;
     let agent_id = agent.id.unwrap_or(0);
+    phase.mark("scope_resolution");
 
     // Parse since_ts if provided (ISO-8601 to micros)
     let since_micros: Option<i64> = if let Some(ts) = &since_ts {
@@ -3118,6 +3136,7 @@ pub async fn fetch_inbox(
         )
         .await
     })?;
+    phase.mark("sqlite_query");
 
     let messages: Vec<InboxMessage> = inbox_rows
         .into_iter()
@@ -3156,6 +3175,12 @@ pub async fn fetch_inbox(
             }
         })
         .collect();
+    phase.set_rows_returned(messages.len());
+    phase.mark(if include_body {
+        "body_hydration_and_row_materialization"
+    } else {
+        "row_materialization"
+    });
 
     tracing::debug!(
         "Fetched {} messages for {} in project {} (limit: {}, urgent: {}, since: {:?})",
@@ -3208,6 +3233,7 @@ pub async fn fetch_inbox(
             );
         }
     }
+    phase.mark("downstream_cache_update");
 
     // Clear notification signal (best-effort).
     let config = &Config::get();
@@ -3224,9 +3250,13 @@ pub async fn fetch_inbox(
         ),
         _ => {}
     }
+    phase.mark("notification_signal_clear");
 
-    serde_json::to_string(&messages)
-        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+    let response = serde_json::to_string(&messages)
+        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))?;
+    phase.mark("json_serialization");
+    emit_tail_latency_evidence(&phase.finish("ok"));
+    Ok(response)
 }
 
 /// Mark a message as read for the given agent.

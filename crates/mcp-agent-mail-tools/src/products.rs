@@ -8,7 +8,10 @@
 
 use asupersync::Cx;
 use fastmcp::prelude::*;
-use mcp_agent_mail_core::Config;
+use mcp_agent_mail_core::{
+    Config, TailLatencyPhaseLedger, TailLatencyPhaseRecorder,
+    append_tail_latency_evidence_if_configured,
+};
 use mcp_agent_mail_db::queries::ThreadMessageRow;
 use mcp_agent_mail_db::{DbError, DbPool, ProductRow, micros_to_iso};
 use serde::{Deserialize, Serialize};
@@ -25,6 +28,16 @@ use crate::tool_util::{
 static PRODUCT_UID_COUNTER: AtomicU64 = AtomicU64::new(0);
 const PRODUCT_TOOL_LIMIT_MAX_I32: i32 = 1000;
 const PRODUCT_TOOL_LIMIT_MAX: usize = 1000;
+
+fn emit_tail_latency_evidence(ledger: &TailLatencyPhaseLedger) {
+    if let Err(error) = append_tail_latency_evidence_if_configured(ledger) {
+        tracing::debug!(
+            operation = %ledger.operation,
+            error = %error,
+            "failed to append tail-latency phase ledger evidence"
+        );
+    }
+}
 
 fn worktrees_required() -> McpError {
     legacy_tool_error(
@@ -437,7 +450,10 @@ pub async fn search_messages_product(
     until: Option<String>,
     include_body_md: Option<bool>,
 ) -> McpResult<String> {
+    let mut phase = TailLatencyPhaseRecorder::new("search_messages_product");
+    phase.mark("queue_wait");
     let include_body_md = include_body_md.unwrap_or(false);
+    phase.set_include_bodies(include_body_md);
     let config = &Config::get();
     if !config.worktrees_enabled {
         return Err(worktrees_required());
@@ -455,17 +471,23 @@ pub async fn search_messages_product(
             )
         })?;
     let product_id = product.id.unwrap_or(0);
+    phase.mark("product_scope_resolution");
 
     let trimmed = query.trim();
     if trimmed.is_empty() {
+        phase.set_rows_returned(0);
+        phase.mark("empty_query_short_circuit");
         let response = ProductSearchResponse {
             result: Vec::new(),
             assistance: None,
             next_cursor: None,
             diagnostics: None,
         };
-        return serde_json::to_string(&response)
-            .map_err(|e| McpError::internal_error(format!("JSON error: {e}")));
+        let response = serde_json::to_string(&response)
+            .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))?;
+        phase.mark("json_serialization");
+        emit_tail_latency_evidence(&phase.finish("ok"));
+        return Ok(response);
     }
 
     let max_results = parse_product_search_limit(limit);
@@ -508,6 +530,7 @@ pub async fn search_messages_product(
     } else {
         None
     };
+    phase.mark("argument_filter_resolution");
 
     // Build planner query with product scope and facets
     let search_query = mcp_agent_mail_db::search_planner::SearchQuery {
@@ -528,12 +551,14 @@ pub async fn search_messages_product(
         explain: true,
         ..Default::default()
     };
+    phase.mark("planner_query_build");
 
     // Product search always routes through the unified Search V3 service.
     let planner_response = db_outcome_to_mcp_result(
         mcp_agent_mail_db::search_service::execute_search_simple(ctx.cx(), &pool, &search_query)
             .await,
     )?;
+    phase.mark("search_service_query");
 
     let result: Vec<ProductSearchItem> = planner_response
         .results
@@ -550,16 +575,26 @@ pub async fn search_messages_product(
             body_md: if include_body_md { Some(r.body) } else { None },
         })
         .collect();
+    phase.set_rows_returned(result.len());
+    phase.mark(if include_body_md {
+        "body_hydration_and_row_materialization"
+    } else {
+        "row_materialization"
+    });
 
     let diagnostics = crate::search::derive_search_diagnostics(planner_response.explain.as_ref());
+    phase.mark("diagnostics_derivation");
     let response = ProductSearchResponse {
         result,
         assistance: planner_response.assistance,
         next_cursor: planner_response.next_cursor,
         diagnostics,
     };
-    serde_json::to_string(&response)
-        .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
+    let response = serde_json::to_string(&response)
+        .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))?;
+    phase.mark("json_serialization");
+    emit_tail_latency_evidence(&phase.finish("ok"));
+    Ok(response)
 }
 
 /// Retrieve recent messages for an agent across all projects linked to a product (non-mutating).
@@ -579,6 +614,8 @@ pub async fn fetch_inbox_product(
     include_bodies: Option<bool>,
     since_ts: Option<String>,
 ) -> McpResult<String> {
+    let mut phase = TailLatencyPhaseRecorder::new("fetch_inbox_product");
+    phase.mark("queue_wait");
     let agent_name = mcp_agent_mail_core::models::normalize_agent_name(&agent_name)
         .unwrap_or_else(|| agent_name.trim().to_string());
 
@@ -599,12 +636,15 @@ pub async fn fetch_inbox_product(
             )
         })?;
     let product_id = product.id.unwrap_or(0);
+    phase.mark("product_scope_resolution");
 
     let max_messages = parse_fetch_inbox_product_limit(limit)?;
     let urgent = urgent_only.unwrap_or(false);
     let with_bodies = include_bodies.unwrap_or(false);
+    phase.set_include_bodies(with_bodies);
     let since_micros = parse_product_since_ts(since_ts.as_deref());
     validate_product_inbox_agent_name(&agent_name)?;
+    phase.mark("argument_validation");
 
     let rows = db_outcome_to_mcp_result(if with_bodies {
         mcp_agent_mail_db::queries::fetch_inbox_for_product_agent(
@@ -629,6 +669,7 @@ pub async fn fetch_inbox_product(
         )
         .await
     })?;
+    phase.mark("sqlite_query");
 
     let out: Vec<InboxMessage> = rows
         .into_iter()
@@ -656,8 +697,18 @@ pub async fn fetch_inbox_product(
             }
         })
         .collect();
+    phase.set_rows_returned(out.len());
+    phase.mark(if with_bodies {
+        "body_hydration_and_row_materialization"
+    } else {
+        "row_materialization"
+    });
 
-    serde_json::to_string(&out).map_err(|e| McpError::internal_error(format!("JSON error: {e}")))
+    let response = serde_json::to_string(&out)
+        .map_err(|e| McpError::internal_error(format!("JSON error: {e}")))?;
+    phase.mark("json_serialization");
+    emit_tail_latency_evidence(&phase.finish("ok"));
+    Ok(response)
 }
 
 /// Summarize a thread (by id or thread key) across all projects linked to a product.

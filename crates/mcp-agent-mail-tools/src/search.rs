@@ -6,6 +6,9 @@
 
 use fastmcp::McpErrorCode;
 use fastmcp::prelude::*;
+use mcp_agent_mail_core::{
+    TailLatencyPhaseLedger, TailLatencyPhaseRecorder, append_tail_latency_evidence_if_configured,
+};
 use mcp_agent_mail_db::micros_to_iso;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -18,6 +21,16 @@ use crate::tool_util::{
 
 const MAX_SUMMARIZE_THREAD_IDS: usize = 128;
 const MAX_MESSAGES_PER_SUMMARIZED_THREAD: usize = 1000;
+
+fn emit_tail_latency_evidence(ledger: &TailLatencyPhaseLedger) {
+    if let Err(error) = append_tail_latency_evidence_if_configured(ledger) {
+        tracing::debug!(
+            operation = %ledger.operation,
+            error = %error,
+            "failed to append tail-latency phase ledger evidence"
+        );
+    }
+}
 
 /// Search result entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -734,7 +747,10 @@ pub async fn search_messages(
     explain: Option<bool>,
     include_body_md: Option<bool>,
 ) -> McpResult<String> {
+    let mut phase = TailLatencyPhaseRecorder::new("search_messages");
+    phase.mark("queue_wait");
     let include_body_md = include_body_md.unwrap_or(false);
+    phase.set_include_bodies(include_body_md);
     let max_results_raw = match limit {
         Some(l) if l > 0 => l.clamp(1, 1000),
         _ => 20,
@@ -750,6 +766,8 @@ pub async fn search_messages(
     // Legacy parity: empty query returns an empty result set (no DB call).
     let trimmed = query.trim();
     if trimmed.is_empty() {
+        phase.set_rows_returned(0);
+        phase.mark("empty_query_short_circuit");
         let response = SearchResponse {
             result: Vec::new(),
             assistance: None,
@@ -758,8 +776,11 @@ pub async fn search_messages(
             next_cursor: None,
             diagnostics: None,
         };
-        return serde_json::to_string(&response)
-            .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")));
+        let response = serde_json::to_string(&response)
+            .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))?;
+        phase.mark("json_serialization");
+        emit_tail_latency_evidence(&phase.finish("ok"));
+        return Ok(response);
     }
 
     // Parse optional ranking mode
@@ -791,6 +812,7 @@ pub async fn search_messages(
     let pool = get_read_db_pool()?;
     let project = resolve_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
+    phase.mark("scope_resolution");
 
     // Build a SearchQuery with all facets
     let search_query = mcp_agent_mail_db::search_planner::SearchQuery {
@@ -812,6 +834,7 @@ pub async fn search_messages(
         explain: true,
         ..Default::default()
     };
+    phase.mark("planner_query_build");
 
     let search_options = mcp_agent_mail_db::search_service::SearchOptions {
         track_telemetry: true,
@@ -827,6 +850,7 @@ pub async fn search_messages(
         )
         .await,
     )?;
+    phase.mark("search_service_query");
 
     // Map planner SearchResult → tool SearchResult (legacy format)
     // Apply offset manually (planner doesn't support offset for simple search)
@@ -854,6 +878,12 @@ pub async fn search_messages(
             }
         })
         .collect();
+    phase.set_rows_returned(results.len());
+    phase.mark(if include_body_md {
+        "body_hydration_and_row_materialization"
+    } else {
+        "row_materialization"
+    });
 
     tracing::debug!(
         "Searched messages in project {} for '{}' (limit: {}, offset: {}, ranking: {:?}, found: {})",
@@ -866,6 +896,7 @@ pub async fn search_messages(
     );
 
     let diagnostics = derive_search_diagnostics(planner_response.explain.as_ref());
+    phase.mark("diagnostics_derivation");
     let response = SearchResponse {
         result: results,
         assistance: planner_response.assistance,
@@ -878,8 +909,11 @@ pub async fn search_messages(
         next_cursor: planner_response.next_cursor,
         diagnostics,
     };
-    serde_json::to_string(&response)
-        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
+    let response = serde_json::to_string(&response)
+        .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))?;
+    phase.mark("json_serialization");
+    emit_tail_latency_evidence(&phase.finish("ok"));
+    Ok(response)
 }
 
 /// Parse ISO-8601 date strings into a `TimeRange` (microsecond timestamps).
