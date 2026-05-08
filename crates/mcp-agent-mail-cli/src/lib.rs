@@ -56884,10 +56884,16 @@ fn handle_tooling_metrics_core(
     let health = mcp_agent_mail_core::cached_health_level().to_string();
     let metrics = mcp_agent_mail_core::global_metrics().snapshot();
     let locks = mcp_agent_mail_core::lock_contention_snapshot();
+    let read_cache_metrics = mcp_agent_mail_db::cache_metrics().snapshot();
+    let read_cache_entries = mcp_agent_mail_db::read_cache().entry_counts();
     let val = serde_json::json!({
         "health_level": health,
         "metrics": metrics,
         "lock_contention": locks,
+        "read_cache": {
+            "metrics": read_cache_metrics.clone(),
+            "entry_counts": read_cache_entries.clone(),
+        },
     });
 
     output::emit_output(&val, fmt, || {
@@ -56928,6 +56934,25 @@ fn handle_tooling_metrics_core(
         output::kv(
             "    Commits drained",
             &metrics.storage.commit_drained_total.to_string(),
+        );
+
+        ftui_runtime::ftui_println!("");
+        output::section("  Read Cache:");
+        output::kv(
+            "    Project hit rate",
+            &format!("{:.1}%", read_cache_metrics.project_hit_rate() * 100.0),
+        );
+        output::kv(
+            "    Agent hit rate",
+            &format!("{:.1}%", read_cache_metrics.agent_hit_rate() * 100.0),
+        );
+        output::kv(
+            "    Inbox stats hit rate",
+            &format!("{:.1}%", read_cache_metrics.inbox_stats_hit_rate() * 100.0),
+        );
+        output::kv(
+            "    Inbox stats entries",
+            &read_cache_entries.inbox_stats.to_string(),
         );
 
         if !locks.is_empty() {

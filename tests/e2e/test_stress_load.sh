@@ -353,8 +353,9 @@ if 'error' in d or d.get('result',{}).get('isError',False):
     fi
 }
 
-PROJECT_KEY="/tmp/stress-test-project-$$"
+PROJECT_KEY="${WORK}/stress-test-project"
 PRODUCT_KEY="stress-load-product-$$"
+mkdir -p "$PROJECT_KEY"
 
 # ---------------------------------------------------------------------------
 # Phase 0: Initialize project (single call)
@@ -914,9 +915,12 @@ data = json.loads(text)
 metrics = data.get("metrics", {})
 db = metrics.get("db", {})
 storage = metrics.get("storage", {})
+read_cache = data.get("read_cache", {})
 if "pool_acquires_total" not in db:
     raise SystemExit(1)
 if "wbq_depth" not in storage:
+    raise SystemExit(1)
+if "inbox_stats_hits" not in read_cache.get("metrics", {}):
     raise SystemExit(1)
 PY
 then
@@ -1325,6 +1329,9 @@ metrics_snapshot = metrics_core.get("metrics", {}) if isinstance(metrics_core, d
 db_metrics = metrics_snapshot.get("db", {}) if isinstance(metrics_snapshot, dict) else {}
 storage_metrics = metrics_snapshot.get("storage", {}) if isinstance(metrics_snapshot, dict) else {}
 system_metrics = metrics_snapshot.get("system", {}) if isinstance(metrics_snapshot, dict) else {}
+read_cache = metrics_core.get("read_cache", {}) if isinstance(metrics_core, dict) else {}
+read_cache_metrics = read_cache.get("metrics", {}) if isinstance(read_cache, dict) else {}
+read_cache_entries = read_cache.get("entry_counts", {}) if isinstance(read_cache, dict) else {}
 
 report = {
     "profile": os.getenv("STRESS_PROFILE", "ci"),
@@ -1373,6 +1380,13 @@ report = {
         "storage_commit_failures_total": nested_int(storage_metrics, ["commit_failures_total"]),
         "system_disk_io_read_bytes": nested_int(system_metrics, ["disk_io_read_bytes"]),
         "system_disk_io_write_bytes": nested_int(system_metrics, ["disk_io_write_bytes"]),
+        "read_cache_project_hits": nested_int(read_cache_metrics, ["project_hits"]),
+        "read_cache_project_misses": nested_int(read_cache_metrics, ["project_misses"]),
+        "read_cache_agent_hits": nested_int(read_cache_metrics, ["agent_hits"]),
+        "read_cache_agent_misses": nested_int(read_cache_metrics, ["agent_misses"]),
+        "read_cache_inbox_stats_hits": nested_int(read_cache_metrics, ["inbox_stats_hits"]),
+        "read_cache_inbox_stats_misses": nested_int(read_cache_metrics, ["inbox_stats_misses"]),
+        "read_cache_inbox_stats_entries": nested_int(read_cache_entries, ["inbox_stats"]),
     },
     "summary": summary,
     "latencies": latencies,
@@ -1436,6 +1450,13 @@ lines.extend([
     f"commit failures {report['resources']['storage_commit_failures_total']}",
     f"Process IO: read {report['resources']['system_disk_io_read_bytes']} bytes, "
     f"wrote {report['resources']['system_disk_io_write_bytes']} bytes",
+    f"Read cache: project {report['resources']['read_cache_project_hits']} hits / "
+    f"{report['resources']['read_cache_project_misses']} misses, agent "
+    f"{report['resources']['read_cache_agent_hits']} hits / "
+    f"{report['resources']['read_cache_agent_misses']} misses, inbox stats "
+    f"{report['resources']['read_cache_inbox_stats_hits']} hits / "
+    f"{report['resources']['read_cache_inbox_stats_misses']} misses "
+    f"({report['resources']['read_cache_inbox_stats_entries']} entries)",
     "",
     "## Gate Verdicts",
     "",

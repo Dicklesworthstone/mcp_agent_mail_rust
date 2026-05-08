@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 use crate::models::{AgentRow, InboxStatsRow, ProjectRow};
 use crate::s3fifo::S3FifoCache;
 use mcp_agent_mail_core::{InternedStr, LockLevel, OrderedMutex, OrderedRwLock};
+use serde::Serialize;
 
 const PROJECT_TTL: Duration = Duration::from_mins(5);
 const AGENT_TTL: Duration = Duration::from_mins(5);
@@ -108,15 +109,19 @@ pub struct CacheMetrics {
     pub project_misses: AtomicU64,
     pub agent_hits: AtomicU64,
     pub agent_misses: AtomicU64,
+    pub inbox_stats_hits: AtomicU64,
+    pub inbox_stats_misses: AtomicU64,
 }
 
 /// Snapshot of cache metrics at a point in time.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CacheMetricsSnapshot {
     pub project_hits: u64,
     pub project_misses: u64,
     pub agent_hits: u64,
     pub agent_misses: u64,
+    pub inbox_stats_hits: u64,
+    pub inbox_stats_misses: u64,
 }
 
 impl CacheMetricsSnapshot {
@@ -143,6 +148,18 @@ impl CacheMetricsSnapshot {
             self.agent_hits as f64 / total as f64
         }
     }
+
+    /// Inbox stats cache hit rate (0.0–1.0). Returns 0.0 if no lookups yet.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn inbox_stats_hit_rate(&self) -> f64 {
+        let total = self.inbox_stats_hits + self.inbox_stats_misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.inbox_stats_hits as f64 / total as f64
+        }
+    }
 }
 
 impl CacheMetrics {
@@ -152,6 +169,8 @@ impl CacheMetrics {
             project_misses: AtomicU64::new(0),
             agent_hits: AtomicU64::new(0),
             agent_misses: AtomicU64::new(0),
+            inbox_stats_hits: AtomicU64::new(0),
+            inbox_stats_misses: AtomicU64::new(0),
         }
     }
 
@@ -181,6 +200,14 @@ impl CacheMetrics {
         self.agent_misses.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_inbox_stats_hit(&self) {
+        self.inbox_stats_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_inbox_stats_miss(&self) {
+        self.inbox_stats_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Take a snapshot of the current metric values.
     pub fn snapshot(&self) -> CacheMetricsSnapshot {
         CacheMetricsSnapshot {
@@ -188,6 +215,8 @@ impl CacheMetrics {
             project_misses: self.project_misses.load(Ordering::Relaxed),
             agent_hits: self.agent_hits.load(Ordering::Relaxed),
             agent_misses: self.agent_misses.load(Ordering::Relaxed),
+            inbox_stats_hits: self.inbox_stats_hits.load(Ordering::Relaxed),
+            inbox_stats_misses: self.inbox_stats_misses.load(Ordering::Relaxed),
         }
     }
 }
@@ -779,14 +808,21 @@ impl ReadCache {
         let key = (scope_fingerprint(scope), agent_id);
         {
             let cache = self.inbox_stats.read();
-            let entry = cache.peek(&key)?;
+            let Some(entry) = cache.peek(&key) else {
+                CACHE_METRICS.record_inbox_stats_miss();
+                return None;
+            };
             if !entry.is_expired(INBOX_STATS_TTL) {
+                CACHE_METRICS.record_inbox_stats_hit();
                 return Some(entry.value.clone());
             }
         }
 
         let mut cache = self.inbox_stats.write();
-        let entry = cache.get_mut(&key)?;
+        let Some(entry) = cache.get_mut(&key) else {
+            CACHE_METRICS.record_inbox_stats_miss();
+            return None;
+        };
         let expired = if entry.is_expired(INBOX_STATS_TTL) {
             true
         } else {
@@ -795,8 +831,10 @@ impl ReadCache {
         };
         if expired {
             cache.remove(&key);
+            CACHE_METRICS.record_inbox_stats_miss();
             None
         } else {
+            CACHE_METRICS.record_inbox_stats_hit();
             Some(
                 cache
                     .peek(&key)
@@ -1001,7 +1039,7 @@ impl ReadCache {
 }
 
 /// Snapshot of cache entry counts.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CacheEntryCounts {
     pub projects_by_slug: usize,
     pub projects_by_human_key: usize,
@@ -1422,10 +1460,13 @@ mod tests {
             project_misses: 20,
             agent_hits: 0,
             agent_misses: 0,
+            inbox_stats_hits: 9,
+            inbox_stats_misses: 1,
         };
         let rate = snap.project_hit_rate();
         assert!((rate - 0.8).abs() < f64::EPSILON);
         assert!(snap.agent_hit_rate().abs() < f64::EPSILON);
+        assert!((snap.inbox_stats_hit_rate() - 0.9).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1443,6 +1484,42 @@ mod tests {
         assert_eq!(c.projects_by_human_key, 1);
         assert_eq!(c.agents_by_key, 1);
         assert_eq!(c.agents_by_id, 1);
+    }
+
+    #[test]
+    fn inbox_stats_cache_metrics_recorded() {
+        let cache = ReadCache::new();
+        let before = CACHE_METRICS.snapshot();
+
+        assert!(cache.get_inbox_stats(42).is_none());
+        let after_miss = CACHE_METRICS.snapshot();
+        assert!(
+            after_miss.inbox_stats_misses > before.inbox_stats_misses,
+            "inbox stats miss not recorded (before={}, after={})",
+            before.inbox_stats_misses,
+            after_miss.inbox_stats_misses
+        );
+
+        let stats = InboxStatsRow {
+            agent_id: 42,
+            total_count: 7,
+            unread_count: 3,
+            ack_pending_count: 2,
+            last_message_ts: Some(123),
+        };
+        cache.put_inbox_stats(&stats);
+        let cached = cache
+            .get_inbox_stats(42)
+            .expect("cached inbox stats should hit");
+        assert_eq!(cached.total_count, stats.total_count);
+
+        let after_hit = CACHE_METRICS.snapshot();
+        assert!(
+            after_hit.inbox_stats_hits > before.inbox_stats_hits,
+            "inbox stats hit not recorded (before={}, after={})",
+            before.inbox_stats_hits,
+            after_hit.inbox_stats_hits
+        );
     }
 
     #[test]

@@ -1728,6 +1728,14 @@ pub struct ToolingMetricsCoreResponse {
     pub health_level: String,
     pub metrics: mcp_agent_mail_core::GlobalMetricsSnapshot,
     pub lock_contention: Vec<mcp_agent_mail_core::LockContentionEntry>,
+    pub read_cache: ReadCacheMetricsResponse,
+}
+
+/// Read-cache telemetry attached to core metrics.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReadCacheMetricsResponse {
+    pub metrics: mcp_agent_mail_db::CacheMetricsSnapshot,
+    pub entry_counts: mcp_agent_mail_db::CacheEntryCounts,
 }
 
 /// Get core system metrics (HTTP/DB/Storage).
@@ -1741,6 +1749,10 @@ pub fn tooling_metrics_core(_ctx: &McpContext) -> McpResult<String> {
         health_level: mcp_agent_mail_core::compute_health_level().to_string(),
         metrics: mcp_agent_mail_core::global_metrics().snapshot(),
         lock_contention: mcp_agent_mail_core::lock_contention_snapshot(),
+        read_cache: ReadCacheMetricsResponse {
+            metrics: mcp_agent_mail_db::cache_metrics().snapshot(),
+            entry_counts: mcp_agent_mail_db::read_cache().entry_counts(),
+        },
     };
 
     serde_json::to_string(&response)
@@ -5440,9 +5452,16 @@ mod resource_shape_tests {
                     )
                     .is_object()
                 );
+                let core_metrics =
+                    parse_json(&tooling_metrics_core(&ctx).expect("tooling core metrics"));
+                assert!(core_metrics.is_object());
                 assert!(
-                    parse_json(&tooling_metrics_core(&ctx).expect("tooling core metrics"))
-                        .is_object()
+                    core_metrics["read_cache"]["metrics"]["inbox_stats_hits"].is_number(),
+                    "core metrics should expose inbox stats cache hits"
+                );
+                assert!(
+                    core_metrics["read_cache"]["entry_counts"]["inbox_stats"].is_number(),
+                    "core metrics should expose inbox stats cache entry count"
                 );
                 assert!(
                     parse_json(

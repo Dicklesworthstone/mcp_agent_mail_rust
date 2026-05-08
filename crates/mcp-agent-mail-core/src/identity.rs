@@ -418,6 +418,9 @@ pub fn compute_project_slug(human_key: &str) -> String {
         return slugify(human_key);
     }
     let target_path = resolve_path(human_key);
+    if !target_path.exists() {
+        return slugify(human_key);
+    }
 
     let repo_root = git_cmd(&target_path, &["rev-parse", "--show-toplevel"]);
     let remote_name = config.project_identity_remote.as_str();
@@ -482,6 +485,27 @@ static IDENTITY_CACHE: std::sync::OnceLock<
     Mutex<std::collections::HashMap<String, (ProjectIdentity, Instant)>>,
 > = std::sync::OnceLock::new();
 
+fn fallback_identity(
+    human_key: &str,
+    target_str: &str,
+    identity_mode_used: &str,
+) -> ProjectIdentity {
+    ProjectIdentity {
+        slug: slugify(human_key),
+        identity_mode_used: identity_mode_used.to_string(),
+        canonical_path: target_str.to_string(),
+        human_key: target_str.to_string(),
+        repo_root: None,
+        git_common_dir: None,
+        branch: None,
+        worktree_name: None,
+        core_ignorecase: None,
+        normalized_remote: None,
+        project_uid: short_sha1(target_str, 20),
+        discovery: None,
+    }
+}
+
 /// Resolve identity details for a given `human_key` path.
 #[must_use]
 #[allow(clippy::too_many_lines)]
@@ -506,23 +530,15 @@ pub fn resolve_project_identity(human_key: &str) -> ProjectIdentity {
     };
 
     if !config.worktrees_enabled {
-        let slug_value = slugify(human_key);
-        let project_uid = short_sha1(&target_str, 20);
-        let resolved_human_key = target_str.clone();
-        let ident = ProjectIdentity {
-            slug: slug_value,
-            identity_mode_used: "dir".to_string(),
-            canonical_path: target_str.clone(),
-            human_key: resolved_human_key,
-            repo_root: None,
-            git_common_dir: None,
-            branch: None,
-            worktree_name: None,
-            core_ignorecase: None,
-            normalized_remote: None,
-            project_uid,
-            discovery: None,
-        };
+        let ident = fallback_identity(human_key, &target_str, "dir");
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(target_str, (ident.clone(), Instant::now()));
+        }
+        return ident;
+    }
+
+    if !target_path.exists() {
+        let ident = fallback_identity(human_key, &target_str, &mode_used);
         if let Ok(mut guard) = cache.lock() {
             guard.insert(target_str, (ident.clone(), Instant::now()));
         }
@@ -1118,6 +1134,20 @@ mod tests {
         let missing = tmp.path().join("does-not-exist");
         let resolved = resolve_path(&missing.display().to_string());
         assert_eq!(resolved, missing);
+    }
+
+    #[test]
+    fn fallback_identity_uses_dir_fields_for_missing_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("does-not-exist");
+        let target = missing.display().to_string();
+        let identity = fallback_identity(&target, &target, "git-common-dir");
+
+        assert_eq!(identity.identity_mode_used, "git-common-dir");
+        assert_eq!(identity.canonical_path, target);
+        assert!(identity.repo_root.is_none());
+        assert!(identity.git_common_dir.is_none());
+        assert!(identity.discovery.is_none());
     }
 
     #[cfg(unix)]

@@ -123,7 +123,7 @@ mod tui_ws_state;
 use asupersync::channel::mpsc;
 use asupersync::http::h1::HttpClient;
 use asupersync::http::h1::listener::{Http1Listener, Http1ListenerConfig, Http1ListenerStats};
-use asupersync::http::h1::server::Http1Config;
+use asupersync::http::h1::server::{HostPolicy, Http1Config};
 use asupersync::http::h1::types::{
     Method as Http1Method, Request as Http1Request, Response as Http1Response, default_reason,
 };
@@ -1672,12 +1672,39 @@ fn hardened_http_listener_config(config: &mcp_agent_mail_core::Config) -> Http1L
         .max_requests(Some(8))
         .idle_timeout(Some(Duration::from_secs(config.http_idle_timeout_secs)))
         .max_headers_size(32 * 1024)
-        .max_body_size(10 * 1024 * 1024); // 10MB — must match HttpHandlerConfig.max_body_size
+        .max_body_size(10 * 1024 * 1024) // 10MB — must match HttpHandlerConfig.max_body_size
+        .host_policy(HostPolicy::allow_list(http_allowed_hosts(config)));
 
     Http1ListenerConfig::default()
         .http_config(http_config)
         .max_connections(Some(config.http_max_connections))
         .drain_timeout(Duration::from_secs(config.http_drain_timeout_secs))
+}
+
+fn http_allowed_hosts(config: &mcp_agent_mail_core::Config) -> Vec<String> {
+    let mut hosts = Vec::new();
+    push_unique_host(&mut hosts, normalize_allowed_http_host(&config.http_host));
+    push_unique_host(
+        &mut hosts,
+        normalize_allowed_http_host(normalized_probe_host(&config.http_host)),
+    );
+    push_unique_host(&mut hosts, "localhost".to_string());
+    hosts
+}
+
+fn normalize_allowed_http_host(host: &str) -> String {
+    let trimmed = host.trim().trim_matches(['[', ']']);
+    if trimmed.is_empty() || trimmed == "0.0.0.0" || trimmed == "::" {
+        "127.0.0.1".to_string()
+    } else {
+        trimmed.to_ascii_lowercase()
+    }
+}
+
+fn push_unique_host(hosts: &mut Vec<String>, host: String) {
+    if !hosts.iter().any(|existing| existing == &host) {
+        hosts.push(host);
+    }
 }
 
 fn normalized_probe_host(http_host: &str) -> &str {
@@ -14864,6 +14891,21 @@ mod tests {
         assert_eq!(normalized_probe_host(""), "127.0.0.1");
         assert_eq!(normalized_probe_host("  "), "127.0.0.1");
         assert_eq!(normalized_probe_host("127.0.0.1"), "127.0.0.1");
+    }
+
+    #[test]
+    fn hardened_http_listener_allows_configured_host_headers() {
+        let mut config = mcp_agent_mail_core::Config::default();
+        config.http_host = "127.0.0.1".to_string();
+        let listener = hardened_http_listener_config(&config);
+
+        match listener.http_config.allowed_hosts {
+            HostPolicy::AllowList(hosts) => {
+                assert!(hosts.contains(&"127.0.0.1".to_string()));
+                assert!(hosts.contains(&"localhost".to_string()));
+            }
+            other => panic!("expected HTTP host allow-list, got {other:?}"),
+        }
     }
 
     #[test]
