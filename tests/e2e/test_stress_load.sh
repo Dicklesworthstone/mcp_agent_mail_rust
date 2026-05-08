@@ -9,7 +9,8 @@
 #   5. Message send + inbox fetch mixed concurrency
 #   6. File reservation conflicts under contention
 #   7. Product bus fan-in reads over the same live workload
-#   8. Robot status snapshots over the isolated mailbox
+#   8. Core metrics resource snapshots for DB/queue resource ledgers
+#   9. Robot status snapshots over the isolated mailbox
 #
 # Usage:
 #   bash tests/e2e/test_stress_load.sh
@@ -98,6 +99,8 @@ STRESS_PRODUCT_P95_BUDGET_MS="${STRESS_PRODUCT_P95_BUDGET_MS:-18000}"
 STRESS_PRODUCT_P99_BUDGET_MS="${STRESS_PRODUCT_P99_BUDGET_MS:-20000}"
 STRESS_HEALTH_P95_BUDGET_MS="${STRESS_HEALTH_P95_BUDGET_MS:-8000}"
 STRESS_HEALTH_P99_BUDGET_MS="${STRESS_HEALTH_P99_BUDGET_MS:-12000}"
+STRESS_METRICS_P95_BUDGET_MS="${STRESS_METRICS_P95_BUDGET_MS:-12000}"
+STRESS_METRICS_P99_BUDGET_MS="${STRESS_METRICS_P99_BUDGET_MS:-18000}"
 STRESS_ROBOT_P95_BUDGET_MS="${STRESS_ROBOT_P95_BUDGET_MS:-12000}"
 STRESS_ROBOT_P99_BUDGET_MS="${STRESS_ROBOT_P99_BUDGET_MS:-18000}"
 STRESS_RSS_GROWTH_BUDGET_KB="${STRESS_RSS_GROWTH_BUDGET_KB:-$PROFILE_RSS_GROWTH_BUDGET_KB}"
@@ -117,7 +120,7 @@ write_ignored_large_report() {
     "messages_per_agent": ${PROFILE_MSGS_PER_AGENT},
     "mixed_duration_secs": ${PROFILE_DURATION_SECS},
     "health_checks": ${PROFILE_HEALTH_CHECKS},
-    "surfaces": ["http_mcp", "product_bus", "robot_status"]
+    "surfaces": ["http_mcp", "product_bus", "tooling_metrics_core", "robot_status"]
   },
   "reproduction": "${run_cmd}"
 }
@@ -298,6 +301,37 @@ EOF
         cat "${response_file}"
     elif [ "${rpc_rc}" -ne 0 ]; then
         printf '{"error":"rpc_transport_or_http_failure","case_id":"%s","tool":"%s"}\n' "${case_id}" "${tool_name}"
+    else
+        echo "{}"
+    fi
+}
+
+mcp_resource_read() {
+    local uri="$1"
+    local call_id
+    call_id=$(next_id)
+
+    local payload
+    payload=$(cat <<EOF
+{"jsonrpc":"2.0","id":${call_id},"method":"resources/read","params":{"uri":"${uri}"}}
+EOF
+)
+    local case_id
+    case_id="rpc_resource_${BASHPID}_${call_id}_${RANDOM}"
+    local case_dir="${E2E_ARTIFACT_DIR}/${case_id}"
+    local response_file="${case_dir}/response.json"
+    local rpc_rc=0
+
+    e2e_mark_case_start "${case_id}"
+    set +e
+    e2e_rpc_call_raw "${case_id}" "${MCP_URL}" "${payload}"
+    rpc_rc=$?
+    set -e
+
+    if [ -f "${response_file}" ]; then
+        cat "${response_file}"
+    elif [ "${rpc_rc}" -ne 0 ]; then
+        printf '{"error":"rpc_transport_or_http_failure","case_id":"%s","uri":"%s"}\n' "${case_id}" "${uri}"
     else
         echo "{}"
     fi
@@ -844,6 +878,55 @@ else
     e2e_fail "Health check: ${HEALTH_FAIL}/${HEALTH_CHECKS} failed"
 fi
 
+# ---------------------------------------------------------------------------
+# Phase 9: Core Metrics Resource Snapshot
+#
+# Capture live DB pool and storage queue metrics from the server process before
+# it is stopped for the robot snapshot.
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "=== Phase 9: Core Metrics Resource Snapshot ==="
+
+METRICS_CORE_OK=0
+METRICS_CORE_FAIL=0
+METRICS_CORE_FILE="${E2E_ARTIFACT_DIR}/metrics_core_resource.json"
+
+op_start_ns="$(now_ns)"
+METRICS_CORE_RESP=$(mcp_resource_read "resource://tooling/metrics_core")
+op_end_ns="$(now_ns)"
+record_latency_us "metrics_core" "resource" "$op_start_ns" "$op_end_ns"
+printf '%s\n' "$METRICS_CORE_RESP" > "$METRICS_CORE_FILE"
+
+if python3 - "$METRICS_CORE_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if "error" in payload:
+    raise SystemExit(1)
+contents = payload.get("result", {}).get("contents", [])
+if not contents:
+    raise SystemExit(1)
+text = contents[0].get("text", "")
+data = json.loads(text)
+metrics = data.get("metrics", {})
+db = metrics.get("db", {})
+storage = metrics.get("storage", {})
+if "pool_acquires_total" not in db:
+    raise SystemExit(1)
+if "wbq_depth" not in storage:
+    raise SystemExit(1)
+PY
+then
+    METRICS_CORE_OK=1
+    e2e_pass "Core metrics resource captured DB and queue ledgers"
+else
+    METRICS_CORE_FAIL=1
+    e2e_fail "Core metrics resource failed or produced invalid JSON"
+fi
+
 SERVER_RSS_END_KB="$(rss_kb_for_pid "${E2E_SERVER_PID}")"
 RSS_GROWTH_KB=$(( SERVER_RSS_END_KB - SERVER_RSS_START_KB ))
 [ "$RSS_GROWTH_KB" -lt 0 ] && RSS_GROWTH_KB=0
@@ -863,13 +946,13 @@ STRESS_STORAGE_FILE_COUNT="$(tree_file_count "${STRESS_STORAGE}")"
 e2e_stop_server || true
 
 # ---------------------------------------------------------------------------
-# Phase 9: Robot Status Snapshot
+# Phase 10: Robot Status Snapshot
 #
 # Exercise the agent-first operator surface against the isolated workload state.
 # ---------------------------------------------------------------------------
 
 echo ""
-echo "=== Phase 9: Robot Status Snapshot ==="
+echo "=== Phase 10: Robot Status Snapshot ==="
 
 ROBOT_OK=0
 ROBOT_FAIL=0
@@ -969,6 +1052,9 @@ write_load_lab_reports() {
     PRODUCT_INBOX_FAIL="$PRODUCT_INBOX_FAIL" \
     HEALTH_OK="$HEALTH_OK" \
     HEALTH_FAIL="$HEALTH_FAIL" \
+    METRICS_CORE_FILE="$METRICS_CORE_FILE" \
+    METRICS_CORE_OK="$METRICS_CORE_OK" \
+    METRICS_CORE_FAIL="$METRICS_CORE_FAIL" \
     ROBOT_OK="$ROBOT_OK" \
     ROBOT_FAIL="$ROBOT_FAIL" \
     STRESS_REG_P95_BUDGET_MS="$STRESS_REG_P95_BUDGET_MS" \
@@ -981,6 +1067,8 @@ write_load_lab_reports() {
     STRESS_PRODUCT_P99_BUDGET_MS="$STRESS_PRODUCT_P99_BUDGET_MS" \
     STRESS_HEALTH_P95_BUDGET_MS="$STRESS_HEALTH_P95_BUDGET_MS" \
     STRESS_HEALTH_P99_BUDGET_MS="$STRESS_HEALTH_P99_BUDGET_MS" \
+    STRESS_METRICS_P95_BUDGET_MS="$STRESS_METRICS_P95_BUDGET_MS" \
+    STRESS_METRICS_P99_BUDGET_MS="$STRESS_METRICS_P99_BUDGET_MS" \
     STRESS_ROBOT_P95_BUDGET_MS="$STRESS_ROBOT_P95_BUDGET_MS" \
     STRESS_ROBOT_P99_BUDGET_MS="$STRESS_ROBOT_P99_BUDGET_MS" \
     STRESS_RSS_GROWTH_BUDGET_KB="$STRESS_RSS_GROWTH_BUDGET_KB" \
@@ -1006,6 +1094,29 @@ def env_float(name: str, default: float = 0.0) -> float:
     if raw is None or raw == "":
         return default
     return float(raw)
+
+def nested_int(data: dict, path: list[str], default: int = 0) -> int:
+    current = data
+    for key in path:
+        if not isinstance(current, dict):
+            return default
+        current = current.get(key)
+    return int(current) if isinstance(current, (int, float)) else default
+
+def load_metrics_core(path: str) -> dict:
+    if not path:
+        return {}
+    source = Path(path)
+    if not source.exists():
+        return {}
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        contents = payload.get("result", {}).get("contents", [])
+        if not contents:
+            return {}
+        return json.loads(contents[0].get("text", ""))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
 
 def pct(values: list[int], percentile: float) -> int:
     if not values:
@@ -1043,6 +1154,7 @@ latencies = {
     "product_search": latency_stats("product_search"),
     "product_inbox": latency_stats("product_inbox"),
     "health": latency_stats("health"),
+    "metrics_core": latency_stats("metrics_core"),
     "robot_status": latency_stats("robot_status"),
 }
 
@@ -1074,6 +1186,10 @@ phase_budgets = {
     "health": {
         "p95_budget_us": budget_ms("STRESS_HEALTH_P95_BUDGET_MS") * 1000,
         "p99_budget_us": budget_ms("STRESS_HEALTH_P99_BUDGET_MS") * 1000,
+    },
+    "metrics_core": {
+        "p95_budget_us": budget_ms("STRESS_METRICS_P95_BUDGET_MS") * 1000,
+        "p99_budget_us": budget_ms("STRESS_METRICS_P99_BUDGET_MS") * 1000,
     },
     "robot_status": {
         "p95_budget_us": budget_ms("STRESS_ROBOT_P95_BUDGET_MS") * 1000,
@@ -1135,6 +1251,12 @@ gates.extend([
         "attempted": env_int("CONCURRENCY") * 2,
     },
     {
+        "name": "metrics_core_success",
+        "passed": env_int("METRICS_CORE_FAIL") == 0,
+        "failed": env_int("METRICS_CORE_FAIL"),
+        "attempted": 1,
+    },
+    {
         "name": "robot_status_success",
         "passed": env_int("ROBOT_FAIL") == 0,
         "failed": env_int("ROBOT_FAIL"),
@@ -1186,12 +1308,23 @@ summary = {
         "failed": env_int("HEALTH_FAIL"),
         "attempted": env_int("HEALTH_CHECKS"),
     },
+    "metrics_core": {
+        "ok": env_int("METRICS_CORE_OK"),
+        "failed": env_int("METRICS_CORE_FAIL"),
+        "attempted": 1,
+    },
     "robot_status": {
         "ok": env_int("ROBOT_OK"),
         "failed": env_int("ROBOT_FAIL"),
         "attempted": 1,
     },
 }
+
+metrics_core = load_metrics_core(os.getenv("METRICS_CORE_FILE", ""))
+metrics_snapshot = metrics_core.get("metrics", {}) if isinstance(metrics_core, dict) else {}
+db_metrics = metrics_snapshot.get("db", {}) if isinstance(metrics_snapshot, dict) else {}
+storage_metrics = metrics_snapshot.get("storage", {}) if isinstance(metrics_snapshot, dict) else {}
+system_metrics = metrics_snapshot.get("system", {}) if isinstance(metrics_snapshot, dict) else {}
 
 report = {
     "profile": os.getenv("STRESS_PROFILE", "ci"),
@@ -1202,7 +1335,7 @@ report = {
         "messages_per_agent": env_int("MSGS_PER_AGENT"),
         "mixed_duration_secs": env_int("DURATION_SECS"),
         "health_checks": env_int("HEALTH_CHECKS"),
-        "surfaces": ["http_mcp", "product_bus", "robot_status"],
+        "surfaces": ["http_mcp", "product_bus", "tooling_metrics_core", "robot_status"],
     },
     "isolation": {
         "project_key": os.getenv("PROJECT_KEY", ""),
@@ -1226,6 +1359,20 @@ report = {
         "sqlite_shm_bytes": env_int("STRESS_DB_SHM_BYTES"),
         "storage_tree_bytes": env_int("STRESS_STORAGE_BYTES"),
         "storage_file_count": env_int("STRESS_STORAGE_FILE_COUNT"),
+        "db_pool_acquires_total": nested_int(db_metrics, ["pool_acquires_total"]),
+        "db_pool_acquire_errors_total": nested_int(db_metrics, ["pool_acquire_errors_total"]),
+        "db_pool_acquire_p95_us": nested_int(db_metrics, ["pool_acquire_latency_us", "p95"]),
+        "db_pool_peak_active_connections": nested_int(db_metrics, ["pool_peak_active_connections"]),
+        "db_pool_pending_requests": nested_int(db_metrics, ["pool_pending_requests"]),
+        "storage_wbq_depth": nested_int(storage_metrics, ["wbq_depth"]),
+        "storage_wbq_peak_depth": nested_int(storage_metrics, ["wbq_peak_depth"]),
+        "storage_wbq_capacity": nested_int(storage_metrics, ["wbq_capacity"]),
+        "storage_commit_pending_requests": nested_int(storage_metrics, ["commit_pending_requests"]),
+        "storage_commit_peak_pending_requests": nested_int(storage_metrics, ["commit_peak_pending_requests"]),
+        "storage_commit_attempts_total": nested_int(storage_metrics, ["commit_attempts_total"]),
+        "storage_commit_failures_total": nested_int(storage_metrics, ["commit_failures_total"]),
+        "system_disk_io_read_bytes": nested_int(system_metrics, ["disk_io_read_bytes"]),
+        "system_disk_io_write_bytes": nested_int(system_metrics, ["disk_io_write_bytes"]),
     },
     "summary": summary,
     "latencies": latencies,
@@ -1279,6 +1426,16 @@ lines.extend([
     f"{report['resources']['sqlite_wal_bytes']} / {report['resources']['sqlite_shm_bytes']} bytes",
     f"Storage tree: {report['resources']['storage_file_count']} files, "
     f"{report['resources']['storage_tree_bytes']} bytes",
+    f"DB pool: {report['resources']['db_pool_acquires_total']} acquires, "
+    f"{report['resources']['db_pool_acquire_errors_total']} errors, "
+    f"p95 acquire {fmt_us(report['resources']['db_pool_acquire_p95_us'])}, "
+    f"peak active {report['resources']['db_pool_peak_active_connections']}",
+    f"Storage queues: WBQ peak {report['resources']['storage_wbq_peak_depth']} / "
+    f"{report['resources']['storage_wbq_capacity']}, commit peak pending "
+    f"{report['resources']['storage_commit_peak_pending_requests']}, "
+    f"commit failures {report['resources']['storage_commit_failures_total']}",
+    f"Process IO: read {report['resources']['system_disk_io_read_bytes']} bytes, "
+    f"wrote {report['resources']['system_disk_io_write_bytes']} bytes",
     "",
     "## Gate Verdicts",
     "",
@@ -1327,11 +1484,13 @@ echo "  Phase 5 (Reservations):  ${RES_OK} reserved, ${RES_CONFLICT} conflicts, 
 echo "  Phase 6 (Search):        ${SEARCH_OK}/${CONCURRENCY} ok"
 echo "  Phase 7 (Product Bus):   S:${PRODUCT_SEARCH_OK}/${CONCURRENCY} I:${PRODUCT_INBOX_OK}/${CONCURRENCY}"
 echo "  Phase 8 (Health):        ${HEALTH_OK}/${HEALTH_CHECKS} ok, avg ${HEALTH_AVG_MS}ms"
-echo "  Phase 9 (Robot Status):  ${ROBOT_OK}/1 ok"
+echo "  Phase 9 (Metrics Core):  ${METRICS_CORE_OK}/1 ok"
+echo "  Phase 10 (Robot Status): ${ROBOT_OK}/1 ok"
 echo "  RSS Growth:              ${RSS_GROWTH_KB} KB / ${STRESS_RSS_GROWTH_BUDGET_KB} KB"
 echo "  Server CPU:              ${SERVER_CPU_SECONDS}s (${SERVER_CPU_TICKS_DELTA} ticks)"
 echo "  SQLite bytes:            main=${STRESS_DB_BYTES} wal=${STRESS_DB_WAL_BYTES} shm=${STRESS_DB_SHM_BYTES}"
 echo "  Storage tree:            ${STRESS_STORAGE_FILE_COUNT} files, ${STRESS_STORAGE_BYTES} bytes"
+echo "  Metrics core:            ${METRICS_CORE_FILE}"
 echo "  Reports:                 ${E2E_ARTIFACT_DIR}/load_lab_report.{json,md}"
 echo "================================================================"
 
