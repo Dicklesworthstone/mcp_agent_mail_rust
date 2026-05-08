@@ -3,9 +3,11 @@
 use std::path::{Path, PathBuf};
 
 use mcp_agent_mail_cli::robot::{
-    AttachmentInfo, MessageContext, OutputFormat, ReservationEntry, RobotEnvelope, StatusData,
-    ThreadMessage, ThreadSummary, format_output, format_output_md,
+    AnomalyCard, AttachmentInfo, MessageContext, OutputFormat, ReservationEntry, RobotEnvelope,
+    StatusData, SwarmTopologyCoverage, SwarmTopologyEdge, SwarmTopologyHotspot, SwarmTopologyNode,
+    SwarmTopologySummary, ThreadMessage, ThreadSummary, format_output, format_output_md,
 };
+use serde::Serialize;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -155,6 +157,102 @@ fn thread_envelope() -> RobotEnvelope<Vec<ThreadMessage>> {
     env
 }
 
+#[derive(Serialize)]
+struct AnalyticsGoldenData {
+    anomaly_count: usize,
+    anomalies: Vec<AnomalyCard>,
+    topology: SwarmTopologySummary,
+}
+
+fn analytics_envelope() -> RobotEnvelope<AnalyticsGoldenData> {
+    let mut env = RobotEnvelope::new(
+        "robot analytics",
+        OutputFormat::Json,
+        AnalyticsGoldenData {
+            anomaly_count: 1,
+            anomalies: vec![AnomalyCard {
+                severity: "warn".to_string(),
+                confidence: 0.82,
+                category: "reservation_expiry".to_string(),
+                headline: "Reservation pressure building".to_string(),
+                rationale:
+                    "Two agents are converging on the same hot thread and reservation surface."
+                        .to_string(),
+                remediation: "am robot reservations --conflicts".to_string(),
+            }],
+            topology: SwarmTopologySummary {
+                coverage: SwarmTopologyCoverage {
+                    agents: 2,
+                    threads: 1,
+                    reservations: 1,
+                    build_slots: 1,
+                    products: 1,
+                    nodes: 6,
+                    edges: 5,
+                },
+                nodes: vec![
+                    SwarmTopologyNode {
+                        id: "agent:RedFox".to_string(),
+                        kind: "agent".to_string(),
+                        label: "RedFox".to_string(),
+                        weight: 4,
+                        heat_score: 8,
+                        edge_count: 3,
+                    },
+                    SwarmTopologyNode {
+                        id: "thread:br-scfay".to_string(),
+                        kind: "thread".to_string(),
+                        label: "br-scfay".to_string(),
+                        weight: 3,
+                        heat_score: 6,
+                        edge_count: 2,
+                    },
+                ],
+                edges: vec![
+                    SwarmTopologyEdge {
+                        from: "agent:RedFox".to_string(),
+                        to: "thread:br-scfay".to_string(),
+                        kind: "sent_messages".to_string(),
+                        weight: 3,
+                        heat_score: 6,
+                    },
+                    SwarmTopologyEdge {
+                        from: "agent:RedFox".to_string(),
+                        to: "build_slot:ci-heavy".to_string(),
+                        kind: "holds_build_slot".to_string(),
+                        weight: 1,
+                        heat_score: 4,
+                    },
+                    SwarmTopologyEdge {
+                        from: "agent:BlueLake".to_string(),
+                        to: "reservation:crates/mcp-agent-mail-cli/src/**".to_string(),
+                        kind: "holds_reservation".to_string(),
+                        weight: 1,
+                        heat_score: 3,
+                    },
+                ],
+                contention: vec![SwarmTopologyHotspot {
+                    id: "agent:RedFox".to_string(),
+                    kind: "agent".to_string(),
+                    label: "RedFox".to_string(),
+                    heat_score: 8,
+                    edge_count: 3,
+                }],
+            },
+        },
+    )
+    .with_alert(
+        "warn",
+        "Reservation pressure building",
+        Some("am robot reservations --conflicts".to_string()),
+    )
+    .with_action("am robot analytics --format json");
+    env._meta.timestamp = "2026-01-02T03:04:05Z".to_string();
+    env._meta.project = Some("/workspace/project-alpha".to_string());
+    env._meta.agent = Some("RedFox".to_string());
+    env
+}
+
 #[test]
 fn robot_status_json_matches_golden() {
     let actual = format_output(&status_envelope(), OutputFormat::Json).expect("format json");
@@ -179,4 +277,14 @@ fn robot_thread_markdown_matches_golden() {
     let actual =
         format_output_md(&thread_envelope(), OutputFormat::Markdown).expect("format markdown");
     assert_golden("robot/thread/md.md", &actual);
+}
+
+#[test]
+fn robot_analytics_json_matches_golden() {
+    let actual = format_output(&analytics_envelope(), OutputFormat::Json).expect("format json");
+    assert_golden("robot/analytics/json.json", &actual);
+    assert!(
+        !actual.contains("Fixture body"),
+        "analytics topology golden must stay metadata-only and not include message bodies"
+    );
 }

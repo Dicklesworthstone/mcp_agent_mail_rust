@@ -1,0 +1,92 @@
+{
+  "_meta": {
+    "command": "robot analytics",
+    "timestamp": "2026-01-02T03:04:05Z",
+    "format": "json",
+    "version": "1.0",
+    "project": "/workspace/project-alpha",
+    "agent": "RedFox"
+  },
+  "_alerts": [
+    {
+      "severity": "warn",
+      "summary": "Reservation pressure building",
+      "action": "am robot reservations --conflicts"
+    }
+  ],
+  "_actions": [
+    "am robot analytics --format json"
+  ],
+  "anomaly_count": 1,
+  "anomalies": [
+    {
+      "severity": "warn",
+      "confidence": 0.82,
+      "category": "reservation_expiry",
+      "headline": "Reservation pressure building",
+      "rationale": "Two agents are converging on the same hot thread and reservation surface.",
+      "remediation": "am robot reservations --conflicts"
+    }
+  ],
+  "topology": {
+    "coverage": {
+      "agents": 2,
+      "threads": 1,
+      "reservations": 1,
+      "build_slots": 1,
+      "products": 1,
+      "nodes": 6,
+      "edges": 5
+    },
+    "nodes": [
+      {
+        "id": "agent:RedFox",
+        "kind": "agent",
+        "label": "RedFox",
+        "weight": 4,
+        "heat_score": 8,
+        "edge_count": 3
+      },
+      {
+        "id": "thread:br-scfay",
+        "kind": "thread",
+        "label": "br-scfay",
+        "weight": 3,
+        "heat_score": 6,
+        "edge_count": 2
+      }
+    ],
+    "edges": [
+      {
+        "from": "agent:RedFox",
+        "to": "thread:br-scfay",
+        "kind": "sent_messages",
+        "weight": 3,
+        "heat_score": 6
+      },
+      {
+        "from": "agent:RedFox",
+        "to": "build_slot:ci-heavy",
+        "kind": "holds_build_slot",
+        "weight": 1,
+        "heat_score": 4
+      },
+      {
+        "from": "agent:BlueLake",
+        "to": "reservation:crates/mcp-agent-mail-cli/src/**",
+        "kind": "holds_reservation",
+        "weight": 1,
+        "heat_score": 3
+      }
+    ],
+    "contention": [
+      {
+        "id": "agent:RedFox",
+        "kind": "agent",
+        "label": "RedFox",
+        "heat_score": 8,
+        "edge_count": 3
+      }
+    ]
+  }
+}
