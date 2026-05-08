@@ -897,7 +897,7 @@ pub struct ThreadSummary {
 }
 
 /// robot inbox — actionable inbox entry.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct InboxEntry {
     pub id: i64,
     pub priority: String,
@@ -1096,7 +1096,7 @@ pub struct AnomalyCard {
 }
 
 /// robot agents — agent roster entry.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AgentHealthMetricRow {
     pub label: String,
     pub available: bool,
@@ -1107,7 +1107,7 @@ pub struct AgentHealthMetricRow {
 }
 
 /// robot agents — optional per-agent health detail.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AgentHealthView {
     pub badge: String,
     pub score: u8,
@@ -1119,7 +1119,7 @@ pub struct AgentHealthView {
 }
 
 /// robot agents — agent roster entry.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AgentRow {
     pub name: String,
     pub program: String,
@@ -1143,7 +1143,7 @@ pub struct ContactRow {
 }
 
 /// robot projects — project entry.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ProjectRow {
     pub slug: String,
     pub path: String,
@@ -2573,6 +2573,45 @@ struct RobotOverviewSnapshotKey {
     db_identity: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RobotInboxSnapshotKey {
+    db_identity: String,
+    project_id: i64,
+    project_slug: String,
+    agent_id: i64,
+    agent_name: String,
+    urgent_only: bool,
+    ack_overdue_only: bool,
+    unread_only: bool,
+    show_all: bool,
+    limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RobotReservationsSnapshotKey {
+    db_identity: String,
+    project_id: i64,
+    project_slug: String,
+    agent_id: Option<i64>,
+    agent_name: Option<String>,
+    show_all: bool,
+    conflicts_only: bool,
+    expiring_minutes: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RobotAgentsSnapshotKey {
+    db_identity: String,
+    project_id: i64,
+    active_only: bool,
+    sort_field: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RobotProjectsSnapshotKey {
+    db_identity: String,
+}
+
 #[derive(Debug, Clone)]
 struct RobotStatusSnapshotEntry {
     generation: RobotSnapshotGeneration,
@@ -2588,11 +2627,52 @@ struct RobotOverviewSnapshotEntry {
     projects: Vec<OverviewProject>,
 }
 
+#[derive(Debug, Clone)]
+struct RobotInboxSnapshotEntry {
+    generation: RobotSnapshotGeneration,
+    cached_at: Instant,
+    result: InboxResult,
+}
+
+#[derive(Debug, Clone)]
+struct RobotReservationsSnapshotEntry {
+    generation: RobotSnapshotGeneration,
+    cached_at: Instant,
+    data: ReservationsData,
+    actions: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RobotAgentsSnapshotEntry {
+    generation: RobotSnapshotGeneration,
+    cached_at: Instant,
+    agents: Vec<AgentRow>,
+}
+
+#[derive(Debug, Clone)]
+struct RobotProjectsSnapshotEntry {
+    generation: RobotSnapshotGeneration,
+    cached_at: Instant,
+    projects: Vec<ProjectRow>,
+}
+
 static ROBOT_STATUS_SNAPSHOT_CACHE: OnceLock<
     Mutex<HashMap<RobotStatusSnapshotKey, RobotStatusSnapshotEntry>>,
 > = OnceLock::new();
 static ROBOT_OVERVIEW_SNAPSHOT_CACHE: OnceLock<
     Mutex<HashMap<RobotOverviewSnapshotKey, RobotOverviewSnapshotEntry>>,
+> = OnceLock::new();
+static ROBOT_INBOX_SNAPSHOT_CACHE: OnceLock<
+    Mutex<HashMap<RobotInboxSnapshotKey, RobotInboxSnapshotEntry>>,
+> = OnceLock::new();
+static ROBOT_RESERVATIONS_SNAPSHOT_CACHE: OnceLock<
+    Mutex<HashMap<RobotReservationsSnapshotKey, RobotReservationsSnapshotEntry>>,
+> = OnceLock::new();
+static ROBOT_AGENTS_SNAPSHOT_CACHE: OnceLock<
+    Mutex<HashMap<RobotAgentsSnapshotKey, RobotAgentsSnapshotEntry>>,
+> = OnceLock::new();
+static ROBOT_PROJECTS_SNAPSHOT_CACHE: OnceLock<
+    Mutex<HashMap<RobotProjectsSnapshotKey, RobotProjectsSnapshotEntry>>,
 > = OnceLock::new();
 
 fn robot_status_snapshot_cache()
@@ -2603,6 +2683,26 @@ fn robot_status_snapshot_cache()
 fn robot_overview_snapshot_cache()
 -> &'static Mutex<HashMap<RobotOverviewSnapshotKey, RobotOverviewSnapshotEntry>> {
     ROBOT_OVERVIEW_SNAPSHOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn robot_inbox_snapshot_cache()
+-> &'static Mutex<HashMap<RobotInboxSnapshotKey, RobotInboxSnapshotEntry>> {
+    ROBOT_INBOX_SNAPSHOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn robot_reservations_snapshot_cache()
+-> &'static Mutex<HashMap<RobotReservationsSnapshotKey, RobotReservationsSnapshotEntry>> {
+    ROBOT_RESERVATIONS_SNAPSHOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn robot_agents_snapshot_cache()
+-> &'static Mutex<HashMap<RobotAgentsSnapshotKey, RobotAgentsSnapshotEntry>> {
+    ROBOT_AGENTS_SNAPSHOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn robot_projects_snapshot_cache()
+-> &'static Mutex<HashMap<RobotProjectsSnapshotKey, RobotProjectsSnapshotEntry>> {
+    ROBOT_PROJECTS_SNAPSHOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn robot_db_identity(conn: &DbConn) -> String {
@@ -2653,6 +2753,30 @@ fn clear_robot_snapshot_caches_for_tests() {
             .clear();
     }
     if let Some(cache) = ROBOT_OVERVIEW_SNAPSHOT_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+    if let Some(cache) = ROBOT_INBOX_SNAPSHOT_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+    if let Some(cache) = ROBOT_RESERVATIONS_SNAPSHOT_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+    if let Some(cache) = ROBOT_AGENTS_SNAPSHOT_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+    if let Some(cache) = ROBOT_PROJECTS_SNAPSHOT_CACHE.get() {
         cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3545,6 +3669,7 @@ fn build_status_with_snapshot_cache(
 // ── Inbox command implementation ────────────────────────────────────────────
 
 /// Inbox result with entries and generated alerts/actions.
+#[derive(Debug, Clone)]
 struct InboxResult {
     entries: Vec<InboxEntry>,
     alerts: Vec<(String, String, Option<String>)>,
@@ -3768,6 +3893,120 @@ fn build_inbox_with_phase(
         alerts,
         actions,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_inbox_with_snapshot_cache(
+    conn: &DbConn,
+    project_id: i64,
+    project_slug: &str,
+    agent_id: i64,
+    agent_name: &str,
+    urgent_only: bool,
+    ack_overdue_only: bool,
+    unread_only: bool,
+    show_all: bool,
+    limit: usize,
+    include_bodies: bool,
+    mut phase: Option<&mut TailLatencyPhaseRecorder>,
+) -> Result<InboxResult, CliError> {
+    if include_bodies {
+        mark_tail_latency_phase(&mut phase, "snapshot_cache_bypass_bodies");
+        return build_inbox_with_phase(
+            conn,
+            project_id,
+            project_slug,
+            agent_id,
+            agent_name,
+            urgent_only,
+            ack_overdue_only,
+            unread_only,
+            show_all,
+            limit,
+            include_bodies,
+            phase,
+        );
+    }
+
+    let db_identity = robot_db_identity(conn);
+    let generation = match robot_status_snapshot_generation(conn, project_id) {
+        Ok(generation) => {
+            mark_tail_latency_phase(&mut phase, "snapshot_generation");
+            generation
+        }
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                "robot inbox snapshot generation unavailable; falling back to live build"
+            );
+            mark_tail_latency_phase(&mut phase, "snapshot_cache_unavailable");
+            return build_inbox_with_phase(
+                conn,
+                project_id,
+                project_slug,
+                agent_id,
+                agent_name,
+                urgent_only,
+                ack_overdue_only,
+                unread_only,
+                show_all,
+                limit,
+                include_bodies,
+                phase,
+            );
+        }
+    };
+    let key = RobotInboxSnapshotKey {
+        db_identity,
+        project_id,
+        project_slug: project_slug.to_string(),
+        agent_id,
+        agent_name: agent_name.to_string(),
+        urgent_only,
+        ack_overdue_only,
+        unread_only,
+        show_all,
+        limit,
+    };
+    let now = Instant::now();
+    let mut cache = robot_inbox_snapshot_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = cache.get(&key)
+        && entry.generation == generation
+        && now.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+    {
+        mark_tail_latency_phase(&mut phase, "snapshot_cache_hit");
+        return Ok(entry.result.clone());
+    }
+
+    mark_tail_latency_phase(&mut phase, "snapshot_cache_miss");
+    let result = build_inbox_with_phase(
+        conn,
+        project_id,
+        project_slug,
+        agent_id,
+        agent_name,
+        urgent_only,
+        ack_overdue_only,
+        unread_only,
+        show_all,
+        limit,
+        include_bodies,
+        phase,
+    )?;
+    if cache.len() >= ROBOT_SNAPSHOT_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(
+        key,
+        RobotInboxSnapshotEntry {
+            generation,
+            cached_at: now,
+            result: result.clone(),
+        },
+    );
+    Ok(result)
 }
 
 fn load_recipient_display_names(
@@ -5093,7 +5332,7 @@ struct ReservationConflict {
 }
 
 /// Full reservations response data.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct ReservationsData {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     my_reservations: Vec<ReservationEntry>,
@@ -5333,6 +5572,79 @@ fn build_reservations(
         },
         actions,
     ))
+}
+
+fn build_reservations_with_snapshot_cache(
+    conn: &DbConn,
+    project_id: i64,
+    project_slug: &str,
+    agent: Option<(i64, String)>,
+    show_all: bool,
+    conflicts_only: bool,
+    expiring_minutes: Option<u32>,
+) -> Result<(ReservationsData, Vec<String>), CliError> {
+    let db_identity = robot_db_identity(conn);
+    let generation = match robot_status_snapshot_generation(conn, project_id) {
+        Ok(generation) => generation,
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                "robot reservations snapshot generation unavailable; falling back to live build"
+            );
+            return build_reservations(
+                conn,
+                project_id,
+                project_slug,
+                agent,
+                show_all,
+                conflicts_only,
+                expiring_minutes,
+            );
+        }
+    };
+    let key = RobotReservationsSnapshotKey {
+        db_identity,
+        project_id,
+        project_slug: project_slug.to_string(),
+        agent_id: agent.as_ref().map(|(id, _)| *id),
+        agent_name: agent.as_ref().map(|(_, name)| name.clone()),
+        show_all,
+        conflicts_only,
+        expiring_minutes,
+    };
+    let now = Instant::now();
+    let mut cache = robot_reservations_snapshot_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = cache.get(&key)
+        && entry.generation == generation
+        && now.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+    {
+        return Ok((entry.data.clone(), entry.actions.clone()));
+    }
+
+    let (data, actions) = build_reservations(
+        conn,
+        project_id,
+        project_slug,
+        agent,
+        show_all,
+        conflicts_only,
+        expiring_minutes,
+    )?;
+    if cache.len() >= ROBOT_SNAPSHOT_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(
+        key,
+        RobotReservationsSnapshotEntry {
+            generation,
+            cached_at: now,
+            data: data.clone(),
+            actions: actions.clone(),
+        },
+    );
+    Ok((data, actions))
 }
 
 /// Check whether two reservation path patterns can overlap.
@@ -6093,6 +6405,82 @@ fn build_agents_with_health(
         .collect())
 }
 
+fn build_agents_with_snapshot_cache(
+    conn: &DbConn,
+    project_id: i64,
+    active_only: bool,
+    sort_field: Option<&str>,
+    health_target: Option<&str>,
+    threshold: Option<AgentHealthGrade>,
+) -> Result<Vec<AgentRow>, CliError> {
+    if health_target.is_some() || threshold.is_some() || sort_field == Some("health") {
+        return build_agents_with_health(
+            conn,
+            project_id,
+            active_only,
+            sort_field,
+            health_target,
+            threshold,
+        );
+    }
+
+    let db_identity = robot_db_identity(conn);
+    let generation = match robot_status_snapshot_generation(conn, project_id) {
+        Ok(generation) => generation,
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                "robot agents snapshot generation unavailable; falling back to live build"
+            );
+            return build_agents_with_health(
+                conn,
+                project_id,
+                active_only,
+                sort_field,
+                health_target,
+                threshold,
+            );
+        }
+    };
+    let key = RobotAgentsSnapshotKey {
+        db_identity,
+        project_id,
+        active_only,
+        sort_field: sort_field.map(str::to_string),
+    };
+    let now = Instant::now();
+    let mut cache = robot_agents_snapshot_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = cache.get(&key)
+        && entry.generation == generation
+        && now.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+    {
+        return Ok(entry.agents.clone());
+    }
+
+    let agents = build_agents_with_health(
+        conn,
+        project_id,
+        active_only,
+        sort_field,
+        health_target,
+        None,
+    )?;
+    if cache.len() >= ROBOT_SNAPSHOT_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(
+        key,
+        RobotAgentsSnapshotEntry {
+            generation,
+            cached_at: now,
+            agents: agents.clone(),
+        },
+    );
+    Ok(agents)
+}
+
 #[derive(Debug, Clone, Default)]
 struct RobotAgentAckStats {
     on_time_count: u64,
@@ -6609,6 +6997,45 @@ fn build_projects(conn: &DbConn) -> Result<Vec<ProjectRow>, CliError> {
         });
     }
 
+    Ok(projects)
+}
+
+fn build_projects_with_snapshot_cache(conn: &DbConn) -> Result<Vec<ProjectRow>, CliError> {
+    let db_identity = robot_db_identity(conn);
+    let generation = match robot_overview_snapshot_generation(conn) {
+        Ok(generation) => generation,
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                "robot projects snapshot generation unavailable; falling back to live build"
+            );
+            return build_projects(conn);
+        }
+    };
+    let key = RobotProjectsSnapshotKey { db_identity };
+    let now = Instant::now();
+    let mut cache = robot_projects_snapshot_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = cache.get(&key)
+        && entry.generation == generation
+        && now.duration_since(entry.cached_at) <= ROBOT_SNAPSHOT_CACHE_TTL
+    {
+        return Ok(entry.projects.clone());
+    }
+
+    let projects = build_projects(conn)?;
+    if cache.len() >= ROBOT_SNAPSHOT_CACHE_MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(
+        key,
+        RobotProjectsSnapshotEntry {
+            generation,
+            cached_at: now,
+            projects: projects.clone(),
+        },
+    );
     Ok(projects)
 }
 
@@ -8694,7 +9121,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 )
             })?;
 
-            let result = build_inbox_with_phase(
+            let result = build_inbox_with_snapshot_cache(
                 scope.conn(),
                 scope.project_id,
                 &scope.project_slug,
@@ -8807,7 +9234,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let agent_flag = agent_override.as_deref().or(args.agent.as_deref());
             let scope = resolve_robot_scope(args.project.as_deref(), agent_flag)?;
             let agent = scope.agent.clone();
-            let (data, actions) = build_reservations(
+            let (data, actions) = build_reservations_with_snapshot_cache(
                 scope.conn(),
                 scope.project_id,
                 &scope.project_slug,
@@ -9286,19 +9713,14 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             if (health.is_some() || threshold.is_some()) && sort.is_none() {
                 sort = Some("health".to_string());
             }
-            let agents =
-                if health.is_some() || threshold.is_some() || sort.as_deref() == Some("health") {
-                    build_agents_with_health(
-                        scope.conn(),
-                        scope.project_id,
-                        active,
-                        sort.as_deref(),
-                        health.as_deref(),
-                        threshold,
-                    )?
-                } else {
-                    build_agents(scope.conn(), scope.project_id, active, sort.as_deref())?
-                };
+            let agents = build_agents_with_snapshot_cache(
+                scope.conn(),
+                scope.project_id,
+                active,
+                sort.as_deref(),
+                health.as_deref(),
+                threshold,
+            )?;
 
             #[derive(Serialize)]
             struct AgentsData {
@@ -9328,7 +9750,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
         }
         RobotSubcommand::Projects => {
             let conn = crate::open_db_sync_robot()?;
-            let projects = build_projects(&conn)?;
+            let projects = build_projects_with_snapshot_cache(&conn)?;
 
             #[derive(Serialize)]
             struct ProjectsData {
@@ -9611,6 +10033,8 @@ mod tests {
                 id INTEGER PRIMARY KEY,
                 project_id INTEGER NOT NULL,
                 name TEXT NOT NULL,
+                program TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
                 last_active_ts INTEGER NOT NULL
             )",
             &empty,
@@ -12001,6 +12425,263 @@ mod tests {
                 .iter()
                 .any(|name| name == "snapshot_cache_miss")
         );
+    }
+
+    #[test]
+    fn build_inbox_snapshot_cache_reuses_metadata_polling_generation() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_robot_snapshot_caches_for_tests();
+        let (_temp_dir, conn) = setup_robot_status_snapshot_test_db();
+
+        let mut first_phase = TailLatencyPhaseRecorder::new("robot_inbox");
+        let first = build_inbox_with_snapshot_cache(
+            &conn,
+            1,
+            "demo",
+            2,
+            "Reader",
+            false,
+            false,
+            true,
+            false,
+            20,
+            false,
+            Some(&mut first_phase),
+        )
+        .expect("first inbox build");
+        assert_eq!(first.entries.len(), 1);
+
+        let mut hit_phase = TailLatencyPhaseRecorder::new("robot_inbox");
+        let cached = build_inbox_with_snapshot_cache(
+            &conn,
+            1,
+            "demo",
+            2,
+            "Reader",
+            false,
+            false,
+            true,
+            false,
+            20,
+            false,
+            Some(&mut hit_phase),
+        )
+        .expect("cached inbox build");
+        assert_eq!(
+            serde_json::to_value(&cached.entries).unwrap(),
+            serde_json::to_value(&first.entries).unwrap()
+        );
+        let phase_names: Vec<String> = hit_phase
+            .finish("ok")
+            .phases
+            .into_iter()
+            .map(|phase| phase.name)
+            .collect();
+        assert!(phase_names.iter().any(|name| name == "snapshot_cache_hit"));
+        assert!(
+            !phase_names.iter().any(|name| name == "sqlite_query"),
+            "fresh metadata cache hits should skip the inbox SQL query"
+        );
+    }
+
+    #[test]
+    fn build_inbox_snapshot_cache_invalidates_on_message_generation_change() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_robot_snapshot_caches_for_tests();
+        let (_temp_dir, conn) = setup_robot_status_snapshot_test_db();
+
+        build_inbox_with_snapshot_cache(
+            &conn, 1, "demo", 2, "Reader", false, false, true, false, 20, false, None,
+        )
+        .expect("prime inbox cache");
+
+        let now_us = mcp_agent_mail_db::now_micros();
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, thread_id, subject, created_ts, ack_required, importance)
+             VALUES (2, 1, 1, 'thread-2', 'New inbox subject', ?, 0, 'normal')",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us)],
+        )
+        .expect("insert invalidating message");
+        conn.query_sync(
+            "INSERT INTO message_recipients (id, message_id, agent_id, kind, read_ts, ack_ts)
+             VALUES (2, 2, 2, 'to', NULL, NULL)",
+            &[],
+        )
+        .expect("insert invalidating recipient");
+
+        let mut phase = TailLatencyPhaseRecorder::new("robot_inbox");
+        let result = build_inbox_with_snapshot_cache(
+            &conn,
+            1,
+            "demo",
+            2,
+            "Reader",
+            false,
+            false,
+            true,
+            false,
+            20,
+            false,
+            Some(&mut phase),
+        )
+        .expect("inbox rebuild after invalidation");
+        assert_eq!(result.entries.len(), 2);
+        assert_eq!(result.entries[0].subject, "New inbox subject");
+        let phase_names: Vec<String> = phase
+            .finish("ok")
+            .phases
+            .into_iter()
+            .map(|phase| phase.name)
+            .collect();
+        assert!(phase_names.iter().any(|name| name == "snapshot_cache_miss"));
+        assert!(phase_names.iter().any(|name| name == "sqlite_query"));
+    }
+
+    #[test]
+    fn build_inbox_snapshot_cache_falls_back_when_generation_is_unavailable() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_robot_snapshot_caches_for_tests();
+        let (_temp_dir, conn) = setup_robot_status_snapshot_test_db();
+        set_robot_snapshot_generation_forced_error(true);
+
+        let mut phase = TailLatencyPhaseRecorder::new("robot_inbox");
+        let result = build_inbox_with_snapshot_cache(
+            &conn,
+            1,
+            "demo",
+            2,
+            "Reader",
+            false,
+            false,
+            true,
+            false,
+            20,
+            false,
+            Some(&mut phase),
+        )
+        .expect("inbox fallback build");
+        assert_eq!(result.entries.len(), 1);
+        let phase_names: Vec<String> = phase
+            .finish("ok")
+            .phases
+            .into_iter()
+            .map(|phase| phase.name)
+            .collect();
+        assert!(
+            phase_names
+                .iter()
+                .any(|name| name == "snapshot_cache_unavailable")
+        );
+        assert!(phase_names.iter().any(|name| name == "sqlite_query"));
+        set_robot_snapshot_generation_forced_error(false);
+    }
+
+    #[test]
+    fn build_inbox_snapshot_cache_enforces_memory_cap() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_robot_snapshot_caches_for_tests();
+        let (_temp_dir, conn) = setup_robot_status_snapshot_test_db();
+
+        for limit in 1..=(ROBOT_SNAPSHOT_CACHE_MAX_ENTRIES + 2) {
+            build_inbox_with_snapshot_cache(
+                &conn, 1, "demo", 2, "Reader", false, false, true, false, limit, false, None,
+            )
+            .expect("populate inbox cache");
+        }
+
+        let cache_len = robot_inbox_snapshot_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        assert!(cache_len > 0);
+        assert!(
+            cache_len <= ROBOT_SNAPSHOT_CACHE_MAX_ENTRIES,
+            "cache should stay bounded, found {cache_len}"
+        );
+    }
+
+    #[test]
+    fn metadata_snapshot_cache_invalidates_reservations_agents_and_projects() {
+        let _guard = ROBOT_COMMAND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_robot_snapshot_caches_for_tests();
+        let (temp_dir, conn) = setup_robot_thread_message_test_db();
+        let db_path = temp_dir.path().join("robot_thread_message_test.sqlite3");
+        let now_us = mcp_agent_mail_db::now_micros();
+
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES (1, 1, 1, 'src/a.rs', 1, 'a', ?, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
+            ],
+        )
+        .expect("insert initial reservation");
+
+        let (initial_reservations, _) =
+            build_reservations_with_snapshot_cache(&conn, 1, "proj", None, true, false, Some(10))
+                .expect("prime reservations cache");
+        assert_eq!(initial_reservations.all_active.len(), 1);
+
+        let initial_agents = build_agents_with_snapshot_cache(&conn, 1, false, None, None, None)
+            .expect("prime agents cache");
+        assert_eq!(initial_agents.len(), 3);
+
+        let initial_projects =
+            build_projects_with_snapshot_cache(&conn).expect("prime projects cache");
+        assert_eq!(initial_projects.len(), 1);
+
+        conn.query_sync(
+            "INSERT INTO file_reservations
+             (id, project_id, agent_id, path_pattern, exclusive, reason, created_ts, expires_ts, released_ts)
+             VALUES (2, 1, 2, 'src/b.rs', 1, 'b', ?, ?, NULL)",
+            &[
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 1),
+                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3_600_000_000),
+            ],
+        )
+        .expect("insert invalidating reservation");
+        conn.query_sync(
+            "INSERT INTO agents (id, project_id, name, program, model, last_active_ts)
+             VALUES (4, 1, 'Delta', 'codex-cli', 'gpt-5', ?)",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 2)],
+        )
+        .expect("insert invalidating agent");
+        conn.query_sync(
+            "INSERT INTO messages
+             (id, project_id, sender_id, subject, thread_id, importance, ack_required, created_ts, body_md, attachments)
+             VALUES (10, 1, 1, 'Project counter invalidation', 'proj-thread', 'normal', 0, ?, 'body', '[]')",
+            &[mcp_agent_mail_db::sqlmodel_core::Value::BigInt(now_us + 3)],
+        )
+        .expect("insert invalidating project message");
+
+        let (updated_reservations, _) =
+            build_reservations_with_snapshot_cache(&conn, 1, "proj", None, true, false, Some(10))
+                .expect("reservations rebuild after invalidation");
+        assert_eq!(updated_reservations.all_active.len(), 2);
+
+        let updated_agents = build_agents_with_snapshot_cache(&conn, 1, false, None, None, None)
+            .expect("agents rebuild after invalidation");
+        assert_eq!(updated_agents.len(), 4);
+
+        let fresh_conn = mcp_agent_mail_db::DbConn::open_file(db_path.display().to_string())
+            .expect("reopen project cache sqlite db");
+        let updated_projects = build_projects_with_snapshot_cache(&fresh_conn)
+            .expect("projects rebuild after invalidation");
+        assert_eq!(updated_projects.len(), 1);
+        assert_eq!(updated_projects[0].messages, 1);
     }
 
     #[test]
@@ -14850,7 +15531,8 @@ mod tests {
                 name TEXT NOT NULL,
                 program TEXT,
                 model TEXT,
-                contact_policy TEXT
+                contact_policy TEXT,
+                last_active_ts INTEGER NOT NULL DEFAULT 0
             )",
             &empty,
         )
