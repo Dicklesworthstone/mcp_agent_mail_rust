@@ -1111,6 +1111,30 @@ fn is_sqlite_file(path: &std::path::Path) -> bool {
     header.starts_with(b"SQLite format 3\0")
 }
 
+fn remove_copy_destination_sidecar_if_present(
+    sidecar: &std::path::Path,
+) -> Result<(), MigrationError> {
+    match std::fs::symlink_metadata(sidecar) {
+        Ok(metadata) if metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            std::fs::remove_file(sidecar).map_err(|e| {
+                MigrationError::Aborted(format!(
+                    "cannot remove stale destination sqlite sidecar {} before copy: {e}",
+                    sidecar.display()
+                ))
+            })
+        }
+        Ok(_) => Err(MigrationError::Aborted(format!(
+            "cannot remove stale destination sqlite sidecar {} before copy: sidecar is not a file or symlink",
+            sidecar.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(MigrationError::Aborted(format!(
+            "cannot inspect stale destination sqlite sidecar {} before copy: {error}",
+            sidecar.display()
+        ))),
+    }
+}
+
 /// Copy a Python database to the Rust storage root.
 ///
 /// Performs `wal_checkpoint(TRUNCATE)` on the source DB first, then copies only
@@ -1150,14 +1174,7 @@ pub fn copy_python_database_to_rust(
     // to avoid.
     for suffix in SQLITE_COPY_DESTINATION_SIDECAR_SUFFIXES {
         let sidecar = sqlite_path_with_suffix(&dest, suffix);
-        if sidecar.exists() {
-            std::fs::remove_file(&sidecar).map_err(|e| {
-                MigrationError::Aborted(format!(
-                    "cannot remove stale destination sqlite sidecar {} before copy: {e}",
-                    sidecar.display()
-                ))
-            })?;
-        }
+        remove_copy_destination_sidecar_if_present(&sidecar)?;
     }
 
     // Ensure the source DB is self-contained before copying.
@@ -2241,6 +2258,54 @@ mod tests {
             blocking_journal_dir.is_dir(),
             "blocking sidecar directory should remain for operator inspection"
         );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_database_removes_broken_destination_sidecar_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join("migrate_test_copy_broken_sidecar_symlink");
+        let src_dir = base.join("python");
+        let dst_dir = base.join("rust_storage");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::create_dir_all(&src_dir);
+        let _ = std::fs::create_dir_all(&dst_dir);
+
+        let src_db = src_dir.join("storage.sqlite3");
+        let source_conn = DbConn::open_file(src_db.display().to_string()).expect("open source db");
+        source_conn
+            .execute_raw("CREATE TABLE marker(value TEXT)")
+            .expect("create source marker table");
+        source_conn
+            .execute_raw("INSERT INTO marker(value) VALUES('python-source')")
+            .expect("seed source marker");
+        drop(source_conn);
+
+        let dest_wal = dst_dir.join("storage.sqlite3-wal");
+        let missing_target = dst_dir.join("missing-wal-target");
+        symlink(&missing_target, &dest_wal).expect("create broken destination WAL symlink");
+
+        let result = copy_python_database_to_rust(&src_db, &dst_dir).unwrap();
+        let dest = result.expect("copy should publish destination DB");
+        assert_eq!(dest, dst_dir.join("storage.sqlite3"));
+        assert!(
+            std::fs::symlink_metadata(&dest_wal)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+            "broken destination WAL symlink should be removed before copy"
+        );
+
+        let dest_conn = DbConn::open_file(dest.display().to_string()).expect("open copied db");
+        let rows = dest_conn
+            .query_sync("SELECT value FROM marker LIMIT 1", &[])
+            .expect("query copied marker");
+        let marker: String = rows
+            .first()
+            .and_then(|row| row.get_named::<String>("value").ok())
+            .expect("copied marker row");
+        assert_eq!(marker, "python-source");
 
         let _ = std::fs::remove_dir_all(&base);
     }
