@@ -2376,6 +2376,15 @@ struct HybridBudgetGovernorState {
     rerank_enabled: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProductSqlBudgetState {
+    remaining_budget_ms: Option<u64>,
+    tier: HybridBudgetGovernorTier,
+    requested_limit: usize,
+    effective_limit: usize,
+    page_limited: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct HybridExecutionPlan {
     derivation: CandidateBudgetDerivation,
@@ -2640,6 +2649,101 @@ fn apply_hybrid_budget_governor(
             rerank_enabled,
         },
     )
+}
+
+fn scaled_product_sql_limit(requested_limit: usize, scale_pct: u32, result_floor: usize) -> usize {
+    let floor = result_floor.clamp(1, requested_limit.max(1));
+    scale_limit_by_pct(requested_limit, scale_pct)
+        .max(floor)
+        .min(requested_limit)
+}
+
+fn product_sql_budget_state(cx: &Cx, query: &SearchQuery) -> Option<ProductSqlBudgetState> {
+    if !matches!(query.doc_kind, DocKind::Message | DocKind::Thread) {
+        return None;
+    }
+    query.product_id?;
+    let requested_limit = query.effective_limit();
+    let config = hybrid_budget_governor_config_from_env();
+    let remaining_budget_ms = request_budget_remaining_ms(cx);
+    let tier = classify_hybrid_budget_tier(remaining_budget_ms, config);
+
+    let effective_limit = if config.enabled {
+        match tier {
+            HybridBudgetGovernorTier::Unlimited | HybridBudgetGovernorTier::Normal => {
+                requested_limit
+            }
+            HybridBudgetGovernorTier::Tight => scaled_product_sql_limit(
+                requested_limit,
+                config.tight_scale_pct,
+                config.result_floor,
+            ),
+            HybridBudgetGovernorTier::Critical => scaled_product_sql_limit(
+                requested_limit,
+                config.critical_scale_pct,
+                config.result_floor,
+            ),
+        }
+    } else {
+        requested_limit
+    };
+
+    Some(ProductSqlBudgetState {
+        remaining_budget_ms,
+        tier,
+        requested_limit,
+        effective_limit,
+        page_limited: effective_limit < requested_limit,
+    })
+}
+
+fn product_sql_budgeted_query(
+    query: &SearchQuery,
+    budget: Option<ProductSqlBudgetState>,
+) -> SearchQuery {
+    let Some(state) = budget else {
+        return query.clone();
+    };
+    if !state.page_limited {
+        return query.clone();
+    }
+    let mut query = query.clone();
+    query.limit = Some(state.effective_limit);
+    query
+}
+
+fn annotate_product_sql_budget_explain(
+    explain: &mut crate::search_planner::QueryExplain,
+    budget: Option<ProductSqlBudgetState>,
+) {
+    let Some(state) = budget.filter(|state| state.page_limited) else {
+        return;
+    };
+
+    explain
+        .facets_applied
+        .push("product_budget_limited:true".to_string());
+    explain
+        .facets_applied
+        .push(format!("product_budget_tier:{}", state.tier.as_str()));
+    explain.facets_applied.push(format!(
+        "product_budget_requested_limit:{}",
+        state.requested_limit
+    ));
+    explain.facets_applied.push(format!(
+        "product_budget_effective_limit:{}",
+        state.effective_limit
+    ));
+    explain.facets_applied.push(format!(
+        "product_budget_exhausted:{}",
+        state.tier == HybridBudgetGovernorTier::Critical
+    ));
+    if let Some(remaining_ms) = state.remaining_budget_ms {
+        explain
+            .facets_applied
+            .push(format!("product_budget_remaining_ms:{remaining_ms}"));
+    }
+    explain.facet_count = explain.facets_applied.len();
 }
 
 fn derive_hybrid_execution_plan(
@@ -3483,12 +3587,14 @@ pub async fn execute_search(
     options: &SearchOptions,
 ) -> Outcome<ScopedSearchResponse, DbError> {
     let timer = std::time::Instant::now();
+    let product_sql_budget = product_sql_budget_state(cx, query);
+    let cache_allowed = product_sql_budget.is_none_or(|state| !state.page_limited);
 
     // ── Cache lookup ──────────────────────────────────────────────────
     let cache = global_search_cache();
     let cache_key = build_search_cache_key(pool, query, options, cache.current_epoch());
 
-    if let Some(cached) = cache.get(&cache_key) {
+    if cache_allowed && let Some(cached) = cache.get(&cache_key) {
         let latency_us = u64::try_from(timer.elapsed().as_micros()).unwrap_or(u64::MAX);
         if options.track_telemetry {
             record_query("search_service_cache_hit", latency_us);
@@ -3511,7 +3617,16 @@ pub async fn execute_search(
         || message_query_requires_sql_plan(query)
     {
         return execute_sql_plan_search(
-            cx, pool, query, options, cache, cache_key, assistance, timer,
+            cx,
+            pool,
+            query,
+            options,
+            cache,
+            cache_key,
+            assistance,
+            timer,
+            product_sql_budget,
+            cache_allowed,
         )
         .await;
     }
@@ -3965,7 +4080,11 @@ async fn execute_sql_plan_search(
     cache_key: QueryCacheKey,
     assistance: Option<QueryAssistance>,
     timer: std::time::Instant,
+    product_sql_budget: Option<ProductSqlBudgetState>,
+    cache_allowed: bool,
 ) -> Outcome<ScopedSearchResponse, DbError> {
+    let budgeted_query = product_sql_budgeted_query(query, product_sql_budget);
+    let query = &budgeted_query;
     let plan = plan_search(query);
     let raw_results = if plan.method == PlanMethod::Empty && plan.sql.is_empty() {
         Vec::new()
@@ -3991,7 +4110,9 @@ async fn execute_sql_plan_search(
     };
 
     let explain = if query.explain {
-        Some(plan.explain())
+        let mut explain = plan.explain();
+        annotate_product_sql_budget_explain(&mut explain, product_sql_budget);
+        Some(explain)
     } else {
         None
     };
@@ -4003,7 +4124,7 @@ async fn execute_sql_plan_search(
         .search
         .record_legacy_query(latency_us, false);
     let resp = finish_scoped_response(raw_results, query, options, assistance, explain);
-    if let Outcome::Ok(ref val) = resp {
+    if cache_allowed && let Outcome::Ok(ref val) = resp {
         cache.put(cache_key, val.clone());
     }
     resp
@@ -5899,6 +6020,74 @@ mod tests {
     fn request_budget_remaining_ms_reports_expired_deadline_as_zero() {
         let cx = Cx::for_request_with_budget(Budget::new().with_deadline(Time::ZERO));
         assert_eq!(request_budget_remaining_ms(&cx), Some(0));
+    }
+
+    #[test]
+    fn product_sql_budget_state_limits_page_when_budget_is_critical() {
+        let cx = Cx::for_request_with_budget(Budget::new().with_cost_quota(0));
+        let query = SearchQuery {
+            limit: Some(100),
+            ..SearchQuery::product_messages("deployment", 7)
+        };
+
+        let state = product_sql_budget_state(&cx, &query).expect("product budget state");
+
+        assert_eq!(state.tier, HybridBudgetGovernorTier::Critical);
+        assert!(state.page_limited);
+        assert!(state.effective_limit < state.requested_limit);
+        assert!(state.effective_limit >= 1);
+    }
+
+    #[test]
+    fn product_sql_budget_state_leaves_non_product_queries_unbounded() {
+        let cx = Cx::for_request_with_budget(Budget::new().with_cost_quota(0));
+        let query = SearchQuery {
+            limit: Some(100),
+            ..SearchQuery::messages("deployment", 7)
+        };
+
+        assert!(product_sql_budget_state(&cx, &query).is_none());
+    }
+
+    #[test]
+    fn product_sql_budget_explain_records_partial_page_diagnostics() {
+        let state = ProductSqlBudgetState {
+            remaining_budget_ms: Some(12),
+            tier: HybridBudgetGovernorTier::Critical,
+            requested_limit: 100,
+            effective_limit: 40,
+            page_limited: true,
+        };
+        let mut explain = crate::search_planner::QueryExplain {
+            method: "like_fallback".to_string(),
+            normalized_query: None,
+            used_like_fallback: true,
+            facet_count: 1,
+            facets_applied: vec!["product_id".to_string()],
+            sql: "SELECT ...".to_string(),
+            scope_policy: "unrestricted".to_string(),
+            denied_count: 0,
+            redacted_count: 0,
+        };
+
+        annotate_product_sql_budget_explain(&mut explain, Some(state));
+
+        assert_eq!(explain.facet_count, explain.facets_applied.len());
+        assert!(
+            explain
+                .facets_applied
+                .contains(&"product_budget_limited:true".to_string())
+        );
+        assert!(
+            explain
+                .facets_applied
+                .contains(&"product_budget_tier:critical".to_string())
+        );
+        assert!(
+            explain
+                .facets_applied
+                .contains(&"product_budget_remaining_ms:12".to_string())
+        );
     }
 
     #[test]

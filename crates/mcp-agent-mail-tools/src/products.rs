@@ -1239,6 +1239,41 @@ mod tests {
     }
 
     #[test]
+    fn product_search_response_serializes_budget_diagnostics_when_present() {
+        let resp = ProductSearchResponse {
+            result: Vec::new(),
+            assistance: None,
+            next_cursor: Some("cursor-2".to_string()),
+            diagnostics: Some(crate::search::SearchDiagnostics {
+                degraded: true,
+                fallback_mode: Some("product_sql_budget_governor".to_string()),
+                timeout_stage: None,
+                budget_tier: Some("critical".to_string()),
+                budget_remaining_ms: Some(0),
+                budget_exhausted: Some(true),
+                remediation_hints: vec![
+                    "Continue with `next_cursor` or narrow product filters to stay within budget."
+                        .to_string(),
+                ],
+            }),
+        };
+
+        let json = serde_json::to_string(&resp).unwrap();
+
+        assert!(json.contains("\"next_cursor\":\"cursor-2\""));
+        assert!(json.contains("\"diagnostics\""));
+        assert!(json.contains("\"product_sql_budget_governor\""));
+        let parsed: ProductSearchResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed
+                .diagnostics
+                .as_ref()
+                .and_then(|diag| diag.budget_tier.as_deref()),
+            Some("critical")
+        );
+    }
+
+    #[test]
     fn fetch_inbox_product_limit_must_be_positive() {
         let err = parse_fetch_inbox_product_limit(Some(0)).expect_err("zero limit should fail");
         assert!(err.to_string().contains("limit must be at least 1"));

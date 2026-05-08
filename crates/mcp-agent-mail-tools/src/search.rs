@@ -318,6 +318,30 @@ pub(crate) fn derive_search_diagnostics(
         }
     }
 
+    if explain_facet_value(explain, "product_budget_limited")
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        diagnostics.degraded = true;
+        diagnostics
+            .fallback_mode
+            .get_or_insert_with(|| "product_sql_budget_governor".to_string());
+        diagnostics.remediation_hints.push(
+            "Continue with `next_cursor` or narrow product filters to stay within budget."
+                .to_string(),
+        );
+    }
+
+    if let Some(remaining_ms) = explain_facet_value(explain, "product_budget_remaining_ms")
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        diagnostics.budget_remaining_ms = Some(remaining_ms);
+    }
+
+    if let Some(tier) = explain_facet_value(explain, "product_budget_tier") {
+        diagnostics.budget_tier = Some(tier.to_string());
+        diagnostics.budget_exhausted = Some(tier.eq_ignore_ascii_case("critical"));
+    }
+
     if let Some(stage) = explain_facet_value(explain, "timeout_stage") {
         diagnostics.degraded = true;
         diagnostics.timeout_stage = Some(stage.to_string());
@@ -1472,6 +1496,37 @@ mod tests {
         assert_eq!(diagnostics.budget_tier.as_deref(), Some("critical"));
         assert_eq!(diagnostics.budget_remaining_ms, Some(12));
         assert_eq!(diagnostics.budget_exhausted, Some(true));
+    }
+
+    #[test]
+    fn derive_search_diagnostics_detects_product_budget_signal() {
+        let explain = mcp_agent_mail_db::search_planner::QueryExplain {
+            method: "like_fallback".to_string(),
+            normalized_query: None,
+            used_like_fallback: true,
+            facet_count: 4,
+            facets_applied: vec![
+                "product_id".to_string(),
+                "product_budget_limited:true".to_string(),
+                "product_budget_tier:tight".to_string(),
+                "product_budget_remaining_ms:180".to_string(),
+            ],
+            sql: "SELECT ...".to_string(),
+            scope_policy: "unrestricted".to_string(),
+            denied_count: 0,
+            redacted_count: 0,
+        };
+
+        let diagnostics = derive_search_diagnostics(Some(&explain)).expect("diagnostics");
+
+        assert!(diagnostics.degraded);
+        assert_eq!(
+            diagnostics.fallback_mode.as_deref(),
+            Some("product_sql_budget_governor")
+        );
+        assert_eq!(diagnostics.budget_tier.as_deref(), Some("tight"));
+        assert_eq!(diagnostics.budget_remaining_ms, Some(180));
+        assert_eq!(diagnostics.budget_exhausted, Some(false));
     }
 
     #[test]
