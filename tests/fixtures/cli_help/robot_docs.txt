@@ -1,0 +1,10 @@
+Agent-targeted CLI docs and copy-paste workflow recipes
+
+Usage: am robot-docs <COMMAND>
+
+Commands:
+  guide  Print the agent-targeted CLI guide with copy-paste commands
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help

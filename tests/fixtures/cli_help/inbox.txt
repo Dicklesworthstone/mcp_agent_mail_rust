@@ -1,0 +1,16 @@
+Direct alias for `am robot inbox`
+
+Usage: am inbox [OPTIONS]
+
+Options:
+      --format <FORMAT>    Output format: toon or json
+      --json               Output JSON (shorthand for --format json)
+      --project <PROJECT>  Project key (absolute path or slug). Falls back to AGENT_MAIL_PROJECT, then CWD
+      --agent <AGENT>      Agent name. Falls back to AGENT_MAIL_AGENT, then AGENT_NAME
+      --urgent             Show only urgent messages
+      --ack-overdue        Show only ack-overdue messages
+      --unread             Show only unread messages
+      --all                Show all messages (no filtering)
+      --limit <LIMIT>      Maximum messages to return
+      --include-bodies     Include message bodies in output
+  -h, --help               Print help

@@ -69,6 +69,125 @@ pub type CliResult<T> = Result<T, CliError>;
 
 const UNKNOWN_SENDER_DISPLAY: &str = "[unknown sender]";
 
+#[derive(Debug, Serialize)]
+struct CliCapabilities {
+    schema_version: &'static str,
+    tool: &'static str,
+    version: &'static str,
+    binaries: Vec<&'static str>,
+    primary_agent_surfaces: BTreeMap<&'static str, &'static str>,
+    output_formats: CapabilityOutputFormats,
+    exit_codes: Vec<ExitCodeCapability>,
+    environment: Vec<EnvCapability>,
+    commands: Vec<CommandCapability>,
+}
+
+#[derive(Debug, Serialize)]
+struct CapabilityOutputFormats {
+    cli: Vec<&'static str>,
+    robot: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExitCodeCapability {
+    code: i32,
+    meaning: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct EnvCapability {
+    name: &'static str,
+    default: &'static str,
+    purpose: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct CommandCapability {
+    name: String,
+    about: String,
+    category: String,
+    direct_subcommands: Vec<String>,
+    supports_format_flag: bool,
+    supports_json_flag: bool,
+    output_formats: Vec<&'static str>,
+    project_scoped: bool,
+    recommended_for_agents: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RobotDocsGuide {
+    schema_version: &'static str,
+    title: &'static str,
+    quick_start: Vec<&'static str>,
+    sections: Vec<RobotDocsSection>,
+}
+
+#[derive(Debug, Serialize)]
+struct RobotDocsSection {
+    heading: &'static str,
+    commands: Vec<&'static str>,
+    notes: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentStartReport {
+    schema_version: &'static str,
+    tool: &'static str,
+    version: &'static str,
+    project: AgentStartProject,
+    agent: AgentStartIdentity,
+    runtime: AgentStartRuntime,
+    readiness: AgentStartReadiness,
+    commands: BTreeMap<&'static str, String>,
+    next_actions: Vec<AgentStartAction>,
+    notes: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentStartProject {
+    key: String,
+    source: &'static str,
+    absolute: bool,
+    exists: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentStartIdentity {
+    name: Option<String>,
+    source: &'static str,
+    detected: bool,
+    program: String,
+    model: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentStartRuntime {
+    database_url: String,
+    storage_root: String,
+    http_host: String,
+    http_port: String,
+    http_path: String,
+    http_url: String,
+    bearer_token_configured: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentStartReadiness {
+    project_ready: bool,
+    agent_ready: bool,
+    can_check_status: bool,
+    can_check_inbox: bool,
+    should_register_first: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentStartAction {
+    id: &'static str,
+    priority: u8,
+    command: String,
+    reason: &'static str,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "am", version = env!("CARGO_PKG_VERSION"), about = "MCP Agent Mail CLI (Rust)")]
 pub struct Cli {
@@ -95,6 +214,137 @@ pub enum Commands {
     },
     #[command(name = "serve-stdio")]
     ServeStdio,
+    /// Print the machine-readable CLI capabilities contract.
+    #[command(name = "capabilities")]
+    Capabilities {
+        /// Output format: table, json, or toon (default: table).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long)]
+        json: bool,
+    },
+    /// First-turn cockpit for agents: identity, project, runtime hints, and next actions.
+    #[command(name = "agent")]
+    Agent {
+        #[command(subcommand)]
+        action: AgentCommand,
+    },
+    /// Direct alias for `am robot status`.
+    #[command(name = "status")]
+    Status {
+        /// Output format: toon or json.
+        #[arg(long, value_parser = parse_robot_snapshot_output_format)]
+        format: Option<robot::OutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long)]
+        json: bool,
+        /// Project key (absolute path or slug). Falls back to AGENT_MAIL_PROJECT, then CWD.
+        #[arg(long)]
+        project: Option<String>,
+        /// Agent name. Falls back to AGENT_MAIL_AGENT, then AGENT_NAME.
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Direct alias for `am robot inbox`.
+    #[command(name = "inbox")]
+    Inbox {
+        /// Output format: toon or json.
+        #[arg(long, value_parser = parse_robot_snapshot_output_format)]
+        format: Option<robot::OutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long)]
+        json: bool,
+        /// Project key (absolute path or slug). Falls back to AGENT_MAIL_PROJECT, then CWD.
+        #[arg(long)]
+        project: Option<String>,
+        /// Agent name. Falls back to AGENT_MAIL_AGENT, then AGENT_NAME.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Show only urgent messages.
+        #[arg(long)]
+        urgent: bool,
+        /// Show only ack-overdue messages.
+        #[arg(long)]
+        ack_overdue: bool,
+        /// Show only unread messages.
+        #[arg(long)]
+        unread: bool,
+        /// Show all messages (no filtering).
+        #[arg(long)]
+        all: bool,
+        /// Maximum messages to return.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Include message bodies in output.
+        #[arg(long)]
+        include_bodies: bool,
+    },
+    /// Direct alias for `am robot reservations`.
+    #[command(name = "reservations")]
+    Reservations {
+        /// Output format: toon or json.
+        #[arg(long, value_parser = parse_robot_snapshot_output_format)]
+        format: Option<robot::OutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long)]
+        json: bool,
+        /// Project key (absolute path or slug). Falls back to AGENT_MAIL_PROJECT, then CWD.
+        #[arg(long)]
+        project: Option<String>,
+        /// Agent name. Falls back to AGENT_MAIL_AGENT, then AGENT_NAME.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Show reservations for all agents, not just the selected agent.
+        #[arg(long)]
+        all: bool,
+        /// Show only conflicting reservations.
+        #[arg(long)]
+        conflicts: bool,
+        /// Warn about reservations expiring within N minutes.
+        #[arg(long)]
+        expiring: Option<u32>,
+    },
+    /// Direct alias for `am robot health`.
+    #[command(name = "health")]
+    Health {
+        /// Output format: toon or json.
+        #[arg(long, value_parser = parse_robot_snapshot_output_format)]
+        format: Option<robot::OutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long)]
+        json: bool,
+        /// Project key (absolute path or slug). Falls back to AGENT_MAIL_PROJECT, then CWD.
+        #[arg(long)]
+        project: Option<String>,
+        /// Agent name. Falls back to AGENT_MAIL_AGENT, then AGENT_NAME.
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Direct alias for `am robot thread`.
+    #[command(name = "thread")]
+    Thread {
+        /// Thread ID.
+        id: String,
+        /// Output format: toon, json, or md.
+        #[arg(long, value_parser = parse_robot_alias_output_format)]
+        format: Option<robot::OutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long)]
+        json: bool,
+        /// Project key (absolute path or slug). Falls back to AGENT_MAIL_PROJECT, then CWD.
+        #[arg(long)]
+        project: Option<String>,
+        /// Agent name. Falls back to AGENT_MAIL_AGENT, then AGENT_NAME.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Maximum messages in thread.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Show messages after this timestamp.
+        #[arg(long)]
+        since: Option<String>,
+    },
     /// Check agent inbox for unread messages (for git hooks and editor integrations).
     #[command(name = "check-inbox")]
     CheckInbox {
@@ -373,6 +623,12 @@ pub enum Commands {
     /// Agent-optimized commands with TOON/JSON/Markdown output.
     #[command(name = "robot")]
     Robot(robot::RobotArgs),
+    /// Agent-targeted CLI docs and copy-paste workflow recipes.
+    #[command(name = "robot-docs")]
+    RobotDocs {
+        #[command(subcommand)]
+        action: RobotDocsCommand,
+    },
     /// Legacy Python installation detection, migration/import, and status.
     #[command(name = "legacy")]
     Legacy(legacy::LegacyArgs),
@@ -1570,6 +1826,46 @@ pub enum DocsCommand {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum RobotDocsCommand {
+    /// Print the agent-targeted CLI guide with copy-paste commands.
+    #[command(name = "guide")]
+    Guide {
+        /// Output format: table, json, or toon (default: table).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AgentCommand {
+    /// Print a side-effect-free first-turn cockpit with next actions.
+    #[command(name = "start", alias = "status", alias = "cockpit", alias = "doctor")]
+    Start {
+        /// Project key (absolute path or slug). Falls back to AGENT_MAIL_PROJECT, then CWD.
+        #[arg(long)]
+        project: Option<String>,
+        /// Agent name. Falls back to AGENT_MAIL_AGENT, then AGENT_NAME.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Agent program to use in suggested registration command.
+        #[arg(long, default_value = "codex-cli")]
+        program: String,
+        /// Model to use in suggested registration command (falls back to AGENT_MODEL, MODEL, then gpt-5.5).
+        #[arg(long)]
+        model: Option<String>,
+        /// Output format: table, json, or toon (default: table).
+        #[arg(long, value_parser)]
+        format: Option<output::CliOutputFormat>,
+        /// Output JSON (shorthand for --format json).
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum DoctorCommand {
     Check {
         project: Option<String>,
@@ -2267,6 +2563,92 @@ fn execute(cli: Cli) -> CliResult<()> {
             no_tui,
         } => handle_serve_http(host, port, path, no_auth, no_tui),
         Commands::ServeStdio => handle_serve_stdio(),
+        Commands::Capabilities { format, json } => handle_capabilities(format, json),
+        Commands::Agent { action } => handle_agent(action),
+        Commands::Status {
+            format,
+            json,
+            project,
+            agent,
+        } => robot::handle_robot(robot_alias_args(
+            format,
+            json,
+            project,
+            agent,
+            robot::RobotSubcommand::Status,
+        )),
+        Commands::Inbox {
+            format,
+            json,
+            project,
+            agent,
+            urgent,
+            ack_overdue,
+            unread,
+            all,
+            limit,
+            include_bodies,
+        } => robot::handle_robot(robot_alias_args(
+            format,
+            json,
+            project,
+            agent,
+            robot::RobotSubcommand::Inbox {
+                urgent,
+                ack_overdue,
+                unread,
+                all,
+                limit,
+                include_bodies,
+            },
+        )),
+        Commands::Reservations {
+            format,
+            json,
+            project,
+            agent,
+            all,
+            conflicts,
+            expiring,
+        } => robot::handle_robot(robot_alias_args(
+            format,
+            json,
+            project,
+            agent.clone(),
+            robot::RobotSubcommand::Reservations {
+                agent,
+                all,
+                conflicts,
+                expiring,
+            },
+        )),
+        Commands::Health {
+            format,
+            json,
+            project,
+            agent,
+        } => robot::handle_robot(robot_alias_args(
+            format,
+            json,
+            project,
+            agent,
+            robot::RobotSubcommand::Health,
+        )),
+        Commands::Thread {
+            id,
+            format,
+            json,
+            project,
+            agent,
+            limit,
+            since,
+        } => robot::handle_robot(robot_alias_args(
+            format,
+            json,
+            project,
+            agent,
+            robot::RobotSubcommand::Thread { id, limit, since },
+        )),
         Commands::CheckInbox {
             agent,
             rate_limit,
@@ -2348,6 +2730,7 @@ fn execute(cli: Cli) -> CliResult<()> {
         Commands::FlakeTriage { action } => handle_flake_triage(action),
         Commands::Atc { action } => handle_atc(action),
         Commands::Robot(args) => robot::handle_robot(args),
+        Commands::RobotDocs { action } => handle_robot_docs(action),
         Commands::Legacy(args) => legacy::handle_legacy(args),
         Commands::Upgrade(args) => legacy::handle_upgrade(args),
         Commands::SelfUpdate {
@@ -55486,6 +55869,744 @@ async fn handle_products_with(
 // ---------------------------------------------------------------------------
 // Docs commands
 // ---------------------------------------------------------------------------
+
+fn parse_robot_alias_output_format(value: &str) -> Result<robot::OutputFormat, String> {
+    value.parse()
+}
+
+fn parse_robot_snapshot_output_format(value: &str) -> Result<robot::OutputFormat, String> {
+    let format = parse_robot_alias_output_format(value)?;
+    if format == robot::OutputFormat::Markdown {
+        Err("unknown output format: markdown (expected toon or json)".to_string())
+    } else {
+        Ok(format)
+    }
+}
+
+fn robot_alias_args(
+    format: Option<robot::OutputFormat>,
+    json_mode: bool,
+    project: Option<String>,
+    agent: Option<String>,
+    command: robot::RobotSubcommand,
+) -> robot::RobotArgs {
+    robot::RobotArgs {
+        format: resolve_robot_alias_format(format, json_mode),
+        project,
+        agent,
+        command,
+    }
+}
+
+fn resolve_robot_alias_format(
+    format: Option<robot::OutputFormat>,
+    json_mode: bool,
+) -> Option<robot::OutputFormat> {
+    format.or_else(|| json_mode.then_some(robot::OutputFormat::Json))
+}
+
+fn handle_agent(action: AgentCommand) -> CliResult<()> {
+    match action {
+        AgentCommand::Start {
+            project,
+            agent,
+            program,
+            model,
+            format,
+            json,
+        } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
+            let report = build_agent_start_report(project, agent, program, model)?;
+            output::emit_output(&report, fmt, || render_agent_start_report(&report));
+            Ok(())
+        }
+    }
+}
+
+fn build_agent_start_report(
+    project: Option<String>,
+    agent: Option<String>,
+    program: String,
+    model: Option<String>,
+) -> CliResult<AgentStartReport> {
+    let (project_key, project_source) = detect_agent_project(project)?;
+    let (agent_name, agent_source) = detect_agent_name(agent);
+    let model = non_empty_arg(model)
+        .or_else(|| non_empty_env("AGENT_MODEL"))
+        .or_else(|| non_empty_env("MODEL"))
+        .unwrap_or_else(|| "gpt-5.5".to_string());
+
+    let database_url =
+        non_empty_env("DATABASE_URL").unwrap_or_else(|| "sqlite:///:memory:".to_string());
+    let storage_root =
+        non_empty_env("STORAGE_ROOT").unwrap_or_else(|| "XDG-aware default".to_string());
+    let http_host = non_empty_env("HTTP_HOST").unwrap_or_else(|| "127.0.0.1".to_string());
+    let http_port = non_empty_env("HTTP_PORT").unwrap_or_else(|| "8765".to_string());
+    let http_path = normalize_http_path(
+        non_empty_env("HTTP_PATH")
+            .unwrap_or_else(|| "/mcp/".to_string())
+            .as_str(),
+    );
+    let http_url = format!("http://{http_host}:{http_port}{http_path}");
+    let bearer_token_configured = non_empty_env("HTTP_BEARER_TOKEN").is_some();
+
+    let project_path = Path::new(&project_key);
+    let project_absolute = project_path.is_absolute();
+    let project_exists = project_path.exists();
+    let agent_ready = agent_name.is_some();
+    let project_ready = project_absolute && project_exists;
+
+    let mut commands = BTreeMap::new();
+    commands.insert(
+        "agent_cockpit",
+        scoped_agent_command(
+            "am agent start",
+            &project_key,
+            agent_name.as_deref(),
+            " --json",
+        ),
+    );
+    commands.insert(
+        "status",
+        scoped_agent_command("am status", &project_key, agent_name.as_deref(), " --json"),
+    );
+    commands.insert(
+        "urgent_inbox",
+        scoped_agent_command(
+            "am inbox",
+            &project_key,
+            agent_name.as_deref(),
+            " --urgent --json",
+        ),
+    );
+    commands.insert(
+        "reservations",
+        scoped_agent_command(
+            "am reservations",
+            &project_key,
+            agent_name.as_deref(),
+            " --conflicts --json",
+        ),
+    );
+    commands.insert(
+        "thread",
+        scoped_agent_command(
+            "am thread <thread_id>",
+            &project_key,
+            agent_name.as_deref(),
+            " --format md",
+        ),
+    );
+    commands.insert("capabilities", "am capabilities --json".to_string());
+    commands.insert("robot_guide", "am robot-docs guide".to_string());
+    commands.insert(
+        "register",
+        start_session_command(&project_key, agent_name.as_deref(), &program, &model),
+    );
+
+    let mut next_actions = Vec::new();
+    if !project_ready {
+        next_actions.push(AgentStartAction {
+            id: "use_absolute_project",
+            priority: 1,
+            command: format!(
+                "am agent start --project {} --agent {} --json",
+                shell_arg(&project_key),
+                agent_name
+                    .as_deref()
+                    .map(shell_arg)
+                    .unwrap_or_else(|| "<AgentName>".to_string())
+            ),
+            reason: "Project-scoped commands work best with an existing absolute project path.",
+        });
+    }
+    if !agent_ready {
+        next_actions.push(AgentStartAction {
+            id: "register_agent",
+            priority: 2,
+            command: commands
+                .get("register")
+                .cloned()
+                .expect("register command should be populated"),
+            reason: "Agent-scoped status and inbox commands need a registered agent identity.",
+        });
+    }
+    next_actions.push(AgentStartAction {
+        id: "check_status",
+        priority: 3,
+        command: commands
+            .get("status")
+            .cloned()
+            .expect("status command should be populated"),
+        reason: "Status gives the quickest health, inbox, activity, and reservation snapshot.",
+    });
+    next_actions.push(AgentStartAction {
+        id: "check_urgent_inbox",
+        priority: 4,
+        command: commands
+            .get("urgent_inbox")
+            .cloned()
+            .expect("urgent inbox command should be populated"),
+        reason: "Urgent inbox narrows attention to messages most likely to affect current work.",
+    });
+    next_actions.push(AgentStartAction {
+        id: "check_reservations",
+        priority: 5,
+        command: commands
+            .get("reservations")
+            .cloned()
+            .expect("reservations command should be populated"),
+        reason: "Reservations should be checked before editing shared files.",
+    });
+
+    Ok(AgentStartReport {
+        schema_version: "am.agent_start.v1",
+        tool: "am",
+        version: env!("CARGO_PKG_VERSION"),
+        project: AgentStartProject {
+            key: project_key,
+            source: project_source,
+            absolute: project_absolute,
+            exists: project_exists,
+        },
+        agent: AgentStartIdentity {
+            name: agent_name,
+            source: agent_source,
+            detected: agent_ready,
+            program,
+            model,
+        },
+        runtime: AgentStartRuntime {
+            database_url,
+            storage_root,
+            http_host,
+            http_port,
+            http_path,
+            http_url,
+            bearer_token_configured,
+        },
+        readiness: AgentStartReadiness {
+            project_ready,
+            agent_ready,
+            can_check_status: project_ready && agent_ready,
+            can_check_inbox: project_ready && agent_ready,
+            should_register_first: !agent_ready,
+        },
+        commands,
+        next_actions,
+        notes: vec![
+            "This command is side-effect-free; it does not register agents or mutate the archive.",
+            "Top-level aliases like am status and am inbox delegate to the robot command surface.",
+            "Use JSON for automation and TOON when token budget matters.",
+        ],
+    })
+}
+
+fn detect_agent_project(project: Option<String>) -> CliResult<(String, &'static str)> {
+    if let Some(value) = non_empty_arg(project) {
+        return Ok((value, "flag"));
+    }
+    if let Some(value) = non_empty_env("AGENT_MAIL_PROJECT") {
+        return Ok((value, "AGENT_MAIL_PROJECT"));
+    }
+    Ok((
+        std::env::current_dir()?.display().to_string(),
+        "current_directory",
+    ))
+}
+
+fn detect_agent_name(agent: Option<String>) -> (Option<String>, &'static str) {
+    if let Some(value) = non_empty_arg(agent) {
+        return (Some(value), "flag");
+    }
+    if let Some(value) = non_empty_env("AGENT_MAIL_AGENT") {
+        return (Some(value), "AGENT_MAIL_AGENT");
+    }
+    if let Some(value) = non_empty_env("AGENT_NAME") {
+        return (Some(value), "AGENT_NAME");
+    }
+    (None, "missing")
+}
+
+fn non_empty_arg(value: Option<String>) -> Option<String> {
+    value.filter(|raw| !raw.trim().is_empty())
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|raw| !raw.trim().is_empty())
+}
+
+fn scoped_agent_command(
+    base: &str,
+    project_key: &str,
+    agent_name: Option<&str>,
+    suffix: &str,
+) -> String {
+    let agent = agent_name
+        .map(shell_arg)
+        .unwrap_or_else(|| "<AgentName>".to_string());
+    format!(
+        "{base} --project {} --agent {agent}{suffix}",
+        shell_arg(project_key)
+    )
+}
+
+fn start_session_command(
+    project_key: &str,
+    agent_name: Option<&str>,
+    program: &str,
+    model: &str,
+) -> String {
+    let mut command = format!(
+        "am macros start-session --project {} --program {} --model {}",
+        shell_arg(project_key),
+        shell_arg(program),
+        shell_arg(model)
+    );
+    if let Some(agent_name) = agent_name {
+        command.push_str(" --agent-name ");
+        command.push_str(&shell_arg(agent_name));
+    }
+    command.push_str(" --format json");
+    command
+}
+
+fn shell_arg(value: &str) -> String {
+    if value.chars().all(|ch| {
+        ch.is_ascii_alphanumeric()
+            || matches!(ch, '/' | '.' | '_' | '-' | ':' | '@' | '=' | '+' | ',')
+    }) {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn render_agent_start_report(report: &AgentStartReport) {
+    output::section("Agent Start Cockpit:");
+    output::kv("Project", &report.project.key);
+    output::kv("Project source", report.project.source);
+    output::kv(
+        "Project ready",
+        if report.readiness.project_ready {
+            "yes"
+        } else {
+            "no"
+        },
+    );
+    output::kv("Agent", report.agent.name.as_deref().unwrap_or("<missing>"));
+    output::kv("Agent source", report.agent.source);
+    output::kv(
+        "Agent ready",
+        if report.readiness.agent_ready {
+            "yes"
+        } else {
+            "no"
+        },
+    );
+    output::kv("HTTP endpoint", &report.runtime.http_url);
+    output::kv("Schema", report.schema_version);
+    ftui_runtime::ftui_println!("");
+
+    let mut table = output::CliTable::new(vec!["PRIORITY", "ACTION", "COMMAND"]);
+    for action in &report.next_actions {
+        table.add_row(vec![
+            action.priority.to_string(),
+            action.id.to_string(),
+            action.command.clone(),
+        ]);
+    }
+    table.render();
+    ftui_runtime::ftui_println!("");
+    ftui_runtime::ftui_println!(
+        "Use `am agent start --json` for the parseable first-turn contract."
+    );
+}
+
+fn handle_capabilities(format: Option<output::CliOutputFormat>, json_mode: bool) -> CliResult<()> {
+    let fmt = output::CliOutputFormat::resolve(format, json_mode);
+    let capabilities = build_cli_capabilities();
+    output::emit_output(&capabilities, fmt, || {
+        render_capabilities_table(&capabilities);
+    });
+    Ok(())
+}
+
+fn build_cli_capabilities() -> CliCapabilities {
+    let mut primary_agent_surfaces = BTreeMap::new();
+    primary_agent_surfaces.insert("agent_cockpit", "am agent start --json");
+    primary_agent_surfaces.insert("capabilities", "am capabilities --json");
+    primary_agent_surfaces.insert("robot_guide", "am robot-docs guide");
+    primary_agent_surfaces.insert(
+        "status",
+        "am status --project /abs/path --agent <AgentName> --json",
+    );
+    primary_agent_surfaces.insert(
+        "urgent_inbox",
+        "am inbox --project /abs/path --agent <AgentName> --urgent --json",
+    );
+    primary_agent_surfaces.insert(
+        "deep_thread",
+        "am thread <thread_id> --project /abs/path --agent <AgentName> --format md",
+    );
+    primary_agent_surfaces.insert(
+        "reservations",
+        "am reservations --project /abs/path --agent <AgentName> --conflicts --json",
+    );
+    primary_agent_surfaces.insert("tool_schemas", "am tooling schemas --json");
+
+    CliCapabilities {
+        schema_version: "am.capabilities.v1",
+        tool: "am",
+        version: env!("CARGO_PKG_VERSION"),
+        binaries: vec!["am", "mcp-agent-mail"],
+        primary_agent_surfaces,
+        output_formats: CapabilityOutputFormats {
+            cli: vec!["table", "json", "toon"],
+            robot: vec!["toon", "json", "md"],
+        },
+        exit_codes: vec![
+            ExitCodeCapability {
+                code: 0,
+                meaning: "success",
+            },
+            ExitCodeCapability {
+                code: 1,
+                meaning: "runtime error",
+            },
+            ExitCodeCapability {
+                code: 2,
+                meaning: "usage error or wrong interface mode",
+            },
+        ],
+        environment: vec![
+            EnvCapability {
+                name: "AM_INTERFACE_MODE",
+                default: "mcp for mcp-agent-mail, cli for am",
+                purpose: "Selects MCP or CLI surface for dual-mode binaries.",
+            },
+            EnvCapability {
+                name: "DATABASE_URL",
+                default: "sqlite:///:memory:",
+                purpose: "SQLite index location.",
+            },
+            EnvCapability {
+                name: "STORAGE_ROOT",
+                default: "XDG-aware mailbox archive root",
+                purpose: "Git-backed archive location.",
+            },
+            EnvCapability {
+                name: "HTTP_HOST",
+                default: "127.0.0.1",
+                purpose: "HTTP MCP bind host.",
+            },
+            EnvCapability {
+                name: "HTTP_PORT",
+                default: "8765",
+                purpose: "HTTP MCP bind port.",
+            },
+            EnvCapability {
+                name: "HTTP_PATH",
+                default: "/mcp/",
+                purpose: "HTTP MCP base path.",
+            },
+            EnvCapability {
+                name: "HTTP_BEARER_TOKEN",
+                default: "loaded from config when present",
+                purpose: "Bearer token for authenticated HTTP transport.",
+            },
+            EnvCapability {
+                name: "AGENT_NAME",
+                default: "",
+                purpose: "Fallback agent identity for local CLI flows.",
+            },
+            EnvCapability {
+                name: "AGENT_MAIL_PROJECT",
+                default: "current directory",
+                purpose: "Fallback project key for agent-scoped commands.",
+            },
+            EnvCapability {
+                name: "TUI_ENABLED",
+                default: "true",
+                purpose: "Enables the interactive operations console.",
+            },
+            EnvCapability {
+                name: "WORKTREES_ENABLED",
+                default: "false",
+                purpose: "Enables build slot workflows.",
+            },
+        ],
+        commands: collect_command_catalog(),
+    }
+}
+
+fn collect_command_catalog() -> Vec<CommandCapability> {
+    let root = Cli::command();
+    let mut commands = Vec::new();
+    for command in root
+        .get_subcommands()
+        .filter(|command| !command.is_hide_set())
+    {
+        collect_command_capability(command, "", &mut commands);
+    }
+    commands.sort_by(|left, right| left.name.cmp(&right.name));
+    commands
+}
+
+fn collect_command_capability(
+    command: &clap::Command,
+    prefix: &str,
+    commands: &mut Vec<CommandCapability>,
+) {
+    let name = if prefix.is_empty() {
+        command.get_name().to_string()
+    } else {
+        format!("{prefix} {}", command.get_name())
+    };
+    let direct_subcommands = command
+        .get_subcommands()
+        .filter(|subcommand| !subcommand.is_hide_set())
+        .map(|subcommand| subcommand.get_name().to_string())
+        .collect::<Vec<_>>();
+    let supports_format_flag = command_has_arg(command, "format") || name.starts_with("robot ");
+    let supports_json_flag = command_has_arg(command, "json") || name.starts_with("robot ");
+    let project_scoped =
+        command_has_any_arg(command, &["project", "project_key"]) || name.starts_with("robot ");
+
+    commands.push(CommandCapability {
+        about: command_about(command),
+        category: command_category(&name).to_string(),
+        direct_subcommands,
+        output_formats: command_output_formats(&name, supports_format_flag, supports_json_flag),
+        project_scoped,
+        recommended_for_agents: command_recommended_for_agents(&name),
+        supports_format_flag,
+        supports_json_flag,
+        name: name.clone(),
+    });
+
+    for subcommand in command
+        .get_subcommands()
+        .filter(|subcommand| !subcommand.is_hide_set())
+    {
+        collect_command_capability(subcommand, &name, commands);
+    }
+}
+
+fn command_has_arg(command: &clap::Command, id: &str) -> bool {
+    command
+        .get_arguments()
+        .any(|argument| argument.get_id().as_str() == id)
+}
+
+fn command_has_any_arg(command: &clap::Command, ids: &[&str]) -> bool {
+    command
+        .get_arguments()
+        .any(|argument| ids.contains(&argument.get_id().as_str()))
+}
+
+fn command_about(command: &clap::Command) -> String {
+    command
+        .get_about()
+        .or_else(|| command.get_long_about())
+        .map(std::string::ToString::to_string)
+        .unwrap_or_default()
+}
+
+fn command_category(name: &str) -> &str {
+    name.split_whitespace().next().unwrap_or(name)
+}
+
+fn command_output_formats(
+    name: &str,
+    supports_format_flag: bool,
+    supports_json_flag: bool,
+) -> Vec<&'static str> {
+    if name == "thread" || name == "robot thread" || name == "robot message" {
+        return vec!["toon", "json", "md"];
+    }
+    if matches!(name, "status" | "inbox" | "reservations" | "health") {
+        return vec!["toon", "json"];
+    }
+    if name.starts_with("robot ") {
+        return vec!["toon", "json"];
+    }
+    if supports_format_flag {
+        return vec!["table", "json", "toon"];
+    }
+    if supports_json_flag {
+        return vec!["json"];
+    }
+    Vec::new()
+}
+
+fn command_recommended_for_agents(name: &str) -> bool {
+    matches!(
+        command_category(name),
+        "capabilities"
+            | "agent"
+            | "status"
+            | "inbox"
+            | "reservations"
+            | "health"
+            | "thread"
+            | "robot-docs"
+            | "robot"
+            | "tooling"
+            | "doctor"
+            | "check"
+            | "check-inbox"
+            | "projects"
+            | "agents"
+            | "mail"
+            | "contacts"
+            | "file_reservations"
+            | "beads"
+    )
+}
+
+fn render_capabilities_table(capabilities: &CliCapabilities) {
+    output::section("Agent CLI Capabilities:");
+    output::kv("Tool", capabilities.tool);
+    output::kv("Version", capabilities.version);
+    output::kv("Schema", capabilities.schema_version);
+    output::kv("Catalog entries", &capabilities.commands.len().to_string());
+    ftui_runtime::ftui_println!("");
+
+    let mut table = output::CliTable::new(vec!["SURFACE", "COMMAND"]);
+    for (surface, command) in &capabilities.primary_agent_surfaces {
+        table.add_row(vec![(*surface).to_string(), (*command).to_string()]);
+    }
+    table.render();
+    ftui_runtime::ftui_println!("");
+    ftui_runtime::ftui_println!(
+        "Use `am capabilities --json` for the full command catalog and parseable contract."
+    );
+}
+
+fn handle_robot_docs(action: RobotDocsCommand) -> CliResult<()> {
+    match action {
+        RobotDocsCommand::Guide { format, json } => {
+            let fmt = output::CliOutputFormat::resolve(format, json);
+            let guide = build_robot_docs_guide();
+            output::emit_output(&guide, fmt, || {
+                render_robot_docs_guide(&guide);
+            });
+            Ok(())
+        }
+    }
+}
+
+fn build_robot_docs_guide() -> RobotDocsGuide {
+    RobotDocsGuide {
+        schema_version: "am.robot_docs.v1",
+        title: "am robot docs guide",
+        quick_start: vec![
+            "am agent start --json",
+            "am capabilities --json",
+            "am status --project /abs/path --agent <AgentName> --json",
+            "am inbox --project /abs/path --agent <AgentName> --urgent --json",
+            "am reservations --project /abs/path --agent <AgentName> --conflicts --json",
+            "am thread <thread_id> --project /abs/path --agent <AgentName> --format md",
+            "am tooling schemas --json",
+        ],
+        sections: vec![
+            RobotDocsSection {
+                heading: "Discover",
+                commands: vec![
+                    "am agent start --json",
+                    "am capabilities --json",
+                    "am robot-docs guide",
+                ],
+                notes: vec![
+                    "Start with the agent cockpit when you need identity, project, runtime hints, and next actions.",
+                    "Start with the capabilities contract when automating against an unknown am binary.",
+                    "Use the guide when you need human-readable command recipes without leaving the terminal.",
+                ],
+            },
+            RobotDocsSection {
+                heading: "Start of Turn",
+                commands: vec![
+                    "am status --project /abs/path --agent <AgentName> --json",
+                    "am inbox --project /abs/path --agent <AgentName> --urgent --json",
+                    "am reservations --project /abs/path --agent <AgentName> --conflicts --json",
+                ],
+                notes: vec![
+                    "Top-level aliases delegate to am robot so the obvious command names work.",
+                    "Status summarizes health, inbox pressure, activity, reservations, and top threads.",
+                    "Inbox with --urgent narrows attention to high-importance or acknowledgement-sensitive work.",
+                    "Reservations should be checked before editing shared files.",
+                ],
+            },
+            RobotDocsSection {
+                heading: "Deep Drilldown",
+                commands: vec![
+                    "am robot search <query> --project /abs/path --agent <AgentName> --format json",
+                    "am thread <thread_id> --project /abs/path --agent <AgentName> --format md",
+                    "am robot message <id> --project /abs/path --agent <AgentName> --format md",
+                    "am robot navigate resource://thread/<id> --project /abs/path --agent <AgentName> --format json",
+                ],
+                notes: vec![
+                    "Search returns structured facets and relevance data.",
+                    "Thread and message are the prose-friendly robot commands; use markdown there for context reads.",
+                ],
+            },
+            RobotDocsSection {
+                heading: "Output Contract",
+                commands: vec![
+                    "am status --json",
+                    "am status --format toon",
+                    "am thread <thread_id> --format md",
+                ],
+                notes: vec![
+                    "Use JSON for strict parsing in automation.",
+                    "Use TOON for compact agent-readable snapshots.",
+                    "Markdown is intentionally limited to thread and message views.",
+                ],
+            },
+            RobotDocsSection {
+                heading: "Coordination Safety",
+                commands: vec![
+                    "am reservations --project /abs/path --agent <AgentName> --json",
+                    "am robot contacts --project /abs/path --agent <AgentName> --format json",
+                    "am robot timeline --project /abs/path --agent <AgentName> --since <iso8601> --format json",
+                ],
+                notes: vec![
+                    "Reserve the exact edit surface before touching shared files.",
+                    "Broadcast send_message is intentionally unsupported.",
+                    "Use the timeline command for incremental monitoring loops.",
+                ],
+            },
+        ],
+    }
+}
+
+fn render_robot_docs_guide(guide: &RobotDocsGuide) {
+    ftui_runtime::ftui_println!("# {}", guide.title);
+    ftui_runtime::ftui_println!("");
+    ftui_runtime::ftui_println!("## Quick Start");
+    for command in &guide.quick_start {
+        ftui_runtime::ftui_println!("- `{command}`");
+    }
+    for section in &guide.sections {
+        ftui_runtime::ftui_println!("");
+        ftui_runtime::ftui_println!("## {}", section.heading);
+        if !section.commands.is_empty() {
+            ftui_runtime::ftui_println!("Commands:");
+            for command in &section.commands {
+                ftui_runtime::ftui_println!("- `{command}`");
+            }
+        }
+        if !section.notes.is_empty() {
+            ftui_runtime::ftui_println!("Notes:");
+            for note in &section.notes {
+                ftui_runtime::ftui_println!("- {note}");
+            }
+        }
+    }
+}
 
 fn handle_docs(action: DocsCommand) -> CliResult<()> {
     match action {

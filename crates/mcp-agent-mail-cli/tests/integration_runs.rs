@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use mcp_agent_mail_db::sqlmodel::Value as SqlValue;
+use serde_json::Value;
 
 fn am_bin() -> PathBuf {
     // Cargo sets this for integration tests.
@@ -89,6 +90,10 @@ impl TestEnv {
             (
                 "STORAGE_ROOT".to_string(),
                 self.storage_root.display().to_string(),
+            ),
+            (
+                "AM_ALLOW_EPHEMERAL_PROJECT_ROOTS".to_string(),
+                "1".to_string(),
             ),
             // Guard check requires this.
             ("AGENT_NAME".to_string(), "RusticGlen".to_string()),
@@ -373,6 +378,141 @@ fn assert_success(
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[test]
+fn capabilities_json_exposes_agent_contract() {
+    let env = TestEnv::new();
+    let out = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &["capabilities", "--json"],
+        None,
+    );
+    if !out.status.success() {
+        write_artifact("capabilities_json", &["capabilities", "--json"], &out);
+        panic!(
+            "expected success\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let value: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(value["schema_version"].as_str(), Some("am.capabilities.v1"));
+    assert_eq!(
+        value["primary_agent_surfaces"]["capabilities"].as_str(),
+        Some("am capabilities --json")
+    );
+    assert_eq!(
+        value["primary_agent_surfaces"]["agent_cockpit"].as_str(),
+        Some("am agent start --json")
+    );
+    assert_eq!(
+        value["primary_agent_surfaces"]["status"].as_str(),
+        Some("am status --project /abs/path --agent <AgentName> --json")
+    );
+    let commands = value["commands"]
+        .as_array()
+        .expect("commands should be an array");
+    assert!(
+        commands.iter().any(|command| {
+            command["name"].as_str() == Some("robot status")
+                && command["recommended_for_agents"].as_bool() == Some(true)
+        }),
+        "robot status should be present and marked agent-recommended"
+    );
+    assert!(
+        commands.iter().any(|command| {
+            command["name"].as_str() == Some("status")
+                && command["recommended_for_agents"].as_bool() == Some(true)
+        }),
+        "top-level status alias should be present and marked agent-recommended"
+    );
+    assert!(
+        commands
+            .iter()
+            .any(|command| command["name"].as_str() == Some("robot-docs guide")),
+        "robot-docs guide should be present in the command catalog"
+    );
+}
+
+#[test]
+fn agent_start_json_surfaces_first_turn_cockpit() {
+    let env = TestEnv::new();
+    let project = env.tmp.path().display().to_string();
+    let out = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &[
+            "agent",
+            "start",
+            "--project",
+            &project,
+            "--agent",
+            "BlueLake",
+            "--program",
+            "codex-cli",
+            "--model",
+            "gpt-5.5",
+            "--json",
+        ],
+        None,
+    );
+    if !out.status.success() {
+        write_artifact("agent_start_json", &["agent", "start", "--json"], &out);
+        panic!(
+            "expected success\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let value: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(value["schema_version"].as_str(), Some("am.agent_start.v1"));
+    assert_eq!(value["project"]["key"].as_str(), Some(project.as_str()));
+    assert_eq!(value["agent"]["name"].as_str(), Some("BlueLake"));
+    assert_eq!(value["readiness"]["agent_ready"].as_bool(), Some(true));
+    let expected_status = format!("am status --project {project} --agent BlueLake --json");
+    assert_eq!(
+        value["commands"]["status"].as_str(),
+        Some(expected_status.as_str())
+    );
+    let next_actions = value["next_actions"]
+        .as_array()
+        .expect("next_actions should be an array");
+    assert!(
+        next_actions
+            .iter()
+            .any(|action| action["id"].as_str() == Some("check_status")),
+        "agent start should recommend checking status"
+    );
+}
+
+#[test]
+fn robot_docs_guide_prints_agent_handbook() {
+    let env = TestEnv::new();
+    let out = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &["robot-docs", "guide"],
+        None,
+    );
+    if !out.status.success() {
+        write_artifact("robot_docs_guide", &["robot-docs", "guide"], &out);
+        panic!(
+            "expected success\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let stdout = String::from_utf8(out.stdout).expect("stdout should be utf-8");
+    assert!(stdout.contains("am agent start --json"));
+    assert!(stdout.contains("am capabilities --json"));
+    assert!(stdout.contains("am status --project /abs/path --agent <AgentName>"));
+    assert!(stdout.contains("am tooling schemas --json"));
+    assert!(stdout.contains("Broadcast send_message is intentionally unsupported."));
 }
 
 #[test]

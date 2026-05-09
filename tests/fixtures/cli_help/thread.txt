@@ -1,0 +1,15 @@
+Direct alias for `am robot thread`
+
+Usage: am thread [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Thread ID
+
+Options:
+      --format <FORMAT>    Output format: toon, json, or md
+      --json               Output JSON (shorthand for --format json)
+      --project <PROJECT>  Project key (absolute path or slug). Falls back to AGENT_MAIL_PROJECT, then CWD
+      --agent <AGENT>      Agent name. Falls back to AGENT_MAIL_AGENT, then AGENT_NAME
+      --limit <LIMIT>      Maximum messages in thread
+      --since <SINCE>      Show messages after this timestamp
+  -h, --help               Print help

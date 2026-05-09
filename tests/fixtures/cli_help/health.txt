@@ -1,0 +1,10 @@
+Direct alias for `am robot health`
+
+Usage: am health [OPTIONS]
+
+Options:
+      --format <FORMAT>    Output format: toon or json
+      --json               Output JSON (shorthand for --format json)
+      --project <PROJECT>  Project key (absolute path or slug). Falls back to AGENT_MAIL_PROJECT, then CWD
+      --agent <AGENT>      Agent name. Falls back to AGENT_MAIL_AGENT, then AGENT_NAME
+  -h, --help               Print help

@@ -136,6 +136,14 @@ fn cli_help_snapshots() {
     // br-2ei.5.7.3: golden help snapshots
     let cases: &[(&str, &[&str])] = &[
         ("top_level", &["--help"]),
+        ("capabilities", &["capabilities", "--help"]),
+        ("agent", &["agent", "--help"]),
+        ("agent_start", &["agent", "start", "--help"]),
+        ("status", &["status", "--help"]),
+        ("inbox", &["inbox", "--help"]),
+        ("reservations", &["reservations", "--help"]),
+        ("health", &["health", "--help"]),
+        ("thread", &["thread", "--help"]),
         ("check", &["check", "--help"]),
         ("serve_http", &["serve-http", "--help"]),
         ("serve_stdio", &["serve-stdio", "--help"]),
@@ -150,6 +158,8 @@ fn cli_help_snapshots() {
         ("products", &["products", "--help"]),
         ("docs", &["docs", "--help"]),
         ("docs_insert_blurbs", &["docs", "insert-blurbs", "--help"]),
+        ("robot_docs", &["robot-docs", "--help"]),
+        ("robot_docs_guide", &["robot-docs", "guide", "--help"]),
         ("migrate", &["migrate", "--help"]),
         (
             "clear_and_reset_everything",

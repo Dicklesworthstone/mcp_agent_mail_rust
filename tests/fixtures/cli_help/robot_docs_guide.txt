@@ -1,0 +1,8 @@
+Print the agent-targeted CLI guide with copy-paste commands
+
+Usage: am robot-docs guide [OPTIONS]
+
+Options:
+      --format <FORMAT>  Output format: table, json, or toon (default: table)
+      --json             Output JSON (shorthand for --format json)
+  -h, --help             Print help

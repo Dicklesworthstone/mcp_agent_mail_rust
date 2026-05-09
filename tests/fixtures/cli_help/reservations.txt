@@ -1,0 +1,13 @@
+Direct alias for `am robot reservations`
+
+Usage: am reservations [OPTIONS]
+
+Options:
+      --format <FORMAT>      Output format: toon or json
+      --json                 Output JSON (shorthand for --format json)
+      --project <PROJECT>    Project key (absolute path or slug). Falls back to AGENT_MAIL_PROJECT, then CWD
+      --agent <AGENT>        Agent name. Falls back to AGENT_MAIL_AGENT, then AGENT_NAME
+      --all                  Show reservations for all agents, not just the selected agent
+      --conflicts            Show only conflicting reservations
+      --expiring <EXPIRING>  Warn about reservations expiring within N minutes
+  -h, --help                 Print help

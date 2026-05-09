@@ -1,0 +1,12 @@
+Print a side-effect-free first-turn cockpit with next actions
+
+Usage: am agent start [OPTIONS]
+
+Options:
+      --project <PROJECT>  Project key (absolute path or slug). Falls back to AGENT_MAIL_PROJECT, then CWD
+      --agent <AGENT>      Agent name. Falls back to AGENT_MAIL_AGENT, then AGENT_NAME
+      --program <PROGRAM>  Agent program to use in suggested registration command [default: codex-cli]
+      --model <MODEL>      Model to use in suggested registration command (falls back to AGENT_MODEL, MODEL, then gpt-5.5)
+      --format <FORMAT>    Output format: table, json, or toon (default: table)
+      --json               Output JSON (shorthand for --format json)
+  -h, --help               Print help
