@@ -186,7 +186,10 @@ pub use atc_queries::{
     CompactSummary, ExperienceStream, ExpiredExperienceCandidate, OpenExperienceFilter,
     OpenExperienceSummary, RollupEntry, SequenceRange,
 };
-pub use cache::{CacheEntryCounts, CacheMetrics, CacheMetricsSnapshot, cache_metrics, read_cache};
+pub use cache::{
+    CacheDiagnosticsSnapshot, CacheEntryCounts, CacheFootprintEstimate, CacheMetrics,
+    CacheMetricsSnapshot, cache_diagnostics_snapshot, cache_metrics, read_cache,
+};
 pub use coalesce::{CoalesceMap, CoalesceMetrics, CoalesceOutcome};
 pub use error::{DbError, DbResult, is_corruption_error, is_lock_error, is_pool_exhausted_error};
 pub use forensics::{

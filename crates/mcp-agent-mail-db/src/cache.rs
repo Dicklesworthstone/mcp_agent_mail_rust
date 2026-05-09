@@ -217,6 +217,7 @@ impl CacheMetrics {
     }
 
     /// Take a snapshot of the current metric values.
+    #[must_use]
     pub fn snapshot(&self) -> CacheMetricsSnapshot {
         CacheMetricsSnapshot {
             project_hits: self.project_hits.load(Ordering::Relaxed),
@@ -225,6 +226,15 @@ impl CacheMetrics {
             agent_misses: self.agent_misses.load(Ordering::Relaxed),
             inbox_stats_hits: self.inbox_stats_hits.load(Ordering::Relaxed),
             inbox_stats_misses: self.inbox_stats_misses.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Take a combined hit/miss and memory-footprint diagnostic snapshot.
+    #[must_use]
+    pub fn diagnostics_snapshot(&self, cache: &ReadCache) -> CacheDiagnosticsSnapshot {
+        CacheDiagnosticsSnapshot {
+            metrics: self.snapshot(),
+            footprint: cache.footprint_estimate(),
         }
     }
 }
@@ -1165,6 +1175,13 @@ pub struct CacheFootprintEstimate {
     pub total_estimated_bytes: usize,
 }
 
+/// Operator-facing read-cache diagnostic snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheDiagnosticsSnapshot {
+    pub metrics: CacheMetricsSnapshot,
+    pub footprint: CacheFootprintEstimate,
+}
+
 fn estimate_project_row_bytes(row: &ProjectRow) -> usize {
     size_of::<ProjectRow>()
         .saturating_add(row.slug.len())
@@ -1186,6 +1203,12 @@ static READ_CACHE: OnceLock<ReadCache> = OnceLock::new();
 /// Get the global read cache instance.
 pub fn read_cache() -> &'static ReadCache {
     READ_CACHE.get_or_init(ReadCache::new)
+}
+
+/// Get a combined snapshot of global read-cache counters and footprint.
+#[must_use]
+pub fn cache_diagnostics_snapshot() -> CacheDiagnosticsSnapshot {
+    CACHE_METRICS.diagnostics_snapshot(read_cache())
 }
 
 #[cfg(test)]
@@ -1707,6 +1730,50 @@ mod tests {
         assert_eq!(
             footprint.agent_payload_bytes,
             estimate_agent_row_bytes(&agent)
+        );
+    }
+
+    #[test]
+    fn diagnostics_snapshot_combines_counters_and_footprint() {
+        let metrics = CacheMetrics::new();
+        let cache = ReadCache::new();
+        let project = make_project("diag");
+
+        metrics.record_project_hit();
+        metrics.record_project_miss();
+        cache.put_project(&project);
+
+        let snapshot = metrics.diagnostics_snapshot(&cache);
+
+        assert_eq!(snapshot.metrics.project_hits, 1);
+        assert_eq!(snapshot.metrics.project_misses, 1);
+        assert_eq!(snapshot.footprint.counts.projects_by_slug, 1);
+        assert_eq!(snapshot.footprint.counts.projects_by_human_key, 1);
+        assert_eq!(
+            snapshot.footprint.project_payload_bytes,
+            estimate_project_row_bytes(&project)
+        );
+        assert!(snapshot.footprint.total_estimated_bytes > 0);
+    }
+
+    #[test]
+    fn diagnostics_snapshot_serializes_metrics_and_footprint_fields() {
+        let metrics = CacheMetrics::new();
+        let cache = ReadCache::new();
+
+        metrics.record_agent_miss();
+        cache.put_agent(&make_agent("DiagAgent", 3));
+
+        let snapshot = metrics.diagnostics_snapshot(&cache);
+        let value = serde_json::to_value(&snapshot).expect("diagnostic snapshot serializes");
+
+        assert_eq!(value["metrics"]["agent_misses"], 1);
+        assert_eq!(value["footprint"]["counts"]["agents_by_key"], 1);
+        assert!(
+            value["footprint"]["total_estimated_bytes"]
+                .as_u64()
+                .expect("estimated bytes should serialize as a number")
+                > 0
         );
     }
 
