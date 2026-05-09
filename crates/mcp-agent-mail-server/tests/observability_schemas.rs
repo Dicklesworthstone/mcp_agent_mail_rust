@@ -117,7 +117,7 @@ fn validate_type(name: &str, value: &Value, property: &Value) -> Result<(), Stri
     match property.get("type").and_then(Value::as_str) {
         Some("string") if !value.is_string() => Err(format!("{name} must be a string")),
         Some("number") if !value.is_number() => Err(format!("{name} must be a number")),
-        Some("integer") if !value.as_u64().is_some() && !value.as_i64().is_some() => {
+        Some("integer") if value.as_u64().is_none() && value.as_i64().is_none() => {
             Err(format!("{name} must be an integer"))
         }
         Some("boolean") if !value.is_boolean() => Err(format!("{name} must be a boolean")),

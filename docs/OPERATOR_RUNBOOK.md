@@ -260,7 +260,7 @@ is used in hot paths.
 | `AM_CACHE_PROFILE`             | `balanced`            | Cache budget preset: `conservative`, `balanced`, or `high-memory` |
 | `DATABASE_CACHE_BUDGET_KB`     | profile-derived `524288` | Total SQLite page-cache budget across pooled connections, clamped to 16 MiB..4 GiB |
 | `INTEGRITY_CHECK_ON_STARTUP`   | `true`                | Run `PRAGMA quick_check` at boot |
-| `INTEGRITY_CHECK_INTERVAL_HOURS` | `24`               | Periodic full integrity check    |
+| `INTEGRITY_CHECK_INTERVAL_HOURS` | `1`                | Periodic full integrity check    |
 
 ### HTTP Server
 
@@ -291,6 +291,9 @@ is used in hot paths.
 | `MEMORY_WARNING_MB`             | `2048`  | RSS warning threshold (MB)         |
 | `MEMORY_CRITICAL_MB`            | `4096`  | RSS critical threshold (MB)        |
 | `MEMORY_FATAL_MB`               | `8192`  | RSS fatal threshold (MB)           |
+| `AM_HEALTH_SWEEP_ENABLED`       | `true`  | Enable periodic read-only git ref-integrity sweeps |
+| `AM_HEALTH_SWEEP_INTERVAL_SEC`  | `900`   | Seconds between git ref-integrity sweep cycles |
+| `AM_HEALTH_SWEEP_BATCH`         | `5`     | Registered projects checked per sweep cycle |
 
 ### TUI
 

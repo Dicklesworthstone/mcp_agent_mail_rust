@@ -161,6 +161,11 @@ pub struct Config {
     pub archive_maintenance_enabled: bool,
     pub archive_maintenance_interval_secs: u64,
 
+    // Periodic git health sweep (read-only orphan-ref detection)
+    pub health_sweep_enabled: bool,
+    pub health_sweep_interval_seconds: u64,
+    pub health_sweep_batch: usize,
+
     // Memory pressure monitoring (RSS-based)
     pub memory_warning_mb: u64,
     pub memory_critical_mb: u64,
@@ -1169,6 +1174,11 @@ impl Default for Config {
             archive_maintenance_enabled: true,
             archive_maintenance_interval_secs: 1800, // 30 minutes
 
+            // Periodic git health sweep
+            health_sweep_enabled: true,
+            health_sweep_interval_seconds: 900, // 15 minutes
+            health_sweep_batch: 5,
+
             // Memory pressure monitoring
             memory_warning_mb: 2048,  // 2 GB
             memory_critical_mb: 4096, // 4 GB
@@ -1474,6 +1484,12 @@ impl std::fmt::Debug for Config {
             .field("storage_root", &self.storage_root)
             .field("ephemeral_mode", &self.ephemeral_mode)
             .field("ephemeral_root", &self.ephemeral_root)
+            .field("health_sweep_enabled", &self.health_sweep_enabled)
+            .field(
+                "health_sweep_interval_seconds",
+                &self.health_sweep_interval_seconds,
+            )
+            .field("health_sweep_batch", &self.health_sweep_batch)
             .field("log_level", &self.log_level)
             .field("tui_enabled", &self.tui_enabled)
             .finish_non_exhaustive()
@@ -1633,6 +1649,17 @@ impl Config {
             config.archive_maintenance_interval_secs =
                 raw.clamp(MIN_MAINTENANCE_INTERVAL_SECS, MAX_MAINTENANCE_INTERVAL_SECS);
         }
+
+        // Periodic git health sweep
+        config.health_sweep_enabled =
+            env_bool("AM_HEALTH_SWEEP_ENABLED", config.health_sweep_enabled);
+        config.health_sweep_interval_seconds = env_u64(
+            "AM_HEALTH_SWEEP_INTERVAL_SEC",
+            config.health_sweep_interval_seconds,
+        )
+        .max(1);
+        config.health_sweep_batch =
+            env_usize("AM_HEALTH_SWEEP_BATCH", config.health_sweep_batch).max(1);
 
         // Memory pressure monitoring
         config.memory_warning_mb = env_u64("MEMORY_WARNING_MB", config.memory_warning_mb);
@@ -3337,6 +3364,42 @@ mod tests {
         let _env = TestEnvOverrideGuard::set(&[("AM_ARCHIVE_MAINTENANCE_DISABLED", "1")]);
         let config = Config::from_env();
         assert!(!config.archive_maintenance_enabled);
+    }
+
+    #[test]
+    fn test_health_sweep_config_defaults() {
+        let config = Config::default();
+        assert!(config.health_sweep_enabled);
+        assert_eq!(config.health_sweep_interval_seconds, 900);
+        assert_eq!(config.health_sweep_batch, 5);
+    }
+
+    #[test]
+    fn test_health_sweep_config_from_env() {
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_HEALTH_SWEEP_ENABLED", "false"),
+            ("AM_HEALTH_SWEEP_INTERVAL_SEC", "60"),
+            ("AM_HEALTH_SWEEP_BATCH", "12"),
+        ]);
+
+        let config = Config::from_env();
+        assert!(!config.health_sweep_enabled);
+        assert_eq!(config.health_sweep_interval_seconds, 60);
+        assert_eq!(config.health_sweep_batch, 12);
+    }
+
+    #[test]
+    fn test_health_sweep_interval_invalid_env_falls_back_to_default() {
+        let _env = TestEnvOverrideGuard::set(&[("AM_HEALTH_SWEEP_INTERVAL_SEC", "garbage")]);
+        let config = Config::from_env();
+        assert_eq!(config.health_sweep_interval_seconds, 900);
+    }
+
+    #[test]
+    fn test_health_sweep_batch_floor_is_one() {
+        let _env = TestEnvOverrideGuard::set(&[("AM_HEALTH_SWEEP_BATCH", "0")]);
+        let config = Config::from_env();
+        assert_eq!(config.health_sweep_batch, 1);
     }
 
     #[test]

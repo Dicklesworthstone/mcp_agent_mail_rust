@@ -1,6 +1,6 @@
 # Git 2.51 Observability Contract
 
-spec_version: 1.0.0
+spec_version: 1.1.0
 
 This document is the single source of truth for event names, baseline fields,
 metric labels, and schema locations for the git 2.51.0 mitigation work. The
@@ -81,7 +81,7 @@ Draft 2020-12, has a stable `$id` under
 | `reservation_activity.schema.json` | `reservation_activity_*` events. |
 | `pathspec_walk.schema.json` | `pathspec_walk_*` events. |
 | `doctor_fix_orphan_refs.schema.json` | `fix_orphan_refs_*`, `ref_pruned`, packed refs and backup events. |
-| `health_sweep.schema.json` | F5 health sweep events that consume this contract. |
+| `health_sweep.schema.json` | F5 health sweep events: `git_ref_integrity_started`, `git_ref_integrity_swept`, `git_ref_integrity_finding`, `git_ref_integrity_completed`. |
 | `boot_check.schema.json` | F8 boot-time archive integrity events that consume this contract. |
 
 Each schema enumerates:
@@ -120,7 +120,18 @@ The checker may use `ast-grep` when available and falls back to text scanning.
 The fallback is deliberately conservative: it is good enough for the current
 macro shape and reports locations so humans can inspect uncertain cases.
 
-## 6. Cross-References
+## 6. Health Sweep Configuration
+
+The F5 git ref-integrity sweep is read-only. It reuses libgit2 orphan-ref
+detection and never invokes the manual prune/repack path.
+
+| variable | default | description |
+|---|---|---|
+| `AM_HEALTH_SWEEP_ENABLED` | `true` | Enables the periodic git ref-integrity sweep. |
+| `AM_HEALTH_SWEEP_INTERVAL_SEC` | `900` | Cadence between sweep cycles in seconds. |
+| `AM_HEALTH_SWEEP_BATCH` | `5` | Maximum registered projects checked per cycle before advancing the cursor. |
+
+## 7. Cross-References
 
 - `br-fqs7t` - E4 TUI toast: consumes `git_segfault_retry` fields and displays
   `repo_slug`.
@@ -133,4 +144,5 @@ macro shape and reports locations so humans can inspect uncertain cases.
 
 ## Changelog
 
+- `1.1.0` - Added F5 health sweep env knobs and four-event ref-integrity schema contract.
 - `1.0.0` - Initial E6 observability contract landed via `br-j1qwr`.
