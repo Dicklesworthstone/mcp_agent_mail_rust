@@ -52,6 +52,7 @@ const ATC_STALE_HEARTBEAT_SECS: i64 = 5 * 60;
 const GIT_REF_INTEGRITY_VISIBLE_PROJECTS: usize = 3;
 const HEALTH_SWEEP_DATA_DIR_NAME: &str = "mcp-agent-mail";
 const GIT_REF_SWEEP_CURSOR_FILE_NAME: &str = "sweep_cursor.json";
+const GIT_REF_SWEEP_DISMISSALS_FILE_NAME: &str = "sweep_dismissals.toml";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Level {
@@ -297,6 +298,18 @@ struct GitRefIntegritySweepState {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 struct GitRefSweepCursorFile {
     cursor_index: usize,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct GitRefSweepDismissalsFile {
+    #[serde(default)]
+    dismissed: Vec<GitRefSweepDismissalEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct GitRefSweepDismissalEntry {
+    project_slug: String,
+    ref_kind: String,
 }
 
 impl GitRefIntegritySweepState {
@@ -2088,6 +2101,7 @@ fn diagnostics_worker_loop(
     let mut tailscale_checked_at = Instant::now();
     let mut git_ref_integrity = GitRefIntegritySweepState::default();
     let git_ref_cursor_path = git_ref_sweep_cursor_path();
+    let git_ref_dismissals_path = git_ref_sweep_dismissals_path();
     let mut git_ref_cursor_index = load_git_ref_sweep_cursor(&git_ref_cursor_path);
     let mut next_git_ref_sweep_due = Instant::now();
 
@@ -2103,11 +2117,17 @@ fn diagnostics_worker_loop(
                 tailscale_checked_at = now;
             }
             let run_git_ref_sweep = refresh || now >= next_git_ref_sweep_due;
+            let git_ref_dismissals = if run_git_ref_sweep {
+                load_git_ref_sweep_dismissals(&git_ref_dismissals_path)
+            } else {
+                Vec::new()
+            };
             let snap = run_diagnostics(
                 state,
                 cached_tailscale_ip.as_deref(),
                 &mut git_ref_integrity,
                 &mut git_ref_cursor_index,
+                &git_ref_dismissals,
                 run_git_ref_sweep,
             );
             if run_git_ref_sweep {
@@ -2188,6 +2208,7 @@ fn run_diagnostics(
     tailscale_ip: Option<&str>,
     git_ref_integrity: &mut GitRefIntegritySweepState,
     git_ref_cursor_index: &mut usize,
+    git_ref_dismissals: &[GitRefSweepDismissalEntry],
     run_git_ref_sweep: bool,
 ) -> DiagnosticsSnapshot {
     let cfg = state.config_snapshot();
@@ -2252,6 +2273,7 @@ fn run_diagnostics(
             env_cfg.health_sweep_enabled,
             env_cfg.health_sweep_interval_seconds,
             std::env::var_os("AM_GIT_BINARY").is_some(),
+            git_ref_dismissals,
             out.checked_at.unwrap_or_else(Utc::now),
         );
         *git_ref_cursor_index = git_ref_integrity.next_cursor_index;
@@ -2549,10 +2571,17 @@ fn git_ref_sweep_cursor_path() -> PathBuf {
     git_ref_sweep_cursor_path_from_data_dir(&data_dir)
 }
 
+fn git_ref_sweep_dismissals_path() -> PathBuf {
+    let data_dir = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+    git_ref_sweep_data_file_path_from_data_dir(&data_dir, GIT_REF_SWEEP_DISMISSALS_FILE_NAME)
+}
+
 fn git_ref_sweep_cursor_path_from_data_dir(data_dir: &Path) -> PathBuf {
-    data_dir
-        .join(HEALTH_SWEEP_DATA_DIR_NAME)
-        .join(GIT_REF_SWEEP_CURSOR_FILE_NAME)
+    git_ref_sweep_data_file_path_from_data_dir(data_dir, GIT_REF_SWEEP_CURSOR_FILE_NAME)
+}
+
+fn git_ref_sweep_data_file_path_from_data_dir(data_dir: &Path, file_name: &str) -> PathBuf {
+    data_dir.join(HEALTH_SWEEP_DATA_DIR_NAME).join(file_name)
 }
 
 fn load_git_ref_sweep_cursor(path: &Path) -> usize {
@@ -2586,6 +2615,49 @@ fn save_git_ref_sweep_cursor(path: &Path, cursor_index: usize) -> io::Result<()>
     let json = serde_json::to_string_pretty(&GitRefSweepCursorFile { cursor_index })
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     crate::tui_persist::atomic_write_text(path, &json)
+}
+
+fn load_git_ref_sweep_dismissals(path: &Path) -> Vec<GitRefSweepDismissalEntry> {
+    match crate::tui_persist::read_persist_text(path) {
+        Ok(toml_text) => match toml::from_str::<GitRefSweepDismissalsFile>(&toml_text) {
+            Ok(file) => file
+                .dismissed
+                .into_iter()
+                .filter(|entry| {
+                    !entry.project_slug.trim().is_empty() && !entry.ref_kind.trim().is_empty()
+                })
+                .collect(),
+            Err(error) => {
+                tracing::warn!(
+                    target: "mcp_agent_mail::health_sweep",
+                    path = %path.display(),
+                    error = %error,
+                    "git_ref_integrity_dismissals_parse_failed"
+                );
+                Vec::new()
+            }
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            tracing::warn!(
+                target: "mcp_agent_mail::health_sweep",
+                path = %path.display(),
+                error = %error,
+                "git_ref_integrity_dismissals_load_failed"
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn git_ref_finding_is_dismissed(
+    dismissals: &[GitRefSweepDismissalEntry],
+    project_slug: &str,
+    ref_kind: &str,
+) -> bool {
+    dismissals.iter().any(|entry| {
+        entry.project_slug == project_slug && entry.ref_kind.eq_ignore_ascii_case(ref_kind)
+    })
 }
 
 fn git_ref_integrity_targets_from_snapshot(
@@ -2638,6 +2710,24 @@ fn git_ref_severity(category: mcp_agent_mail_storage::recovery::RefCategory) -> 
     }
 }
 
+fn git_ref_visible_findings<'a>(
+    project_slug: &str,
+    findings: &'a [mcp_agent_mail_storage::recovery::PrunableRef],
+    dismissals: &[GitRefSweepDismissalEntry],
+) -> Vec<(
+    &'a mcp_agent_mail_storage::recovery::PrunableRef,
+    &'static str,
+)> {
+    findings
+        .iter()
+        .filter_map(|finding| {
+            let ref_kind = git_ref_kind(&finding.ref_name, finding.category);
+            (!git_ref_finding_is_dismissed(dismissals, project_slug, ref_kind))
+                .then_some((finding, ref_kind))
+        })
+        .collect()
+}
+
 fn git_ref_integrity_sweep(
     targets: &[GitRefIntegrityProjectTarget],
     cursor_index: usize,
@@ -2645,6 +2735,7 @@ fn git_ref_integrity_sweep(
     enabled: bool,
     interval_seconds: u64,
     am_git_binary_set: bool,
+    dismissals: &[GitRefSweepDismissalEntry],
     now: DateTime<Utc>,
 ) -> GitRefIntegritySweepState {
     let batch_size = batch_size.max(1);
@@ -2690,10 +2781,14 @@ fn git_ref_integrity_sweep(
 
         match mcp_agent_mail_storage::recovery::detect_missing_refs(&target.path) {
             Ok(findings) => {
+                let visible_findings =
+                    git_ref_visible_findings(&target.slug, &findings, dismissals);
+                let mut finding_count = 0;
                 let mut protected_count = 0;
                 let mut safe_to_prune_count = 0;
                 let mut ask_user_count = 0;
-                for finding in &findings {
+                for (finding, ref_kind) in &visible_findings {
+                    finding_count += 1;
                     match finding.category {
                         mcp_agent_mail_storage::recovery::RefCategory::Protected => {
                             protected_count += 1;
@@ -2708,13 +2803,12 @@ fn git_ref_integrity_sweep(
                     tracing::warn!(
                         target: "mcp_agent_mail::health_sweep",
                         project_slug = %target.slug,
-                        ref_kind = git_ref_kind(&finding.ref_name, finding.category),
+                        ref_kind = *ref_kind,
                         ref_name = %finding.ref_name,
                         severity = git_ref_severity(finding.category),
                         "git_ref_integrity_finding"
                     );
                 }
-                let finding_count = findings.len();
                 state.total_findings += finding_count;
                 let duration_ms = saturating_duration_ms_u64(project_started.elapsed());
                 tracing::info!(
@@ -3115,6 +3209,18 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).expect("test dir");
         path
+    }
+
+    fn prunable_ref(
+        ref_name: &str,
+        category: mcp_agent_mail_storage::recovery::RefCategory,
+    ) -> mcp_agent_mail_storage::recovery::PrunableRef {
+        mcp_agent_mail_storage::recovery::PrunableRef {
+            ref_name: ref_name.to_string(),
+            target_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            reason: "test".to_string(),
+            category,
+        }
     }
 
     fn test_screen(snapshot: DiagnosticsSnapshot) -> SystemHealthScreen {
@@ -4449,7 +4555,7 @@ mod tests {
             path: PathBuf::from("/definitely/not/a/git/repo"),
         }];
 
-        let sweep = git_ref_integrity_sweep(&targets, 0, 10, false, 900, false, Utc::now());
+        let sweep = git_ref_integrity_sweep(&targets, 0, 10, false, 900, false, &[], Utc::now());
 
         assert!(!sweep.enabled);
         assert_eq!(sweep.total_projects, 1);
@@ -4467,7 +4573,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let sweep = git_ref_integrity_sweep(&targets, 1, 2, true, 900, false, Utc::now());
+        let sweep = git_ref_integrity_sweep(&targets, 1, 2, true, 900, false, &[], Utc::now());
 
         assert_eq!(sweep.cursor_index, 1);
         assert_eq!(sweep.next_cursor_index, 3);
@@ -4486,7 +4592,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let sweep = git_ref_integrity_sweep(&targets, 0, 99, true, 900, false, Utc::now());
+        let sweep = git_ref_integrity_sweep(&targets, 0, 99, true, 900, false, &[], Utc::now());
 
         assert_eq!(sweep.total_projects, 2);
         assert_eq!(sweep.projects_scanned, 2);
@@ -4500,6 +4606,19 @@ mod tests {
         assert_eq!(
             path,
             PathBuf::from("/tmp/xdg-data/mcp-agent-mail/sweep_cursor.json")
+        );
+    }
+
+    #[test]
+    fn health_sweep_dismissals_path_uses_xdg_app_dir() {
+        let path = git_ref_sweep_data_file_path_from_data_dir(
+            Path::new("/tmp/xdg-data"),
+            GIT_REF_SWEEP_DISMISSALS_FILE_NAME,
+        );
+
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/xdg-data/mcp-agent-mail/sweep_dismissals.toml")
         );
     }
 
@@ -4530,6 +4649,114 @@ mod tests {
         std::fs::create_dir_all(path.parent().expect("cursor parent")).expect("cursor parent");
         std::fs::write(&path, "not json").expect("invalid cursor");
         assert_eq!(load_git_ref_sweep_cursor(&path), 0);
+    }
+
+    #[test]
+    fn health_sweep_dismissal_toml_loads_entries() {
+        let temp = unique_test_dir("dismissals-load");
+        let path = temp.join("state").join("sweep_dismissals.toml");
+        std::fs::create_dir_all(path.parent().expect("dismissals parent"))
+            .expect("dismissals parent");
+        std::fs::write(
+            &path,
+            r#"
+[[dismissed]]
+project_slug = "proj-c"
+ref_kind = "orphan_stash"
+dismissed_at = "2026-05-09T12:00:00Z"
+reason = "manual prune"
+"#,
+        )
+        .expect("dismissals toml");
+
+        let dismissals = load_git_ref_sweep_dismissals(&path);
+
+        assert_eq!(
+            dismissals,
+            vec![GitRefSweepDismissalEntry {
+                project_slug: "proj-c".to_string(),
+                ref_kind: "orphan_stash".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn health_sweep_dismissal_malformed_toml_logs_warn() {
+        let temp = unique_test_dir("dismissals-invalid");
+        let path = temp.join("state").join("sweep_dismissals.toml");
+        std::fs::create_dir_all(path.parent().expect("dismissals parent"))
+            .expect("dismissals parent");
+        std::fs::write(&path, "[[dismissed]\nproject_slug =").expect("invalid toml");
+
+        assert!(load_git_ref_sweep_dismissals(&path).is_empty());
+    }
+
+    #[test]
+    fn health_sweep_dismissal_filters_finding() {
+        let findings = vec![
+            prunable_ref(
+                "refs/stash",
+                mcp_agent_mail_storage::recovery::RefCategory::SafeToPrune,
+            ),
+            prunable_ref(
+                "refs/heads/recovery",
+                mcp_agent_mail_storage::recovery::RefCategory::AskUser,
+            ),
+        ];
+        let dismissals = vec![GitRefSweepDismissalEntry {
+            project_slug: "proj-c".to_string(),
+            ref_kind: "orphan_stash".to_string(),
+        }];
+
+        let visible = git_ref_visible_findings("proj-c", &findings, &dismissals);
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].0.ref_name, "refs/heads/recovery");
+        assert_eq!(visible[0].1, "orphan_ref");
+    }
+
+    #[test]
+    fn health_sweep_dismissal_unrelated_passes_through() {
+        let findings = vec![prunable_ref(
+            "refs/stash",
+            mcp_agent_mail_storage::recovery::RefCategory::SafeToPrune,
+        )];
+        let dismissals = vec![GitRefSweepDismissalEntry {
+            project_slug: "proj-a".to_string(),
+            ref_kind: "orphan_stash".to_string(),
+        }];
+
+        let visible = git_ref_visible_findings("proj-b", &findings, &dismissals);
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].0.ref_name, "refs/stash");
+        assert_eq!(visible[0].1, "orphan_stash");
+    }
+
+    #[test]
+    fn health_sweep_banner_suppressed_after_dismissal_clears_findings() {
+        let findings = vec![prunable_ref(
+            "refs/stash",
+            mcp_agent_mail_storage::recovery::RefCategory::SafeToPrune,
+        )];
+        let dismissals = vec![GitRefSweepDismissalEntry {
+            project_slug: "proj-c".to_string(),
+            ref_kind: "orphan_stash".to_string(),
+        }];
+        let visible = git_ref_visible_findings("proj-c", &findings, &dismissals);
+        let sweep = GitRefIntegritySweepState {
+            enabled: true,
+            total_findings: visible.len(),
+            projects: vec![GitRefIntegrityProjectSummary {
+                slug: "proj-c".to_string(),
+                finding_count: visible.len(),
+                classification: Level::Ok,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(sweep.banner().is_none());
     }
 
     #[test]
