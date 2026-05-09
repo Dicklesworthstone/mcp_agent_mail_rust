@@ -11,6 +11,7 @@
 //! - Agent profile writes
 //! - Notification signals
 
+pub mod boot_check;
 pub mod recovery;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
