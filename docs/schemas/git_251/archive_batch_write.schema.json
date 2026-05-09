@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.mcp-agent-mail/git_251/archive_batch_write.schema.json",
+  "title": "archive batch write event",
+  "description": "Structured tracing payload for archive message-batch write phases.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ts", "level", "target", "name", "fields"],
+  "x-event-names": [
+    "start",
+    "sqlite_phase",
+    "disk_phase",
+    "git_phase",
+    "complete"
+  ],
+  "x-drift-required-fields": [
+    "repo_slug",
+    "caller",
+    "args_hash",
+    "duration_ms",
+    "outcome",
+    "git_version",
+    "batch_id"
+  ],
+  "properties": {
+    "ts": { "type": "string" },
+    "level": { "type": "string", "enum": ["trace", "debug", "info", "warn", "error"] },
+    "target": { "type": "string", "const": "mcp_agent_mail::storage::archive::batch_write" },
+    "name": { "type": "string" },
+    "fields": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo_slug", "caller", "args_hash", "duration_ms", "outcome", "git_version"],
+      "properties": {
+        "repo_slug": { "type": "string" },
+        "caller": { "type": "string" },
+        "args_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "duration_ms": { "type": "number", "minimum": 0 },
+        "outcome": { "type": "string", "enum": ["success", "retrying", "succeeded_after_retry", "exhausted", "error"] },
+        "git_version": { "type": "string" },
+        "batch_id": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "message_count": { "type": "integer", "minimum": 0 },
+        "total_bytes": { "type": "integer", "minimum": 0 },
+        "has_attachments": { "type": "boolean" },
+        "rows_inserted": { "type": "integer", "minimum": 0 },
+        "statements_executed": { "type": "integer", "minimum": 0 },
+        "files_written": { "type": "integer", "minimum": 0 },
+        "commit_count": { "type": "integer", "minimum": 0 },
+        "blob_count": { "type": "integer", "minimum": 0 },
+        "pack_size_bytes": { "type": "integer", "minimum": 0 },
+        "total_duration_ms": { "type": "number", "minimum": 0 },
+        "success": { "type": "boolean" },
+        "error_kind": { "type": "string" }
+      }
+    }
+  }
+}

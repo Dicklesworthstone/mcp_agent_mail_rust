@@ -29,6 +29,7 @@ use git2::{ErrorCode, IndexAddOption, Repository, Signature};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha1::Digest as Sha1Digest;
+use sha2::Sha256;
 use thiserror::Error;
 
 use mcp_agent_mail_core::{
@@ -5117,6 +5118,39 @@ fn build_batch_message_bundle_commit_message(summary_lines: &[String]) -> String
     msg
 }
 
+fn archive_batch_write_total_body_bytes(entries: &[MessageBundleBatchEntry<'_>]) -> u64 {
+    entries.iter().fold(0u64, |acc, entry| {
+        acc.saturating_add(u64::try_from(entry.body_md.len()).unwrap_or(u64::MAX))
+            .saturating_add(u64::try_from(entry.message.to_string().len()).unwrap_or(u64::MAX))
+    })
+}
+
+fn archive_batch_write_args_hash(
+    archive: &ProjectArchive,
+    entries: &[MessageBundleBatchEntry<'_>],
+    total_bytes: u64,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(archive.slug.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(entries.len().to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(total_bytes.to_string().as_bytes());
+    for entry in entries {
+        hasher.update(b"\0");
+        hasher.update(entry.sender.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(entry.recipients.len().to_string().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(entry.extra_paths.len().to_string().as_bytes());
+        if let Some(id) = entry.message.get("id") {
+            hasher.update(b"\0");
+            hasher.update(id.to_string().as_bytes());
+        }
+    }
+    hex::encode(hasher.finalize())
+}
+
 /// Write multiple message bundles to the archive and enqueue a single async commit.
 pub fn write_message_batch_bundle(
     archive: &ProjectArchive,
@@ -5127,6 +5161,45 @@ pub fn write_message_batch_bundle(
     if entries.is_empty() {
         return Ok(());
     }
+
+    let total_started = Instant::now();
+    let repo_slug = archive.slug.as_str();
+    let caller = "write_message_batch_bundle";
+    let git_version = "libgit2";
+    let message_count = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+    let total_bytes = archive_batch_write_total_body_bytes(entries);
+    let has_attachments = entries.iter().any(|entry| !entry.extra_paths.is_empty());
+    let args_hash = archive_batch_write_args_hash(archive, entries, total_bytes);
+
+    tracing::info!(
+        target: "mcp_agent_mail::storage::archive::batch_write",
+        repo_slug = repo_slug,
+        caller = caller,
+        args_hash = %args_hash,
+        duration_ms = 0.0,
+        outcome = "success",
+        git_version = git_version,
+        batch_id = %args_hash,
+        message_count = message_count,
+        total_bytes = total_bytes,
+        has_attachments = has_attachments,
+        "start"
+    );
+
+    let sqlite_started = Instant::now();
+    tracing::info!(
+        target: "mcp_agent_mail::storage::archive::batch_write",
+        repo_slug = repo_slug,
+        caller = caller,
+        args_hash = %args_hash,
+        duration_ms = sqlite_started.elapsed().as_secs_f64() * 1000.0,
+        outcome = "success",
+        git_version = git_version,
+        batch_id = %args_hash,
+        rows_inserted = 0u64,
+        statements_executed = 0u64,
+        "sqlite_phase"
+    );
 
     let repo_root = archive_repo_root_checked(archive)?;
     let estimated_rel_paths = entries
@@ -5147,8 +5220,9 @@ pub fn write_message_batch_bundle(
     let mut summary_lines = Vec::with_capacity(entries.len());
     let mut single_auto_commit_message: Option<String> = None;
 
+    let disk_started = Instant::now();
     for entry in entries {
-        let commit_meta = append_message_bundle_files(
+        let commit_meta = match append_message_bundle_files(
             archive,
             entry.message,
             entry.body_md,
@@ -5156,12 +5230,61 @@ pub fn write_message_batch_bundle(
             entry.recipients,
             entry.extra_paths,
             &mut rel_paths,
-        )?;
+        ) {
+            Ok(meta) => meta,
+            Err(err) => {
+                let error_kind = err.to_string();
+                let duration_ms = disk_started.elapsed().as_secs_f64() * 1000.0;
+                tracing::error!(
+                    target: "mcp_agent_mail::storage::archive::batch_write",
+                    repo_slug = repo_slug,
+                    caller = caller,
+                    args_hash = %args_hash,
+                    duration_ms = duration_ms,
+                    outcome = "error",
+                    git_version = git_version,
+                    batch_id = %args_hash,
+                    files_written = u64::try_from(rel_paths.len()).unwrap_or(u64::MAX),
+                    total_bytes = total_bytes,
+                    error_kind = %error_kind,
+                    "disk_phase"
+                );
+                tracing::error!(
+                    target: "mcp_agent_mail::storage::archive::batch_write",
+                    repo_slug = repo_slug,
+                    caller = caller,
+                    args_hash = %args_hash,
+                    duration_ms = total_started.elapsed().as_secs_f64() * 1000.0,
+                    outcome = "error",
+                    git_version = git_version,
+                    batch_id = %args_hash,
+                    total_duration_ms = total_started.elapsed().as_secs_f64() * 1000.0,
+                    message_count = message_count,
+                    success = false,
+                    error_kind = %error_kind,
+                    "complete"
+                );
+                return Err(err);
+            }
+        };
         if entries.len() == 1 {
             single_auto_commit_message = Some(commit_meta.auto_commit_message);
         }
         summary_lines.push(commit_meta.summary_line);
     }
+    tracing::info!(
+        target: "mcp_agent_mail::storage::archive::batch_write",
+        repo_slug = repo_slug,
+        caller = caller,
+        args_hash = %args_hash,
+        duration_ms = disk_started.elapsed().as_secs_f64() * 1000.0,
+        outcome = "success",
+        git_version = git_version,
+        batch_id = %args_hash,
+        files_written = u64::try_from(rel_paths.len()).unwrap_or(u64::MAX),
+        total_bytes = total_bytes,
+        "disk_phase"
+    );
 
     dedup_repo_relative_paths(&mut rel_paths);
 
@@ -5173,7 +5296,36 @@ pub fn write_message_batch_bundle(
         build_batch_message_bundle_commit_message(&summary_lines)
     };
 
+    let git_started = Instant::now();
     enqueue_async_commit(repo_root, config, &commit_message, &rel_paths);
+    tracing::info!(
+        target: "mcp_agent_mail::storage::archive::batch_write",
+        repo_slug = repo_slug,
+        caller = caller,
+        args_hash = %args_hash,
+        duration_ms = git_started.elapsed().as_secs_f64() * 1000.0,
+        outcome = "success",
+        git_version = git_version,
+        batch_id = %args_hash,
+        commit_count = 1u64,
+        blob_count = u64::try_from(rel_paths.len()).unwrap_or(u64::MAX),
+        pack_size_bytes = 0u64,
+        "git_phase"
+    );
+    tracing::info!(
+        target: "mcp_agent_mail::storage::archive::batch_write",
+        repo_slug = repo_slug,
+        caller = caller,
+        args_hash = %args_hash,
+        duration_ms = total_started.elapsed().as_secs_f64() * 1000.0,
+        outcome = "success",
+        git_version = git_version,
+        batch_id = %args_hash,
+        total_duration_ms = total_started.elapsed().as_secs_f64() * 1000.0,
+        message_count = message_count,
+        success = true,
+        "complete"
+    );
     Ok(())
 }
 

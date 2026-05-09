@@ -1,6 +1,6 @@
 # Git 2.51 Observability Contract
 
-spec_version: 1.1.0
+spec_version: 1.1.1
 
 This document is the single source of truth for event names, baseline fields,
 metric labels, and schema locations for the git 2.51.0 mitigation work. The
@@ -83,6 +83,7 @@ Draft 2020-12, has a stable `$id` under
 | `doctor_fix_orphan_refs.schema.json` | `fix_orphan_refs_*`, `ref_pruned`, packed refs and backup events. |
 | `health_sweep.schema.json` | F5 health sweep events: `git_ref_integrity_started`, `git_ref_integrity_swept`, `git_ref_integrity_finding`, `git_ref_integrity_completed`. |
 | `boot_check.schema.json` | F8 boot-time archive integrity events that consume this contract. |
+| `archive_batch_write.schema.json` | Archive message-batch write phase events: `start`, `sqlite_phase`, `disk_phase`, `git_phase`, `complete`. |
 
 Each schema enumerates:
 
@@ -144,5 +145,6 @@ detection and never invokes the manual prune/repack path.
 
 ## Changelog
 
+- `1.1.1` - Added archive batch-write phase event schema coverage for br-q8yaa.
 - `1.1.0` - Added F5 health sweep env knobs and four-event ref-integrity schema contract.
 - `1.0.0` - Initial E6 observability contract landed via `br-j1qwr`.

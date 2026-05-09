@@ -201,7 +201,7 @@ fn validate_event(schema: &Value, event: &Value) -> Result<(), String> {
 #[test]
 fn schemas_are_draft_2020_12_strict_and_complete() -> Result<(), Box<dyn Error>> {
     let paths = schema_paths()?;
-    assert_eq!(paths.len(), 9, "expected exactly nine git_251 schemas");
+    assert_eq!(paths.len(), 10, "expected exactly ten git_251 schemas");
 
     for path in paths {
         let schema = read_json(&path)?;

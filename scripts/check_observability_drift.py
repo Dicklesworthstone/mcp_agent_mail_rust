@@ -22,6 +22,7 @@ DEFAULT_TARGET_PREFIXES = (
     "mcp_agent_mail::tools::reservations::activity",
     "mcp_agent_mail::tools::reservations::pathspec",
     "mcp_agent_mail::doctor::fix_orphan_refs",
+    "mcp_agent_mail::storage::archive::batch_write",
 )
 
 SKIP_DIR_NAMES = {".git", "target", "__pycache__"}
