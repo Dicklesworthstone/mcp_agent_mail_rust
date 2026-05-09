@@ -1,0 +1,40 @@
+name: Observability Drift
+
+on:
+  pull_request:
+    paths:
+      - "crates/mcp-agent-mail-core/**"
+      - "crates/mcp-agent-mail-storage/**"
+      - "crates/mcp-agent-mail-server/**"
+      - "crates/mcp-agent-mail-tools/**"
+      - "crates/mcp-agent-mail-cli/**"
+      - "crates/mcp-agent-mail-guard/**"
+      - "docs/OBSERVABILITY_git_251.md"
+      - "docs/schemas/git_251/**"
+      - "scripts/check_observability_drift.py"
+      - "tests/fixtures/observability/**"
+  workflow_dispatch:
+
+jobs:
+  drift:
+    name: Check git 2.51 observability drift
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run drift check
+        id: drift
+        shell: bash
+        run: |
+          set +e
+          python3 scripts/check_observability_drift.py --pretty > observability-drift.json
+          status=$?
+          {
+            echo '## Observability drift'
+            echo
+            echo '```json'
+            cat observability-drift.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"

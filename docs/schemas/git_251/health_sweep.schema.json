@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.mcp-agent-mail/git_251/health_sweep.schema.json",
+  "title": "git health sweep event",
+  "description": "Structured tracing payload for periodic git health sweep checks.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ts", "level", "target", "name", "fields"],
+  "x-event-names": ["git_ref_integrity_check", "git_ref_integrity_result"],
+  "x-planned": true,
+  "x-drift-required-fields": [],
+  "properties": {
+    "ts": { "type": "string" },
+    "level": { "type": "string", "enum": ["trace", "debug", "info", "warn", "error"] },
+    "target": { "type": "string" },
+    "name": { "type": "string" },
+    "fields": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo_slug", "caller", "args_hash", "duration_ms", "outcome", "git_version", "check_name"],
+      "properties": {
+        "repo_slug": { "type": "string" },
+        "caller": { "type": "string" },
+        "args_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "duration_ms": { "type": "number", "minimum": 0 },
+        "outcome": { "type": "string", "enum": ["success", "retrying", "succeeded_after_retry", "exhausted", "error"] },
+        "git_version": { "type": "string" },
+        "check_name": { "type": "string" },
+        "status": { "type": "string", "enum": ["ok", "warn", "error"] },
+        "finding_count": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

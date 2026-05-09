@@ -1,0 +1,15 @@
+{
+  "ts": "2026-05-09T07:00:00Z",
+  "level": "debug",
+  "target": "mcp_agent_mail::git_locked",
+  "name": "git_locked_exit_ok",
+  "fields": {
+    "repo_slug": "data-projects-demo",
+    "caller": "storage.archive.write",
+    "args_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "duration_ms": 12,
+    "outcome": "success",
+    "git_version": "2.50.1",
+    "binary_version": "2.50.1"
+  }
+}

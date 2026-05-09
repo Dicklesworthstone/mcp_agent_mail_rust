@@ -1,0 +1,17 @@
+{
+  "ts": "2026-05-09T07:00:00Z",
+  "level": "info",
+  "target": "mcp_agent_mail::archive::boot_check",
+  "name": "boot_check_result",
+  "fields": {
+    "repo_slug": "data-projects-demo",
+    "caller": "startup.boot_check",
+    "args_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "duration_ms": 29,
+    "outcome": "success",
+    "git_version": "libgit2",
+    "mode": "warn",
+    "findings_count": 0,
+    "degraded": false
+  }
+}

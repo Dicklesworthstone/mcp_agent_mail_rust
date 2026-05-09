@@ -1,0 +1,14 @@
+{
+  "ts": "2026-05-09T07:00:00Z",
+  "level": "info",
+  "target": "mcp_agent_mail::health::git_251",
+  "name": "git_ref_integrity_result",
+  "fields": {
+    "repo_slug": "data-projects-demo",
+    "caller": "health_sweep",
+    "args_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "duration_ms": 17,
+    "outcome": "success",
+    "git_version": "libgit2"
+  }
+}

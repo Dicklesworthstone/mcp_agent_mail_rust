@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.mcp-agent-mail/git_251/git_flock.schema.json",
+  "title": "git flock event",
+  "description": "Structured tracing payload for cooperative repository flock events.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ts", "level", "target", "name", "fields"],
+  "x-event-names": [
+    "sentinel_path_unresolved_no_flock",
+    "sentinel_parent_missing_no_flock",
+    "flock_readonly_fallback",
+    "flock_acquired_nonblocking",
+    "flock_waiting",
+    "flock_acquired_after_wait",
+    "flock_timeout_aborting",
+    "flock_still_waiting",
+    "flock_unlock_failed",
+    "flock_acquire_failed"
+  ],
+  "x-drift-required-fields": [],
+  "properties": {
+    "ts": { "type": "string" },
+    "level": { "type": "string", "enum": ["trace", "debug", "info", "warn", "error"] },
+    "target": { "type": "string" },
+    "name": { "type": "string" },
+    "fields": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo_slug", "caller", "args_hash", "duration_ms", "outcome", "git_version", "sentinel_path"],
+      "properties": {
+        "repo_slug": { "type": "string" },
+        "caller": { "type": "string" },
+        "args_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "duration_ms": { "type": "number", "minimum": 0 },
+        "outcome": { "type": "string", "enum": ["success", "retrying", "succeeded_after_retry", "exhausted", "error"] },
+        "git_version": { "type": "string" },
+        "repo": { "type": "string" },
+        "parent": { "type": "string" },
+        "sentinel": { "type": "string" },
+        "sentinel_path": { "type": "string" },
+        "wait_seconds": { "type": "number", "minimum": 0 },
+        "waited_s": { "type": "integer", "minimum": 0 },
+        "wait_ms": { "type": "integer", "minimum": 0 },
+        "readonly": { "type": "boolean" },
+        "err": { "type": "string" },
+        "error": { "type": "string" }
+      }
+    }
+  }
+}

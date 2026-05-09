@@ -1,0 +1,14 @@
+{
+  "ts": "2026-05-09T07:00:00Z",
+  "level": "debug",
+  "target": "mcp_agent_mail::tools::reservations::activity",
+  "name": "reservation_activity_result",
+  "fields": {
+    "repo_slug": "data-projects-demo",
+    "caller": "reservation.active",
+    "args_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "duration_ms": 3,
+    "outcome": "success",
+    "git_version": "libgit2"
+  }
+}

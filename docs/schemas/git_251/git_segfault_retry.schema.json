@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.mcp-agent-mail/git_251/git_segfault_retry.schema.json",
+  "title": "git segfault retry event",
+  "description": "Structured tracing payload for git 2.51.0 segfault retry handling.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ts", "level", "target", "name", "fields"],
+  "x-event-names": [
+    "git_segfault_retry_attempt",
+    "git_segfault_retry_succeeded",
+    "git_segfault_retry_exhausted",
+    "guard_git_segfault_retry",
+    "guard_git_segfault_retry_exhausted",
+    "git_locked_exit_segfault_like"
+  ],
+  "x-drift-required-fields": [],
+  "properties": {
+    "ts": { "type": "string" },
+    "level": { "type": "string", "enum": ["trace", "debug", "info", "warn", "error"] },
+    "target": { "type": "string" },
+    "name": { "type": "string" },
+    "fields": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo_slug", "caller", "args_hash", "duration_ms", "outcome", "git_version", "attempt_n", "signal"],
+      "properties": {
+        "repo_slug": { "type": "string" },
+        "caller": { "type": "string" },
+        "args_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "duration_ms": { "type": "number", "minimum": 0 },
+        "outcome": { "type": "string", "enum": ["success", "retrying", "succeeded_after_retry", "exhausted", "error"] },
+        "git_version": { "type": "string" },
+        "repo": { "type": "string" },
+        "attempt": { "type": "integer", "minimum": 0 },
+        "attempt_n": { "type": "integer", "minimum": 0 },
+        "signal": { "type": "integer" },
+        "retry_latency_seconds": { "type": "number", "minimum": 0 }
+      }
+    }
+  }
+}

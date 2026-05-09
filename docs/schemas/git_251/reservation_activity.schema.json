@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.mcp-agent-mail/git_251/reservation_activity.schema.json",
+  "title": "reservation activity event",
+  "description": "Structured tracing payload for libgit2 reservation activity probes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ts", "level", "target", "name", "fields"],
+  "x-event-names": [
+    "reservation_activity_cli_fallback_enabled",
+    "reservation_activity_result",
+    "reservation_activity_open_failed",
+    "reservation_activity_pathspec_invalid"
+  ],
+  "x-drift-required-fields": [],
+  "properties": {
+    "ts": { "type": "string" },
+    "level": { "type": "string", "enum": ["trace", "debug", "info", "warn", "error"] },
+    "target": { "type": "string" },
+    "name": { "type": "string" },
+    "fields": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo_slug", "caller", "args_hash", "duration_ms", "outcome", "git_version", "patterns"],
+      "properties": {
+        "repo_slug": { "type": "string" },
+        "caller": { "type": "string" },
+        "args_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "duration_ms": { "type": "number", "minimum": 0 },
+        "outcome": { "type": "string", "enum": ["success", "retrying", "succeeded_after_retry", "exhausted", "error"] },
+        "git_version": { "type": "string" },
+        "repo": { "type": "string" },
+        "patterns": { "type": "integer", "minimum": 0 },
+        "reservation_id": { "type": "integer", "minimum": 0 },
+        "path_count": { "type": "integer", "minimum": 0 },
+        "found": { "type": "boolean" },
+        "via": { "type": "string" },
+        "err": { "type": "string" },
+        "error": { "type": "string" }
+      }
+    }
+  }
+}

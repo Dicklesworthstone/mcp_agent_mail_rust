@@ -1,0 +1,18 @@
+{
+  "ts": "2026-05-09T07:00:00Z",
+  "level": "warn",
+  "target": "mcp_agent_mail::git_locked",
+  "name": "git_segfault_retry_attempt",
+  "fields": {
+    "repo_slug": "data-projects-demo",
+    "caller": "storage.archive.write",
+    "args_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "duration_ms": 93,
+    "outcome": "retrying",
+    "git_version": "2.51.0",
+    "attempt": 0,
+    "attempt_n": 0,
+    "signal": 11,
+    "retry_latency_seconds": 0.1
+  }
+}

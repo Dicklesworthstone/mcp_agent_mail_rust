@@ -1,0 +1,18 @@
+{
+  "ts": "2026-05-09T07:00:00Z",
+  "level": "debug",
+  "target": "mcp_agent_mail::tools::reservations::pathspec",
+  "name": "pathspec_walk_open_failed",
+  "fields": {
+    "repo_slug": "data-projects-demo",
+    "caller": "reservation.pathspec",
+    "args_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "duration_ms": 2,
+    "outcome": "error",
+    "git_version": "libgit2",
+    "pathspec_count": 1,
+    "matched_paths": 0,
+    "repo": "/data/projects/demo",
+    "error": "repository not found"
+  }
+}
