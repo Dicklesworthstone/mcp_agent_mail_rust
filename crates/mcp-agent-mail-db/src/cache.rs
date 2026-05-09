@@ -28,10 +28,12 @@
 //! ## Metrics
 //!
 //! Lock-free atomic counters track cache hit/miss rates per category.
-//! Call `cache_metrics()` to get a snapshot.
+//! Call `cache_metrics()` to get a counter snapshot, and
+//! `ReadCache::footprint_estimate()` for a bounded-memory diagnostic snapshot.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -56,6 +58,12 @@ const HIT_WRITE_MAINTENANCE_INTERVAL: u64 = 4;
 /// Shard key: `agent_id % NUM_TOUCH_SHARDS`. Reduces contention 16×
 /// compared to a single mutex at 100+ concurrent tool calls/sec.
 const NUM_TOUCH_SHARDS: usize = 16;
+const PROJECT_BY_SLUG_KEY_BYTES: usize = size_of::<(u64, InternedStr)>();
+const PROJECT_BY_HUMAN_KEY_KEY_BYTES: usize = size_of::<(u64, InternedStr)>();
+const AGENT_BY_KEY_KEY_BYTES: usize = size_of::<(u64, i64, InternedStr)>();
+const AGENT_BY_ID_KEY_BYTES: usize = size_of::<(u64, i64)>();
+const INBOX_STATS_KEY_BYTES: usize = size_of::<(u64, i64)>();
+const DEFERRED_TOUCH_ENTRY_BYTES: usize = size_of::<((u64, i64), i64)>();
 
 #[inline]
 fn scope_fingerprint(scope: &str) -> u64 {
@@ -1012,6 +1020,68 @@ impl ReadCache {
         }
     }
 
+    /// Return a best-effort resident footprint estimate for the live cache.
+    ///
+    /// This reports estimates rather than exact allocator usage: `HashMap`,
+    /// `VecDeque`, intern pools, and allocator slab overhead are
+    /// implementation-defined. Payload rows are counted once from their
+    /// canonical cache indexes so the dual slug/human-key and name/id indexes
+    /// do not double-count the shared `Arc` rows.
+    #[must_use]
+    pub fn footprint_estimate(&self) -> CacheFootprintEstimate {
+        let counts = self.entry_counts();
+        let project_payload_bytes = self.project_payload_bytes();
+        let agent_payload_bytes = self.agent_payload_bytes();
+        let inbox_stats_payload_bytes = counts
+            .inbox_stats
+            .saturating_mul(size_of::<CacheEntry<InboxStatsRow>>());
+        let index_entry_bytes = counts.index_entry_bytes();
+        let deferred_touch_entries = self.deferred_touch_entry_count();
+        let deferred_touch_bytes =
+            deferred_touch_entries.saturating_mul(DEFERRED_TOUCH_ENTRY_BYTES);
+        let total_estimated_bytes = project_payload_bytes
+            .saturating_add(agent_payload_bytes)
+            .saturating_add(inbox_stats_payload_bytes)
+            .saturating_add(index_entry_bytes)
+            .saturating_add(deferred_touch_bytes);
+
+        CacheFootprintEstimate {
+            counts,
+            project_payload_bytes,
+            agent_payload_bytes,
+            inbox_stats_payload_bytes,
+            index_entry_bytes,
+            deferred_touch_entries,
+            deferred_touch_bytes,
+            total_estimated_bytes,
+        }
+    }
+
+    fn project_payload_bytes(&self) -> usize {
+        let cache = self.projects_by_slug.read();
+        cache
+            .keys()
+            .filter_map(|key| cache.peek(key))
+            .map(|entry| estimate_project_row_bytes(entry.value.as_ref()))
+            .sum()
+    }
+
+    fn agent_payload_bytes(&self) -> usize {
+        let cache = self.agents_by_key.read();
+        cache
+            .keys()
+            .filter_map(|key| cache.peek(key))
+            .map(|entry| estimate_agent_row_bytes(entry.value.as_ref()))
+            .sum()
+    }
+
+    fn deferred_touch_entry_count(&self) -> usize {
+        self.deferred_touch_shards
+            .iter()
+            .map(|shard| shard.lock().len())
+            .sum()
+    }
+
     /// Create a new standalone cache instance (for testing).
     #[must_use]
     pub fn new_for_testing() -> Self {
@@ -1046,6 +1116,69 @@ pub struct CacheEntryCounts {
     pub agents_by_key: usize,
     pub agents_by_id: usize,
     pub inbox_stats: usize,
+}
+
+impl CacheEntryCounts {
+    #[must_use]
+    pub fn total_live_entries(&self) -> usize {
+        self.projects_by_slug
+            .saturating_add(self.projects_by_human_key)
+            .saturating_add(self.agents_by_key)
+            .saturating_add(self.agents_by_id)
+            .saturating_add(self.inbox_stats)
+    }
+
+    #[must_use]
+    fn index_entry_bytes(&self) -> usize {
+        self.projects_by_slug
+            .saturating_mul(PROJECT_BY_SLUG_KEY_BYTES + size_of::<CacheEntry<SharedProjectRow>>())
+            .saturating_add(self.projects_by_human_key.saturating_mul(
+                PROJECT_BY_HUMAN_KEY_KEY_BYTES + size_of::<CacheEntry<SharedProjectRow>>(),
+            ))
+            .saturating_add(
+                self.agents_by_key.saturating_mul(
+                    AGENT_BY_KEY_KEY_BYTES + size_of::<CacheEntry<SharedAgentRow>>(),
+                ),
+            )
+            .saturating_add(
+                self.agents_by_id.saturating_mul(
+                    AGENT_BY_ID_KEY_BYTES + size_of::<CacheEntry<SharedAgentRow>>(),
+                ),
+            )
+            .saturating_add(
+                self.inbox_stats
+                    .saturating_mul(INBOX_STATS_KEY_BYTES + size_of::<CacheEntry<InboxStatsRow>>()),
+            )
+    }
+}
+
+/// Best-effort read-cache memory diagnostic snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub struct CacheFootprintEstimate {
+    pub counts: CacheEntryCounts,
+    pub project_payload_bytes: usize,
+    pub agent_payload_bytes: usize,
+    pub inbox_stats_payload_bytes: usize,
+    pub index_entry_bytes: usize,
+    pub deferred_touch_entries: usize,
+    pub deferred_touch_bytes: usize,
+    pub total_estimated_bytes: usize,
+}
+
+fn estimate_project_row_bytes(row: &ProjectRow) -> usize {
+    size_of::<ProjectRow>()
+        .saturating_add(row.slug.len())
+        .saturating_add(row.human_key.len())
+}
+
+fn estimate_agent_row_bytes(row: &AgentRow) -> usize {
+    size_of::<AgentRow>()
+        .saturating_add(row.name.len())
+        .saturating_add(row.program.len())
+        .saturating_add(row.model.len())
+        .saturating_add(row.task_description.len())
+        .saturating_add(row.attachments_policy.len())
+        .saturating_add(row.contact_policy.len())
 }
 
 static READ_CACHE: OnceLock<ReadCache> = OnceLock::new();
@@ -1484,6 +1617,97 @@ mod tests {
         assert_eq!(c.projects_by_human_key, 1);
         assert_eq!(c.agents_by_key, 1);
         assert_eq!(c.agents_by_id, 1);
+    }
+
+    #[test]
+    fn footprint_estimate_empty_cache_is_zero() {
+        let cache = ReadCache::new();
+        let footprint = cache.footprint_estimate();
+
+        assert_eq!(footprint.counts.total_live_entries(), 0);
+        assert_eq!(footprint.project_payload_bytes, 0);
+        assert_eq!(footprint.agent_payload_bytes, 0);
+        assert_eq!(footprint.inbox_stats_payload_bytes, 0);
+        assert_eq!(footprint.index_entry_bytes, 0);
+        assert_eq!(footprint.deferred_touch_entries, 0);
+        assert_eq!(footprint.deferred_touch_bytes, 0);
+        assert_eq!(footprint.total_estimated_bytes, 0);
+    }
+
+    #[test]
+    fn footprint_estimate_tracks_live_rows_and_deferred_touches() {
+        let cache = ReadCache::new();
+        let project = make_project("p1");
+        let agent = make_agent("A1", 1);
+        let stats = InboxStatsRow {
+            agent_id: 42,
+            total_count: 7,
+            unread_count: 3,
+            ack_pending_count: 2,
+            last_message_ts: Some(123),
+        };
+
+        cache.put_project(&project);
+        cache.put_agent(&agent);
+        cache.put_inbox_stats(&stats);
+        assert!(!cache.enqueue_touch(42, 456));
+
+        let footprint = cache.footprint_estimate();
+
+        assert_eq!(footprint.counts.projects_by_slug, 1);
+        assert_eq!(footprint.counts.projects_by_human_key, 1);
+        assert_eq!(footprint.counts.agents_by_key, 1);
+        assert_eq!(footprint.counts.agents_by_id, 1);
+        assert_eq!(footprint.counts.inbox_stats, 1);
+        assert_eq!(
+            footprint.project_payload_bytes,
+            estimate_project_row_bytes(&project)
+        );
+        assert_eq!(
+            footprint.agent_payload_bytes,
+            estimate_agent_row_bytes(&agent)
+        );
+        assert_eq!(
+            footprint.inbox_stats_payload_bytes,
+            size_of::<CacheEntry<InboxStatsRow>>()
+        );
+        assert!(footprint.index_entry_bytes > 0);
+        assert_eq!(footprint.deferred_touch_entries, 1);
+        assert_eq!(footprint.deferred_touch_bytes, DEFERRED_TOUCH_ENTRY_BYTES);
+        assert_eq!(
+            footprint.total_estimated_bytes,
+            footprint
+                .project_payload_bytes
+                .saturating_add(footprint.agent_payload_bytes)
+                .saturating_add(footprint.inbox_stats_payload_bytes)
+                .saturating_add(footprint.index_entry_bytes)
+                .saturating_add(footprint.deferred_touch_bytes)
+        );
+    }
+
+    #[test]
+    fn footprint_estimate_counts_shared_payloads_once() {
+        let cache = ReadCache::new();
+        let project = make_project("shared");
+        let agent = make_agent_with_id("SharedAgent", 7, 77);
+
+        cache.put_project(&project);
+        cache.put_agent(&agent);
+
+        let footprint = cache.footprint_estimate();
+
+        assert_eq!(footprint.counts.projects_by_slug, 1);
+        assert_eq!(footprint.counts.projects_by_human_key, 1);
+        assert_eq!(footprint.counts.agents_by_key, 1);
+        assert_eq!(footprint.counts.agents_by_id, 1);
+        assert_eq!(
+            footprint.project_payload_bytes,
+            estimate_project_row_bytes(&project)
+        );
+        assert_eq!(
+            footprint.agent_payload_bytes,
+            estimate_agent_row_bytes(&agent)
+        );
     }
 
     #[test]
