@@ -1535,67 +1535,17 @@ async fn verify_agent_visible_after_commit(
     {
         return fresh_result;
     }
-    match verify_agent_visible_on_pooled_handle(cx, pool, project_id, name).await {
-        Outcome::Ok(agent) => {
-            tracing::warn!(
-                project_id,
-                agent = %name,
-                fresh_error = %fresh_error,
-                "fresh durability probe missed committed agent visibility; pooled runtime handle confirmed row"
-            );
-            Outcome::Ok(agent)
-        }
-        Outcome::Err(pooled_error) => {
-            tracing::warn!(
-                project_id,
-                agent = %name,
-                fresh_error = %fresh_error,
-                pooled_error = %pooled_error,
-                "fresh and pooled agent visibility probes both failed after commit"
-            );
-            fresh_result
-        }
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
-    }
+    tracing::warn!(
+        project_id,
+        agent = %name,
+        fresh_error = %fresh_error,
+        "fresh durability probe missed committed agent visibility; refusing pooled-only confirmation"
+    );
+    fresh_result
 }
 
 fn is_agent_visibility_probe_consistency_error(error: &DbError) -> bool {
     matches!(error, DbError::Internal(message) if message.contains("agent row not visible after commit"))
-}
-
-async fn verify_agent_visible_on_pooled_handle(
-    cx: &Cx,
-    pool: &DbPool,
-    project_id: i64,
-    name: &str,
-) -> Outcome<AgentRow, DbError> {
-    let conn = match acquire_conn(cx, pool).await {
-        Outcome::Ok(c) => c,
-        Outcome::Err(e) => return Outcome::Err(e),
-        Outcome::Cancelled(r) => return Outcome::Cancelled(r),
-        Outcome::Panicked(p) => return Outcome::Panicked(p),
-    };
-    let tracked = tracked(&*conn);
-    let sql = "SELECT id, project_id, name, program, model, task_description, \
-               inception_ts, last_active_ts, attachments_policy, contact_policy, reaper_exempt, \
-               registration_token \
-               FROM agents WHERE project_id = ? AND name = ? COLLATE NOCASE \
-               LIMIT 1";
-    let params = [Value::BigInt(project_id), Value::Text(name.to_string())];
-    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
-        Outcome::Ok(rows) => rows.first().map_or_else(
-            || {
-                Outcome::Err(DbError::Internal(format!(
-                    "agent row not visible after commit for {project_id}:{name}"
-                )))
-            },
-            |row| Outcome::Ok(decode_agent_row_indexed(row)),
-        ),
-        Outcome::Err(e) => Outcome::Err(e),
-        Outcome::Cancelled(r) => Outcome::Cancelled(r),
-        Outcome::Panicked(p) => Outcome::Panicked(p),
-    }
 }
 
 fn normalize_expected_recipients(recipients: &[(i64, &str)]) -> Vec<(i64, String)> {
@@ -1611,6 +1561,7 @@ fn normalize_expected_recipients(recipients: &[(i64, &str)]) -> Vec<(i64, String
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MessageVisibilityProbeMode {
     FreshHandle,
+    #[cfg(test)]
     PooledHandle,
 }
 
@@ -1631,6 +1582,7 @@ async fn message_visibility_probe_query(
         MessageVisibilityProbeMode::FreshHandle => {
             durability_probe_query(cx, pool, sql, params).await
         }
+        #[cfg(test)]
         MessageVisibilityProbeMode::PooledHandle => {
             let conn = match acquire_conn(cx, pool).await {
                 Outcome::Ok(c) => c,
@@ -1791,39 +1743,13 @@ async fn verify_message_recipients_visible_after_commit(
     {
         return fresh_result;
     }
-
-    match verify_message_recipients_visible_with_probe_mode(
-        cx,
-        pool,
+    tracing::warn!(
         project_id,
         message_id,
-        expected_recipients,
-        MessageVisibilityProbeMode::PooledHandle,
-    )
-    .await
-    {
-        Outcome::Ok(()) => {
-            tracing::warn!(
-                project_id,
-                message_id,
-                fresh_error = %fresh_error,
-                "fresh durability probe missed committed message visibility; pooled runtime handle confirmed rows"
-            );
-            Outcome::Ok(())
-        }
-        Outcome::Err(pooled_error) => {
-            tracing::warn!(
-                project_id,
-                message_id,
-                fresh_error = %fresh_error,
-                pooled_error = %pooled_error,
-                "fresh and pooled message visibility probes both failed after commit"
-            );
-            fresh_result
-        }
-        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => Outcome::Panicked(payload),
-    }
+        fresh_error = %fresh_error,
+        "fresh durability probe missed committed message visibility; refusing pooled-only confirmation"
+    );
+    fresh_result
 }
 
 async fn fetch_durable_atc_experience_by_decision_effect(
@@ -15663,6 +15589,87 @@ mod tests {
     }
 
     #[test]
+    fn register_agent_runtime_migration_three_slash_url_is_fresh_handle_durable() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("register_agent_three_slash_runtime.db");
+        let database_url = format!("sqlite://{}", db_path.display());
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+        let cfg = crate::pool::DbPoolConfig {
+            database_url,
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let project = ensure_project(
+                &cx,
+                &pool,
+                "/data/projects/mcp-agent-mail-three-slash-durability",
+            )
+            .await
+            .into_result()
+            .expect("ensure project");
+            let project_id = project.id.expect("project id");
+
+            register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "BlueLake",
+                "codex-cli",
+                "gpt-5",
+                Some("three-slash durability"),
+                Some("auto"),
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register agent");
+        });
+        drop(pool);
+
+        let db_path_str = db_path.to_str().expect("utf8 db path");
+        let verify =
+            crate::CanonicalDbConn::open_file(db_path_str).expect("open fresh canonical handle");
+        let project_rows = verify
+            .query_sync(
+                "SELECT count(*) AS count FROM projects \
+                 WHERE slug = 'data-projects-mcp-agent-mail-three-slash-durability'",
+                &[],
+            )
+            .expect("query fresh project count");
+        let agent_rows = verify
+            .query_sync(
+                "SELECT count(*) AS count FROM agents WHERE name = 'BlueLake'",
+                &[],
+            )
+            .expect("query fresh agent count");
+        assert_eq!(
+            project_rows
+                .first()
+                .and_then(|row| row.get_named::<i64>("count").ok()),
+            Some(1),
+            "project must be visible to a fresh canonical handle"
+        );
+        assert_eq!(
+            agent_rows
+                .first()
+                .and_then(|row| row.get_named::<i64>("count").ok()),
+            Some(1),
+            "agent must be visible to a fresh canonical handle"
+        );
+    }
+
+    #[test]
     fn register_agent_case_insensitive_reuses_existing_row() {
         use asupersync::runtime::RuntimeBuilder;
         use tempfile::tempdir;
@@ -18072,6 +18079,78 @@ mod tests {
             }
 
             rollback_tx(&cx, &tracked).await;
+        });
+    }
+
+    #[test]
+    fn durability_probe_rejects_pooled_only_retained_autocommit_agent() {
+        use asupersync::runtime::RuntimeBuilder;
+        use tempfile::tempdir;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("pooled_only_retained_autocommit_agent.db");
+        let init_conn = crate::DbConn::open_file(db_path.display().to_string())
+            .expect("open base schema connection");
+        init_conn
+            .execute_raw(crate::schema::PRAGMA_DB_INIT_SQL)
+            .expect("apply init PRAGMAs");
+        let init_sql = crate::schema::init_schema_sql_base();
+        init_conn
+            .execute_raw(&init_sql)
+            .expect("initialize base schema");
+        init_conn
+            .execute_raw(
+                "INSERT INTO projects (id, slug, human_key, created_at) \
+                 VALUES (1, 'durability-project', '/tmp/am-pooled-only-agent', 0)",
+            )
+            .expect("seed project");
+        drop(init_conn);
+
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: false,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let conn = acquire_conn(&cx, &pool)
+                .await
+                .into_result()
+                .expect("acquire pooled conn");
+            conn.execute_raw("PRAGMA autocommit_retain = ON")
+                .expect("enable retained autocommit for regression setup");
+            conn.execute_raw("PRAGMA fsqlite.concurrent_mode = OFF")
+                .expect("force retained-autocommit candidate mode");
+            conn.execute_raw(
+                "INSERT INTO agents \
+                 (project_id, name, program, model, task_description, inception_ts, last_active_ts, attachments_policy, contact_policy) \
+                 VALUES (1, 'BlueLake', 'codex-cli', 'gpt-5', 'pooled-only', 0, 0, 'auto', 'auto')",
+            )
+            .expect("park agent insert in retained autocommit state");
+            drop(conn);
+
+            let err = verify_agent_visible_after_commit(&cx, &pool, 1, "BlueLake")
+                .await
+                .into_result()
+                .expect_err("fresh durability probe must reject pooled-only retained rows");
+            match err {
+                asupersync::OutcomeError::Err(DbError::Internal(msg)) => {
+                    assert!(
+                        msg.contains("agent row not visible after commit"),
+                        "unexpected error: {msg}"
+                    );
+                }
+                other => panic!("expected internal durability error, got: {other:?}"),
+            }
         });
     }
 

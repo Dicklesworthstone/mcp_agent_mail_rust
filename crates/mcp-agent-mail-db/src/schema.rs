@@ -221,6 +221,7 @@ END;
 pub const PRAGMA_SETTINGS_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
+PRAGMA autocommit_retain = OFF;
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 1000;
@@ -235,6 +236,7 @@ PRAGMA journal_size_limit = 268435456;
 pub const PRAGMA_DB_INIT_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
+PRAGMA autocommit_retain = OFF;
 PRAGMA journal_mode = WAL;
 ";
 
@@ -245,6 +247,7 @@ PRAGMA journal_mode = WAL;
 pub const PRAGMA_DB_INIT_BASE_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
+PRAGMA autocommit_retain = OFF;
 PRAGMA journal_mode = 'DELETE';
 ";
 
@@ -260,6 +263,7 @@ PRAGMA journal_mode = 'DELETE';
 pub const PRAGMA_CONN_SETTINGS_SQL: &str = r"
 PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
+PRAGMA autocommit_retain = OFF;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 1000;
 PRAGMA cache_size = -8192;
@@ -297,6 +301,7 @@ pub fn build_conn_pragmas(max_connections: usize, cache_budget_kb: usize) -> Str
         "\
 PRAGMA foreign_keys = OFF;
 PRAGMA busy_timeout = 60000;
+PRAGMA autocommit_retain = OFF;
 PRAGMA synchronous = NORMAL;
 PRAGMA wal_autocheckpoint = 1000;
 PRAGMA cache_size = -{per_conn_kb};

@@ -7768,11 +7768,73 @@ mod tests {
             !schema::PRAGMA_CONN_SETTINGS_SQL.contains("journal_mode"),
             "fresh probe/read connections must not try to switch journal mode"
         );
+        assert!(
+            schema::PRAGMA_CONN_SETTINGS_SQL.contains("autocommit_retain = OFF"),
+            "runtime connections must disable retained autocommit"
+        );
 
         let sql = schema::build_conn_pragmas(4, schema::DEFAULT_CACHE_BUDGET_KB);
         assert!(
             !sql.contains("journal_mode"),
             "pool connection init must not reissue journal_mode=WAL: {sql}"
+        );
+        assert!(
+            sql.contains("autocommit_retain = OFF"),
+            "pool connection init must disable retained autocommit: {sql}"
+        );
+    }
+
+    #[test]
+    fn sqlite_pool_connection_disables_retained_autocommit_for_durable_visibility() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = asupersync::Cx::for_testing();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("retained_autocommit_disabled.db");
+        let cfg = DbPoolConfig {
+            database_url: format!("sqlite:///{}", db_path.display()),
+            min_connections: 1,
+            max_connections: 1,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let conn = pool
+                .acquire(&cx)
+                .await
+                .into_result()
+                .expect("acquire initialized pool connection");
+            conn.execute_raw("PRAGMA fsqlite.concurrent_mode = OFF")
+                .expect("force retained-autocommit candidate mode");
+            conn.execute_raw(
+                "INSERT INTO projects (slug, human_key, created_at) \
+                 VALUES ('retain-disabled', '/tmp/am-retain-disabled', 0)",
+            )
+            .expect("insert project through pooled connection");
+            drop(conn);
+        });
+
+        let db_path_str = db_path.to_str().expect("utf8 db path");
+        let verify = open_sqlite_file_with_lock_retry_canonical(db_path_str)
+            .expect("open fresh canonical verification connection");
+        let rows = verify
+            .query_sync(
+                "SELECT count(*) AS count FROM projects WHERE slug = 'retain-disabled'",
+                &[],
+            )
+            .expect("query committed project count");
+        assert_eq!(
+            rows.first()
+                .and_then(|row| row.get_named::<i64>("count").ok()),
+            Some(1),
+            "autocommit insert through a pooled connection must be visible to a fresh handle"
         );
     }
 
