@@ -8,7 +8,8 @@
 //!
 //! - Projects cached for 5 minutes (almost never change after creation)
 //! - Agents cached for 5 minutes (profile updates are infrequent)
-//! - Max 16,384 entries per category (~3.2 MB total at saturation)
+//! - Capacity is profile-driven via `AM_CACHE_PROFILE` and can be overridden
+//!   with `AM_READ_CACHE_ENTRIES_PER_CATEGORY`
 //! - Write-through: callers should call `invalidate_*` or `put_*` after mutations
 //! - Deferred touch: `touch_agent` timestamps are buffered and flushed in batches
 //!
@@ -40,13 +41,14 @@ use std::time::{Duration, Instant};
 
 use crate::models::{AgentRow, InboxStatsRow, ProjectRow};
 use crate::s3fifo::S3FifoCache;
-use mcp_agent_mail_core::{InternedStr, LockLevel, OrderedMutex, OrderedRwLock};
+use mcp_agent_mail_core::{Config, InternedStr, LockLevel, OrderedMutex, OrderedRwLock};
 use serde::Serialize;
 
 const PROJECT_TTL: Duration = Duration::from_mins(5);
 const AGENT_TTL: Duration = Duration::from_mins(5);
 const INBOX_STATS_TTL: Duration = Duration::from_secs(30); // 30 sec (shorter: counters change often)
-const MAX_ENTRIES_PER_CATEGORY: usize = 16_384;
+#[cfg(test)]
+const DEFAULT_ENTRIES_PER_CATEGORY: usize = 16_384;
 /// Minimum interval between deferred touch flushes.
 const TOUCH_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 /// Minimum accesses before adaptive TTL kicks in (2x base TTL).
@@ -272,7 +274,7 @@ pub struct ReadCache {
 
 impl ReadCache {
     fn new() -> Self {
-        Self::with_capacity(MAX_ENTRIES_PER_CATEGORY)
+        Self::with_capacity(Config::get().read_cache_entries_per_category)
     }
 
     fn with_capacity(capacity: usize) -> Self {
@@ -1030,6 +1032,12 @@ impl ReadCache {
         }
     }
 
+    /// Return the configured per-category capacity.
+    #[must_use]
+    pub fn capacity_per_category(&self) -> usize {
+        self.projects_by_slug.read().capacity()
+    }
+
     /// Return a best-effort resident footprint estimate for the live cache.
     ///
     /// This reports estimates rather than exact allocator usage: `HashMap`,
@@ -1057,6 +1065,7 @@ impl ReadCache {
 
         CacheFootprintEstimate {
             counts,
+            capacity_per_category: self.capacity_per_category(),
             project_payload_bytes,
             agent_payload_bytes,
             inbox_stats_payload_bytes,
@@ -1166,6 +1175,7 @@ impl CacheEntryCounts {
 #[derive(Debug, Clone, Serialize)]
 pub struct CacheFootprintEstimate {
     pub counts: CacheEntryCounts,
+    pub capacity_per_category: usize,
     pub project_payload_bytes: usize,
     pub agent_payload_bytes: usize,
     pub inbox_stats_payload_bytes: usize,
@@ -1352,15 +1362,40 @@ mod tests {
 
     #[test]
     fn max_entries_respected() {
-        let cache = ReadCache::new();
+        let cache = ReadCache::with_capacity(DEFAULT_ENTRIES_PER_CATEGORY);
 
-        for i in 0..MAX_ENTRIES_PER_CATEGORY + 10 {
+        for i in 0..DEFAULT_ENTRIES_PER_CATEGORY + 10 {
             let slug = format!("proj-{i}");
             cache.put_project(&make_project(&slug));
         }
 
         let map_len = cache.projects_by_slug.read().len();
-        assert!(map_len <= MAX_ENTRIES_PER_CATEGORY);
+        assert!(map_len <= DEFAULT_ENTRIES_PER_CATEGORY);
+    }
+
+    #[test]
+    fn read_cache_capacity_uses_cache_profile_default() {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("AM_CACHE_PROFILE", "high-memory")],
+            || {
+                let cache = ReadCache::new();
+                assert_eq!(cache.capacity_per_category(), 131_072);
+            },
+        );
+    }
+
+    #[test]
+    fn read_cache_capacity_override_is_clamped() {
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_CACHE_PROFILE", "high-memory"),
+                ("AM_READ_CACHE_ENTRIES_PER_CATEGORY", "1"),
+            ],
+            || {
+                let cache = ReadCache::new();
+                assert_eq!(cache.capacity_per_category(), 1_024);
+            },
+        );
     }
 
     #[test]
@@ -1710,7 +1745,7 @@ mod tests {
 
     #[test]
     fn footprint_estimate_counts_shared_payloads_once() {
-        let cache = ReadCache::new();
+        let cache = ReadCache::with_capacity(DEFAULT_ENTRIES_PER_CATEGORY);
         let project = make_project("shared");
         let agent = make_agent_with_id("SharedAgent", 7, 77);
 
@@ -1724,6 +1759,10 @@ mod tests {
         assert_eq!(footprint.counts.agents_by_key, 1);
         assert_eq!(footprint.counts.agents_by_id, 1);
         assert_eq!(
+            footprint.capacity_per_category,
+            DEFAULT_ENTRIES_PER_CATEGORY
+        );
+        assert_eq!(
             footprint.project_payload_bytes,
             estimate_project_row_bytes(&project)
         );
@@ -1736,7 +1775,7 @@ mod tests {
     #[test]
     fn diagnostics_snapshot_combines_counters_and_footprint() {
         let metrics = CacheMetrics::new();
-        let cache = ReadCache::new();
+        let cache = ReadCache::with_capacity(DEFAULT_ENTRIES_PER_CATEGORY);
         let project = make_project("diag");
 
         metrics.record_project_hit();
@@ -1747,6 +1786,10 @@ mod tests {
 
         assert_eq!(snapshot.metrics.project_hits, 1);
         assert_eq!(snapshot.metrics.project_misses, 1);
+        assert_eq!(
+            snapshot.footprint.capacity_per_category,
+            DEFAULT_ENTRIES_PER_CATEGORY
+        );
         assert_eq!(snapshot.footprint.counts.projects_by_slug, 1);
         assert_eq!(snapshot.footprint.counts.projects_by_human_key, 1);
         assert_eq!(
@@ -1759,7 +1802,7 @@ mod tests {
     #[test]
     fn diagnostics_snapshot_serializes_metrics_and_footprint_fields() {
         let metrics = CacheMetrics::new();
-        let cache = ReadCache::new();
+        let cache = ReadCache::with_capacity(DEFAULT_ENTRIES_PER_CATEGORY);
 
         metrics.record_agent_miss();
         cache.put_agent(&make_agent("DiagAgent", 3));
@@ -1768,6 +1811,14 @@ mod tests {
         let value = serde_json::to_value(&snapshot).expect("diagnostic snapshot serializes");
 
         assert_eq!(value["metrics"]["agent_misses"], 1);
+        assert_eq!(
+            value["footprint"]["capacity_per_category"].as_u64(),
+            Some(
+                DEFAULT_ENTRIES_PER_CATEGORY
+                    .try_into()
+                    .expect("default cache capacity fits u64")
+            )
+        );
         assert_eq!(value["footprint"]["counts"]["agents_by_key"], 1);
         assert!(
             value["footprint"]["total_estimated_bytes"]
@@ -1824,8 +1875,8 @@ mod tests {
             cache.put_agent(&make_agent_with_id(&name, 1, i));
         }
         let counts = cache.entry_counts();
-        assert!(counts.agents_by_key <= MAX_ENTRIES_PER_CATEGORY);
-        assert!(counts.agents_by_id <= MAX_ENTRIES_PER_CATEGORY);
+        assert!(counts.agents_by_key <= DEFAULT_ENTRIES_PER_CATEGORY);
+        assert!(counts.agents_by_id <= DEFAULT_ENTRIES_PER_CATEGORY);
     }
 
     #[test]

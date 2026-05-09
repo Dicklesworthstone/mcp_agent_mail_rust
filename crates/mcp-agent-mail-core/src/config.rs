@@ -105,6 +105,13 @@ pub struct Config {
     /// Override via `DATABASE_CACHE_BUDGET_KB`. Default: profile-derived
     /// `524_288` (512 MiB).
     pub database_cache_budget_kb: usize,
+    /// In-memory read-cache entries per category.
+    ///
+    /// This bounds each hot lookup cache independently (projects by slug,
+    /// projects by human key, agents by name, agents by id, and inbox stats).
+    /// Override via `AM_READ_CACHE_ENTRIES_PER_CATEGORY`. Default:
+    /// profile-derived `16_384`.
+    pub read_cache_entries_per_category: usize,
     /// Run `PRAGMA quick_check` on pool initialization (default: true).
     pub integrity_check_on_startup: bool,
     /// Hours between periodic full `PRAGMA integrity_check` runs
@@ -451,6 +458,15 @@ impl CacheProfile {
             Self::Conservative => 128 * 1024,
             Self::Balanced => 512 * 1024,
             Self::HighMemory => 2 * 1024 * 1024,
+        }
+    }
+
+    #[must_use]
+    pub const fn read_cache_entries_per_category(self) -> usize {
+        match self {
+            Self::Conservative => 4_096,
+            Self::Balanced => 16_384,
+            Self::HighMemory => 131_072,
         }
     }
 }
@@ -1141,6 +1157,8 @@ impl Default for Config {
             database_pool_timeout: None,
             cache_profile: CacheProfile::Balanced,
             database_cache_budget_kb: CacheProfile::Balanced.database_cache_budget_kb(),
+            read_cache_entries_per_category: CacheProfile::Balanced
+                .read_cache_entries_per_category(),
             integrity_check_on_startup: true,
             integrity_check_interval_hours: 1,
 
@@ -1470,6 +1488,10 @@ impl std::fmt::Debug for Config {
             .field("database_url", &redact_db_url(&self.database_url))
             .field("cache_profile", &self.cache_profile)
             .field("database_cache_budget_kb", &self.database_cache_budget_kb)
+            .field(
+                "read_cache_entries_per_category",
+                &self.read_cache_entries_per_category,
+            )
             .field("http_host", &self.http_host)
             .field("http_port", &self.http_port)
             .field("http_path", &self.http_path)
@@ -1548,11 +1570,17 @@ impl Config {
         if let Some(v) = env_value("AM_CACHE_PROFILE") {
             config.cache_profile = CacheProfile::parse(&v);
             config.database_cache_budget_kb = config.cache_profile.database_cache_budget_kb();
+            config.read_cache_entries_per_category =
+                config.cache_profile.read_cache_entries_per_category();
         }
         config.database_cache_budget_kb = env_value("DATABASE_CACHE_BUDGET_KB")
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(config.database_cache_budget_kb)
             .clamp(16_384, 4_194_304); // 16 MiB .. 4 GiB
+        config.read_cache_entries_per_category = env_value("AM_READ_CACHE_ENTRIES_PER_CATEGORY")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(config.read_cache_entries_per_category)
+            .clamp(1_024, 1_048_576);
         config.integrity_check_on_startup = env_bool(
             "INTEGRITY_CHECK_ON_STARTUP",
             config.integrity_check_on_startup,
@@ -3270,6 +3298,7 @@ mod tests {
         assert!(config.database_pool_timeout.is_none());
         assert_eq!(config.cache_profile, CacheProfile::Balanced);
         assert_eq!(config.database_cache_budget_kb, 512 * 1024);
+        assert_eq!(config.read_cache_entries_per_category, 16_384);
         assert_eq!(
             config.database_url,
             "sqlite+aiosqlite:///./storage.sqlite3".to_string()
@@ -3296,6 +3325,7 @@ mod tests {
         let config = Config::from_env();
         assert_eq!(config.cache_profile, CacheProfile::HighMemory);
         assert_eq!(config.database_cache_budget_kb, 2 * 1024 * 1024);
+        assert_eq!(config.read_cache_entries_per_category, 131_072);
     }
 
     #[test]
@@ -3317,6 +3347,27 @@ mod tests {
         let config = Config::from_env();
         assert_eq!(config.cache_profile, CacheProfile::Conservative);
         assert_eq!(config.database_cache_budget_kb, 16_384);
+    }
+
+    #[test]
+    fn test_read_cache_entry_budget_overrides_profile_and_clamps() {
+        let env_guard = TestEnvOverrideGuard::set(&[
+            ("AM_CACHE_PROFILE", "high-memory"),
+            ("AM_READ_CACHE_ENTRIES_PER_CATEGORY", "999999999"),
+        ]);
+        let config = Config::from_env();
+        assert_eq!(config.cache_profile, CacheProfile::HighMemory);
+        assert_eq!(config.read_cache_entries_per_category, 1_048_576);
+
+        drop(env_guard);
+
+        let _env = TestEnvOverrideGuard::set(&[
+            ("AM_CACHE_PROFILE", "conservative"),
+            ("AM_READ_CACHE_ENTRIES_PER_CATEGORY", "1"),
+        ]);
+        let config = Config::from_env();
+        assert_eq!(config.cache_profile, CacheProfile::Conservative);
+        assert_eq!(config.read_cache_entries_per_category, 1_024);
     }
 
     #[test]
