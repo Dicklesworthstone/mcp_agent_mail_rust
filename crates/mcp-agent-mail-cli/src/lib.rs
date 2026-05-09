@@ -26721,6 +26721,18 @@ mod tests {
     }
 
     #[test]
+    fn agent_start_http_url_normalizes_http_path() {
+        assert_eq!(
+            agent_start_http_url("127.0.0.1", "8765", "api"),
+            "http://127.0.0.1:8765/api/"
+        );
+        assert_eq!(
+            agent_start_http_url("127.0.0.1", "8765", "/custom/path"),
+            "http://127.0.0.1:8765/custom/path/"
+        );
+    }
+
+    #[test]
     fn resolve_socket_bind_addr_accepts_raw_ipv6_loopback_host() {
         if std::net::TcpListener::bind("[::1]:0").is_err() {
             return;
@@ -56195,6 +56207,7 @@ fn start_session_command(
 
 fn agent_start_http_url(host: &str, port: &str, http_path: &str) -> String {
     let connect_host = normalize_connect_host_for_client_url(host);
+    let http_path = normalize_http_path(http_path);
     format!("http://{connect_host}:{port}{http_path}")
 }
 
