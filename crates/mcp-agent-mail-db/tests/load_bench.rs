@@ -28,7 +28,10 @@
 mod common;
 
 use asupersync::{Cx, Outcome};
+use mcp_agent_mail_core::config::CacheProfile;
 use mcp_agent_mail_core::models::{VALID_ADJECTIVES, VALID_NOUNS};
+use mcp_agent_mail_db::AgentRow;
+use mcp_agent_mail_db::cache::ReadCache;
 use mcp_agent_mail_db::queries;
 use mcp_agent_mail_db::{DbPool, DbPoolConfig, QUERY_TRACKER, read_cache};
 use std::collections::BTreeMap;
@@ -263,6 +266,25 @@ struct SwarmLoadLabReport {
     realism_notes: Vec<&'static str>,
 }
 
+#[derive(serde::Serialize)]
+struct CacheProfileHotsetReport {
+    profile: &'static str,
+    capacity_per_category: usize,
+    seeded_agents: usize,
+    probes: usize,
+    hits: u64,
+    misses: u64,
+    hit_ratio: f64,
+    lookup_p50_us: u64,
+    lookup_p95_us: u64,
+    lookup_p99_us: u64,
+    lookup_max_us: u64,
+    output_checksum: u64,
+    final_live_entries: usize,
+    capacity_utilization_bp: u64,
+    total_estimated_bytes: usize,
+}
+
 impl SwarmLoadLabOperationReport {
     const fn from_latency_report(operation: &'static str, report: &LatencyReport) -> Self {
         Self {
@@ -403,6 +425,26 @@ fn write_swarm_load_lab_artifacts(report: &SwarmLoadLabReport) {
     eprintln!(
         "swarm load lab markdown artifact: {}",
         markdown_path.display()
+    );
+}
+
+fn cache_profile_hotset_artifact_dir() -> PathBuf {
+    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    repo_root().join(format!(
+        "tests/artifacts/perf/cache_profile_hotset/{ts}_{}",
+        std::process::id()
+    ))
+}
+
+fn write_cache_profile_hotset_artifact(report: &serde_json::Value) {
+    let dir = cache_profile_hotset_artifact_dir();
+    std::fs::create_dir_all(&dir).expect("create cache profile hotset artifact dir");
+    let json_path = dir.join("report.json");
+    let json = serde_json::to_string_pretty(report).expect("serialize cache profile hotset report");
+    std::fs::write(&json_path, json).expect("write cache profile hotset json report");
+    eprintln!(
+        "cache profile hotset json artifact: {}",
+        json_path.display()
     );
 }
 
@@ -1687,5 +1729,194 @@ fn load_scenario_e_inbox_stats_polling_cache_effectiveness() {
     assert!(
         warm_hit_ratio > forced_hit_ratio,
         "warm-cache polling should yield a higher hit ratio (forced={forced_hit_ratio:.4}, warm={warm_hit_ratio:.4})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario F: Read-cache profile hotset retention
+// ---------------------------------------------------------------------------
+// Compare conservative and high-memory read-cache profile capacities on the
+// same deterministic hotset. Misses simulate a DB fallback by reinserting the
+// expected row, so both profiles must produce the same logical output stream
+// while the high-memory profile should avoid most fallback work.
+
+fn make_cache_profile_agent(idx: usize) -> AgentRow {
+    let id = i64::try_from(idx + 1).expect("agent id fits i64");
+    AgentRow {
+        id: Some(id),
+        project_id: 1,
+        name: format!("HotAgent{idx:05}"),
+        program: "load-bench".to_string(),
+        model: "cache-profile".to_string(),
+        task_description: "read-cache hotset profile benchmark".to_string(),
+        inception_ts: 1_700_000_000_000_000,
+        last_active_ts: 1_700_000_000_000_000,
+        attachments_policy: "auto".to_string(),
+        contact_policy: "auto".to_string(),
+        reaper_exempt: 0,
+        registration_token: None,
+    }
+}
+
+fn run_cache_profile_hotset(
+    profile: &'static str,
+    capacity_per_category: usize,
+    agents: &[AgentRow],
+    passes: usize,
+) -> CacheProfileHotsetReport {
+    let cache = ReadCache::new_for_testing_with_capacity(capacity_per_category);
+    for agent in agents {
+        cache.put_agent(agent);
+    }
+
+    let probes = agents
+        .len()
+        .checked_mul(passes)
+        .expect("probe count should fit usize");
+    let mut hits = 0_u64;
+    let mut misses = 0_u64;
+    let mut checksum = 0_u64;
+    let mut latencies = Vec::with_capacity(probes);
+
+    for pass in 0..passes {
+        for step in 0..agents.len() {
+            let idx = (step.wrapping_mul(37).wrapping_add(pass.wrapping_mul(101))) % agents.len();
+            let expected = &agents[idx];
+            let t0 = Instant::now();
+            let cached = cache.get_agent(expected.project_id, &expected.name);
+            latencies.push(t0.elapsed().as_micros() as u64);
+
+            match cached {
+                Some(agent) => {
+                    hits += 1;
+                    assert_eq!(agent.id, expected.id, "cached agent id mismatch");
+                    checksum = checksum
+                        .wrapping_mul(1_000_003)
+                        .wrapping_add(agent.id.expect("agent id must exist") as u64);
+                }
+                None => {
+                    misses += 1;
+                    cache.put_agent(expected);
+                    checksum = checksum
+                        .wrapping_mul(1_000_003)
+                        .wrapping_add(expected.id.expect("agent id must exist") as u64);
+                }
+            }
+        }
+    }
+
+    let latency = LatencyReport::from_latencies(&mut latencies, 0);
+    let footprint = cache.footprint_estimate();
+    CacheProfileHotsetReport {
+        profile,
+        capacity_per_category,
+        seeded_agents: agents.len(),
+        probes,
+        hits,
+        misses,
+        hit_ratio: hits as f64 / probes as f64,
+        lookup_p50_us: latency.p50,
+        lookup_p95_us: latency.p95,
+        lookup_p99_us: latency.p99,
+        lookup_max_us: latency.max,
+        output_checksum: checksum,
+        final_live_entries: footprint.counts.total_live_entries(),
+        capacity_utilization_bp: footprint.capacity_utilization_bp,
+        total_estimated_bytes: footprint.total_estimated_bytes,
+    }
+}
+
+#[test]
+#[ignore = "benchmark scenario: read-cache profile hotset retention"]
+fn load_scenario_f_read_cache_profile_hotset_retention() {
+    let conservative_capacity = CacheProfile::Conservative.read_cache_entries_per_category();
+    let high_memory_capacity = CacheProfile::HighMemory.read_cache_entries_per_category();
+    let seeded_agents = 20_000;
+    let passes = 3;
+    assert!(
+        conservative_capacity < seeded_agents,
+        "conservative profile must be smaller than the synthetic hotset"
+    );
+    assert!(
+        high_memory_capacity >= seeded_agents,
+        "high-memory profile must fit the synthetic hotset"
+    );
+
+    let agents: Vec<_> = (0..seeded_agents).map(make_cache_profile_agent).collect();
+    let conservative =
+        run_cache_profile_hotset("conservative", conservative_capacity, &agents, passes);
+    let high_memory =
+        run_cache_profile_hotset("high-memory", high_memory_capacity, &agents, passes);
+
+    eprintln!("\n=== Scenario F: Read Cache Profile Hotset Retention ===");
+    eprintln!(
+        "  conservative: hits={}, misses={}, hit_ratio={:.2}%, p95={}us, live_entries={}, util={}bp",
+        conservative.hits,
+        conservative.misses,
+        conservative.hit_ratio * 100.0,
+        conservative.lookup_p95_us,
+        conservative.final_live_entries,
+        conservative.capacity_utilization_bp
+    );
+    eprintln!(
+        "  high-memory: hits={}, misses={}, hit_ratio={:.2}%, p95={}us, live_entries={}, util={}bp",
+        high_memory.hits,
+        high_memory.misses,
+        high_memory.hit_ratio * 100.0,
+        high_memory.lookup_p95_us,
+        high_memory.final_live_entries,
+        high_memory.capacity_utilization_bp
+    );
+
+    let miss_reduction_factor = if high_memory.misses == 0 {
+        conservative.misses as f64
+    } else {
+        conservative.misses as f64 / high_memory.misses as f64
+    };
+    let report = serde_json::json!({
+        "scenario": "load_scenario_f_read_cache_profile_hotset_retention",
+        "bead": "br-n1wry",
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "workload": {
+            "seeded_agents": seeded_agents,
+            "passes": passes,
+            "probes": seeded_agents * passes,
+            "lookup_order": "deterministic permutation: idx=(step*37 + pass*101) mod seeded_agents",
+            "miss_policy": "simulate DB fallback by reinserting the expected row",
+        },
+        "profiles": {
+            "conservative": conservative,
+            "high_memory": high_memory,
+        },
+        "comparison": {
+            "miss_reduction_factor": miss_reduction_factor,
+        }
+    });
+    eprintln!("BENCH_JSON {report}");
+    write_cache_profile_hotset_artifact(&report);
+
+    let conservative = &report["profiles"]["conservative"];
+    let high_memory = &report["profiles"]["high_memory"];
+    assert_eq!(
+        conservative["output_checksum"], high_memory["output_checksum"],
+        "profile choice must not change logical lookup outputs"
+    );
+    assert!(
+        high_memory["hit_ratio"].as_f64().expect("high hit ratio") >= 0.85,
+        "high-memory profile should retain at least 85% of repeated hotset probes"
+    );
+    assert!(
+        conservative["hit_ratio"]
+            .as_f64()
+            .expect("conservative hit ratio")
+            < 0.10,
+        "conservative profile should show measurable churn on this oversized hotset"
+    );
+    assert!(
+        report["comparison"]["miss_reduction_factor"]
+            .as_f64()
+            .expect("miss reduction factor")
+            >= 8.0,
+        "high-memory profile should reduce simulated DB fallback misses by at least 8x"
     );
 }
