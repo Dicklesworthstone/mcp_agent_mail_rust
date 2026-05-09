@@ -13,6 +13,7 @@
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -47,6 +48,7 @@ const WORKER_SLEEP: Duration = Duration::from_millis(500);
 const MAX_READ_BYTES: usize = 8 * 1024;
 const SCREEN_DIAGNOSTIC_PREVIEW_LIMIT: usize = 3;
 const ATC_STALE_HEARTBEAT_SECS: i64 = 5 * 60;
+const GIT_REF_INTEGRITY_VISIBLE_PROJECTS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Level {
@@ -256,6 +258,74 @@ struct PathProbe {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct GitRefIntegrityProjectTarget {
+    slug: String,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GitRefIntegrityProjectSummary {
+    slug: String,
+    last_sweep_ts: Option<DateTime<Utc>>,
+    finding_count: usize,
+    protected_count: usize,
+    safe_to_prune_count: usize,
+    ask_user_count: usize,
+    classification: Level,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GitRefIntegritySweepState {
+    enabled: bool,
+    interval_seconds: u64,
+    batch_size: usize,
+    cursor_index: usize,
+    next_cursor_index: usize,
+    total_projects: usize,
+    projects_scanned: usize,
+    total_findings: usize,
+    checked_at: Option<DateTime<Utc>>,
+    am_git_binary_set: bool,
+    projects: Vec<GitRefIntegrityProjectSummary>,
+}
+
+impl GitRefIntegritySweepState {
+    fn level(&self) -> Level {
+        if !self.enabled {
+            return Level::Warn;
+        }
+        let mut idx = 0;
+        while idx < self.projects.len() {
+            if self.projects[idx].classification == Level::Fail {
+                return Level::Fail;
+            }
+            idx += 1;
+        }
+        if self.total_findings > 0 {
+            Level::Warn
+        } else {
+            Level::Ok
+        }
+    }
+
+    fn banner(&self) -> Option<String> {
+        if !self.enabled || self.total_findings == 0 || self.am_git_binary_set {
+            return None;
+        }
+        let affected_projects = self
+            .projects
+            .iter()
+            .filter(|project| project.finding_count > 0)
+            .count();
+        Some(format!(
+            "archive has {} orphan refs across {} projects. Run: am doctor fix-orphan-refs --all --dry-run",
+            self.total_findings, affected_projects
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct DiagnosticsSnapshot {
     checked_at: Option<DateTime<Utc>>,
@@ -275,6 +345,7 @@ struct DiagnosticsSnapshot {
     atc: crate::AtcOperatorSnapshot,
     agent_attention_count: usize,
     agent_attention_summary: String,
+    git_ref_integrity: GitRefIntegritySweepState,
     /// Tailscale remote-access URL with token, if Tailscale is active.
     remote_url: Option<String>,
 }
@@ -785,6 +856,69 @@ impl SystemHealthScreen {
         }
 
         lines.push(Line::raw(String::new()));
+        lines.push(Line::from_spans([Span::styled(
+            "\u{2500}\u{2500} Git ref integrity \u{2500}\u{2500}",
+            section_style,
+        )]));
+        let git_sweep = &snap.git_ref_integrity;
+        let git_level = git_sweep.level();
+        lines.push(level_styled_line(
+            git_level,
+            &tp,
+            "Health sweep".to_string(),
+            format!(
+                "enabled={} batch={} interval={}s scanned={}/{} findings={} next_cursor={}",
+                git_sweep.enabled,
+                git_sweep.batch_size,
+                git_sweep.interval_seconds,
+                git_sweep.projects_scanned,
+                git_sweep.total_projects,
+                git_sweep.total_findings,
+                git_sweep.next_cursor_index
+            ),
+        ));
+        if let Some(banner) = git_sweep.banner() {
+            lines.push(Line::from_spans([
+                Span::styled("       Run: ", accent_style),
+                Span::styled(banner, crate::tui_theme::text_warning(&tp)),
+            ]));
+        }
+        if git_sweep.projects.is_empty() {
+            lines.push(Line::from_spans([
+                Span::styled("       Rows: ", accent_style),
+                Span::styled("no project sweep data yet".to_string(), hint_style),
+            ]));
+        } else {
+            for project in git_sweep
+                .projects
+                .iter()
+                .take(GIT_REF_INTEGRITY_VISIBLE_PROJECTS)
+            {
+                let checked = project
+                    .last_sweep_ts
+                    .map_or_else(|| "--".to_string(), |ts| ts.to_rfc3339());
+                let detail = project.error.as_ref().map_or_else(
+                    || {
+                        format!(
+                            "findings={} protected={} safe={} ask={} checked={checked}",
+                            project.finding_count,
+                            project.protected_count,
+                            project.safe_to_prune_count,
+                            project.ask_user_count
+                        )
+                    },
+                    |error| format!("error={error} checked={checked}"),
+                );
+                lines.push(level_styled_line(
+                    project.classification,
+                    &tp,
+                    project.slug.clone(),
+                    detail,
+                ));
+            }
+        }
+
+        lines.push(Line::raw(String::new()));
 
         // ── Connection Diagnostics Section ──
         lines.push(Line::from_spans([Span::styled(
@@ -998,17 +1132,25 @@ impl SystemHealthScreen {
 
                 self.render_metric_tiles(frame, tiles_area, state, &snap);
                 if gauge_h >= 2 {
-                    let left_w = gauge_area.width / 2;
+                    let left_w = gauge_area.width / 3;
+                    let mid_w = gauge_area.width / 3;
                     let event_area =
                         Rect::new(gauge_area.x, gauge_area.y, left_w, gauge_area.height);
                     let atc_area = Rect::new(
                         gauge_area.x + left_w,
                         gauge_area.y,
-                        gauge_area.width.saturating_sub(left_w),
+                        mid_w,
+                        gauge_area.height,
+                    );
+                    let git_area = Rect::new(
+                        gauge_area.x + left_w + mid_w,
+                        gauge_area.y,
+                        gauge_area.width.saturating_sub(left_w + mid_w),
                         gauge_area.height,
                     );
                     self.render_event_ring_gauge(frame, event_area, state);
                     self.render_atc_health_widget(frame, atc_area, &snap);
+                    self.render_git_ref_integrity_widget(frame, git_area, &snap);
                 }
                 if cards_h >= 3 {
                     self.render_anomaly_cards(frame, cards_area, &snap);
@@ -1249,6 +1391,75 @@ impl SystemHealthScreen {
             .render(area, frame);
     }
 
+    #[allow(clippy::unused_self)]
+    fn render_git_ref_integrity_widget(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        snap: &DiagnosticsSnapshot,
+    ) {
+        if area.is_empty() {
+            return;
+        }
+
+        let sweep = &snap.git_ref_integrity;
+        let level = sweep.level();
+        let tp = crate::tui_theme::TuiThemePalette::current();
+        let border_style = level.style(&tp);
+        let checked = sweep
+            .checked_at
+            .map_or_else(|| "--".to_string(), |ts| ts.to_rfc3339());
+        let top_project = sweep
+            .projects
+            .iter()
+            .find(|project| project.finding_count > 0 || project.error.is_some())
+            .or_else(|| sweep.projects.first());
+        let project_summary = top_project.map_or_else(
+            || "project=none".to_string(),
+            |project| {
+                project.error.as_ref().map_or_else(
+                    || {
+                        format!(
+                            "project={} findings={} class={}",
+                            project.slug,
+                            project.finding_count,
+                            project.classification.label()
+                        )
+                    },
+                    |error| format!("project={} error={error}", project.slug),
+                )
+            },
+        );
+        let banner = sweep.banner().unwrap_or_else(|| {
+            if sweep.am_git_binary_set {
+                "banner suppressed by AM_GIT_BINARY".to_string()
+            } else {
+                "no orphan-ref banner".to_string()
+            }
+        });
+        let body = format!(
+            "state={} batch={} interval={}s cursor={}->{} scanned={}/{}\nfindings={} checked={checked}\n{project_summary}\n{banner}",
+            if sweep.enabled { "enabled" } else { "disabled" },
+            sweep.batch_size,
+            sweep.interval_seconds,
+            sweep.cursor_index,
+            sweep.next_cursor_index,
+            sweep.projects_scanned,
+            sweep.total_projects,
+            sweep.total_findings,
+        );
+
+        Paragraph::new(body)
+            .block(
+                Block::default()
+                    .title(" Git ref integrity ")
+                    .border_type(BorderType::Rounded)
+                    .border_style(border_style)
+                    .borders(ftui::widgets::borders::Borders::ALL),
+            )
+            .render(area, frame);
+    }
+
     /// Render diagnostic findings as anomaly cards.
     #[allow(clippy::too_many_lines, clippy::unused_self)]
     fn render_anomaly_cards(&self, frame: &mut Frame<'_>, area: Rect, snap: &DiagnosticsSnapshot) {
@@ -1272,6 +1483,14 @@ impl SystemHealthScreen {
                 confidence: 0.95,
                 title: "TCP connection failed".to_string(),
                 rationale: Some(err.clone()),
+            });
+        }
+        if let Some(banner) = snap.git_ref_integrity.banner() {
+            findings.push(FindingCard {
+                severity: AnomalySeverity::Medium,
+                confidence: 0.9,
+                title: "Git ref integrity findings".to_string(),
+                rationale: Some(banner),
             });
         }
         for line in &snap.lines {
@@ -1485,7 +1704,15 @@ impl SystemHealthScreen {
         block.render(area, frame);
 
         let snap = self.snapshot();
-        if snap.lines.is_empty() && snap.tcp_error.is_none() {
+        if snap.lines.is_empty()
+            && snap.tcp_error.is_none()
+            && snap.git_ref_integrity.total_findings == 0
+            && snap
+                .git_ref_integrity
+                .projects
+                .iter()
+                .all(|project| project.error.is_none())
+        {
             crate::tui_panel_helpers::render_empty_state(
                 frame,
                 inner,
@@ -1499,6 +1726,30 @@ impl SystemHealthScreen {
         let mut lines: Vec<(String, String, Option<PackedRgba>)> = Vec::new();
         if let Some(err) = &snap.tcp_error {
             lines.push(("[CRIT] TCP".into(), err.clone(), Some(tp.severity_critical)));
+        }
+        if let Some(banner) = snap.git_ref_integrity.banner() {
+            lines.push(("[WARN] Git refs".into(), banner, Some(tp.severity_warn)));
+        }
+        for project in snap
+            .git_ref_integrity
+            .projects
+            .iter()
+            .filter(|project| project.finding_count > 0 || project.error.is_some())
+        {
+            let color = match project.classification {
+                Level::Ok => tp.severity_ok,
+                Level::Warn => tp.severity_warn,
+                Level::Fail => tp.severity_error,
+            };
+            let detail = project.error.as_ref().map_or_else(
+                || format!("{} orphan ref(s)", project.finding_count),
+                Clone::clone,
+            );
+            lines.push((
+                format!("[{}] {}", project.classification.label(), project.slug),
+                detail,
+                Some(color),
+            ));
         }
         for probe_line in &snap.lines {
             let color = match probe_line.level {
@@ -1737,6 +1988,7 @@ fn format_uptime(d: Duration) -> String {
 
 fn critical_finding_count(snap: &DiagnosticsSnapshot) -> usize {
     usize::from(snap.tcp_error.is_some())
+        + usize::from(snap.git_ref_integrity.level() == Level::Fail)
         + snap
             .lines
             .iter()
@@ -1826,6 +2078,9 @@ fn diagnostics_worker_loop(
     // Cache Tailscale IP to avoid spawning a subprocess every diagnostics cycle.
     let mut cached_tailscale_ip: Option<String> = crate::detect_tailscale_ip();
     let mut tailscale_checked_at = Instant::now();
+    let mut git_ref_integrity = GitRefIntegritySweepState::default();
+    let mut git_ref_cursor_index = 0_usize;
+    let mut next_git_ref_sweep_due = Instant::now();
 
     let mut next_due = Instant::now();
     while !stop.load(Ordering::Relaxed) {
@@ -1838,7 +2093,18 @@ fn diagnostics_worker_loop(
                 cached_tailscale_ip = crate::detect_tailscale_ip();
                 tailscale_checked_at = now;
             }
-            let snap = run_diagnostics(state, cached_tailscale_ip.as_deref());
+            let run_git_ref_sweep = refresh || now >= next_git_ref_sweep_due;
+            let snap = run_diagnostics(
+                state,
+                cached_tailscale_ip.as_deref(),
+                &mut git_ref_integrity,
+                &mut git_ref_cursor_index,
+                run_git_ref_sweep,
+            );
+            if run_git_ref_sweep {
+                next_git_ref_sweep_due = Instant::now()
+                    + Duration::from_secs(snap.git_ref_integrity.interval_seconds.max(1));
+            }
             emit_screen_diagnostic(state, &snap);
             if let Ok(mut guard) = snapshot.lock() {
                 *guard = snap;
@@ -1895,7 +2161,13 @@ fn emit_screen_diagnostic(state: &TuiSharedState, snap: &DiagnosticsSnapshot) {
     });
 }
 
-fn run_diagnostics(state: &TuiSharedState, tailscale_ip: Option<&str>) -> DiagnosticsSnapshot {
+fn run_diagnostics(
+    state: &TuiSharedState,
+    tailscale_ip: Option<&str>,
+    git_ref_integrity: &mut GitRefIntegritySweepState,
+    git_ref_cursor_index: &mut usize,
+    run_git_ref_sweep: bool,
+) -> DiagnosticsSnapshot {
     let cfg = state.config_snapshot();
     let env_cfg = Config::from_env();
 
@@ -1918,15 +2190,18 @@ fn run_diagnostics(state: &TuiSharedState, tailscale_ip: Option<&str>) -> Diagno
         remote_url,
         ..Default::default()
     };
-    if let Some(db_snapshot) = state.db_stats_snapshot() {
+    let db_snapshot = state.db_stats_snapshot();
+    if let Some(db_snapshot) = &db_snapshot {
         let mut attention_agents = db_snapshot
             .agents_list
-            .into_iter()
+            .iter()
             .filter_map(|agent| {
-                agent.health.and_then(|health| {
-                    health
-                        .needs_attention()
-                        .then_some((health.score, health.badge(), agent.name))
+                agent.health.as_ref().and_then(|health| {
+                    health.needs_attention().then_some((
+                        health.score,
+                        health.badge(),
+                        agent.name.clone(),
+                    ))
                 })
             })
             .collect::<Vec<_>>();
@@ -1944,6 +2219,28 @@ fn run_diagnostics(state: &TuiSharedState, tailscale_ip: Option<&str>) -> Diagno
                 .join(", ")
         };
     }
+    let git_ref_targets = db_snapshot
+        .as_ref()
+        .map_or_else(Vec::new, git_ref_integrity_targets_from_snapshot);
+    if run_git_ref_sweep || !env_cfg.health_sweep_enabled {
+        *git_ref_integrity = git_ref_integrity_sweep(
+            &git_ref_targets,
+            *git_ref_cursor_index,
+            env_cfg.health_sweep_batch,
+            env_cfg.health_sweep_enabled,
+            env_cfg.health_sweep_interval_seconds,
+            std::env::var_os("AM_GIT_BINARY").is_some(),
+            out.checked_at.unwrap_or_else(Utc::now),
+        );
+        *git_ref_cursor_index = git_ref_integrity.next_cursor_index;
+    } else {
+        git_ref_integrity.enabled = env_cfg.health_sweep_enabled;
+        git_ref_integrity.interval_seconds = env_cfg.health_sweep_interval_seconds;
+        git_ref_integrity.batch_size = env_cfg.health_sweep_batch;
+        git_ref_integrity.total_projects = git_ref_targets.len();
+        git_ref_integrity.am_git_binary_set = std::env::var_os("AM_GIT_BINARY").is_some();
+    }
+    out.git_ref_integrity = git_ref_integrity.clone();
 
     let parsed = match parse_http_endpoint(&cfg) {
         Ok(p) => p,
@@ -2223,6 +2520,192 @@ fn add_atc_findings(out: &mut DiagnosticsSnapshot) {
             ),
         });
     }
+}
+
+fn git_ref_integrity_targets_from_snapshot(
+    db_snapshot: &crate::tui_events::DbStatSnapshot,
+) -> Vec<GitRefIntegrityProjectTarget> {
+    db_snapshot
+        .projects_list
+        .iter()
+        .filter(|project| !project.slug.trim().is_empty() && !project.human_key.trim().is_empty())
+        .map(|project| GitRefIntegrityProjectTarget {
+            slug: project.slug.clone(),
+            path: PathBuf::from(project.human_key.clone()),
+        })
+        .collect()
+}
+
+fn git_ref_integrity_classification(
+    finding_count: usize,
+    protected_count: usize,
+    error: Option<&str>,
+) -> Level {
+    if error.is_some() || protected_count > 0 {
+        Level::Fail
+    } else if finding_count > 0 {
+        Level::Warn
+    } else {
+        Level::Ok
+    }
+}
+
+fn git_ref_kind(
+    ref_name: &str,
+    category: mcp_agent_mail_storage::recovery::RefCategory,
+) -> &'static str {
+    match category {
+        mcp_agent_mail_storage::recovery::RefCategory::Protected => "orphan_protected",
+        mcp_agent_mail_storage::recovery::RefCategory::SafeToPrune if ref_name == "refs/stash" => {
+            "orphan_stash"
+        }
+        mcp_agent_mail_storage::recovery::RefCategory::SafeToPrune => "orphan_safe_to_prune",
+        mcp_agent_mail_storage::recovery::RefCategory::AskUser => "orphan_ref",
+    }
+}
+
+fn git_ref_severity(category: mcp_agent_mail_storage::recovery::RefCategory) -> &'static str {
+    match category {
+        mcp_agent_mail_storage::recovery::RefCategory::Protected => "error",
+        mcp_agent_mail_storage::recovery::RefCategory::SafeToPrune => "warning",
+        mcp_agent_mail_storage::recovery::RefCategory::AskUser => "warning",
+    }
+}
+
+fn git_ref_integrity_sweep(
+    targets: &[GitRefIntegrityProjectTarget],
+    cursor_index: usize,
+    batch_size: usize,
+    enabled: bool,
+    interval_seconds: u64,
+    am_git_binary_set: bool,
+    now: DateTime<Utc>,
+) -> GitRefIntegritySweepState {
+    let batch_size = batch_size.max(1);
+    let total_projects = targets.len();
+    let cursor_index = if total_projects == 0 {
+        0
+    } else {
+        cursor_index % total_projects
+    };
+    let mut state = GitRefIntegritySweepState {
+        enabled,
+        interval_seconds,
+        batch_size,
+        cursor_index,
+        next_cursor_index: cursor_index,
+        total_projects,
+        checked_at: Some(now),
+        am_git_binary_set,
+        ..Default::default()
+    };
+
+    if !enabled || total_projects == 0 {
+        return state;
+    }
+
+    let projects_to_scan = batch_size.min(total_projects);
+    state.projects_scanned = projects_to_scan;
+
+    tracing::info!(
+        target: "mcp_agent_mail::health_sweep",
+        batch_size = projects_to_scan,
+        cursor_index,
+        total_projects,
+        "git_ref_integrity_started"
+    );
+
+    let sweep_started = Instant::now();
+    for offset in 0..projects_to_scan {
+        let project_index = (cursor_index + offset) % total_projects;
+        let target = &targets[project_index];
+        let project_started = Instant::now();
+        let last_sweep_ts = Some(now);
+
+        match mcp_agent_mail_storage::recovery::detect_missing_refs(&target.path) {
+            Ok(findings) => {
+                let mut protected_count = 0;
+                let mut safe_to_prune_count = 0;
+                let mut ask_user_count = 0;
+                for finding in &findings {
+                    match finding.category {
+                        mcp_agent_mail_storage::recovery::RefCategory::Protected => {
+                            protected_count += 1;
+                        }
+                        mcp_agent_mail_storage::recovery::RefCategory::SafeToPrune => {
+                            safe_to_prune_count += 1;
+                        }
+                        mcp_agent_mail_storage::recovery::RefCategory::AskUser => {
+                            ask_user_count += 1;
+                        }
+                    }
+                    tracing::warn!(
+                        target: "mcp_agent_mail::health_sweep",
+                        project_slug = %target.slug,
+                        ref_kind = git_ref_kind(&finding.ref_name, finding.category),
+                        ref_name = %finding.ref_name,
+                        severity = git_ref_severity(finding.category),
+                        "git_ref_integrity_finding"
+                    );
+                }
+                let finding_count = findings.len();
+                state.total_findings += finding_count;
+                let duration_ms = saturating_duration_ms_u64(project_started.elapsed());
+                tracing::info!(
+                    target: "mcp_agent_mail::health_sweep",
+                    project_slug = %target.slug,
+                    finding_count,
+                    duration_ms,
+                    outcome = "ok",
+                    "git_ref_integrity_swept"
+                );
+                state.projects.push(GitRefIntegrityProjectSummary {
+                    slug: target.slug.clone(),
+                    last_sweep_ts,
+                    finding_count,
+                    protected_count,
+                    safe_to_prune_count,
+                    ask_user_count,
+                    classification: git_ref_integrity_classification(
+                        finding_count,
+                        protected_count,
+                        None,
+                    ),
+                    error: None,
+                });
+            }
+            Err(error) => {
+                let duration_ms = saturating_duration_ms_u64(project_started.elapsed());
+                tracing::warn!(
+                    target: "mcp_agent_mail::health_sweep",
+                    project_slug = %target.slug,
+                    finding_count = 0,
+                    duration_ms,
+                    outcome = "error",
+                    error = %error,
+                    "git_ref_integrity_swept"
+                );
+                state.projects.push(GitRefIntegrityProjectSummary {
+                    slug: target.slug.clone(),
+                    last_sweep_ts,
+                    classification: git_ref_integrity_classification(0, 0, Some(error.message())),
+                    error: Some(error.message().to_string()),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    state.next_cursor_index = (cursor_index + projects_to_scan) % total_projects;
+    tracing::info!(
+        target: "mcp_agent_mail::health_sweep",
+        batch_size = projects_to_scan,
+        total_findings = state.total_findings,
+        total_duration_ms = saturating_duration_ms_u64(sweep_started.elapsed()),
+        next_cursor_index = state.next_cursor_index,
+        "git_ref_integrity_completed"
+    );
+    state
 }
 
 fn push_unique_path(list: &mut Vec<String>, path: &str) {
@@ -3825,6 +4308,137 @@ mod tests {
             out.lines
                 .iter()
                 .any(|line| { line.name == "atc-stale" && line.detail.contains("no heartbeat") })
+        );
+    }
+
+    #[test]
+    fn health_sweep_banner_emits_when_findings_present() {
+        let sweep = GitRefIntegritySweepState {
+            enabled: true,
+            interval_seconds: 900,
+            batch_size: 5,
+            total_projects: 3,
+            projects_scanned: 3,
+            total_findings: 3,
+            projects: vec![
+                GitRefIntegrityProjectSummary {
+                    slug: "proj-a".to_string(),
+                    finding_count: 2,
+                    classification: Level::Warn,
+                    ..Default::default()
+                },
+                GitRefIntegrityProjectSummary {
+                    slug: "proj-b".to_string(),
+                    finding_count: 1,
+                    classification: Level::Warn,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            sweep.banner().as_deref(),
+            Some(
+                "archive has 3 orphan refs across 2 projects. Run: am doctor fix-orphan-refs --all --dry-run"
+            )
+        );
+    }
+
+    #[test]
+    fn health_sweep_banner_suppressed_when_am_git_binary_set() {
+        let sweep = GitRefIntegritySweepState {
+            enabled: true,
+            total_findings: 1,
+            am_git_binary_set: true,
+            projects: vec![GitRefIntegrityProjectSummary {
+                slug: "proj-a".to_string(),
+                finding_count: 1,
+                classification: Level::Warn,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(sweep.banner().is_none());
+    }
+
+    #[test]
+    fn health_sweep_disabled_env_skips_step() {
+        let targets = vec![GitRefIntegrityProjectTarget {
+            slug: "missing".to_string(),
+            path: PathBuf::from("/definitely/not/a/git/repo"),
+        }];
+
+        let sweep = git_ref_integrity_sweep(&targets, 0, 10, false, 900, false, Utc::now());
+
+        assert!(!sweep.enabled);
+        assert_eq!(sweep.total_projects, 1);
+        assert_eq!(sweep.projects_scanned, 0);
+        assert!(sweep.projects.is_empty());
+    }
+
+    #[test]
+    fn health_sweep_cursor_round_robin() {
+        let targets = ["alpha", "beta", "gamma", "delta"]
+            .into_iter()
+            .map(|slug| GitRefIntegrityProjectTarget {
+                slug: slug.to_string(),
+                path: PathBuf::from(format!("/definitely/not/a/git/repo/{slug}")),
+            })
+            .collect::<Vec<_>>();
+
+        let sweep = git_ref_integrity_sweep(&targets, 1, 2, true, 900, false, Utc::now());
+
+        assert_eq!(sweep.cursor_index, 1);
+        assert_eq!(sweep.next_cursor_index, 3);
+        assert_eq!(sweep.projects_scanned, 2);
+        assert_eq!(sweep.projects[0].slug, "beta");
+        assert_eq!(sweep.projects[1].slug, "gamma");
+    }
+
+    #[test]
+    fn health_sweep_panel_renders_per_project_summary() {
+        let screen = test_screen(DiagnosticsSnapshot::default());
+        let snap = DiagnosticsSnapshot {
+            git_ref_integrity: GitRefIntegritySweepState {
+                enabled: true,
+                interval_seconds: 900,
+                batch_size: 5,
+                cursor_index: 2,
+                next_cursor_index: 3,
+                total_projects: 4,
+                projects_scanned: 1,
+                total_findings: 1,
+                checked_at: Some(Utc::now()),
+                projects: vec![GitRefIntegrityProjectSummary {
+                    slug: "proj-c".to_string(),
+                    finding_count: 1,
+                    safe_to_prune_count: 1,
+                    classification: Level::Warn,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let mut pool = ftui::GraphemePool::new();
+        let mut frame = Frame::new(120, 6, &mut pool);
+        screen.render_git_ref_integrity_widget(&mut frame, Rect::new(0, 0, 120, 6), &snap);
+
+        let text = buffer_to_text(&frame.buffer);
+        assert!(
+            text.contains("Git ref integrity"),
+            "expected panel title, got:\n{text}"
+        );
+        assert!(
+            text.contains("findings=1"),
+            "expected finding count, got:\n{text}"
+        );
+        assert!(
+            text.contains("proj-c"),
+            "expected project row, got:\n{text}"
         );
     }
 
