@@ -619,10 +619,66 @@ fn agent_start_json_reports_resolved_runtime_config() {
         value["runtime"]["bearer_token_configured"].as_bool(),
         Some(true)
     );
+    assert_eq!(value["runtime"]["auth_enabled"].as_bool(), Some(true));
+    assert_eq!(value["runtime"]["http_jwt_enabled"].as_bool(), Some(false));
     let expected_database_url = env.database_url();
     assert_eq!(
         value["runtime"]["database_url"].as_str(),
         Some(expected_database_url.as_str())
+    );
+}
+
+#[test]
+fn agent_start_json_reports_jwt_auth_mode() {
+    let env = TestEnv::new();
+    let project = env.tmp.path().display().to_string();
+    let mut env_vars = env.hermetic_env();
+    env_vars.extend([
+        ("DATABASE_URL".to_string(), env.database_url()),
+        (
+            "STORAGE_ROOT".to_string(),
+            env.storage_root.display().to_string(),
+        ),
+        (
+            "AM_ALLOW_EPHEMERAL_PROJECT_ROOTS".to_string(),
+            "1".to_string(),
+        ),
+        ("HTTP_JWT_ENABLED".to_string(), "true".to_string()),
+        ("HTTP_JWT_SECRET".to_string(), "test-secret".to_string()),
+    ]);
+
+    let out = run_am_hermetic(
+        &env_vars,
+        Some(env.tmp.path()),
+        &[
+            "agent",
+            "start",
+            "--project",
+            &project,
+            "--agent",
+            "BlueLake",
+            "--json",
+        ],
+    );
+    if !out.status.success() {
+        write_artifact(
+            "agent_start_jwt_auth_mode",
+            &["agent", "start", "--json"],
+            &out,
+        );
+        panic!(
+            "expected success\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let value: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(value["runtime"]["auth_enabled"].as_bool(), Some(true));
+    assert_eq!(value["runtime"]["http_jwt_enabled"].as_bool(), Some(true));
+    assert_eq!(
+        value["runtime"]["bearer_token_configured"].as_bool(),
+        Some(false)
     );
 }
 

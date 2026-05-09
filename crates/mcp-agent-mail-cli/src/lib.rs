@@ -170,7 +170,9 @@ struct AgentStartRuntime {
     http_port: String,
     http_path: String,
     http_url: String,
+    auth_enabled: bool,
     bearer_token_configured: bool,
+    http_jwt_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -4485,7 +4487,7 @@ fn emit_pre_tui_startup_banner(config: &Config) {
             endpoint: endpoint.as_str(),
             database_url: config.database_url.as_str(),
             storage_root: storage_root.as_ref(),
-            auth_enabled: config.http_bearer_token.is_some(),
+            auth_enabled: config.http_bearer_token.is_some() || config.http_jwt_enabled,
             tools_log_enabled: config.tools_log_enabled,
             tool_calls_log_enabled: config.log_tool_calls_enabled,
             console_theme: mcp_agent_mail_server::theme::current_theme_display_name(),
@@ -55981,6 +55983,8 @@ fn build_agent_start_report(
     let http_path = config.http_path.clone();
     let http_url = agent_start_http_url(&http_host, &http_port, &http_path);
     let bearer_token_configured = config.http_bearer_token.is_some();
+    let http_jwt_enabled = config.http_jwt_enabled;
+    let auth_enabled = bearer_token_configured || http_jwt_enabled;
 
     let project_path = Path::new(&project_key);
     let project_absolute = project_path.is_absolute();
@@ -56115,7 +56119,9 @@ fn build_agent_start_report(
             http_port,
             http_path,
             http_url,
+            auth_enabled,
             bearer_token_configured,
+            http_jwt_enabled,
         },
         readiness: AgentStartReadiness {
             project_ready,
@@ -56245,6 +56251,14 @@ fn render_agent_start_report(report: &AgentStartReport) {
         },
     );
     output::kv("HTTP endpoint", &report.runtime.http_url);
+    output::kv(
+        "Auth enabled",
+        if report.runtime.auth_enabled {
+            "yes"
+        } else {
+            "no"
+        },
+    );
     output::kv("Schema", report.schema_version);
     ftui_runtime::ftui_println!("");
 
