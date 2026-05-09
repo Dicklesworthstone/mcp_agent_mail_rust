@@ -516,6 +516,43 @@ fn robot_docs_guide_prints_agent_handbook() {
 }
 
 #[test]
+fn robot_docs_guide_json_exposes_precise_schema() {
+    let env = TestEnv::new();
+    let out = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &["robot-docs", "guide", "--json"],
+        None,
+    );
+    if !out.status.success() {
+        write_artifact(
+            "robot_docs_guide_json",
+            &["robot-docs", "guide", "--json"],
+            &out,
+        );
+        panic!(
+            "expected success\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let value: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(
+        value["schema_version"].as_str(),
+        Some("am.robot_docs.guide.v1")
+    );
+    assert!(
+        value["quick_start"]
+            .as_array()
+            .is_some_and(|commands| commands
+                .iter()
+                .any(|command| command.as_str() == Some("am agent start --json"))),
+        "guide should include the first-turn cockpit in quick_start"
+    );
+}
+
+#[test]
 fn migrate_then_list_projects_json_smoke() {
     let env = TestEnv::new();
     init_cli_schema(&env.db_path);

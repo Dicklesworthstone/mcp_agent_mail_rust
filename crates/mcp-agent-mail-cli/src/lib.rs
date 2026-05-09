@@ -26697,6 +26697,26 @@ mod tests {
     }
 
     #[test]
+    fn agent_start_http_url_normalizes_client_hosts() {
+        assert_eq!(
+            agent_start_http_url("0.0.0.0", "8765", "/mcp/"),
+            "http://127.0.0.1:8765/mcp/"
+        );
+        assert_eq!(
+            agent_start_http_url("::", "8765", "/api/"),
+            "http://[::1]:8765/api/"
+        );
+        assert_eq!(
+            agent_start_http_url("::1", "8765", "/mcp/"),
+            "http://[::1]:8765/mcp/"
+        );
+        assert_eq!(
+            agent_start_http_url("[::1]", "8765", "/mcp/"),
+            "http://[::1]:8765/mcp/"
+        );
+    }
+
+    #[test]
     fn resolve_socket_bind_addr_accepts_raw_ipv6_loopback_host() {
         if std::net::TcpListener::bind("[::1]:0").is_err() {
             return;
@@ -55947,7 +55967,7 @@ fn build_agent_start_report(
             .unwrap_or_else(|| "/mcp/".to_string())
             .as_str(),
     );
-    let http_url = format!("http://{http_host}:{http_port}{http_path}");
+    let http_url = agent_start_http_url(&http_host, &http_port, &http_path);
     let bearer_token_configured = non_empty_env("HTTP_BEARER_TOKEN").is_some();
 
     let project_path = Path::new(&project_key);
@@ -56171,6 +56191,11 @@ fn start_session_command(
     }
     command.push_str(" --format json");
     command
+}
+
+fn agent_start_http_url(host: &str, port: &str, http_path: &str) -> String {
+    let connect_host = normalize_connect_host_for_client_url(host);
+    format!("http://{connect_host}:{port}{http_path}")
 }
 
 fn shell_arg(value: &str) -> String {
@@ -56501,7 +56526,7 @@ fn handle_robot_docs(action: RobotDocsCommand) -> CliResult<()> {
 
 fn build_robot_docs_guide() -> RobotDocsGuide {
     RobotDocsGuide {
-        schema_version: "am.robot_docs.v1",
+        schema_version: "am.robot_docs.guide.v1",
         title: "am robot docs guide",
         quick_start: vec![
             "am agent start --json",
