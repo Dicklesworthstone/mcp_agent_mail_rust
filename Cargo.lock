@@ -4568,6 +4568,7 @@ dependencies = [
  "mcp-agent-mail-db",
  "mcp-agent-mail-share",
  "mcp-agent-mail-storage",
+ "mcp-agent-mail-test-helpers",
  "mcp-agent-mail-tools",
  "minijinja",
  "nix 0.31.2",

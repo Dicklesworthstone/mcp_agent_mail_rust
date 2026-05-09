@@ -3193,6 +3193,7 @@ mod tests {
     use super::*;
     use ftui_harness::buffer_to_text;
     use mcp_agent_mail_core::Config;
+    use mcp_agent_mail_test_helpers::repo;
 
     fn test_state() -> Arc<TuiSharedState> {
         TuiSharedState::new(&Config::default())
@@ -4549,6 +4550,15 @@ mod tests {
     }
 
     #[test]
+    fn health_sweep_interval_default_is_900s() {
+        let config = Config::default();
+
+        assert!(config.health_sweep_enabled);
+        assert_eq!(config.health_sweep_interval_seconds, 900);
+        assert_eq!(config.health_sweep_batch, 5);
+    }
+
+    #[test]
     fn health_sweep_disabled_env_skips_step() {
         let targets = vec![GitRefIntegrityProjectTarget {
             slug: "missing".to_string(),
@@ -4600,6 +4610,85 @@ mod tests {
     }
 
     #[test]
+    fn health_sweep_healthy_project_no_findings() {
+        let clean_repo = repo::single_commit();
+        let targets = vec![GitRefIntegrityProjectTarget {
+            slug: "clean".to_string(),
+            path: clean_repo.path().to_path_buf(),
+        }];
+
+        let sweep = git_ref_integrity_sweep(&targets, 0, 1, true, 900, false, &[], Utc::now());
+
+        assert_eq!(sweep.total_projects, 1);
+        assert_eq!(sweep.projects_scanned, 1);
+        assert_eq!(sweep.total_findings, 0);
+        assert_eq!(sweep.level(), Level::Ok);
+        assert_eq!(sweep.projects[0].slug, "clean");
+        assert_eq!(sweep.projects[0].finding_count, 0);
+        assert_eq!(sweep.projects[0].classification, Level::Ok);
+        assert!(sweep.projects[0].error.is_none());
+    }
+
+    #[test]
+    fn health_sweep_orphan_stash_detected() {
+        let damaged_repo = repo::with_orphan_stash_ref();
+        let targets = vec![GitRefIntegrityProjectTarget {
+            slug: "stash-damage".to_string(),
+            path: damaged_repo.path().to_path_buf(),
+        }];
+
+        let sweep = git_ref_integrity_sweep(&targets, 0, 1, true, 900, false, &[], Utc::now());
+        let project = &sweep.projects[0];
+
+        assert_eq!(sweep.total_findings, 1);
+        assert_eq!(sweep.level(), Level::Warn);
+        assert_eq!(project.finding_count, 1);
+        assert_eq!(project.safe_to_prune_count, 1);
+        assert_eq!(project.ask_user_count, 0);
+        assert_eq!(project.protected_count, 0);
+        assert_eq!(project.classification, Level::Warn);
+        assert!(project.error.is_none());
+    }
+
+    #[test]
+    fn health_sweep_dangling_branch_detected() {
+        let damaged_repo = repo::with_dangling_branch();
+        let targets = vec![GitRefIntegrityProjectTarget {
+            slug: "branch-damage".to_string(),
+            path: damaged_repo.path().to_path_buf(),
+        }];
+
+        let sweep = git_ref_integrity_sweep(&targets, 0, 1, true, 900, false, &[], Utc::now());
+        let project = &sweep.projects[0];
+
+        assert_eq!(sweep.total_findings, 1);
+        assert_eq!(sweep.level(), Level::Warn);
+        assert_eq!(project.finding_count, 1);
+        assert_eq!(project.safe_to_prune_count, 0);
+        assert_eq!(project.ask_user_count, 1);
+        assert_eq!(project.protected_count, 0);
+        assert_eq!(project.classification, Level::Warn);
+        assert!(project.error.is_none());
+    }
+
+    #[test]
+    fn health_sweep_error_project_does_not_panic() {
+        let targets = vec![GitRefIntegrityProjectTarget {
+            slug: "missing".to_string(),
+            path: PathBuf::from("/definitely/not/a/git/repo"),
+        }];
+
+        let sweep = git_ref_integrity_sweep(&targets, 0, 1, true, 900, false, &[], Utc::now());
+        let project = &sweep.projects[0];
+
+        assert_eq!(sweep.total_findings, 0);
+        assert_eq!(sweep.level(), Level::Fail);
+        assert_eq!(project.slug, "missing");
+        assert_eq!(project.classification, Level::Fail);
+        assert!(project.error.is_some());
+    }
+
+    #[test]
     fn health_sweep_cursor_path_uses_xdg_app_dir() {
         let path = git_ref_sweep_cursor_path_from_data_dir(Path::new("/tmp/xdg-data"));
 
@@ -4637,6 +4726,25 @@ mod tests {
 
         save_git_ref_sweep_cursor(&path, 3).expect("replace cursor");
         assert_eq!(load_git_ref_sweep_cursor(&path), 3);
+    }
+
+    #[test]
+    fn health_sweep_cursor_atomic_write_survives_stale_temp_file() {
+        let temp = unique_test_dir("cursor-stale-temp");
+        let path = temp.join("state").join("sweep_cursor.json");
+
+        save_git_ref_sweep_cursor(&path, 17).expect("save cursor");
+        let stale_temp = path.with_file_name(".sweep_cursor.json.tmp-stale");
+        std::fs::write(&stale_temp, r#"{"cursor_index":999}"#).expect("stale temp cursor");
+
+        assert_eq!(load_git_ref_sweep_cursor(&path), 17);
+
+        save_git_ref_sweep_cursor(&path, 5).expect("replace cursor after stale temp");
+        assert_eq!(load_git_ref_sweep_cursor(&path), 5);
+        assert_eq!(
+            std::fs::read_to_string(&stale_temp).expect("stale temp preserved"),
+            r#"{"cursor_index":999}"#
+        );
     }
 
     #[test]
@@ -4731,6 +4839,41 @@ reason = "manual prune"
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].0.ref_name, "refs/stash");
         assert_eq!(visible[0].1, "orphan_stash");
+    }
+
+    #[test]
+    fn health_sweep_per_finding_event_includes_required_fields() {
+        let project_slug = "proj-c";
+        let findings = vec![prunable_ref(
+            "refs/stash",
+            mcp_agent_mail_storage::recovery::RefCategory::SafeToPrune,
+        )];
+        let visible = git_ref_visible_findings(project_slug, &findings, &[]);
+        let (finding, ref_kind) = visible[0];
+        let severity = git_ref_severity(finding.category);
+        let fields = [
+            ("project_slug", project_slug),
+            ("ref_kind", ref_kind),
+            ("ref_name", finding.ref_name.as_str()),
+            ("severity", severity),
+        ];
+
+        assert_eq!(
+            fields,
+            [
+                ("project_slug", "proj-c"),
+                ("ref_kind", "orphan_stash"),
+                ("ref_name", "refs/stash"),
+                ("severity", "warning"),
+            ]
+        );
+        assert!(
+            fields
+                .iter()
+                .all(|(name, value)| !name.is_empty() && !value.is_empty())
+        );
+        assert!(!finding.target_sha.is_empty());
+        assert!(!finding.reason.is_empty());
     }
 
     #[test]
