@@ -11,9 +11,9 @@
 //! - View mode toggle: text diagnostics (default) vs widget dashboard
 
 use std::fmt::Write as _;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -30,6 +30,7 @@ use ftui::{Event, Frame, KeyCode, KeyEventKind, PackedRgba, Style};
 use ftui_extras::text_effects::{StyledText, TextEffect};
 use ftui_runtime::program::Cmd;
 use mcp_agent_mail_core::Config;
+use serde::{Deserialize, Serialize};
 
 use crate::tui_bridge::{
     ConfigSnapshot, ScreenDiagnosticSnapshot, TuiSharedState, query_params_explain_empty_state,
@@ -49,6 +50,8 @@ const MAX_READ_BYTES: usize = 8 * 1024;
 const SCREEN_DIAGNOSTIC_PREVIEW_LIMIT: usize = 3;
 const ATC_STALE_HEARTBEAT_SECS: i64 = 5 * 60;
 const GIT_REF_INTEGRITY_VISIBLE_PROJECTS: usize = 3;
+const HEALTH_SWEEP_DATA_DIR_NAME: &str = "mcp-agent-mail";
+const GIT_REF_SWEEP_CURSOR_FILE_NAME: &str = "sweep_cursor.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Level {
@@ -289,6 +292,11 @@ struct GitRefIntegritySweepState {
     checked_at: Option<DateTime<Utc>>,
     am_git_binary_set: bool,
     projects: Vec<GitRefIntegrityProjectSummary>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+struct GitRefSweepCursorFile {
+    cursor_index: usize,
 }
 
 impl GitRefIntegritySweepState {
@@ -2079,7 +2087,8 @@ fn diagnostics_worker_loop(
     let mut cached_tailscale_ip: Option<String> = crate::detect_tailscale_ip();
     let mut tailscale_checked_at = Instant::now();
     let mut git_ref_integrity = GitRefIntegritySweepState::default();
-    let mut git_ref_cursor_index = 0_usize;
+    let git_ref_cursor_path = git_ref_sweep_cursor_path();
+    let mut git_ref_cursor_index = load_git_ref_sweep_cursor(&git_ref_cursor_path);
     let mut next_git_ref_sweep_due = Instant::now();
 
     let mut next_due = Instant::now();
@@ -2104,6 +2113,19 @@ fn diagnostics_worker_loop(
             if run_git_ref_sweep {
                 next_git_ref_sweep_due = Instant::now()
                     + Duration::from_secs(snap.git_ref_integrity.interval_seconds.max(1));
+                if snap.git_ref_integrity.enabled
+                    && let Err(error) = save_git_ref_sweep_cursor(
+                        &git_ref_cursor_path,
+                        snap.git_ref_integrity.next_cursor_index,
+                    )
+                {
+                    tracing::warn!(
+                        target: "mcp_agent_mail::health_sweep",
+                        path = %git_ref_cursor_path.display(),
+                        error = %error,
+                        "git_ref_integrity_cursor_save_failed"
+                    );
+                }
             }
             emit_screen_diagnostic(state, &snap);
             if let Ok(mut guard) = snapshot.lock() {
@@ -2520,6 +2542,50 @@ fn add_atc_findings(out: &mut DiagnosticsSnapshot) {
             ),
         });
     }
+}
+
+fn git_ref_sweep_cursor_path() -> PathBuf {
+    let data_dir = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+    git_ref_sweep_cursor_path_from_data_dir(&data_dir)
+}
+
+fn git_ref_sweep_cursor_path_from_data_dir(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join(HEALTH_SWEEP_DATA_DIR_NAME)
+        .join(GIT_REF_SWEEP_CURSOR_FILE_NAME)
+}
+
+fn load_git_ref_sweep_cursor(path: &Path) -> usize {
+    match crate::tui_persist::read_persist_text(path) {
+        Ok(json) => match serde_json::from_str::<GitRefSweepCursorFile>(&json) {
+            Ok(file) => file.cursor_index,
+            Err(error) => {
+                tracing::warn!(
+                    target: "mcp_agent_mail::health_sweep",
+                    path = %path.display(),
+                    error = %error,
+                    "git_ref_integrity_cursor_parse_failed"
+                );
+                0
+            }
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+        Err(error) => {
+            tracing::warn!(
+                target: "mcp_agent_mail::health_sweep",
+                path = %path.display(),
+                error = %error,
+                "git_ref_integrity_cursor_load_failed"
+            );
+            0
+        }
+    }
+}
+
+fn save_git_ref_sweep_cursor(path: &Path, cursor_index: usize) -> io::Result<()> {
+    let json = serde_json::to_string_pretty(&GitRefSweepCursorFile { cursor_index })
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    crate::tui_persist::atomic_write_text(path, &json)
 }
 
 fn git_ref_integrity_targets_from_snapshot(
@@ -3036,6 +3102,19 @@ mod tests {
 
     fn test_state() -> Arc<TuiSharedState> {
         TuiSharedState::new(&Config::default())
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "mcp-agent-mail-system-health-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("test dir");
+        path
     }
 
     fn test_screen(snapshot: DiagnosticsSnapshot) -> SystemHealthScreen {
@@ -4395,6 +4474,62 @@ mod tests {
         assert_eq!(sweep.projects_scanned, 2);
         assert_eq!(sweep.projects[0].slug, "beta");
         assert_eq!(sweep.projects[1].slug, "gamma");
+    }
+
+    #[test]
+    fn health_sweep_batch_size_caps_at_total_projects() {
+        let targets = ["alpha", "beta"]
+            .into_iter()
+            .map(|slug| GitRefIntegrityProjectTarget {
+                slug: slug.to_string(),
+                path: PathBuf::from(format!("/definitely/not/a/git/repo/{slug}")),
+            })
+            .collect::<Vec<_>>();
+
+        let sweep = git_ref_integrity_sweep(&targets, 0, 99, true, 900, false, Utc::now());
+
+        assert_eq!(sweep.total_projects, 2);
+        assert_eq!(sweep.projects_scanned, 2);
+        assert_eq!(sweep.next_cursor_index, 0);
+    }
+
+    #[test]
+    fn health_sweep_cursor_path_uses_xdg_app_dir() {
+        let path = git_ref_sweep_cursor_path_from_data_dir(Path::new("/tmp/xdg-data"));
+
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/xdg-data/mcp-agent-mail/sweep_cursor.json")
+        );
+    }
+
+    #[test]
+    fn health_sweep_cursor_persistence_round_trip() {
+        let temp = unique_test_dir("cursor-round-trip");
+        let path = temp.join("state").join("sweep_cursor.json");
+
+        save_git_ref_sweep_cursor(&path, 17).expect("save cursor");
+        assert_eq!(load_git_ref_sweep_cursor(&path), 17);
+        let json = std::fs::read_to_string(&path).expect("cursor json");
+        assert!(
+            json.contains("\"cursor_index\": 17"),
+            "expected persisted cursor index, got:\n{json}"
+        );
+
+        save_git_ref_sweep_cursor(&path, 3).expect("replace cursor");
+        assert_eq!(load_git_ref_sweep_cursor(&path), 3);
+    }
+
+    #[test]
+    fn health_sweep_cursor_missing_or_invalid_defaults_to_zero() {
+        let temp = unique_test_dir("cursor-defaults");
+        let path = temp.join("state").join("sweep_cursor.json");
+
+        assert_eq!(load_git_ref_sweep_cursor(&path), 0);
+
+        std::fs::create_dir_all(path.parent().expect("cursor parent")).expect("cursor parent");
+        std::fs::write(&path, "not json").expect("invalid cursor");
+        assert_eq!(load_git_ref_sweep_cursor(&path), 0);
     }
 
     #[test]

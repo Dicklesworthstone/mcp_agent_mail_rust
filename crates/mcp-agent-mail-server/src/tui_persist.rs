@@ -659,7 +659,7 @@ fn validate_persist_path(path: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-fn read_persist_text(path: &Path) -> Result<String, std::io::Error> {
+pub(crate) fn read_persist_text(path: &Path) -> Result<String, std::io::Error> {
     validate_persist_path(path)?;
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() {
@@ -671,7 +671,7 @@ fn read_persist_text(path: &Path) -> Result<String, std::io::Error> {
     std::fs::read_to_string(path)
 }
 
-fn atomic_write_text(path: &Path, contents: &str) -> Result<(), std::io::Error> {
+pub(crate) fn atomic_write_text(path: &Path, contents: &str) -> Result<(), std::io::Error> {
     use std::io::Write as _;
 
     validate_persist_path(path)?;
