@@ -55956,19 +55956,14 @@ fn build_agent_start_report(
         .or_else(|| non_empty_env("MODEL"))
         .unwrap_or_else(|| "gpt-5.5".to_string());
 
-    let database_url =
-        non_empty_env("DATABASE_URL").unwrap_or_else(|| "sqlite:///:memory:".to_string());
-    let storage_root =
-        non_empty_env("STORAGE_ROOT").unwrap_or_else(|| "XDG-aware default".to_string());
-    let http_host = non_empty_env("HTTP_HOST").unwrap_or_else(|| "127.0.0.1".to_string());
-    let http_port = non_empty_env("HTTP_PORT").unwrap_or_else(|| "8765".to_string());
-    let http_path = normalize_http_path(
-        non_empty_env("HTTP_PATH")
-            .unwrap_or_else(|| "/mcp/".to_string())
-            .as_str(),
-    );
+    let config = Config::from_env();
+    let database_url = config.database_url.clone();
+    let storage_root = config.storage_root.display().to_string();
+    let http_host = config.http_host.clone();
+    let http_port = config.http_port.to_string();
+    let http_path = config.http_path.clone();
     let http_url = agent_start_http_url(&http_host, &http_port, &http_path);
-    let bearer_token_configured = non_empty_env("HTTP_BEARER_TOKEN").is_some();
+    let bearer_token_configured = config.http_bearer_token.is_some();
 
     let project_path = Path::new(&project_key);
     let project_absolute = project_path.is_absolute();

@@ -490,6 +490,70 @@ fn agent_start_json_surfaces_first_turn_cockpit() {
 }
 
 #[test]
+fn agent_start_json_reports_resolved_runtime_config() {
+    let env = TestEnv::new();
+    let project = env.tmp.path().display().to_string();
+    let mut env_vars = env.base_env();
+    env_vars.retain(|(key, _)| {
+        !matches!(
+            key.as_str(),
+            "HTTP_HOST" | "HTTP_PORT" | "HTTP_PATH" | "HTTP_BEARER_TOKEN"
+        )
+    });
+    env_vars.extend([
+        ("HTTP_HOST".to_string(), "0.0.0.0".to_string()),
+        ("HTTP_PORT".to_string(), "9123".to_string()),
+        ("HTTP_PATH".to_string(), "api".to_string()),
+        ("HTTP_BEARER_TOKEN".to_string(), "test-token".to_string()),
+    ]);
+
+    let out = run_am(
+        &env_vars,
+        Some(env.tmp.path()),
+        &[
+            "agent",
+            "start",
+            "--project",
+            &project,
+            "--agent",
+            "BlueLake",
+            "--json",
+        ],
+        None,
+    );
+    if !out.status.success() {
+        write_artifact(
+            "agent_start_runtime_config",
+            &["agent", "start", "--json"],
+            &out,
+        );
+        panic!(
+            "expected success\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let value: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(value["runtime"]["http_host"].as_str(), Some("0.0.0.0"));
+    assert_eq!(value["runtime"]["http_port"].as_str(), Some("9123"));
+    assert_eq!(value["runtime"]["http_path"].as_str(), Some("/api/"));
+    assert_eq!(
+        value["runtime"]["http_url"].as_str(),
+        Some("http://127.0.0.1:9123/api/")
+    );
+    assert_eq!(
+        value["runtime"]["bearer_token_configured"].as_bool(),
+        Some(true)
+    );
+    let expected_database_url = env.database_url();
+    assert_eq!(
+        value["runtime"]["database_url"].as_str(),
+        Some(expected_database_url.as_str())
+    );
+}
+
+#[test]
 fn robot_docs_guide_prints_agent_handbook() {
     let env = TestEnv::new();
     let out = run_am(
