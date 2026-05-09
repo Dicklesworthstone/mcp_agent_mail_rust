@@ -1836,7 +1836,7 @@ fn validate_requested_robot_format(args: &RobotArgs) -> Result<(), CliError> {
     if matches!(requested_robot_format(args), Some(OutputFormat::Markdown))
         && !args.command.supports_markdown()
     {
-        return Err(CliError::InvalidArgument(
+        return Err(CliError::Usage(
             "--format md is only supported for `am robot thread` and `am robot message`"
                 .to_string(),
         ));

@@ -487,6 +487,30 @@ fn robot_status_accepts_json_shorthand() {
 }
 
 #[test]
+fn robot_status_markdown_rejection_is_usage_error() {
+    let env = TestEnv::new();
+    let out = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &["robot", "status", "--format", "md"],
+        None,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "invalid robot format should exit as usage error\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8(out.stderr).expect("stderr should be utf-8");
+    assert!(
+        stderr.contains("usage error")
+            && stderr.contains("--format md is only supported for `am robot thread`"),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+#[test]
 fn agent_start_json_surfaces_first_turn_cockpit() {
     let env = TestEnv::new();
     let project = env.tmp.path().display().to_string();

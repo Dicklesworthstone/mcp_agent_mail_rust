@@ -51,6 +51,8 @@ pub enum CliError {
     NotImplemented(&'static str),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    #[error("usage error: {0}")]
+    Usage(String),
     #[error("exit code {0}")]
     ExitCode(i32),
     #[error(transparent)]
@@ -2527,6 +2529,7 @@ fn parse_with_invocation_name(invocation_name: &'static str) -> Result<Cli, i32>
 fn err_exit_code(_err: &CliError) -> i32 {
     match _err {
         CliError::ExitCode(code) => *code,
+        CliError::Usage(_) => 2,
         _ => 1,
     }
 }
