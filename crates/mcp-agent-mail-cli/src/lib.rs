@@ -56006,7 +56006,7 @@ fn build_agent_start_report(
     commands.insert(
         "thread",
         scoped_agent_command(
-            "am thread <thread_id>",
+            "am thread THREAD_ID",
             &project_key,
             agent_name.as_deref(),
             " --format md",
@@ -56030,7 +56030,7 @@ fn build_agent_start_report(
                 agent_name
                     .as_deref()
                     .map(shell_arg)
-                    .unwrap_or_else(|| "<AgentName>".to_string())
+                    .unwrap_or_else(|| "AGENT_NAME".to_string())
             ),
             reason: "Project-scoped commands work best with an existing absolute project path.",
         });
@@ -56161,7 +56161,7 @@ fn scoped_agent_command(
 ) -> String {
     let agent = agent_name
         .map(shell_arg)
-        .unwrap_or_else(|| "<AgentName>".to_string());
+        .unwrap_or_else(|| "AGENT_NAME".to_string());
     format!(
         "{base} --project {} --agent {agent}{suffix}",
         shell_arg(project_key)
@@ -56261,19 +56261,19 @@ fn build_cli_capabilities() -> CliCapabilities {
     primary_agent_surfaces.insert("robot_guide", "am robot-docs guide");
     primary_agent_surfaces.insert(
         "status",
-        "am status --project /abs/path --agent <AgentName> --json",
+        "am status --project /abs/path --agent AGENT_NAME --json",
     );
     primary_agent_surfaces.insert(
         "urgent_inbox",
-        "am inbox --project /abs/path --agent <AgentName> --urgent --json",
+        "am inbox --project /abs/path --agent AGENT_NAME --urgent --json",
     );
     primary_agent_surfaces.insert(
         "deep_thread",
-        "am thread <thread_id> --project /abs/path --agent <AgentName> --format md",
+        "am thread THREAD_ID --project /abs/path --agent AGENT_NAME --format md",
     );
     primary_agent_surfaces.insert(
         "reservations",
-        "am reservations --project /abs/path --agent <AgentName> --conflicts --json",
+        "am reservations --project /abs/path --agent AGENT_NAME --conflicts --json",
     );
     primary_agent_surfaces.insert("tool_schemas", "am tooling schemas --json");
 
@@ -56526,10 +56526,10 @@ fn build_robot_docs_guide() -> RobotDocsGuide {
         quick_start: vec![
             "am agent start --json",
             "am capabilities --json",
-            "am status --project /abs/path --agent <AgentName> --json",
-            "am inbox --project /abs/path --agent <AgentName> --urgent --json",
-            "am reservations --project /abs/path --agent <AgentName> --conflicts --json",
-            "am thread <thread_id> --project /abs/path --agent <AgentName> --format md",
+            "am status --project /abs/path --agent AGENT_NAME --json",
+            "am inbox --project /abs/path --agent AGENT_NAME --urgent --json",
+            "am reservations --project /abs/path --agent AGENT_NAME --conflicts --json",
+            "am thread THREAD_ID --project /abs/path --agent AGENT_NAME --format md",
             "am tooling schemas --json",
         ],
         sections: vec![
@@ -56549,9 +56549,9 @@ fn build_robot_docs_guide() -> RobotDocsGuide {
             RobotDocsSection {
                 heading: "Start of Turn",
                 commands: vec![
-                    "am status --project /abs/path --agent <AgentName> --json",
-                    "am inbox --project /abs/path --agent <AgentName> --urgent --json",
-                    "am reservations --project /abs/path --agent <AgentName> --conflicts --json",
+                    "am status --project /abs/path --agent AGENT_NAME --json",
+                    "am inbox --project /abs/path --agent AGENT_NAME --urgent --json",
+                    "am reservations --project /abs/path --agent AGENT_NAME --conflicts --json",
                 ],
                 notes: vec![
                     "Top-level aliases delegate to am robot so the obvious command names work.",
@@ -56563,10 +56563,10 @@ fn build_robot_docs_guide() -> RobotDocsGuide {
             RobotDocsSection {
                 heading: "Deep Drilldown",
                 commands: vec![
-                    "am robot search <query> --project /abs/path --agent <AgentName> --format json",
-                    "am thread <thread_id> --project /abs/path --agent <AgentName> --format md",
-                    "am robot message <id> --project /abs/path --agent <AgentName> --format md",
-                    "am robot navigate resource://thread/<id> --project /abs/path --agent <AgentName> --format json",
+                    "am robot search QUERY --project /abs/path --agent AGENT_NAME --format json",
+                    "am thread THREAD_ID --project /abs/path --agent AGENT_NAME --format md",
+                    "am robot message MESSAGE_ID --project /abs/path --agent AGENT_NAME --format md",
+                    "am robot navigate resource://thread/THREAD_ID --project /abs/path --agent AGENT_NAME --format json",
                 ],
                 notes: vec![
                     "Search returns structured facets and relevance data.",
@@ -56578,7 +56578,7 @@ fn build_robot_docs_guide() -> RobotDocsGuide {
                 commands: vec![
                     "am status --json",
                     "am status --format toon",
-                    "am thread <thread_id> --format md",
+                    "am thread THREAD_ID --format md",
                 ],
                 notes: vec![
                     "Use JSON for strict parsing in automation.",
@@ -56589,9 +56589,9 @@ fn build_robot_docs_guide() -> RobotDocsGuide {
             RobotDocsSection {
                 heading: "Coordination Safety",
                 commands: vec![
-                    "am reservations --project /abs/path --agent <AgentName> --json",
-                    "am robot contacts --project /abs/path --agent <AgentName> --format json",
-                    "am robot timeline --project /abs/path --agent <AgentName> --since <iso8601> --format json",
+                    "am reservations --project /abs/path --agent AGENT_NAME --json",
+                    "am robot contacts --project /abs/path --agent AGENT_NAME --format json",
+                    "am robot timeline --project /abs/path --agent AGENT_NAME --since ISO8601_TIMESTAMP --format json",
                 ],
                 notes: vec![
                     "Reserve the exact edit surface before touching shared files.",

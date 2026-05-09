@@ -410,7 +410,17 @@ fn capabilities_json_exposes_agent_contract() {
     );
     assert_eq!(
         value["primary_agent_surfaces"]["status"].as_str(),
-        Some("am status --project /abs/path --agent <AgentName> --json")
+        Some("am status --project /abs/path --agent AGENT_NAME --json")
+    );
+    let primary_surfaces = value["primary_agent_surfaces"]
+        .as_object()
+        .expect("primary_agent_surfaces should be an object");
+    assert!(
+        primary_surfaces.values().all(|command| {
+            let command = command.as_str().unwrap_or_default();
+            !command.contains('<') && !command.contains('>')
+        }),
+        "machine-readable command recipes should avoid shell metacharacter placeholders"
     );
     let commands = value["commands"]
         .as_array()
@@ -554,6 +564,47 @@ fn agent_start_json_reports_resolved_runtime_config() {
 }
 
 #[test]
+fn agent_start_json_missing_agent_uses_shell_safe_placeholder() {
+    let env = TestEnv::new();
+    let project = env.tmp.path().display().to_string();
+    let mut env_vars = env.base_env();
+    env_vars.retain(|(key, _)| !matches!(key.as_str(), "AGENT_NAME" | "AGENT_MAIL_AGENT"));
+
+    let out = run_am(
+        &env_vars,
+        Some(env.tmp.path()),
+        &["agent", "start", "--project", &project, "--json"],
+        None,
+    );
+    if !out.status.success() {
+        write_artifact(
+            "agent_start_missing_agent_placeholder",
+            &["agent", "start", "--json"],
+            &out,
+        );
+        panic!(
+            "expected success\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let value: Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
+    assert_eq!(value["agent"]["source"].as_str(), Some("missing"));
+    assert_eq!(value["readiness"]["agent_ready"].as_bool(), Some(false));
+    let expected_status = format!("am status --project {project} --agent AGENT_NAME --json");
+    assert_eq!(
+        value["commands"]["status"].as_str(),
+        Some(expected_status.as_str())
+    );
+    let serialized = serde_json::to_string(&value).expect("serialize agent start JSON");
+    assert!(
+        !serialized.contains("<AgentName>") && !serialized.contains("<thread_id>"),
+        "agent start JSON should avoid shell metacharacter placeholders"
+    );
+}
+
+#[test]
 fn robot_docs_guide_prints_agent_handbook() {
     let env = TestEnv::new();
     let out = run_am(
@@ -574,9 +625,13 @@ fn robot_docs_guide_prints_agent_handbook() {
     let stdout = String::from_utf8(out.stdout).expect("stdout should be utf-8");
     assert!(stdout.contains("am agent start --json"));
     assert!(stdout.contains("am capabilities --json"));
-    assert!(stdout.contains("am status --project /abs/path --agent <AgentName>"));
+    assert!(stdout.contains("am status --project /abs/path --agent AGENT_NAME"));
     assert!(stdout.contains("am tooling schemas --json"));
     assert!(stdout.contains("Broadcast send_message is intentionally unsupported."));
+    assert!(
+        !stdout.contains("<AgentName>") && !stdout.contains("<thread_id>"),
+        "rendered guide should not emit shell metacharacter placeholders"
+    );
 }
 
 #[test]
@@ -613,6 +668,15 @@ fn robot_docs_guide_json_exposes_precise_schema() {
                 .iter()
                 .any(|command| command.as_str() == Some("am agent start --json"))),
         "guide should include the first-turn cockpit in quick_start"
+    );
+    let serialized = serde_json::to_string(&value).expect("serialize guide JSON");
+    assert!(
+        !serialized.contains("<AgentName>")
+            && !serialized.contains("<thread_id>")
+            && !serialized.contains("<query>")
+            && !serialized.contains("<id>")
+            && !serialized.contains("<iso8601>"),
+        "guide JSON should avoid shell metacharacter placeholders"
     );
 }
 
