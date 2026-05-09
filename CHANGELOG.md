@@ -48,6 +48,15 @@ Release sequencing now lives in [docs/RELEASE_TRAIN_PLAN.md](docs/RELEASE_TRAIN_
   `vv0.2.50` foot-guns. Two regression tests pin the prefix-stripping
   behavior.
 
+### Performance
+
+- **Archive perf 3 completion-debt now has a baseline/delta artifact pipeline**
+  (`br-8qdh0.3`, follow-up to `br-8qdh0.6`). Added the `br-q8yaa`
+  capture-and-delta scripts plus a lightweight e2e contract so future archive
+  write fixes can publish `baseline_pre_fix_*`, `baseline_post_fix_*`, and
+  `fix_delta.json` artifacts covering batch-1, batch-10, batch-100,
+  batch-1000, single-attachment, and 30-agent-stress points.
+
 ---
 
 ## [v0.2.46](https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/tag/v0.2.46) — 2026-04-20 **[Release]**
