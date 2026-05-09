@@ -2774,6 +2774,7 @@ fn handle_default_launch() -> CliResult<()> {
 fn noninteractive_robot_args(command: robot::RobotSubcommand) -> robot::RobotArgs {
     robot::RobotArgs {
         format: Some(robot::OutputFormat::Json),
+        json: false,
         project: None,
         agent: None,
         command,
@@ -55912,6 +55913,7 @@ fn robot_alias_args(
 ) -> robot::RobotArgs {
     robot::RobotArgs {
         format: resolve_robot_alias_format(format, json_mode),
+        json: false,
         project,
         agent,
         command,
@@ -56444,6 +56446,9 @@ fn command_output_formats(
     supports_format_flag: bool,
     supports_json_flag: bool,
 ) -> Vec<&'static str> {
+    if name == "robot" {
+        return vec!["toon", "json", "md"];
+    }
     if name == "thread" || name == "robot thread" || name == "robot message" {
         return vec!["toon", "json", "md"];
     }

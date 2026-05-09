@@ -1619,6 +1619,10 @@ pub struct RobotArgs {
     #[arg(long, global = true, value_parser = parse_output_format)]
     pub format: Option<OutputFormat>,
 
+    /// Output JSON (shorthand for --format json).
+    #[arg(long, global = true)]
+    pub json: bool,
+
     /// Project key (absolute path or slug). Falls back to AGENT_MAIL_PROJECT, then CWD.
     #[arg(long, global = true)]
     pub project: Option<String>,
@@ -1829,13 +1833,20 @@ impl RobotSubcommand {
 }
 
 fn validate_requested_robot_format(args: &RobotArgs) -> Result<(), CliError> {
-    if matches!(args.format, Some(OutputFormat::Markdown)) && !args.command.supports_markdown() {
+    if matches!(requested_robot_format(args), Some(OutputFormat::Markdown))
+        && !args.command.supports_markdown()
+    {
         return Err(CliError::InvalidArgument(
             "--format md is only supported for `am robot thread` and `am robot message`"
                 .to_string(),
         ));
     }
     Ok(())
+}
+
+fn requested_robot_format(args: &RobotArgs) -> Option<OutputFormat> {
+    args.format
+        .or_else(|| args.json.then_some(OutputFormat::Json))
 }
 
 fn parse_search_recipient_kind(kind: Option<&str>) -> Result<Option<String>, CliError> {
@@ -9638,7 +9649,7 @@ fn build_navigate(
 /// Execute a robot subcommand and print formatted output.
 pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
     validate_requested_robot_format(&args)?;
-    let format = OutputFormat::resolve(args.format, args.command.is_prose());
+    let format = OutputFormat::resolve(requested_robot_format(&args), args.command.is_prose());
     let cmd_name = args.command.name();
 
     let out = match args.command {
@@ -16608,6 +16619,7 @@ mod tests {
                 let handle_thread = std::thread::spawn(move || {
                     let args = RobotArgs {
                         format: Some(OutputFormat::Json),
+                        json: false,
                         project: Some("robot-lock".to_string()),
                         agent: None,
                         command: RobotSubcommand::Attachments,
@@ -16657,6 +16669,7 @@ mod tests {
         let value = run_robot_json_capture(
             RobotArgs {
                 format: Some(OutputFormat::Json),
+                json: false,
                 project: None,
                 agent: None,
                 command: RobotSubcommand::Health,
@@ -16716,6 +16729,7 @@ mod tests {
         let value = run_robot_json_capture(
             RobotArgs {
                 format: Some(OutputFormat::Json),
+                json: false,
                 project: None,
                 agent: None,
                 command: RobotSubcommand::Health,
@@ -16870,6 +16884,7 @@ mod tests {
         let value = run_robot_json_capture(
             RobotArgs {
                 format: Some(OutputFormat::Json),
+                json: false,
                 project: Some("/tmp/demo-project".to_string()),
                 agent: None,
                 command: RobotSubcommand::Search {
@@ -18179,6 +18194,7 @@ mod tests {
     fn handle_robot_rejects_markdown_for_non_prose_command() {
         let err = handle_robot(RobotArgs {
             format: Some(OutputFormat::Markdown),
+            json: false,
             project: None,
             agent: None,
             command: RobotSubcommand::Status,

@@ -429,8 +429,19 @@ fn capabilities_json_exposes_agent_contract() {
         commands.iter().any(|command| {
             command["name"].as_str() == Some("robot status")
                 && command["recommended_for_agents"].as_bool() == Some(true)
+                && command["supports_json_flag"].as_bool() == Some(true)
         }),
-        "robot status should be present and marked agent-recommended"
+        "robot status should be present, agent-recommended, and advertise --json"
+    );
+    assert!(
+        commands.iter().any(|command| {
+            command["name"].as_str() == Some("robot")
+                && command["supports_json_flag"].as_bool() == Some(true)
+                && command["output_formats"].as_array().is_some_and(|formats| {
+                    formats == &vec![Value::from("toon"), Value::from("json"), Value::from("md")]
+                })
+        }),
+        "robot parent command should advertise robot formats, not generic table output"
     );
     assert!(
         commands.iter().any(|command| {
@@ -444,6 +455,34 @@ fn capabilities_json_exposes_agent_contract() {
             .iter()
             .any(|command| command["name"].as_str() == Some("robot-docs guide")),
         "robot-docs guide should be present in the command catalog"
+    );
+}
+
+#[test]
+fn robot_status_accepts_json_shorthand() {
+    let env = TestEnv::new();
+    let out = run_am(
+        &env.base_env(),
+        Some(env.tmp.path()),
+        &["robot", "status", "--json", "--help"],
+        None,
+    );
+    if !out.status.success() {
+        write_artifact(
+            "robot_status_json_help",
+            &["robot", "status", "--json", "--help"],
+            &out,
+        );
+        panic!(
+            "expected success\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let stdout = String::from_utf8(out.stdout).expect("stdout should be utf-8");
+    assert!(
+        stdout.contains("--json"),
+        "robot status help should document --json shorthand"
     );
 }
 
