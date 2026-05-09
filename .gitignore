@@ -205,3 +205,6 @@ vendor/*
 # Share viewer assets are bundled into the offline export viewer.
 !crates/mcp-agent-mail-share/viewer_assets/vendor/
 !crates/mcp-agent-mail-share/viewer_assets/vendor/**
+
+# Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
+/beads_compliance_audit/
