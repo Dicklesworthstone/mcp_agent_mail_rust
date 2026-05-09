@@ -60,6 +60,7 @@ const HIT_WRITE_MAINTENANCE_INTERVAL: u64 = 4;
 /// Shard key: `agent_id % NUM_TOUCH_SHARDS`. Reduces contention 16×
 /// compared to a single mutex at 100+ concurrent tool calls/sec.
 const NUM_TOUCH_SHARDS: usize = 16;
+const CACHE_INDEX_CATEGORY_COUNT: usize = 5;
 const PROJECT_BY_SLUG_KEY_BYTES: usize = size_of::<(u64, InternedStr)>();
 const PROJECT_BY_HUMAN_KEY_KEY_BYTES: usize = size_of::<(u64, InternedStr)>();
 const AGENT_BY_KEY_KEY_BYTES: usize = size_of::<(u64, i64, InternedStr)>();
@@ -1062,10 +1063,16 @@ impl ReadCache {
             .saturating_add(inbox_stats_payload_bytes)
             .saturating_add(index_entry_bytes)
             .saturating_add(deferred_touch_bytes);
+        let capacity_per_category = self.capacity_per_category();
+        let max_live_entries =
+            CacheEntryCounts::max_live_entries_for_capacity(capacity_per_category);
+        let capacity_utilization_bp = counts.utilization_basis_points(capacity_per_category);
 
         CacheFootprintEstimate {
             counts,
-            capacity_per_category: self.capacity_per_category(),
+            capacity_per_category,
+            max_live_entries,
+            capacity_utilization_bp,
             project_payload_bytes,
             agent_payload_bytes,
             inbox_stats_payload_bytes,
@@ -1148,6 +1155,23 @@ impl CacheEntryCounts {
     }
 
     #[must_use]
+    pub fn max_live_entries_for_capacity(capacity_per_category: usize) -> usize {
+        capacity_per_category.saturating_mul(CACHE_INDEX_CATEGORY_COUNT)
+    }
+
+    #[must_use]
+    pub fn utilization_basis_points(&self, capacity_per_category: usize) -> u64 {
+        let max_live_entries = Self::max_live_entries_for_capacity(capacity_per_category);
+        if max_live_entries == 0 {
+            return 0;
+        }
+
+        let basis_points =
+            (self.total_live_entries() as u128).saturating_mul(10_000) / (max_live_entries as u128);
+        u64::try_from(basis_points.min(10_000)).expect("basis points fit u64")
+    }
+
+    #[must_use]
     fn index_entry_bytes(&self) -> usize {
         self.projects_by_slug
             .saturating_mul(PROJECT_BY_SLUG_KEY_BYTES + size_of::<CacheEntry<SharedProjectRow>>())
@@ -1176,6 +1200,8 @@ impl CacheEntryCounts {
 pub struct CacheFootprintEstimate {
     pub counts: CacheEntryCounts,
     pub capacity_per_category: usize,
+    pub max_live_entries: usize,
+    pub capacity_utilization_bp: u64,
     pub project_payload_bytes: usize,
     pub agent_payload_bytes: usize,
     pub inbox_stats_payload_bytes: usize,
@@ -1763,12 +1789,43 @@ mod tests {
             DEFAULT_ENTRIES_PER_CATEGORY
         );
         assert_eq!(
+            footprint.max_live_entries,
+            DEFAULT_ENTRIES_PER_CATEGORY.saturating_mul(CACHE_INDEX_CATEGORY_COUNT)
+        );
+        assert_eq!(
             footprint.project_payload_bytes,
             estimate_project_row_bytes(&project)
         );
         assert_eq!(
             footprint.agent_payload_bytes,
             estimate_agent_row_bytes(&agent)
+        );
+    }
+
+    #[test]
+    fn footprint_estimate_reports_capacity_utilization_budget() {
+        let cache = ReadCache::with_capacity(2);
+        let stats = InboxStatsRow {
+            agent_id: 42,
+            total_count: 7,
+            unread_count: 3,
+            ack_pending_count: 2,
+            last_message_ts: Some(123),
+        };
+
+        cache.put_project(&make_project("budget"));
+        cache.put_agent(&make_agent_with_id("BudgetAgent", 1, 42));
+        cache.put_inbox_stats(&stats);
+
+        let footprint = cache.footprint_estimate();
+
+        assert_eq!(footprint.capacity_per_category, 2);
+        assert_eq!(footprint.counts.total_live_entries(), 5);
+        assert_eq!(footprint.max_live_entries, 10);
+        assert_eq!(footprint.capacity_utilization_bp, 5_000);
+        assert_eq!(
+            footprint.counts.utilization_basis_points(2),
+            footprint.capacity_utilization_bp
         );
     }
 
@@ -1819,6 +1876,16 @@ mod tests {
                     .expect("default cache capacity fits u64")
             )
         );
+        assert_eq!(
+            value["footprint"]["max_live_entries"].as_u64(),
+            Some(
+                DEFAULT_ENTRIES_PER_CATEGORY
+                    .saturating_mul(CACHE_INDEX_CATEGORY_COUNT)
+                    .try_into()
+                    .expect("default max cache entries fit u64")
+            )
+        );
+        assert_eq!(value["footprint"]["capacity_utilization_bp"], 0);
         assert_eq!(value["footprint"]["counts"]["agents_by_key"], 1);
         assert!(
             value["footprint"]["total_estimated_bytes"]
