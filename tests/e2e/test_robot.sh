@@ -379,10 +379,56 @@ if echo "$ANALYTICS_OUT" | jq -e '.topology.coverage.build_slots >= 1' >/dev/nul
 else
     e2e_fail "analytics: expected build slot topology coverage"
 fi
+if echo "$ANALYTICS_OUT" | jq -e '
+    .topology.coverage.agents >= 2
+    and .topology.coverage.threads >= 1
+    and .topology.coverage.reservations >= 1
+    and .topology.coverage.nodes >= 4
+    and .topology.coverage.edges >= 4
+' >/dev/null 2>&1; then
+    e2e_pass "analytics: topology coverage counts include agents, threads, reservations, nodes, and edges"
+else
+    e2e_fail "analytics: topology coverage counts missing expected fixture entities"
+fi
+if echo "$ANALYTICS_OUT" | jq -e '.topology.nodes | any(.id == "agent:BlueLake" and .kind == "agent" and .edge_count >= 2)' >/dev/null 2>&1; then
+    e2e_pass "analytics: topology includes hot agent node"
+else
+    e2e_fail "analytics: expected hot agent node"
+fi
+if echo "$ANALYTICS_OUT" | jq -e '.topology.nodes | any(.id == "thread:robot-e2e-thread" and .kind == "thread")' >/dev/null 2>&1; then
+    e2e_pass "analytics: topology includes thread node"
+else
+    e2e_fail "analytics: expected thread node"
+fi
+if echo "$ANALYTICS_OUT" | jq -e '.topology.edges | any(.kind == "sent_messages" and .from == "agent:BlueLake" and .to == "thread:robot-e2e-thread" and .weight >= 2)' >/dev/null 2>&1; then
+    e2e_pass "analytics: message sender topology edge present"
+else
+    e2e_fail "analytics: expected message sender topology edge"
+fi
+if echo "$ANALYTICS_OUT" | jq -e '.topology.edges | any(.kind == "delivered_messages" and .from == "thread:robot-e2e-thread" and .to == "agent:RedFox" and .weight >= 2)' >/dev/null 2>&1; then
+    e2e_pass "analytics: message recipient topology edge present"
+else
+    e2e_fail "analytics: expected message recipient topology edge"
+fi
+if echo "$ANALYTICS_OUT" | jq -e '.topology.edges | any(.kind == "holds_reservation" and .from == "agent:BlueLake" and .to == "reservation:src/test.rs")' >/dev/null 2>&1; then
+    e2e_pass "analytics: reservation topology edge present"
+else
+    e2e_fail "analytics: expected reservation topology edge"
+fi
 if echo "$ANALYTICS_OUT" | jq -e '.topology.edges | any(.kind == "holds_build_slot")' >/dev/null 2>&1; then
     e2e_pass "analytics: build slot topology edge present"
 else
     e2e_fail "analytics: expected build slot topology edge"
+fi
+if echo "$ANALYTICS_OUT" | jq -e '.topology.contention | any(.id == "agent:BlueLake" and .kind == "agent" and .edge_count >= 2)' >/dev/null 2>&1; then
+    e2e_pass "analytics: topology contention hotspot present"
+else
+    e2e_fail "analytics: expected topology contention hotspot"
+fi
+if echo "$ANALYTICS_OUT" | grep -q "Robot E2E Test Message"; then
+    e2e_fail "analytics: topology leaked message subject content"
+else
+    e2e_pass "analytics: topology omits message subject content"
 fi
 if echo "$ANALYTICS_OUT" | grep -q "This is test message"; then
     e2e_fail "analytics: topology leaked message body content"
