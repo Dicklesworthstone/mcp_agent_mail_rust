@@ -193,6 +193,43 @@ A structured, in-process version lives at
 `tests/fixtures/git_251_racer` (bead H1) once it ships. That fixture
 is the canonical reproduction we exercise in CI.
 
+### 5.1 Reproducing under stress
+
+The storage stress harness exercises the same 30-agent message pipeline
+and 10-project concurrent operations used by the normal storage stress
+tests, then overlays a known-bad-git shell-out probe so operators can
+measure the retry layer without touching the live mailbox.
+
+```bash
+# Clean baseline. Always runs.
+cargo test -p mcp-agent-mail-storage --test stress_pipeline_known_bad_git \
+  scenario_a_clean_baseline -- --nocapture
+
+# Synthetic racer. No real buggy git binary required.
+AM_TEST_GIT_251=1 \
+cargo test -p mcp-agent-mail-storage --test stress_pipeline_known_bad_git \
+  scenario_b_synthetic_racer -- --nocapture
+
+# Real 2.51.0 binary. Requires an installed buggy git.
+AM_TEST_GIT_251=1 \
+AM_GIT_BINARY=/path/to/git-2.51.0 \
+cargo test -p mcp-agent-mail-storage --test stress_pipeline_known_bad_git \
+  scenario_c_real_2510_gated -- --nocapture
+
+# Negative control: verifies flock is load-bearing.
+AM_TEST_GIT_251=1 \
+AM_GIT_BINARY=/path/to/git-2.51.0 \
+AM_GIT_FLOCK_DISABLED=1 \
+cargo test -p mcp-agent-mail-storage --test stress_pipeline_known_bad_git \
+  scenario_d_real_2510_no_flock_gated -- --nocapture
+```
+
+Each scenario writes postmortem artifacts under
+`tests/artifacts/stress/git_251/<UTC>/<scenario>/`:
+`metrics.json`, `events.jsonl`, `summary.json`, `stdout.log`,
+`stderr.log`, and `replay.sh`. Replay a scenario by running the
+corresponding `replay.sh`.
+
 ---
 
 ## 6. Symptoms in affected repos

@@ -35,6 +35,7 @@ portable = ["mcp-agent-mail-db/portable"]
 
 [dev-dependencies]
 tempfile = "3"
+toml.workspace = true
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

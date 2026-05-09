@@ -1,0 +1,20 @@
+[scenario_a]
+retry_rate_max = 0.005
+archive_corruption_max = 0
+libgit2_retries_max = 0
+
+[scenario_b]
+retry_rate_min = 0.03
+retry_rate_max = 0.08
+archive_corruption_max = 0
+libgit2_retries_max = 0
+
+[scenario_c]
+retry_rate_max = 0.05
+archive_corruption_max = 0
+libgit2_retries_max = 0
+
+[scenario_d]
+retry_rate_max = 0.05
+archive_corruption_min = 1
+libgit2_retries_max = 0
