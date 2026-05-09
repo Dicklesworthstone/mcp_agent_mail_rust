@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "bead_id": "br-q8yaa",
+  "status": "measured",
+  "source_artifact": "tests/artifacts/stress_load/20260418_151236",
+  "suite": "stress_load",
+  "timestamp": "20260418_151236",
+  "source_summary": {
+    "duration_s": 49,
+    "passed_cases": 8,
+    "failed_cases": 0,
+    "skipped_cases": 0,
+    "http_status_200_count": 1014,
+    "total_rpc_count": 1014
+  },
+  "metrics": {
+    "agent_count": 50,
+    "message_count": 592,
+    "sample_count": 592,
+    "p50_ms": 13,
+    "p95_ms": 1496,
+    "p99_ms": 2240,
+    "max_ms": 2760,
+    "throughput_elements_per_sec": 12.0816
+  },
+  "rpc_timing_ms": {
+    "ensure_project": {
+      "sample_count": 1,
+      "p50": 732,
+      "p95": 732,
+      "p99": 732,
+      "max": 732
+    },
+    "fetch_inbox": {
+      "sample_count": 181,
+      "p50": 257,
+      "p95": 853,
+      "p99": 983,
+      "max": 1261
+    },
+    "file_reservation_paths": {
+      "sample_count": 20,
+      "p50": 29,
+      "p95": 90,
+      "p99": 90,
+      "max": 141
+    },
+    "health_check": {
+      "sample_count": 100,
+      "p50": 178,
+      "p95": 189,
+      "p99": 191,
+      "max": 194
+    },
+    "register_agent": {
+      "sample_count": 50,
+      "p50": 1,
+      "p95": 105,
+      "p99": 119,
+      "max": 132
+    },
+    "search_messages": {
+      "sample_count": 20,
+      "p50": 202,
+      "p95": 205,
+      "p99": 205,
+      "max": 216
+    },
+    "send_message": {
+      "sample_count": 592,
+      "p50": 13,
+      "p95": 1496,
+      "p99": 2240,
+      "max": 2760
+    },
+    "set_contact_policy": {
+      "sample_count": 50,
+      "p50": 8,
+      "p95": 9,
+      "p99": 10,
+      "max": 10
+    }
+  }
+}
