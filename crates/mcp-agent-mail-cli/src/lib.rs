@@ -16004,8 +16004,49 @@ fn doctor_orphaned_message_recipients(
     Ok(recipients)
 }
 
-fn doctor_rebuild_inbox_stats_for_agents(
-    conn: &mcp_agent_mail_db::DbConn,
+fn doctor_orphaned_message_recipients_canonical(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
+) -> CliResult<Vec<DoctorOrphanedMessageRecipient>> {
+    let rows = conn
+        .query_sync(
+            "SELECT mr.rowid, mr.message_id, mr.agent_id, \
+                    CASE WHEN m.id IS NULL THEN 1 ELSE 0 END AS missing_message, \
+                    CASE WHEN a.id IS NULL THEN 1 ELSE 0 END AS missing_agent \
+             FROM message_recipients mr \
+             LEFT JOIN messages m ON m.id = mr.message_id \
+             LEFT JOIN agents a ON a.id = mr.agent_id \
+             WHERE m.id IS NULL OR a.id IS NULL \
+             ORDER BY mr.message_id ASC, mr.agent_id ASC",
+            &[],
+        )
+        .map_err(|e| CliError::Other(format!("orphaned recipient query failed: {e}")))?;
+    let mut recipients = Vec::with_capacity(rows.len());
+    for row in rows {
+        recipients.push(DoctorOrphanedMessageRecipient {
+            rowid: row
+                .get_as(0)
+                .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
+            message_id: row
+                .get_as(1)
+                .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
+            agent_id: row
+                .get_as(2)
+                .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
+            missing_message: row
+                .get_as::<i64>(3)
+                .map(|value| value != 0)
+                .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
+            missing_agent: row
+                .get_as::<i64>(4)
+                .map(|value| value != 0)
+                .map_err(|e| CliError::Other(format!("orphaned recipient decode failed: {e}")))?,
+        });
+    }
+    Ok(recipients)
+}
+
+fn doctor_rebuild_inbox_stats_for_agents_canonical(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
     agent_ids: &[i64],
 ) -> CliResult<()> {
     let delete_sql = "DELETE FROM inbox_stats WHERE agent_id = ?";
@@ -16039,7 +16080,9 @@ fn doctor_rebuild_inbox_stats_for_agents(
     Ok(())
 }
 
-fn doctor_rebuild_all_inbox_stats(conn: &mcp_agent_mail_db::DbConn) -> CliResult<usize> {
+fn doctor_rebuild_all_inbox_stats_canonical(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
+) -> CliResult<usize> {
     conn.execute_raw("DELETE FROM inbox_stats")
         .map_err(|e| CliError::Other(format!("failed to clear inbox_stats: {e}")))?;
     conn.execute_raw(
@@ -16068,29 +16111,11 @@ fn doctor_rebuild_all_inbox_stats(conn: &mcp_agent_mail_db::DbConn) -> CliResult
     Ok(usize::try_from(count).unwrap_or(0))
 }
 
-/// Issue #113: opt-in cleanup that drops `message_recipients` rows whose
-/// `agent_id` no longer exists in `agents`.
-///
-/// `doctor_cleanup_orphaned_message_recipients` deliberately preserves these
-/// rows so the parent message stays readable as "to: [unknown-agent-N]" —
-/// useful for forensic analysis of agent_links dedup gaps.  This function is
-/// the destructive counterpart, gated behind `--prune-orphan-recipients`, that
-/// users explicitly invoke once they have audited the orphans (typically left
-/// by an interrupted Python→Rust migration whose archive-replay path did not
-/// remap dedup'd agent IDs through `agent_links`).
-///
-/// Wraps `BEGIN IMMEDIATE` + per-row DELETE + COMMIT for crash safety; rebuilds
-/// `inbox_stats` for affected agents the same way the standard cleanup does
-/// (in this case, no rebuild is needed because the agent rows themselves are
-/// already gone, but we keep the same boundaries for symmetry).
-///
-/// Returns the number of rows actually deleted (or that would be deleted in
-/// `dry_run`).
-fn doctor_prune_missing_agent_recipients(
-    conn: &mcp_agent_mail_db::DbConn,
+fn doctor_prune_missing_agent_recipients_canonical(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
     dry_run: bool,
 ) -> CliResult<usize> {
-    let orphaned = doctor_orphaned_message_recipients(conn)?;
+    let orphaned = doctor_orphaned_message_recipients_canonical(conn)?;
     let to_prune: Vec<_> = orphaned
         .iter()
         .filter(|row| !row.missing_message && row.missing_agent)
@@ -16108,12 +16133,11 @@ fn doctor_prune_missing_agent_recipients(
     })?;
 
     let prune_result = (|| -> CliResult<()> {
-        let delete_sql = "DELETE FROM message_recipients WHERE message_id = ? AND agent_id = ?";
+        let delete_sql = "DELETE FROM message_recipients WHERE rowid = ?";
         for orphan in &to_prune {
-            let params = [
-                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(orphan.message_id),
-                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(orphan.agent_id),
-            ];
+            let params = [mcp_agent_mail_db::sqlmodel_core::Value::BigInt(
+                orphan.rowid,
+            )];
             conn.execute_sync(delete_sql, &params).map_err(|e| {
                 CliError::Other(format!(
                     "failed to prune missing-agent recipient (message_id={}, agent_id={}): {e}",
@@ -16136,14 +16160,24 @@ fn doctor_prune_missing_agent_recipients(
         }
     }
 
+    let remaining = doctor_orphaned_message_recipients_canonical(conn)?
+        .into_iter()
+        .filter(|row| !row.missing_message && row.missing_agent)
+        .count();
+    if remaining > 0 {
+        return Err(CliError::Other(format!(
+            "missing-agent recipient prune reported success but {remaining} orphaned row(s) remain"
+        )));
+    }
+
     Ok(to_prune.len())
 }
 
-fn doctor_cleanup_orphaned_message_recipients(
-    conn: &mcp_agent_mail_db::DbConn,
+fn doctor_cleanup_orphaned_message_recipients_canonical(
+    conn: &mcp_agent_mail_db::CanonicalDbConn,
     dry_run: bool,
 ) -> CliResult<DoctorRecipientCleanupSummary> {
-    let orphaned = doctor_orphaned_message_recipients(conn)?;
+    let orphaned = doctor_orphaned_message_recipients_canonical(conn)?;
     if orphaned.is_empty() {
         return Ok(DoctorRecipientCleanupSummary {
             deleted_rows: 0,
@@ -16189,12 +16223,11 @@ fn doctor_cleanup_orphaned_message_recipients(
         .map_err(|e| CliError::Other(format!("failed to begin orphan-recipient cleanup: {e}")))?;
 
     let cleanup_result = (|| -> CliResult<()> {
-        let delete_sql = "DELETE FROM message_recipients WHERE message_id = ? AND agent_id = ?";
+        let delete_sql = "DELETE FROM message_recipients WHERE rowid = ?";
         for orphan in &dangling_message_rows {
-            let params = [
-                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(orphan.message_id),
-                mcp_agent_mail_db::sqlmodel_core::Value::BigInt(orphan.agent_id),
-            ];
+            let params = [mcp_agent_mail_db::sqlmodel_core::Value::BigInt(
+                orphan.rowid,
+            )];
             conn.execute_sync(delete_sql, &params).map_err(|e| {
                 CliError::Other(format!(
                     "failed to delete orphaned recipient (message_id={}, agent_id={}): {e}",
@@ -16203,7 +16236,7 @@ fn doctor_cleanup_orphaned_message_recipients(
             })?;
         }
         if !affected_agents.is_empty() {
-            doctor_rebuild_inbox_stats_for_agents(conn, &affected_agents)?;
+            doctor_rebuild_inbox_stats_for_agents_canonical(conn, &affected_agents)?;
         }
         Ok(())
     })();
@@ -16216,6 +16249,16 @@ fn doctor_cleanup_orphaned_message_recipients(
             let _ = conn.execute_raw("ROLLBACK");
             return Err(err);
         }
+    }
+
+    let remaining = doctor_orphaned_message_recipients_canonical(conn)?
+        .into_iter()
+        .filter(|row| row.missing_message)
+        .count();
+    if remaining > 0 {
+        return Err(CliError::Other(format!(
+            "orphan-recipient cleanup reported success but {remaining} dangling row(s) remain"
+        )));
     }
 
     Ok(DoctorRecipientCleanupSummary {
@@ -20098,7 +20141,42 @@ fn handle_doctor_check_with(
         }
     }
 
-    // Check 1c: Non-mutating reopen probe (do not run migrations in doctor check).
+    // Check 1c: recovery lock state. A stale lock should be visible to the
+    // operator but should not be treated as live ownership.
+    {
+        let cfg = mcp_agent_mail_db::DbPoolConfig {
+            database_url: database_url.to_string(),
+            ..Default::default()
+        };
+        match cfg.sqlite_path() {
+            Ok(db_path) if db_path != ":memory:" => {
+                let db_path = PathBuf::from(resolve_sqlite_path_with_absolute_candidate(&db_path));
+                let lock = mcp_agent_mail_db::inspect_mailbox_recovery_lock(&db_path);
+                let lock_needs_attention = lock.active || (lock.exists && lock.pid.is_none());
+                let status = if lock_needs_attention { "warn" } else { "ok" };
+                checks.push(serde_json::json!({
+                    "check": "recovery_lock",
+                    "status": status,
+                    "detail": lock.detail,
+                    "lock_path": lock.lock_path,
+                    "pid": lock.pid,
+                    "active": lock.active,
+                }));
+            }
+            Ok(_) => checks.push(serde_json::json!({
+                "check": "recovery_lock",
+                "status": "ok",
+                "detail": "In-memory database (no recovery lock file)",
+            })),
+            Err(err) => checks.push(serde_json::json!({
+                "check": "recovery_lock",
+                "status": "warn",
+                "detail": format!("Skipped: cannot resolve sqlite path for recovery-lock check: {err}"),
+            })),
+        }
+    }
+
+    // Check 1d: Non-mutating reopen probe (do not run migrations in doctor check).
     {
         if db_file_sanity_failed {
             checks.push(serde_json::json!({
@@ -20126,7 +20204,7 @@ fn handle_doctor_check_with(
         }
     }
 
-    // Check 1d: Foreign-key integrity, including orphaned message recipients.
+    // Check 1e: Foreign-key integrity, including orphaned message recipients.
     {
         if db_file_sanity_failed {
             checks.push(serde_json::json!({
@@ -52424,6 +52502,18 @@ fn handle_doctor_repair_with_options(
         return Ok(());
     }
 
+    if !dry_run
+        && let Some(bundle_dir) = capture_doctor_forensic_bundle(
+            "repair",
+            database_url,
+            &reconstruct_db_path,
+            storage_root,
+            None,
+        )?
+    {
+        ftui_runtime::ftui_println!("  Forensics: {}", bundle_dir.display());
+    }
+
     // 1. File sanity check via the canonical FrankenSQLite probe so doctor
     // repair does not misclassify healthy databases as corrupt.
     let (integrity_ok, integrity_detail, _used_absolute_fallback, _missing_configured_path) =
@@ -52433,18 +52523,6 @@ fn handle_doctor_repair_with_options(
         "  Integrity: {}",
         if integrity_ok { "OK" } else { "FAILED" }
     );
-
-    if !dry_run
-        && let Some(bundle_dir) = capture_doctor_forensic_bundle(
-            "repair",
-            database_url,
-            &reconstruct_db_path,
-            storage_root,
-            Some(&integrity_detail),
-        )?
-    {
-        ftui_runtime::ftui_println!("  Forensics: {}", bundle_dir.display());
-    }
 
     let archive_projects_dir = storage_root.join("projects");
     let archive_available = path_is_real_directory(&archive_projects_dir);
@@ -52537,7 +52615,16 @@ fn handle_doctor_repair_with_options(
         );
     }
 
-    let recipient_cleanup = doctor_cleanup_orphaned_message_recipients(&conn, dry_run)?;
+    drop(conn);
+    let cleanup_conn =
+        mcp_agent_mail_db::CanonicalDbConn::open_file(reconstruct_db_path.display().to_string())
+            .map_err(|e| {
+                CliError::Other(format!(
+                    "Failed to open DB for orphan-recipient cleanup: {e}"
+                ))
+            })?;
+    let recipient_cleanup =
+        doctor_cleanup_orphaned_message_recipients_canonical(&cleanup_conn, dry_run)?;
     if recipient_cleanup.deleted_rows > 0 {
         if dry_run {
             ftui_runtime::ftui_println!(
@@ -52566,7 +52653,7 @@ fn handle_doctor_repair_with_options(
             // `recovery.mode = degraded_read_only` for users who already
             // imported a corrupted Python DB; users who care about the "to:
             // \[unknown-agent-N\]" placeholder must omit this flag.
-            let pruned = doctor_prune_missing_agent_recipients(&conn, dry_run)?;
+            let pruned = doctor_prune_missing_agent_recipients_canonical(&cleanup_conn, dry_run)?;
             if dry_run {
                 ftui_runtime::ftui_println!(
                     "  Would prune missing-agent recipient rows: {} (--prune-orphan-recipients)",
@@ -52589,7 +52676,7 @@ fn handle_doctor_repair_with_options(
 
     // 4. Rebuild FTS if tables exist
     if !dry_run {
-        let fts_tables = conn
+        let fts_tables = cleanup_conn
             .query_sync(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_fts%'",
                 &[],
@@ -52599,7 +52686,7 @@ fn handle_doctor_repair_with_options(
             for row in &fts_tables {
                 let name: String = row.get_named("name").unwrap_or_default();
                 let rebuild_sql = format!("INSERT INTO {name}({name}) VALUES('rebuild')");
-                match conn.execute_raw(&rebuild_sql) {
+                match cleanup_conn.execute_raw(&rebuild_sql) {
                     Ok(_) => ftui_runtime::ftui_println!("  Rebuilt FTS: {name}"),
                     Err(e) => ftui_runtime::ftui_eprintln!("  FTS rebuild failed for {name}: {e}"),
                 }
@@ -52609,7 +52696,7 @@ fn handle_doctor_repair_with_options(
 
     // 5. VACUUM + ANALYZE + REINDEX
     if !dry_run {
-        drop(conn);
+        drop(cleanup_conn);
         let vacuum_conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
             reconstruct_db_path.display().to_string(),
         )
@@ -52630,12 +52717,11 @@ fn handle_doctor_repair_with_options(
             .map_err(|e| CliError::Other(format!("REINDEX failed: {e}")))?;
         ftui_runtime::ftui_println!("  VACUUM + ANALYZE + REINDEX complete.");
 
-        let stats_conn =
-            mcp_agent_mail_db::DbConn::open_file(reconstruct_db_path.display().to_string())
-                .map_err(|e| {
-                    CliError::Other(format!("Failed to open DB for inbox_stats rebuild: {e}"))
-                })?;
-        let rebuilt_stats_rows = doctor_rebuild_all_inbox_stats(&stats_conn)?;
+        let stats_conn = mcp_agent_mail_db::CanonicalDbConn::open_file(
+            reconstruct_db_path.display().to_string(),
+        )
+        .map_err(|e| CliError::Other(format!("Failed to open DB for inbox_stats rebuild: {e}")))?;
+        let rebuilt_stats_rows = doctor_rebuild_all_inbox_stats_canonical(&stats_conn)?;
         ftui_runtime::ftui_println!(
             "  Rebuilt inbox_stats from repaired rows: {rebuilt_stats_rows} agent(s)."
         );
