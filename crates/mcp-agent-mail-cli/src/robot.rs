@@ -17,6 +17,7 @@ use mcp_agent_mail_core::{
     load_latest_atc_canary_report,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlmodel_core::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1589,6 +1590,78 @@ struct AtcConflictData {
     recent_actions: Vec<AtcDecisionData>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct AtcPrivacyTotals {
+    total_rows: u64,
+    open_rows: u64,
+    resolved_rows: u64,
+    censored_rows: u64,
+    expired_rows: u64,
+    suspected_secret_rows: u64,
+    redacted_due_to_secret_rows: u64,
+    legacy_unclassified_rows: u64,
+    redaction_candidate_rows: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AtcPrivacyProjectData {
+    project_hash: String,
+    total_rows: u64,
+    suspected_secret_rows: u64,
+    redaction_candidate_rows: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AtcPrivacyStratumData {
+    stratum: String,
+    total_rows: u64,
+    suspected_secret_rows: u64,
+    redaction_candidate_rows: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AtcPrivacyRetentionWindow {
+    artifact: &'static str,
+    sqlite_ttl_days: Option<u16>,
+    git_archive: &'static str,
+    enforced_by: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AtcPrivacySchemaClass {
+    category: &'static str,
+    risk: &'static str,
+    field_count: u8,
+    handling: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AtcPrivacyRedactionOption {
+    action: &'static str,
+    target_rows: &'static str,
+    effect: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AtcPrivacyReportData {
+    report_version: u8,
+    generated_at: String,
+    scope: &'static str,
+    source_table: &'static str,
+    policy_doc: &'static str,
+    totals: AtcPrivacyTotals,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    privacy_classifications: std::collections::BTreeMap<String, u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    projects: Vec<AtcPrivacyProjectData>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    strata: Vec<AtcPrivacyStratumData>,
+    retention_windows: Vec<AtcPrivacyRetentionWindow>,
+    redaction_options: Vec<AtcPrivacyRedactionOption>,
+    schema_classification_summary: Vec<AtcPrivacySchemaClass>,
+    safety_notes: Vec<&'static str>,
+}
+
 #[derive(Debug, Serialize)]
 struct AtcData {
     enabled: bool,
@@ -1611,6 +1684,8 @@ struct AtcData {
     liveness: Option<Vec<AtcLivenessData>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     conflicts: Option<AtcConflictData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    privacy: Option<AtcPrivacyReportData>,
 }
 
 // ── Robot subcommand scaffold ────────────────────────────────────────────────
@@ -8467,6 +8542,317 @@ fn atc_rollup_observability_from_conn(conn: &DbConn) -> Result<AtcRobotObservabi
     Ok(observability)
 }
 
+fn atc_privacy_identifier_hash(value: &str) -> String {
+    if value.trim().is_empty() {
+        return "unscoped".to_string();
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"mcp-agent-mail-atc-privacy-report:v1\0");
+    hasher.update(value.as_bytes());
+    let digest = hasher.finalize();
+    digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn atc_privacy_retention_windows() -> Vec<AtcPrivacyRetentionWindow> {
+    vec![
+        AtcPrivacyRetentionWindow {
+            artifact: "open_experience_rows",
+            sqlite_ttl_days: Some(30),
+            git_archive: "never",
+            enforced_by: "denylist",
+        },
+        AtcPrivacyRetentionWindow {
+            artifact: "resolved_experience_rows",
+            sqlite_ttl_days: Some(365),
+            git_archive: "never",
+            enforced_by: "denylist",
+        },
+        AtcPrivacyRetentionWindow {
+            artifact: "experience_rollups",
+            sqlite_ttl_days: Some(730),
+            git_archive: "never",
+            enforced_by: "denylist",
+        },
+        AtcPrivacyRetentionWindow {
+            artifact: "evidence_ledger_entries",
+            sqlite_ttl_days: Some(30),
+            git_archive: "never",
+            enforced_by: "bounded_debug_tail",
+        },
+        AtcPrivacyRetentionWindow {
+            artifact: "transparency_cards",
+            sqlite_ttl_days: Some(365),
+            git_archive: "never_folded",
+            enforced_by: "batched_audit",
+        },
+        AtcPrivacyRetentionWindow {
+            artifact: "audit_summaries",
+            sqlite_ttl_days: Some(730),
+            git_archive: "archived",
+            enforced_by: "aggregated_only",
+        },
+        AtcPrivacyRetentionWindow {
+            artifact: "feature_vectors",
+            sqlite_ttl_days: None,
+            git_archive: "never",
+            enforced_by: "parent_denylist",
+        },
+    ]
+}
+
+fn atc_privacy_schema_classification_summary() -> Vec<AtcPrivacySchemaClass> {
+    vec![
+        AtcPrivacySchemaClass {
+            category: "A_metadata",
+            risk: "none",
+            field_count: 16,
+            handling: "numeric_or_enum_metrics",
+        },
+        AtcPrivacySchemaClass {
+            category: "B_derived_hashed",
+            risk: "low",
+            field_count: 9,
+            handling: "constrained_or_hashed_identifiers",
+        },
+        AtcPrivacySchemaClass {
+            category: "C_pseudonymous_id",
+            risk: "medium",
+            field_count: 2,
+            handling: "hash_in_operator_reports",
+        },
+        AtcPrivacySchemaClass {
+            category: "D_content_validated",
+            risk: "high",
+            field_count: 3,
+            handling: "secret_scan_and_count_only_reporting",
+        },
+        AtcPrivacySchemaClass {
+            category: "F_timing",
+            risk: "low",
+            field_count: 2,
+            handling: "bucketized_feature_vector_metrics",
+        },
+    ]
+}
+
+fn atc_privacy_redaction_options() -> Vec<AtcPrivacyRedactionOption> {
+    vec![
+        AtcPrivacyRedactionOption {
+            action: "censor_suspected_secret_rows",
+            target_rows: "suspected_secret_rows",
+            effect: "mark rows as censored and retain count-only audit evidence",
+        },
+        AtcPrivacyRedactionOption {
+            action: "redact_category_d_payloads",
+            target_rows: "redaction_candidate_rows",
+            effect: "remove Category D payload columns before wider rollout",
+        },
+        AtcPrivacyRedactionOption {
+            action: "expire_legacy_unclassified_rows",
+            target_rows: "legacy_unclassified_rows",
+            effect: "drop stale legacy rows after classification and retention review",
+        },
+    ]
+}
+
+fn atc_privacy_report_unavailable() -> AtcPrivacyReportData {
+    AtcPrivacyReportData {
+        report_version: 1,
+        generated_at: mcp_agent_mail_db::micros_to_iso(mcp_agent_mail_db::now_micros()),
+        scope: "all_atc_experiences",
+        source_table: "atc_experiences",
+        policy_doc: "docs/SPEC-atc-data-minimization.md",
+        totals: AtcPrivacyTotals {
+            total_rows: 0,
+            open_rows: 0,
+            resolved_rows: 0,
+            censored_rows: 0,
+            expired_rows: 0,
+            suspected_secret_rows: 0,
+            redacted_due_to_secret_rows: 0,
+            legacy_unclassified_rows: 0,
+            redaction_candidate_rows: 0,
+        },
+        privacy_classifications: std::collections::BTreeMap::new(),
+        projects: Vec::new(),
+        strata: Vec::new(),
+        retention_windows: atc_privacy_retention_windows(),
+        redaction_options: atc_privacy_redaction_options(),
+        schema_classification_summary: atc_privacy_schema_classification_summary(),
+        safety_notes: vec![
+            "ATC experience storage is unavailable or has not been migrated yet.",
+            "This report intentionally emits counts and hashes only; raw ATC content fields are never rendered.",
+        ],
+    }
+}
+
+fn atc_privacy_count(row: &sqlmodel_core::Row, name: &str) -> u64 {
+    row.get_named::<i64>(name).unwrap_or(0).max(0) as u64
+}
+
+fn atc_privacy_report_from_conn(conn: &DbConn) -> Result<AtcPrivacyReportData, CliError> {
+    let candidate_sql = "CASE WHEN \
+        contained_suspected_secret = 1 \
+        OR privacy_classification IN ('legacy_unclassified', 'redacted_due_to_secret') \
+        OR NULLIF(TRIM(COALESCE(evidence_summary, '')), '') IS NOT NULL \
+        OR NULLIF(TRIM(COALESCE(outcome_json, '')), '') IS NOT NULL \
+        OR NULLIF(TRIM(COALESCE(context_json, '')), '') IS NOT NULL \
+        THEN 1 ELSE 0 END";
+
+    let totals_rows = match conn.query_sync(
+        &format!(
+            "SELECT \
+                COUNT(*) AS total_rows, \
+                SUM(CASE WHEN state = 'open' THEN 1 ELSE 0 END) AS open_rows, \
+                SUM(CASE WHEN state = 'resolved' THEN 1 ELSE 0 END) AS resolved_rows, \
+                SUM(CASE WHEN state = 'censored' THEN 1 ELSE 0 END) AS censored_rows, \
+                SUM(CASE WHEN state = 'expired' THEN 1 ELSE 0 END) AS expired_rows, \
+                SUM(CASE WHEN contained_suspected_secret = 1 THEN 1 ELSE 0 END) AS suspected_secret_rows, \
+                SUM(CASE WHEN privacy_classification = 'redacted_due_to_secret' THEN 1 ELSE 0 END) AS redacted_due_to_secret_rows, \
+                SUM(CASE WHEN privacy_classification = 'legacy_unclassified' THEN 1 ELSE 0 END) AS legacy_unclassified_rows, \
+                SUM({candidate_sql}) AS redaction_candidate_rows \
+             FROM atc_experiences"
+        ),
+        &[],
+    ) {
+        Ok(rows) => rows,
+        Err(error) => {
+            let message = error.to_string();
+            if message.contains("no such table")
+                || message.contains("atc_experiences")
+                || message.contains("no such column")
+            {
+                return Ok(atc_privacy_report_unavailable());
+            }
+            return Err(CliError::Other(format!("ATC privacy totals query failed: {error}")));
+        }
+    };
+
+    let totals_row = totals_rows.first();
+    let totals = if let Some(row) = totals_row {
+        AtcPrivacyTotals {
+            total_rows: atc_privacy_count(row, "total_rows"),
+            open_rows: atc_privacy_count(row, "open_rows"),
+            resolved_rows: atc_privacy_count(row, "resolved_rows"),
+            censored_rows: atc_privacy_count(row, "censored_rows"),
+            expired_rows: atc_privacy_count(row, "expired_rows"),
+            suspected_secret_rows: atc_privacy_count(row, "suspected_secret_rows"),
+            redacted_due_to_secret_rows: atc_privacy_count(row, "redacted_due_to_secret_rows"),
+            legacy_unclassified_rows: atc_privacy_count(row, "legacy_unclassified_rows"),
+            redaction_candidate_rows: atc_privacy_count(row, "redaction_candidate_rows"),
+        }
+    } else {
+        AtcPrivacyTotals {
+            total_rows: 0,
+            open_rows: 0,
+            resolved_rows: 0,
+            censored_rows: 0,
+            expired_rows: 0,
+            suspected_secret_rows: 0,
+            redacted_due_to_secret_rows: 0,
+            legacy_unclassified_rows: 0,
+            redaction_candidate_rows: 0,
+        }
+    };
+
+    let classification_rows = conn
+        .query_sync(
+            "SELECT privacy_classification, COUNT(*) AS row_count \
+             FROM atc_experiences \
+             GROUP BY privacy_classification \
+             ORDER BY privacy_classification",
+            &[],
+        )
+        .map_err(|error| CliError::Other(format!("ATC privacy class query failed: {error}")))?;
+    let mut privacy_classifications = std::collections::BTreeMap::new();
+    for row in &classification_rows {
+        let class: String = row
+            .get_named("privacy_classification")
+            .unwrap_or_else(|_| "unknown".to_string());
+        privacy_classifications.insert(class, atc_privacy_count(row, "row_count"));
+    }
+
+    let project_rows = conn
+        .query_sync(
+            &format!(
+                "SELECT COALESCE(project_key, '') AS project_key, \
+                    COUNT(*) AS total_rows, \
+                    SUM(CASE WHEN contained_suspected_secret = 1 THEN 1 ELSE 0 END) AS suspected_secret_rows, \
+                    SUM({candidate_sql}) AS redaction_candidate_rows \
+                 FROM atc_experiences \
+                 GROUP BY COALESCE(project_key, '') \
+                 ORDER BY total_rows DESC, project_key \
+                 LIMIT 50"
+            ),
+            &[],
+        )
+        .map_err(|error| CliError::Other(format!("ATC privacy project query failed: {error}")))?;
+    let projects = project_rows
+        .iter()
+        .map(|row| {
+            let project_key: String = row.get_named("project_key").unwrap_or_default();
+            AtcPrivacyProjectData {
+                project_hash: atc_privacy_identifier_hash(&project_key),
+                total_rows: atc_privacy_count(row, "total_rows"),
+                suspected_secret_rows: atc_privacy_count(row, "suspected_secret_rows"),
+                redaction_candidate_rows: atc_privacy_count(row, "redaction_candidate_rows"),
+            }
+        })
+        .collect();
+
+    let stratum_rows = conn
+        .query_sync(
+            &format!(
+                "SELECT \
+                    COALESCE(subsystem, 'unknown') || ':' || \
+                    COALESCE(effect_kind, 'unknown') || ':' || \
+                    COALESCE(state, 'unknown') AS stratum, \
+                    COUNT(*) AS total_rows, \
+                    SUM(CASE WHEN contained_suspected_secret = 1 THEN 1 ELSE 0 END) AS suspected_secret_rows, \
+                    SUM({candidate_sql}) AS redaction_candidate_rows \
+                 FROM atc_experiences \
+                 GROUP BY stratum \
+                 ORDER BY total_rows DESC, stratum \
+                 LIMIT 50"
+            ),
+            &[],
+        )
+        .map_err(|error| CliError::Other(format!("ATC privacy stratum query failed: {error}")))?;
+    let strata = stratum_rows
+        .iter()
+        .map(|row| AtcPrivacyStratumData {
+            stratum: row.get_named("stratum").unwrap_or_default(),
+            total_rows: atc_privacy_count(row, "total_rows"),
+            suspected_secret_rows: atc_privacy_count(row, "suspected_secret_rows"),
+            redaction_candidate_rows: atc_privacy_count(row, "redaction_candidate_rows"),
+        })
+        .collect();
+
+    Ok(AtcPrivacyReportData {
+        report_version: 1,
+        generated_at: mcp_agent_mail_db::micros_to_iso(mcp_agent_mail_db::now_micros()),
+        scope: "all_atc_experiences",
+        source_table: "atc_experiences",
+        policy_doc: "docs/SPEC-atc-data-minimization.md",
+        totals,
+        privacy_classifications,
+        projects,
+        strata,
+        retention_windows: atc_privacy_retention_windows(),
+        redaction_options: atc_privacy_redaction_options(),
+        schema_classification_summary: atc_privacy_schema_classification_summary(),
+        safety_notes: vec![
+            "Project identifiers are domain-separated SHA-256 prefixes; raw project paths are not rendered.",
+            "Raw ATC subject, evidence_summary, outcome_json, context_json, and project_key values are never included in this report.",
+            "Rows counted as redaction candidates require operator review before broader ATC rollout.",
+        ],
+    })
+}
+
 fn build_unavailable_atc_snapshot(live_error: &str) -> AtcRobotSnapshot {
     let config = mcp_agent_mail_core::Config::from_env();
     AtcRobotSnapshot {
@@ -8908,6 +9294,7 @@ fn build_atc_data(
     since: Option<&str>,
     stratum_filter: Option<&str>,
     canary: Option<AtcCanaryReportSummary>,
+    privacy: Option<AtcPrivacyReportData>,
     summary_only: bool,
     limit: usize,
 ) -> AtcData {
@@ -8946,6 +9333,7 @@ fn build_atc_data(
                 limit,
             )
         }),
+        privacy,
     }
 }
 
@@ -10484,6 +10872,15 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
             let live_endpoint = atc_live_endpoint_from_config(&config);
             let maybe_scope =
                 maybe_resolve_robot_scope(args.project.as_deref(), args.agent.as_deref())?;
+            let privacy_report = maybe_scope.as_ref().and_then(|scope| {
+                match atc_privacy_report_from_conn(scope.conn()) {
+                    Ok(report) => Some(report),
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to build ATC privacy report");
+                        None
+                    }
+                }
+            });
 
             let (snapshot, reservation_conflicts, project_slug, live_error) =
                 match fetch_live_atc_snapshot(&live_endpoint) {
@@ -10548,6 +10945,7 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                 since.as_deref(),
                 stratum.as_deref(),
                 canary,
+                privacy_report,
                 summary_only,
                 limit,
             );
@@ -10633,6 +11031,28 @@ pub fn handle_robot(args: RobotArgs) -> Result<(), CliError> {
                     .and_then(|summary| summary.fallback_reason.clone())
                     .unwrap_or_else(|| "deterministic conservative fallback active".to_string());
                 env = env.with_alert("warn", "ATC fallback mode active", Some(detail));
+            }
+            let privacy_alert = env.data.privacy.as_ref().and_then(|privacy| {
+                let suspected_secret_rows = privacy.totals.suspected_secret_rows;
+                let redaction_candidate_rows = privacy.totals.redaction_candidate_rows;
+                if suspected_secret_rows > 0 {
+                    Some((
+                        "ATC privacy report found suspected-secret rows",
+                        format!(
+                            "{suspected_secret_rows} suspected-secret row(s); inspect privacy.redaction_candidate_rows before live rollout"
+                        ),
+                    ))
+                } else if redaction_candidate_rows > 0 {
+                    Some((
+                        "ATC privacy report has redaction candidates",
+                        format!("{redaction_candidate_rows} row(s) require privacy review"),
+                    ))
+                } else {
+                    None
+                }
+            });
+            if let Some((message, detail)) = privacy_alert {
+                env = env.with_alert("warn", message, Some(detail));
             }
             if let Some(age) = snapshot_age_micros {
                 tracing::debug!(event = "robot.atc.snapshot_age_micros", age_micros = age);
@@ -11077,6 +11497,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             5,
         );
@@ -11220,6 +11641,7 @@ mod tests {
             None,
             None,
             Some(canary),
+            None,
             true,
             5,
         );
@@ -11238,6 +11660,7 @@ mod tests {
             None,
             Some("1970-01-01T00:00:02Z"),
             Some("liveness:probe:0"),
+            None,
             None,
             true,
             5,
@@ -11302,6 +11725,7 @@ mod tests {
             None,
             Some("liveness"),
             None,
+            None,
             true,
             1,
         );
@@ -11316,6 +11740,101 @@ mod tests {
             summary.experiences_open, 12,
             "aggregate should include all matching strata, not only displayed rows"
         );
+    }
+
+    fn setup_atc_privacy_test_db() -> (tempfile::TempDir, DbConn) {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let db_path = temp_dir.path().join("atc_privacy.sqlite3");
+        let conn = DbConn::open_file(db_path.display().to_string()).expect("open sqlite db");
+        let empty: [mcp_agent_mail_db::sqlmodel_core::Value; 0] = [];
+        conn.query_sync(
+            "CREATE TABLE atc_experiences (
+                experience_id INTEGER PRIMARY KEY,
+                project_key TEXT,
+                subject TEXT,
+                subsystem TEXT,
+                effect_kind TEXT,
+                state TEXT,
+                evidence_summary TEXT,
+                outcome_json TEXT,
+                context_json TEXT,
+                contained_suspected_secret INTEGER NOT NULL DEFAULT 0,
+                privacy_classification TEXT NOT NULL DEFAULT 'legacy_unclassified'
+            )",
+            &empty,
+        )
+        .expect("create atc_experiences");
+        conn.query_sync(
+            "INSERT INTO atc_experiences (
+                experience_id, project_key, subject, subsystem, effect_kind, state,
+                evidence_summary, outcome_json, context_json,
+                contained_suspected_secret, privacy_classification
+            ) VALUES
+                (1, '/data/projects/private-client', 'AlphaAgent', 'liveness', 'probe', 'open',
+                 '', NULL, NULL, 0, 'metadata_only'),
+                (2, '/data/projects/private-client', 'SecretSubject', 'conflict', 'advisory', 'resolved',
+                 'secret message body from ticket', '{\"label\":\"PRIVATE_RAW_SUBJECT\"}', '{\"path\":\"/data/projects/private-client/src/secrets.rs\"}', 1, 'redacted_due_to_secret'),
+                (3, '/tmp/another-private-path', 'OtherAgent', 'liveness', 'probe', 'censored',
+                 '', NULL, NULL, 0, 'legacy_unclassified')",
+            &empty,
+        )
+        .expect("seed atc_experiences");
+        (temp_dir, conn)
+    }
+
+    #[test]
+    fn atc_privacy_report_counts_rows_without_leaking_raw_fields() {
+        let (_temp, conn) = setup_atc_privacy_test_db();
+        let report = atc_privacy_report_from_conn(&conn).expect("privacy report");
+
+        assert_eq!(report.totals.total_rows, 3);
+        assert_eq!(report.totals.open_rows, 1);
+        assert_eq!(report.totals.resolved_rows, 1);
+        assert_eq!(report.totals.censored_rows, 1);
+        assert_eq!(report.totals.suspected_secret_rows, 1);
+        assert_eq!(report.totals.redacted_due_to_secret_rows, 1);
+        assert_eq!(report.totals.legacy_unclassified_rows, 1);
+        assert_eq!(report.totals.redaction_candidate_rows, 2);
+        assert_eq!(
+            report.privacy_classifications.get("metadata_only").copied(),
+            Some(1)
+        );
+        assert_eq!(
+            report
+                .privacy_classifications
+                .get("redacted_due_to_secret")
+                .copied(),
+            Some(1)
+        );
+        assert_eq!(report.projects.len(), 2);
+        assert!(
+            report
+                .projects
+                .iter()
+                .all(|project| project.project_hash != "/data/projects/private-client")
+        );
+        assert!(report.strata.iter().any(
+            |row| row.stratum == "conflict:advisory:resolved" && row.suspected_secret_rows == 1
+        ));
+
+        let json = serde_json::to_string(&report).expect("serialize report");
+        for forbidden in [
+            "/data/projects/private-client",
+            "/tmp/another-private-path",
+            "SecretSubject",
+            "secret message body",
+            "PRIVATE_RAW_SUBJECT",
+            "secrets.rs",
+        ] {
+            assert!(
+                !json.contains(forbidden),
+                "privacy report leaked raw field `{forbidden}` in {json}"
+            );
+        }
+        assert!(json.contains("redaction_candidate_rows"));
+        assert!(json.contains("retention_windows"));
+        assert!(json.contains("redaction_options"));
+        assert!(json.contains("schema_classification_summary"));
     }
 
     #[test]
